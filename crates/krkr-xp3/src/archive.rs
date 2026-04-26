@@ -12,13 +12,12 @@ use crate::{
     Xp3Entry, Xp3EntryStream, Xp3Error,
     cache::SegmentCache,
     parse::{find_xp3_base_offset, read_entries},
-    source::{ArchiveSource, FileArchiveSource, SeekArchiveSource},
+    source::{ArchiveSourceHandle, FileArchiveSource, SeekArchiveSource},
     util::normalize_entry_name,
 };
 
-#[derive(Clone)]
 pub struct Xp3Archive<R> {
-    reader: Arc<dyn ArchiveSource>,
+    reader: ArchiveSourceHandle<R>,
     entries: Vec<Xp3Entry>,
     by_name: HashMap<String, usize>,
     base_offset: u64,
@@ -30,7 +29,7 @@ pub struct Xp3Archive<R> {
 
 impl<R> Xp3Archive<R>
 where
-    R: Read + Seek + Send + 'static,
+    R: Read + Seek + Send,
 {
     pub fn open(reader: R) -> Result<Self> {
         Self::open_with_options(reader, Xp3OpenOptions::default())
@@ -38,14 +37,14 @@ where
 
     pub fn open_with_options(reader: R, options: Xp3OpenOptions) -> Result<Self> {
         Self::open_with_source(reader, options, |reader| {
-            Arc::new(SeekArchiveSource::new(reader))
+            ArchiveSourceHandle::Seek(Arc::new(SeekArchiveSource::new(reader)))
         })
     }
 
     fn open_with_source(
         mut reader: R,
         options: Xp3OpenOptions,
-        make_source: impl FnOnce(R) -> Arc<dyn ArchiveSource>,
+        make_source: impl FnOnce(R) -> ArchiveSourceHandle<R>,
     ) -> Result<Self> {
         let file_len = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
@@ -102,7 +101,7 @@ where
             .ok_or_else(|| Xp3Error::NotFound(index.to_string()))?;
 
         Ok(Xp3EntryStream::new(
-            Arc::clone(&self.reader),
+            self.reader.clone(),
             Arc::clone(&self.segment_cache),
             self.extraction_filter.clone(),
             index,
@@ -132,6 +131,23 @@ impl Xp3Archive<File> {
 
     pub fn open_file_with_options(path: impl AsRef<Path>, options: Xp3OpenOptions) -> Result<Self> {
         let file = File::open(path)?;
-        Self::open_with_source(file, options, |file| Arc::new(FileArchiveSource::new(file)))
+        Self::open_with_source(file, options, |file| {
+            ArchiveSourceHandle::File(Arc::new(FileArchiveSource::new(file)))
+        })
+    }
+}
+
+impl<R> Clone for Xp3Archive<R> {
+    fn clone(&self) -> Self {
+        Self {
+            reader: self.reader.clone(),
+            entries: self.entries.clone(),
+            by_name: self.by_name.clone(),
+            base_offset: self.base_offset,
+            file_len: self.file_len,
+            extraction_filter: self.extraction_filter.clone(),
+            segment_cache: Arc::clone(&self.segment_cache),
+            reader_type: PhantomData,
+        }
     }
 }

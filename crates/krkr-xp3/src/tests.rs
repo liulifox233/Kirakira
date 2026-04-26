@@ -51,6 +51,32 @@ fn opens_raw_archive_and_normalizes_paths() {
 }
 
 #[test]
+fn opens_archive_from_borrowed_reader() {
+    let archive_bytes = build_archive(
+        &[FixtureEntry {
+            name: "borrowed.ks",
+            segments: vec![FixtureSegment::raw(b"borrowed")],
+            hash: 0,
+            time: None,
+        }],
+        BuildOptions::default(),
+    );
+    let borrowed_bytes = archive_bytes.as_slice();
+    let archive = Xp3Archive::open(Cursor::new(borrowed_bytes)).expect("open borrowed archive");
+
+    let mut stream = archive
+        .open_by_name("borrowed.ks")
+        .expect("open entry")
+        .expect("entry exists");
+    let mut contents = String::new();
+    stream
+        .read_to_string(&mut contents)
+        .expect("read borrowed entry");
+
+    assert_eq!(contents, "borrowed");
+}
+
+#[test]
 fn opens_exe_bound_current_header_archive() {
     let archive = Xp3Archive::open(Cursor::new(build_archive(
         &[FixtureEntry {
@@ -250,7 +276,10 @@ fn file_archive_supports_concurrent_independent_streams() {
         ),
     )
     .expect("write archive");
-    let archive = Arc::new(Xp3Archive::open_file(&archive_path).expect("open file archive"));
+    let archive = Xp3Archive::open_file(&archive_path).expect("open file archive");
+    let cloned_archive = archive.clone();
+    assert_eq!(cloned_archive.entries().len(), 2);
+    let archive = Arc::new(cloned_archive);
 
     let handles = ["first.bin", "second.bin"].map(|name| {
         let archive = Arc::clone(&archive);

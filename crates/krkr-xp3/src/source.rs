@@ -1,10 +1,36 @@
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
-pub(crate) trait ArchiveSource: Send + Sync {
+pub(crate) enum ArchiveSourceHandle<R> {
+    Seek(Arc<SeekArchiveSource<R>>),
+    File(Arc<FileArchiveSource>),
+}
+
+impl<R> Clone for ArchiveSourceHandle<R> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Seek(source) => Self::Seek(Arc::clone(source)),
+            Self::File(source) => Self::File(Arc::clone(source)),
+        }
+    }
+}
+
+impl<R> ArchiveSourceHandle<R>
+where
+    R: Read + Seek + Send,
+{
+    pub(crate) fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        match self {
+            Self::Seek(source) => source.read_exact_at(offset, buffer),
+            Self::File(source) => source.read_exact_at(offset, buffer),
+        }
+    }
+}
+
+trait ArchiveSource: Send + Sync {
     fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()>;
 }
 

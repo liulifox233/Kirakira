@@ -9,12 +9,12 @@ use flate2::read::ZlibDecoder;
 use crate::{
     Xp3Entry, Xp3ExtractionFilter, Xp3Segment, Xp3SegmentEncoding,
     cache::{SegmentCache, SegmentCacheKey},
-    source::ArchiveSource,
+    source::ArchiveSourceHandle,
     util::{checked_add_io, ensure_range_io, usize_from_u64_io},
 };
 
 pub struct Xp3EntryStream<R> {
-    reader: Arc<dyn ArchiveSource>,
+    reader: ArchiveSourceHandle<R>,
     segments: Vec<Xp3Segment>,
     file_size: u64,
     file_hash: u32,
@@ -34,7 +34,7 @@ struct ActiveDecodedSegment {
 
 impl<R> Xp3EntryStream<R> {
     pub(crate) fn new(
-        reader: Arc<dyn ArchiveSource>,
+        reader: ArchiveSourceHandle<R>,
         segment_cache: Arc<SegmentCache>,
         extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
         entry_index: usize,
@@ -57,7 +57,10 @@ impl<R> Xp3EntryStream<R> {
     }
 }
 
-impl<R> Xp3EntryStream<R> {
+impl<R> Xp3EntryStream<R>
+where
+    R: Read + Seek + Send,
+{
     fn find_segment(&self, position: u64) -> io::Result<usize> {
         if self.segments.is_empty() {
             return Err(io::Error::new(
@@ -175,7 +178,10 @@ impl<R> Xp3EntryStream<R> {
     }
 }
 
-impl<R> Read for Xp3EntryStream<R> {
+impl<R> Read for Xp3EntryStream<R>
+where
+    R: Read + Seek + Send,
+{
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() || self.position >= self.file_size {
             return Ok(0);
