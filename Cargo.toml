@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "apps/desktop",
+    "crates/krkr-audio",
+    "crates/krkr-core",
+    "crates/krkr-platform",
+    "crates/krkr-render",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+bytemuck = { version = "1.24.0", features = ["derive"] }
+cpal = "=0.17.3"
+pollster = "0.4.0"
+rfd = "=0.17.2"
+symphonia = { version = "=0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+wgpu = "=29.0.1"
+winit = "=0.30.13"
+
+krkr-audio = { path = "crates/krkr-audio" }
+krkr-core = { path = "crates/krkr-core" }
+krkr-platform = { path = "crates/krkr-platform" }
+krkr-render = { path = "crates/krkr-render" }
