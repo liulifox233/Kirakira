@@ -3,12 +3,15 @@ mod cache;
 mod entry;
 mod options;
 mod parse;
+mod provider;
+mod source;
 mod stream;
 mod util;
 
 pub use archive::Xp3Archive;
 pub use entry::{Xp3Entry, Xp3Segment, Xp3SegmentEncoding};
 pub use options::{SegmentCacheConfig, Xp3OpenOptions};
+pub use provider::Xp3ResourceProvider;
 pub use stream::Xp3EntryStream;
 pub use util::{Result, Xp3Error, Xp3ExtractionFilter, normalize_entry_name};
 

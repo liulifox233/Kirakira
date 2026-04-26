@@ -884,6 +884,7 @@ name = "krkr-xp3"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "krkr-core",
 ]
 
 [[package]]

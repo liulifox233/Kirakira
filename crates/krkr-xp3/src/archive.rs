@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
+    fs::File,
     io::{Read, Seek, SeekFrom},
-    sync::{Arc, Mutex},
+    marker::PhantomData,
+    path::Path,
+    sync::Arc,
 };
 
 use crate::{Result, SegmentCacheConfig, Xp3ExtractionFilter, Xp3OpenOptions};
@@ -9,28 +12,41 @@ use crate::{
     Xp3Entry, Xp3EntryStream, Xp3Error,
     cache::SegmentCache,
     parse::{find_xp3_base_offset, read_entries},
+    source::{ArchiveSource, FileArchiveSource, SeekArchiveSource},
     util::normalize_entry_name,
 };
 
+#[derive(Clone)]
 pub struct Xp3Archive<R> {
-    reader: Arc<Mutex<R>>,
+    reader: Arc<dyn ArchiveSource>,
     entries: Vec<Xp3Entry>,
     by_name: HashMap<String, usize>,
     base_offset: u64,
     file_len: u64,
     extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
     segment_cache: Arc<SegmentCache>,
+    reader_type: PhantomData<fn() -> R>,
 }
 
 impl<R> Xp3Archive<R>
 where
-    R: Read + Seek + Send,
+    R: Read + Seek + Send + 'static,
 {
     pub fn open(reader: R) -> Result<Self> {
         Self::open_with_options(reader, Xp3OpenOptions::default())
     }
 
-    pub fn open_with_options(mut reader: R, options: Xp3OpenOptions) -> Result<Self> {
+    pub fn open_with_options(reader: R, options: Xp3OpenOptions) -> Result<Self> {
+        Self::open_with_source(reader, options, |reader| {
+            Arc::new(SeekArchiveSource::new(reader))
+        })
+    }
+
+    fn open_with_source(
+        mut reader: R,
+        options: Xp3OpenOptions,
+        make_source: impl FnOnce(R) -> Arc<dyn ArchiveSource>,
+    ) -> Result<Self> {
         let file_len = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 
@@ -44,13 +60,14 @@ where
         }
 
         Ok(Self {
-            reader: Arc::new(Mutex::new(reader)),
+            reader: make_source(reader),
             entries,
             by_name,
             base_offset,
             file_len,
             extraction_filter: options.extraction_filter,
             segment_cache: Arc::new(SegmentCache::new(options.segment_cache)),
+            reader_type: PhantomData,
         })
     }
 
@@ -105,5 +122,16 @@ where
     pub fn clear_segment_cache(&self) -> Result<()> {
         self.segment_cache.clear()?;
         Ok(())
+    }
+}
+
+impl Xp3Archive<File> {
+    pub fn open_file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_file_with_options(path, Xp3OpenOptions::default())
+    }
+
+    pub fn open_file_with_options(path: impl AsRef<Path>, options: Xp3OpenOptions) -> Result<Self> {
+        let file = File::open(path)?;
+        Self::open_with_source(file, options, |file| Arc::new(FileArchiveSource::new(file)))
     }
 }

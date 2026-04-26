@@ -1,6 +1,7 @@
 use std::{
     io::{self, Read, Seek, SeekFrom},
-    sync::{Arc, Mutex},
+    marker::PhantomData,
+    sync::Arc,
 };
 
 use flate2::read::ZlibDecoder;
@@ -8,11 +9,12 @@ use flate2::read::ZlibDecoder;
 use crate::{
     Xp3Entry, Xp3ExtractionFilter, Xp3Segment, Xp3SegmentEncoding,
     cache::{SegmentCache, SegmentCacheKey},
+    source::ArchiveSource,
     util::{checked_add_io, ensure_range_io, usize_from_u64_io},
 };
 
 pub struct Xp3EntryStream<R> {
-    reader: Arc<Mutex<R>>,
+    reader: Arc<dyn ArchiveSource>,
     segments: Vec<Xp3Segment>,
     file_size: u64,
     file_hash: u32,
@@ -22,6 +24,7 @@ pub struct Xp3EntryStream<R> {
     extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
     segment_cache: Arc<SegmentCache>,
     active_segment: Option<ActiveDecodedSegment>,
+    reader_type: PhantomData<fn() -> R>,
 }
 
 struct ActiveDecodedSegment {
@@ -31,7 +34,7 @@ struct ActiveDecodedSegment {
 
 impl<R> Xp3EntryStream<R> {
     pub(crate) fn new(
-        reader: Arc<Mutex<R>>,
+        reader: Arc<dyn ArchiveSource>,
         segment_cache: Arc<SegmentCache>,
         extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
         entry_index: usize,
@@ -49,14 +52,12 @@ impl<R> Xp3EntryStream<R> {
             extraction_filter,
             segment_cache,
             active_segment: None,
+            reader_type: PhantomData,
         }
     }
 }
 
-impl<R> Xp3EntryStream<R>
-where
-    R: Read + Seek + Send,
-{
+impl<R> Xp3EntryStream<R> {
     fn find_segment(&self, position: u64) -> io::Result<usize> {
         if self.segments.is_empty() {
             return Err(io::Error::new(
@@ -114,12 +115,7 @@ where
             "XP3 raw segment exceeds archive length",
         )?;
 
-        let mut reader = self
-            .reader
-            .lock()
-            .map_err(|_| io::Error::other("XP3 reader lock poisoned"))?;
-        reader.seek(SeekFrom::Start(file_offset))?;
-        reader.read_exact(output)
+        self.reader.read_exact_at(file_offset, output)
     }
 
     fn decompressed_segment(
@@ -156,14 +152,8 @@ where
         )?;
 
         let mut compressed = vec![0; compressed_len];
-        {
-            let mut reader = self
-                .reader
-                .lock()
-                .map_err(|_| io::Error::other("XP3 reader lock poisoned"))?;
-            reader.seek(SeekFrom::Start(segment.archive_offset))?;
-            reader.read_exact(&mut compressed)?;
-        }
+        self.reader
+            .read_exact_at(segment.archive_offset, &mut compressed)?;
 
         let mut decoder = ZlibDecoder::new(&compressed[..]);
         let mut decoded = Vec::with_capacity(expected_len);
@@ -185,10 +175,7 @@ where
     }
 }
 
-impl<R> Read for Xp3EntryStream<R>
-where
-    R: Read + Seek + Send,
-{
+impl<R> Read for Xp3EntryStream<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() || self.position >= self.file_size {
             return Ok(0);

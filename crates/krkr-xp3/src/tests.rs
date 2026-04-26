@@ -1,15 +1,21 @@
 use std::{
+    fs,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use flate2::{Compression, write::ZlibEncoder};
+use krkr_core::ResourceProvider;
 
 use crate::{
-    SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3Error, Xp3OpenOptions, normalize_entry_name,
+    SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3Error, Xp3OpenOptions, Xp3ResourceProvider,
+    normalize_entry_name,
     parse::{XP3_INDEX_CONTINUE, XP3_INDEX_ENCODE_RAW, XP3_INDEX_ENCODE_ZLIB, parse_index},
 };
 
@@ -210,6 +216,144 @@ fn stream_keeps_active_compressed_segment_when_global_cache_skips_it() {
 
     assert_eq!(contents, b"abcdefghijkl");
     assert_eq!(read_calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn file_archive_supports_concurrent_independent_streams() {
+    let root = temp_root("file-archive-concurrent");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let archive_path = root.join("data.xp3");
+    fs::write(
+        &archive_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "first.bin",
+                    segments: vec![
+                        FixtureSegment::raw(b"first"),
+                        FixtureSegment::zlib(b"-data"),
+                    ],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "second.bin",
+                    segments: vec![
+                        FixtureSegment::zlib(b"second"),
+                        FixtureSegment::raw(b"-data"),
+                    ],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write archive");
+    let archive = Arc::new(Xp3Archive::open_file(&archive_path).expect("open file archive"));
+
+    let handles = ["first.bin", "second.bin"].map(|name| {
+        let archive = Arc::clone(&archive);
+        thread::spawn(move || {
+            let mut stream = archive
+                .open_by_name(name)
+                .expect("open stream")
+                .expect("entry exists");
+            let mut contents = Vec::new();
+            stream.read_to_end(&mut contents).expect("read entry");
+            contents
+        })
+    });
+
+    let [first, second] = handles.map(|handle| handle.join().expect("reader thread should finish"));
+    assert_eq!(first, b"first-data");
+    assert_eq!(second, b"second-data");
+
+    fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+#[test]
+fn xp3_resource_provider_reads_entries_with_patch_priority() {
+    let root = temp_root("provider");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let data_path = root.join("data.xp3");
+    let patch_path = root.join("patch.xp3");
+    fs::write(
+        &data_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "scenario/start.ks",
+                    segments: vec![FixtureSegment::raw(b"base")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "scenario/base_only.ks",
+                    segments: vec![FixtureSegment::zlib(b"base-only")],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write data archive");
+    fs::write(
+        &patch_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "scenario/start.ks",
+                    segments: vec![FixtureSegment::raw(b"patch")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "scenario/patch_only.ks",
+                    segments: vec![FixtureSegment::zlib(b"patch-only")],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write patch archive");
+    let provider =
+        Xp3ResourceProvider::open_archives([&data_path, &patch_path]).expect("open provider");
+
+    assert_eq!(provider.archive_count(), 2);
+    assert_eq!(provider.entry_count(), 4);
+    assert!(provider.exists("scenario\\start.ks"));
+    assert!(provider.exists("scenario/base_only.ks"));
+    assert!(provider.exists("scenario/patch_only.ks"));
+    assert!(!provider.exists("../outside.ks"));
+    assert!(!provider.exists("scenario/missing.ks"));
+
+    let mut contents = String::new();
+    provider
+        .open("scenario/start.ks")
+        .expect("open patched entry")
+        .read_to_string(&mut contents)
+        .expect("read patched entry");
+    assert_eq!(contents, "patch");
+
+    contents.clear();
+    provider
+        .open("scenario/base_only.ks")
+        .expect("open base entry")
+        .read_to_string(&mut contents)
+        .expect("read base entry");
+    assert_eq!(contents, "base-only");
+
+    let error = match provider.open("scenario/missing.ks") {
+        Ok(_) => panic!("missing entry should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+
+    fs::remove_dir_all(root).expect("remove temp dir");
 }
 
 #[test]
@@ -502,4 +646,15 @@ fn push_u64(output: &mut Vec<u8>, value: u64) {
 
 fn write_u64_at(output: &mut [u8], offset: usize, value: u64) {
     output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn temp_root(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "krkr-ruri-xp3-{prefix}-{}-{nanos}",
+        std::process::id()
+    ))
 }
