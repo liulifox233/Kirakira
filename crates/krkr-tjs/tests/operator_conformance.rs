@@ -1,7 +1,7 @@
 use krkr_tjs::{Runtime, Value};
 
 #[test]
-#[ignore = "requires complete TJS2 numeric arithmetic operators"]
+#[ignore = "requires parser/evaluator wiring for numeric arithmetic operators"]
 fn conformance_operator_numeric_matrix_fixture() {
     assert_source_returns(
         include_str!("fixtures/conformance/operator/numeric_matrix.tjs"),
@@ -10,7 +10,7 @@ fn conformance_operator_numeric_matrix_fixture() {
 }
 
 #[test]
-#[ignore = "requires TJS2 comparison and equality semantics"]
+#[ignore = "requires parser/evaluator wiring for equality/comparison and logical &&"]
 fn conformance_operator_equality_comparison_fixture() {
     assert_source_returns(
         include_str!("fixtures/conformance/operator/equality_comparison.tjs"),
