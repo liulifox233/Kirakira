@@ -110,7 +110,23 @@ pub enum DrawCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameOutput {
     pub clear_color: Color,
+    pub clip: Option<Rect>,
     pub draw_commands: Vec<DrawCommand>,
+}
+
+impl FrameOutput {
+    pub fn new(clear_color: Color, draw_commands: Vec<DrawCommand>) -> Self {
+        Self {
+            clear_color,
+            clip: None,
+            draw_commands,
+        }
+    }
+
+    pub fn with_clip(mut self, clip: Rect) -> Self {
+        self.clip = Some(clip);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -198,6 +214,13 @@ pub enum UiAction {
     OpenProjectRequested,
     SettingsOpened,
     SettingsClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusLevel {
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -312,6 +335,7 @@ pub struct Engine {
     hovered: Option<UiElement>,
     pressed: Option<UiElement>,
     last_action: Option<UiAction>,
+    status_level: Option<StatusLevel>,
     launch_requests: u32,
     open_project_requests: u32,
 }
@@ -325,6 +349,7 @@ impl Engine {
             hovered: None,
             pressed: None,
             last_action: None,
+            status_level: None,
             launch_requests: 0,
             open_project_requests: 0,
         }
@@ -388,10 +413,20 @@ impl Engine {
             Panel::Settings => self.draw_settings(&mut draw_commands, layout),
         }
 
-        FrameOutput {
-            clear_color: palette::BACKGROUND,
-            draw_commands,
+        FrameOutput::new(palette::BACKGROUND, draw_commands)
+    }
+
+    pub fn tick_running(&mut self, input: FrameInput) -> FrameOutput {
+        if !input.viewport_size.is_empty() {
+            self.viewport_size = input.viewport_size;
         }
+
+        let layout = UiLayout::new(self.viewport_size, Panel::Launcher);
+        let mut draw_commands = Vec::with_capacity(24);
+        self.draw_shell(&mut draw_commands, layout);
+        self.draw_running(&mut draw_commands, layout);
+
+        FrameOutput::new(palette::RUNTIME_BACKGROUND, draw_commands)
     }
 
     pub fn view_model(&self) -> LauncherViewModel {
@@ -407,6 +442,28 @@ impl Engine {
 
     pub fn layout(&self) -> UiLayout {
         UiLayout::new(self.viewport_size, self.panel)
+    }
+
+    pub fn panel(&self) -> Panel {
+        self.panel
+    }
+
+    pub fn set_panel(&mut self, panel: Panel) {
+        if self.panel == panel {
+            return;
+        }
+
+        self.panel = panel;
+        self.pressed = None;
+        self.update_hover();
+    }
+
+    pub fn set_status_level(&mut self, level: Option<StatusLevel>) {
+        self.status_level = level;
+    }
+
+    pub fn take_last_action(&mut self) -> Option<UiAction> {
+        self.last_action.take()
     }
 
     fn activate(&mut self, element: Option<UiElement>) {
@@ -475,6 +532,15 @@ impl Engine {
             Rect::new(layout.top_bar.width - 184.0, 18.0, 128.0, 20.0),
             palette::TOP_BAR_LINE,
         );
+
+        if let Some(level) = self.status_level {
+            let color = match level {
+                StatusLevel::Info => palette::ACCENT_BLUE,
+                StatusLevel::Warning => palette::ACCENT_YELLOW,
+                StatusLevel::Error => palette::ACCENT_RED,
+            };
+            rect(commands, Rect::new(96.0, 18.0, 72.0, 20.0), color);
+        }
     }
 
     fn draw_launcher(&self, commands: &mut Vec<DrawCommand>, layout: UiLayout) {
@@ -617,6 +683,59 @@ impl Engine {
         }
     }
 
+    fn draw_running(&self, commands: &mut Vec<DrawCommand>, layout: UiLayout) {
+        let stage_margin = if layout.content.width >= 640.0 {
+            32.0
+        } else {
+            16.0
+        };
+        let stage = layout.content.inset(stage_margin);
+        rect(commands, stage, palette::STAGE);
+
+        let stage_inner = fit_rect(stage.inset(18.0), 16.0 / 9.0);
+        rect(commands, stage_inner, palette::STAGE_INNER);
+
+        rect(
+            commands,
+            Rect::new(
+                stage_inner.x + 24.0,
+                stage_inner.y + stage_inner.height - 82.0,
+                (stage_inner.width - 48.0).max(0.0),
+                58.0,
+            ),
+            palette::TEXT_BOX,
+        );
+        rect(
+            commands,
+            Rect::new(stage_inner.x + 48.0, stage_inner.y + 40.0, 120.0, 20.0),
+            palette::ACCENT_GREEN,
+        );
+        rect(
+            commands,
+            Rect::new(
+                stage_inner.x + 48.0,
+                stage_inner.y + 76.0,
+                (stage_inner.width * 0.42).max(80.0),
+                14.0,
+            ),
+            palette::MUTED_LINE,
+        );
+
+        let meter_y = layout.content.y + layout.content.height - 22.0;
+        for index in 0..5 {
+            rect(
+                commands,
+                Rect::new(
+                    layout.content.x + index as f32 * 34.0,
+                    meter_y,
+                    20.0,
+                    8.0 + index as f32 * 2.0,
+                ),
+                palette::PANEL_INSET,
+            );
+        }
+    }
+
     fn element_color(&self, element: UiElement) -> Color {
         if self.pressed == Some(element) {
             return palette::PRESSED;
@@ -639,15 +758,44 @@ fn rect(commands: &mut Vec<DrawCommand>, rect: Rect, color: Color) {
     }
 }
 
+fn fit_rect(bounds: Rect, aspect_ratio: f32) -> Rect {
+    if bounds.width <= 0.0 || bounds.height <= 0.0 || aspect_ratio <= 0.0 {
+        return Rect::default();
+    }
+
+    let bounds_ratio = bounds.width / bounds.height;
+    if bounds_ratio > aspect_ratio {
+        let width = bounds.height * aspect_ratio;
+        Rect::new(
+            bounds.x + (bounds.width - width) * 0.5,
+            bounds.y,
+            width,
+            bounds.height,
+        )
+    } else {
+        let height = bounds.width / aspect_ratio;
+        Rect::new(
+            bounds.x,
+            bounds.y + (bounds.height - height) * 0.5,
+            bounds.width,
+            height,
+        )
+    }
+}
+
 mod palette {
     use super::Color;
 
     pub const BACKGROUND: Color = Color::rgb_u8(18, 20, 23);
+    pub const RUNTIME_BACKGROUND: Color = Color::rgb_u8(10, 12, 14);
     pub const TOP_BAR: Color = Color::rgb_u8(32, 35, 40);
     pub const TOP_BAR_LINE: Color = Color::rgb_u8(67, 74, 84);
     pub const SIDE_RAIL: Color = Color::rgb_u8(25, 28, 32);
     pub const PANEL: Color = Color::rgb_u8(42, 48, 54);
     pub const PANEL_INSET: Color = Color::rgb_u8(57, 65, 73);
+    pub const STAGE: Color = Color::rgb_u8(20, 23, 28);
+    pub const STAGE_INNER: Color = Color::rgb_u8(12, 14, 18);
+    pub const TEXT_BOX: Color = Color::new(0.07, 0.08, 0.1, 0.84);
     pub const MUTED_LINE: Color = Color::rgb_u8(105, 116, 128);
     pub const CONTROL: Color = Color::rgb_u8(77, 86, 96);
     pub const HOVERED: Color = Color::rgb_u8(103, 118, 132);
@@ -724,6 +872,29 @@ mod tests {
         let view_model = engine.view_model();
         assert_eq!(view_model.panel, Panel::Settings);
         assert_eq!(view_model.last_action, Some(UiAction::SettingsOpened));
+        assert_eq!(engine.take_last_action(), Some(UiAction::SettingsOpened));
+        assert_eq!(engine.take_last_action(), None);
+    }
+
+    #[test]
+    fn redraw_between_press_and_release_keeps_press_state() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let layout = engine.layout();
+        let point = Point::new(layout.start_button.x + 8.0, layout.start_button.y + 8.0);
+
+        engine.handle_event(EngineEvent::CursorMoved { position: point });
+        engine.handle_event(EngineEvent::PointerInput {
+            button: PointerButton::Primary,
+            state: ButtonState::Pressed,
+        });
+        engine.set_panel(Panel::Launcher);
+        let _frame = engine.tick(FrameInput::new(Size::new(960.0, 600.0), 0.016));
+        engine.handle_event(EngineEvent::PointerInput {
+            button: PointerButton::Primary,
+            state: ButtonState::Released,
+        });
+
+        assert_eq!(engine.take_last_action(), Some(UiAction::LaunchRequested));
     }
 
     #[test]
@@ -740,5 +911,26 @@ mod tests {
         assert_eq!(idle.draw_commands.len(), hovered.draw_commands.len());
         assert_ne!(idle.draw_commands, hovered.draw_commands);
         assert_eq!(engine.view_model().hovered, Some(UiElement::Start));
+    }
+
+    #[test]
+    fn running_frame_draws_stage_shell() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let frame = engine.tick_running(FrameInput::new(Size::new(960.0, 600.0), 0.0));
+
+        assert_eq!(frame.clear_color, palette::RUNTIME_BACKGROUND);
+        assert!(frame.draw_commands.len() >= 10);
+        assert_eq!(engine.panel(), Panel::Launcher);
+    }
+
+    #[test]
+    fn fit_rect_preserves_aspect_ratio_inside_bounds() {
+        let bounds = Rect::new(0.0, 0.0, 400.0, 400.0);
+        let fitted = fit_rect(bounds, 16.0 / 9.0);
+
+        assert!(bounds.contains(Point::new(fitted.x, fitted.y)));
+        assert!(fitted.width <= bounds.width);
+        assert!(fitted.height <= bounds.height);
+        assert!((fitted.width / fitted.height - 16.0 / 9.0).abs() < 0.001);
     }
 }

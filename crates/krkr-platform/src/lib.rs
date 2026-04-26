@@ -5,6 +5,7 @@ use std::{
 };
 
 use krkr_core::{ResourceProvider, ResourceStream};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 
 #[derive(Clone, Debug)]
 pub struct FsResourceProvider {
@@ -54,6 +55,23 @@ impl ResourceProvider for FsResourceProvider {
 
 pub fn pick_folder() -> Option<PathBuf> {
     rfd::FileDialog::new().pick_folder()
+}
+
+pub fn show_error(title: &str, message: &str) {
+    show_message(MessageLevel::Error, title, message);
+}
+
+pub fn show_warning(title: &str, message: &str) {
+    show_message(MessageLevel::Warning, title, message);
+}
+
+fn show_message(level: MessageLevel, title: &str, message: &str) {
+    let _result = MessageDialog::new()
+        .set_level(level)
+        .set_title(title)
+        .set_description(message)
+        .set_buttons(MessageButtons::Ok)
+        .show();
 }
 
 fn invalid_resource_path(path: &Path) -> io::Error {

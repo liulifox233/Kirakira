@@ -47,8 +47,28 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    texture_pipeline: TexturePipelineResources,
     physical_size: PhysicalSize<u32>,
     scale_factor: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TexturePipelineState {
+    Reserved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderCapabilities {
+    pub rectangles: bool,
+    pub clipping: bool,
+    pub texture_pipeline: TexturePipelineState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderViewport {
+    pub physical_size: PhysicalSize<u32>,
+    pub logical_size: Size,
+    pub scale_factor: f64,
 }
 
 impl Renderer {
@@ -111,7 +131,8 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let pipeline = create_pipeline(&device, format);
+        let pipeline = create_rect_pipeline(&device, format);
+        let texture_pipeline = TexturePipelineResources::new(&device, format);
 
         Ok(Self {
             surface,
@@ -119,6 +140,7 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            texture_pipeline,
             physical_size,
             scale_factor,
         })
@@ -144,6 +166,22 @@ impl Renderer {
         )
     }
 
+    pub fn viewport(&self) -> RenderViewport {
+        RenderViewport {
+            physical_size: self.physical_size,
+            logical_size: self.logical_size(),
+            scale_factor: self.scale_factor,
+        }
+    }
+
+    pub fn capabilities(&self) -> RenderCapabilities {
+        RenderCapabilities {
+            rectangles: true,
+            clipping: true,
+            texture_pipeline: self.texture_pipeline.state(),
+        }
+    }
+
     pub fn render(&mut self, frame: &FrameOutput) -> Result<(), RenderError> {
         if self.physical_size.width == 0 || self.physical_size.height == 0 {
             return Ok(());
@@ -165,6 +203,7 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let vertices = self.vertices_for_frame(frame);
+        let physical_clip = frame.clip.and_then(|clip| self.physical_rect(clip));
         let vertex_buffer = (!vertices.is_empty()).then(|| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -199,8 +238,13 @@ impl Renderer {
 
             if let Some(vertex_buffer) = &vertex_buffer {
                 pass.set_pipeline(&self.pipeline);
+                if let Some(clip) = physical_clip {
+                    pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+                }
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.draw(0..vertices.len() as u32, 0..1);
+                if frame.clip.is_none() || physical_clip.is_some() {
+                    pass.draw(0..vertices.len() as u32, 0..1);
+                }
             }
         }
 
@@ -251,6 +295,31 @@ impl Renderer {
         let height = self.config.height as f32;
         [(x / width) * 2.0 - 1.0, 1.0 - (y / height) * 2.0]
     }
+
+    fn physical_rect(&self, rect: Rect) -> Option<PhysicalRect> {
+        let scale = self.scale_factor as f32;
+        let target_width = self.config.width as f32;
+        let target_height = self.config.height as f32;
+        let x0 = (rect.x * scale).floor().clamp(0.0, target_width);
+        let y0 = (rect.y * scale).floor().clamp(0.0, target_height);
+        let x1 = ((rect.x + rect.width) * scale)
+            .ceil()
+            .clamp(0.0, target_width);
+        let y1 = ((rect.y + rect.height) * scale)
+            .ceil()
+            .clamp(0.0, target_height);
+
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+
+        Some(PhysicalRect {
+            x: x0 as u32,
+            y: y0 as u32,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -263,7 +332,10 @@ fn preferred_backends() -> wgpu::Backends {
     wgpu::Backends::PRIMARY
 }
 
-fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+fn create_rect_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::include_wgsl!("rect.wgsl"));
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("krkr-ruri rect pipeline layout"),
@@ -306,6 +378,108 @@ fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::
     })
 }
 
+struct TexturePipelineResources {
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    pipeline: wgpu::RenderPipeline,
+}
+
+impl TexturePipelineResources {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("krkr-ruri texture bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("krkr-ruri texture sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let shader = device.create_shader_module(wgpu::include_wgsl!("texture.wgsl"));
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("krkr-ruri texture pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("krkr-ruri texture pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[TexturedVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        Self {
+            bind_group_layout,
+            sampler,
+            pipeline,
+        }
+    }
+
+    fn state(&self) -> TexturePipelineState {
+        let _bind_group_layout = &self.bind_group_layout;
+        let _sampler = &self.sampler;
+        let _pipeline = &self.pipeline;
+        TexturePipelineState::Reserved
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhysicalRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
 fn wgpu_color(color: Color) -> wgpu::Color {
     wgpu::Color {
         r: color.r as f64,
@@ -329,6 +503,27 @@ impl Vertex {
     const fn new(position: [f32; 2], color: [f32; 4]) -> Self {
         Self { position, color }
     }
+
+    fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TexturedVertex {
+    position: [f32; 2],
+    tex_coord: [f32; 2],
+    tint: [f32; 4],
+}
+
+impl TexturedVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
 
     fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
