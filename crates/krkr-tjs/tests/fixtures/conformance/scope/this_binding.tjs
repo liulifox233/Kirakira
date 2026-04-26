@@ -1,0 +1,4 @@
+// Expected result: method call binds this to the receiver object.
+var obj = %["value" => 42];
+obj.get = function() { return this.value; };
+return obj.get();

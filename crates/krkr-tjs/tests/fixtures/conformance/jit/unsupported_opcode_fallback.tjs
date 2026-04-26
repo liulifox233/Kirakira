@@ -1,0 +1,6 @@
+// Expected result: unsupported JIT operations fall back to interpreter.
+try {
+    throw "handled";
+} catch (e) {
+    return e;
+}

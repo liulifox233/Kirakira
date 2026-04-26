@@ -1,0 +1,3 @@
+// Expected result: Storages compatibility object supports search paths.
+Storages.addAutoPath("scenario/");
+return Storages.isExistentStorage("first.ks");

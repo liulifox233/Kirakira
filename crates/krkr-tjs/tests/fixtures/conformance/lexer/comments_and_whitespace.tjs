@@ -1,0 +1,5 @@
+// Expected result: comments and whitespace do not affect execution.
+var value = 1;
+/* block comment */
+value += 2;
+return value;

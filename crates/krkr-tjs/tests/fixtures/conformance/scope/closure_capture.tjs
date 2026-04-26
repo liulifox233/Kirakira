@@ -1,0 +1,12 @@
+// Expected result: closure captures and mutates its outer lexical variable.
+function makeCounter() {
+    var value = 3;
+    return function() {
+        value += 1;
+        return value;
+    };
+}
+var next = makeCounter();
+next();
+next();
+return next();

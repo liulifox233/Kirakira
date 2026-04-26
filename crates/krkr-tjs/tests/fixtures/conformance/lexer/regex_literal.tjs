@@ -1,0 +1,3 @@
+// Expected result: regular expression literals compile and match.
+var re = /KAG[0-9]+/;
+return re.test("KAG3");

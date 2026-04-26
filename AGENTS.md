@@ -16,6 +16,8 @@ Build through small, runnable vertical slices, but keep every slice aligned with
 - `krkr-render`: `wgpu` rendering, surface/device/pipeline management, GPU resources.
 - `krkr-platform`: filesystem and minimal platform bridges. Keep native UI out of core and avoid platform UI components for engine surfaces.
 - `krkr-audio`: audio backend shell and future playback.
+- `krkr-tjs`: pure Rust TJS2 language runtime crate. Keep it platform/GPU independent and focused on values, parsing, bytecode/VM, host bindings, and optional JIT support.
+- `krkr-kag`: KAG3 `.ks` scenario-layer scaffold and tests. KAG3 itself is mostly TJS2 code; this crate exists to parse/step `.ks` fixtures and integrate with `krkr-tjs`, not to reimplement the full TJS-written KAG3 framework independently.
 - `apps/desktop`: `winit` app lifecycle, input mapping, state transitions.
 
 ## Working Rules
@@ -25,6 +27,7 @@ Build through small, runnable vertical slices, but keep every slice aligned with
 - Prefer simple data structures and explicit state machines.
 - Add tests for core behavior, resource handling, and parsing logic as those areas grow.
 - Do not add text/image/audio/TJS/XP3 claims unless the feature is actually wired and verified.
+- Keep TJS2 semantics in `krkr-tjs`; keep `.ks` parsing and KAG scenario tests in `krkr-kag`. Use ignored conformance fixtures for KAG3 behavior that still depends on a real TJS2 runtime.
 
 ## Verification
 

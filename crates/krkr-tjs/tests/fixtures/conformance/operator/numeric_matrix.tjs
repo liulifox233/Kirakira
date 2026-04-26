@@ -1,0 +1,7 @@
+// Expected result: arithmetic operators produce TJS2-compatible numbers.
+var a = 20 + 10;
+var b = 9 - 3;
+var c = 4 * 2;
+var d = 8 / 2;
+var e = 7 % 3;
+return a + b + c + d + e - 13;

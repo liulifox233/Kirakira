@@ -1,0 +1,8 @@
+// Expected result: property setter stores a value and getter reads it back.
+var backing = 0;
+property answer {
+    getter() { return backing; }
+    setter(v) { backing = v; }
+}
+answer = 42;
+return answer;

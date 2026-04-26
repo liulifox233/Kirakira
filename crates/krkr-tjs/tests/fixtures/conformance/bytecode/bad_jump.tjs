@@ -1,0 +1,3 @@
+// Expected result: invalid bytecode jump targets are rejected by verifier.
+// Fixture is descriptive until a bytecode assembler format exists.
+return true;

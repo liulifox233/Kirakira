@@ -1,0 +1,6 @@
+// Expected result: push and pop preserve array order.
+var a = [];
+a.push("a");
+a.push("b");
+var b = a.pop();
+return a.pop() + "/" + b;

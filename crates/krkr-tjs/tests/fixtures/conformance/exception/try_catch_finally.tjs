@@ -1,0 +1,12 @@
+// Expected TJS2 result: catch observes the thrown value and finally runs.
+var seen = 0;
+
+try {
+    throw 2;
+} catch (e) {
+    seen = e;
+} finally {
+    seen += 1;
+}
+
+return seen;

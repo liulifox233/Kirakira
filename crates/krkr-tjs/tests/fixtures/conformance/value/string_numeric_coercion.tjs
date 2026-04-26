@@ -1,0 +1,3 @@
+// Expected TJS2 result: "1" + 2 == "12".
+// This records the first string/numeric coercion case for operator +.
+return "1" + 2;

@@ -1,0 +1,3 @@
+// Expected result: verifier rejects paths with incompatible stack heights.
+// Fixture is descriptive until a bytecode assembler format exists.
+return true;

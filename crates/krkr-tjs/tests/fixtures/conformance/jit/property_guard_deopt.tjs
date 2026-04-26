@@ -1,0 +1,6 @@
+// Expected result: JIT deopts or re-guards after object shape changes.
+var obj = %["x" => 1];
+var sum = obj.x;
+obj.y = 10;
+sum += obj.x + obj.y;
+return sum;

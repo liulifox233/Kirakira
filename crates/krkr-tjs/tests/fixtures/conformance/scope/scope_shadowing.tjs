@@ -1,0 +1,7 @@
+// Expected result: local variables shadow globals without overwriting them.
+var name = "global";
+function f() {
+    var name = "local";
+    return name;
+}
+return f() + "/" + name;

@@ -1,0 +1,5 @@
+// Expected result: omitted arguments read as void.
+function describe(a, b, c) {
+    return a + "," + b + "," + c;
+}
+return describe(1, void, 3);

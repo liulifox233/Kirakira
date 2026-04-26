@@ -1,0 +1,7 @@
+// Expected result: class constructor initializes instance state.
+class Box {
+    function Box(value) { this.value = value; }
+    function get() { return this.value; }
+}
+var box = new Box(42);
+return box.get();

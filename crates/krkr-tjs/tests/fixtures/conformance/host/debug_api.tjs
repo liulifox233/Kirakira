@@ -1,0 +1,5 @@
+// Expected result: Debug APIs are callable by KAG3 system scripts.
+Debug.message("message");
+Debug.notice("notice");
+Debug.logAsError();
+return true;

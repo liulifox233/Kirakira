@@ -1,0 +1,2 @@
+// Expected result: host-provided native callbacks can be called from TJS.
+return nativeAdd(20, 22);

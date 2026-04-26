@@ -1,0 +1,7 @@
+// Expected result: function call loop remains a benchmarkable workload.
+function one() { return 1; }
+var total = 0;
+for (var i = 0; i < 1000; i++) {
+    total += one();
+}
+return total;

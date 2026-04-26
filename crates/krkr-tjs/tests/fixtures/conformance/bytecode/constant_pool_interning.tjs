@@ -1,0 +1,4 @@
+// Expected result: identical constants are interned once in compiled bytecode.
+var a = "same";
+var b = "same";
+return a === b;

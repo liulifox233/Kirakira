@@ -1,0 +1,5 @@
+// Expected TJS2 result: child.answer resolves through its parent/prototype object.
+var parent = %["answer" => 12];
+var child = new Object();
+child.__proto__ = parent;
+return child.answer;

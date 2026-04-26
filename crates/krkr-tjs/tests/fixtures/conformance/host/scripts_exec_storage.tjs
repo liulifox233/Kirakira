@@ -1,0 +1,3 @@
+// Expected result: Scripts.execStorage loads and executes a resource.
+Scripts.execStorage("fixtures/loaded_script.tjs");
+return global.loadedFixtureState;

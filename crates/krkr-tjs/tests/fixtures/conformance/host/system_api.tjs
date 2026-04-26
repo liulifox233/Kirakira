@@ -1,0 +1,4 @@
+// Expected result: System compatibility object exposes KAG3-required members.
+return typeof System.versionString != "undefined"
+    && typeof System.exePath != "undefined"
+    && typeof System.getTickCount == "function";

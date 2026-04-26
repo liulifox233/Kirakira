@@ -1,0 +1,4 @@
+// Expected result: assignment expressions and ternary operator compose.
+var x = 1;
+var y = (x = 7) > 3 ? x * 2 : 0;
+return y;

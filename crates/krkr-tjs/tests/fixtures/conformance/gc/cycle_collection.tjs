@@ -1,0 +1,9 @@
+// Expected result: object cycles can be collected after roots are removed.
+var a = new Object();
+var b = new Object();
+a.other = b;
+b.other = a;
+a = void;
+b = void;
+System.gc();
+return true;

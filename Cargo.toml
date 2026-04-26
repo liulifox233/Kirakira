@@ -3,8 +3,10 @@ members = [
     "apps/desktop",
     "crates/krkr-audio",
     "crates/krkr-core",
+    "crates/krkr-kag",
     "crates/krkr-platform",
     "crates/krkr-render",
+    "crates/krkr-tjs",
     "crates/krkr-xp3",
 ]
 resolver = "3"
@@ -16,6 +18,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
 cpal = "=0.17.3"
+encoding_rs = "0.8.35"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 pollster = "0.4.0"
 rfd = "=0.17.2"
@@ -25,6 +28,8 @@ winit = "=0.30.13"
 
 krkr-audio = { path = "crates/krkr-audio" }
 krkr-core = { path = "crates/krkr-core" }
+krkr-kag = { path = "crates/krkr-kag" }
 krkr-platform = { path = "crates/krkr-platform" }
 krkr-render = { path = "crates/krkr-render" }
+krkr-tjs = { path = "crates/krkr-tjs" }
 krkr-xp3 = { path = "crates/krkr-xp3" }

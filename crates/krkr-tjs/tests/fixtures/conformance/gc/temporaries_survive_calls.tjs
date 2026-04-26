@@ -1,0 +1,3 @@
+// Expected result: temporaries remain rooted across nested calls.
+function id(v) { return v; }
+return id(id(%["answer" => 42])).answer;

@@ -1,0 +1,8 @@
+// Expected result: derived class override can call base behavior.
+class Base {
+    function name() { return "base"; }
+}
+class Child extends Base {
+    function name() { return super.name() + "/child"; }
+}
+return new Child().name();

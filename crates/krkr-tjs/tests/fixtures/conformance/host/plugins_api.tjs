@@ -1,0 +1,4 @@
+// Expected result: plugin link calls are captured or shimmed without native DLLs.
+Plugins.link("KAGParser.dll");
+Plugins.link("menu.dll");
+return true;

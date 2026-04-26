@@ -862,6 +862,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-kag"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+]
+
+[[package]]
 name = "krkr-platform"
 version = "0.1.0"
 dependencies = [
@@ -878,6 +885,10 @@ dependencies = [
  "wgpu",
  "winit",
 ]
+
+[[package]]
+name = "krkr-tjs"
+version = "0.1.0"
 
 [[package]]
 name = "krkr-xp3"

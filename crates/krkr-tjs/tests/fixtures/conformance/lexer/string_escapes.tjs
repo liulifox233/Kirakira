@@ -1,0 +1,2 @@
+// Expected result: escape sequences are decoded in string literals.
+return "line\nquote=\" slash=\\";

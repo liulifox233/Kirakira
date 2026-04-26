@@ -1,0 +1,6 @@
+// Expected result: right-hand side is not evaluated when short-circuited.
+var x = 0;
+function bump() { x += 1; return true; }
+false && bump();
+true || bump();
+return x + 1;

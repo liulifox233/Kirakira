@@ -1,0 +1,2 @@
+// Expected result: hexadecimal, decimal, and exponent literals parse correctly.
+return 0xff + 1 - 1;

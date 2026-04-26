@@ -1,0 +1,2 @@
+// Expected result: bitwise operators and shifts match TJS2 integer coercion.
+return ((1 << 4) | 3) & ~1;

@@ -1,0 +1,4 @@
+// Expected result: array and dictionary literals use TJS2 literal syntax.
+var a = [1, 2, 3];
+var d = %["answer" => "ok"];
+return d["answer"];

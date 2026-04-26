@@ -1,0 +1,3 @@
+// Expected TJS2 result: 1 + 2 * 3 == 7.
+// This fixture becomes active once the parser and evaluator exist.
+return 1 + 2 * 3;

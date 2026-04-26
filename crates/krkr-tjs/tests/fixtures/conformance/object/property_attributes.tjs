@@ -1,0 +1,5 @@
+// Expected TJS2 result: non-configurable property survives delete.
+var obj = new Object();
+obj.defineProperty("locked", 1, "dontdelete");
+delete obj.locked;
+return obj.locked == 1;

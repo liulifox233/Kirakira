@@ -1,0 +1,2 @@
+// Loaded by scripts_exec_storage.tjs in the future resource-backed runtime.
+global.loadedFixtureState = "loaded";

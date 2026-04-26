@@ -1,0 +1,5 @@
+// Expected result: pre/post increment and compound assignment order is stable.
+var x = 1;
+var y = x++ + ++x;
+y += x;
+return y + 4;

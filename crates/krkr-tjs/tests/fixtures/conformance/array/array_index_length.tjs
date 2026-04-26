@@ -1,0 +1,4 @@
+// Expected result: sparse writes update array length.
+var a = [];
+a[3] = "x";
+return a.length;
