@@ -3,6 +3,7 @@ members = [
     "apps/desktop",
     "crates/krkr-audio",
     "crates/krkr-core",
+    "crates/krkr-kag",
     "crates/krkr-platform",
     "crates/krkr-render",
     "crates/krkr-engine",
@@ -27,6 +28,7 @@ winit = "=0.30.13"
 
 krkr-audio = { path = "crates/krkr-audio" }
 krkr-core = { path = "crates/krkr-core" }
+krkr-kag = { path = "crates/krkr-kag" }
 krkr-platform = { path = "crates/krkr-platform" }
 krkr-render = { path = "crates/krkr-render" }
 krkr-engine = { path = "crates/krkr-engine" }
