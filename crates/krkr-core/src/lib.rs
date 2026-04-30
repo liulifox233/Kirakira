@@ -102,9 +102,18 @@ pub struct RectCommand {
     pub color: Color,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextCommand {
+    pub position: Point,
+    pub text: String,
+    pub color: Color,
+    pub size: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum DrawCommand {
     Rect(RectCommand),
+    Text(TextCommand),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,6 +135,43 @@ impl FrameOutput {
     pub fn with_clip(mut self, clip: Rect) -> Self {
         self.clip = Some(clip);
         self
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageLayerModel {
+    pub lines: Vec<String>,
+    pub waiting_for_click: bool,
+    pub page: usize,
+}
+
+impl MessageLayerModel {
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.waiting_for_click = false;
+        self.page = 0;
+    }
+
+    pub fn clear_text(&mut self) {
+        self.lines.clear();
+    }
+
+    pub fn append_text(&mut self, text: &str) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        if let Some(line) = self.lines.last_mut() {
+            line.push_str(text);
+        }
+    }
+
+    pub fn newline(&mut self) {
+        self.lines.push(String::new());
+    }
+
+    pub fn page_break(&mut self) {
+        self.page = self.page.saturating_add(1);
+        self.waiting_for_click = true;
     }
 }
 
@@ -417,6 +463,14 @@ impl Engine {
     }
 
     pub fn tick_running(&mut self, input: FrameInput) -> FrameOutput {
+        self.tick_running_with_message(input, &MessageLayerModel::default())
+    }
+
+    pub fn tick_running_with_message(
+        &mut self,
+        input: FrameInput,
+        message: &MessageLayerModel,
+    ) -> FrameOutput {
         if !input.viewport_size.is_empty() {
             self.viewport_size = input.viewport_size;
         }
@@ -424,7 +478,7 @@ impl Engine {
         let layout = UiLayout::new(self.viewport_size, Panel::Launcher);
         let mut draw_commands = Vec::with_capacity(24);
         self.draw_shell(&mut draw_commands, layout);
-        self.draw_running(&mut draw_commands, layout);
+        self.draw_running(&mut draw_commands, layout, message);
 
         FrameOutput::new(palette::RUNTIME_BACKGROUND, draw_commands)
     }
@@ -683,7 +737,12 @@ impl Engine {
         }
     }
 
-    fn draw_running(&self, commands: &mut Vec<DrawCommand>, layout: UiLayout) {
+    fn draw_running(
+        &self,
+        commands: &mut Vec<DrawCommand>,
+        layout: UiLayout,
+        message: &MessageLayerModel,
+    ) {
         let stage_margin = if layout.content.width >= 640.0 {
             32.0
         } else {
@@ -701,7 +760,7 @@ impl Engine {
                 stage_inner.x + 24.0,
                 stage_inner.y + stage_inner.height - 82.0,
                 (stage_inner.width - 48.0).max(0.0),
-                58.0,
+                70.0,
             ),
             palette::TEXT_BOX,
         );
@@ -720,6 +779,32 @@ impl Engine {
             ),
             palette::MUTED_LINE,
         );
+
+        let text_x = stage_inner.x + 42.0;
+        let mut text_y = stage_inner.y + stage_inner.height - 66.0;
+        let first_line = message.lines.len().saturating_sub(3);
+        for line in message.lines.iter().skip(first_line) {
+            text(
+                commands,
+                Point::new(text_x, text_y),
+                line,
+                palette::TEXT,
+                18.0,
+            );
+            text_y += 21.0;
+        }
+        if message.waiting_for_click {
+            rect(
+                commands,
+                Rect::new(
+                    stage_inner.x + stage_inner.width - 58.0,
+                    stage_inner.y + stage_inner.height - 36.0,
+                    12.0,
+                    12.0,
+                ),
+                palette::ACCENT_YELLOW,
+            );
+        }
 
         let meter_y = layout.content.y + layout.content.height - 22.0;
         for index in 0..5 {
@@ -755,6 +840,17 @@ impl Engine {
 fn rect(commands: &mut Vec<DrawCommand>, rect: Rect, color: Color) {
     if rect.width > 0.0 && rect.height > 0.0 {
         commands.push(DrawCommand::Rect(RectCommand { rect, color }));
+    }
+}
+
+fn text(commands: &mut Vec<DrawCommand>, position: Point, text: &str, color: Color, size: f32) {
+    if !text.is_empty() && size > 0.0 {
+        commands.push(DrawCommand::Text(TextCommand {
+            position,
+            text: text.to_string(),
+            color,
+            size,
+        }));
     }
 }
 
@@ -796,6 +892,7 @@ mod palette {
     pub const STAGE: Color = Color::rgb_u8(20, 23, 28);
     pub const STAGE_INNER: Color = Color::rgb_u8(12, 14, 18);
     pub const TEXT_BOX: Color = Color::new(0.07, 0.08, 0.1, 0.84);
+    pub const TEXT: Color = Color::rgb_u8(232, 238, 242);
     pub const MUTED_LINE: Color = Color::rgb_u8(105, 116, 128);
     pub const CONTROL: Color = Color::rgb_u8(77, 86, 96);
     pub const HOVERED: Color = Color::rgb_u8(103, 118, 132);
@@ -921,6 +1018,31 @@ mod tests {
         assert_eq!(frame.clear_color, palette::RUNTIME_BACKGROUND);
         assert!(frame.draw_commands.len() >= 10);
         assert_eq!(engine.panel(), Panel::Launcher);
+    }
+
+    #[test]
+    fn running_frame_draws_message_text() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let mut message = MessageLayerModel::default();
+        message.append_text("Hello");
+        message.newline();
+        message.append_text("World");
+
+        let frame = engine
+            .tick_running_with_message(FrameInput::new(Size::new(960.0, 600.0), 0.0), &message);
+
+        assert!(
+            frame
+                .draw_commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Text(text) if text.text == "Hello"))
+        );
+        assert!(
+            frame
+                .draw_commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::Text(text) if text.text == "World"))
+        );
     }
 
     #[test]

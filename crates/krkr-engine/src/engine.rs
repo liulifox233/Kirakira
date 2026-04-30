@@ -1,9 +1,17 @@
-use std::path::PathBuf;
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
-use krkr_kag::{KagParser, Tag};
+use krkr_core::{
+    ButtonState, Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey,
+    FrameInput, FrameOutput, MessageLayerModel, PointerButton,
+};
+use krkr_kag::{Attribute, AttributeValue, KagParser, Tag};
 use krkr_tjs2::{
-    Result,
-    runtime::{Runtime, Variant},
+    Result, TjsError,
+    runtime::{ObjectHandle, Runtime, Variant},
 };
 
 use crate::{
@@ -14,14 +22,91 @@ use crate::{
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KagRunBudget {
+    pub max_tags_per_tick: usize,
+    pub max_wall_time: Duration,
+}
+
+impl Default for KagRunBudget {
+    fn default() -> Self {
+        Self {
+            max_tags_per_tick: 1000,
+            max_wall_time: Duration::from_millis(2),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct EngineConfig {
     pub project_root: Option<PathBuf>,
+    pub kag_budget: KagRunBudget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KagTaskState {
+    Running,
+    WaitingClick,
+    WaitingTimer { remaining: Duration },
+    WaitingTransition,
+    WaitingAudio,
+    WaitingResource,
+    Finished,
+    Error { message: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KagYieldReason {
+    AlreadyBlocked,
+    BudgetExhausted,
+    HandlerYield,
+    Waiting(KagTaskState),
+    Finished,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineTickResult {
+    pub state: KagTaskState,
+    pub reason: KagYieldReason,
+    pub tags_processed: usize,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineInput {
+    pub frame: FrameInput,
+    pub events: Vec<EngineEvent>,
+}
+
+impl EngineInput {
+    pub fn new(frame: FrameInput, events: Vec<EngineEvent>) -> Self {
+        Self { frame, events }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KagLocation {
+    pub storage: Option<String>,
+    pub label: Option<String>,
+    pub line: Option<usize>,
+    pub page: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineFrame {
+    pub output: FrameOutput,
+    pub tick: EngineTickResult,
+    pub message_layer: MessageLayerModel,
+    pub location: KagLocation,
 }
 
 pub struct KrkrEngine {
     tjs_runtime: Runtime<KrkrHost>,
     kag_parser: KagParser,
+    kag_task: KagRuntimeTask,
+    core_engine: CoreEngine,
+    message_layer: MessageLayerModel,
+    kag_budget: KagRunBudget,
     plugins: Vec<Box<dyn KrkrPlugin>>,
 }
 
@@ -36,6 +121,10 @@ impl KrkrEngine {
         Ok(Self {
             tjs_runtime,
             kag_parser: KagParser::new(),
+            kag_task: KagRuntimeTask::new(),
+            core_engine: CoreEngine::new(CoreEngineConfig::default()),
+            message_layer: MessageLayerModel::default(),
+            kag_budget: config.kag_budget,
             plugins: Vec::new(),
         })
     }
@@ -43,6 +132,7 @@ impl KrkrEngine {
     pub fn for_project(root: impl Into<PathBuf>) -> Result<Self> {
         Self::new(EngineConfig {
             project_root: Some(root.into()),
+            ..EngineConfig::default()
         })
     }
 
@@ -94,12 +184,92 @@ impl KrkrEngine {
 
     pub fn load_kag_scenario(&mut self, storage: &str) -> krkr_kag::Result<()> {
         let mut host = EngineKagHost::new(&mut self.tjs_runtime);
-        self.kag_parser.load_scenario_with(storage, &mut host)
+        self.kag_parser.load_scenario_with(storage, &mut host)?;
+        self.message_layer.clear();
+        self.kag_task.start();
+        Ok(())
     }
 
     pub fn next_kag_tag(&mut self) -> krkr_kag::Result<Option<Tag>> {
         let mut host = EngineKagHost::new(&mut self.tjs_runtime);
         self.kag_parser.next_tag_with(&mut host)
+    }
+
+    pub fn kag_state(&self) -> &KagTaskState {
+        self.kag_task.state()
+    }
+
+    pub fn has_kag_scenario(&self) -> bool {
+        self.kag_task.loaded()
+    }
+
+    pub fn message_layer(&self) -> &MessageLayerModel {
+        &self.message_layer
+    }
+
+    pub fn kag_location(&self) -> KagLocation {
+        KagLocation {
+            storage: self.kag_parser.cur_storage().map(str::to_string),
+            label: self.kag_parser.cur_label().map(str::to_string),
+            line: self.kag_parser.cur_line(),
+            page: self.message_layer.page,
+        }
+    }
+
+    pub fn set_kag_handler(&mut self, handler: ObjectHandle) {
+        self.kag_task.set_handler(handler);
+    }
+
+    pub fn clear_kag_handler(&mut self) {
+        self.kag_task.clear_handler();
+    }
+
+    pub fn signal_kag_click(&mut self) {
+        self.kag_task.signal_click(&mut self.message_layer);
+    }
+
+    pub fn tick(&mut self) -> Result<EngineTickResult> {
+        self.advance(Duration::ZERO)
+    }
+
+    pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
+        self.handle_input_events(&input.events);
+        let tick = self.advance(delta)?;
+        let output = self
+            .core_engine
+            .tick_running_with_message(input.frame, &self.message_layer);
+        Ok(EngineFrame {
+            output,
+            tick,
+            message_layer: self.message_layer.clone(),
+            location: self.kag_location(),
+        })
+    }
+
+    fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
+        self.kag_task.update_wait(delta);
+        self.kag_task.run_until_yield(
+            &mut self.kag_parser,
+            &mut self.tjs_runtime,
+            &mut self.message_layer,
+            self.kag_budget,
+        )
+    }
+
+    fn handle_input_events(&mut self, events: &[EngineEvent]) {
+        for event in events {
+            match event {
+                EngineEvent::PointerInput {
+                    button: PointerButton::Primary,
+                    state: ButtonState::Released,
+                }
+                | EngineEvent::KeyboardInput {
+                    key: EngineKey::Enter | EngineKey::Space,
+                    state: ButtonState::Pressed,
+                } => self.signal_kag_click(),
+                _ => {}
+            }
+        }
     }
 
     pub fn register_plugin<P>(&mut self, plugin: P) -> Result<()>
@@ -117,15 +287,367 @@ impl KrkrEngine {
     }
 }
 
+#[derive(Clone, Debug)]
+struct KagRuntimeTask {
+    state: KagTaskState,
+    handler: Option<ObjectHandle>,
+    pending_tags: VecDeque<Tag>,
+    loaded: bool,
+    clear_page_on_click: bool,
+}
+
+impl KagRuntimeTask {
+    fn new() -> Self {
+        Self {
+            state: KagTaskState::Finished,
+            handler: None,
+            pending_tags: VecDeque::new(),
+            loaded: false,
+            clear_page_on_click: false,
+        }
+    }
+
+    fn state(&self) -> &KagTaskState {
+        &self.state
+    }
+
+    fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    fn start(&mut self) {
+        self.state = KagTaskState::Running;
+        self.pending_tags.clear();
+        self.loaded = true;
+        self.clear_page_on_click = false;
+    }
+
+    fn set_handler(&mut self, handler: ObjectHandle) {
+        self.handler = Some(handler);
+    }
+
+    fn clear_handler(&mut self) {
+        self.handler = None;
+    }
+
+    fn signal_click(&mut self, message_layer: &mut MessageLayerModel) {
+        if self.state == KagTaskState::WaitingClick {
+            if self.clear_page_on_click {
+                message_layer.clear_text();
+                self.clear_page_on_click = false;
+            }
+            message_layer.waiting_for_click = false;
+            self.state = KagTaskState::Running;
+        }
+    }
+
+    fn update_wait(&mut self, delta: Duration) {
+        if let KagTaskState::WaitingTimer { remaining } = self.state.clone() {
+            self.state = if delta >= remaining {
+                KagTaskState::Running
+            } else {
+                KagTaskState::WaitingTimer {
+                    remaining: remaining - delta,
+                }
+            };
+        }
+    }
+
+    fn run_until_yield(
+        &mut self,
+        parser: &mut KagParser,
+        runtime: &mut Runtime<KrkrHost>,
+        message_layer: &mut MessageLayerModel,
+        budget: KagRunBudget,
+    ) -> Result<EngineTickResult> {
+        let started = Instant::now();
+        let mut tags_processed = 0;
+
+        if self.state != KagTaskState::Running {
+            return Ok(EngineTickResult {
+                state: self.state.clone(),
+                reason: if self.state == KagTaskState::Finished {
+                    KagYieldReason::Finished
+                } else {
+                    KagYieldReason::AlreadyBlocked
+                },
+                tags_processed,
+                elapsed: started.elapsed(),
+            });
+        }
+
+        loop {
+            if tags_processed >= budget.max_tags_per_tick
+                || (tags_processed > 0 && started.elapsed() >= budget.max_wall_time)
+            {
+                return Ok(EngineTickResult {
+                    state: self.state.clone(),
+                    reason: KagYieldReason::BudgetExhausted,
+                    tags_processed,
+                    elapsed: started.elapsed(),
+                });
+            }
+
+            let tag = match self.pending_tags.pop_front() {
+                Some(tag) => Some(tag),
+                None => {
+                    let mut host = EngineKagHost::new(runtime);
+                    match parser.next_tag_with(&mut host) {
+                        Ok(tag) => tag,
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.state = KagTaskState::Error {
+                                message: message.clone(),
+                            };
+                            return Err(TjsError::runtime(message));
+                        }
+                    }
+                }
+            };
+
+            let Some(tag) = tag else {
+                self.state = KagTaskState::Finished;
+                return Ok(EngineTickResult {
+                    state: self.state.clone(),
+                    reason: KagYieldReason::Finished,
+                    tags_processed,
+                    elapsed: started.elapsed(),
+                });
+            };
+
+            tags_processed += 1;
+            let action = self.process_tag(runtime, message_layer, tag)?;
+            match action {
+                TagAction::Continue => {}
+                TagAction::Yield(reason) => {
+                    return Ok(EngineTickResult {
+                        state: self.state.clone(),
+                        reason,
+                        tags_processed,
+                        elapsed: started.elapsed(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn process_tag(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        message_layer: &mut MessageLayerModel,
+        tag: Tag,
+    ) -> Result<TagAction> {
+        if let Some(handler) = self.handler
+            && !matches!(runtime.object_member(handler, "onTag"), Variant::Void)
+        {
+            let tag_object = tag_variant(runtime, &tag)?;
+            let value = self.call_handler(runtime, handler, "onTag", vec![tag_object])?;
+            return self.apply_handler_step(tag, value);
+        }
+
+        let default_action = self.process_builtin_tag(message_layer, &tag);
+        if matches!(default_action, TagAction::Continue)
+            && let Some(handler) = self.handler
+            && !is_builtin_tag(&tag.tagname)
+            && !matches!(
+                runtime.object_member(handler, "onUnknownTag"),
+                Variant::Void
+            )
+        {
+            let tag_object = tag_variant(runtime, &tag)?;
+            let value = call_tag_handler(
+                runtime,
+                handler,
+                "onUnknownTag",
+                vec![Variant::String(tag.tagname.clone()), tag_object],
+            )
+            .inspect_err(|error| {
+                self.state = KagTaskState::Error {
+                    message: error.to_string(),
+                };
+            })?;
+            return self.apply_handler_step(tag, value);
+        }
+        Ok(default_action)
+    }
+
+    fn call_handler(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        handler: ObjectHandle,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        call_tag_handler(runtime, handler, name, args).inspect_err(|error| {
+            self.state = KagTaskState::Error {
+                message: error.to_string(),
+            };
+        })
+    }
+
+    fn process_builtin_tag(
+        &mut self,
+        message_layer: &mut MessageLayerModel,
+        tag: &Tag,
+    ) -> TagAction {
+        match tag.tagname.as_str() {
+            "ch" => {
+                if let Some(text) = tag.literal_attr("text") {
+                    message_layer.append_text(text);
+                }
+                TagAction::Continue
+            }
+            "r" => {
+                message_layer.newline();
+                TagAction::Continue
+            }
+            "l" => {
+                message_layer.newline();
+                self.wait_click(message_layer, false)
+            }
+            "p" => {
+                message_layer.page_break();
+                self.wait_click(message_layer, true)
+            }
+            "waitclick" => self.wait_click(message_layer, false),
+            "wait" => match tag_millis(tag, "time") {
+                Some(duration) => self.wait(KagTaskState::WaitingTimer {
+                    remaining: duration,
+                }),
+                None => self.wait_click(message_layer, false),
+            },
+            "trans" | "wt" => self.wait(KagTaskState::WaitingTransition),
+            "wq" | "wf" | "wb" | "wm" => self.wait(KagTaskState::WaitingAudio),
+            "waitload" | "waittrig" => self.wait(KagTaskState::WaitingResource),
+            "s" => {
+                self.state = KagTaskState::Finished;
+                TagAction::Yield(KagYieldReason::Finished)
+            }
+            _ => TagAction::Continue,
+        }
+    }
+
+    fn apply_handler_step(&mut self, tag: Tag, value: Variant) -> Result<TagAction> {
+        if matches!(value, Variant::Void) {
+            self.state = KagTaskState::Error {
+                message: format!("KAG handler returned void for tag `{}`", tag.tagname),
+            };
+            return Err(TjsError::runtime(match &self.state {
+                KagTaskState::Error { message } => message.clone(),
+                _ => unreachable!(),
+            }));
+        }
+
+        let step = value.to_integer()?;
+        Ok(match step {
+            0 => TagAction::Continue,
+            -5 => {
+                self.pending_tags.push_front(tag);
+                TagAction::Yield(KagYieldReason::HandlerYield)
+            }
+            -4 => TagAction::Yield(KagYieldReason::HandlerYield),
+            -3 => {
+                self.pending_tags.push_front(tag);
+                TagAction::Yield(KagYieldReason::HandlerYield)
+            }
+            -2 => TagAction::Yield(KagYieldReason::HandlerYield),
+            -1 => {
+                self.state = KagTaskState::Finished;
+                TagAction::Yield(KagYieldReason::Finished)
+            }
+            n if n > 0 => {
+                self.state = KagTaskState::WaitingTimer {
+                    remaining: Duration::from_millis(n as u64),
+                };
+                TagAction::Yield(KagYieldReason::Waiting(self.state.clone()))
+            }
+            _ => TagAction::Yield(KagYieldReason::HandlerYield),
+        })
+    }
+
+    fn wait(&mut self, state: KagTaskState) -> TagAction {
+        self.state = state;
+        TagAction::Yield(KagYieldReason::Waiting(self.state.clone()))
+    }
+
+    fn wait_click(
+        &mut self,
+        message_layer: &mut MessageLayerModel,
+        clear_page_on_click: bool,
+    ) -> TagAction {
+        message_layer.waiting_for_click = true;
+        self.clear_page_on_click = clear_page_on_click;
+        self.wait(KagTaskState::WaitingClick)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TagAction {
+    Continue,
+    Yield(KagYieldReason),
+}
+
+fn call_tag_handler(
+    runtime: &mut Runtime<KrkrHost>,
+    handler: ObjectHandle,
+    name: &str,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    runtime.call_object_method(handler, name, args)
+}
+
+fn tag_variant(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<Variant> {
+    let object = runtime.alloc_ordinary_object();
+    runtime.add_object_class_info(object, "Dictionary");
+    runtime.set_object_member(object, "tagname", Variant::String(tag.tagname.clone()));
+    for attribute in &tag.attributes {
+        if let Attribute::Named { name, value } = attribute {
+            runtime.set_object_member(object, name, attribute_value_to_variant(value));
+        }
+    }
+    Ok(Variant::Object(object))
+}
+
+fn attribute_value_to_variant(value: &AttributeValue) -> Variant {
+    Variant::String(value.raw().to_string())
+}
+
+fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
+    tag.attr(name)
+        .and_then(|value| value.raw().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+fn is_builtin_tag(tagname: &str) -> bool {
+    matches!(
+        tagname,
+        "ch" | "r"
+            | "p"
+            | "l"
+            | "wait"
+            | "waitclick"
+            | "trans"
+            | "wt"
+            | "wq"
+            | "wf"
+            | "wb"
+            | "wm"
+            | "waitload"
+            | "waittrig"
+            | "s"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use krkr_core::Size;
     use krkr_tjs2::{
         Result,
         runtime::{Runtime, Variant},
@@ -388,6 +910,193 @@ mod tests {
         assert_eq!(tag.tagname, "ch");
         assert_eq!(tag.literal_attr("text"), Some("3"));
         assert!(engine.next_kag_tag().expect("eof").is_none());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tick_processes_multiple_tags_until_click_wait() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "AB[p]C").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+
+        let tick = engine.tick().expect("tick");
+        assert_eq!(tick.tags_processed, 3);
+        assert_eq!(tick.state, KagTaskState::WaitingClick);
+        assert_eq!(
+            tick.reason,
+            KagYieldReason::Waiting(KagTaskState::WaitingClick)
+        );
+
+        let blocked = engine.tick().expect("blocked tick");
+        assert_eq!(blocked.tags_processed, 0);
+        assert_eq!(blocked.reason, KagYieldReason::AlreadyBlocked);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_click_signal_resumes_after_page_wait() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[p]B").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        assert_eq!(
+            engine.tick().expect("first tick").state,
+            KagTaskState::WaitingClick
+        );
+
+        engine.signal_kag_click();
+        let tick = engine.tick().expect("resumed tick");
+        assert_eq!(tick.tags_processed, 1);
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(tick.reason, KagYieldReason::Finished);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tick_budget_yields_and_next_tick_continues() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "ABC[p]").expect("write scenario");
+
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_root: Some(root.clone()),
+            kag_budget: KagRunBudget {
+                max_tags_per_tick: 2,
+                max_wall_time: Duration::from_secs(1),
+            },
+        })
+        .expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+
+        let first = engine.tick().expect("first tick");
+        assert_eq!(first.tags_processed, 2);
+        assert_eq!(first.state, KagTaskState::Running);
+        assert_eq!(first.reason, KagYieldReason::BudgetExhausted);
+
+        let second = engine.tick().expect("second tick");
+        assert_eq!(second.tags_processed, 2);
+        assert_eq!(second.state, KagTaskState::WaitingClick);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tick_enters_finished_at_scenario_end() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "AB").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+
+        let tick = engine.tick().expect("tick");
+        assert_eq!(tick.tags_processed, 2);
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(tick.reason, KagYieldReason::Finished);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tick_uses_tjs_unknown_tag_and_script_bridges() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[iscript]\nf.value = 7;\n[endscript]\n[foo value=9]A",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var f = new Dictionary();
+                var handler = new Dictionary();
+                handler.seen = "";
+                handler.onUnknownTag = function(name, elm) {
+                    this.seen = name + ":" + elm.value;
+                    return 0;
+                };
+                return handler;
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+
+        engine.set_kag_handler(handler);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "seen"),
+            Variant::String("foo:9".to_string())
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "f.value")
+                .expect("f value"),
+            Variant::Integer(7)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_update_renders_text_waits_for_click_and_continues() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "*start\nA[p]B[p]").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(960.0, 600.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("first update");
+        assert_eq!(frame.tick.state, KagTaskState::WaitingClick);
+        assert_eq!(frame.message_layer.lines, vec!["A".to_string()]);
+        assert!(frame.message_layer.waiting_for_click);
+        assert_eq!(frame.location.storage.as_deref(), Some("first.ks"));
+        assert_eq!(frame.location.label.as_deref(), Some("*start"));
+        assert!(frame.location.line.is_some());
+        assert_eq!(frame.location.page, 1);
+        assert!(frame.output.draw_commands.iter().any(
+            |command| matches!(command, krkr_core::DrawCommand::Text(text) if text.text == "A")
+        ));
+
+        let frame = engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(960.0, 600.0), 0.016),
+                    vec![EngineEvent::PointerInput {
+                        button: PointerButton::Primary,
+                        state: ButtonState::Released,
+                    }],
+                ),
+                Duration::from_millis(16),
+            )
+            .expect("click update");
+        assert_eq!(frame.tick.state, KagTaskState::WaitingClick);
+        assert_eq!(frame.message_layer.lines, vec!["B".to_string()]);
+        assert!(frame.message_layer.waiting_for_click);
+        assert_eq!(frame.location.page, 2);
 
         fs::remove_dir_all(root).expect("cleanup");
     }

@@ -5,7 +5,7 @@ use krkr_core::{
     ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Panel, Point,
     PointerButton, StatusLevel, UiAction,
 };
-use krkr_engine::KrkrEngine;
+use krkr_engine::{EngineInput as KrkrEngineInput, KrkrEngine};
 use krkr_platform::{pick_folder, show_error};
 use krkr_render::{RenderError, Renderer};
 use winit::{
@@ -69,6 +69,7 @@ struct DesktopApp {
     engine: Engine,
     audio: AudioSystem,
     krkr_engine: Option<KrkrEngine>,
+    pending_runtime_events: Vec<EngineEvent>,
     state: DesktopState,
     project_root: Option<PathBuf>,
     status: Option<DesktopStatus>,
@@ -83,6 +84,7 @@ impl DesktopApp {
             engine: Engine::new(EngineConfig::default()),
             audio: AudioSystem::new(),
             krkr_engine: None,
+            pending_runtime_events: Vec::new(),
             state: DesktopState::Launcher,
             project_root: None,
             status: None,
@@ -158,7 +160,26 @@ impl DesktopApp {
                 self.engine.set_panel(Panel::Settings);
                 self.engine.tick(frame_input)
             }
-            DesktopState::Running => self.engine.tick_running(frame_input),
+            DesktopState::Running => {
+                if let Some(krkr_engine) = &mut self.krkr_engine {
+                    let events = std::mem::take(&mut self.pending_runtime_events);
+                    match krkr_engine.update(
+                        KrkrEngineInput::new(frame_input, events),
+                        std::time::Duration::from_secs_f32(delta_seconds.max(0.0)),
+                    ) {
+                        Ok(frame) => frame.output,
+                        Err(error) => {
+                            let message = format!("engine update failed: {error}");
+                            log_error(&message);
+                            self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
+                            self.engine.set_status_level(Some(StatusLevel::Error));
+                            self.engine.tick_running(frame_input)
+                        }
+                    }
+                } else {
+                    self.engine.tick_running(frame_input)
+                }
+            }
             DesktopState::FatalError => {
                 self.engine.set_status_level(Some(StatusLevel::Error));
                 self.engine.tick(frame_input)
@@ -253,18 +274,32 @@ impl DesktopApp {
             }
         };
 
-        match krkr_engine.execute_startup() {
-            Ok(value) => log_info(&format!(
-                "startup.tjs completed for {} with result {}",
-                root.display(),
-                value
-            )),
-            Err(error) => {
-                let message = format!("startup.tjs failed: {error}");
+        let has_startup_tjs = krkr_engine.host().storage_exists("startup.tjs");
+        let has_startup_ks = krkr_engine.host().storage_exists("startup.ks");
+        if has_startup_tjs || !has_startup_ks {
+            match krkr_engine.execute_startup() {
+                Ok(value) => log_info(&format!(
+                    "startup.tjs completed for {} with result {}",
+                    root.display(),
+                    value
+                )),
+                Err(error) => {
+                    let message = format!("startup.tjs failed: {error}");
+                    self.set_status(StatusLevel::Error, message.clone(), Some(window));
+                    show_error("Project startup failed", &message);
+                    return;
+                }
+            }
+        }
+
+        if !krkr_engine.has_kag_scenario() && has_startup_ks {
+            if let Err(error) = krkr_engine.load_kag_scenario("startup.ks") {
+                let message = format!("startup.ks failed: {error}");
                 self.set_status(StatusLevel::Error, message.clone(), Some(window));
-                show_error("Project startup failed", &message);
+                show_error("Project KAG startup failed", &message);
                 return;
             }
+            log_info(&format!("loaded startup.ks for {}", root.display()));
         }
 
         self.krkr_engine = Some(krkr_engine);
@@ -277,6 +312,7 @@ impl DesktopApp {
     fn return_to_launcher(&mut self, window: &Window) {
         self.state = DesktopState::Launcher;
         self.krkr_engine = None;
+        self.pending_runtime_events.clear();
         self.engine.set_panel(Panel::Launcher);
         self.set_status(
             StatusLevel::Info,
@@ -387,6 +423,12 @@ impl ApplicationHandler for DesktopApp {
                         &window,
                     );
                     window.request_redraw();
+                } else if self.state == DesktopState::Running {
+                    let position = position.to_logical::<f64>(window.scale_factor());
+                    self.pending_runtime_events.push(EngineEvent::CursorMoved {
+                        position: Point::new(position.x as f32, position.y as f32),
+                    });
+                    window.request_redraw();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -398,6 +440,12 @@ impl ApplicationHandler for DesktopApp {
                         },
                         &window,
                     );
+                    window.request_redraw();
+                } else if self.state == DesktopState::Running {
+                    self.pending_runtime_events.push(EngineEvent::PointerInput {
+                        button: map_mouse_button(button),
+                        state: map_button_state(state),
+                    });
                     window.request_redraw();
                 }
             }
@@ -421,6 +469,15 @@ impl ApplicationHandler for DesktopApp {
                         },
                         &window,
                     );
+                    window.request_redraw();
+                } else if self.state == DesktopState::Running
+                    && let Some(key) = map_key(&event.logical_key)
+                {
+                    self.pending_runtime_events
+                        .push(EngineEvent::KeyboardInput {
+                            key,
+                            state: map_button_state(event.state),
+                        });
                     window.request_redraw();
                 }
             }

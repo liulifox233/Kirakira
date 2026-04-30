@@ -1,7 +1,7 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
-use krkr_core::{Color, DrawCommand, FrameOutput, Rect, Size};
+use krkr_core::{Color, DrawCommand, FrameOutput, Rect, Size, TextCommand};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -254,22 +254,57 @@ impl Renderer {
     }
 
     fn vertices_for_frame(&self, frame: &FrameOutput) -> Vec<Vertex> {
-        let rect_count = frame
-            .draw_commands
-            .iter()
-            .filter(|command| matches!(command, DrawCommand::Rect(_)))
-            .count();
-        let mut vertices = Vec::with_capacity(rect_count * 6);
+        let mut vertices = Vec::new();
 
         for command in &frame.draw_commands {
             match command {
                 DrawCommand::Rect(rect) => {
                     vertices.extend_from_slice(&self.rect_vertices(rect.rect, rect.color));
                 }
+                DrawCommand::Text(text) => self.push_text_vertices(&mut vertices, text),
             }
         }
 
         vertices
+    }
+
+    fn push_text_vertices(&self, vertices: &mut Vec<Vertex>, command: &TextCommand) {
+        let pixel = (command.size / 7.0).max(1.0);
+        let advance = pixel * 6.0;
+        let line_advance = pixel * 9.0;
+        let mut origin = command.position;
+
+        for ch in command.text.chars() {
+            match ch {
+                '\n' => {
+                    origin.x = command.position.x;
+                    origin.y += line_advance;
+                }
+                ' ' => {
+                    origin.x += advance;
+                }
+                _ => {
+                    if let Some(pattern) = glyph_pattern(ch) {
+                        for (row, bits) in pattern.iter().enumerate() {
+                            for col in 0..5 {
+                                if bits & (1 << (4 - col)) != 0 {
+                                    let rect = Rect::new(
+                                        origin.x + col as f32 * pixel,
+                                        origin.y + row as f32 * pixel,
+                                        pixel,
+                                        pixel,
+                                    );
+                                    vertices.extend_from_slice(
+                                        &self.rect_vertices(rect, command.color),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    origin.x += advance;
+                }
+            }
+        }
     }
 
     fn rect_vertices(&self, rect: Rect, color: Color) -> [Vertex; 6] {
@@ -320,6 +355,139 @@ impl Renderer {
             height: (y1 - y0) as u32,
         })
     }
+}
+
+fn glyph_pattern(ch: char) -> Option<[u8; 7]> {
+    let upper = ch.to_ascii_uppercase();
+    Some(match upper {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        ',' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b00100, 0b01000,
+        ],
+        '!' => [
+            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
+        '?' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        ':' => [
+            0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000,
+        ],
+        _ => return None,
+    })
 }
 
 #[cfg(target_os = "macos")]

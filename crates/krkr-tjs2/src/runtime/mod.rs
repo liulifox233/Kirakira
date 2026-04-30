@@ -292,6 +292,17 @@ impl<H: TjsHost + 'static> Runtime<H> {
         vm.execute_top_level()
     }
 
+    pub fn call_object_method(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        let file_id = self.call_context_file_id();
+        let mut vm = Vm::new(file_id, self)?;
+        vm.call_object_method(object, name, args)
+    }
+
     pub fn host(&self) -> &H {
         &self.host
     }
@@ -340,6 +351,19 @@ impl<H: TjsHost + 'static> Runtime<H> {
         }
         self.script_files.push(ScriptFile { file, code_handles });
         file_id
+    }
+
+    fn call_context_file_id(&mut self) -> usize {
+        if self.script_files.is_empty() {
+            self.install_script_file(Arc::new(BytecodeFile {
+                data: Default::default(),
+                objects: Vec::new(),
+                top_level: None,
+                debug_info: Default::default(),
+            }))
+        } else {
+            self.script_files.len() - 1
+        }
     }
 
     pub(crate) fn script_file(&self, file_id: usize) -> Result<Arc<BytecodeFile>> {
