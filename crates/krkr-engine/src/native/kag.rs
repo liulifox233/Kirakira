@@ -260,6 +260,9 @@ where
 
     let result = (|| {
         sync_parser_from_members(vm, handle, &mut parser)?;
+        vm.runtime_mut()
+            .host_mut()
+            .insert_kag_parser(handle, parser.clone());
         let result = f(&mut parser, vm, handle);
         refresh_kag_parser_members_from_parser(vm.runtime_mut(), handle, &parser)?;
         result
@@ -426,8 +429,10 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
             "onScenarioLoad",
             vec![Variant::String(event.storage.to_string())],
         )?
-        .filter(|value| !matches!(value, Variant::Void))
-        .map(|value| value.to_tjs_string().map_err(kag_host_error))
+        .and_then(|value| match value {
+            Variant::String(source) => Some(Ok(source)),
+            _ => None,
+        })
         .transpose()
     }
 
@@ -577,7 +582,7 @@ fn kag_to_tjs(error: krkr_kag::KagError) -> TjsError {
 }
 
 fn eval_expression(runtime: &mut Runtime<KrkrHost>, expression: &str) -> krkr_kag::Result<Variant> {
-    execute_expression_on_runtime(runtime, "<kag-expression>", expression).map_err(kag_host_error)
+    execute_expression_on_runtime(runtime, expression, expression).map_err(kag_host_error)
 }
 
 fn kag_host_error(error: impl std::fmt::Display) -> KagError {

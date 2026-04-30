@@ -67,7 +67,7 @@ impl KagHost for EngineKagHost<'_> {
 }
 
 fn eval_expression(runtime: &mut Runtime<KrkrHost>, expression: &str) -> krkr_kag::Result<Variant> {
-    execute_expression_on_runtime(runtime, "<kag-expression>", expression).map_err(kag_host_error)
+    execute_expression_on_runtime(runtime, expression, expression).map_err(kag_host_error)
 }
 
 fn kag_host_error(error: impl std::fmt::Display) -> KagError {

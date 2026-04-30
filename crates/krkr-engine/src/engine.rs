@@ -234,6 +234,7 @@ impl KrkrEngine {
 
     pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
         self.handle_input_events(&input.events);
+        self.pump_tjs_events()?;
         let tick = self.advance(delta)?;
         self.sync_native_layers_from_tjs()?;
         let output = self.core_engine.tick_running_with_layers(
@@ -257,6 +258,104 @@ impl KrkrEngine {
             &mut self.message_layer,
             self.kag_budget,
         )
+    }
+
+    fn pump_tjs_events(&mut self) -> Result<()> {
+        const MAX_NATIVE_EVENT_PASSES: usize = 1024;
+
+        for _ in 0..MAX_NATIVE_EVENT_PASSES {
+            let events = self.collect_due_tjs_events()?;
+            if events.is_empty() {
+                return Ok(());
+            }
+            for event in events {
+                self.fire_tjs_event(event)?;
+            }
+        }
+
+        self.tjs_runtime
+            .host_mut()
+            .log("native event pump reached its per-frame pass budget; remaining events deferred");
+        Ok(())
+    }
+
+    fn collect_due_tjs_events(&mut self) -> Result<Vec<TjsEvent>> {
+        let now = self.tjs_runtime.host_mut().now_millis();
+        let mut events = self
+            .tjs_runtime
+            .host_mut()
+            .take_pending_async_triggers()
+            .into_iter()
+            .map(|handle| TjsEvent {
+                handle,
+                kind: TjsEventKind::AsyncTrigger,
+            })
+            .collect::<Vec<_>>();
+
+        for handle in self.tjs_runtime.host().timer_handles() {
+            let enabled = self
+                .tjs_runtime
+                .object_member(handle, "enabled")
+                .is_truthy();
+            if !enabled {
+                self.tjs_runtime
+                    .host_mut()
+                    .set_timer_next_fire_millis(handle, None);
+                continue;
+            }
+
+            let interval = self
+                .tjs_runtime
+                .object_member(handle, "interval")
+                .to_integer()?
+                .max(0);
+            let next_fire = match self.tjs_runtime.host().timer_next_fire_millis(handle) {
+                Some(next_fire) => next_fire,
+                None => {
+                    let next_fire = now.saturating_add(interval);
+                    self.tjs_runtime
+                        .host_mut()
+                        .set_timer_next_fire_millis(handle, Some(next_fire));
+                    next_fire
+                }
+            };
+
+            if now >= next_fire {
+                self.tjs_runtime
+                    .host_mut()
+                    .set_timer_next_fire_millis(handle, None);
+                events.push(TjsEvent {
+                    handle,
+                    kind: TjsEventKind::Timer,
+                });
+            }
+        }
+
+        Ok(events)
+    }
+
+    fn fire_tjs_event(&mut self, event: TjsEvent) -> Result<()> {
+        let callback = self.tjs_runtime.object_member(event.handle, "__callback");
+        if !matches!(callback, Variant::Void) {
+            return self
+                .tjs_runtime
+                .call_function(callback, Vec::new())
+                .map(|_| ());
+        }
+
+        let method = match event.kind {
+            TjsEventKind::Timer => "onTimer",
+            TjsEventKind::AsyncTrigger => "onFire",
+        };
+        if matches!(
+            self.tjs_runtime.object_member(event.handle, method),
+            Variant::Void
+        ) {
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(event.handle, method, Vec::new())
+            .map(|_| ())
     }
 
     fn handle_input_events(&mut self, events: &[EngineEvent]) {
@@ -323,6 +422,18 @@ impl KrkrEngine {
     pub fn plugin_count(&self) -> usize {
         self.plugins.len()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TjsEvent {
+    handle: ObjectHandle,
+    kind: TjsEventKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TjsEventKind {
+    Timer,
+    AsyncTrigger,
 }
 
 #[derive(Clone, Debug)]
@@ -1535,6 +1646,30 @@ mod tests {
     }
 
     #[test]
+    fn tjs_kag_parser_treats_true_scenario_load_callback_as_normal_load() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.onScenarioLoad = function(storage) { return true; };
+                parser.loadScenario("first.ks");
+                var tag = parser.getNextTag();
+                return tag.tagname + ":" + tag.text;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("ch:A".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn tjs_kag_parser_fires_label_and_script_callbacks() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -1577,6 +1712,32 @@ mod tests {
     }
 
     #[test]
+    fn tjs_kag_parser_allows_store_during_callbacks() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "*start\nA").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.onLabel = function(label, page) {
+                    this.snapshot = this.store();
+                };
+                parser.loadScenario("first.ks");
+                parser.getNextTag();
+                return parser.snapshot.curStorage;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("first.ks".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn tjs_kag_parser_process_callbacks_can_cancel_control_tags() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -1600,6 +1761,33 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("AB:*end".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_skips_command_iscript_inside_if_block() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "@if exp=\"true\"\n@iscript\nvar x = 1;\n@endscript\n@endif\n[wait]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.loadScenario("first.ks");
+                var tag = parser.getNextTag();
+                return tag.tagname;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("wait".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -1700,6 +1888,82 @@ mod tests {
                 .host()
                 .linked_plugins()
                 .any(|name| name == "test-plugin")
+        );
+    }
+
+    #[test]
+    fn native_timer_callback_runs_from_update() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer.tjs",
+                r#"
+                global.timerProbeCount = 0;
+                var timerProbe = new Timer(function() {
+                    global.timerProbeCount++;
+                    timerProbe.enabled = false;
+                }, "");
+                global.timerProbe = timerProbe;
+                timerProbe.interval = 0;
+                timerProbe.enabled = true;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(engine.host().timer_handles().len(), 1);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("timerProbeCount"),
+            Variant::Integer(1)
+        );
+        let Variant::Object(timer) = engine.tjs_runtime().global_member("timerProbe") else {
+            panic!("timerProbe should be an object");
+        };
+        assert_eq!(
+            engine.tjs_runtime().object_member(timer, "enabled"),
+            Variant::Integer(0)
+        );
+    }
+
+    #[test]
+    fn native_async_trigger_callback_runs_from_update() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "async.tjs",
+                r#"
+                global.asyncProbeCount = 0;
+                var asyncProbe = new AsyncTrigger(function() {
+                    global.asyncProbeCount++;
+                }, "");
+                global.asyncProbe = asyncProbe;
+                asyncProbe.trigger();
+                "#,
+            )
+            .expect("script");
+        assert_eq!(engine.host_mut().take_pending_async_triggers().len(), 1);
+        let async_probe = match engine.tjs_runtime().global_member("asyncProbe") {
+            Variant::Object(handle) => handle,
+            _ => panic!("asyncProbe should be an object"),
+        };
+        engine.host_mut().trigger_async(async_probe);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("asyncProbeCount"),
+            Variant::Integer(1)
         );
     }
 

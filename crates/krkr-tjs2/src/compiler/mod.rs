@@ -125,6 +125,23 @@ mod tests {
     }
 
     #[test]
+    fn execute_source_assigns_sparse_array_index() {
+        assert_eq!(
+            execute_source("inline.tjs", "var a = []; a[30] = false; return a.count;")
+                .expect("execute"),
+            Variant::Integer(31)
+        );
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                "var sf = %[]; sf.album_flag = []; sf.album_flag[30] = false; return sf.album_flag.count;"
+            )
+            .expect("execute"),
+            Variant::Integer(31)
+        );
+    }
+
+    #[test]
     fn execute_source_runs_direct_and_indirect_method_calls() {
         assert_eq!(
             execute_source("inline.tjs", r#"return "abcd".substr(1, 2);"#).expect("execute"),

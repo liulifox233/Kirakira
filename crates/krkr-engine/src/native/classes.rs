@@ -111,6 +111,18 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "interval", Variant::Integer(1000));
             runtime.set_object_member(handle, "capacity", Variant::Integer(1));
             runtime.set_object_member(handle, "mode", Variant::Integer(0));
+            if let Some(callback) = args.first().filter(|value| !matches!(value, Variant::Void)) {
+                runtime.set_object_member(handle, "__callback", callback.clone());
+            }
+            runtime.host_mut().register_timer(handle);
+        }
+        "AsyncTrigger" => {
+            runtime.set_object_member(handle, "cached", Variant::Integer(0));
+            runtime.set_object_member(handle, "mode", Variant::Integer(0));
+            if let Some(callback) = args.first().filter(|value| !matches!(value, Variant::Void)) {
+                runtime.set_object_member(handle, "__callback", callback.clone());
+            }
+            runtime.host_mut().register_async_trigger(handle);
         }
         "Window" => {
             runtime.set_object_member(handle, "visible", Variant::Integer(0));
@@ -220,6 +232,8 @@ fn install_special_methods(
         install_menu_item_methods(runtime, handle);
     } else if class_name == "Layer" {
         install_layer_methods(runtime, handle);
+    } else if class_name == "AsyncTrigger" {
+        install_async_trigger_methods(runtime, handle);
     }
 }
 
@@ -344,6 +358,31 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     runtime.register_object_native(handle, "bringToFront", layer_bring_to_front);
     runtime.register_object_native(handle, "bringToBack", layer_bring_to_back);
     runtime.register_object_native(handle, "update", layer_noop);
+}
+
+fn install_async_trigger_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    runtime.register_object_native(handle, "trigger", async_trigger_trigger);
+    runtime.register_object_native(handle, "cancel", async_trigger_cancel);
+}
+
+fn async_trigger_trigger(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("AsyncTrigger.trigger requires this"))?;
+    runtime.host_mut().trigger_async(this);
+    Ok(Variant::Void)
+}
+
+fn async_trigger_cancel(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("AsyncTrigger.cancel requires this"))?;
+    runtime.host_mut().cancel_async(this);
+    Ok(Variant::Void)
 }
 
 fn this_layer_id(

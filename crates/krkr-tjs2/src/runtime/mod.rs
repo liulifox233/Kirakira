@@ -303,6 +303,12 @@ impl<H: TjsHost + 'static> Runtime<H> {
         vm.call_object_method(object, name, args)
     }
 
+    pub fn call_function(&mut self, callee: Variant, args: Vec<Variant>) -> Result<Variant> {
+        let file_id = self.call_context_file_id();
+        let mut vm = Vm::new(file_id, self)?;
+        vm.call_function(callee, args)
+    }
+
     pub fn host(&self) -> &H {
         &self.host
     }

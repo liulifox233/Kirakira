@@ -29,6 +29,8 @@ pub struct KrkrHost {
     next_kag_snapshot_id: i64,
     layer_tree: LayerTree,
     native_layers: BTreeMap<ObjectHandle, LayerId>,
+    timers: BTreeMap<ObjectHandle, TimerState>,
+    pending_async_triggers: BTreeSet<ObjectHandle>,
     kag_layers: BTreeMap<String, LayerId>,
     current_kag_page: String,
     current_kag_layer: String,
@@ -52,6 +54,8 @@ impl Default for KrkrHost {
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            pending_async_triggers: BTreeSet::new(),
             kag_layers: BTreeMap::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
@@ -80,6 +84,8 @@ impl KrkrHost {
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            pending_async_triggers: BTreeSet::new(),
             kag_layers: BTreeMap::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
@@ -174,13 +180,15 @@ impl KrkrHost {
             return fs::read(&storage.path).map_err(io_error);
         }
 
-        if let Some(provider) = &self.xp3_provider
-            && provider.exists(name)
-        {
-            let mut stream = provider.open(name).map_err(io_error)?;
-            let mut bytes = Vec::new();
-            stream.read_to_end(&mut bytes).map_err(io_error)?;
-            return Ok(bytes);
+        if let Some(provider) = &self.xp3_provider {
+            for candidate in storage_lookup_names(name)? {
+                if provider.exists(&candidate) {
+                    let mut stream = provider.open(&candidate).map_err(io_error)?;
+                    let mut bytes = Vec::new();
+                    stream.read_to_end(&mut bytes).map_err(io_error)?;
+                    return Ok(bytes);
+                }
+            }
         }
 
         Err(TjsError::runtime(format!("storage `{name}` not found")))
@@ -233,11 +241,14 @@ impl KrkrHost {
     }
 
     fn fs_candidates(&self, name: &str) -> Result<Vec<PathBuf>> {
-        let clean = clean_relative_path(name)?;
-        let mut candidates = Vec::with_capacity(self.auto_paths.len() + 1);
-        candidates.push(clean.clone());
-        for auto_path in self.auto_paths.iter().rev() {
-            candidates.extend(auto_path_candidates(auto_path, &clean));
+        let names = storage_lookup_names(name)?;
+        let mut candidates = Vec::with_capacity(names.len() * (self.auto_paths.len() + 1));
+        for name in names {
+            let clean = clean_relative_path(&name)?;
+            candidates.push(clean.clone());
+            for auto_path in self.auto_paths.iter().rev() {
+                candidates.extend(auto_path_candidates(auto_path, &clean));
+            }
         }
         Ok(candidates)
     }
@@ -322,6 +333,53 @@ impl KrkrHost {
         self.native_layers
             .iter()
             .map(|(handle, layer_id)| (*handle, *layer_id))
+            .collect()
+    }
+
+    pub(crate) fn register_timer(&mut self, handle: ObjectHandle) {
+        self.timers.entry(handle).or_insert(TimerState {
+            next_fire_millis: None,
+        });
+    }
+
+    pub(crate) fn timer_handles(&self) -> Vec<ObjectHandle> {
+        self.timers.keys().copied().collect()
+    }
+
+    pub(crate) fn timer_next_fire_millis(&self, handle: ObjectHandle) -> Option<i64> {
+        self.timers
+            .get(&handle)
+            .and_then(|timer| timer.next_fire_millis)
+    }
+
+    pub(crate) fn set_timer_next_fire_millis(
+        &mut self,
+        handle: ObjectHandle,
+        next_fire_millis: Option<i64>,
+    ) {
+        self.timers
+            .entry(handle)
+            .or_insert(TimerState {
+                next_fire_millis: None,
+            })
+            .next_fire_millis = next_fire_millis;
+    }
+
+    pub(crate) fn register_async_trigger(&mut self, handle: ObjectHandle) {
+        self.pending_async_triggers.remove(&handle);
+    }
+
+    pub(crate) fn trigger_async(&mut self, handle: ObjectHandle) {
+        self.pending_async_triggers.insert(handle);
+    }
+
+    pub(crate) fn cancel_async(&mut self, handle: ObjectHandle) {
+        self.pending_async_triggers.remove(&handle);
+    }
+
+    pub(crate) fn take_pending_async_triggers(&mut self) -> Vec<ObjectHandle> {
+        std::mem::take(&mut self.pending_async_triggers)
+            .into_iter()
             .collect()
     }
 
@@ -439,6 +497,11 @@ struct ProjectLayer {
 }
 
 #[derive(Clone)]
+struct TimerState {
+    next_fire_millis: Option<i64>,
+}
+
+#[derive(Clone)]
 struct LocatedStorage {
     path: PathBuf,
     encoding_hint: Option<&'static Encoding>,
@@ -501,6 +564,24 @@ fn auto_path_candidates(auto_path: &str, clean: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     vec![auto_relative.join(clean)]
+}
+
+fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
+    let name = normalize_storage_separators(name);
+    clean_relative_path(&name)?;
+    let path = Path::new(&name);
+    if path.extension().is_some() {
+        return Ok(vec![name]);
+    }
+
+    let mut names = Vec::with_capacity(12);
+    names.push(name.clone());
+    for extension in [
+        "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "mpg", "mpeg",
+    ] {
+        names.push(format!("{name}.{extension}"));
+    }
+    Ok(names)
 }
 
 fn normalize_auto_path(path: &str) -> Option<String> {

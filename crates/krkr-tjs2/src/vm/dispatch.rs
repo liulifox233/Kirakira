@@ -36,6 +36,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let receiver_type = self.value_debug_type(&target);
         match &target {
+            Variant::Void if !flags.must_exist => return Ok(Variant::Void),
             Variant::String(value) => return self.string_property(value, name),
             Variant::Octet(value) => return self.octet_property(value, name),
             _ => {}
@@ -656,6 +657,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         args: Vec<Variant>,
     ) -> Result<Variant> {
         self.call_member_direct(Variant::Object(object), name, args, 1)
+    }
+
+    pub fn call_function(&mut self, callee: Variant, args: Vec<Variant>) -> Result<Variant> {
+        let base_depth = self.runtime.call_depth;
+        match self.call_value(callee, None, args, false, Continuation::Root)? {
+            CallOutcome::Immediate(value, Continuation::Root) => Ok(value),
+            CallOutcome::Immediate(_, continuation) => Err(TjsError::runtime(format!(
+                "unexpected immediate function call continuation {continuation:?}"
+            ))),
+            CallOutcome::Frame(frame) => self.run_call_stack(vec![*frame], base_depth),
+        }
     }
 
     pub(super) fn call_value(
