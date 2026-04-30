@@ -79,7 +79,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 if bind_this.is_some() && self.handle_class_name_matches(primary, name) {
                     return Ok(Variant::Closure(Closure::new(primary, bind_this)));
                 }
-                let value = self.prop_get_handle(primary, name, flags, caller_this)?;
+                let value =
+                    self.prop_get_handle(primary, name, flags, bind_this.or(caller_this))?;
                 if !matches!(value, Variant::Void) {
                     return Ok(self.bind_proxy_value(value, bind_this));
                 }
@@ -88,6 +89,13 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
 
         let Some(value) = self.runtime.heap[handle.0].get_raw(name) else {
+            if let Some(class_handle) = self.runtime.heap[handle.0].super_class {
+                let receiver = caller_this.or(Some(handle));
+                let value = self.prop_get_handle(class_handle, name, flags, receiver)?;
+                if !matches!(value, Variant::Void) {
+                    return Ok(self.bind_proxy_value(value, receiver));
+                }
+            }
             if flags.must_exist {
                 return Err(TjsError::runtime(format!("member `{name}` not found")));
             }
@@ -818,6 +826,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if context == BytecodeContextType::Class {
             self.add_class_info(instance, name.clone());
             let class_handle = code_handles[object_index];
+            self.runtime.heap[instance.0].super_class = Some(class_handle);
             let frame = self.create_call_frame(
                 file_id,
                 object_index,
@@ -866,6 +875,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.add_class_info(instance, name.clone());
         }
         let class_handle = code_handles[object_index];
+        if self.runtime.heap[instance.0].super_class.is_none() {
+            self.runtime.heap[instance.0].super_class = Some(class_handle);
+        }
         let frame = self.create_call_frame(
             file_id,
             object_index,
@@ -1094,7 +1106,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 .cloned()
                 .ok_or_else(|| TjsError::runtime("property name missing"))?;
             let handle = self.code_handles[property.object];
-            self.runtime.heap[dest.0].set(name, Variant::Closure(Closure::new(handle, Some(dest))));
+            if self.runtime.heap[dest.0].get_raw(&name).is_none() {
+                self.runtime.heap[dest.0]
+                    .set(name, Variant::Closure(Closure::new(handle, Some(dest))));
+            }
         }
         Ok(())
     }

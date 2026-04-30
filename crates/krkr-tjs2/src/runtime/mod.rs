@@ -251,6 +251,13 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.heap[object.0].get(name)
     }
 
+    pub fn bound_this(&self, object: ObjectHandle) -> Option<ObjectHandle> {
+        match self.heap[object.0].kind {
+            ObjectKind::Proxy { bind_this, .. } => bind_this,
+            _ => None,
+        }
+    }
+
     pub fn set_object_member(
         &mut self,
         object: ObjectHandle,

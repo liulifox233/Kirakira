@@ -357,6 +357,8 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     runtime.register_object_native(handle, "setSizeToImageSize", layer_set_size_to_image_size);
     runtime.register_object_native(handle, "bringToFront", layer_bring_to_front);
     runtime.register_object_native(handle, "bringToBack", layer_bring_to_back);
+    runtime.register_object_native(handle, "assignImages", layer_assign_images);
+    runtime.register_object_native(handle, "beginTransition", layer_begin_transition);
     runtime.register_object_native(handle, "update", layer_noop);
 }
 
@@ -390,6 +392,7 @@ fn this_layer_id(
     this_obj: Option<ObjectHandle>,
 ) -> Result<(ObjectHandle, u64)> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
+    let this = runtime.bound_this(this).unwrap_or(this);
     let id = runtime
         .object_member(this, "__nativeLayerId")
         .to_integer()? as u64;
@@ -401,20 +404,133 @@ fn layer_load_images(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
-    let storage = args
-        .first()
-        .ok_or_else(|| TjsError::runtime("Layer.loadImages requires storage"))?
-        .to_tjs_string()?;
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
+    let Some(source) = args.first() else {
+        return Err(TjsError::runtime("Layer.loadImages requires storage"));
+    };
+    let storage = load_images_storage(runtime, source)?
+        .filter(|storage| !storage.is_empty())
+        .ok_or_else(|| TjsError::runtime("Layer.loadImages requires storage"))?;
+    let options = source_object(source);
+    let visible = match options {
+        Some(options) => object_optional_integer(runtime, options, "visible")
+            .transpose()?
+            .map(|value| value != 0)
+            .unwrap_or(true),
+        None => true,
+    };
+    let left = match options {
+        Some(options) => object_optional_integer(runtime, options, "left").transpose()?,
+        None => None,
+    };
+    let top = match options {
+        Some(options) => object_optional_integer(runtime, options, "top").transpose()?,
+        None => None,
+    };
+    let opacity = match options {
+        Some(options) => object_optional_integer(runtime, options, "opacity").transpose()?,
+        None => None,
+    };
+
     let image = runtime.host_mut().load_image_storage(&storage)?;
     let size = image.size();
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.set_image(image);
-        layer.visible = true;
+
+    match native_layer_id(runtime, this)? {
+        Some(layer_id) => {
+            if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+                layer.set_image(image);
+                layer.visible = visible;
+                if let Some(left) = left {
+                    layer.left = left as f32;
+                }
+                if let Some(top) = top {
+                    layer.top = top as f32;
+                }
+                if let Some(opacity) = opacity {
+                    layer.opacity = opacity.clamp(0, 255) as u8;
+                }
+            }
+        }
+        None => {
+            let page = match options {
+                Some(options) => object_optional_string(runtime, options, "page")?
+                    .unwrap_or_else(|| "back".to_string()),
+                None => "back".to_string(),
+            };
+            let layer_name = match options {
+                Some(options) => object_optional_string(runtime, options, "layer")?
+                    .unwrap_or_else(|| "base".to_string()),
+                None => "base".to_string(),
+            };
+            let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
+            if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+                layer.set_image(image);
+                layer.visible = visible;
+                if let Some(left) = left {
+                    layer.left = left as f32;
+                }
+                if let Some(top) = top {
+                    layer.top = top as f32;
+                }
+                if let Some(opacity) = opacity {
+                    layer.opacity = opacity.clamp(0, 255) as u8;
+                }
+            }
+        }
     }
     sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
-    runtime.set_object_member(this, "visible", Variant::Integer(1));
+    runtime.set_object_member(this, "visible", Variant::Integer(i64::from(visible)));
+    if let Some(left) = left {
+        runtime.set_object_member(this, "left", Variant::Integer(left));
+    }
+    if let Some(top) = top {
+        runtime.set_object_member(this, "top", Variant::Integer(top));
+    }
+    if let Some(opacity) = opacity {
+        runtime.set_object_member(this, "opacity", Variant::Integer(opacity.clamp(0, 255)));
+    }
     Ok(Variant::Void)
+}
+
+fn load_images_storage(runtime: &Runtime<KrkrHost>, value: &Variant) -> Result<Option<String>> {
+    if let Some(object) = source_object(value) {
+        return match runtime.object_member(object, "storage") {
+            Variant::Void => Ok(None),
+            storage => storage.to_tjs_string().map(Some),
+        };
+    }
+    value.to_tjs_string().map(Some)
+}
+
+fn object_optional_integer(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Option<Result<i64>> {
+    match runtime.object_member(object, name) {
+        Variant::Void => None,
+        value => Some(value.to_integer()),
+    }
+}
+
+fn object_optional_string(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Result<Option<String>> {
+    match runtime.object_member(object, name) {
+        Variant::Void => Ok(None),
+        value => value.to_tjs_string().map(Some),
+    }
+}
+
+fn source_object(value: &Variant) -> Option<ObjectHandle> {
+    match value {
+        Variant::Object(handle) => Some(*handle),
+        _ => None,
+    }
 }
 
 fn layer_set_pos(
@@ -506,6 +622,48 @@ fn layer_set_size_to_image_size(
     Ok(Variant::Void)
 }
 
+fn layer_assign_images(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let Some(source) = args.first().and_then(variant_object) else {
+        return Ok(Variant::Void);
+    };
+    copy_layer_images(runtime, this, layer_id, source)?;
+    Ok(Variant::Void)
+}
+
+fn layer_begin_transition(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
+    let source = args
+        .get(2)
+        .and_then(variant_object)
+        .or_else(|| variant_object(&runtime.object_member(this, "comp")));
+    match native_layer_id(runtime, this)? {
+        Some(layer_id) => {
+            if let Some(source) = source {
+                copy_layer_images(runtime, this, layer_id, source)?;
+            }
+            if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+                layer.visible = true;
+            }
+        }
+        None => {}
+    }
+    runtime.host_mut().apply_immediate_transition();
+    runtime.set_object_member(this, "visible", Variant::Integer(1));
+    finish_immediate_transition(runtime, this);
+    Ok(Variant::Void)
+}
+
 fn layer_bring_to_front(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -535,6 +693,97 @@ fn layer_bring_to_back(
         layer.z_order = 0;
     }
     Ok(Variant::Void)
+}
+
+fn copy_layer_images(
+    runtime: &mut Runtime<KrkrHost>,
+    dest_object: ObjectHandle,
+    dest_layer_id: u64,
+    source_object: ObjectHandle,
+) -> Result<()> {
+    let Some(source_layer_id) = native_layer_id(runtime, source_object)? else {
+        return Ok(());
+    };
+    let Some(source) = runtime.host().layer_tree().layer(source_layer_id).cloned() else {
+        return Ok(());
+    };
+
+    let mut resized_to_source = false;
+    if let Some(dest) = runtime.host_mut().layer_tree_mut().layer_mut(dest_layer_id) {
+        dest.image = source.image.clone();
+        dest.image_left = source.image_left;
+        dest.image_top = source.image_top;
+        dest.image_width = source.image_width;
+        dest.image_height = source.image_height;
+        if dest.width <= 0.0 || dest.height <= 0.0 {
+            dest.width = source.width;
+            dest.height = source.height;
+            resized_to_source = true;
+        }
+    }
+
+    runtime.set_object_member(
+        dest_object,
+        "imageLeft",
+        Variant::Integer(source.image_left as i64),
+    );
+    runtime.set_object_member(
+        dest_object,
+        "imageTop",
+        Variant::Integer(source.image_top as i64),
+    );
+    runtime.set_object_member(
+        dest_object,
+        "imageWidth",
+        Variant::Integer(source.image_width as i64),
+    );
+    runtime.set_object_member(
+        dest_object,
+        "imageHeight",
+        Variant::Integer(source.image_height as i64),
+    );
+    if resized_to_source {
+        runtime.set_object_member(dest_object, "width", Variant::Integer(source.width as i64));
+        runtime.set_object_member(
+            dest_object,
+            "height",
+            Variant::Integer(source.height as i64),
+        );
+    }
+    Ok(())
+}
+
+fn native_layer_id(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> Result<Option<u64>> {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    match runtime.object_member(handle, "__nativeLayerId") {
+        Variant::Void => Ok(None),
+        value => {
+            let id = value.to_integer()? as u64;
+            Ok((id != 0).then_some(id))
+        }
+    }
+}
+
+fn variant_object(value: &Variant) -> Option<ObjectHandle> {
+    match value {
+        Variant::Object(handle) => Some(*handle),
+        _ => None,
+    }
+}
+
+fn finish_immediate_transition(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) {
+    runtime.set_object_member(layer, "inTransition", Variant::Integer(0));
+    let Variant::Object(window) = runtime.object_member(layer, "window") else {
+        return;
+    };
+    let Ok(trans_count) = runtime.object_member(window, "transCount").to_integer() else {
+        return;
+    };
+    runtime.set_object_member(
+        window,
+        "transCount",
+        Variant::Integer(trans_count.saturating_sub(1).max(0)),
+    );
 }
 
 fn layer_noop(

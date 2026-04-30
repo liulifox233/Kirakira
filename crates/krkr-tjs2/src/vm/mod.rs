@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
-use crate::bytecode::{BytecodeFile, CodeObject, Instruction};
+use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError, TjsSourceLocation, TjsStackFrame};
 use crate::runtime::{
-    Closure, NativeFunction, NoHost, Object, ObjectHandle, Runtime, TjsHost, Variant,
+    Closure, NativeFunction, NoHost, Object, ObjectHandle, ObjectKind, Runtime, TjsHost, Variant,
 };
 
 mod dispatch;
@@ -676,7 +676,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let info = frame.get(inst.operands[1])?;
                 let mut copied_object_infos = false;
                 if let Ok(info_handle) = self.resolve_object(info.clone()) {
-                    self.runtime.heap[object_handle.0].super_class = Some(info_handle);
+                    let should_update_super =
+                        matches!(
+                            self.runtime.heap[object_handle.0].kind,
+                            ObjectKind::InterCode {
+                                context: BytecodeContextType::Class,
+                                ..
+                            }
+                        ) || self.runtime.heap[object_handle.0].super_class.is_none();
+                    if should_update_super {
+                        self.runtime.heap[object_handle.0].super_class = Some(info_handle);
+                    }
                     let infos = self.runtime.heap[info_handle.0].class_infos.clone();
                     copied_object_infos = !infos.is_empty();
                     for info in infos {

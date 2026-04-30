@@ -1572,6 +1572,112 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_load_images_accepts_kag_dictionary_options() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[0, 0, 255, 255]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.loadImages(%[
+                    storage: "sprite.png",
+                    visible: false,
+                    left: 17,
+                    top: 19,
+                    opacity: 64
+                ]);
+                return layer.imageWidth + ":" + layer.visible + ":" + layer.left + ":" + layer.opacity;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:0:17:64".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_assign_images_copies_source_image_to_destination() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[255, 0, 0, 255]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.loadImages("sprite.png");
+                var dest = new Layer();
+                dest.visible = true;
+                dest.assignImages(source);
+                return dest.imageWidth + ":" + dest.imageHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:1".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(frame.output.image_uploads.len(), 2);
+        assert_eq!(
+            frame
+                .output
+                .draw_commands
+                .iter()
+                .filter(|command| matches!(command, krkr_core::DrawCommand::Image(_)))
+                .count(),
+            2
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_begin_transition_applies_source_image_immediately() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[0, 255, 0, 255]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.loadImages("sprite.png");
+                var dest = new Layer();
+                dest.visible = true;
+                dest.window = %[transCount: 1];
+                dest.inTransition = true;
+                dest.beginTransition("crossfade", true, source, %[]);
+                return dest.window.transCount + ":" + dest.inTransition + ":" + dest.imageWidth;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("0:0:1".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(frame.output.image_uploads.len(), 2);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn tjs_kag_parser_returns_tag_dictionaries() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");

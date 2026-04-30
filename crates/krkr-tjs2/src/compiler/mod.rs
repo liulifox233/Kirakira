@@ -155,6 +155,48 @@ mod tests {
     }
 
     #[test]
+    fn bare_method_calls_dispatch_through_receiver() {
+        let result = execute_source(
+            "inline.tjs",
+            r#"
+            class Base {
+                function callHook() { return hook(); }
+                function hook() { return "base"; }
+            }
+            class Child extends Base {
+                function hook() { return "child"; }
+            }
+            var child = new Child();
+            return child.callHook();
+            "#,
+        )
+        .expect("execute");
+        assert_eq!(result, Variant::String("child".to_string()));
+    }
+
+    #[test]
+    fn captured_base_method_uses_instance_for_bare_calls() {
+        let result = execute_source(
+            "inline.tjs",
+            r#"
+            class Base {
+                function Base() { global.callback = timerCallback; }
+                function timerCallback() { return onTag(); }
+                function onTag() { return "base"; }
+            }
+            class Child extends Base {
+                function Child() { super.Base(); }
+                function onTag() { return "child"; }
+            }
+            var child = new Child();
+            return global.callback();
+            "#,
+        )
+        .expect("execute");
+        assert_eq!(result, Variant::String("child".to_string()));
+    }
+
+    #[test]
     fn runtime_errors_include_stack_and_member_context() {
         let error = execute_source(
             "debug.tjs",
@@ -309,6 +351,31 @@ mod tests {
         assert!(indirect.iter().any(|line| line.contains("gpis")));
         assert!(indirect.iter().any(|line| line.contains("spis")));
         assert!(!indirect.iter().any(|line| line.contains("incpi")));
+    }
+
+    #[test]
+    fn continue_inside_try_stays_in_loop() {
+        let result = execute_source(
+            "inline.tjs",
+            r#"
+            function f() {
+                var n = 0;
+                try {
+                    for (;;) {
+                        n++;
+                        if (n < 3) continue;
+                        break;
+                    }
+                } catch (e) {
+                    return -1;
+                }
+                return n;
+            }
+            return f();
+            "#,
+        )
+        .expect("execute");
+        assert_eq!(result, Variant::Integer(3));
     }
 
     fn disassemble_top_level(source: &str) -> Vec<String> {

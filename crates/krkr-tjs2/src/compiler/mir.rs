@@ -3151,20 +3151,24 @@ fn collapse_empty_gotos(object: &mut MirObject) {
     if redirects.is_empty() {
         return;
     }
+    let resolve = |mut target: BlockId| {
+        let mut seen = BTreeSet::new();
+        while let Some(next) = redirects.get(&target).copied() {
+            if !seen.insert(target) {
+                break;
+            }
+            target = next;
+        }
+        target
+    };
     for block in &mut object.blocks {
         rewrite_terminator_targets(&mut block.terminator, &redirects);
     }
     for region in &mut object.exception_regions {
-        if let Some(target) = redirects.get(&region.entry).copied() {
-            region.entry = target;
-        }
-        if let Some(target) = redirects.get(&region.catch).copied() {
-            region.catch = target;
-        }
+        region.entry = resolve(region.entry);
+        region.catch = resolve(region.catch);
         for block in &mut region.protected_blocks {
-            if let Some(target) = redirects.get(block).copied() {
-                *block = target;
-            }
+            *block = resolve(*block);
         }
         region.protected_blocks.sort();
         region.protected_blocks.dedup();
