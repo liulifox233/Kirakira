@@ -155,6 +155,15 @@ mod tests {
     }
 
     #[test]
+    fn string_escape_escapes_tjs_string_literal_fragments() {
+        assert_eq!(
+            execute_source("inline.tjs", r#"return "voice\\line\"01\n".escape();"#)
+                .expect("execute"),
+            Variant::String("voice\\\\line\\\"01\\n".to_string())
+        );
+    }
+
+    #[test]
     fn bare_method_calls_dispatch_through_receiver() {
         let result = execute_source(
             "inline.tjs",

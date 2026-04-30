@@ -336,6 +336,12 @@ impl KrkrHost {
             .collect()
     }
 
+    pub(crate) fn native_object_for_layer(&self, layer_id: LayerId) -> Option<ObjectHandle> {
+        self.native_layers
+            .iter()
+            .find_map(|(handle, id)| (*id == layer_id).then_some(*handle))
+    }
+
     pub(crate) fn register_timer(&mut self, handle: ObjectHandle) {
         self.timers.entry(handle).or_insert(TimerState {
             next_fire_millis: None,

@@ -647,16 +647,13 @@ fn layer_begin_transition(
         .get(2)
         .and_then(variant_object)
         .or_else(|| variant_object(&runtime.object_member(this, "comp")));
-    match native_layer_id(runtime, this)? {
-        Some(layer_id) => {
-            if let Some(source) = source {
-                copy_layer_images(runtime, this, layer_id, source)?;
-            }
-            if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-                layer.visible = true;
-            }
+    if let Some(layer_id) = native_layer_id(runtime, this)? {
+        if let Some(source) = source {
+            copy_layer_images(runtime, this, layer_id, source)?;
         }
-        None => {}
+        if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+            layer.visible = true;
+        }
     }
     runtime.host_mut().apply_immediate_transition();
     runtime.set_object_member(this, "visible", Variant::Integer(1));

@@ -897,6 +897,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     fn call_string_method(&self, value: String, name: &str, args: Vec<Variant>) -> Result<Variant> {
         match name {
             "toString" => Ok(Variant::String(value)),
+            "escape" => Ok(Variant::String(escape_tjs_string_fragment(&value))),
             "substr" | "substring" => {
                 let start = args
                     .first()
@@ -1146,4 +1147,23 @@ fn byte_index_for_utf16(value: &str, target: usize) -> usize {
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
+}
+
+fn escape_tjs_string_fragment(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\0' => escaped.push_str("\\0"),
+            ch if ch.is_control() => {
+                escaped.push_str(&format!("\\x{:02x}", ch as u32));
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }

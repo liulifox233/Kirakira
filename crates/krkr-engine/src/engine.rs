@@ -6,7 +6,7 @@ use std::{
 
 use krkr_core::{
     ButtonState, Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey,
-    FrameInput, FrameOutput, MessageLayerModel, PointerButton,
+    FrameInput, FrameOutput, MessageLayerModel, Point, PointerButton,
 };
 use krkr_kag::{Attribute, AttributeValue, KagParser, Tag};
 use krkr_tjs2::{
@@ -108,6 +108,7 @@ pub struct KrkrEngine {
     message_layer: MessageLayerModel,
     kag_budget: KagRunBudget,
     plugins: Vec<Box<dyn KrkrPlugin>>,
+    cursor_position: Option<Point>,
 }
 
 impl KrkrEngine {
@@ -126,6 +127,7 @@ impl KrkrEngine {
             message_layer: MessageLayerModel::default(),
             kag_budget: config.kag_budget,
             plugins: Vec::new(),
+            cursor_position: None,
         })
     }
 
@@ -233,7 +235,7 @@ impl KrkrEngine {
     }
 
     pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
-        self.handle_input_events(&input.events);
+        self.handle_input_events(&input.events)?;
         self.pump_tjs_events()?;
         let tick = self.advance(delta)?;
         self.sync_native_layers_from_tjs()?;
@@ -358,20 +360,68 @@ impl KrkrEngine {
             .map(|_| ())
     }
 
-    fn handle_input_events(&mut self, events: &[EngineEvent]) {
+    fn handle_input_events(&mut self, events: &[EngineEvent]) -> Result<()> {
         for event in events {
             match event {
+                EngineEvent::CursorMoved { position } => {
+                    self.cursor_position = Some(*position);
+                }
+                EngineEvent::PointerInput {
+                    button: PointerButton::Primary,
+                    state: ButtonState::Pressed,
+                } => {
+                    self.dispatch_layer_pointer_event("onMouseDown")?;
+                }
                 EngineEvent::PointerInput {
                     button: PointerButton::Primary,
                     state: ButtonState::Released,
+                } => {
+                    self.dispatch_layer_pointer_event("onMouseUp")?;
+                    self.signal_kag_click();
                 }
-                | EngineEvent::KeyboardInput {
+                EngineEvent::KeyboardInput {
                     key: EngineKey::Enter | EngineKey::Space,
                     state: ButtonState::Pressed,
                 } => self.signal_kag_click(),
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    fn dispatch_layer_pointer_event(&mut self, method: &str) -> Result<()> {
+        let Some(position) = self.cursor_position else {
+            return Ok(());
+        };
+        let Some(layer_id) = self.tjs_runtime.host().layer_tree().hit_test(position) else {
+            return Ok(());
+        };
+        let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
+            return Ok(());
+        };
+        let Some((layer_left, layer_top)) = self
+            .tjs_runtime
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .map(|layer| (layer.left, layer.top))
+        else {
+            return Ok(());
+        };
+        let x = (position.x - layer_left).round() as i64;
+        let y = (position.y - layer_top).round() as i64;
+        self.tjs_runtime
+            .call_object_method(
+                object,
+                method,
+                vec![
+                    Variant::Integer(x),
+                    Variant::Integer(y),
+                    Variant::Integer(0),
+                    Variant::Integer(0),
+                ],
+            )
+            .map(|_| ())
     }
 
     fn sync_native_layers_from_tjs(&mut self) -> Result<()> {
@@ -1673,6 +1723,62 @@ mod tests {
             )
             .expect("update");
         assert_eq!(frame.output.image_uploads.len(), 2);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn update_dispatches_primary_pointer_release_to_top_native_layer() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var testLayer = new Layer();
+                testLayer.clicked = "";
+                testLayer.setPos(10, 20);
+                testLayer.setSize(30, 40);
+                testLayer.visible = true;
+                testLayer.onMouseUp = function(x, y, button, shift) {
+                    this.clicked = "" + x + ":" + y + ":" + button + ":" + shift;
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(15.0, 26.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "testLayer.clicked")
+                .expect("clicked"),
+            Variant::String("5:6:0:0".to_string())
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

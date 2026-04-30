@@ -258,6 +258,51 @@ impl LayerNode {
         )
     }
 
+    fn image_command(&self) -> Option<ImageCommand> {
+        let image = self.image.as_ref()?;
+        if self.width <= 0.0 || self.height <= 0.0 {
+            return None;
+        }
+
+        let texture_size = image.size();
+        let image_width = texture_size.width;
+        let image_height = texture_size.height;
+        let layer_x0 = self.left;
+        let layer_y0 = self.top;
+        let layer_x1 = self.left + self.width;
+        let layer_y1 = self.top + self.height;
+        let image_x0 = self.left + self.image_left;
+        let image_y0 = self.top + self.image_top;
+        let image_x1 = image_x0 + image_width;
+        let image_y1 = image_y0 + image_height;
+
+        let target_x0 = layer_x0.max(image_x0);
+        let target_y0 = layer_y0.max(image_y0);
+        let target_x1 = layer_x1.min(image_x1);
+        let target_y1 = layer_y1.min(image_y1);
+        if target_x1 <= target_x0 || target_y1 <= target_y0 {
+            return None;
+        }
+
+        Some(ImageCommand {
+            texture_id: image.upload.texture_id,
+            rect: Rect::new(
+                target_x0,
+                target_y0,
+                target_x1 - target_x0,
+                target_y1 - target_y0,
+            ),
+            source_rect: Rect::new(
+                target_x0 - image_x0,
+                target_y0 - image_y0,
+                target_x1 - target_x0,
+                target_y1 - target_y0,
+            ),
+            texture_size,
+            opacity: self.opacity as f32 / 255.0,
+        })
+    }
+
     pub fn set_image(&mut self, image: LayerImage) {
         let size = image.size();
         self.image_width = size.width;
@@ -321,6 +366,23 @@ impl LayerTree {
         self.layers.remove(&id)
     }
 
+    pub fn hit_test(&self, point: Point) -> Option<LayerId> {
+        let mut layers = self
+            .layers
+            .values()
+            .filter(|layer| {
+                layer.renderable
+                    && layer.visible
+                    && layer.opacity > 0
+                    && layer.width > 0.0
+                    && layer.height > 0.0
+                    && layer.rect().contains(point)
+            })
+            .collect::<Vec<_>>();
+        layers.sort_by_key(|layer| (layer.z_order, layer.id));
+        layers.last().map(|layer| layer.id)
+    }
+
     pub fn draw_model(&self) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
         let mut layers = self
             .layers
@@ -335,16 +397,10 @@ impl LayerTree {
             let Some(image) = &layer.image else {
                 continue;
             };
-            if layer.width <= 0.0 || layer.height <= 0.0 {
+            let Some(command) = layer.image_command() else {
                 continue;
-            }
-            commands.push(DrawCommand::Image(ImageCommand {
-                texture_id: image.upload.texture_id,
-                rect: layer.rect(),
-                source_rect: layer.image_rect(),
-                texture_size: image.size(),
-                opacity: layer.opacity as f32 / 255.0,
-            }));
+            };
+            commands.push(DrawCommand::Image(command));
             uploads.push(image.upload.clone());
         }
         (commands, uploads)
@@ -1353,6 +1409,83 @@ mod tests {
                 DrawCommand::Image(second)
             ] if first.texture_id == 1 && second.texture_id == 2
         ));
+    }
+
+    #[test]
+    fn layer_tree_draw_model_clips_negative_image_offsets_for_sprite_sheets() {
+        let pixels = std::sync::Arc::<[u8]>::from(vec![255; 12 * 4]);
+        let image = LayerImage::new(7, 12, 1, pixels);
+        let mut layers = LayerTree::new();
+        let id = layers.create_layer("button", None, 10);
+        {
+            let layer = layers.layer_mut(id).expect("button layer");
+            layer.left = 100.0;
+            layer.top = 20.0;
+            layer.width = 4.0;
+            layer.height = 1.0;
+            layer.image_left = -4.0;
+            layer.visible = true;
+            layer.set_image(image);
+        }
+
+        let (commands, uploads) = layers.draw_model();
+
+        assert_eq!(uploads.len(), 1);
+        assert!(matches!(
+            &commands[..],
+            [DrawCommand::Image(image)]
+                if image.rect == Rect::new(100.0, 20.0, 4.0, 1.0)
+                    && image.source_rect == Rect::new(4.0, 0.0, 4.0, 1.0)
+                    && image.texture_size == Size::new(12.0, 1.0)
+        ));
+    }
+
+    #[test]
+    fn layer_tree_draw_model_clips_positive_image_offsets_to_layer_viewport() {
+        let pixels = std::sync::Arc::<[u8]>::from(vec![255; 8 * 4]);
+        let image = LayerImage::new(9, 8, 1, pixels);
+        let mut layers = LayerTree::new();
+        let id = layers.create_layer("inset", None, 10);
+        {
+            let layer = layers.layer_mut(id).expect("inset layer");
+            layer.left = 10.0;
+            layer.top = 5.0;
+            layer.width = 4.0;
+            layer.height = 1.0;
+            layer.image_left = 2.0;
+            layer.visible = true;
+            layer.set_image(image);
+        }
+
+        let (commands, _uploads) = layers.draw_model();
+
+        assert!(matches!(
+            &commands[..],
+            [DrawCommand::Image(image)]
+                if image.rect == Rect::new(12.0, 5.0, 2.0, 1.0)
+                    && image.source_rect == Rect::new(0.0, 0.0, 2.0, 1.0)
+        ));
+    }
+
+    #[test]
+    fn layer_tree_hit_test_returns_topmost_visible_layer() {
+        let mut layers = LayerTree::new();
+        let low = layers.create_layer("low", None, 10);
+        let high = layers.create_layer("high", None, 20);
+        for id in [low, high] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.left = 10.0;
+            layer.top = 20.0;
+            layer.width = 30.0;
+            layer.height = 40.0;
+            layer.visible = true;
+        }
+
+        assert_eq!(layers.hit_test(Point::new(15.0, 25.0)), Some(high));
+        assert_eq!(layers.hit_test(Point::new(50.0, 25.0)), None);
+
+        layers.layer_mut(high).expect("high").visible = false;
+        assert_eq!(layers.hit_test(Point::new(15.0, 25.0)), Some(low));
     }
 
     #[test]
