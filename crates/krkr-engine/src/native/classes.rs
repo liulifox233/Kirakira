@@ -483,6 +483,14 @@ fn layer_load_images(
         Some(options) => object_optional_integer(runtime, options, "top").transpose()?,
         None => None,
     };
+    let width = match options {
+        Some(options) => object_optional_integer(runtime, options, "width").transpose()?,
+        None => None,
+    };
+    let height = match options {
+        Some(options) => object_optional_integer(runtime, options, "height").transpose()?,
+        None => None,
+    };
     let opacity = match options {
         Some(options) => object_optional_integer(runtime, options, "opacity").transpose()?,
         None => None,
@@ -501,6 +509,12 @@ fn layer_load_images(
                 }
                 if let Some(top) = top {
                     layer.top = top as f32;
+                }
+                if let Some(width) = width {
+                    layer.width = width.max(0) as f32;
+                }
+                if let Some(height) = height {
+                    layer.height = height.max(0) as f32;
                 }
                 if let Some(opacity) = opacity {
                     layer.opacity = opacity.clamp(0, 255) as u8;
@@ -528,6 +542,8 @@ fn layer_load_images(
                 if let Some(top) = top {
                     layer.top = top as f32;
                 }
+                layer.width = width.map_or(size.width, |width| width.max(0) as f32);
+                layer.height = height.map_or(size.height, |height| height.max(0) as f32);
                 if let Some(opacity) = opacity {
                     layer.opacity = opacity.clamp(0, 255) as u8;
                 }
@@ -541,6 +557,12 @@ fn layer_load_images(
     }
     if let Some(top) = top {
         runtime.set_object_member(this, "top", Variant::Integer(top));
+    }
+    if let Some(width) = width {
+        runtime.set_object_member(this, "width", Variant::Integer(width.max(0)));
+    }
+    if let Some(height) = height {
+        runtime.set_object_member(this, "height", Variant::Integer(height.max(0)));
     }
     if let Some(opacity) = opacity {
         runtime.set_object_member(this, "opacity", Variant::Integer(opacity.clamp(0, 255)));
@@ -862,8 +884,22 @@ fn sync_layer_image_members(
     runtime.set_object_member(this, "imageTop", Variant::Integer(0));
     runtime.set_object_member(this, "imageWidth", Variant::Integer(width));
     runtime.set_object_member(this, "imageHeight", Variant::Integer(height));
-    runtime.set_object_member(this, "width", Variant::Integer(width));
-    runtime.set_object_member(this, "height", Variant::Integer(height));
+    if runtime
+        .object_member(this, "width")
+        .to_integer()
+        .unwrap_or(0)
+        <= 0
+    {
+        runtime.set_object_member(this, "width", Variant::Integer(width));
+    }
+    if runtime
+        .object_member(this, "height")
+        .to_integer()
+        .unwrap_or(0)
+        <= 0
+    {
+        runtime.set_object_member(this, "height", Variant::Integer(height));
+    }
 }
 
 pub(crate) struct NativeClassSpec {

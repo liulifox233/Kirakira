@@ -878,9 +878,18 @@ fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
         .ok_or_else(|| TjsError::runtime("KAG image tag requires storage"))?;
     let (page, layer_name) = kag_target(runtime, tag);
     let image = runtime.host_mut().load_image_storage(storage)?;
+    let image_size = image.size();
+    let has_explicit_width = tag.literal_attr("width").is_some();
+    let has_explicit_height = tag.literal_attr("height").is_some();
     let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
         layer.set_image(image);
+        if !has_explicit_width {
+            layer.width = image_size.width;
+        }
+        if !has_explicit_height {
+            layer.height = image_size.height;
+        }
         layer.visible = kag_bool_attr(tag, "visible").unwrap_or(true);
         apply_tag_geometry(layer, tag)?;
     }
@@ -1596,6 +1605,70 @@ mod tests {
     }
 
     #[test]
+    fn kag_image_tag_replaces_previous_layer_size_when_geometry_is_implicit() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("small.png"), 2, 1, &[255; 8]);
+        write_png(root.join("large.png"), 4, 3, &[0; 48]);
+        fs::write(
+            root.join("first.ks"),
+            "[image storage=small.png layer=base page=fore][image storage=large.png layer=base page=fore][s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.width == 4.0 && image.rect.height == 3.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_transition_uses_replacement_image_size() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("small.png"), 2, 1, &[255; 8]);
+        write_png(root.join("large.png"), 4, 3, &[0; 48]);
+        fs::write(
+            root.join("first.ks"),
+            "[image storage=small.png layer=base page=back][trans][wt][image storage=large.png layer=base page=back][trans][wt][s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.width == 4.0 && image.rect.height == 3.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn kag_current_supplies_default_visual_layer_target() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -1675,6 +1748,32 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_load_images_preserves_existing_viewport_size() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 2, 3, &[255; 24]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(1280, 720);
+                layer.setSizeToImageSize();
+                layer.loadImages("sprite.png");
+                return layer.width + ":" + layer.height + ":" +
+                    layer.imageWidth + ":" + layer.imageHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1280:720:2:3".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn native_layer_load_images_accepts_kag_dictionary_options() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -1699,6 +1798,45 @@ mod tests {
             .expect("script");
 
         assert_eq!(result, Variant::String("1:0:17:64".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_load_images_for_kag_target_replaces_previous_layer_size() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("small.png"), 2, 1, &[255; 8]);
+        write_png(root.join("large.png"), 4, 3, &[0; 48]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.__nativeLayerId = 0;
+                layer.loadImages(%[storage: "small.png", page: "fore", layer: "base"]);
+                layer.loadImages(%[storage: "large.png", page: "fore", layer: "base"]);
+                return "done";
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.width == 4.0 && image.rect.height == 3.0
+            )
+        }));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
