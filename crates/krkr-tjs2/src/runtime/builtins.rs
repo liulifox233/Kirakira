@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::BTreeSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::error::{Result, TjsError};
 use crate::runtime::object::Object;
@@ -467,7 +470,8 @@ fn dictionary_save_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    let text = dictionary_struct_value(runtime, &Variant::Object(handle), 0);
+    let mut serializer = DictionaryStructSerializer::new(runtime);
+    let text = serializer.value(&Variant::Object(handle), 0);
     runtime.host_mut().write_text(&path, &mode, &text)?;
     Ok(Variant::Void)
 }
@@ -501,45 +505,60 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
     Ok(Variant::Integer(1))
 }
 
-fn dictionary_struct_value<H: TjsHost + 'static>(
-    runtime: &Runtime<H>,
-    value: &Variant,
-    depth: usize,
-) -> String {
-    if depth > 16 {
-        return "void".to_string();
-    }
-    match value {
-        Variant::Void => "void".to_string(),
-        Variant::Null => "null".to_string(),
-        Variant::Integer(value) => value.to_string(),
-        Variant::Real(value) => value.to_string(),
-        Variant::String(value) => tjs_quote(value),
-        Variant::Octet(_) => "void".to_string(),
-        Variant::Object(handle) => {
-            if let Some(elements) = runtime.heap[handle.0].array_elements() {
-                let elements = elements
-                    .iter()
-                    .map(|value| dictionary_struct_value(runtime, value, depth + 1))
-                    .collect::<Vec<_>>();
-                format!("[{}]", elements.join(", "))
-            } else {
-                let entries = runtime.heap[handle.0]
-                    .members
-                    .iter()
-                    .filter(|(key, _)| !is_native_member_name(key))
-                    .map(|(key, value)| {
-                        format!(
-                            "{} => {}",
-                            tjs_quote(key),
-                            dictionary_struct_value(runtime, value, depth + 1)
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                format!("%[{}]", entries.join(", "))
-            }
+struct DictionaryStructSerializer<'a, H: TjsHost> {
+    runtime: &'a Runtime<H>,
+    active: BTreeSet<ObjectHandle>,
+}
+
+impl<'a, H: TjsHost + 'static> DictionaryStructSerializer<'a, H> {
+    const MAX_DEPTH: usize = 32;
+
+    fn new(runtime: &'a Runtime<H>) -> Self {
+        Self {
+            runtime,
+            active: BTreeSet::new(),
         }
-        Variant::Closure(_) | Variant::CodeObject(_) => "void".to_string(),
+    }
+
+    fn value(&mut self, value: &Variant, depth: usize) -> String {
+        if depth > Self::MAX_DEPTH {
+            return "void".to_string();
+        }
+        match value {
+            Variant::Void => "void".to_string(),
+            Variant::Null => "null".to_string(),
+            Variant::Integer(value) => value.to_string(),
+            Variant::Real(value) => value.to_string(),
+            Variant::String(value) => tjs_quote(value),
+            Variant::Octet(_) => "void".to_string(),
+            Variant::Object(handle) => self.object(*handle, depth),
+            Variant::Closure(_) | Variant::CodeObject(_) => "void".to_string(),
+        }
+    }
+
+    fn object(&mut self, handle: ObjectHandle, depth: usize) -> String {
+        if !self.active.insert(handle) {
+            return "void".to_string();
+        }
+        let text = if let Some(elements) = self.runtime.heap[handle.0].array_elements() {
+            let elements = elements
+                .iter()
+                .map(|value| self.value(value, depth + 1))
+                .collect::<Vec<_>>();
+            format!("[{}]", elements.join(", "))
+        } else {
+            let entries = self.runtime.heap[handle.0]
+                .members
+                .iter()
+                .filter(|(key, _)| !is_native_member_name(key))
+                .map(|(key, value)| {
+                    format!("{} => {}", tjs_quote(key), self.value(value, depth + 1))
+                })
+                .collect::<Vec<_>>();
+            format!("%[{}]", entries.join(", "))
+        };
+        self.active.remove(&handle);
+        text
     }
 }
 

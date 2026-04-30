@@ -108,6 +108,8 @@ pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) script_files: Vec<ScriptFile>,
     pub(crate) native_functions: Vec<Arc<dyn NativeFunction<H>>>,
     pub(crate) vm_native_functions: Vec<Arc<dyn VmNativeFunction<H>>>,
+    pub(crate) call_depth: usize,
+    pub(crate) max_call_depth: usize,
     host: H,
 }
 
@@ -137,6 +139,8 @@ impl<H: TjsHost + 'static> Runtime<H> {
             script_files: Vec::new(),
             native_functions: Vec::new(),
             vm_native_functions: Vec::new(),
+            call_depth: 0,
+            max_call_depth: 32,
             host,
         };
         builtins::install(&mut runtime);
@@ -296,6 +300,21 @@ impl<H: TjsHost + 'static> Runtime<H> {
         &mut self.host
     }
 
+    pub(crate) fn enter_call_frame(&mut self) -> Result<()> {
+        if self.call_depth >= self.max_call_depth {
+            return Err(TjsError::runtime(format!(
+                "TJS call stack exceeded {} frames",
+                self.max_call_depth
+            )));
+        }
+        self.call_depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn leave_call_frame(&mut self) {
+        self.call_depth = self.call_depth.saturating_sub(1);
+    }
+
     pub(crate) fn alloc_object(&mut self, object: Object) -> ObjectHandle {
         let handle = ObjectHandle(self.heap.len());
         self.heap.push(object);
@@ -337,12 +356,17 @@ impl<H: TjsHost + 'static> Runtime<H> {
             .ok_or_else(|| TjsError::runtime(format!("script file {file_id} does not exist")))
     }
 
-    pub(crate) fn alloc_proxy(
+    pub(crate) fn alloc_proxy_bound(
         &mut self,
         primary: Option<ObjectHandle>,
         fallback: ObjectHandle,
+        bind_this: Option<ObjectHandle>,
     ) -> ObjectHandle {
-        self.alloc_object(Object::new(ObjectKind::Proxy { primary, fallback }))
+        self.alloc_object(Object::new(ObjectKind::Proxy {
+            primary,
+            fallback,
+            bind_this,
+        }))
     }
 
     pub(crate) fn alloc_native<F>(&mut self, function: F, constructable: bool) -> ObjectHandle

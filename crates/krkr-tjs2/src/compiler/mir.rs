@@ -212,6 +212,7 @@ pub struct SourceFile {
     pub id: SourceFileId,
     pub name: String,
     pub text_hash: Option<[u8; 32]>,
+    pub text: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -624,7 +625,7 @@ impl MirObject {
                     Err(TjsError::mir(format!("invalid arg id {index}")))
                 }
             }
-            SlotId::This | SlotId::ThisProxy => Ok(()),
+            SlotId::This | SlotId::ThisProxy | SlotId::SuperProxy => Ok(()),
         }
     }
 }
@@ -713,6 +714,7 @@ pub enum SlotId {
     Arg(u32),
     This,
     ThisProxy,
+    SuperProxy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1185,6 +1187,7 @@ impl<'a> Lowerer<'a> {
                     id: SourceFileId(0),
                     name: source_name.to_string(),
                     text_hash: None,
+                    text: Some(source_text.to_string()),
                 }],
                 spans: Vec::new(),
                 strings: Vec::new(),
@@ -2293,7 +2296,7 @@ impl ObjectBuilder {
             }
             syntax::ExprKind::Identifier(ident) => self.read_ident(lowerer, ident, expr.span),
             syntax::ExprKind::This => Ok(Value::Slot(SlotId::This)),
-            syntax::ExprKind::Super => Ok(Value::Slot(SlotId::ThisProxy)),
+            syntax::ExprKind::Super => Ok(Value::Slot(SlotId::SuperProxy)),
             syntax::ExprKind::Global => {
                 let dst = self.temp();
                 self.emit(MirInst::LoadGlobal { dst });

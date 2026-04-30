@@ -11,6 +11,7 @@ pub(super) struct Frame {
     pub(super) entries: Vec<ExceptionEntry>,
     pub(super) this_obj: Option<ObjectHandle>,
     pub(super) this_proxy: ObjectHandle,
+    pub(super) super_proxy: ObjectHandle,
 }
 
 impl Frame {
@@ -19,6 +20,7 @@ impl Frame {
         args: Vec<Variant>,
         this_obj: Option<ObjectHandle>,
         this_proxy: ObjectHandle,
+        super_proxy: ObjectHandle,
     ) -> Result<Self> {
         let frame_len = object.max_frame_count.saturating_add(1).max(1) as usize;
         let mut regs = vec![Variant::Void; frame_len];
@@ -46,6 +48,7 @@ impl Frame {
             entries: Vec::new(),
             this_obj,
             this_proxy,
+            super_proxy,
         })
     }
 
@@ -60,8 +63,9 @@ impl Frame {
         match reg {
             -1 => Ok(self.this_obj.map(Variant::Object).unwrap_or(Variant::Null)),
             -2 => Ok(Variant::Object(self.this_proxy)),
+            -3 => Ok(Variant::Object(self.super_proxy)),
             value => {
-                let index = usize::try_from((-3 - value) as i32).expect("nonnegative");
+                let index = usize::try_from((-4 - value) as i32).expect("nonnegative");
                 Ok(self.negative.get(index).cloned().unwrap_or_default())
             }
         }
@@ -77,11 +81,11 @@ impl Frame {
             return Ok(());
         }
         match reg {
-            -1 | -2 => Err(TjsError::runtime(format!(
+            -3..=-1 => Err(TjsError::runtime(format!(
                 "writing reserved register {reg} is not supported"
             ))),
             reg_value => {
-                let index = usize::try_from((-3 - reg_value) as i32).expect("nonnegative");
+                let index = usize::try_from((-4 - reg_value) as i32).expect("nonnegative");
                 if index >= self.negative.len() {
                     self.negative.resize(index + 1, Variant::Void);
                 }

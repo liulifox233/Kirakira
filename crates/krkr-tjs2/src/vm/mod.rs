@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
 use crate::bytecode::{BytecodeFile, CodeObject, Instruction};
-use crate::error::{Result, TjsError};
+use crate::error::{Result, TjsError, TjsSourceLocation, TjsStackFrame};
 use crate::runtime::{
     Closure, NativeFunction, NoHost, Object, ObjectHandle, Runtime, TjsHost, Variant,
 };
@@ -121,41 +121,52 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .enumerate()
             .map(|(index, inst)| (inst.offset, index))
             .collect::<BTreeMap<_, _>>();
-        let caller_args = args.clone();
-        let global = self.runtime.global;
-        let this_obj = this_obj.or(Some(global));
-        let this_proxy = self.runtime.alloc_proxy(this_obj, global);
-        let mut frame = Frame::new(&object, args, this_obj, this_proxy)?;
-        if let Some(collapse_base) = object.func_decl_collapse_base {
-            let base = collapse_base as usize;
-            let rest = if caller_args.len() > base {
-                caller_args[base..].to_vec()
-            } else {
-                Vec::new()
-            };
-            let array = self.runtime.alloc_object(Object::array(rest));
-            frame.set(-3 - collapse_base as i16, Variant::Object(array))?;
-        }
-
-        let mut pc = offset_to_index.get(&(0_usize)).copied().unwrap_or(0);
-        while pc < instructions.len() {
-            let inst = &instructions[pc];
-            let next_pc = next_instruction_index(&offset_to_index, &instructions, pc)?;
-            match self
-                .execute_instruction(&object, &mut frame, inst, next_pc, &offset_to_index)
-                .map_err(|error| {
-                    let name = object.name(self.file.as_ref()).unwrap_or("<anonymous>");
-                    TjsError::runtime(format!(
-                        "while executing `{name}` at bytecode {}: {}",
-                        inst.offset, error.message
-                    ))
-                })? {
-                Step::Next(next) => pc = next,
-                Step::Return(value) => return Ok(value),
+        self.runtime
+            .enter_call_frame()
+            .map_err(|error| error.with_stack_frame(self.stack_frame(&object, 0)))?;
+        let result = (|| {
+            let caller_args = args.clone();
+            let global = self.runtime.global;
+            let this_obj = this_obj.or(Some(global));
+            let this_proxy = self.runtime.alloc_proxy_bound(this_obj, global, None);
+            let super_class = self.super_class_for_object(&object);
+            let super_proxy = self.runtime.alloc_proxy_bound(
+                super_class.or(this_obj),
+                global,
+                super_class.and(this_obj),
+            );
+            let mut frame = Frame::new(&object, args, this_obj, this_proxy, super_proxy)?;
+            if let Some(collapse_base) = object.func_decl_collapse_base {
+                let base = collapse_base as usize;
+                let rest = if caller_args.len() > base {
+                    caller_args[base..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let array = self.runtime.alloc_object(Object::array(rest));
+                frame.set(-4 - collapse_base as i16, Variant::Object(array))?;
             }
-        }
 
-        Ok(frame.result)
+            let mut pc = offset_to_index.get(&(0_usize)).copied().unwrap_or(0);
+            while pc < instructions.len() {
+                let inst = &instructions[pc];
+                let next_pc = next_instruction_index(&offset_to_index, &instructions, pc).map_err(
+                    |error| error.with_stack_frame(self.stack_frame(&object, inst.offset)),
+                )?;
+                match self
+                    .execute_instruction(&object, &mut frame, inst, next_pc, &offset_to_index)
+                    .map_err(|error| {
+                        error.with_stack_frame(self.stack_frame(&object, inst.offset))
+                    })? {
+                    Step::Next(next) => pc = next,
+                    Step::Return(value) => return Ok(value),
+                }
+            }
+
+            Ok(frame.result)
+        })();
+        self.runtime.leave_call_frame();
+        result
     }
 
     fn execute_instruction(
@@ -437,6 +448,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let info = frame.get(inst.operands[1])?;
                 let mut copied_object_infos = false;
                 if let Ok(info_handle) = self.resolve_object(info.clone()) {
+                    self.runtime.heap[object_handle.0].super_class = Some(info_handle);
                     let infos = self.runtime.heap[info_handle.0].class_infos.clone();
                     copied_object_infos = !infos.is_empty();
                     for info in infos {
@@ -521,6 +533,130 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             value => value,
         }
     }
+
+    fn super_class_for_object(&self, object: &CodeObject) -> Option<ObjectHandle> {
+        let class_object = object.parent?;
+        let class_handle = *self.code_handles.get(class_object)?;
+        self.runtime.heap[class_handle.0].super_class
+    }
+
+    pub(super) fn value_debug_type(&self, value: &Variant) -> String {
+        match value {
+            Variant::Void => "void".to_string(),
+            Variant::Null => "null".to_string(),
+            Variant::Integer(_) => "Integer".to_string(),
+            Variant::Real(_) => "Real".to_string(),
+            Variant::String(_) => "String".to_string(),
+            Variant::Octet(_) => "Octet".to_string(),
+            Variant::CodeObject(index) => format!("CodeObject#{index}"),
+            Variant::Closure(closure) => self.object_debug_type(closure.object, "closure"),
+            Variant::Object(handle) => self.object_debug_type(*handle, "object"),
+        }
+    }
+
+    pub(super) fn object_debug_type(&self, handle: ObjectHandle, fallback: &str) -> String {
+        let Some(object) = self.runtime.heap.get(handle.0) else {
+            return format!("{fallback}#{}", handle.0);
+        };
+        let mut label = match &object.kind {
+            crate::runtime::ObjectKind::Ordinary => fallback.to_string(),
+            crate::runtime::ObjectKind::Proxy { .. } => "proxy".to_string(),
+            crate::runtime::ObjectKind::Array { .. } => "Array".to_string(),
+            crate::runtime::ObjectKind::InterCode {
+                file_id,
+                object_index,
+                context,
+            } => {
+                let name = self
+                    .runtime
+                    .script_file(*file_id)
+                    .ok()
+                    .and_then(|file| {
+                        file.objects
+                            .get(*object_index)
+                            .and_then(|object| object.name(&file).map(str::to_string))
+                    })
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                format!("{context:?} {name}")
+            }
+            crate::runtime::ObjectKind::NativeFunction { .. } => "NativeFunction".to_string(),
+            crate::runtime::ObjectKind::VmNativeFunction { .. } => "VmNativeFunction".to_string(),
+        };
+        if !object.class_infos.is_empty() {
+            label.push('<');
+            label.push_str(&object.class_infos.join("|"));
+            label.push('>');
+        }
+        format!("{label}#{}", handle.0)
+    }
+
+    fn stack_frame(&self, object: &CodeObject, bytecode_offset: usize) -> TjsStackFrame {
+        let storage = self
+            .file
+            .debug_info
+            .sources
+            .first()
+            .map(|source| source.name.clone());
+        TjsStackFrame {
+            storage,
+            object_name: object
+                .name(self.file.as_ref())
+                .unwrap_or("<anonymous>")
+                .to_string(),
+            context: format!("{:?}", object.context_type),
+            bytecode_offset,
+            source: self.source_location(object, bytecode_offset),
+        }
+    }
+
+    fn source_location(
+        &self,
+        object: &CodeObject,
+        bytecode_offset: usize,
+    ) -> Option<TjsSourceLocation> {
+        let position = object
+            .source_positions
+            .iter()
+            .take_while(|position| position.code_pos as usize <= bytecode_offset)
+            .last()?;
+        let source = self.file.debug_info.sources.first();
+        let storage = source.map(|source| source.name.clone());
+        let utf16_offset = position.source_pos as usize;
+        let Some(text) = source.and_then(|source| source.text.as_deref()) else {
+            return Some(TjsSourceLocation {
+                storage,
+                line: None,
+                column: None,
+                utf16_offset: Some(utf16_offset),
+            });
+        };
+        let (line, column) = line_column_for_utf16_offset(text, utf16_offset);
+        Some(TjsSourceLocation {
+            storage,
+            line: Some(line),
+            column: Some(column),
+            utf16_offset: Some(utf16_offset),
+        })
+    }
+}
+
+fn line_column_for_utf16_offset(text: &str, utf16_offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    let mut offset = 0;
+    for ch in text.chars() {
+        if offset >= utf16_offset {
+            break;
+        }
+        offset += ch.len_utf16();
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
 }
 
 impl DispatchFlags {
@@ -705,6 +841,7 @@ mod tests {
                 properties: Vec::new(),
             }],
             top_level: Some(0),
+            debug_info: Default::default(),
         }
     }
 }

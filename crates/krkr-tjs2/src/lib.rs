@@ -21,7 +21,10 @@ pub mod runtime;
 pub mod vm;
 
 pub use compiler::{compile_source_to_bytecode, compile_source_to_mir, execute_source};
-pub use error::{Result, Span, TjsError, TjsErrorKind};
+pub use error::{
+    Result, Span, TjsError, TjsErrorContext, TjsErrorKind, TjsMemberAccess, TjsMemberOperation,
+    TjsSourceLocation, TjsStackFrame,
+};
 pub use frontend::{
     Diagnostic, DiagnosticSeverity, FrontendOptions, FrontendOutput, SourceLocation,
     analyze_script, parse_expression, parse_script,

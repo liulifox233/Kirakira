@@ -8,6 +8,7 @@ pub struct Object {
     pub kind: ObjectKind,
     pub members: BTreeMap<String, Variant>,
     pub class_infos: Vec<String>,
+    pub super_class: Option<ObjectHandle>,
     pub valid: bool,
 }
 
@@ -17,6 +18,7 @@ impl Default for Object {
             kind: ObjectKind::Ordinary,
             members: BTreeMap::new(),
             class_infos: Vec::new(),
+            super_class: None,
             valid: true,
         }
     }
@@ -164,6 +166,7 @@ pub enum ObjectKind {
     Proxy {
         primary: Option<ObjectHandle>,
         fallback: ObjectHandle,
+        bind_this: Option<ObjectHandle>,
     },
     Array {
         elements: Vec<Variant>,

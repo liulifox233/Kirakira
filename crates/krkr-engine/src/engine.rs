@@ -311,6 +311,45 @@ mod tests {
     }
 
     #[test]
+    fn native_super_constructor_initializes_current_instance() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class GameWindow extends Window {
+                    function GameWindow() { super.Window(); }
+                }
+                var window = new GameWindow();
+                return typeof window.menu != "undefined";
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::Integer(1));
+    }
+
+    #[test]
+    fn kag_parser_super_methods_are_visible() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Parser extends KAGParser {
+                    function Parser() { super.KAGParser(); }
+                    function hasLoadScenario() {
+                        return typeof super.loadScenario != "undefined";
+                    }
+                }
+                var parser = new Parser();
+                return parser.hasLoadScenario();
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::Integer(1));
+    }
+
+    #[test]
     fn top_level_functions_are_visible_to_later_storages() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");

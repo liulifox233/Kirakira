@@ -1,5 +1,5 @@
 use crate::bytecode::{BytecodeContextType, CallArgs, CodeObject, Instruction};
-use crate::error::{Result, TjsError};
+use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
 use crate::runtime::{Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant};
 
 use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form};
@@ -34,16 +34,30 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         flags: DispatchFlags,
         caller_this: Option<ObjectHandle>,
     ) -> Result<Variant> {
-        match target {
-            Variant::String(value) => return self.string_property(&value, name),
-            Variant::Octet(value) => return self.octet_property(&value, name),
+        let receiver_type = self.value_debug_type(&target);
+        match &target {
+            Variant::String(value) => return self.string_property(value, name),
+            Variant::Octet(value) => return self.octet_property(value, name),
             _ => {}
         }
 
         let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
-            TjsError::runtime(format!("getting member `{name}` failed: {}", error.message))
+            error.with_member_access(TjsMemberAccess {
+                operation: TjsMemberOperation::Getting,
+                receiver_type: receiver_type.clone(),
+                member_name: name.to_string(),
+                callee_type: None,
+            })
         })?;
         self.prop_get_handle(handle, name, flags, closure_this.or(caller_this))
+            .map_err(|error| {
+                error.with_member_access(TjsMemberAccess {
+                    operation: TjsMemberOperation::Getting,
+                    receiver_type,
+                    member_name: name.to_string(),
+                    callee_type: None,
+                })
+            })
     }
 
     pub(super) fn prop_get_handle(
@@ -54,11 +68,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         caller_this: Option<ObjectHandle>,
     ) -> Result<Variant> {
         let kind = self.runtime.heap[handle.0].kind.clone();
-        if let ObjectKind::Proxy { primary, fallback } = kind {
+        if let ObjectKind::Proxy {
+            primary,
+            fallback,
+            bind_this,
+        } = kind
+        {
             if let Some(primary) = primary {
+                if bind_this.is_some() && self.handle_class_name_matches(primary, name) {
+                    return Ok(Variant::Closure(Closure::new(primary, bind_this)));
+                }
                 let value = self.prop_get_handle(primary, name, flags, caller_this)?;
                 if !matches!(value, Variant::Void) {
-                    return Ok(value);
+                    return Ok(self.bind_proxy_value(value, bind_this));
                 }
             }
             return self.prop_get_handle(fallback, name, flags, caller_this);
@@ -87,10 +109,24 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         flags: DispatchFlags,
         caller_this: Option<ObjectHandle>,
     ) -> Result<()> {
+        let receiver_type = self.value_debug_type(&target);
         let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
-            TjsError::runtime(format!("setting member `{name}` failed: {}", error.message))
+            error.with_member_access(TjsMemberAccess {
+                operation: TjsMemberOperation::Setting,
+                receiver_type: receiver_type.clone(),
+                member_name: name.to_string(),
+                callee_type: None,
+            })
         })?;
         self.prop_set_handle(handle, name, value, flags, closure_this.or(caller_this))
+            .map_err(|error| {
+                error.with_member_access(TjsMemberAccess {
+                    operation: TjsMemberOperation::Setting,
+                    receiver_type,
+                    member_name: name.to_string(),
+                    callee_type: None,
+                })
+            })
     }
 
     pub(super) fn prop_set_handle(
@@ -102,7 +138,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         caller_this: Option<ObjectHandle>,
     ) -> Result<()> {
         let kind = self.runtime.heap[handle.0].kind.clone();
-        if let ObjectKind::Proxy { primary, fallback } = kind {
+        if let ObjectKind::Proxy {
+            primary, fallback, ..
+        } = kind
+        {
             if let Some(primary) = primary
                 && (flags.ensure || self.runtime.heap[primary.0].get_raw(name).is_some())
             {
@@ -258,7 +297,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     }
 
     pub(super) fn delete_member(&mut self, target: Variant, name: &str) -> Result<bool> {
-        let handle = self.resolve_object(target)?;
+        let receiver_type = self.value_debug_type(&target);
+        let handle = self.resolve_object(target).map_err(|error| {
+            error.with_member_access(TjsMemberAccess {
+                operation: TjsMemberOperation::Deleting,
+                receiver_type,
+                member_name: name.to_string(),
+                callee_type: None,
+            })
+        })?;
         Ok(self.runtime.heap[handle.0].delete(name))
     }
 
@@ -524,6 +571,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         args: Vec<Variant>,
         dest_reg: i16,
     ) -> Result<Variant> {
+        let receiver_type = self.value_debug_type(&object_value);
         if let Variant::String(value) = &object_value {
             return self.call_string_method(value.clone(), name, args);
         }
@@ -531,18 +579,40 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return self.call_octet_method(value.clone(), name, args);
         }
 
-        let (handle, closure_this) = self.closure_parts(object_value.clone())?;
-        let member = self.prop_get_handle(
-            handle,
-            name,
-            DispatchFlags::default(),
-            closure_this.or(Some(handle)),
-        )?;
+        let (handle, closure_this) = self.closure_parts(object_value.clone()).map_err(|error| {
+            error.with_member_access(TjsMemberAccess {
+                operation: TjsMemberOperation::Calling,
+                receiver_type: receiver_type.clone(),
+                member_name: name.to_string(),
+                callee_type: None,
+            })
+        })?;
+        let member = self
+            .prop_get_handle(
+                handle,
+                name,
+                DispatchFlags::default(),
+                closure_this.or(Some(handle)),
+            )
+            .map_err(|error| {
+                error.with_member_access(TjsMemberAccess {
+                    operation: TjsMemberOperation::Calling,
+                    receiver_type: receiver_type.clone(),
+                    member_name: name.to_string(),
+                    callee_type: None,
+                })
+            })?;
+        let callee_type = self.value_debug_type(&member);
         let receiver = self.receiver_this(handle);
         let value = self
             .call_value(member, closure_this.or(Some(receiver)), args, false)
             .map_err(|error| {
-                TjsError::runtime(format!("calling member `{name}` failed: {}", error.message))
+                error.with_member_access(TjsMemberAccess {
+                    operation: TjsMemberOperation::Calling,
+                    receiver_type,
+                    member_name: name.to_string(),
+                    callee_type: Some(callee_type),
+                })
             })?;
         if dest_reg == 0 {
             Ok(Variant::Void)
@@ -569,10 +639,13 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         match self.materialize_code_object(callee) {
             Variant::Closure(closure) => {
-                let effective_this = if self.is_class_handle(closure.object)
-                    && this_obj.is_some_and(|handle| handle != self.runtime.global)
-                {
-                    this_obj
+                let effective_this = if self.is_class_handle(closure.object) {
+                    closure
+                        .this_obj
+                        .filter(|handle| *handle != self.runtime.global)
+                        .or_else(|| this_obj.filter(|handle| *handle != self.runtime.global))
+                        .or(closure.this_obj)
+                        .or(this_obj)
                 } else {
                     closure.this_obj.or(this_obj)
                 };
@@ -637,7 +710,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     .ok_or_else(|| TjsError::runtime(format!("VM native function {id} missing")))?;
                 function.call(self, this_obj, args)
             }
-            ObjectKind::Proxy { primary, fallback } => {
+            ObjectKind::Proxy {
+                primary, fallback, ..
+            } => {
                 if let Some(primary) = primary {
                     self.call_handle(primary, this_obj, args, is_new)
                 } else {
@@ -832,6 +907,47 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             } => primary,
             _ => handle,
         }
+    }
+
+    fn bind_proxy_value(&self, value: Variant, bind_this: Option<ObjectHandle>) -> Variant {
+        let Some(this_obj) = bind_this else {
+            return value;
+        };
+        match self.materialize_code_object(value) {
+            Variant::Closure(mut closure) => {
+                closure.this_obj = Some(this_obj);
+                Variant::Closure(closure)
+            }
+            Variant::Object(handle) => Variant::Closure(Closure::new(handle, Some(this_obj))),
+            value => value,
+        }
+    }
+
+    fn handle_class_name_matches(&self, handle: ObjectHandle, name: &str) -> bool {
+        if self.runtime.heap[handle.0]
+            .class_infos
+            .iter()
+            .any(|info| info == name)
+        {
+            return true;
+        }
+        let ObjectKind::InterCode {
+            file_id,
+            object_index,
+            context: BytecodeContextType::Class,
+        } = self.runtime.heap[handle.0].kind
+        else {
+            return false;
+        };
+        self.runtime
+            .script_file(file_id)
+            .ok()
+            .and_then(|file| {
+                file.objects
+                    .get(object_index)
+                    .and_then(|object| object.name(&file).map(str::to_string))
+            })
+            .is_some_and(|class_name| class_name == name)
     }
 
     pub(super) fn key_from_variant(&self, value: &Variant) -> Result<String> {

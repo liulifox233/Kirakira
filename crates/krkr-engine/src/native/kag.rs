@@ -16,15 +16,19 @@ use crate::{
 use super::{arg_string, required_arg_string};
 
 pub(crate) fn install_kag_parser(runtime: &mut Runtime<KrkrHost>) {
-    runtime.register_global_native("KAGParser", kag_parser_constructor);
+    let handle = runtime.register_global_native("KAGParser", kag_parser_constructor);
+    runtime.add_object_class_info(handle, "KAGParser");
+    install_kag_parser_methods(runtime, handle);
 }
 
 fn kag_parser_constructor(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
+    this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    let handle = runtime.alloc_ordinary_object();
+    let handle = this_obj
+        .filter(|handle| *handle != runtime.global_handle())
+        .unwrap_or_else(|| runtime.alloc_ordinary_object());
     runtime.add_object_class_info(handle, "KAGParser");
     install_kag_parser_methods(runtime, handle);
     runtime

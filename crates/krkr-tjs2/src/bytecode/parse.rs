@@ -45,6 +45,7 @@ pub(super) fn parse_bytecode(bytes: &[u8]) -> Result<BytecodeFile> {
         data,
         objects,
         top_level,
+        debug_info: Default::default(),
     };
     file.verify()?;
     Ok(file)

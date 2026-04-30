@@ -43,6 +43,7 @@ fn output_to_result<T>(output: FrontendOutput<T>) -> Result<T> {
             kind: diagnostic.kind,
             span: diagnostic.span,
             message: diagnostic.message,
+            contexts: Vec::new(),
         });
     }
     output
@@ -121,6 +122,74 @@ mod tests {
             execute_source("inline.tjs", r#"var f = "substr"; return "abcd"[f](1, 2);"#)
                 .expect("execute"),
             Variant::String("bc".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_errors_include_stack_and_member_context() {
+        let error = execute_source(
+            "debug.tjs",
+            "function run() {\n  var d = new Dictionary();\n  d.missing();\n}\nrun();",
+        )
+        .expect_err("missing member call should fail");
+        let text = error.to_string();
+        assert!(text.contains("debug.tjs:"), "{text}");
+        assert!(text.contains("run [Function] bytecode"), "{text}");
+        assert!(text.contains("global [TopLevel] bytecode"), "{text}");
+        assert!(text.contains("calling member `missing`"), "{text}");
+        assert!(text.contains("callee void"), "{text}");
+    }
+
+    #[test]
+    fn recursive_script_calls_fail_before_rust_stack_overflow() {
+        let error = execute_source("recursive.tjs", "function f() { return f(); }\nf();")
+            .expect_err("recursive script should hit the VM call guard");
+        let text = error.to_string();
+        assert!(text.contains("TJS call stack exceeded"), "{text}");
+        assert!(text.contains("more context entries omitted"), "{text}");
+    }
+
+    #[test]
+    fn super_member_call_dispatches_to_base_class() {
+        assert_eq!(
+            execute_source(
+                "super.tjs",
+                r#"
+                    class Base {
+                        function f() { return "base"; }
+                    }
+                    class Child extends Base {
+                        function f() { return super.f(); }
+                    }
+                    var c = new Child();
+                    return c.f();
+                "#
+            )
+            .expect("execute"),
+            Variant::String("base".to_string())
+        );
+    }
+
+    #[test]
+    fn super_constructor_initializes_base_class_members() {
+        assert_eq!(
+            execute_source(
+                "super_ctor.tjs",
+                r#"
+                    class Base {
+                        var value = 42;
+                        function Base() {}
+                    }
+                    class Child extends Base {
+                        function Child() { super.Base(); }
+                        function getValue() { return value; }
+                    }
+                    var c = new Child();
+                    return c.getValue();
+                "#
+            )
+            .expect("execute"),
+            Variant::Integer(42)
         );
     }
 

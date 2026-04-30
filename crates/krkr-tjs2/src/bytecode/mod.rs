@@ -20,6 +20,7 @@ pub struct BytecodeFile {
     pub data: DataPool,
     pub objects: Vec<CodeObject>,
     pub top_level: Option<usize>,
+    pub debug_info: BytecodeDebugInfo,
 }
 
 impl BytecodeFile {
@@ -46,6 +47,17 @@ impl BytecodeFile {
             })
             .map_err(|err| TjsError::bytecode(err.message))
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BytecodeDebugInfo {
+    pub sources: Vec<BytecodeSource>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BytecodeSource {
+    pub name: String,
+    pub text: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

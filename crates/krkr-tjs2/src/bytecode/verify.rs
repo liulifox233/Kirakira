@@ -216,7 +216,7 @@ fn verify_call_args(object: &CodeObject, args: Option<&CallArgs>) -> Result<()> 
 
 fn require_reg(object: &CodeObject, reg: i16) -> Result<()> {
     let min = -i64::from(
-        object.max_variable_count + object.variable_reserve_count + object.func_decl_arg_count + 3,
+        object.max_variable_count + object.variable_reserve_count + object.func_decl_arg_count + 4,
     );
     let max = i64::from(object.max_frame_count);
     let reg = i64::from(reg);

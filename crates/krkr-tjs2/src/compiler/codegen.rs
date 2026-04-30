@@ -6,8 +6,8 @@ use super::mir::{
     MirObject, ObjectId, Place, SlotId, Terminator, UnaryOp, UpdateOp, UpdateResultValue, Value,
 };
 use crate::bytecode::{
-    BytecodeContextType, BytecodeFile, CodeObject, DataPool, DataSlot, DataSlotType,
-    PropertyRegistration, SourcePosition,
+    BytecodeContextType, BytecodeDebugInfo, BytecodeFile, BytecodeSource, CodeObject, DataPool,
+    DataSlot, DataSlotType, PropertyRegistration, SourcePosition,
 };
 use crate::error::{Result, TjsError};
 
@@ -52,6 +52,17 @@ impl<'a> ModuleCodegen<'a> {
             data: self.data.clone(),
             objects,
             top_level,
+            debug_info: BytecodeDebugInfo {
+                sources: self
+                    .module
+                    .sources
+                    .iter()
+                    .map(|source| BytecodeSource {
+                        name: source.name.clone(),
+                        text: source.text.clone(),
+                    })
+                    .collect(),
+            },
         };
         file.verify()?;
         Ok(file)
@@ -153,6 +164,7 @@ struct ObjectCodegen<'a, 'm> {
     object: &'m MirObject,
     code: Vec<i16>,
     data_slots: Vec<DataSlot>,
+    source_positions: Vec<SourcePosition>,
     block_offsets: BTreeMap<super::mir::BlockId, usize>,
     patches: Vec<Patch>,
     next_reg: i16,
@@ -180,6 +192,7 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
             object,
             code: Vec::new(),
             data_slots: Vec::new(),
+            source_positions: Vec::new(),
             block_offsets: BTreeMap::new(),
             patches: Vec::new(),
             next_reg,
@@ -188,6 +201,7 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
 
     fn compile(mut self) -> Result<CodeObject> {
         for block in &self.object.blocks {
+            self.record_block_source_position(block);
             self.block_offsets.insert(block.id, self.code.len());
             for region in self
                 .object
@@ -253,7 +267,7 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
             prop_setter,
             prop_getter,
             super_class_getter,
-            source_positions: Vec::<SourcePosition>::new(),
+            source_positions: self.source_positions,
             code_words: self.code,
             data_slots: self.data_slots,
             super_class_getter_pointers: Vec::new(),
@@ -1141,11 +1155,12 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
             SlotId::Temp(id) => checked_i16(id.0 as usize + 1, "temp register")?,
             SlotId::Local(id) => {
                 let offset = self.object.args.declared.len() + id.0 as usize;
-                -3 - checked_i16(offset, "local register")?
+                -4 - checked_i16(offset, "local register")?
             }
-            SlotId::Arg(index) => -3 - checked_i16(index as usize, "arg register")?,
+            SlotId::Arg(index) => -4 - checked_i16(index as usize, "arg register")?,
             SlotId::This => -1,
             SlotId::ThisProxy => -2,
+            SlotId::SuperProxy => -3,
         })
     }
 
@@ -1153,6 +1168,27 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
         let reg = self.next_reg;
         self.next_reg += 1;
         reg
+    }
+
+    fn record_block_source_position(&mut self, block: &super::mir::BasicBlock) {
+        let Some(span_id) = block.source_span else {
+            return;
+        };
+        let Some(span) = self.module.spans.get(span_id.0 as usize) else {
+            return;
+        };
+        let code_pos = self.code.len() as u32;
+        if self
+            .source_positions
+            .last()
+            .is_some_and(|position| position.code_pos == code_pos)
+        {
+            return;
+        }
+        self.source_positions.push(SourcePosition {
+            code_pos,
+            source_pos: span.utf16_start,
+        });
     }
 
     fn emit_op(&mut self, opcode: i16) {
