@@ -71,7 +71,8 @@ mod tests {
     fn source_to_bytecode_generates_executable_file() {
         let file = compile_source_to_bytecode("inline.tjs", "return 1 + 2;").expect("bytecode");
         let mut runtime = Runtime::new();
-        let mut vm = crate::vm::Vm::new(&file, &mut runtime);
+        let file_id = runtime.install_script_file(std::sync::Arc::new(file));
+        let mut vm = crate::vm::Vm::new(file_id, &mut runtime).expect("vm");
         assert_eq!(
             vm.execute_top_level().expect("execute"),
             Variant::Integer(3)

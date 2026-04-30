@@ -866,6 +866,7 @@ dependencies = [
 name = "krkr-engine"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "krkr-core",
  "krkr-kag",
  "krkr-tjs2",

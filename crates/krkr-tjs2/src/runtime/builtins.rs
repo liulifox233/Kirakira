@@ -6,8 +6,10 @@ use crate::runtime::value::{ObjectHandle, Variant};
 use crate::runtime::{Runtime, TjsHost};
 
 pub(crate) fn install<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
-    runtime.register_global_native("Array", native_array::<H>);
-    runtime.register_global_native("Dictionary", native_dictionary::<H>);
+    let array = runtime.register_global_native("Array", native_array::<H>);
+    install_array_methods(runtime, array);
+    let dictionary = runtime.register_global_native("Dictionary", native_dictionary::<H>);
+    install_dictionary_methods(runtime, dictionary);
     runtime.register_global_native("RegExp", native_regexp::<H>);
     runtime.register_global_native("Date", native_date::<H>);
     runtime.register_global_native("Exception", native_exception::<H>);
@@ -291,6 +293,7 @@ fn install_array_methods<H: TjsHost + 'static>(runtime: &mut Runtime<H>, handle:
     runtime.register_object_native(handle, "push", array_push::<H>);
     runtime.register_object_native(handle, "pop", array_pop::<H>);
     runtime.register_object_native(handle, "clear", array_clear::<H>);
+    runtime.register_object_native(handle, "assign", array_assign::<H>);
     runtime.register_object_native(handle, "join", array_join::<H>);
     runtime.register_object_native(handle, "reverse", array_reverse::<H>);
 }
@@ -302,6 +305,9 @@ fn install_dictionary_methods<H: TjsHost + 'static>(
     runtime.add_object_class_info(handle, "Dictionary");
     runtime.register_object_native(handle, "clear", dictionary_clear::<H>);
     runtime.register_object_native(handle, "assign", dictionary_assign::<H>);
+    runtime.register_object_native(handle, "assignStruct", dictionary_assign::<H>);
+    runtime.register_object_native(handle, "saveStruct", dictionary_save_struct::<H>);
+    runtime.register_object_native(handle, "loadStruct", dictionary_load_struct::<H>);
 }
 
 fn require_this(this_obj: Option<ObjectHandle>, name: &str) -> Result<ObjectHandle> {
@@ -350,6 +356,35 @@ fn array_clear<H: TjsHost + 'static>(
         ));
     }
     Ok(Variant::Void)
+}
+
+fn array_assign<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let dest = require_this(this_obj, "Array.assign")?;
+    let Some(Variant::Object(src)) = args.first().cloned() else {
+        return Ok(Variant::Object(dest));
+    };
+
+    if !runtime.heap[dest.0].array_clear() {
+        return Err(TjsError::runtime(
+            "Array.assign called on a non-array object",
+        ));
+    }
+
+    if let Some(elements) = runtime.heap[src.0].array_elements().map(Vec::from) {
+        for value in elements {
+            runtime.heap[dest.0].array_push(value);
+        }
+    } else {
+        for (key, value) in runtime.heap[src.0].members.clone() {
+            runtime.heap[dest.0].array_push(Variant::String(key));
+            runtime.heap[dest.0].array_push(value);
+        }
+    }
+    Ok(Variant::Object(dest))
 }
 
 fn array_join<H: TjsHost + 'static>(
@@ -415,6 +450,137 @@ fn dictionary_assign<H: TjsHost + 'static>(
         runtime.heap[dest.0].set(key, value);
     }
     Ok(Variant::Object(dest))
+}
+
+fn dictionary_save_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Dictionary.saveStruct")?;
+    let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
+        return Ok(Variant::Void);
+    };
+    let path = path.to_tjs_string()?;
+    let mode = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    let text = dictionary_struct_value(runtime, &Variant::Object(handle), 0);
+    runtime.host_mut().write_text(&path, &mode, &text)?;
+    Ok(Variant::Void)
+}
+
+fn dictionary_load_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Dictionary.loadStruct")?;
+    let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
+        return Ok(Variant::Integer(0));
+    };
+    let path = path.to_tjs_string()?;
+    let mode = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
+        return Ok(Variant::Integer(0));
+    };
+    runtime.heap[handle.0].members.clear();
+    install_dictionary_methods(runtime, handle);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        runtime.heap[handle.0].set(key.to_string(), parse_struct_value(value));
+    }
+    Ok(Variant::Integer(1))
+}
+
+fn dictionary_struct_value<H: TjsHost + 'static>(
+    runtime: &Runtime<H>,
+    value: &Variant,
+    depth: usize,
+) -> String {
+    if depth > 16 {
+        return "void".to_string();
+    }
+    match value {
+        Variant::Void => "void".to_string(),
+        Variant::Null => "null".to_string(),
+        Variant::Integer(value) => value.to_string(),
+        Variant::Real(value) => value.to_string(),
+        Variant::String(value) => tjs_quote(value),
+        Variant::Octet(_) => "void".to_string(),
+        Variant::Object(handle) => {
+            if let Some(elements) = runtime.heap[handle.0].array_elements() {
+                let elements = elements
+                    .iter()
+                    .map(|value| dictionary_struct_value(runtime, value, depth + 1))
+                    .collect::<Vec<_>>();
+                format!("[{}]", elements.join(", "))
+            } else {
+                let entries = runtime.heap[handle.0]
+                    .members
+                    .iter()
+                    .filter(|(key, _)| !is_native_member_name(key))
+                    .map(|(key, value)| {
+                        format!(
+                            "{} => {}",
+                            tjs_quote(key),
+                            dictionary_struct_value(runtime, value, depth + 1)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                format!("%[{}]", entries.join(", "))
+            }
+        }
+        Variant::Closure(_) | Variant::CodeObject(_) => "void".to_string(),
+    }
+}
+
+fn is_native_member_name(key: &str) -> bool {
+    matches!(
+        key,
+        "clear" | "assign" | "assignStruct" | "saveStruct" | "loadStruct"
+    )
+}
+
+fn tjs_quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn parse_struct_value(value: &str) -> Variant {
+    if value == "void" {
+        Variant::Void
+    } else if value == "null" {
+        Variant::Null
+    } else if let Ok(value) = value.parse::<i64>() {
+        Variant::Integer(value)
+    } else if let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        Variant::String(value.to_string())
+    } else {
+        Variant::String(value.to_string())
+    }
 }
 
 fn regexp_compile<H: TjsHost + 'static>(

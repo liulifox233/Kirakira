@@ -1149,6 +1149,7 @@ pub fn lower_hir_program(
 #[derive(Clone, Debug)]
 struct BindingInfo {
     is_global: bool,
+    scope_kind: hir::ScopeKind,
 }
 
 struct Lowerer<'a> {
@@ -1162,11 +1163,19 @@ impl<'a> Lowerer<'a> {
     fn new(program: &hir::Program, source_name: &str, source_text: &'a str) -> Self {
         let mut bindings = BTreeMap::new();
         for binding in &program.bindings {
-            let is_global = program
+            let scope_kind = program
                 .scopes
                 .get(binding.scope.0)
-                .is_some_and(|scope| scope.kind == hir::ScopeKind::Global);
-            bindings.insert(binding.id, BindingInfo { is_global });
+                .map(|scope| scope.kind)
+                .unwrap_or(hir::ScopeKind::Global);
+            let is_global = scope_kind == hir::ScopeKind::Global;
+            bindings.insert(
+                binding.id,
+                BindingInfo {
+                    is_global,
+                    scope_kind,
+                },
+            );
         }
 
         Self {
@@ -1198,6 +1207,13 @@ impl<'a> Lowerer<'a> {
             .binding
             .and_then(|id| self.binding(id))
             .is_some_and(|binding| binding.is_global)
+    }
+
+    fn ident_is_class_scoped(&self, ident: &syntax::Ident) -> bool {
+        ident
+            .binding
+            .and_then(|id| self.binding(id))
+            .is_some_and(|binding| binding.scope_kind == hir::ScopeKind::Class)
     }
 
     fn intern_string(&mut self, text: &str) -> StringId {
@@ -2961,6 +2977,13 @@ impl ObjectBuilder {
         span: Span,
     ) -> Place {
         if ident.binding.is_some() && !lowerer.ident_is_global(ident) {
+            if lowerer.ident_is_class_scoped(ident) {
+                return Place::Member {
+                    object: Value::Slot(SlotId::ThisProxy),
+                    key: MemberKey::Direct(lowerer.intern_string(&ident.name)),
+                    flags: FLAGS_IGNORE_PROP_SET,
+                };
+            }
             return Place::Slot(self.local(lowerer, ident.binding, Some(&ident.name), span));
         }
 
@@ -2980,6 +3003,9 @@ impl ObjectBuilder {
             return Ok(None);
         };
         if lowerer.ident_is_global(ident) {
+            return Ok(None);
+        }
+        if lowerer.ident_is_class_scoped(ident) {
             return Ok(None);
         }
         self.binding_slots.get(&binding).copied().map_or_else(

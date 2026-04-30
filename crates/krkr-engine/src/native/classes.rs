@@ -12,10 +12,12 @@ pub(crate) fn install_native_class(
     spec: &'static NativeClassSpec,
     global: bool,
 ) -> ObjectHandle {
-    let handle = runtime.alloc_native_function(
+    let handle = runtime.alloc_native_constructor(
         move |runtime: &mut Runtime<KrkrHost>,
-              _this_obj: Option<ObjectHandle>,
-              args: Vec<Variant>| { construct_native_instance(runtime, spec, args) },
+              this_obj: Option<ObjectHandle>,
+              args: Vec<Variant>| {
+            construct_native_instance(runtime, spec, this_obj, args)
+        },
     );
     runtime.add_object_class_info(handle, spec.name);
     install_methods(runtime, handle, spec.name, spec.static_methods);
@@ -29,9 +31,12 @@ pub(crate) fn install_native_class(
 fn construct_native_instance(
     runtime: &mut Runtime<KrkrHost>,
     spec: &'static NativeClassSpec,
+    this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let handle = runtime.alloc_ordinary_object();
+    let handle = this_obj
+        .filter(|handle| *handle != runtime.global_handle())
+        .unwrap_or_else(|| runtime.alloc_ordinary_object());
     runtime.add_object_class_info(handle, spec.name);
     runtime.set_object_member(
         handle,
@@ -39,6 +44,7 @@ fn construct_native_instance(
         Variant::String(spec.name.to_string()),
     );
     install_methods(runtime, handle, spec.name, spec.methods);
+    install_special_methods(runtime, handle, spec.name);
     install_properties(runtime, handle, spec.properties);
     apply_constructor_defaults(runtime, handle, spec.name, &args)?;
     Ok(Variant::Object(handle))
@@ -111,8 +117,66 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "caption", Variant::String(String::new()));
             runtime.set_object_member(handle, "width", Variant::Integer(0));
             runtime.set_object_member(handle, "height", Variant::Integer(0));
+            let menu = alloc_menu_item_object(runtime, Some(handle), String::new());
+            runtime.set_object_member(handle, "menu", Variant::Object(menu));
         }
-        "Layer" | "Bitmap" | "BitmapLayerTreeOwner" => {
+        "MenuItem" => {
+            let owner = args.first().cloned().unwrap_or_default();
+            let caption = args
+                .get(1)
+                .map(Variant::to_tjs_string)
+                .transpose()?
+                .unwrap_or_default();
+            runtime.set_object_member(handle, "owner", owner);
+            runtime.set_object_member(handle, "caption", Variant::String(caption));
+            runtime.set_object_member(handle, "shortcut", Variant::String(String::new()));
+            runtime.set_object_member(handle, "checked", Variant::Integer(0));
+            runtime.set_object_member(handle, "enabled", Variant::Integer(1));
+            runtime.set_object_member(handle, "visible", Variant::Integer(1));
+            runtime.set_object_member(handle, "radio", Variant::Integer(0));
+            runtime.set_object_member(handle, "group", Variant::Integer(0));
+            let children = runtime.alloc_array_object(Vec::new());
+            runtime.set_object_member(handle, "children", Variant::Object(children));
+        }
+        "Layer" => {
+            let window = args.first().cloned().unwrap_or_default();
+            let parent = args.get(1).cloned().unwrap_or_default();
+            runtime.set_object_member(handle, "window", window.clone());
+            runtime.set_object_member(handle, "parent", parent.clone());
+            let children = runtime.alloc_array_object(Vec::new());
+            runtime.set_object_member(handle, "children", Variant::Object(children));
+            runtime.set_object_member(handle, "left", Variant::Integer(0));
+            runtime.set_object_member(handle, "top", Variant::Integer(0));
+            runtime.set_object_member(handle, "width", Variant::Integer(0));
+            runtime.set_object_member(handle, "height", Variant::Integer(0));
+            runtime.set_object_member(handle, "imageLeft", Variant::Integer(0));
+            runtime.set_object_member(handle, "imageTop", Variant::Integer(0));
+            runtime.set_object_member(handle, "imageWidth", Variant::Integer(0));
+            runtime.set_object_member(handle, "imageHeight", Variant::Integer(0));
+            runtime.set_object_member(handle, "visible", Variant::Integer(0));
+            runtime.set_object_member(handle, "opacity", Variant::Integer(255));
+            runtime.set_object_member(handle, "cursor", Variant::Integer(0));
+            runtime.set_object_member(handle, "hint", Variant::String(String::new()));
+            runtime.set_object_member(handle, "showParentHint", Variant::Integer(1));
+            let font = construct_native_instance(runtime, &FONT_CLASS, None, Vec::new())?;
+            runtime.set_object_member(handle, "font", font);
+            if let Variant::Object(parent) = parent {
+                let children = ensure_child_array(runtime, parent);
+                runtime.array_push(children, Variant::Object(handle));
+            }
+        }
+        "Font" => {
+            runtime.set_object_member(handle, "face", Variant::String(String::new()));
+            runtime.set_object_member(handle, "height", Variant::Integer(0));
+            runtime.set_object_member(handle, "bold", Variant::Integer(0));
+            runtime.set_object_member(handle, "italic", Variant::Integer(0));
+            runtime.set_object_member(handle, "strikeout", Variant::Integer(0));
+            runtime.set_object_member(handle, "underline", Variant::Integer(0));
+            runtime.set_object_member(handle, "angle", Variant::Integer(0));
+            runtime.set_object_member(handle, "faceIsFileName", Variant::Integer(0));
+            runtime.set_object_member(handle, "rasterizer", Variant::String(String::new()));
+        }
+        "Bitmap" | "BitmapLayerTreeOwner" => {
             runtime.set_object_member(handle, "width", Variant::Integer(0));
             runtime.set_object_member(handle, "height", Variant::Integer(0));
         }
@@ -124,6 +188,138 @@ fn apply_constructor_defaults(
         _ => {}
     }
     Ok(())
+}
+
+fn ensure_child_array(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> ObjectHandle {
+    match runtime.object_member(handle, "children") {
+        Variant::Object(children) => children,
+        _ => {
+            let children = runtime.alloc_array_object(Vec::new());
+            runtime.set_object_member(handle, "children", Variant::Object(children));
+            children
+        }
+    }
+}
+
+fn install_special_methods(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    class_name: &'static str,
+) {
+    if class_name == "MenuItem" {
+        install_menu_item_methods(runtime, handle);
+    }
+}
+
+fn alloc_menu_item_object(
+    runtime: &mut Runtime<KrkrHost>,
+    owner: Option<ObjectHandle>,
+    caption: String,
+) -> ObjectHandle {
+    let handle = runtime.alloc_ordinary_object();
+    runtime.add_object_class_info(handle, "MenuItem");
+    install_methods(runtime, handle, "MenuItem", MENU_ITEM_CLASS.methods);
+    install_menu_item_methods(runtime, handle);
+    install_properties(runtime, handle, MENU_ITEM_CLASS.properties);
+    runtime.set_object_member(
+        handle,
+        "owner",
+        owner.map(Variant::Object).unwrap_or_default(),
+    );
+    runtime.set_object_member(handle, "caption", Variant::String(caption));
+    runtime.set_object_member(handle, "shortcut", Variant::String(String::new()));
+    runtime.set_object_member(handle, "checked", Variant::Integer(0));
+    runtime.set_object_member(handle, "enabled", Variant::Integer(1));
+    runtime.set_object_member(handle, "visible", Variant::Integer(1));
+    runtime.set_object_member(handle, "radio", Variant::Integer(0));
+    runtime.set_object_member(handle, "group", Variant::Integer(0));
+    let children = runtime.alloc_array_object(Vec::new());
+    runtime.set_object_member(handle, "children", Variant::Object(children));
+    handle
+}
+
+fn install_menu_item_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    runtime.register_object_native(handle, "add", menu_item_add);
+    runtime.register_object_native(handle, "insert", menu_item_insert);
+    runtime.register_object_native(handle, "remove", menu_item_remove);
+    runtime.register_object_native(handle, "clear", menu_item_clear);
+    runtime.register_object_native(handle, "click", menu_item_noop);
+    runtime.register_object_native(handle, "onClick", menu_item_noop);
+    runtime.register_object_native(handle, "popup", menu_item_noop);
+}
+
+fn menu_item_children(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    method: &str,
+) -> Result<ObjectHandle> {
+    let this =
+        this_obj.ok_or_else(|| krkr_tjs2::TjsError::runtime(format!("{method} requires this")))?;
+    match runtime.object_member(this, "children") {
+        Variant::Object(children) => Ok(children),
+        _ => {
+            let children = runtime.alloc_array_object(Vec::new());
+            runtime.set_object_member(this, "children", Variant::Object(children));
+            Ok(children)
+        }
+    }
+}
+
+fn menu_item_add(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let item = args.into_iter().next().unwrap_or_default();
+    let children = menu_item_children(runtime, this_obj, "MenuItem.add")?;
+    runtime.array_push(children, item.clone());
+    Ok(item)
+}
+
+fn menu_item_insert(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let item = args.first().cloned().unwrap_or_default();
+    let index = args
+        .get(1)
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(i64::MAX)
+        .max(0) as usize;
+    let children = menu_item_children(runtime, this_obj, "MenuItem.insert")?;
+    runtime.array_insert(children, index, item.clone());
+    Ok(item)
+}
+
+fn menu_item_remove(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let item = args.into_iter().next().unwrap_or_default();
+    let children = menu_item_children(runtime, this_obj, "MenuItem.remove")?;
+    runtime.array_remove_value(children, &item);
+    Ok(Variant::Void)
+}
+
+fn menu_item_clear(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let children = menu_item_children(runtime, this_obj, "MenuItem.clear")?;
+    runtime.array_clear(children);
+    Ok(Variant::Void)
+}
+
+fn menu_item_noop(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Void)
 }
 
 pub(crate) struct NativeClassSpec {
@@ -275,6 +471,19 @@ pub(crate) static BITMAP_LAYER_TREE_OWNER_CLASS: NativeClassSpec = NativeClassSp
     static_properties: &[],
 };
 
+pub(crate) static MENU_ITEM_CLASS: NativeClassSpec = NativeClassSpec {
+    name: "MenuItem",
+    methods: &[
+        "add", "insert", "remove", "clear", "click", "onClick", "popup",
+    ],
+    properties: &[
+        "owner", "caption", "shortcut", "checked", "enabled", "visible", "radio", "group",
+        "children",
+    ],
+    static_methods: &[],
+    static_properties: &[],
+};
+
 pub(crate) static WINDOW_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Window",
     methods: &[
@@ -354,6 +563,7 @@ pub(crate) static WINDOW_CLASS: NativeClassSpec = NativeClassSpec {
         "imeMode",
         "mouseCursorState",
         "fullScreen",
+        "menu",
         "mainWindow",
         "focusedLayer",
         "primaryLayer",

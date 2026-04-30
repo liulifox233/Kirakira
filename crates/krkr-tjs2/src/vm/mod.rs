@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
-use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
+use crate::bytecode::{BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError};
 use crate::runtime::{
-    Closure, NativeFunction, NoHost, Object, ObjectHandle, ObjectKind, Runtime, TjsHost, Variant,
+    Closure, NativeFunction, NoHost, Object, ObjectHandle, Runtime, TjsHost, Variant,
 };
 
 mod dispatch;
@@ -26,35 +26,26 @@ pub(super) struct DispatchFlags {
 }
 
 pub struct Vm<'bc, 'rt, H: TjsHost = NoHost> {
-    file: &'bc BytecodeFile,
+    file_id: usize,
+    file: Arc<BytecodeFile>,
     runtime: &'rt mut Runtime<H>,
     code_handles: Vec<ObjectHandle>,
+    _file_lifetime: PhantomData<&'bc BytecodeFile>,
 }
 
 impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
-    pub fn new(file: &'bc BytecodeFile, runtime: &'rt mut Runtime<H>) -> Self {
-        let mut code_handles = Vec::with_capacity(file.objects.len());
-        for (index, object) in file.objects.iter().enumerate() {
-            let handle = runtime.alloc_object(Object::new(ObjectKind::InterCode {
-                object_index: index,
-                context: object.context_type,
-            }));
-            if object.context_type == BytecodeContextType::Class
-                && let Some(name) = object.name(file)
-                && !name.is_empty()
-            {
-                runtime.heap[handle.0].class_infos.push(name.to_string());
-            }
-            code_handles.push(handle);
-        }
-
+    pub fn new(file_id: usize, runtime: &'rt mut Runtime<H>) -> Result<Self> {
+        let file = runtime.script_file(file_id)?;
+        let code_handles = runtime.script_code_handles(file_id)?;
         let mut vm = Self {
+            file_id,
             file,
             runtime,
             code_handles,
+            _file_lifetime: PhantomData,
         };
         vm.register_code_object_properties();
-        vm
+        Ok(vm)
     }
 
     pub fn set_global_member(&mut self, name: impl Into<String>, value: Variant) {
@@ -98,6 +89,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.execute_object_with_this(object_index, args, Some(self.runtime.global))
     }
 
+    pub(super) fn execute_file_object_with_this(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+        args: Vec<Variant>,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<Variant> {
+        if file_id == self.file_id {
+            return self.execute_object_with_this(object_index, args, this_obj);
+        }
+        let mut vm = Vm::new(file_id, self.runtime)?;
+        vm.execute_object_with_this(object_index, args, this_obj)
+    }
+
     pub(super) fn execute_object_with_this(
         &mut self,
         object_index: usize,
@@ -136,7 +141,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         while pc < instructions.len() {
             let inst = &instructions[pc];
             let next_pc = next_instruction_index(&offset_to_index, &instructions, pc)?;
-            match self.execute_instruction(&object, &mut frame, inst, next_pc, &offset_to_index)? {
+            match self
+                .execute_instruction(&object, &mut frame, inst, next_pc, &offset_to_index)
+                .map_err(|error| {
+                    let name = object.name(self.file.as_ref()).unwrap_or("<anonymous>");
+                    TjsError::runtime(format!(
+                        "while executing `{name}` at bytecode {}: {}",
+                        inst.offset, error.message
+                    ))
+                })? {
                 Step::Next(next) => pc = next,
                 Step::Return(value) => return Ok(value),
             }
@@ -458,7 +471,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             if let Some(parent_index) = object.parent {
                 let parent_handle = self.code_handles[parent_index];
                 let object_handle = self.code_handles[object_index];
-                let Some(name) = object.name(self.file).map(str::to_string) else {
+                let Some(name) = object.name(self.file.as_ref()).map(str::to_string) else {
                     continue;
                 };
                 let closure = Variant::Closure(Closure::new(object_handle, Some(parent_handle)));
@@ -484,7 +497,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .data_slots
             .get(index)
             .ok_or_else(|| TjsError::runtime(format!("data slot {index} does not exist")))?
-            .value(self.file)?;
+            .value(&self.file)?;
         Ok(self.materialize_code_object(value))
     }
 
@@ -578,7 +591,8 @@ mod tests {
             1,
         );
         let mut runtime = Runtime::new();
-        let mut vm = Vm::new(&file, &mut runtime);
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
         assert_eq!(
             vm.execute_top_level().expect("execute"),
             Variant::Integer(42)
@@ -607,7 +621,8 @@ mod tests {
             2,
         );
         let mut runtime = Runtime::new();
-        let mut vm = Vm::new(&file, &mut runtime);
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
         assert_eq!(
             vm.execute_top_level().expect("execute"),
             Variant::Integer(7)
@@ -630,7 +645,8 @@ mod tests {
             2,
         );
         let mut runtime = Runtime::new();
-        let mut vm = Vm::new(&file, &mut runtime);
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
         assert_eq!(
             vm.execute_top_level().expect("execute"),
             Variant::String("boom".to_string())
@@ -653,7 +669,8 @@ mod tests {
             1,
         );
         let mut runtime = Runtime::new();
-        let mut vm = Vm::new(&file, &mut runtime);
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
         assert_eq!(
             vm.execute_top_level().expect("execute"),
             Variant::String("Integer".to_string())

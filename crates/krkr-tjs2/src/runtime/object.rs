@@ -102,6 +102,28 @@ impl Object {
         true
     }
 
+    pub fn array_insert(&mut self, index: usize, value: Variant) -> bool {
+        let ObjectKind::Array { elements } = &mut self.kind else {
+            return false;
+        };
+        let index = index.min(elements.len());
+        elements.insert(index, value);
+        self.sync_array_members();
+        true
+    }
+
+    pub fn array_remove_value(&mut self, value: &Variant) -> bool {
+        let ObjectKind::Array { elements } = &mut self.kind else {
+            return false;
+        };
+        let Some(index) = elements.iter().position(|item| item == value) else {
+            return false;
+        };
+        elements.remove(index);
+        self.sync_array_members();
+        true
+    }
+
     pub fn array_pop(&mut self) -> Option<Variant> {
         let ObjectKind::Array { elements } = &mut self.kind else {
             return None;
@@ -147,11 +169,13 @@ pub enum ObjectKind {
         elements: Vec<Variant>,
     },
     InterCode {
+        file_id: usize,
         object_index: usize,
         context: BytecodeContextType,
     },
     NativeFunction {
         id: usize,
+        constructable: bool,
     },
     VmNativeFunction {
         id: usize,

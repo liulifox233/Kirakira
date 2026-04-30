@@ -40,6 +40,9 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
         ("versionString", Variant::String("krkr-ruri".to_string())),
         ("platformName", Variant::String("krkr-ruri".to_string())),
         ("osName", Variant::String(std::env::consts::OS.to_string())),
+        ("exePath", Variant::String(exe_path(runtime))),
+        ("personalPath", Variant::String(temp_path())),
+        ("appDataPath", Variant::String(temp_path())),
         ("eventDisabled", Variant::Integer(0)),
         ("graphicCacheLimit", Variant::Integer(0)),
         ("exitOnWindowClose", Variant::Integer(1)),
@@ -61,6 +64,18 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     }
     let version_info = runtime.alloc_ordinary_object();
     runtime.set_object_member(system, "versionInformation", Variant::Object(version_info));
+}
+
+fn exe_path(runtime: &Runtime<KrkrHost>) -> String {
+    runtime
+        .host()
+        .project_root()
+        .map(|path| format!("{}/", path.display()))
+        .unwrap_or_default()
+}
+
+fn temp_path() -> String {
+    format!("{}/", std::env::temp_dir().display())
 }
 
 fn system_get_tick_count(

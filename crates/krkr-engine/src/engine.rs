@@ -196,6 +196,144 @@ mod tests {
     }
 
     #[test]
+    fn storage_reads_startup_from_unpacked_project_layers() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("data/system")).expect("create data");
+        fs::create_dir_all(root.join("patch3")).expect("create patch");
+        fs::write(
+            root.join("data/startup.tjs"),
+            r#"
+            Storages.addAutoPath(System.exePath + "system/");
+            return Scripts.evalStorage("Config.tjs");
+            "#,
+        )
+        .expect("write startup");
+        fs::write(root.join("data/system/Config.tjs"), "1").expect("write config");
+        fs::write(root.join("patch3/Config.tjs"), "2").expect("write patch config");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        assert_eq!(
+            engine.execute_startup().expect("startup"),
+            Variant::Integer(2)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn storage_decodes_legacy_project_text() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("data")).expect("create data");
+        fs::create_dir_all(root.join("patch3")).expect("create patch");
+        fs::write(root.join("data/startup.tjs"), b"// \x82\xa0\nreturn 7;")
+            .expect("write shift-jis startup");
+        fs::write(root.join("patch3/gbk.tjs"), b"// \xc4\xe3\n8").expect("write gbk storage");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        assert_eq!(
+            engine.execute_startup().expect("startup"),
+            Variant::Integer(7)
+        );
+        assert_eq!(
+            engine.eval_storage("gbk.tjs").expect("gbk"),
+            Variant::Integer(8)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn string_replace_supports_kag_startup_lock_pattern() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"return "a/b-c".replace(/[^A-Za-z]/g, "_");"#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("a_b_c".to_string()));
+    }
+
+    #[test]
+    fn string_index_methods_use_tjs_offsets() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"return "a😀b😀".indexOf("😀", 2) + ":" + "a😀b😀".lastIndexOf("😀");"#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("4:4".to_string()));
+    }
+
+    #[test]
+    fn class_methods_access_class_var_members() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class C {
+                    var value = 3;
+                    function getValue() { return value; }
+                    function setValue(next) { value = next; }
+                }
+                var c = new C();
+                c.setValue(9);
+                return c.getValue();
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::Integer(9));
+    }
+
+    #[test]
+    fn class_super_constructor_initializes_current_instance() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Base {
+                    var value;
+                    function Base(v) { value = v; }
+                    function getValue() { return value; }
+                }
+                class Child extends Base {
+                    function Child() { super.Base(11); }
+                }
+                var child = new Child();
+                return child.getValue();
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::Integer(11));
+    }
+
+    #[test]
+    fn top_level_functions_are_visible_to_later_storages() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("startup.tjs"),
+            r#"
+            Scripts.execStorage("a.tjs");
+            return Scripts.execStorage("b.tjs");
+            "#,
+        )
+        .expect("write startup");
+        fs::write(root.join("a.tjs"), "function helper() { return 4; }").expect("write a");
+        fs::write(root.join("b.tjs"), "return helper();").expect("write b");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        assert_eq!(
+            engine.execute_startup().expect("startup"),
+            Variant::Integer(4)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn engine_loads_kag_scenario_from_project_storage() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");

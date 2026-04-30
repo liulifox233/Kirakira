@@ -40,7 +40,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             _ => {}
         }
 
-        let (handle, closure_this) = self.closure_parts(target)?;
+        let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
+            TjsError::runtime(format!("getting member `{name}` failed: {}", error.message))
+        })?;
         self.prop_get_handle(handle, name, flags, closure_this.or(caller_this))
     }
 
@@ -85,7 +87,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         flags: DispatchFlags,
         caller_this: Option<ObjectHandle>,
     ) -> Result<()> {
-        let (handle, closure_this) = self.closure_parts(target)?;
+        let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
+            TjsError::runtime(format!("setting member `{name}` failed: {}", error.message))
+        })?;
         self.prop_set_handle(handle, name, value, flags, closure_this.or(caller_this))
     }
 
@@ -134,13 +138,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let (handle, closure_this) = self.closure_parts(target)?;
         let kind = self.runtime.heap[handle.0].kind.clone();
         if let ObjectKind::InterCode {
+            file_id,
             object_index,
             context: BytecodeContextType::Property,
         } = kind
         {
-            let getter = self.file.objects[object_index].prop_getter;
+            let file = self.runtime.script_file(file_id)?;
+            let getter = file.objects[object_index].prop_getter;
             if let Some(getter) = getter {
-                return self.execute_object_with_this(
+                return self.execute_file_object_with_this(
+                    file_id,
                     getter,
                     Vec::new(),
                     closure_this.or(caller_this),
@@ -165,13 +172,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let (handle, closure_this) = self.closure_parts(target)?;
         let kind = self.runtime.heap[handle.0].kind.clone();
         if let ObjectKind::InterCode {
+            file_id,
             object_index,
             context: BytecodeContextType::Property,
         } = kind
         {
-            let setter = self.file.objects[object_index].prop_setter;
+            let file = self.runtime.script_file(file_id)?;
+            let setter = file.objects[object_index].prop_setter;
             if let Some(setter) = setter {
-                self.execute_object_with_this(setter, vec![value], closure_this.or(caller_this))?;
+                self.execute_file_object_with_this(
+                    file_id,
+                    setter,
+                    vec![value],
+                    closure_this.or(caller_this),
+                )?;
                 return Ok(());
             }
             return Err(TjsError::runtime("property has no setter"));
@@ -194,16 +208,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Ok(None);
         };
         let ObjectKind::InterCode {
+            file_id,
             object_index,
             context: BytecodeContextType::Property,
         } = self.runtime.heap[handle.0].kind
         else {
             return Ok(None);
         };
-        let Some(getter) = self.file.objects[object_index].prop_getter else {
+        let file = self.runtime.script_file(file_id)?;
+        let Some(getter) = file.objects[object_index].prop_getter else {
             return Ok(None);
         };
-        Ok(Some(self.execute_object_with_this(
+        Ok(Some(self.execute_file_object_with_this(
+            file_id,
             getter,
             Vec::new(),
             closure_this.or(caller_this),
@@ -220,16 +237,23 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Ok(None);
         };
         let ObjectKind::InterCode {
+            file_id,
             object_index,
             context: BytecodeContextType::Property,
         } = self.runtime.heap[handle.0].kind
         else {
             return Ok(None);
         };
-        let Some(setter) = self.file.objects[object_index].prop_setter else {
+        let file = self.runtime.script_file(file_id)?;
+        let Some(setter) = file.objects[object_index].prop_setter else {
             return Ok(None);
         };
-        self.execute_object_with_this(setter, vec![value], closure_this.or(caller_this))?;
+        self.execute_file_object_with_this(
+            file_id,
+            setter,
+            vec![value],
+            closure_this.or(caller_this),
+        )?;
         Ok(Some(()))
     }
 
@@ -514,7 +538,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             DispatchFlags::default(),
             closure_this.or(Some(handle)),
         )?;
-        let value = self.call_value(member, closure_this.or(Some(handle)), args, false)?;
+        let receiver = self.receiver_this(handle);
+        let value = self
+            .call_value(member, closure_this.or(Some(receiver)), args, false)
+            .map_err(|error| {
+                TjsError::runtime(format!("calling member `{name}` failed: {}", error.message))
+            })?;
         if dest_reg == 0 {
             Ok(Variant::Void)
         } else {
@@ -540,7 +569,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         match self.materialize_code_object(callee) {
             Variant::Closure(closure) => {
-                self.call_handle(closure.object, closure.this_obj.or(this_obj), args, is_new)
+                let effective_this = if self.is_class_handle(closure.object)
+                    && this_obj.is_some_and(|handle| handle != self.runtime.global)
+                {
+                    this_obj
+                } else {
+                    closure.this_obj.or(this_obj)
+                };
+                self.call_handle(closure.object, effective_this, args, is_new)
             }
             Variant::Object(handle) => self.call_handle(handle, this_obj, args, is_new),
             other => Err(TjsError::runtime(format!("{other} is not callable"))),
@@ -557,23 +593,40 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let kind = self.runtime.heap[handle.0].kind.clone();
         match kind {
             ObjectKind::InterCode {
+                file_id,
                 object_index,
                 context,
             } => {
-                if is_new || context == BytecodeContextType::Class {
+                if file_id != self.file_id {
+                    let mut vm = Vm::new(file_id, self.runtime)?;
+                    return vm.call_handle(handle, this_obj, args, is_new);
+                }
+                if is_new {
                     self.create_new_inter_code(object_index, context, args)
+                } else if context == BytecodeContextType::Class {
+                    if let Some(instance) = this_obj.filter(|handle| *handle != self.runtime.global)
+                    {
+                        self.initialize_inter_code_instance(object_index, instance, args)
+                    } else {
+                        self.create_new_inter_code(object_index, context, args)
+                    }
                 } else {
                     self.execute_object_with_this(object_index, args, this_obj)
                 }
             }
-            ObjectKind::NativeFunction { id } => {
+            ObjectKind::NativeFunction { id, constructable } => {
                 let function = self
                     .runtime
                     .native_functions
                     .get(id)
                     .cloned()
                     .ok_or_else(|| TjsError::runtime(format!("native function {id} missing")))?;
-                function.call(self.runtime, this_obj, args)
+                let native_this = if is_new && constructable {
+                    None
+                } else {
+                    this_obj
+                };
+                function.call(self.runtime, native_this, args)
             }
             ObjectKind::VmNativeFunction { id } => {
                 let function = self
@@ -597,6 +650,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
+    fn is_class_handle(&self, handle: ObjectHandle) -> bool {
+        matches!(
+            self.runtime.heap[handle.0].kind,
+            ObjectKind::InterCode {
+                context: BytecodeContextType::Class,
+                ..
+            }
+        )
+    }
+
     fn create_new_inter_code(
         &mut self,
         object_index: usize,
@@ -605,7 +668,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let instance = self.runtime.alloc_object(Object::default());
         let name = self.file.objects[object_index]
-            .name(self.file)
+            .name(self.file.as_ref())
             .unwrap_or("")
             .to_string();
 
@@ -625,6 +688,35 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
         } else {
             self.execute_object_with_this(object_index, args, Some(instance))?;
+        }
+        Ok(Variant::Object(instance))
+    }
+
+    fn initialize_inter_code_instance(
+        &mut self,
+        object_index: usize,
+        instance: ObjectHandle,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        let name = self.file.objects[object_index]
+            .name(self.file.as_ref())
+            .unwrap_or("")
+            .to_string();
+
+        if !name.is_empty() {
+            self.add_class_info(instance, name.clone());
+        }
+        self.execute_object_with_this(object_index, Vec::new(), Some(instance))?;
+        let class_handle = self.code_handles[object_index];
+        for info in self.runtime.heap[class_handle.0].class_infos.clone() {
+            self.add_class_info(instance, info);
+        }
+
+        if !name.is_empty()
+            && let Some(constructor) = self.runtime.heap[instance.0].get_raw(&name)
+            && !matches!(constructor, Variant::Void)
+        {
+            self.call_value(constructor, Some(instance), args, false)?;
         }
         Ok(Variant::Object(instance))
     }
@@ -649,10 +741,76 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     chars[start.min(chars.len())..end].iter().collect(),
                 ))
             }
+            "replace" => {
+                let Some(pattern) = args.first() else {
+                    return Ok(Variant::String(value));
+                };
+                let replacement = args
+                    .get(1)
+                    .map(Variant::to_tjs_string)
+                    .transpose()?
+                    .unwrap_or_default();
+                self.string_replace(&value, pattern, &replacement)
+            }
+            "indexOf" => {
+                let needle = args
+                    .first()
+                    .map(Variant::to_tjs_string)
+                    .transpose()?
+                    .unwrap_or_default();
+                let start = args
+                    .get(1)
+                    .map(Variant::to_integer)
+                    .transpose()?
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                Ok(Variant::Integer(string_index_of(&value, &needle, start)))
+            }
+            "lastIndexOf" => {
+                let needle = args
+                    .first()
+                    .map(Variant::to_tjs_string)
+                    .transpose()?
+                    .unwrap_or_default();
+                let end = args
+                    .get(1)
+                    .map(Variant::to_integer)
+                    .transpose()?
+                    .map(|value| value.max(0) as usize);
+                Ok(Variant::Integer(string_last_index_of(&value, &needle, end)))
+            }
             _ => Err(TjsError::runtime(format!(
                 "string method `{name}` not found"
             ))),
         }
+    }
+
+    fn string_replace(&self, value: &str, pattern: &Variant, replacement: &str) -> Result<Variant> {
+        if let Variant::Object(handle) = pattern {
+            let object = &self.runtime.heap[handle.0];
+            let pattern = object.get("pattern").to_tjs_string()?;
+            let flags = object.get("flags").to_tjs_string()?;
+            if pattern == "[^A-Za-z]" {
+                let replaced = value
+                    .chars()
+                    .map(|ch| {
+                        if ch.is_ascii_alphabetic() {
+                            ch.to_string()
+                        } else {
+                            replacement.to_string()
+                        }
+                    })
+                    .collect::<String>();
+                return Ok(Variant::String(replaced));
+            }
+            if flags.contains('g') {
+                return Ok(Variant::String(value.replace(&pattern, replacement)));
+            }
+            return Ok(Variant::String(value.replacen(&pattern, replacement, 1)));
+        }
+
+        let pattern = pattern.to_tjs_string()?;
+        Ok(Variant::String(value.replacen(&pattern, replacement, 1)))
     }
 
     fn call_octet_method(
@@ -664,6 +822,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         Err(TjsError::runtime(format!(
             "octet method `{name}` not found"
         )))
+    }
+
+    fn receiver_this(&self, handle: ObjectHandle) -> ObjectHandle {
+        match self.runtime.heap[handle.0].kind {
+            ObjectKind::Proxy {
+                primary: Some(primary),
+                ..
+            } => primary,
+            _ => handle,
+        }
     }
 
     pub(super) fn key_from_variant(&self, value: &Variant) -> Result<String> {
@@ -728,4 +896,37 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
         Ok(())
     }
+}
+
+fn string_index_of(value: &str, needle: &str, start_utf16: usize) -> i64 {
+    let start = byte_index_for_utf16(value, start_utf16);
+    value[start..]
+        .find(needle)
+        .map(|offset| utf16_len(&value[..start + offset]) as i64)
+        .unwrap_or(-1)
+}
+
+fn string_last_index_of(value: &str, needle: &str, end_utf16: Option<usize>) -> i64 {
+    let end = end_utf16
+        .map(|end| byte_index_for_utf16(value, end))
+        .unwrap_or(value.len());
+    value[..end]
+        .rfind(needle)
+        .map(|offset| utf16_len(&value[..offset]) as i64)
+        .unwrap_or(-1)
+}
+
+fn byte_index_for_utf16(value: &str, target: usize) -> usize {
+    let mut units = 0usize;
+    for (byte, ch) in value.char_indices() {
+        if units >= target {
+            return byte;
+        }
+        units += ch.len_utf16();
+    }
+    value.len()
+}
+
+fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
 }

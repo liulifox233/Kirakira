@@ -6,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use krkr_core::ResourceProvider;
 use krkr_kag::{KagParser, ParserSnapshot};
 use krkr_tjs2::{
@@ -17,6 +18,7 @@ use krkr_xp3::Xp3ResourceProvider;
 #[derive(Clone)]
 pub struct KrkrHost {
     project_root: Option<PathBuf>,
+    fs_layers: Vec<ProjectLayer>,
     xp3_provider: Option<Xp3ResourceProvider>,
     auto_paths: Vec<String>,
     logs: Vec<String>,
@@ -32,6 +34,7 @@ impl Default for KrkrHost {
     fn default() -> Self {
         Self {
             project_root: None,
+            fs_layers: Vec::new(),
             xp3_provider: None,
             auto_paths: Vec::new(),
             logs: Vec::new(),
@@ -48,9 +51,11 @@ impl Default for KrkrHost {
 impl KrkrHost {
     pub fn for_project(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
+        let fs_layers = project_layers(&root);
         let xp3_provider = open_project_archives(&root)?;
         Ok(Self {
             project_root: Some(root),
+            fs_layers,
             xp3_provider,
             auto_paths: Vec::new(),
             logs: Vec::new(),
@@ -88,7 +93,7 @@ impl KrkrHost {
     }
 
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
-        let path = path.into();
+        let path = normalize_storage_separators(&path.into());
         if !self.auto_paths.iter().any(|item| item == &path) {
             self.auto_paths.push(path);
         }
@@ -113,9 +118,13 @@ impl KrkrHost {
     }
 
     pub(crate) fn read_text_storage(&self, name: &str) -> Result<String> {
+        if let Some(storage) = self.find_fs_storage(name)? {
+            let bytes = fs::read(&storage.path).map_err(io_error)?;
+            return decode_text_storage(name, &bytes, storage.encoding_hint, &self.text_encoding);
+        }
+
         let bytes = self.storage_bytes(name)?;
-        String::from_utf8(bytes)
-            .map_err(|error| TjsError::runtime(format!("storage `{name}` is not UTF-8: {error}")))
+        decode_text_storage(name, &bytes, None, &self.text_encoding)
     }
 
     fn read_binary_storage(&self, name: &str) -> Result<Vec<u8>> {
@@ -131,8 +140,7 @@ impl KrkrHost {
             .project_root
             .as_ref()
             .ok_or_else(|| TjsError::runtime("project root is not set"))?;
-        let relative = clean_relative_path(name)?;
-        let path = root.join(relative);
+        let path = storage_write_path(root, name)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
@@ -140,8 +148,8 @@ impl KrkrHost {
     }
 
     fn storage_bytes(&self, name: &str) -> Result<Vec<u8>> {
-        if let Some(path) = self.find_fs_path(name)? {
-            return fs::read(&path).map_err(io_error);
+        if let Some(storage) = self.find_fs_storage(name)? {
+            return fs::read(&storage.path).map_err(io_error);
         }
 
         if let Some(provider) = &self.xp3_provider
@@ -157,16 +165,49 @@ impl KrkrHost {
     }
 
     fn find_fs_path(&self, name: &str) -> Result<Option<PathBuf>> {
-        let Some(root) = &self.project_root else {
+        Ok(self.find_fs_storage(name)?.map(|storage| storage.path))
+    }
+
+    fn find_fs_storage(&self, name: &str) -> Result<Option<LocatedStorage>> {
+        if let Some(storage) = self.find_absolute_storage(name) {
+            return Ok(Some(storage));
+        }
+
+        if self.project_root.is_none() {
             return Ok(None);
         };
         for candidate in self.fs_candidates(name)? {
-            let path = root.join(candidate);
-            if path.is_file() {
-                return Ok(Some(path));
+            for layer in self.fs_layers.iter().rev() {
+                let path = layer.root.join(&candidate);
+                if path.is_file() {
+                    return Ok(Some(LocatedStorage {
+                        path,
+                        encoding_hint: layer.encoding_hint,
+                    }));
+                }
             }
         }
         Ok(None)
+    }
+
+    fn find_absolute_storage(&self, name: &str) -> Option<LocatedStorage> {
+        let path = Path::new(name);
+        if !path.is_absolute() || !is_safe_absolute_storage_path(path) {
+            return None;
+        }
+        let path = path.to_path_buf();
+        if !path.is_file() {
+            return None;
+        }
+        Some(LocatedStorage {
+            encoding_hint: self
+                .fs_layers
+                .iter()
+                .find(|layer| path.starts_with(&layer.root))
+                .and_then(|layer| layer.encoding_hint)
+                .or_else(|| infer_encoding_from_path(&path)),
+            path,
+        })
     }
 
     fn fs_candidates(&self, name: &str) -> Result<Vec<PathBuf>> {
@@ -174,7 +215,7 @@ impl KrkrHost {
         let mut candidates = Vec::with_capacity(self.auto_paths.len() + 1);
         candidates.push(clean.clone());
         for auto_path in self.auto_paths.iter().rev() {
-            candidates.push(clean_relative_path(auto_path)?.join(&clean));
+            candidates.extend(auto_path_candidates(auto_path, &clean));
         }
         Ok(candidates)
     }
@@ -226,6 +267,158 @@ impl KrkrHost {
     pub(crate) fn log(&mut self, message: &str) {
         self.logs.push(message.to_string());
     }
+}
+
+#[derive(Clone)]
+struct ProjectLayer {
+    root: PathBuf,
+    encoding_hint: Option<&'static Encoding>,
+}
+
+#[derive(Clone)]
+struct LocatedStorage {
+    path: PathBuf,
+    encoding_hint: Option<&'static Encoding>,
+}
+
+fn project_layers(root: &Path) -> Vec<ProjectLayer> {
+    let mut layers = Vec::new();
+    push_project_layer(
+        &mut layers,
+        root.to_path_buf(),
+        infer_encoding_from_layer_name(root),
+    );
+    for name in ["data", "sys", "patch", "patch2", "patch3", "special"] {
+        let layer = root.join(name);
+        if layer.is_dir() {
+            push_project_layer(
+                &mut layers,
+                layer,
+                infer_encoding_from_layer_name(Path::new(name)),
+            );
+        }
+    }
+    layers
+}
+
+fn push_project_layer(
+    layers: &mut Vec<ProjectLayer>,
+    root: PathBuf,
+    encoding_hint: Option<&'static Encoding>,
+) {
+    if layers.iter().any(|layer| layer.root == root) {
+        return;
+    }
+    layers.push(ProjectLayer {
+        root,
+        encoding_hint,
+    });
+}
+
+fn infer_encoding_from_layer_name(path: &Path) -> Option<&'static Encoding> {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("patch") | Some("patch2") | Some("patch3") | Some("special") => Some(GBK),
+        Some("data") | Some("sys") => Some(SHIFT_JIS),
+        _ => None,
+    }
+}
+
+fn infer_encoding_from_path(path: &Path) -> Option<&'static Encoding> {
+    path.components().find_map(|component| match component {
+        Component::Normal(part) => infer_encoding_from_layer_name(Path::new(part)),
+        _ => None,
+    })
+}
+
+fn auto_path_candidates(auto_path: &str, clean: &Path) -> Vec<PathBuf> {
+    let Some(auto_path) = normalize_auto_path(auto_path) else {
+        return Vec::new();
+    };
+    let Ok(auto_relative) = clean_relative_path(&auto_path) else {
+        return Vec::new();
+    };
+    vec![auto_relative.join(clean)]
+}
+
+fn normalize_auto_path(path: &str) -> Option<String> {
+    let mut path = normalize_storage_separators(path);
+    if path.ends_with('>') {
+        path.pop();
+    }
+    if path.is_empty() {
+        return Some(String::new());
+    }
+    let path = Path::new(&path);
+    if path.is_absolute() {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .filter(|name| !name.ends_with(".xp3"))
+    } else if path.extension().is_some_and(|ext| ext == "xp3") {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+    } else {
+        Some(path.to_string_lossy().into_owned())
+    }
+}
+
+fn decode_text_storage(
+    _name: &str,
+    bytes: &[u8],
+    encoding_hint: Option<&'static Encoding>,
+    configured_encoding: &str,
+) -> Result<String> {
+    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+        return Ok(text);
+    }
+
+    let mut encodings = Vec::new();
+    if let Some(encoding) = encoding_hint {
+        encodings.push(encoding);
+    }
+    if let Some(encoding) = Encoding::for_label(configured_encoding.as_bytes()) {
+        encodings.push(encoding);
+    }
+    encodings.push(SHIFT_JIS);
+    encodings.push(GBK);
+    encodings.push(UTF_8);
+
+    for encoding in encodings {
+        let (text, _, had_errors) = encoding.decode(bytes);
+        if !had_errors {
+            return Ok(text.into_owned());
+        }
+    }
+
+    let encoding = encoding_hint.unwrap_or_else(|| {
+        Encoding::for_label(configured_encoding.as_bytes()).unwrap_or(SHIFT_JIS)
+    });
+    let (text, _, _) = encoding.decode(bytes);
+    Ok(text.into_owned())
+}
+
+fn normalize_storage_separators(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn is_safe_absolute_storage_path(path: &Path) -> bool {
+    path.components()
+        .all(|component| !matches!(component, Component::ParentDir | Component::Prefix(_)))
+}
+
+fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        if is_safe_absolute_storage_path(path) {
+            return Ok(path.to_path_buf());
+        }
+        return Err(TjsError::runtime(format!(
+            "storage path must be safe: {}",
+            path.display()
+        )));
+    }
+    Ok(root.join(clean_relative_path(name)?))
 }
 
 impl TjsHost for KrkrHost {

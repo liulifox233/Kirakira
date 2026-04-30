@@ -19,6 +19,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
 cpal = "=0.17.3"
+encoding_rs = "0.8.35"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 pollster = "0.4.0"
 rfd = "=0.17.2"

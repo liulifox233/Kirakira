@@ -105,9 +105,16 @@ where
 pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) heap: Vec<Object>,
     pub(crate) global: ObjectHandle,
+    pub(crate) script_files: Vec<ScriptFile>,
     pub(crate) native_functions: Vec<Arc<dyn NativeFunction<H>>>,
     pub(crate) vm_native_functions: Vec<Arc<dyn VmNativeFunction<H>>>,
     host: H,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScriptFile {
+    pub file: Arc<BytecodeFile>,
+    pub code_handles: Vec<ObjectHandle>,
 }
 
 impl Runtime<NoHost> {
@@ -127,6 +134,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
         let mut runtime = Self {
             heap: vec![Object::default()],
             global: ObjectHandle(0),
+            script_files: Vec::new(),
             native_functions: Vec::new(),
             vm_native_functions: Vec::new(),
             host,
@@ -153,11 +161,34 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.alloc_object(object)
     }
 
+    pub fn array_push(&mut self, object: ObjectHandle, value: Variant) -> bool {
+        self.heap[object.0].array_push(value)
+    }
+
+    pub fn array_insert(&mut self, object: ObjectHandle, index: usize, value: Variant) -> bool {
+        self.heap[object.0].array_insert(index, value)
+    }
+
+    pub fn array_remove_value(&mut self, object: ObjectHandle, value: &Variant) -> bool {
+        self.heap[object.0].array_remove_value(value)
+    }
+
+    pub fn array_clear(&mut self, object: ObjectHandle) -> bool {
+        self.heap[object.0].array_clear()
+    }
+
     pub fn alloc_native_function<F>(&mut self, function: F) -> ObjectHandle
     where
         F: NativeFunction<H> + 'static,
     {
-        self.alloc_native(function)
+        self.alloc_native(function, false)
+    }
+
+    pub fn alloc_native_constructor<F>(&mut self, function: F) -> ObjectHandle
+    where
+        F: NativeFunction<H> + 'static,
+    {
+        self.alloc_native(function, true)
     }
 
     pub fn alloc_vm_native_function<F>(&mut self, function: F) -> ObjectHandle
@@ -175,7 +206,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
     where
         F: NativeFunction<H> + 'static,
     {
-        let handle = self.alloc_native(function);
+        let handle = self.alloc_native(function, false);
         self.heap[self.global.0].set(name, Variant::Object(handle));
         handle
     }
@@ -189,7 +220,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
     where
         F: NativeFunction<H> + 'static,
     {
-        let handle = self.alloc_native(function);
+        let handle = self.alloc_native(function, false);
         self.heap[object.0].set(name, Variant::Object(handle));
         handle
     }
@@ -252,7 +283,8 @@ impl<H: TjsHost + 'static> Runtime<H> {
     }
 
     pub fn execute_file(&mut self, file: &BytecodeFile) -> Result<Variant> {
-        let mut vm = Vm::new(file, self);
+        let file_id = self.install_script_file(Arc::new(file.clone()));
+        let mut vm = Vm::new(file_id, self)?;
         vm.execute_top_level()
     }
 
@@ -270,6 +302,41 @@ impl<H: TjsHost + 'static> Runtime<H> {
         handle
     }
 
+    pub(crate) fn install_script_file(&mut self, file: Arc<BytecodeFile>) -> usize {
+        let file_id = self.script_files.len();
+        let mut code_handles = Vec::with_capacity(file.objects.len());
+        for (index, object) in file.objects.iter().enumerate() {
+            let handle = self.alloc_object(Object::new(ObjectKind::InterCode {
+                file_id,
+                object_index: index,
+                context: object.context_type,
+            }));
+            if object.context_type == crate::bytecode::BytecodeContextType::Class
+                && let Some(name) = object.name(&file)
+                && !name.is_empty()
+            {
+                self.heap[handle.0].class_infos.push(name.to_string());
+            }
+            code_handles.push(handle);
+        }
+        self.script_files.push(ScriptFile { file, code_handles });
+        file_id
+    }
+
+    pub(crate) fn script_file(&self, file_id: usize) -> Result<Arc<BytecodeFile>> {
+        self.script_files
+            .get(file_id)
+            .map(|script| Arc::clone(&script.file))
+            .ok_or_else(|| TjsError::runtime(format!("script file {file_id} does not exist")))
+    }
+
+    pub(crate) fn script_code_handles(&self, file_id: usize) -> Result<Vec<ObjectHandle>> {
+        self.script_files
+            .get(file_id)
+            .map(|script| script.code_handles.clone())
+            .ok_or_else(|| TjsError::runtime(format!("script file {file_id} does not exist")))
+    }
+
     pub(crate) fn alloc_proxy(
         &mut self,
         primary: Option<ObjectHandle>,
@@ -278,13 +345,16 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.alloc_object(Object::new(ObjectKind::Proxy { primary, fallback }))
     }
 
-    pub(crate) fn alloc_native<F>(&mut self, function: F) -> ObjectHandle
+    pub(crate) fn alloc_native<F>(&mut self, function: F, constructable: bool) -> ObjectHandle
     where
         F: NativeFunction<H> + 'static,
     {
         let id = self.native_functions.len();
         self.native_functions.push(Arc::new(function));
-        self.alloc_object(Object::new(ObjectKind::NativeFunction { id }))
+        self.alloc_object(Object::new(ObjectKind::NativeFunction {
+            id,
+            constructable,
+        }))
     }
 
     pub(crate) fn alloc_vm_native<F>(&mut self, function: F) -> ObjectHandle
