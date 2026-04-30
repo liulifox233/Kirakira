@@ -855,10 +855,20 @@ version = "0.1.0"
 dependencies = [
  "krkr-audio",
  "krkr-core",
+ "krkr-engine",
  "krkr-platform",
  "krkr-render",
  "pollster",
  "winit",
+]
+
+[[package]]
+name = "krkr-engine"
+version = "0.1.0"
+dependencies = [
+ "krkr-core",
+ "krkr-tjs2",
+ "krkr-xp3",
 ]
 
 [[package]]
@@ -878,6 +888,10 @@ dependencies = [
  "wgpu",
  "winit",
 ]
+
+[[package]]
+name = "krkr-tjs2"
+version = "0.1.0"
 
 [[package]]
 name = "krkr-xp3"

@@ -5,6 +5,7 @@ use krkr_core::{
     ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Panel, Point,
     PointerButton, StatusLevel, UiAction,
 };
+use krkr_engine::KrkrEngine;
 use krkr_platform::{pick_folder, show_error};
 use krkr_render::{RenderError, Renderer};
 use winit::{
@@ -67,6 +68,7 @@ struct DesktopApp {
     renderer: Option<Renderer>,
     engine: Engine,
     audio: AudioSystem,
+    krkr_engine: Option<KrkrEngine>,
     state: DesktopState,
     project_root: Option<PathBuf>,
     status: Option<DesktopStatus>,
@@ -80,6 +82,7 @@ impl DesktopApp {
             renderer: None,
             engine: Engine::new(EngineConfig::default()),
             audio: AudioSystem::new(),
+            krkr_engine: None,
             state: DesktopState::Launcher,
             project_root: None,
             status: None,
@@ -240,21 +243,47 @@ impl DesktopApp {
             return;
         }
 
+        let mut krkr_engine = match KrkrEngine::for_project(&root) {
+            Ok(engine) => engine,
+            Err(error) => {
+                let message = format!("engine initialization failed: {error}");
+                self.set_status(StatusLevel::Error, message.clone(), Some(window));
+                show_error("Engine initialization failed", &message);
+                return;
+            }
+        };
+
+        match krkr_engine.execute_startup() {
+            Ok(value) => log_info(&format!(
+                "startup.tjs completed for {} with result {}",
+                root.display(),
+                value
+            )),
+            Err(error) => {
+                let message = format!("startup.tjs failed: {error}");
+                self.set_status(StatusLevel::Error, message.clone(), Some(window));
+                show_error("Project startup failed", &message);
+                return;
+            }
+        }
+
+        self.krkr_engine = Some(krkr_engine);
         self.project_root = Some(root.clone());
         self.state = DesktopState::Running;
         self.clear_status(Some(window));
-        log_info(&format!("entered empty runtime shell: {}", root.display()));
+        log_info(&format!("entered engine: {}", root.display()));
     }
 
     fn return_to_launcher(&mut self, window: &Window) {
         self.state = DesktopState::Launcher;
+        self.krkr_engine = None;
         self.engine.set_panel(Panel::Launcher);
         self.set_status(
             StatusLevel::Info,
-            "returned to launcher from runtime shell",
+            "returned to launcher from engine shell",
             Some(window),
         );
-        log_info("returned to launcher from runtime shell");
+        log_info("returned to launcher from engine shell");
     }
 
     fn set_status(

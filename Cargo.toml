@@ -5,6 +5,8 @@ members = [
     "crates/krkr-core",
     "crates/krkr-platform",
     "crates/krkr-render",
+    "crates/krkr-engine",
+    "crates/krkr-tjs2",
     "crates/krkr-xp3",
 ]
 resolver = "3"
@@ -27,4 +29,6 @@ krkr-audio = { path = "crates/krkr-audio" }
 krkr-core = { path = "crates/krkr-core" }
 krkr-platform = { path = "crates/krkr-platform" }
 krkr-render = { path = "crates/krkr-render" }
+krkr-engine = { path = "crates/krkr-engine" }
+krkr-tjs2 = { path = "crates/krkr-tjs2" }
 krkr-xp3 = { path = "crates/krkr-xp3" }

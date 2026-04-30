@@ -12,10 +12,13 @@ Build through small, runnable vertical slices, but keep every slice aligned with
 
 ## Architecture
 
-- `krkr-core`: pure Rust state, resource traits, input events, view models, draw lists. No platform UI or GPU APIs.
+- `krkr-tjs2`: TJS2 language frontend, compiler, bytecode VM, object model, and language builtins.
+- `krkr-engine`: KRKR/TVP engine runtime. It owns the TJS runtime, registers TVP globals/native objects, coordinates project storage, XP3 access, and pure Rust plugin registration.
+- `krkr-core`: pure Rust shell state, input events, view models, draw lists. No platform UI or GPU APIs.
 - `krkr-render`: `wgpu` rendering, surface/device/pipeline management, GPU resources.
 - `krkr-platform`: filesystem and minimal platform bridges. Keep native UI out of core and avoid platform UI components for engine surfaces.
 - `krkr-audio`: audio backend shell and future playback.
+- `krkr-xp3`: XP3 archive parsing and resource streaming.
 - `apps/desktop`: `winit` app lifecycle, input mapping, state transitions.
 
 ## Working Rules
