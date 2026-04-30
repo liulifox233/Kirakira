@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
 use krkr_audio::AudioSystem;
 use krkr_core::{
     ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Panel, Point,
-    PointerButton, StatusLevel, UiAction,
+    PointerButton, Size, StatusLevel, UiAction,
 };
 use krkr_engine::{EngineInput as KrkrEngineInput, KrkrEngine};
 use krkr_platform::{pick_folder, show_error};
@@ -309,6 +309,10 @@ impl DesktopApp {
             log_info(&format!("loaded startup.ks for {}", root.display()));
         }
 
+        if let Some(size) = krkr_engine.preferred_viewport_size() {
+            self.resize_window_for_runtime(window, size);
+        }
+
         self.krkr_engine = Some(krkr_engine);
         self.project_root = Some(root.clone());
         self.state = DesktopState::Running;
@@ -327,6 +331,21 @@ impl DesktopApp {
             Some(window),
         );
         log_info("returned to launcher from engine shell");
+    }
+
+    fn resize_window_for_runtime(&mut self, window: &Window, size: Size) {
+        if size.is_empty() {
+            return;
+        }
+
+        let width = size.width.clamp(320.0, 4096.0) as f64;
+        let height = size.height.clamp(240.0, 4096.0) as f64;
+        let _ = window.request_inner_size(LogicalSize::new(width, height));
+        self.resize_renderer(window.inner_size());
+        log_info(&format!(
+            "requested runtime viewport: {}x{}",
+            width as u32, height as u32
+        ));
     }
 
     fn set_status(

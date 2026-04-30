@@ -57,8 +57,17 @@ fn install_methods(
     methods: &'static [&'static str],
 ) {
     for method in methods {
+        if is_event_callback(method)
+            && !matches!(runtime.object_member(handle, method), Variant::Void)
+        {
+            continue;
+        }
         register_stub_method(runtime, handle, class_name, method);
     }
+}
+
+fn is_event_callback(method: &str) -> bool {
+    method.starts_with("on")
 }
 
 fn install_properties(
@@ -176,6 +185,8 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "imageWidth", Variant::Integer(0));
             runtime.set_object_member(handle, "imageHeight", Variant::Integer(0));
             runtime.set_object_member(handle, "visible", Variant::Integer(0));
+            runtime.set_object_member(handle, "enabled", Variant::Integer(1));
+            runtime.set_object_member(handle, "nodeEnabled", Variant::Integer(1));
             runtime.set_object_member(handle, "opacity", Variant::Integer(255));
             runtime.set_object_member(handle, "cursor", Variant::Integer(0));
             runtime.set_object_member(handle, "hint", Variant::String(String::new()));
@@ -234,6 +245,8 @@ fn install_special_methods(
         install_layer_methods(runtime, handle);
     } else if class_name == "AsyncTrigger" {
         install_async_trigger_methods(runtime, handle);
+    } else if class_name == "Window" {
+        install_window_methods(runtime, handle);
     }
 }
 
@@ -346,6 +359,47 @@ fn menu_item_noop(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Void)
+}
+
+fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    runtime.register_object_native(handle, "setSize", window_set_size);
+    runtime.register_object_native(handle, "setInnerSize", window_set_inner_size);
+}
+
+fn window_set_size(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Window.setSize requires this"))?;
+    let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
+    let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
+    set_window_size_members(runtime, this, width, height);
+    Ok(Variant::Void)
+}
+
+fn window_set_inner_size(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Window.setInnerSize requires this"))?;
+    let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
+    let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
+    set_window_size_members(runtime, this, width, height);
+    Ok(Variant::Void)
+}
+
+fn set_window_size_members(
+    runtime: &mut Runtime<KrkrHost>,
+    window: ObjectHandle,
+    width: i64,
+    height: i64,
+) {
+    runtime.set_object_member(window, "width", Variant::Integer(width));
+    runtime.set_object_member(window, "height", Variant::Integer(height));
+    runtime.set_object_member(window, "innerWidth", Variant::Integer(width));
+    runtime.set_object_member(window, "innerHeight", Variant::Integer(height));
 }
 
 fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -1253,21 +1307,23 @@ pub(crate) static FONT_CLASS: NativeClassSpec = NativeClassSpec {
     static_properties: &[],
 };
 
+const WAVE_SOUND_BUFFER_METHODS: &[&str] = &[
+    "open",
+    "play",
+    "stop",
+    "fade",
+    "stopFade",
+    "setPos",
+    "onStatusChanged",
+    "onFadeCompleted",
+    "onLabel",
+    "freeDirectSound",
+    "getVisBuffer",
+];
+
 pub(crate) static WAVE_SOUND_BUFFER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "WaveSoundBuffer",
-    methods: &[
-        "open",
-        "play",
-        "stop",
-        "fade",
-        "stopFade",
-        "setPos",
-        "onStatusChanged",
-        "onFadeCompleted",
-        "onLabel",
-        "freeDirectSound",
-        "getVisBuffer",
-    ],
+    methods: WAVE_SOUND_BUFFER_METHODS,
     properties: &[
         "position",
         "samplePosition",
@@ -1291,7 +1347,7 @@ pub(crate) static WAVE_SOUND_BUFFER_CLASS: NativeClassSpec = NativeClassSpec {
         "globalFocusMode",
         "useVisBuffer",
     ],
-    static_methods: &["freeDirectSound"],
+    static_methods: WAVE_SOUND_BUFFER_METHODS,
     static_properties: &["globalVolume", "globalFocusMode", "useVisBuffer"],
 };
 

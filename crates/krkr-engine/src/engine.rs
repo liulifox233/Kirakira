@@ -6,7 +6,7 @@ use std::{
 
 use krkr_core::{
     ButtonState, Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey,
-    FrameInput, FrameOutput, MessageLayerModel, Point, PointerButton,
+    FrameInput, FrameOutput, MessageLayerModel, Point, PointerButton, Size,
 };
 use krkr_kag::{Attribute, AttributeValue, KagParser, Tag};
 use krkr_tjs2::{
@@ -152,6 +152,17 @@ impl KrkrEngine {
 
     pub fn host_mut(&mut self) -> &mut KrkrHost {
         self.tjs_runtime.host_mut()
+    }
+
+    pub fn preferred_viewport_size(&self) -> Option<Size> {
+        let Variant::Object(window) = self.tjs_runtime.global_member("kag") else {
+            return None;
+        };
+        let width = object_positive_i64(&self.tjs_runtime, window, "innerWidth")
+            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "width"))?;
+        let height = object_positive_i64(&self.tjs_runtime, window, "innerHeight")
+            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "height"))?;
+        Some(Size::new(width as f32, height as f32))
     }
 
     pub fn kag_parser(&self) -> &KagParser {
@@ -337,6 +348,15 @@ impl KrkrEngine {
     }
 
     fn fire_tjs_event(&mut self, event: TjsEvent) -> Result<()> {
+        if event.kind == TjsEventKind::Timer
+            && !self
+                .tjs_runtime
+                .object_member(event.handle, "enabled")
+                .is_truthy()
+        {
+            return Ok(());
+        }
+
         let callback = self.tjs_runtime.object_member(event.handle, "__callback");
         if !matches!(callback, Variant::Void) {
             return self
@@ -841,6 +861,17 @@ fn object_i64(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> 
     runtime.object_member(object, name).to_integer()
 }
 
+fn object_positive_i64(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Option<i64> {
+    match runtime.object_member(object, name) {
+        Variant::Void => None,
+        value => value.to_integer().ok().filter(|value| *value > 0),
+    }
+}
+
 fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
     let storage = tag
         .literal_attr("storage")
@@ -1040,6 +1071,28 @@ mod tests {
                 .execute_script("inline.tjs", r#"return Scripts.eval("1 + 2");"#)
                 .expect("script"),
             Variant::Integer(3)
+        );
+    }
+
+    #[test]
+    fn window_inner_size_updates_preferred_viewport_size() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Window();
+                kag.setInnerSize(1280, 720);
+                return kag.width + ":" + kag.height + ":" + kag.innerWidth + ":" + kag.innerHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1280:720:1280:720".to_string()));
+        assert_eq!(
+            engine.preferred_viewport_size(),
+            Some(Size::new(1280.0, 720.0))
         );
     }
 
@@ -1784,6 +1837,82 @@ mod tests {
     }
 
     #[test]
+    fn layer_subclass_mouse_handler_is_not_shadowed_by_native_stub() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class ProbeLayer extends Layer {
+                    function ProbeLayer() {
+                        super.Layer(...);
+                    }
+                    function onMouseUp(x, y, button, shift) {
+                        clicked = "" + x + ":" + y + ":" + button + ":" + shift;
+                    }
+                }
+                var testLayer = new ProbeLayer();
+                testLayer.clicked = "";
+                testLayer.setPos(10, 20);
+                testLayer.setSize(30, 40);
+                testLayer.visible = true;
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(15.0, 26.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "testLayer.clicked")
+                .expect("clicked"),
+            Variant::String("5:6:0:0".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_methods_are_available_on_global_class_object() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                WaveSoundBuffer.fade(0, 100, 0);
+                WaveSoundBuffer.stopFade();
+                WaveSoundBuffer.stop();
+                "#,
+            )
+            .expect("script");
+    }
+
+    #[test]
     fn tjs_kag_parser_returns_tag_dictionaries() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -2140,6 +2269,42 @@ mod tests {
         assert_eq!(
             engine.tjs_runtime().object_member(timer, "enabled"),
             Variant::Integer(0)
+        );
+    }
+
+    #[test]
+    fn stale_timer_event_is_skipped_after_async_callback_disables_it() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer_async.tjs",
+                r#"
+                global.timerProbeCount = 0;
+                function stopTimer() {
+                    global.timerProbeCount++;
+                    timerProbe.enabled = false;
+                }
+                var timerProbe = new Timer(stopTimer, "");
+                var asyncProbe = new AsyncTrigger(stopTimer, "");
+                global.timerProbe = timerProbe;
+                global.asyncProbe = asyncProbe;
+                timerProbe.interval = 0;
+                timerProbe.enabled = true;
+                asyncProbe.trigger();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("timerProbeCount"),
+            Variant::Integer(1)
         );
     }
 
