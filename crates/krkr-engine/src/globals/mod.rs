@@ -8,8 +8,8 @@ use crate::{
         ASYNC_TRIGGER_CLASS, BASIC_DRAW_DEVICE_CLASS, BITMAP_CLASS, BITMAP_LAYER_TREE_OWNER_CLASS,
         FONT_CLASS, IMAGE_FUNCTION_CLASS, LAYER_CLASS, PHASE_VOCODER_CLASS, RECT_CLASS,
         TIMER_CLASS, VIDEO_OVERLAY_CLASS, WAVE_SOUND_BUFFER_CLASS, WINDOW_CLASS, install_clipboard,
-        install_debug, install_native_class, install_plugins, install_scripts, install_storages,
-        install_system,
+        install_debug, install_kag_parser, install_native_class, install_plugins, install_scripts,
+        install_storages, install_system,
     },
 };
 
@@ -22,6 +22,7 @@ pub(crate) fn install_tvp_globals(runtime: &mut Runtime<KrkrHost>) {
     install_storages(runtime);
     install_scripts(runtime);
     install_plugins(runtime);
+    install_kag_parser(runtime);
     install_clipboard(runtime);
 
     let font = install_native_class(runtime, &FONT_CLASS, true);

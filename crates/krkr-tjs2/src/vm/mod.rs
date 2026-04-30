@@ -78,6 +78,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.runtime.heap[self.runtime.global.0].get(name)
     }
 
+    pub fn runtime(&self) -> &Runtime<H> {
+        self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut Runtime<H> {
+        self.runtime
+    }
+
     pub fn execute_top_level(&mut self) -> Result<Variant> {
         let index = self
             .file

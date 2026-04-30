@@ -3,6 +3,7 @@ pub mod host;
 pub mod plugin;
 
 mod globals;
+mod kag;
 mod native;
 mod script;
 

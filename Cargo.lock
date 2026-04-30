@@ -867,6 +867,7 @@ name = "krkr-engine"
 version = "0.1.0"
 dependencies = [
  "krkr-core",
+ "krkr-kag",
  "krkr-tjs2",
  "krkr-xp3",
 ]

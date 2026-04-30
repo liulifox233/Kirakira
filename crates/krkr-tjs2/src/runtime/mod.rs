@@ -72,10 +72,41 @@ where
     }
 }
 
+pub trait VmNativeFunction<H: TjsHost>: Send + Sync {
+    fn call(
+        &self,
+        vm: &mut Vm<'_, '_, H>,
+        this_obj: Option<ObjectHandle>,
+        args: Vec<Variant>,
+    ) -> Result<Variant>;
+}
+
+impl<H, F> VmNativeFunction<H> for F
+where
+    H: TjsHost,
+    F: for<'bc, 'rt> Fn(
+            &mut Vm<'bc, 'rt, H>,
+            Option<ObjectHandle>,
+            Vec<Variant>,
+        ) -> Result<Variant>
+        + Send
+        + Sync,
+{
+    fn call(
+        &self,
+        vm: &mut Vm<'_, '_, H>,
+        this_obj: Option<ObjectHandle>,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        self(vm, this_obj, args)
+    }
+}
+
 pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) heap: Vec<Object>,
     pub(crate) global: ObjectHandle,
     pub(crate) native_functions: Vec<Arc<dyn NativeFunction<H>>>,
+    pub(crate) vm_native_functions: Vec<Arc<dyn VmNativeFunction<H>>>,
     host: H,
 }
 
@@ -97,6 +128,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
             heap: vec![Object::default()],
             global: ObjectHandle(0),
             native_functions: Vec::new(),
+            vm_native_functions: Vec::new(),
             host,
         };
         builtins::install(&mut runtime);
@@ -128,6 +160,13 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.alloc_native(function)
     }
 
+    pub fn alloc_vm_native_function<F>(&mut self, function: F) -> ObjectHandle
+    where
+        F: VmNativeFunction<H> + 'static,
+    {
+        self.alloc_vm_native(function)
+    }
+
     pub fn register_global_native<F>(
         &mut self,
         name: impl Into<String>,
@@ -151,6 +190,20 @@ impl<H: TjsHost + 'static> Runtime<H> {
         F: NativeFunction<H> + 'static,
     {
         let handle = self.alloc_native(function);
+        self.heap[object.0].set(name, Variant::Object(handle));
+        handle
+    }
+
+    pub fn register_object_vm_native<F>(
+        &mut self,
+        object: ObjectHandle,
+        name: impl Into<String>,
+        function: F,
+    ) -> ObjectHandle
+    where
+        F: VmNativeFunction<H> + 'static,
+    {
+        let handle = self.alloc_vm_native(function);
         self.heap[object.0].set(name, Variant::Object(handle));
         handle
     }
@@ -232,5 +285,14 @@ impl<H: TjsHost + 'static> Runtime<H> {
         let id = self.native_functions.len();
         self.native_functions.push(Arc::new(function));
         self.alloc_object(Object::new(ObjectKind::NativeFunction { id }))
+    }
+
+    pub(crate) fn alloc_vm_native<F>(&mut self, function: F) -> ObjectHandle
+    where
+        F: VmNativeFunction<H> + 'static,
+    {
+        let id = self.vm_native_functions.len();
+        self.vm_native_functions.push(Arc::new(function));
+        self.alloc_object(Object::new(ObjectKind::VmNativeFunction { id }))
     }
 }

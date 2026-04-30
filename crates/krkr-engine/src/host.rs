@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -7,7 +7,11 @@ use std::{
 };
 
 use krkr_core::ResourceProvider;
-use krkr_tjs2::{Result, TjsError, runtime::TjsHost};
+use krkr_kag::{KagParser, ParserSnapshot};
+use krkr_tjs2::{
+    Result, TjsError,
+    runtime::{ObjectHandle, TjsHost},
+};
 use krkr_xp3::Xp3ResourceProvider;
 
 #[derive(Clone)]
@@ -17,6 +21,9 @@ pub struct KrkrHost {
     auto_paths: Vec<String>,
     logs: Vec<String>,
     linked_plugins: BTreeSet<String>,
+    kag_parsers: BTreeMap<ObjectHandle, KagParser>,
+    kag_snapshots: BTreeMap<i64, ParserSnapshot>,
+    next_kag_snapshot_id: i64,
     text_encoding: String,
     termination_requested: bool,
 }
@@ -29,6 +36,9 @@ impl Default for KrkrHost {
             auto_paths: Vec::new(),
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
+            kag_parsers: BTreeMap::new(),
+            kag_snapshots: BTreeMap::new(),
+            next_kag_snapshot_id: 1,
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
         }
@@ -45,6 +55,9 @@ impl KrkrHost {
             auto_paths: Vec::new(),
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
+            kag_parsers: BTreeMap::new(),
+            kag_snapshots: BTreeMap::new(),
+            next_kag_snapshot_id: 1,
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
         })
@@ -168,6 +181,29 @@ impl KrkrHost {
 
     pub(crate) fn register_plugin(&mut self, name: &str) {
         self.linked_plugins.insert(name.to_string());
+    }
+
+    pub(crate) fn insert_kag_parser(&mut self, handle: ObjectHandle, parser: KagParser) {
+        self.kag_parsers.insert(handle, parser);
+    }
+
+    pub(crate) fn kag_parser(&self, handle: ObjectHandle) -> Option<&KagParser> {
+        self.kag_parsers.get(&handle)
+    }
+
+    pub(crate) fn take_kag_parser(&mut self, handle: ObjectHandle) -> Option<KagParser> {
+        self.kag_parsers.remove(&handle)
+    }
+
+    pub(crate) fn store_kag_snapshot(&mut self, snapshot: ParserSnapshot) -> i64 {
+        let id = self.next_kag_snapshot_id;
+        self.next_kag_snapshot_id += 1;
+        self.kag_snapshots.insert(id, snapshot);
+        id
+    }
+
+    pub(crate) fn kag_snapshot(&self, id: i64) -> Option<&ParserSnapshot> {
+        self.kag_snapshots.get(&id)
     }
 
     pub(crate) fn link_plugin(&mut self, name: &str) {

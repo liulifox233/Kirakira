@@ -522,6 +522,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
+    pub fn call_object_method(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        self.call_member_direct(Variant::Object(object), name, args, 1)
+    }
+
     pub(super) fn call_value(
         &mut self,
         callee: Variant,
@@ -565,6 +574,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     .cloned()
                     .ok_or_else(|| TjsError::runtime(format!("native function {id} missing")))?;
                 function.call(self.runtime, this_obj, args)
+            }
+            ObjectKind::VmNativeFunction { id } => {
+                let function = self
+                    .runtime
+                    .vm_native_functions
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| TjsError::runtime(format!("VM native function {id} missing")))?;
+                function.call(self, this_obj, args)
             }
             ObjectKind::Proxy { primary, fallback } => {
                 if let Some(primary) = primary {

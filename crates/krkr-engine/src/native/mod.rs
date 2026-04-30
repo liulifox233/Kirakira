@@ -1,6 +1,7 @@
 pub(crate) mod classes;
 mod clipboard;
 mod debug;
+mod kag;
 mod plugins;
 mod scripts;
 mod storages;
@@ -13,6 +14,7 @@ pub(crate) use classes::{
 };
 pub(crate) use clipboard::install_clipboard;
 pub(crate) use debug::install_debug;
+pub(crate) use kag::install_kag_parser;
 pub(crate) use plugins::install_plugins;
 pub(crate) use scripts::install_scripts;
 pub(crate) use storages::install_storages;

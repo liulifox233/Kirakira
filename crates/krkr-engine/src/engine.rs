@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use krkr_kag::{KagParser, Tag};
 use krkr_tjs2::{
     Result,
     runtime::{Runtime, Variant},
@@ -8,6 +9,7 @@ use krkr_tjs2::{
 use crate::{
     globals::install_tvp_globals,
     host::KrkrHost,
+    kag::EngineKagHost,
     plugin::KrkrPlugin,
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
@@ -19,6 +21,7 @@ pub struct EngineConfig {
 
 pub struct KrkrEngine {
     tjs_runtime: Runtime<KrkrHost>,
+    kag_parser: KagParser,
     plugins: Vec<Box<dyn KrkrPlugin>>,
 }
 
@@ -32,6 +35,7 @@ impl KrkrEngine {
         install_tvp_globals(&mut tjs_runtime);
         Ok(Self {
             tjs_runtime,
+            kag_parser: KagParser::new(),
             plugins: Vec::new(),
         })
     }
@@ -58,6 +62,14 @@ impl KrkrEngine {
         self.tjs_runtime.host_mut()
     }
 
+    pub fn kag_parser(&self) -> &KagParser {
+        &self.kag_parser
+    }
+
+    pub fn kag_parser_mut(&mut self) -> &mut KagParser {
+        &mut self.kag_parser
+    }
+
     pub fn execute_script(&mut self, source_name: &str, source: &str) -> Result<Variant> {
         execute_script_on_runtime(&mut self.tjs_runtime, source_name, source)
     }
@@ -80,6 +92,16 @@ impl KrkrEngine {
         self.execute_storage("startup.tjs")
     }
 
+    pub fn load_kag_scenario(&mut self, storage: &str) -> krkr_kag::Result<()> {
+        let mut host = EngineKagHost::new(&mut self.tjs_runtime);
+        self.kag_parser.load_scenario_with(storage, &mut host)
+    }
+
+    pub fn next_kag_tag(&mut self) -> krkr_kag::Result<Option<Tag>> {
+        let mut host = EngineKagHost::new(&mut self.tjs_runtime);
+        self.kag_parser.next_tag_with(&mut host)
+    }
+
     pub fn register_plugin<P>(&mut self, plugin: P) -> Result<()>
     where
         P: KrkrPlugin + 'static,
@@ -100,6 +122,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -125,6 +148,7 @@ mod tests {
             "System",
             "Storages",
             "Plugins",
+            "KAGParser",
             "Scripts",
             "Window",
             "Layer",
@@ -172,6 +196,238 @@ mod tests {
     }
 
     #[test]
+    fn engine_loads_kag_scenario_from_project_storage() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[emb exp=\"1 + 2\"]").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+
+        let tag = engine
+            .next_kag_tag()
+            .expect("next tag")
+            .expect("embedded text tag");
+        assert_eq!(tag.tagname, "ch");
+        assert_eq!(tag.literal_attr("text"), Some("3"));
+        assert!(engine.next_kag_tag().expect("eof").is_none());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_returns_tag_dictionaries() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A\n").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.loadScenario("first.ks");
+                var first = parser.getNextTag();
+                var second = parser.getNextTag();
+                return first.tagname + ":" + first.text + ":" + second.tagname + ":" + second.eol;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("ch:A:r:true".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_interrupts_before_next_tag() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.loadScenario("first.ks");
+                parser.interrupt();
+                return parser.getNextTag().tagname;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("interrupt".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_uses_scenario_load_callbacks() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.onScenarioLoad = function(storage) {
+                    this.loadedName = storage;
+                    return "A";
+                };
+                parser.onScenarioLoaded = function(storage) {
+                    this.loadedDone = storage;
+                };
+                parser.loadScenario("virtual.ks");
+                var tag = parser.getNextTag();
+                return tag.text + ":" + parser.loadedName + ":" + parser.loadedDone;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("A:virtual.ks:virtual.ks".to_string())
+        );
+    }
+
+    #[test]
+    fn tjs_kag_parser_fires_label_and_script_callbacks() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "*start|Opening\n[iscript]\nf.value = 7;\n[endscript]\nA",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var f = new Dictionary();
+                var parser = new KAGParser();
+                parser.onLabel = function(label, page) {
+                    this.seenLabel = label;
+                    this.seenPage = page;
+                };
+                parser.onScript = function(script, storage, start) {
+                    this.seenScript = script;
+                    this.seenScriptStorage = storage;
+                    this.seenScriptStart = start;
+                    Scripts.exec(script);
+                };
+                parser.loadScenario("first.ks");
+                var tag = parser.getNextTag();
+                return parser.seenLabel + ":" + parser.seenPage + ":" +
+                    parser.seenScriptStorage + ":" + f.value + ":" + tag.text;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("*start:Opening:first.ks:7:A".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_process_callbacks_can_cancel_control_tags() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[jump target=*end]B\n*end\nC").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.onJump = function(dic) {
+                    this.jumpTarget = dic.target;
+                    return false;
+                };
+                parser.loadScenario("first.ks");
+                var a = parser.getNextTag();
+                var b = parser.getNextTag();
+                return a.text + b.text + ":" + parser.jumpTarget;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("AB:*end".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_fires_call_return_callbacks() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[call target=*sub]X\n*sub\n[return]Y",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.onCall = function(dic) {
+                    this.callTarget = dic.target;
+                    return true;
+                };
+                parser.onReturn = function(dic) {
+                    this.returned = "yes";
+                    return true;
+                };
+                parser.onAfterReturn = function() {
+                    this.afterReturn = "done";
+                };
+                parser.loadScenario("first.ks");
+                var tag = parser.getNextTag();
+                return tag.text + ":" + parser.callTarget + ":" +
+                    parser.returned + ":" + parser.afterReturn;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("X:*sub:yes:done".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_exposes_pop_macro_args() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[macro name=m][font face=%face][wait][endmacro][m face=serif]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.loadScenario("first.ks");
+                parser.getNextTag();
+                var before = parser.macroParams.face;
+                parser.popMacroArgs();
+                return before + ":" + parser.macroParams.face;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("serif:".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn plugin_registry_tracks_registered_and_linked_plugins() {
         struct TestPlugin;
 
@@ -203,10 +459,15 @@ mod tests {
     }
 
     fn temp_root() -> PathBuf {
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("krkr-ruri-engine-{}-{nanos}", std::process::id()))
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "krkr-ruri-engine-{}-{nanos}-{id}",
+            std::process::id()
+        ))
     }
 }

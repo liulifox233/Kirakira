@@ -92,6 +92,9 @@ pub(crate) fn install_tvp_constants(runtime: &mut Runtime<KrkrHost>) {
         ("VK_UP", 0x26),
         ("VK_RIGHT", 0x27),
         ("VK_DOWN", 0x28),
+        ("tkdlNone", 0),
+        ("tkdlSimple", 1),
+        ("tkdlVerbose", 2),
     ] {
         runtime.set_global_member(name, Variant::Integer(value));
     }

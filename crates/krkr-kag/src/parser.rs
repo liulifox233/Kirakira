@@ -361,6 +361,10 @@ impl KagParser {
         self.macro_params.clear();
     }
 
+    pub fn pop_macro_args(&mut self) -> Result<()> {
+        self.pop_macro_arguments(SourceSpan::empty(self.active_offset()))
+    }
+
     pub fn store(&self) -> ParserSnapshot {
         ParserSnapshot {
             current_storage: self.current_storage.clone(),
