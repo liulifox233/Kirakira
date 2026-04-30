@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 encoding_rs.workspace = true
+image.workspace = true
 krkr-core.workspace = true
 krkr-kag.workspace = true
 krkr-tjs2.workspace = true

@@ -1,4 +1,8 @@
-use std::io::{self, Read, Seek};
+use std::{
+    collections::BTreeMap,
+    io::{self, Read, Seek},
+    sync::Arc,
+};
 
 pub trait ResourceStream: Read + Seek + Send {}
 
@@ -110,10 +114,42 @@ pub struct TextCommand {
     pub size: f32,
 }
 
+pub type TextureId = u64;
+pub type LayerId = u64;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageUpload {
+    pub texture_id: TextureId,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<[u8]>,
+}
+
+impl ImageUpload {
+    pub fn new(texture_id: TextureId, width: u32, height: u32, rgba: Arc<[u8]>) -> Self {
+        Self {
+            texture_id,
+            width,
+            height,
+            rgba,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageCommand {
+    pub texture_id: TextureId,
+    pub rect: Rect,
+    pub source_rect: Rect,
+    pub texture_size: Size,
+    pub opacity: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DrawCommand {
     Rect(RectCommand),
     Text(TextCommand),
+    Image(ImageCommand),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +157,7 @@ pub struct FrameOutput {
     pub clear_color: Color,
     pub clip: Option<Rect>,
     pub draw_commands: Vec<DrawCommand>,
+    pub image_uploads: Vec<ImageUpload>,
 }
 
 impl FrameOutput {
@@ -129,12 +166,188 @@ impl FrameOutput {
             clear_color,
             clip: None,
             draw_commands,
+            image_uploads: Vec::new(),
         }
     }
 
     pub fn with_clip(mut self, clip: Rect) -> Self {
         self.clip = Some(clip);
         self
+    }
+
+    pub fn with_image_uploads(mut self, image_uploads: Vec<ImageUpload>) -> Self {
+        self.image_uploads = image_uploads;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerImage {
+    pub upload: ImageUpload,
+}
+
+impl LayerImage {
+    pub fn new(texture_id: TextureId, width: u32, height: u32, rgba: Arc<[u8]>) -> Self {
+        Self {
+            upload: ImageUpload::new(texture_id, width, height, rgba),
+        }
+    }
+
+    pub fn size(&self) -> Size {
+        Size::new(self.upload.width as f32, self.upload.height as f32)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerNode {
+    pub id: LayerId,
+    pub name: String,
+    pub parent: Option<LayerId>,
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+    pub image_left: f32,
+    pub image_top: f32,
+    pub image_width: f32,
+    pub image_height: f32,
+    pub visible: bool,
+    pub renderable: bool,
+    pub opacity: u8,
+    pub z_order: i32,
+    pub image: Option<LayerImage>,
+}
+
+impl LayerNode {
+    pub fn new(
+        id: LayerId,
+        name: impl Into<String>,
+        parent: Option<LayerId>,
+        z_order: i32,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            parent,
+            left: 0.0,
+            top: 0.0,
+            width: 0.0,
+            height: 0.0,
+            image_left: 0.0,
+            image_top: 0.0,
+            image_width: 0.0,
+            image_height: 0.0,
+            visible: false,
+            renderable: true,
+            opacity: 255,
+            z_order,
+            image: None,
+        }
+    }
+
+    pub fn rect(&self) -> Rect {
+        Rect::new(self.left, self.top, self.width, self.height)
+    }
+
+    pub fn image_rect(&self) -> Rect {
+        Rect::new(
+            self.image_left,
+            self.image_top,
+            self.image_width,
+            self.image_height,
+        )
+    }
+
+    pub fn set_image(&mut self, image: LayerImage) {
+        let size = image.size();
+        self.image_width = size.width;
+        self.image_height = size.height;
+        if self.width <= 0.0 || self.height <= 0.0 {
+            self.width = size.width;
+            self.height = size.height;
+        }
+        self.image = Some(image);
+    }
+
+    pub fn clear_image(&mut self) {
+        self.image = None;
+        self.image_width = 0.0;
+        self.image_height = 0.0;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerTree {
+    layers: BTreeMap<LayerId, LayerNode>,
+    next_layer_id: LayerId,
+}
+
+impl Default for LayerTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LayerTree {
+    pub fn new() -> Self {
+        Self {
+            layers: BTreeMap::new(),
+            next_layer_id: 1,
+        }
+    }
+
+    pub fn create_layer(
+        &mut self,
+        name: impl Into<String>,
+        parent: Option<LayerId>,
+        z_order: i32,
+    ) -> LayerId {
+        let id = self.next_layer_id;
+        self.next_layer_id = self.next_layer_id.saturating_add(1);
+        self.layers
+            .insert(id, LayerNode::new(id, name, parent, z_order));
+        id
+    }
+
+    pub fn layer(&self, id: LayerId) -> Option<&LayerNode> {
+        self.layers.get(&id)
+    }
+
+    pub fn layer_mut(&mut self, id: LayerId) -> Option<&mut LayerNode> {
+        self.layers.get_mut(&id)
+    }
+
+    pub fn remove_layer(&mut self, id: LayerId) -> Option<LayerNode> {
+        self.layers.remove(&id)
+    }
+
+    pub fn draw_model(&self) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        let mut layers = self
+            .layers
+            .values()
+            .filter(|layer| layer.renderable && layer.visible && layer.opacity > 0)
+            .collect::<Vec<_>>();
+        layers.sort_by_key(|layer| (layer.z_order, layer.id));
+
+        let mut commands = Vec::new();
+        let mut uploads = Vec::new();
+        for layer in layers {
+            let Some(image) = &layer.image else {
+                continue;
+            };
+            if layer.width <= 0.0 || layer.height <= 0.0 {
+                continue;
+            }
+            commands.push(DrawCommand::Image(ImageCommand {
+                texture_id: image.upload.texture_id,
+                rect: layer.rect(),
+                source_rect: layer.image_rect(),
+                texture_size: image.size(),
+                opacity: layer.opacity as f32 / 255.0,
+            }));
+            uploads.push(image.upload.clone());
+        }
+        (commands, uploads)
     }
 }
 
@@ -483,6 +696,23 @@ impl Engine {
         FrameOutput::new(palette::RUNTIME_BACKGROUND, draw_commands)
     }
 
+    pub fn tick_running_with_layers(
+        &mut self,
+        input: FrameInput,
+        layers: &LayerTree,
+        message: &MessageLayerModel,
+    ) -> FrameOutput {
+        if !input.viewport_size.is_empty() {
+            self.viewport_size = input.viewport_size;
+        }
+
+        let (mut draw_commands, image_uploads) = layers.draw_model();
+        self.draw_message_overlay(&mut draw_commands, message);
+
+        FrameOutput::new(palette::RUNTIME_BACKGROUND, draw_commands)
+            .with_image_uploads(image_uploads)
+    }
+
     pub fn view_model(&self) -> LauncherViewModel {
         LauncherViewModel {
             panel: self.panel,
@@ -821,6 +1051,50 @@ impl Engine {
         }
     }
 
+    fn draw_message_overlay(&self, commands: &mut Vec<DrawCommand>, message: &MessageLayerModel) {
+        if message.lines.is_empty() && !message.waiting_for_click {
+            return;
+        }
+
+        let width = self.viewport_size.width.max(320.0);
+        let height = self.viewport_size.height.max(240.0);
+        let margin = if width >= 640.0 { 42.0 } else { 20.0 };
+        let box_height = 116.0_f32.min((height - margin * 2.0).max(64.0));
+        let box_rect = Rect::new(
+            margin,
+            (height - box_height - margin).max(margin),
+            (width - margin * 2.0).max(0.0),
+            box_height,
+        );
+        rect(commands, box_rect, palette::TEXT_BOX);
+
+        let text_x = box_rect.x + 24.0;
+        let mut text_y = box_rect.y + 20.0;
+        let first_line = message.lines.len().saturating_sub(3);
+        for line in message.lines.iter().skip(first_line) {
+            text(
+                commands,
+                Point::new(text_x, text_y),
+                line,
+                palette::TEXT,
+                18.0,
+            );
+            text_y += 23.0;
+        }
+        if message.waiting_for_click {
+            rect(
+                commands,
+                Rect::new(
+                    box_rect.x + box_rect.width - 30.0,
+                    box_rect.y + box_rect.height - 30.0,
+                    12.0,
+                    12.0,
+                ),
+                palette::ACCENT_YELLOW,
+            );
+        }
+    }
+
     fn element_color(&self, element: UiElement) -> Color {
         if self.pressed == Some(element) {
             return palette::PRESSED;
@@ -1043,6 +1317,42 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, DrawCommand::Text(text) if text.text == "World"))
         );
+    }
+
+    #[test]
+    fn layer_tree_draw_model_sorts_visible_images_by_z_order() {
+        let pixels = std::sync::Arc::<[u8]>::from(vec![255, 255, 255, 255]);
+        let low_image = LayerImage::new(1, 1, 1, pixels.clone());
+        let high_image = LayerImage::new(2, 1, 1, pixels);
+        let mut layers = LayerTree::new();
+        let high = layers.create_layer("high", None, 20);
+        let low = layers.create_layer("low", None, 10);
+
+        {
+            let layer = layers.layer_mut(high).expect("high layer");
+            layer.left = 20.0;
+            layer.top = 30.0;
+            layer.visible = true;
+            layer.set_image(high_image);
+        }
+        {
+            let layer = layers.layer_mut(low).expect("low layer");
+            layer.left = 2.0;
+            layer.top = 3.0;
+            layer.visible = true;
+            layer.set_image(low_image);
+        }
+
+        let (commands, uploads) = layers.draw_model();
+
+        assert_eq!(uploads.len(), 2);
+        assert!(matches!(
+            &commands[..],
+            [
+                DrawCommand::Image(first),
+                DrawCommand::Image(second)
+            ] if first.texture_id == 1 && second.texture_id == 2
+        ));
     }
 
     #[test]

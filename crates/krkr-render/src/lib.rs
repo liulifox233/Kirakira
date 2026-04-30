@@ -1,7 +1,9 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
-use krkr_core::{Color, DrawCommand, FrameOutput, Rect, Size, TextCommand};
+use krkr_core::{
+    Color, DrawCommand, FrameOutput, ImageCommand, Rect, Size, TextCommand, TextureId,
+};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -48,13 +50,14 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     texture_pipeline: TexturePipelineResources,
+    textures: BTreeMap<TextureId, CachedTexture>,
     physical_size: PhysicalSize<u32>,
     scale_factor: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TexturePipelineState {
-    Reserved,
+    Ready,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +144,7 @@ impl Renderer {
             config,
             pipeline,
             texture_pipeline,
+            textures: BTreeMap::new(),
             physical_size,
             scale_factor,
         })
@@ -186,6 +190,7 @@ impl Renderer {
         if self.physical_size.width == 0 || self.physical_size.height == 0 {
             return Ok(());
         }
+        self.upload_frame_images(frame);
 
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
@@ -202,16 +207,7 @@ impl Renderer {
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let vertices = self.vertices_for_frame(frame);
         let physical_clip = frame.clip.and_then(|clip| self.physical_rect(clip));
-        let vertex_buffer = (!vertices.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("krkr-ruri rect vertices"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
 
         let mut encoder = self
             .device
@@ -236,15 +232,11 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if let Some(vertex_buffer) = &vertex_buffer {
-                pass.set_pipeline(&self.pipeline);
-                if let Some(clip) = physical_clip {
-                    pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
-                }
-                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                if frame.clip.is_none() || physical_clip.is_some() {
-                    pass.draw(0..vertices.len() as u32, 0..1);
-                }
+            if let Some(clip) = physical_clip {
+                pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+            }
+            if frame.clip.is_none() || physical_clip.is_some() {
+                self.draw_commands(&mut pass, &frame.draw_commands);
             }
         }
 
@@ -253,19 +245,161 @@ impl Renderer {
         Ok(())
     }
 
-    fn vertices_for_frame(&self, frame: &FrameOutput) -> Vec<Vertex> {
-        let mut vertices = Vec::new();
+    fn upload_frame_images(&mut self, frame: &FrameOutput) {
+        for upload in &frame.image_uploads {
+            let needs_upload = self.textures.get(&upload.texture_id).is_none_or(|texture| {
+                texture.width != upload.width || texture.height != upload.height
+            });
+            if !needs_upload {
+                continue;
+            }
 
-        for command in &frame.draw_commands {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("krkr-ruri uploaded texture"),
+                size: wgpu::Extent3d {
+                    width: upload.width.max(1),
+                    height: upload.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &upload.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(upload.width.saturating_mul(4)),
+                    rows_per_image: Some(upload.height),
+                },
+                wgpu::Extent3d {
+                    width: upload.width.max(1),
+                    height: upload.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("krkr-ruri texture bind group"),
+                layout: &self.texture_pipeline.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.texture_pipeline.sampler),
+                    },
+                ],
+            });
+            self.textures.insert(
+                upload.texture_id,
+                CachedTexture {
+                    width: upload.width,
+                    height: upload.height,
+                    _texture: texture,
+                    _view: view,
+                    bind_group,
+                },
+            );
+        }
+    }
+
+    fn draw_commands<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        commands: &[DrawCommand],
+    ) {
+        let mut vertices = Vec::new();
+        for command in commands {
             match command {
                 DrawCommand::Rect(rect) => {
                     vertices.extend_from_slice(&self.rect_vertices(rect.rect, rect.color));
                 }
                 DrawCommand::Text(text) => self.push_text_vertices(&mut vertices, text),
+                DrawCommand::Image(image) => {
+                    self.flush_rect_vertices(pass, &mut vertices);
+                    self.draw_image(pass, image);
+                }
             }
         }
+        self.flush_rect_vertices(pass, &mut vertices);
+    }
 
-        vertices
+    fn flush_rect_vertices<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        vertices: &mut Vec<Vertex>,
+    ) {
+        if vertices.is_empty() {
+            return;
+        }
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("krkr-ruri rect vertices"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.draw(0..vertices.len() as u32, 0..1);
+        vertices.clear();
+    }
+
+    fn draw_image<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, command: &ImageCommand) {
+        let Some(texture) = self.textures.get(&command.texture_id) else {
+            return;
+        };
+        if command.rect.width <= 0.0 || command.rect.height <= 0.0 {
+            return;
+        }
+        let vertices = self.image_vertices(command);
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("krkr-ruri image vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        pass.set_pipeline(&self.texture_pipeline.pipeline);
+        pass.set_bind_group(0, &texture.bind_group, &[]);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.draw(0..vertices.len() as u32, 0..1);
+    }
+
+    fn image_vertices(&self, command: &ImageCommand) -> [TexturedVertex; 6] {
+        let scale = self.scale_factor as f32;
+        let x0 = command.rect.x * scale;
+        let y0 = command.rect.y * scale;
+        let x1 = (command.rect.x + command.rect.width) * scale;
+        let y1 = (command.rect.y + command.rect.height) * scale;
+        let tx0 = command.source_rect.x / command.texture_size.width.max(1.0);
+        let ty0 = command.source_rect.y / command.texture_size.height.max(1.0);
+        let tx1 = (command.source_rect.x + command.source_rect.width)
+            / command.texture_size.width.max(1.0);
+        let ty1 = (command.source_rect.y + command.source_rect.height)
+            / command.texture_size.height.max(1.0);
+        let tint = [1.0, 1.0, 1.0, command.opacity.clamp(0.0, 1.0)];
+
+        [
+            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint),
+            TexturedVertex::new(self.ndc(x1, y0), [tx1, ty0], tint),
+            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint),
+            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint),
+            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint),
+            TexturedVertex::new(self.ndc(x0, y1), [tx0, ty1], tint),
+        ]
     }
 
     fn push_text_vertices(&self, vertices: &mut Vec<Vertex>, command: &TextCommand) {
@@ -633,11 +767,16 @@ impl TexturePipelineResources {
     }
 
     fn state(&self) -> TexturePipelineState {
-        let _bind_group_layout = &self.bind_group_layout;
-        let _sampler = &self.sampler;
-        let _pipeline = &self.pipeline;
-        TexturePipelineState::Reserved
+        TexturePipelineState::Ready
     }
+}
+
+struct CachedTexture {
+    width: u32,
+    height: u32,
+    _texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -692,6 +831,14 @@ struct TexturedVertex {
 impl TexturedVertex {
     const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
         wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+
+    const fn new(position: [f32; 2], tex_coord: [f32; 2], tint: [f32; 4]) -> Self {
+        Self {
+            position,
+            tex_coord,
+            tint,
+        }
+    }
 
     fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {

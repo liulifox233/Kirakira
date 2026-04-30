@@ -1,5 +1,5 @@
 use krkr_tjs2::{
-    Result,
+    Result, TjsError,
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
@@ -141,8 +141,18 @@ fn apply_constructor_defaults(
         "Layer" => {
             let window = args.first().cloned().unwrap_or_default();
             let parent = args.get(1).cloned().unwrap_or_default();
+            let parent_layer = match parent {
+                Variant::Object(parent) => runtime.host().native_layer(parent),
+                _ => None,
+            };
+            let layer_id = runtime.host_mut().register_native_layer(
+                handle,
+                format!("native:{}", handle.0),
+                parent_layer,
+            );
             runtime.set_object_member(handle, "window", window.clone());
             runtime.set_object_member(handle, "parent", parent.clone());
+            runtime.set_object_member(handle, "__nativeLayerId", Variant::Integer(layer_id as i64));
             let children = runtime.alloc_array_object(Vec::new());
             runtime.set_object_member(handle, "children", Variant::Object(children));
             runtime.set_object_member(handle, "left", Variant::Integer(0));
@@ -208,6 +218,8 @@ fn install_special_methods(
 ) {
     if class_name == "MenuItem" {
         install_menu_item_methods(runtime, handle);
+    } else if class_name == "Layer" {
+        install_layer_methods(runtime, handle);
     }
 }
 
@@ -320,6 +332,199 @@ fn menu_item_noop(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Void)
+}
+
+fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    runtime.register_object_native(handle, "loadImages", layer_load_images);
+    runtime.register_object_native(handle, "setPos", layer_set_pos);
+    runtime.register_object_native(handle, "setSize", layer_set_size);
+    runtime.register_object_native(handle, "setImagePos", layer_set_image_pos);
+    runtime.register_object_native(handle, "setImageSize", layer_set_image_size);
+    runtime.register_object_native(handle, "setSizeToImageSize", layer_set_size_to_image_size);
+    runtime.register_object_native(handle, "bringToFront", layer_bring_to_front);
+    runtime.register_object_native(handle, "bringToBack", layer_bring_to_back);
+    runtime.register_object_native(handle, "update", layer_noop);
+}
+
+fn this_layer_id(
+    runtime: &Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+) -> Result<(ObjectHandle, u64)> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
+    let id = runtime
+        .object_member(this, "__nativeLayerId")
+        .to_integer()? as u64;
+    Ok((this, id))
+}
+
+fn layer_load_images(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let storage = args
+        .first()
+        .ok_or_else(|| TjsError::runtime("Layer.loadImages requires storage"))?
+        .to_tjs_string()?;
+    let image = runtime.host_mut().load_image_storage(&storage)?;
+    let size = image.size();
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.set_image(image);
+        layer.visible = true;
+    }
+    sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
+    runtime.set_object_member(this, "visible", Variant::Integer(1));
+    Ok(Variant::Void)
+}
+
+fn layer_set_pos(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let left = optional_integer(&args, 0)?.unwrap_or(0);
+    let top = optional_integer(&args, 1)?.unwrap_or(0);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.left = left as f32;
+        layer.top = top as f32;
+    }
+    runtime.set_object_member(this, "left", Variant::Integer(left));
+    runtime.set_object_member(this, "top", Variant::Integer(top));
+    Ok(Variant::Void)
+}
+
+fn layer_set_size(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
+    let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.width = width as f32;
+        layer.height = height as f32;
+    }
+    runtime.set_object_member(this, "width", Variant::Integer(width));
+    runtime.set_object_member(this, "height", Variant::Integer(height));
+    Ok(Variant::Void)
+}
+
+fn layer_set_image_pos(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let left = optional_integer(&args, 0)?.unwrap_or(0);
+    let top = optional_integer(&args, 1)?.unwrap_or(0);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.image_left = left as f32;
+        layer.image_top = top as f32;
+    }
+    runtime.set_object_member(this, "imageLeft", Variant::Integer(left));
+    runtime.set_object_member(this, "imageTop", Variant::Integer(top));
+    Ok(Variant::Void)
+}
+
+fn layer_set_image_size(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
+    let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.image_width = width as f32;
+        layer.image_height = height as f32;
+    }
+    runtime.set_object_member(this, "imageWidth", Variant::Integer(width));
+    runtime.set_object_member(this, "imageHeight", Variant::Integer(height));
+    Ok(Variant::Void)
+}
+
+fn layer_set_size_to_image_size(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (width, height) = runtime
+        .host()
+        .layer_tree()
+        .layer(layer_id)
+        .map(|layer| (layer.image_width as i64, layer.image_height as i64))
+        .unwrap_or((0, 0));
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.width = width as f32;
+        layer.height = height as f32;
+    }
+    runtime.set_object_member(this, "width", Variant::Integer(width));
+    runtime.set_object_member(this, "height", Variant::Integer(height));
+    Ok(Variant::Void)
+}
+
+fn layer_bring_to_front(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let (_this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let next = runtime
+        .host()
+        .layer_tree()
+        .layer(layer_id)
+        .map(|layer| layer.z_order)
+        .unwrap_or(20_000)
+        + 1_000;
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.z_order = next;
+    }
+    Ok(Variant::Void)
+}
+
+fn layer_bring_to_back(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let (_this, layer_id) = this_layer_id(runtime, this_obj)?;
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.z_order = 0;
+    }
+    Ok(Variant::Void)
+}
+
+fn layer_noop(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Void)
+}
+
+fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
+    args.get(index)
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_integer)
+        .transpose()
+}
+
+fn sync_layer_image_members(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    width: i64,
+    height: i64,
+) {
+    runtime.set_object_member(this, "imageLeft", Variant::Integer(0));
+    runtime.set_object_member(this, "imageTop", Variant::Integer(0));
+    runtime.set_object_member(this, "imageWidth", Variant::Integer(width));
+    runtime.set_object_member(this, "imageHeight", Variant::Integer(height));
+    runtime.set_object_member(this, "width", Variant::Integer(width));
+    runtime.set_object_member(this, "height", Variant::Integer(height));
 }
 
 pub(crate) struct NativeClassSpec {

@@ -1,13 +1,14 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
-use krkr_core::ResourceProvider;
+use krkr_core::{LayerId, LayerImage, LayerTree, ResourceProvider};
 use krkr_kag::{KagParser, ParserSnapshot};
 use krkr_tjs2::{
     Result, TjsError,
@@ -26,6 +27,13 @@ pub struct KrkrHost {
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
     kag_snapshots: BTreeMap<i64, ParserSnapshot>,
     next_kag_snapshot_id: i64,
+    layer_tree: LayerTree,
+    native_layers: BTreeMap<ObjectHandle, LayerId>,
+    kag_layers: BTreeMap<String, LayerId>,
+    current_kag_page: String,
+    current_kag_layer: String,
+    image_cache: BTreeMap<String, LayerImage>,
+    next_texture_id: u64,
     text_encoding: String,
     termination_requested: bool,
 }
@@ -42,6 +50,13 @@ impl Default for KrkrHost {
             kag_parsers: BTreeMap::new(),
             kag_snapshots: BTreeMap::new(),
             next_kag_snapshot_id: 1,
+            layer_tree: LayerTree::new(),
+            native_layers: BTreeMap::new(),
+            kag_layers: BTreeMap::new(),
+            current_kag_page: "fore".to_string(),
+            current_kag_layer: "base".to_string(),
+            image_cache: BTreeMap::new(),
+            next_texture_id: 1,
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
         }
@@ -63,6 +78,13 @@ impl KrkrHost {
             kag_parsers: BTreeMap::new(),
             kag_snapshots: BTreeMap::new(),
             next_kag_snapshot_id: 1,
+            layer_tree: LayerTree::new(),
+            native_layers: BTreeMap::new(),
+            kag_layers: BTreeMap::new(),
+            current_kag_page: "fore".to_string(),
+            current_kag_layer: "base".to_string(),
+            image_cache: BTreeMap::new(),
+            next_texture_id: 1,
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
         })
@@ -267,6 +289,147 @@ impl KrkrHost {
     pub(crate) fn log(&mut self, message: &str) {
         self.logs.push(message.to_string());
     }
+
+    pub fn layer_tree(&self) -> &LayerTree {
+        &self.layer_tree
+    }
+
+    pub(crate) fn layer_tree_mut(&mut self) -> &mut LayerTree {
+        &mut self.layer_tree
+    }
+
+    pub(crate) fn register_native_layer(
+        &mut self,
+        handle: ObjectHandle,
+        name: impl Into<String>,
+        parent: Option<LayerId>,
+    ) -> LayerId {
+        if let Some(id) = self.native_layers.get(&handle) {
+            return *id;
+        }
+
+        let z_order = 20_000 + self.native_layers.len() as i32;
+        let id = self.layer_tree.create_layer(name, parent, z_order);
+        self.native_layers.insert(handle, id);
+        id
+    }
+
+    pub(crate) fn native_layer(&self, handle: ObjectHandle) -> Option<LayerId> {
+        self.native_layers.get(&handle).copied()
+    }
+
+    pub(crate) fn native_layer_entries(&self) -> Vec<(ObjectHandle, LayerId)> {
+        self.native_layers
+            .iter()
+            .map(|(handle, layer_id)| (*handle, *layer_id))
+            .collect()
+    }
+
+    pub(crate) fn ensure_kag_layer(&mut self, page: &str, layer: &str) -> LayerId {
+        let page = normalize_kag_page(page);
+        let key = format!("{page}:{layer}");
+        match self.kag_layers.entry(key) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let id = self.layer_tree.create_layer(
+                    format!("{page}:{layer}"),
+                    None,
+                    kag_layer_z_order(layer),
+                );
+                if let Some(node) = self.layer_tree.layer_mut(id) {
+                    node.renderable = page == "fore";
+                }
+                entry.insert(id);
+                id
+            }
+        }
+    }
+
+    pub(crate) fn current_kag_page(&self) -> &str {
+        &self.current_kag_page
+    }
+
+    pub(crate) fn current_kag_layer(&self) -> &str {
+        &self.current_kag_layer
+    }
+
+    pub(crate) fn set_current_kag_layer(
+        &mut self,
+        page: impl Into<String>,
+        layer: impl Into<String>,
+    ) {
+        self.current_kag_page = normalize_kag_page(&page.into()).to_string();
+        self.current_kag_layer = layer.into();
+    }
+
+    pub(crate) fn load_image_storage(&mut self, name: &str) -> Result<LayerImage> {
+        if let Some(image) = self.image_cache.get(name) {
+            return Ok(image.clone());
+        }
+
+        let bytes = self.read_binary_storage(name)?;
+        let decoded = image::load_from_memory(&bytes)
+            .map_err(|error| {
+                TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
+            })?
+            .to_rgba8();
+        let width = decoded.width();
+        let height = decoded.height();
+        let rgba = Arc::<[u8]>::from(decoded.into_raw());
+        let texture_id = self.next_texture_id;
+        self.next_texture_id = self.next_texture_id.saturating_add(1);
+        let image = LayerImage::new(texture_id, width, height, rgba);
+        self.image_cache.insert(name.to_string(), image.clone());
+        Ok(image)
+    }
+
+    pub(crate) fn apply_immediate_transition(&mut self) {
+        let back_layers = self
+            .kag_layers
+            .iter()
+            .filter_map(|(key, source_id)| {
+                let layer = key.strip_prefix("back:")?;
+                Some((layer.to_string(), *source_id))
+            })
+            .collect::<Vec<_>>();
+
+        for (layer, source_id) in back_layers {
+            let target_id = self.ensure_kag_layer("fore", &layer);
+            let Some(source) = self.layer_tree.layer(source_id).cloned() else {
+                continue;
+            };
+            if let Some(target) = self.layer_tree.layer_mut(target_id) {
+                let z_order = target.z_order;
+                let id = target.id;
+                let name = target.name.clone();
+                *target = source;
+                target.id = id;
+                target.name = name;
+                target.z_order = z_order;
+                target.renderable = true;
+            }
+        }
+    }
+}
+
+fn normalize_kag_page(page: &str) -> &str {
+    match page {
+        "back" | "background" => "back",
+        _ => "fore",
+    }
+}
+
+fn kag_layer_z_order(layer: &str) -> i32 {
+    if layer == "base" || layer == "background" {
+        return 0;
+    }
+    if let Some(index) = layer
+        .strip_prefix("message")
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        return 10_000 + index;
+    }
+    layer.parse::<i32>().map_or(1_000, |index| 1_000 + index)
 }
 
 #[derive(Clone)]

@@ -27,7 +27,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut app = DesktopApp::new();
+    let initial_project_root = std::env::args_os().nth(1).map(PathBuf::from);
+    let mut app = DesktopApp::new(initial_project_root);
 
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
@@ -72,12 +73,13 @@ struct DesktopApp {
     pending_runtime_events: Vec<EngineEvent>,
     state: DesktopState,
     project_root: Option<PathBuf>,
+    initial_project_root: Option<PathBuf>,
     status: Option<DesktopStatus>,
     last_frame: Instant,
 }
 
 impl DesktopApp {
-    fn new() -> Self {
+    fn new(initial_project_root: Option<PathBuf>) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -87,6 +89,7 @@ impl DesktopApp {
             pending_runtime_events: Vec::new(),
             state: DesktopState::Launcher,
             project_root: None,
+            initial_project_root,
             status: None,
             last_frame: Instant::now(),
         }
@@ -139,6 +142,10 @@ impl DesktopApp {
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
         self.update_window_title(&window);
+
+        if let Some(root) = self.initial_project_root.take() {
+            self.launch_project(root, &window);
+        }
     }
 
     fn handle_redraw(&mut self, event_loop: &ActiveEventLoop) {

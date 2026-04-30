@@ -235,9 +235,12 @@ impl KrkrEngine {
     pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
         self.handle_input_events(&input.events);
         let tick = self.advance(delta)?;
-        let output = self
-            .core_engine
-            .tick_running_with_message(input.frame, &self.message_layer);
+        self.sync_native_layers_from_tjs()?;
+        let output = self.core_engine.tick_running_with_layers(
+            input.frame,
+            self.tjs_runtime.host().layer_tree(),
+            &self.message_layer,
+        );
         Ok(EngineFrame {
             output,
             tick,
@@ -270,6 +273,41 @@ impl KrkrEngine {
                 _ => {}
             }
         }
+    }
+
+    fn sync_native_layers_from_tjs(&mut self) -> Result<()> {
+        let entries = self.tjs_runtime.host().native_layer_entries();
+        for (handle, layer_id) in entries {
+            let left = object_i64(&self.tjs_runtime, handle, "left")?;
+            let top = object_i64(&self.tjs_runtime, handle, "top")?;
+            let width = object_i64(&self.tjs_runtime, handle, "width")?;
+            let height = object_i64(&self.tjs_runtime, handle, "height")?;
+            let image_left = object_i64(&self.tjs_runtime, handle, "imageLeft")?;
+            let image_top = object_i64(&self.tjs_runtime, handle, "imageTop")?;
+            let image_width = object_i64(&self.tjs_runtime, handle, "imageWidth")?;
+            let image_height = object_i64(&self.tjs_runtime, handle, "imageHeight")?;
+            let visible = object_i64(&self.tjs_runtime, handle, "visible")? != 0;
+            let opacity = object_i64(&self.tjs_runtime, handle, "opacity")?.clamp(0, 255) as u8;
+
+            if let Some(layer) = self
+                .tjs_runtime
+                .host_mut()
+                .layer_tree_mut()
+                .layer_mut(layer_id)
+            {
+                layer.left = left as f32;
+                layer.top = top as f32;
+                layer.width = width.max(0) as f32;
+                layer.height = height.max(0) as f32;
+                layer.image_left = image_left as f32;
+                layer.image_top = image_top as f32;
+                layer.image_width = image_width.max(0) as f32;
+                layer.image_height = image_height.max(0) as f32;
+                layer.visible = visible;
+                layer.opacity = opacity;
+            }
+        }
+        Ok(())
     }
 
     pub fn register_plugin<P>(&mut self, plugin: P) -> Result<()>
@@ -445,7 +483,7 @@ impl KagRuntimeTask {
             return self.apply_handler_step(tag, value);
         }
 
-        let default_action = self.process_builtin_tag(message_layer, &tag);
+        let default_action = self.process_builtin_tag(runtime, message_layer, &tag)?;
         if matches!(default_action, TagAction::Continue)
             && let Some(handler) = self.handler
             && !is_builtin_tag(&tag.tagname)
@@ -487,43 +525,63 @@ impl KagRuntimeTask {
 
     fn process_builtin_tag(
         &mut self,
+        runtime: &mut Runtime<KrkrHost>,
         message_layer: &mut MessageLayerModel,
         tag: &Tag,
-    ) -> TagAction {
+    ) -> Result<TagAction> {
         match tag.tagname.as_str() {
             "ch" => {
                 if let Some(text) = tag.literal_attr("text") {
                     message_layer.append_text(text);
                 }
-                TagAction::Continue
+                Ok(TagAction::Continue)
             }
             "r" => {
                 message_layer.newline();
-                TagAction::Continue
+                Ok(TagAction::Continue)
             }
             "l" => {
                 message_layer.newline();
-                self.wait_click(message_layer, false)
+                Ok(self.wait_click(message_layer, false))
             }
             "p" => {
                 message_layer.page_break();
-                self.wait_click(message_layer, true)
+                Ok(self.wait_click(message_layer, true))
             }
-            "waitclick" => self.wait_click(message_layer, false),
-            "wait" => match tag_millis(tag, "time") {
+            "waitclick" => Ok(self.wait_click(message_layer, false)),
+            "wait" => Ok(match tag_millis(tag, "time") {
                 Some(duration) => self.wait(KagTaskState::WaitingTimer {
                     remaining: duration,
                 }),
                 None => self.wait_click(message_layer, false),
-            },
-            "trans" | "wt" => self.wait(KagTaskState::WaitingTransition),
-            "wq" | "wf" | "wb" | "wm" => self.wait(KagTaskState::WaitingAudio),
-            "waitload" | "waittrig" => self.wait(KagTaskState::WaitingResource),
+            }),
+            "image" => {
+                apply_image_tag(runtime, tag)?;
+                Ok(TagAction::Continue)
+            }
+            "layopt" | "position" => {
+                apply_layer_options_tag(runtime, tag)?;
+                Ok(TagAction::Continue)
+            }
+            "freeimage" => {
+                apply_freeimage_tag(runtime, tag);
+                Ok(TagAction::Continue)
+            }
+            "current" => {
+                apply_current_tag(runtime, tag);
+                Ok(TagAction::Continue)
+            }
+            "trans" | "wt" => {
+                runtime.host_mut().apply_immediate_transition();
+                Ok(TagAction::Continue)
+            }
+            "wq" | "wf" | "wb" | "wm" => Ok(self.wait(KagTaskState::WaitingAudio)),
+            "waitload" | "waittrig" => Ok(self.wait(KagTaskState::WaitingResource)),
             "s" => {
                 self.state = KagTaskState::Finished;
-                TagAction::Yield(KagYieldReason::Finished)
+                Ok(TagAction::Yield(KagYieldReason::Finished))
             }
-            _ => TagAction::Continue,
+            _ => Ok(TagAction::Continue),
         }
     }
 
@@ -618,6 +676,123 @@ fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+fn object_i64(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Result<i64> {
+    runtime.object_member(object, name).to_integer()
+}
+
+fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
+    let storage = tag
+        .literal_attr("storage")
+        .ok_or_else(|| TjsError::runtime("KAG image tag requires storage"))?;
+    let (page, layer_name) = kag_target(runtime, tag);
+    let image = runtime.host_mut().load_image_storage(storage)?;
+    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.set_image(image);
+        layer.visible = kag_bool_attr(tag, "visible").unwrap_or(true);
+        apply_tag_geometry(layer, tag)?;
+    }
+    Ok(())
+}
+
+fn apply_layer_options_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
+    let (page, layer_name) = kag_target(runtime, tag);
+    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        apply_tag_geometry(layer, tag)?;
+        if let Some(visible) = kag_bool_attr(tag, "visible") {
+            layer.visible = visible;
+        }
+    }
+    Ok(())
+}
+
+fn apply_freeimage_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) {
+    let (page, layer_name) = kag_target(runtime, tag);
+    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.clear_image();
+        layer.visible = false;
+    }
+}
+
+fn apply_current_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) {
+    let page = kag_page_attr(tag)
+        .map(str::to_string)
+        .unwrap_or_else(|| runtime.host().current_kag_page().to_string());
+    let layer_name = tag
+        .literal_attr("layer")
+        .map(str::to_string)
+        .unwrap_or_else(|| runtime.host().current_kag_layer().to_string());
+    runtime
+        .host_mut()
+        .set_current_kag_layer(page.clone(), layer_name.clone());
+    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
+    runtime
+        .host_mut()
+        .log(&format!("KAG current layer set to {page}:{layer_name}"));
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.visible = kag_bool_attr(tag, "visible").unwrap_or(layer.visible);
+    }
+}
+
+fn apply_tag_geometry(layer: &mut krkr_core::LayerNode, tag: &Tag) -> Result<()> {
+    if let Some(value) = tag_i64(tag, "left")? {
+        layer.left = value as f32;
+    }
+    if let Some(value) = tag_i64(tag, "top")? {
+        layer.top = value as f32;
+    }
+    if let Some(value) = tag_i64(tag, "width")? {
+        layer.width = value.max(0) as f32;
+    }
+    if let Some(value) = tag_i64(tag, "height")? {
+        layer.height = value.max(0) as f32;
+    }
+    if let Some(value) = tag_i64(tag, "opacity")? {
+        layer.opacity = value.clamp(0, 255) as u8;
+    }
+    Ok(())
+}
+
+fn kag_target(runtime: &Runtime<KrkrHost>, tag: &Tag) -> (String, String) {
+    let page = kag_page_attr(tag)
+        .map(str::to_string)
+        .unwrap_or_else(|| runtime.host().current_kag_page().to_string());
+    let layer = tag
+        .literal_attr("layer")
+        .map(str::to_string)
+        .unwrap_or_else(|| runtime.host().current_kag_layer().to_string());
+    (page, layer)
+}
+
+fn kag_page_attr(tag: &Tag) -> Option<&str> {
+    match tag.literal_attr("page") {
+        Some("back") | Some("background") => Some("back"),
+        Some("fore") | Some("foreground") => Some("fore"),
+        Some(_) => Some("fore"),
+        None => None,
+    }
+}
+
+fn kag_bool_attr(tag: &Tag, name: &str) -> Option<bool> {
+    match tag.literal_attr(name)? {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn tag_i64(tag: &Tag, name: &str) -> Result<Option<i64>> {
+    tag.literal_attr(name)
+        .map(|value| {
+            value.parse::<i64>().map_err(|error| {
+                TjsError::runtime(format!("invalid KAG {name} value `{value}`: {error}"))
+            })
+        })
+        .transpose()
+}
+
 fn is_builtin_tag(tagname: &str) -> bool {
     matches!(
         tagname,
@@ -626,6 +801,11 @@ fn is_builtin_tag(tagname: &str) -> bool {
             | "l"
             | "wait"
             | "waitclick"
+            | "image"
+            | "layopt"
+            | "position"
+            | "freeimage"
+            | "current"
             | "trans"
             | "wt"
             | "wq"
@@ -642,7 +822,7 @@ fn is_builtin_tag(tagname: &str) -> bool {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -900,7 +1080,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         fs::write(root.join("first.ks"), "[emb exp=\"1 + 2\"]").expect("write scenario");
 
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let mut engine = image_test_engine(&root);
         engine.load_kag_scenario("first.ks").expect("load scenario");
 
         let tag = engine
@@ -920,7 +1100,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         fs::write(root.join("first.ks"), "AB[p]C").expect("write scenario");
 
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let mut engine = image_test_engine(&root);
         engine.load_kag_scenario("first.ks").expect("load scenario");
 
         let tick = engine.tick().expect("tick");
@@ -939,12 +1119,47 @@ mod tests {
     }
 
     #[test]
+    fn kag_back_page_layers_are_hidden_until_transition() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("back.png"), 1, 1, &[0, 255, 0, 255]);
+        fs::write(
+            root.join("first.ks"),
+            "[image storage=back.png layer=base page=back][wait time=1]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert!(matches!(
+            frame.tick.state,
+            KagTaskState::WaitingTimer { .. }
+        ));
+        assert!(
+            !frame
+                .output
+                .draw_commands
+                .iter()
+                .any(|command| matches!(command, krkr_core::DrawCommand::Image(_)))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn kag_click_signal_resumes_after_page_wait() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
         fs::write(root.join("first.ks"), "A[p]B").expect("write scenario");
 
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let mut engine = image_test_engine(&root);
         engine.load_kag_scenario("first.ks").expect("load scenario");
         assert_eq!(
             engine.tick().expect("first tick").state,
@@ -1097,6 +1312,150 @@ mod tests {
         assert_eq!(frame.message_layer.lines, vec!["B".to_string()]);
         assert!(frame.message_layer.waiting_for_click);
         assert_eq!(frame.location.page, 2);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_image_tags_populate_core_layer_tree_and_frame_uploads() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("bg.png"), 2, 1, &[255, 0, 0, 255, 0, 0, 255, 255]);
+        fs::write(
+            root.join("first.ks"),
+            "[image storage=bg.png layer=base page=fore][layopt layer=base page=fore left=5 top=7 opacity=200][s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(frame.tick.state, KagTaskState::Finished);
+        assert_eq!(frame.output.image_uploads.len(), 1);
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 5.0
+                        && image.rect.y == 7.0
+                        && image.rect.width == 2.0
+                        && image.rect.height == 1.0
+                        && (image.opacity - (200.0 / 255.0)).abs() < 0.001
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_transition_tags_apply_immediately_without_blocking() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("back.png"), 1, 1, &[0, 255, 0, 255]);
+        fs::write(
+            root.join("first.ks"),
+            "[image storage=back.png layer=base page=back][trans][wt][s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(frame.tick.state, KagTaskState::Finished);
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(command, krkr_core::DrawCommand::Image(image) if image.rect.width == 1.0)
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_current_supplies_default_visual_layer_target() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[255, 0, 255, 255]);
+        fs::write(
+            root.join("first.ks"),
+            "[current layer=1 page=fore][image storage=sprite.png][layopt left=31 top=37][s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(frame.tick.state, KagTaskState::Finished);
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 31.0 && image.rect.y == 37.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_load_images_uses_storage_decode_path() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(
+            root.join("sprite.png"),
+            1,
+            2,
+            &[255, 255, 0, 255, 0, 255, 255, 255],
+        );
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.loadImages("sprite.png");
+                layer.left = 11;
+                layer.top = 13;
+                layer.opacity = 128;
+                return layer.width + ":" + layer.height;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:2".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(frame.output.image_uploads.len(), 1);
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 11.0
+                        && image.rect.y == 13.0
+                        && (image.opacity - (128.0 / 255.0)).abs() < 0.001
+            )
+        }));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -1355,5 +1714,21 @@ mod tests {
             "krkr-ruri-engine-{}-{nanos}-{id}",
             std::process::id()
         ))
+    }
+
+    fn write_png(path: PathBuf, width: u32, height: u32, rgba: &[u8]) {
+        let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).expect("rgba image");
+        image.save(path).expect("write png");
+    }
+
+    fn image_test_engine(root: &Path) -> KrkrEngine {
+        KrkrEngine::new(EngineConfig {
+            project_root: Some(root.to_path_buf()),
+            kag_budget: KagRunBudget {
+                max_tags_per_tick: 1000,
+                max_wall_time: Duration::from_secs(1),
+            },
+        })
+        .expect("engine")
     }
 }
