@@ -1,6 +1,39 @@
-use crate::bytecode::CodeObject;
+use std::{collections::BTreeMap, sync::Arc};
+
+use crate::bytecode::{BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError};
 use crate::runtime::{ObjectHandle, Variant};
+
+pub(super) struct CallFrame {
+    pub(super) file_id: usize,
+    pub(super) file: Arc<BytecodeFile>,
+    pub(super) code_handles: Vec<ObjectHandle>,
+    pub(super) object: CodeObject,
+    pub(super) instructions: Vec<Instruction>,
+    pub(super) offset_to_index: BTreeMap<usize, usize>,
+    pub(super) frame: Frame,
+    pub(super) pc: usize,
+    pub(super) continuation: Continuation,
+}
+
+#[derive(Debug)]
+pub(super) enum Continuation {
+    Root,
+    CallerRegister {
+        dest: Option<i16>,
+    },
+    ReturnFixed {
+        value: Variant,
+        target: Box<Continuation>,
+    },
+    ClassBody {
+        instance: ObjectHandle,
+        class_handle: ObjectHandle,
+        class_name: String,
+        constructor_args: Vec<Variant>,
+        target: Box<Continuation>,
+    },
+}
 
 pub(super) struct Frame {
     pub(super) regs: Vec<Variant>,

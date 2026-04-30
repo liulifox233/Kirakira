@@ -3,7 +3,7 @@ use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
 use crate::runtime::{Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant};
 
 use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form};
-use super::{DispatchFlags, Frame, Vm};
+use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
 
 impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     pub(super) fn resolve_object(&self, value: Variant) -> Result<ObjectHandle> {
@@ -571,12 +571,40 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         args: Vec<Variant>,
         dest_reg: i16,
     ) -> Result<Variant> {
+        let base_depth = self.runtime.call_depth;
+        match self.call_member_direct_cont(object_value, name, args, Continuation::Root)? {
+            CallOutcome::Immediate(value, Continuation::Root) => {
+                Ok(if dest_reg == 0 { Variant::Void } else { value })
+            }
+            CallOutcome::Immediate(_, continuation) => Err(TjsError::runtime(format!(
+                "unexpected immediate member call continuation {continuation:?}"
+            ))),
+            CallOutcome::Frame(frame) => {
+                let value = self.run_call_stack(vec![*frame], base_depth)?;
+                Ok(if dest_reg == 0 { Variant::Void } else { value })
+            }
+        }
+    }
+
+    pub(super) fn call_member_direct_cont(
+        &mut self,
+        object_value: Variant,
+        name: &str,
+        args: Vec<Variant>,
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
         let receiver_type = self.value_debug_type(&object_value);
         if let Variant::String(value) = &object_value {
-            return self.call_string_method(value.clone(), name, args);
+            return Ok(CallOutcome::Immediate(
+                self.call_string_method(value.clone(), name, args)?,
+                continuation,
+            ));
         }
         if let Variant::Octet(value) = &object_value {
-            return self.call_octet_method(value.clone(), name, args);
+            return Ok(CallOutcome::Immediate(
+                self.call_octet_method(value.clone(), name, args)?,
+                continuation,
+            ));
         }
 
         let (handle, closure_this) = self.closure_parts(object_value.clone()).map_err(|error| {
@@ -604,21 +632,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             })?;
         let callee_type = self.value_debug_type(&member);
         let receiver = self.receiver_this(handle);
-        let value = self
-            .call_value(member, closure_this.or(Some(receiver)), args, false)
-            .map_err(|error| {
-                error.with_member_access(TjsMemberAccess {
-                    operation: TjsMemberOperation::Calling,
-                    receiver_type,
-                    member_name: name.to_string(),
-                    callee_type: Some(callee_type),
-                })
-            })?;
-        if dest_reg == 0 {
-            Ok(Variant::Void)
-        } else {
-            Ok(value)
-        }
+        self.call_value(
+            member,
+            closure_this.or(Some(receiver)),
+            args,
+            false,
+            continuation,
+        )
+        .map_err(|error| {
+            error.with_member_access(TjsMemberAccess {
+                operation: TjsMemberOperation::Calling,
+                receiver_type,
+                member_name: name.to_string(),
+                callee_type: Some(callee_type),
+            })
+        })
     }
 
     pub fn call_object_method(
@@ -636,7 +664,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         this_obj: Option<ObjectHandle>,
         args: Vec<Variant>,
         is_new: bool,
-    ) -> Result<Variant> {
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
         match self.materialize_code_object(callee) {
             Variant::Closure(closure) => {
                 let effective_this = if self.is_class_handle(closure.object) {
@@ -649,9 +678,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 } else {
                     closure.this_obj.or(this_obj)
                 };
-                self.call_handle(closure.object, effective_this, args, is_new)
+                self.call_handle(closure.object, effective_this, args, is_new, continuation)
             }
-            Variant::Object(handle) => self.call_handle(handle, this_obj, args, is_new),
+            Variant::Object(handle) => {
+                self.call_handle(handle, this_obj, args, is_new, continuation)
+            }
             other => Err(TjsError::runtime(format!("{other} is not callable"))),
         }
     }
@@ -662,7 +693,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         this_obj: Option<ObjectHandle>,
         args: Vec<Variant>,
         is_new: bool,
-    ) -> Result<Variant> {
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
         let kind = self.runtime.heap[handle.0].kind.clone();
         match kind {
             ObjectKind::InterCode {
@@ -670,21 +702,35 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 object_index,
                 context,
             } => {
-                if file_id != self.file_id {
-                    let mut vm = Vm::new(file_id, self.runtime)?;
-                    return vm.call_handle(handle, this_obj, args, is_new);
-                }
                 if is_new {
-                    self.create_new_inter_code(object_index, context, args)
+                    self.create_new_inter_code(file_id, object_index, context, args, continuation)
                 } else if context == BytecodeContextType::Class {
                     if let Some(instance) = this_obj.filter(|handle| *handle != self.runtime.global)
                     {
-                        self.initialize_inter_code_instance(object_index, instance, args)
+                        self.initialize_inter_code_instance(
+                            file_id,
+                            object_index,
+                            instance,
+                            args,
+                            continuation,
+                        )
                     } else {
-                        self.create_new_inter_code(object_index, context, args)
+                        self.create_new_inter_code(
+                            file_id,
+                            object_index,
+                            context,
+                            args,
+                            continuation,
+                        )
                     }
                 } else {
-                    self.execute_object_with_this(object_index, args, this_obj)
+                    Ok(CallOutcome::Frame(Box::new(self.create_call_frame(
+                        file_id,
+                        object_index,
+                        args,
+                        this_obj,
+                        continuation,
+                    )?)))
                 }
             }
             ObjectKind::NativeFunction { id, constructable } => {
@@ -699,7 +745,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 } else {
                     this_obj
                 };
-                function.call(self.runtime, native_this, args)
+                Ok(CallOutcome::Immediate(
+                    function.call(self.runtime, native_this, args)?,
+                    continuation,
+                ))
             }
             ObjectKind::VmNativeFunction { id } => {
                 let function = self
@@ -708,15 +757,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| TjsError::runtime(format!("VM native function {id} missing")))?;
-                function.call(self, this_obj, args)
+                Ok(CallOutcome::Immediate(
+                    function.call(self, this_obj, args)?,
+                    continuation,
+                ))
             }
             ObjectKind::Proxy {
                 primary, fallback, ..
             } => {
                 if let Some(primary) = primary {
-                    self.call_handle(primary, this_obj, args, is_new)
+                    self.call_handle(primary, this_obj, args, is_new, continuation)
                 } else {
-                    self.call_handle(fallback, this_obj, args, is_new)
+                    self.call_handle(fallback, this_obj, args, is_new, continuation)
                 }
             }
             ObjectKind::Ordinary | ObjectKind::Array { .. } => {
@@ -737,63 +789,85 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
 
     fn create_new_inter_code(
         &mut self,
+        file_id: usize,
         object_index: usize,
         context: BytecodeContextType,
         args: Vec<Variant>,
-    ) -> Result<Variant> {
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
         let instance = self.runtime.alloc_object(Object::default());
-        let name = self.file.objects[object_index]
-            .name(self.file.as_ref())
+        let file = self.runtime.script_file(file_id)?;
+        let code_handles = self.runtime.script_code_handles(file_id)?;
+        let name = file.objects[object_index]
+            .name(file.as_ref())
             .unwrap_or("")
             .to_string();
 
         if context == BytecodeContextType::Class {
             self.add_class_info(instance, name.clone());
-            self.execute_object_with_this(object_index, Vec::new(), Some(instance))?;
-            let class_handle = self.code_handles[object_index];
-            for info in self.runtime.heap[class_handle.0].class_infos.clone() {
-                self.add_class_info(instance, info);
-            }
-
-            if !name.is_empty()
-                && let Some(constructor) = self.runtime.heap[instance.0].get_raw(&name)
-                && !matches!(constructor, Variant::Void)
-            {
-                self.call_value(constructor, Some(instance), args, false)?;
-            }
+            let class_handle = code_handles[object_index];
+            let frame = self.create_call_frame(
+                file_id,
+                object_index,
+                Vec::new(),
+                Some(instance),
+                Continuation::ClassBody {
+                    instance,
+                    class_handle,
+                    class_name: name,
+                    constructor_args: args,
+                    target: Box::new(continuation),
+                },
+            )?;
+            Ok(CallOutcome::Frame(Box::new(frame)))
         } else {
-            self.execute_object_with_this(object_index, args, Some(instance))?;
+            let frame = self.create_call_frame(
+                file_id,
+                object_index,
+                args,
+                Some(instance),
+                Continuation::ReturnFixed {
+                    value: Variant::Object(instance),
+                    target: Box::new(continuation),
+                },
+            )?;
+            Ok(CallOutcome::Frame(Box::new(frame)))
         }
-        Ok(Variant::Object(instance))
     }
 
     fn initialize_inter_code_instance(
         &mut self,
+        file_id: usize,
         object_index: usize,
         instance: ObjectHandle,
         args: Vec<Variant>,
-    ) -> Result<Variant> {
-        let name = self.file.objects[object_index]
-            .name(self.file.as_ref())
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
+        let file = self.runtime.script_file(file_id)?;
+        let code_handles = self.runtime.script_code_handles(file_id)?;
+        let name = file.objects[object_index]
+            .name(file.as_ref())
             .unwrap_or("")
             .to_string();
 
         if !name.is_empty() {
             self.add_class_info(instance, name.clone());
         }
-        self.execute_object_with_this(object_index, Vec::new(), Some(instance))?;
-        let class_handle = self.code_handles[object_index];
-        for info in self.runtime.heap[class_handle.0].class_infos.clone() {
-            self.add_class_info(instance, info);
-        }
-
-        if !name.is_empty()
-            && let Some(constructor) = self.runtime.heap[instance.0].get_raw(&name)
-            && !matches!(constructor, Variant::Void)
-        {
-            self.call_value(constructor, Some(instance), args, false)?;
-        }
-        Ok(Variant::Object(instance))
+        let class_handle = code_handles[object_index];
+        let frame = self.create_call_frame(
+            file_id,
+            object_index,
+            Vec::new(),
+            Some(instance),
+            Continuation::ClassBody {
+                instance,
+                class_handle,
+                class_name: name,
+                constructor_args: args,
+                target: Box::new(continuation),
+            },
+        )?;
+        Ok(CallOutcome::Frame(Box::new(frame)))
     }
 
     fn call_string_method(&self, value: String, name: &str, args: Vec<Variant>) -> Result<Variant> {

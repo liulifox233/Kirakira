@@ -105,6 +105,18 @@ mod tests {
     }
 
     #[test]
+    fn execute_source_runs_deep_recursive_return_values_on_vm_stack() {
+        assert_eq!(
+            execute_source(
+                "recursive_return.tjs",
+                "function sum(n) { if (n == 0) return 0; return n + sum(n - 1); } return sum(900);"
+            )
+            .expect("execute"),
+            Variant::Integer(405450)
+        );
+    }
+
+    #[test]
     fn execute_source_builds_and_indexes_array() {
         assert_eq!(
             execute_source("inline.tjs", "var a = [1, 4, 9]; return a[1];").expect("execute"),
@@ -136,6 +148,7 @@ mod tests {
         assert!(text.contains("debug.tjs:"), "{text}");
         assert!(text.contains("run [Function] bytecode"), "{text}");
         assert!(text.contains("global [TopLevel] bytecode"), "{text}");
+        assert!(text.contains("(debug.tjs:"), "{text}");
         assert!(text.contains("calling member `missing`"), "{text}");
         assert!(text.contains("callee void"), "{text}");
     }
@@ -202,6 +215,29 @@ mod tests {
             )
             .expect("execute"),
             Variant::Integer(3)
+        );
+    }
+
+    #[test]
+    fn execute_source_runs_property_getter_and_setter_calls() {
+        assert_eq!(
+            execute_source(
+                "property.tjs",
+                r#"
+                    class C {
+                        var stored = 0;
+                        property value {
+                            getter { return stored + 1; }
+                            setter(v) { stored = v * 2; }
+                        }
+                    }
+                    var c = new C();
+                    c.value = 5;
+                    return c.value;
+                "#
+            )
+            .expect("execute"),
+            Variant::Integer(11)
         );
     }
 

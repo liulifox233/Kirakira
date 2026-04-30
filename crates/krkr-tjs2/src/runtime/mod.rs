@@ -140,7 +140,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
             native_functions: Vec::new(),
             vm_native_functions: Vec::new(),
             call_depth: 0,
-            max_call_depth: 32,
+            max_call_depth: 1024,
             host,
         };
         builtins::install(&mut runtime);

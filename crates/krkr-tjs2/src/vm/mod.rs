@@ -10,7 +10,7 @@ mod dispatch;
 mod frame;
 mod opcode;
 
-use frame::{ExceptionEntry, Frame};
+use frame::{CallFrame, Continuation, ExceptionEntry, Frame};
 use opcode::{branch_index, next_instruction_index};
 
 pub fn execute_bytecode(bytes: &[u8]) -> Result<Variant> {
@@ -96,11 +96,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         args: Vec<Variant>,
         this_obj: Option<ObjectHandle>,
     ) -> Result<Variant> {
-        if file_id == self.file_id {
-            return self.execute_object_with_this(object_index, args, this_obj);
-        }
-        let mut vm = Vm::new(file_id, self.runtime)?;
-        vm.execute_object_with_this(object_index, args, this_obj)
+        let base_depth = self.runtime.call_depth;
+        let frame =
+            self.create_call_frame(file_id, object_index, args, this_obj, Continuation::Root)?;
+        self.run_call_stack(vec![frame], base_depth)
     }
 
     pub(super) fn execute_object_with_this(
@@ -109,27 +108,39 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         args: Vec<Variant>,
         this_obj: Option<ObjectHandle>,
     ) -> Result<Variant> {
-        let object = self
-            .file
-            .objects
-            .get(object_index)
-            .cloned()
-            .ok_or_else(|| TjsError::runtime(format!("object {object_index} does not exist")))?;
-        let instructions = object.decode_instructions()?;
-        let offset_to_index = instructions
-            .iter()
-            .enumerate()
-            .map(|(index, inst)| (inst.offset, index))
-            .collect::<BTreeMap<_, _>>();
+        self.execute_file_object_with_this(self.file_id, object_index, args, this_obj)
+    }
+
+    fn create_call_frame(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+        args: Vec<Variant>,
+        this_obj: Option<ObjectHandle>,
+        continuation: Continuation,
+    ) -> Result<CallFrame> {
+        let file = self.runtime.script_file(file_id)?;
+        let code_handles = self.runtime.script_code_handles(file_id)?;
+        self.register_code_object_properties_for(file.as_ref(), &code_handles);
+        let object =
+            file.objects.get(object_index).cloned().ok_or_else(|| {
+                TjsError::runtime(format!("object {object_index} does not exist"))
+            })?;
         self.runtime
             .enter_call_frame()
-            .map_err(|error| error.with_stack_frame(self.stack_frame(&object, 0)))?;
+            .map_err(|error| error.with_stack_frame(self.stack_frame_for(&file, &object, 0)))?;
         let result = (|| {
+            let instructions = object.decode_instructions()?;
+            let offset_to_index = instructions
+                .iter()
+                .enumerate()
+                .map(|(index, inst)| (inst.offset, index))
+                .collect::<BTreeMap<_, _>>();
             let caller_args = args.clone();
             let global = self.runtime.global;
             let this_obj = this_obj.or(Some(global));
             let this_proxy = self.runtime.alloc_proxy_bound(this_obj, global, None);
-            let super_class = self.super_class_for_object(&object);
+            let super_class = self.super_class_for_parts(&file, &code_handles, &object);
             let super_proxy = self.runtime.alloc_proxy_bound(
                 super_class.or(this_obj),
                 global,
@@ -146,27 +157,187 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let array = self.runtime.alloc_object(Object::array(rest));
                 frame.set(-4 - collapse_base as i16, Variant::Object(array))?;
             }
+            let pc = offset_to_index.get(&(0_usize)).copied().unwrap_or(0);
+            Ok(CallFrame {
+                file_id,
+                file,
+                code_handles,
+                object,
+                instructions,
+                offset_to_index,
+                frame,
+                pc,
+                continuation,
+            })
+        })();
+        if result.is_err() {
+            self.runtime.leave_call_frame();
+        }
+        result
+    }
 
-            let mut pc = offset_to_index.get(&(0_usize)).copied().unwrap_or(0);
-            while pc < instructions.len() {
-                let inst = &instructions[pc];
-                let next_pc = next_instruction_index(&offset_to_index, &instructions, pc).map_err(
-                    |error| error.with_stack_frame(self.stack_frame(&object, inst.offset)),
-                )?;
-                match self
-                    .execute_instruction(&object, &mut frame, inst, next_pc, &offset_to_index)
-                    .map_err(|error| {
-                        error.with_stack_frame(self.stack_frame(&object, inst.offset))
-                    })? {
-                    Step::Next(next) => pc = next,
-                    Step::Return(value) => return Ok(value),
+    fn run_call_stack(&mut self, mut stack: Vec<CallFrame>, base_depth: usize) -> Result<Variant> {
+        let result = loop {
+            let Some(mut call_frame) = stack.pop() else {
+                break Err(TjsError::runtime("VM call stack completed without a value"));
+            };
+            self.activate_call_frame(&call_frame);
+            if call_frame.pc >= call_frame.instructions.len() {
+                let value = call_frame.frame.result.clone();
+                self.runtime.leave_call_frame();
+                match self.complete_call_value(value, call_frame.continuation, &mut stack) {
+                    Ok(Some(value)) => break Ok(value),
+                    Ok(None) => continue,
+                    Err(error) => break Err(error),
                 }
             }
 
-            Ok(frame.result)
-        })();
-        self.runtime.leave_call_frame();
+            let pc = call_frame.pc;
+            let inst = call_frame.instructions[pc].clone();
+            let next_pc = match next_instruction_index(
+                &call_frame.offset_to_index,
+                &call_frame.instructions,
+                pc,
+            ) {
+                Ok(next_pc) => next_pc,
+                Err(error) => {
+                    break Err(self.with_active_stack(
+                        error,
+                        &stack,
+                        Some((&call_frame, inst.offset)),
+                    ));
+                }
+            };
+
+            match self.execute_instruction(
+                &call_frame.object,
+                &mut call_frame.frame,
+                &inst,
+                next_pc,
+                &call_frame.offset_to_index,
+            ) {
+                Ok(Step::Next(next)) => {
+                    call_frame.pc = next;
+                    stack.push(call_frame);
+                }
+                Ok(Step::Return(value)) => {
+                    self.runtime.leave_call_frame();
+                    match self.complete_call_value(value, call_frame.continuation, &mut stack) {
+                        Ok(Some(value)) => break Ok(value),
+                        Ok(None) => {}
+                        Err(error) => break Err(error),
+                    }
+                }
+                Ok(Step::Call { frame, resume_pc }) => {
+                    call_frame.pc = resume_pc;
+                    stack.push(call_frame);
+                    stack.push(*frame);
+                }
+                Err(error) => {
+                    break Err(self.with_active_stack(
+                        error,
+                        &stack,
+                        Some((&call_frame, inst.offset)),
+                    ));
+                }
+            }
+        };
+        if result.is_err() {
+            self.runtime.call_depth = base_depth;
+        }
         result
+    }
+
+    fn complete_call_value(
+        &mut self,
+        value: Variant,
+        continuation: Continuation,
+        stack: &mut Vec<CallFrame>,
+    ) -> Result<Option<Variant>> {
+        match continuation {
+            Continuation::Root => Ok(Some(value)),
+            Continuation::CallerRegister { dest } => {
+                if let Some(dest) = dest
+                    && let Some(caller) = stack.last_mut()
+                {
+                    caller.frame.set(dest, value)?;
+                }
+                Ok(None)
+            }
+            Continuation::ReturnFixed { value, target } => {
+                self.complete_call_value(value, *target, stack)
+            }
+            Continuation::ClassBody {
+                instance,
+                class_handle,
+                class_name,
+                constructor_args,
+                target,
+            } => {
+                for info in self.runtime.heap[class_handle.0].class_infos.clone() {
+                    self.add_class_info(instance, info);
+                }
+                let object_value = Variant::Object(instance);
+                if !class_name.is_empty()
+                    && let Some(constructor) = self.runtime.heap[instance.0].get_raw(&class_name)
+                    && !matches!(constructor, Variant::Void)
+                {
+                    match self.call_value(
+                        constructor,
+                        Some(instance),
+                        constructor_args,
+                        false,
+                        Continuation::ReturnFixed {
+                            value: object_value,
+                            target,
+                        },
+                    )? {
+                        CallOutcome::Immediate(value, continuation) => {
+                            return self.complete_call_value(value, continuation, stack);
+                        }
+                        CallOutcome::Frame(frame) => {
+                            stack.push(*frame);
+                            return Ok(None);
+                        }
+                    }
+                }
+                self.complete_call_value(object_value, *target, stack)
+            }
+        }
+    }
+
+    fn activate_call_frame(&mut self, frame: &CallFrame) {
+        self.file_id = frame.file_id;
+        self.file = Arc::clone(&frame.file);
+        self.code_handles = frame.code_handles.clone();
+    }
+
+    fn with_active_stack(
+        &self,
+        mut error: TjsError,
+        callers: &[CallFrame],
+        current: Option<(&CallFrame, usize)>,
+    ) -> TjsError {
+        if let Some((frame, offset)) = current {
+            error =
+                error.with_stack_frame(self.stack_frame_for(&frame.file, &frame.object, offset));
+        }
+        for frame in callers.iter().rev() {
+            let offset = frame
+                .instructions
+                .get(frame.pc)
+                .map(|inst| inst.offset)
+                .unwrap_or_else(|| {
+                    frame
+                        .instructions
+                        .last()
+                        .map(|inst| inst.offset)
+                        .unwrap_or(0)
+                });
+            error =
+                error.with_stack_frame(self.stack_frame_for(&frame.file, &frame.object, offset));
+        }
+        error
     }
 
     fn execute_instruction(
@@ -322,27 +493,84 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             99 | 102 => {
                 let callee = frame.get(inst.operands[1])?;
                 let args = self.materialize_call_args(frame, object, inst.call_args.as_ref())?;
-                let value = self.call_value(callee, frame.this_obj, args, inst.opcode == 102)?;
-                if inst.operands[0] != 0 {
-                    frame.set(inst.operands[0], value)?;
+                let continuation = Continuation::CallerRegister {
+                    dest: (inst.operands[0] != 0).then_some(inst.operands[0]),
+                };
+                match self.call_value(
+                    callee,
+                    frame.this_obj,
+                    args,
+                    inst.opcode == 102,
+                    continuation,
+                )? {
+                    CallOutcome::Immediate(value, Continuation::CallerRegister { dest }) => {
+                        if let Some(dest) = dest {
+                            frame.set(dest, value)?;
+                        }
+                    }
+                    CallOutcome::Immediate(_, continuation) => {
+                        return Err(TjsError::runtime(format!(
+                            "unexpected immediate call continuation {continuation:?}"
+                        )));
+                    }
+                    CallOutcome::Frame(call_frame) => {
+                        return Ok(Step::Call {
+                            frame: call_frame,
+                            resume_pc: next_pc,
+                        });
+                    }
                 }
             }
             100 => {
                 let object_value = frame.get(inst.operands[1])?;
                 let name = self.data_slot_string(object, inst.operands[2])?;
                 let args = self.materialize_call_args(frame, object, inst.call_args.as_ref())?;
-                let value = self.call_member_direct(object_value, &name, args, inst.operands[0])?;
-                if inst.operands[0] != 0 {
-                    frame.set(inst.operands[0], value)?;
+                let continuation = Continuation::CallerRegister {
+                    dest: (inst.operands[0] != 0).then_some(inst.operands[0]),
+                };
+                match self.call_member_direct_cont(object_value, &name, args, continuation)? {
+                    CallOutcome::Immediate(value, Continuation::CallerRegister { dest }) => {
+                        if let Some(dest) = dest {
+                            frame.set(dest, value)?;
+                        }
+                    }
+                    CallOutcome::Immediate(_, continuation) => {
+                        return Err(TjsError::runtime(format!(
+                            "unexpected immediate member call continuation {continuation:?}"
+                        )));
+                    }
+                    CallOutcome::Frame(call_frame) => {
+                        return Ok(Step::Call {
+                            frame: call_frame,
+                            resume_pc: next_pc,
+                        });
+                    }
                 }
             }
             101 => {
                 let object_value = frame.get(inst.operands[1])?;
                 let name = self.key_from_variant(&frame.get(inst.operands[2])?)?;
                 let args = self.materialize_call_args(frame, object, inst.call_args.as_ref())?;
-                let value = self.call_member_direct(object_value, &name, args, inst.operands[0])?;
-                if inst.operands[0] != 0 {
-                    frame.set(inst.operands[0], value)?;
+                let continuation = Continuation::CallerRegister {
+                    dest: (inst.operands[0] != 0).then_some(inst.operands[0]),
+                };
+                match self.call_member_direct_cont(object_value, &name, args, continuation)? {
+                    CallOutcome::Immediate(value, Continuation::CallerRegister { dest }) => {
+                        if let Some(dest) = dest {
+                            frame.set(dest, value)?;
+                        }
+                    }
+                    CallOutcome::Immediate(_, continuation) => {
+                        return Err(TjsError::runtime(format!(
+                            "unexpected immediate member call continuation {continuation:?}"
+                        )));
+                    }
+                    CallOutcome::Frame(call_frame) => {
+                        return Ok(Step::Call {
+                            frame: call_frame,
+                            resume_pc: next_pc,
+                        });
+                    }
                 }
             }
             103 | 110 => {
@@ -479,23 +707,33 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     }
 
     fn register_code_object_properties(&mut self) {
-        for (object_index, object) in self.file.objects.iter().enumerate() {
+        let file = Arc::clone(&self.file);
+        let code_handles = self.code_handles.clone();
+        self.register_code_object_properties_for(file.as_ref(), &code_handles);
+    }
+
+    fn register_code_object_properties_for(
+        &mut self,
+        file: &BytecodeFile,
+        code_handles: &[ObjectHandle],
+    ) {
+        for (object_index, object) in file.objects.iter().enumerate() {
             if let Some(parent_index) = object.parent {
-                let parent_handle = self.code_handles[parent_index];
-                let object_handle = self.code_handles[object_index];
-                let Some(name) = object.name(self.file.as_ref()).map(str::to_string) else {
+                let parent_handle = code_handles[parent_index];
+                let object_handle = code_handles[object_index];
+                let Some(name) = object.name(file).map(str::to_string) else {
                     continue;
                 };
                 let closure = Variant::Closure(Closure::new(object_handle, Some(parent_handle)));
                 self.runtime.heap[parent_handle.0].set(name, closure);
             }
 
-            let owner_handle = self.code_handles[object_index];
+            let owner_handle = code_handles[object_index];
             for property in &object.properties {
-                let Some(name) = self.file.data.strings.get(property.name).cloned() else {
+                let Some(name) = file.data.strings.get(property.name).cloned() else {
                     continue;
                 };
-                let property_handle = self.code_handles[property.object];
+                let property_handle = code_handles[property.object];
                 let closure = Variant::Closure(Closure::new(property_handle, Some(owner_handle)));
                 self.runtime.heap[owner_handle.0].set(name, closure);
             }
@@ -534,9 +772,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
-    fn super_class_for_object(&self, object: &CodeObject) -> Option<ObjectHandle> {
+    fn super_class_for_parts(
+        &self,
+        _file: &BytecodeFile,
+        code_handles: &[ObjectHandle],
+        object: &CodeObject,
+    ) -> Option<ObjectHandle> {
         let class_object = object.parent?;
-        let class_handle = *self.code_handles.get(class_object)?;
+        let class_handle = *code_handles.get(class_object)?;
         self.runtime.heap[class_handle.0].super_class
     }
 
@@ -590,27 +833,29 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         format!("{label}#{}", handle.0)
     }
 
-    fn stack_frame(&self, object: &CodeObject, bytecode_offset: usize) -> TjsStackFrame {
-        let storage = self
-            .file
+    fn stack_frame_for(
+        &self,
+        file: &BytecodeFile,
+        object: &CodeObject,
+        bytecode_offset: usize,
+    ) -> TjsStackFrame {
+        let storage = file
             .debug_info
             .sources
             .first()
             .map(|source| source.name.clone());
         TjsStackFrame {
             storage,
-            object_name: object
-                .name(self.file.as_ref())
-                .unwrap_or("<anonymous>")
-                .to_string(),
+            object_name: object.name(file).unwrap_or("<anonymous>").to_string(),
             context: format!("{:?}", object.context_type),
             bytecode_offset,
-            source: self.source_location(object, bytecode_offset),
+            source: self.source_location_for(file, object, bytecode_offset),
         }
     }
 
-    fn source_location(
+    fn source_location_for(
         &self,
+        file: &BytecodeFile,
         object: &CodeObject,
         bytecode_offset: usize,
     ) -> Option<TjsSourceLocation> {
@@ -619,7 +864,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .iter()
             .take_while(|position| position.code_pos as usize <= bytecode_offset)
             .last()?;
-        let source = self.file.debug_info.sources.first();
+        let source = file.debug_info.sources.first();
         let storage = source.map(|source| source.name.clone());
         let utf16_offset = position.source_pos as usize;
         let Some(text) = source.and_then(|source| source.text.as_deref()) else {
@@ -701,6 +946,15 @@ impl DispatchFlags {
 enum Step {
     Next(usize),
     Return(Variant),
+    Call {
+        frame: Box<CallFrame>,
+        resume_pc: usize,
+    },
+}
+
+pub(in crate::vm) enum CallOutcome {
+    Immediate(Variant, Continuation),
+    Frame(Box<CallFrame>),
 }
 
 #[cfg(test)]
