@@ -138,6 +138,26 @@ mod tests {
     }
 
     #[test]
+    fn execute_source_erases_array_element() {
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                "var a = [1, 4, 9]; a.erase(1); return a.join(',');"
+            )
+            .expect("execute"),
+            Variant::String("1,9".to_string())
+        );
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                "var a = [1, 4, 9]; a.erase(-1); return a.join(',');"
+            )
+            .expect("execute"),
+            Variant::String("1,4".to_string())
+        );
+    }
+
+    #[test]
     fn execute_source_assigns_sparse_array_index() {
         assert_eq!(
             execute_source("inline.tjs", "var a = []; a[30] = false; return a.count;")

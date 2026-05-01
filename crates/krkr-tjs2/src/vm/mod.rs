@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError, TjsSourceLocation, TjsStackFrame};
 use crate::runtime::{
-    Closure, NativeFunction, NoHost, Object, ObjectHandle, ObjectKind, Runtime, TjsHost, Variant,
+    Closure, NativeFunction, NoHost, ObjectHandle, ObjectKind, Runtime, TjsHost, Variant,
 };
 
 mod dispatch;
@@ -154,7 +154,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 } else {
                     Vec::new()
                 };
-                let array = self.runtime.alloc_object(Object::array(rest));
+                let array = self.runtime.alloc_array_object(rest);
                 frame.set(-4 - collapse_base as i16, Variant::Object(array))?;
             }
             let pc = offset_to_index.get(&(0_usize)).copied().unwrap_or(0);
