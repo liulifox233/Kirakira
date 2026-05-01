@@ -16,8 +16,9 @@ use krkr_tjs2::{
 
 use crate::{
     globals::install_tvp_globals,
-    host::{KrkrHost, NativeTransitionCompletion},
+    host::KrkrHost,
     kag::EngineKagHost,
+    native::classes::finish_completed_native_transitions,
     plugin::KrkrPlugin,
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
@@ -303,7 +304,7 @@ impl KrkrEngine {
 
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
         self.tjs_runtime.host_mut().advance_transition(delta);
-        self.finish_completed_native_transitions()?;
+        finish_completed_native_transitions(&mut self.tjs_runtime)?;
         let transition_active = self.tjs_runtime.host().has_active_transition();
         self.kag_task.update_wait(delta, transition_active);
         self.kag_task.run_until_yield(
@@ -312,17 +313,6 @@ impl KrkrEngine {
             &mut self.message_layer,
             self.kag_budget,
         )
-    }
-
-    fn finish_completed_native_transitions(&mut self) -> Result<()> {
-        let completions = self
-            .tjs_runtime
-            .host_mut()
-            .take_completed_native_transitions();
-        for completion in completions {
-            self.finish_native_transition(completion)?;
-        }
-        Ok(())
     }
 
     fn kag_back_layer_images(&self) -> BTreeSet<LayerId> {
@@ -371,56 +361,6 @@ impl KrkrEngine {
         if let Some(layer_id) = self.tjs_runtime.host().native_layer(handle) {
             layers.insert(layer_id);
         }
-    }
-
-    fn finish_native_transition(&mut self, completion: NativeTransitionCompletion) -> Result<()> {
-        if !self.tjs_runtime.object_valid(completion.dest) {
-            return Ok(());
-        }
-
-        if !matches!(
-            self.tjs_runtime
-                .object_member(completion.dest, "onTransitionCompleted"),
-            Variant::Void
-        ) {
-            let source = completion
-                .source
-                .filter(|source| self.tjs_runtime.object_valid(*source))
-                .map(Variant::Object)
-                .unwrap_or_default();
-            self.tjs_runtime.call_object_method(
-                completion.dest,
-                "onTransitionCompleted",
-                vec![Variant::Object(completion.dest), source],
-            )?;
-            if completion.paired_comp
-                && let Some(source) = completion.source
-                && self.tjs_runtime.object_valid(source)
-            {
-                self.tjs_runtime
-                    .set_object_member(source, "visible", Variant::Integer(1));
-            }
-        } else {
-            self.tjs_runtime.set_object_member(
-                completion.dest,
-                "inTransition",
-                Variant::Integer(0),
-            );
-            if let Variant::Object(window) =
-                self.tjs_runtime.object_member(completion.dest, "window")
-                && let Ok(trans_count) = self
-                    .tjs_runtime
-                    .object_member(window, "transCount")
-                    .to_integer()
-            {
-                self.tjs_runtime.set_object_member(
-                    window,
-                    "transCount",
-                    Variant::Integer(trans_count.saturating_sub(1).max(0)),
-                );
-            }
-        }
-        Ok(())
     }
 
     fn pump_tjs_events(&mut self) -> Result<()> {
@@ -2485,6 +2425,123 @@ mod tests {
                 .expect("completion"),
             Variant::String("0:0:1:2:2".to_string())
         );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_replacing_transition_completes_previous_transition() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 1, 1, &[255, 0, 0, 255]);
+        write_png(
+            root.join("mid.png"),
+            2,
+            1,
+            &[0, 255, 0, 255, 0, 255, 0, 255],
+        );
+        write_png(
+            root.join("new.png"),
+            3,
+            1,
+            &[0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255],
+        );
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                dest.loadImages("old.png");
+                dest.visible = true;
+                dest.window = %[transCount: 0, completed: 0, lastSourceWidth: 0];
+                dest.onTransitionCompleted = function(destLayer, srcLayer) {
+                    this.window.completed++;
+                    this.window.lastSourceWidth = srcLayer.imageWidth;
+                    this.window.transCount--;
+                    this.inTransition = this.window.transCount > 0;
+                };
+                function startTransition(storage) {
+                    var source = new Layer();
+                    source.loadImages(storage);
+                    dest.inTransition = true;
+                    dest.window.transCount++;
+                    dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                }
+                startTransition("mid.png");
+                startTransition("new.png");
+                return dest.inTransition + ":" + dest.window.transCount + ":" + dest.window.completed + ":" + dest.imageWidth + ":" + dest.window.lastSourceWidth;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:1:1:3:2".to_string()));
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 1.0), Vec::new()),
+                Duration::from_millis(1000),
+            )
+            .expect("finish update");
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "dest.inTransition + ':' + dest.window.transCount + ':' + dest.window.completed + ':' + dest.window.lastSourceWidth"
+                )
+                .expect("completion"),
+            Variant::String("0:0:2:3".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_stop_transition_completes_active_transition() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 1, 1, &[255, 0, 0, 255]);
+        write_png(
+            root.join("new.png"),
+            2,
+            1,
+            &[0, 255, 0, 255, 0, 255, 0, 255],
+        );
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.loadImages("new.png");
+                global.dest = new Layer();
+                dest.loadImages("old.png");
+                dest.visible = true;
+                dest.inTransition = true;
+                dest.window = %[transCount: 1, completed: 0];
+                dest.onTransitionCompleted = function(destLayer, srcLayer) {
+                    this.inTransition = false;
+                    this.window.transCount--;
+                    this.window.completed++;
+                };
+                dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                dest.stopTransition();
+                return dest.inTransition + ":" + dest.window.transCount + ":" + dest.window.completed;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("0:0:1".to_string()));
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(frame.output.transition.is_none());
 
         fs::remove_dir_all(root).expect("cleanup");
     }

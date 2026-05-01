@@ -547,11 +547,13 @@ impl KrkrHost {
     }
 
     pub(crate) fn apply_immediate_transition(&mut self) {
+        self.complete_active_transition();
         self.apply_pending_kag_layers();
         self.active_transition = None;
     }
 
     pub(crate) fn begin_kag_transition(&mut self, method: &str, duration: Duration) {
+        self.complete_active_transition();
         if self.pending_kag_layers.is_empty() {
             self.active_transition = None;
             return;
@@ -584,6 +586,7 @@ impl KrkrHost {
         suppressed_live_images: BTreeSet<LayerId>,
         completion: NativeTransitionCompletion,
     ) {
+        self.complete_active_transition();
         if duration.is_zero() {
             self.completed_native_transitions.push(completion);
             self.active_transition = None;
@@ -611,6 +614,26 @@ impl KrkrHost {
                 self.completed_native_transitions.push(completion);
             }
             self.active_transition = None;
+        }
+    }
+
+    pub(crate) fn complete_active_transition(&mut self) {
+        let Some(mut transition) = self.active_transition.take() else {
+            return;
+        };
+        if let Some(completion) = transition.native_completion.take() {
+            self.completed_native_transitions.push(completion);
+        }
+    }
+
+    pub(crate) fn complete_native_transition_for(&mut self, dest: ObjectHandle) {
+        let should_complete = self
+            .active_transition
+            .as_ref()
+            .and_then(|transition| transition.native_completion.as_ref())
+            .is_some_and(|completion| completion.dest == dest);
+        if should_complete {
+            self.complete_active_transition();
         }
     }
 
