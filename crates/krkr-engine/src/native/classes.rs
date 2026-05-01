@@ -1,9 +1,11 @@
+use std::{collections::BTreeSet, time::Duration};
+
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
-use crate::host::KrkrHost;
+use crate::host::{KrkrHost, NativeTransitionCompletion};
 
 use super::register_stub_method;
 
@@ -594,22 +596,23 @@ fn layer_load_images(
                     .unwrap_or_else(|| "base".to_string()),
                 None => "base".to_string(),
             };
-            let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
-            if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-                layer.set_image(image);
-                layer.visible = visible;
-                if let Some(left) = left {
-                    layer.left = left as f32;
-                }
-                if let Some(top) = top {
-                    layer.top = top as f32;
-                }
-                layer.width = width.map_or(size.width, |width| width.max(0) as f32);
-                layer.height = height.map_or(size.height, |height| height.max(0) as f32);
-                if let Some(opacity) = opacity {
-                    layer.opacity = opacity.clamp(0, 255) as u8;
-                }
-            }
+            runtime
+                .host_mut()
+                .mutate_kag_layer(&page, &layer_name, |layer| {
+                    layer.set_image(image);
+                    layer.visible = visible;
+                    if let Some(left) = left {
+                        layer.left = left as f32;
+                    }
+                    if let Some(top) = top {
+                        layer.top = top as f32;
+                    }
+                    layer.width = width.map_or(size.width, |width| width.max(0) as f32);
+                    layer.height = height.map_or(size.height, |height| height.max(0) as f32);
+                    if let Some(opacity) = opacity {
+                        layer.opacity = opacity.clamp(0, 255) as u8;
+                    }
+                });
         }
     }
     sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
@@ -824,6 +827,36 @@ fn layer_begin_transition(
         .get(2)
         .and_then(variant_object)
         .or_else(|| variant_object(&runtime.object_member(this, "comp")));
+    let method = args
+        .first()
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_else(|| "crossfade".to_string());
+    let duration = match args.get(3).and_then(variant_object) {
+        Some(options) => object_optional_integer(runtime, options, "time")
+            .transpose()?
+            .unwrap_or(0),
+        None => 0,
+    }
+    .max(0) as u64;
+    let source_layer_id = source
+        .map(|source| native_layer_id(runtime, source))
+        .transpose()?
+        .flatten();
+    let mut suppressed_images = BTreeSet::new();
+    if let Some(source_layer_id) = source_layer_id {
+        suppressed_images.insert(source_layer_id);
+    }
+    let frozen = runtime
+        .host()
+        .layer_tree()
+        .draw_model_suppressing_images(&suppressed_images);
+    let comp = variant_object(&runtime.object_member(this, "comp"))
+        .map(|comp| runtime.bound_this(comp).unwrap_or(comp));
+    let paired_comp = source
+        .map(|source| runtime.bound_this(source).unwrap_or(source))
+        .is_some_and(|source| Some(source) == comp);
     if let Some(layer_id) = native_layer_id(runtime, this)? {
         if let Some(source) = source {
             copy_layer_images(runtime, this, layer_id, source)?;
@@ -832,9 +865,31 @@ fn layer_begin_transition(
             layer.visible = true;
         }
     }
-    runtime.host_mut().apply_immediate_transition();
     runtime.set_object_member(this, "visible", Variant::Integer(1));
-    finish_immediate_transition(runtime, this);
+    if duration == 0 {
+        if let Some(source_layer_id) = source_layer_id
+            && let Some(source_layer) = runtime
+                .host_mut()
+                .layer_tree_mut()
+                .layer_mut(source_layer_id)
+        {
+            source_layer.renderable = false;
+        }
+        finish_immediate_transition(runtime, this);
+    } else {
+        runtime.host_mut().begin_native_transition(
+            &method,
+            Duration::from_millis(duration),
+            frozen.0,
+            frozen.1,
+            suppressed_images,
+            NativeTransitionCompletion {
+                dest: this,
+                source,
+                paired_comp,
+            },
+        );
+    }
     Ok(Variant::Void)
 }
 
