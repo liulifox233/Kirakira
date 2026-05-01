@@ -158,6 +158,7 @@ impl DesktopApp {
         self.last_frame = now;
 
         let frame_input = FrameInput::new(renderer.logical_size(), delta_seconds);
+        let mut return_to_launcher_after_render = false;
         let frame = match self.state {
             DesktopState::Launcher => {
                 self.engine.set_panel(Panel::Launcher);
@@ -174,7 +175,11 @@ impl DesktopApp {
                         KrkrEngineInput::new(frame_input, events),
                         std::time::Duration::from_secs_f32(delta_seconds.max(0.0)),
                     ) {
-                        Ok(frame) => frame.output,
+                        Ok(frame) => {
+                            return_to_launcher_after_render =
+                                krkr_engine.host().termination_requested();
+                            frame.output
+                        }
                         Err(error) => {
                             let message = format!("engine update failed: {error}");
                             log_error(&message);
@@ -202,6 +207,10 @@ impl DesktopApp {
                     event_loop.exit();
                 }
             }
+        }
+
+        if return_to_launcher_after_render && let Some(window) = self.window.as_ref().cloned() {
+            self.return_to_launcher(&window);
         }
     }
 

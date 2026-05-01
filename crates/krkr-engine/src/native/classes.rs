@@ -142,8 +142,20 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "caption", Variant::String(String::new()));
             runtime.set_object_member(handle, "width", Variant::Integer(0));
             runtime.set_object_member(handle, "height", Variant::Integer(0));
+            runtime.set_object_member(handle, "innerWidth", Variant::Integer(0));
+            runtime.set_object_member(handle, "innerHeight", Variant::Integer(0));
+            let children = runtime.alloc_array_object(Vec::new());
+            runtime.set_object_member(handle, "children", Variant::Object(children));
             let menu = alloc_menu_item_object(runtime, Some(handle), String::new());
             runtime.set_object_member(handle, "menu", Variant::Object(menu));
+            if let Variant::Object(window_class) = runtime.global_member("Window")
+                && matches!(
+                    runtime.object_member(window_class, "mainWindow"),
+                    Variant::Void
+                )
+            {
+                runtime.set_object_member(window_class, "mainWindow", Variant::Object(handle));
+            }
         }
         "MenuItem" => {
             let owner = args.first().cloned().unwrap_or_default();
@@ -403,8 +415,52 @@ fn menu_item_noop(
 }
 
 fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    runtime.register_object_native(handle, "add", window_add);
+    runtime.register_object_native(handle, "remove", window_remove);
     runtime.register_object_native(handle, "setSize", window_set_size);
     runtime.register_object_native(handle, "setInnerSize", window_set_inner_size);
+}
+
+fn window_add(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Window.add requires this"))?;
+    let item = args.first().cloned().unwrap_or_default();
+    let Variant::Object(item_handle) = item else {
+        return Ok(Variant::Void);
+    };
+    let children = ensure_child_array(runtime, this);
+    runtime.array_remove_value(children, &Variant::Object(item_handle));
+    runtime.array_push(children, Variant::Object(item_handle));
+    if runtime.host().native_layer(item_handle).is_some() {
+        if matches!(runtime.object_member(this, "primaryLayer"), Variant::Void) {
+            runtime.set_object_member(this, "primaryLayer", Variant::Object(item_handle));
+        }
+        if matches!(runtime.object_member(this, "focusedLayer"), Variant::Void) {
+            runtime.set_object_member(this, "focusedLayer", Variant::Object(item_handle));
+        }
+    }
+    Ok(Variant::Void)
+}
+
+fn window_remove(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Window.remove requires this"))?;
+    let item = args.first().cloned().unwrap_or_default();
+    let children = ensure_child_array(runtime, this);
+    runtime.array_remove_value(children, &item);
+    if runtime.object_member(this, "primaryLayer") == item {
+        runtime.set_object_member(this, "primaryLayer", Variant::Void);
+    }
+    if runtime.object_member(this, "focusedLayer") == item {
+        runtime.set_object_member(this, "focusedLayer", Variant::Void);
+    }
+    Ok(Variant::Void)
 }
 
 fn window_set_size(
@@ -445,6 +501,7 @@ fn set_window_size_members(
 
 fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     register_native_method_preserving_script(runtime, handle, "loadImages", layer_load_images);
+    register_native_method_preserving_script(runtime, handle, "freeImage", layer_free_image);
     register_native_method_preserving_script(runtime, handle, "setPos", layer_set_pos);
     register_native_method_preserving_script(runtime, handle, "setSize", layer_set_size);
     register_native_method_preserving_script(runtime, handle, "setImagePos", layer_set_image_pos);
@@ -454,6 +511,12 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
         handle,
         "setSizeToImageSize",
         layer_set_size_to_image_size,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "setDefaultCursor",
+        layer_set_default_cursor,
     );
     register_native_method_preserving_script(runtime, handle, "bringToFront", layer_bring_to_front);
     register_native_method_preserving_script(runtime, handle, "bringToBack", layer_bring_to_back);
@@ -868,6 +931,31 @@ fn source_object(value: &Variant) -> Option<ObjectHandle> {
         Variant::Object(handle) => Some(*handle),
         _ => None,
     }
+}
+
+fn layer_free_image(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.clear_image();
+    }
+    sync_layer_image_members(runtime, this, 0, 0);
+    Ok(Variant::Void)
+}
+
+fn layer_set_default_cursor(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Layer.setDefaultCursor requires this"))?;
+    let cursor = args.first().cloned().unwrap_or_default();
+    runtime.set_object_member(this, "cursor", cursor.clone());
+    runtime.set_object_member(this, "defaultCursor", cursor);
+    Ok(Variant::Void)
 }
 
 fn layer_set_pos(
@@ -2736,6 +2824,7 @@ pub(crate) static LAYER_CLASS: NativeClassSpec = NativeClassSpec {
         "bringToFront",
         "saveLayerImage",
         "loadImages",
+        "freeImage",
         "loadProvinceImage",
         "getMainPixel",
         "setMainPixel",
@@ -2749,6 +2838,7 @@ pub(crate) static LAYER_CLASS: NativeClassSpec = NativeClassSpec {
         "setSizeToImageSize",
         "setImagePos",
         "setImageSize",
+        "setDefaultCursor",
         "independMainImage",
         "independProvinceImage",
         "setClip",

@@ -10,27 +10,35 @@ use super::{first_arg_or_void, install_static_object, register_stub_method};
 pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     let system = install_static_object(runtime, "System");
     for method in [
-        "terminate",
-        "exit",
-        "addContinuousHandler",
-        "removeContinuousHandler",
         "clearGraphicCache",
         "touchImages",
         "assignMessage",
         "doCompact",
-        "inform",
-        "getKeyState",
-        "shellExecute",
         "system",
         "readRegValue",
         "setArgument",
-        "createAppLock",
         "dumpHeap",
         "nullpo",
         "showVersion",
     ] {
         register_stub_method(runtime, system, "System", method);
     }
+    runtime.register_object_native(system, "terminate", system_exit);
+    runtime.register_object_native(system, "exit", system_exit);
+    runtime.register_object_native(
+        system,
+        "addContinuousHandler",
+        system_add_continuous_handler,
+    );
+    runtime.register_object_native(
+        system,
+        "removeContinuousHandler",
+        system_remove_continuous_handler,
+    );
+    runtime.register_object_native(system, "inform", system_inform);
+    runtime.register_object_native(system, "getKeyState", system_get_key_state);
+    runtime.register_object_native(system, "shellExecute", system_shell_execute);
+    runtime.register_object_native(system, "createAppLock", system_create_app_lock);
     runtime.register_object_native(system, "getTickCount", system_get_tick_count);
     runtime.register_object_native(system, "toActualColor", first_arg_or_void);
     runtime.register_object_native(system, "createUUID", system_create_uuid);
@@ -52,12 +60,12 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
         ("osBits", Variant::Integer((usize::BITS) as i64)),
         ("exitOnNoWindowStartup", Variant::Integer(0)),
         ("title", Variant::String("krkr-ruri".to_string())),
-        ("screenWidth", Variant::Integer(0)),
-        ("screenHeight", Variant::Integer(0)),
+        ("screenWidth", Variant::Integer(960)),
+        ("screenHeight", Variant::Integer(600)),
         ("desktopLeft", Variant::Integer(0)),
         ("desktopTop", Variant::Integer(0)),
-        ("desktopWidth", Variant::Integer(0)),
-        ("desktopHeight", Variant::Integer(0)),
+        ("desktopWidth", Variant::Integer(960)),
+        ("desktopHeight", Variant::Integer(600)),
         ("touchDevice", Variant::Integer(0)),
     ] {
         runtime.set_object_member(system, name, value);
@@ -76,6 +84,91 @@ fn exe_path(runtime: &Runtime<KrkrHost>) -> String {
 
 fn temp_path() -> String {
     format!("{}/", std::env::temp_dir().display())
+}
+
+fn system_exit(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    runtime.host_mut().request_termination();
+    Ok(Variant::Void)
+}
+
+fn system_add_continuous_handler(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    if let Some(handler) = args.first() {
+        runtime.host_mut().add_continuous_handler(handler.clone());
+    }
+    Ok(Variant::Void)
+}
+
+fn system_remove_continuous_handler(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let removed = args
+        .first()
+        .is_some_and(|handler| runtime.host_mut().remove_continuous_handler(handler));
+    Ok(Variant::Integer(i64::from(removed)))
+}
+
+fn system_inform(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let message = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    runtime.host_mut().log(&format!("System.inform: {message}"));
+    Ok(Variant::Void)
+}
+
+fn system_get_key_state(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Integer(0))
+}
+
+fn system_shell_execute(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let target = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    runtime
+        .host_mut()
+        .log(&format!("System.shellExecute ignored: {target}"));
+    Ok(Variant::Integer(0))
+}
+
+fn system_create_app_lock(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    runtime
+        .host_mut()
+        .log(&format!("System.createAppLock granted: {name}"));
+    Ok(Variant::Integer(1))
 }
 
 fn system_get_tick_count(
