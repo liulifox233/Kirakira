@@ -53,6 +53,8 @@ fn output_to_result<T>(output: FrontendOutput<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::ObjectHandle;
+
     use super::*;
 
     #[test]
@@ -275,6 +277,55 @@ mod tests {
     }
 
     #[test]
+    fn super_native_constructor_and_method_bind_leaf_instance() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "native_super.tjs",
+            r#"
+            class Middle extends NativeBase {
+                function Middle() { super.NativeBase(); }
+                function checkNative() { return super.nativeValue(); }
+            }
+            class Child extends Middle {
+                function Child() { super.Middle(); }
+            }
+            var c = new Child();
+            return c.checkNative() + ":" + (typeof c.initialized != "undefined");
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("7:1".to_string())
+        );
+    }
+
+    #[test]
+    fn new_native_constructor_does_not_reuse_caller_this() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "native_new.tjs",
+            r#"
+            class Maker {
+                function make() { return new NativeBase(); }
+            }
+            var maker = new Maker();
+            var created = maker.make();
+            return (typeof maker.initialized == "undefined") + ":" + created.nativeValue();
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("1:7".to_string())
+        );
+    }
+
+    #[test]
     fn execute_source_passes_new_arguments_to_function_constructor() {
         assert_eq!(
             execute_source(
@@ -284,6 +335,39 @@ mod tests {
             .expect("execute"),
             Variant::Integer(3)
         );
+    }
+
+    fn install_native_base(runtime: &mut Runtime) {
+        let constructor = runtime.alloc_native_constructor(
+            |runtime: &mut Runtime,
+             this_obj: Option<ObjectHandle>,
+             _args: Vec<Variant>|
+             -> Result<Variant> {
+                let handle = this_obj
+                    .filter(|handle| *handle != runtime.global_handle())
+                    .unwrap_or_else(|| runtime.alloc_ordinary_object());
+                runtime.add_object_class_info(handle, "NativeBase");
+                runtime.set_object_member(handle, "initialized", Variant::Integer(1));
+                runtime.register_object_native(handle, "nativeValue", native_base_value);
+                Ok(Variant::Object(handle))
+            },
+        );
+        runtime.add_object_class_info(constructor, "NativeBase");
+        runtime.register_object_native(constructor, "nativeValue", native_base_value);
+        runtime.set_global_member("NativeBase", Variant::Object(constructor));
+    }
+
+    fn native_base_value(
+        runtime: &mut Runtime,
+        this_obj: Option<ObjectHandle>,
+        _args: Vec<Variant>,
+    ) -> Result<Variant> {
+        let handle =
+            this_obj.ok_or_else(|| TjsError::runtime("NativeBase.nativeValue requires this"))?;
+        Ok(match runtime.object_member(handle, "initialized") {
+            Variant::Void => Variant::Integer(0),
+            _ => Variant::Integer(7),
+        })
     }
 
     #[test]

@@ -688,16 +688,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<CallOutcome> {
         match self.materialize_code_object(callee) {
             Variant::Closure(closure) => {
-                let effective_this = if self.is_class_handle(closure.object) {
-                    closure
-                        .this_obj
-                        .filter(|handle| *handle != self.runtime.global)
-                        .or_else(|| this_obj.filter(|handle| *handle != self.runtime.global))
-                        .or(closure.this_obj)
-                        .or(this_obj)
-                } else {
-                    closure.this_obj.or(this_obj)
-                };
+                let effective_this = closure.this_obj.or(this_obj).or(Some(closure.object));
                 self.call_handle(closure.object, effective_this, args, is_new, continuation)
             }
             Variant::Object(handle) => {
@@ -783,28 +774,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 ))
             }
             ObjectKind::Proxy {
-                primary, fallback, ..
+                primary,
+                fallback,
+                bind_this,
             } => {
+                let proxy_this = bind_this.or(this_obj);
                 if let Some(primary) = primary {
-                    self.call_handle(primary, this_obj, args, is_new, continuation)
+                    self.call_handle(primary, proxy_this, args, is_new, continuation)
                 } else {
-                    self.call_handle(fallback, this_obj, args, is_new, continuation)
+                    self.call_handle(fallback, proxy_this, args, is_new, continuation)
                 }
             }
             ObjectKind::Ordinary | ObjectKind::Array { .. } => {
                 Err(TjsError::runtime("object is not callable"))
             }
         }
-    }
-
-    fn is_class_handle(&self, handle: ObjectHandle) -> bool {
-        matches!(
-            self.runtime.heap[handle.0].kind,
-            ObjectKind::InterCode {
-                context: BytecodeContextType::Class,
-                ..
-            }
-        )
     }
 
     fn create_new_inter_code(

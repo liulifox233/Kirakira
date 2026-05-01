@@ -213,8 +213,12 @@ pub struct LayerNode {
     pub image_height: f32,
     pub visible: bool,
     pub renderable: bool,
+    pub enabled: bool,
+    pub node_enabled: bool,
     pub opacity: u8,
     pub z_order: i32,
+    pub layer_type: i32,
+    pub face: i32,
     pub image: Option<LayerImage>,
 }
 
@@ -239,8 +243,12 @@ impl LayerNode {
             image_height: 0.0,
             visible: false,
             renderable: true,
+            enabled: true,
+            node_enabled: true,
             opacity: 255,
             z_order,
+            layer_type: 2,
+            face: 128,
             image: None,
         }
     }
@@ -258,7 +266,12 @@ impl LayerNode {
         )
     }
 
-    fn image_command(&self) -> Option<ImageCommand> {
+    fn image_command(
+        &self,
+        origin: Point,
+        clip: Rect,
+        inherited_opacity: f32,
+    ) -> Option<ImageCommand> {
         let image = self.image.as_ref()?;
         if self.width <= 0.0 || self.height <= 0.0 {
             return None;
@@ -267,19 +280,19 @@ impl LayerNode {
         let texture_size = image.size();
         let image_width = texture_size.width;
         let image_height = texture_size.height;
-        let layer_x0 = self.left;
-        let layer_y0 = self.top;
-        let layer_x1 = self.left + self.width;
-        let layer_y1 = self.top + self.height;
-        let image_x0 = self.left + self.image_left;
-        let image_y0 = self.top + self.image_top;
+        let layer_x0 = origin.x;
+        let layer_y0 = origin.y;
+        let layer_x1 = origin.x + self.width;
+        let layer_y1 = origin.y + self.height;
+        let image_x0 = origin.x + self.image_left;
+        let image_y0 = origin.y + self.image_top;
         let image_x1 = image_x0 + image_width;
         let image_y1 = image_y0 + image_height;
 
-        let target_x0 = layer_x0.max(image_x0);
-        let target_y0 = layer_y0.max(image_y0);
-        let target_x1 = layer_x1.min(image_x1);
-        let target_y1 = layer_y1.min(image_y1);
+        let target_x0 = layer_x0.max(image_x0).max(clip.x);
+        let target_y0 = layer_y0.max(image_y0).max(clip.y);
+        let target_x1 = layer_x1.min(image_x1).min(clip.x + clip.width);
+        let target_y1 = layer_y1.min(image_y1).min(clip.y + clip.height);
         if target_x1 <= target_x0 || target_y1 <= target_y0 {
             return None;
         }
@@ -299,7 +312,7 @@ impl LayerNode {
                 target_y1 - target_y0,
             ),
             texture_size,
-            opacity: self.opacity as f32 / 255.0,
+            opacity: inherited_opacity * self.opacity as f32 / 255.0,
         })
     }
 
@@ -362,49 +375,155 @@ impl LayerTree {
         self.layers.get_mut(&id)
     }
 
+    pub fn layers(&self) -> impl Iterator<Item = &LayerNode> {
+        self.layers.values()
+    }
+
     pub fn remove_layer(&mut self, id: LayerId) -> Option<LayerNode> {
         self.layers.remove(&id)
     }
 
+    pub fn set_parent(&mut self, id: LayerId, parent: Option<LayerId>) -> bool {
+        if parent == Some(id) || parent.is_some_and(|parent| self.is_descendant(parent, id)) {
+            return false;
+        }
+        let Some(layer) = self.layers.get_mut(&id) else {
+            return false;
+        };
+        layer.parent = parent;
+        true
+    }
+
+    pub fn absolute_position(&self, id: LayerId) -> Option<Point> {
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let mut current = Some(id);
+        while let Some(layer_id) = current {
+            let layer = self.layers.get(&layer_id)?;
+            x += layer.left;
+            y += layer.top;
+            current = layer.parent;
+        }
+        Some(Point::new(x, y))
+    }
+
     pub fn hit_test(&self, point: Point) -> Option<LayerId> {
-        let mut layers = self
-            .layers
-            .values()
-            .filter(|layer| {
-                layer.renderable
-                    && layer.visible
-                    && layer.opacity > 0
-                    && layer.width > 0.0
-                    && layer.height > 0.0
-                    && layer.rect().contains(point)
-            })
-            .collect::<Vec<_>>();
-        layers.sort_by_key(|layer| (layer.z_order, layer.id));
-        layers.last().map(|layer| layer.id)
+        let roots = self.sorted_children(None);
+        for root in roots.into_iter().rev() {
+            if let Some(layer_id) = self.hit_test_layer(root.id, Point::new(0.0, 0.0), point) {
+                return Some(layer_id);
+            }
+        }
+        None
     }
 
     pub fn draw_model(&self) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
-        let mut layers = self
-            .layers
-            .values()
-            .filter(|layer| layer.renderable && layer.visible && layer.opacity > 0)
-            .collect::<Vec<_>>();
-        layers.sort_by_key(|layer| (layer.z_order, layer.id));
-
         let mut commands = Vec::new();
         let mut uploads = Vec::new();
-        for layer in layers {
-            let Some(image) = &layer.image else {
-                continue;
-            };
-            let Some(command) = layer.image_command() else {
-                continue;
-            };
-            commands.push(DrawCommand::Image(command));
-            uploads.push(image.upload.clone());
+        let clip = Rect::new(0.0, 0.0, f32::MAX / 4.0, f32::MAX / 4.0);
+        for root in self.sorted_children(None) {
+            self.draw_layer(
+                root.id,
+                Point::new(0.0, 0.0),
+                clip,
+                1.0,
+                &mut commands,
+                &mut uploads,
+            );
         }
         (commands, uploads)
     }
+
+    fn draw_layer(
+        &self,
+        id: LayerId,
+        parent_origin: Point,
+        parent_clip: Rect,
+        parent_opacity: f32,
+        commands: &mut Vec<DrawCommand>,
+        uploads: &mut Vec<ImageUpload>,
+    ) {
+        let Some(layer) = self.layers.get(&id) else {
+            return;
+        };
+        if !layer.renderable || !layer.visible || layer.opacity == 0 {
+            return;
+        }
+        let origin = Point::new(parent_origin.x + layer.left, parent_origin.y + layer.top);
+        let layer_rect = Rect::new(origin.x, origin.y, layer.width, layer.height);
+        let Some(clip) = intersect_rect(parent_clip, layer_rect) else {
+            return;
+        };
+        let opacity = parent_opacity * layer.opacity as f32 / 255.0;
+
+        if let Some(command) = layer.image_command(origin, clip, parent_opacity) {
+            commands.push(DrawCommand::Image(command));
+            if let Some(image) = &layer.image {
+                uploads.push(image.upload.clone());
+            }
+        }
+
+        for child in self.sorted_children(Some(id)) {
+            self.draw_layer(child.id, origin, clip, opacity, commands, uploads);
+        }
+    }
+
+    fn hit_test_layer(&self, id: LayerId, parent_origin: Point, point: Point) -> Option<LayerId> {
+        let layer = self.layers.get(&id)?;
+        if !layer.renderable
+            || !layer.visible
+            || !layer.enabled
+            || !layer.node_enabled
+            || layer.opacity == 0
+            || layer.width <= 0.0
+            || layer.height <= 0.0
+        {
+            return None;
+        }
+
+        let origin = Point::new(parent_origin.x + layer.left, parent_origin.y + layer.top);
+        let rect = Rect::new(origin.x, origin.y, layer.width, layer.height);
+        if !rect.contains(point) {
+            return None;
+        }
+
+        for child in self.sorted_children(Some(id)).into_iter().rev() {
+            if let Some(layer_id) = self.hit_test_layer(child.id, origin, point) {
+                return Some(layer_id);
+            }
+        }
+
+        Some(id)
+    }
+
+    fn sorted_children(&self, parent: Option<LayerId>) -> Vec<&LayerNode> {
+        let mut children = self
+            .layers
+            .values()
+            .filter(|layer| layer.parent == parent)
+            .collect::<Vec<_>>();
+        children.sort_by_key(|layer| (layer.z_order, layer.id));
+        children
+    }
+
+    fn is_descendant(&self, id: LayerId, ancestor: LayerId) -> bool {
+        let mut current = Some(id);
+        while let Some(layer_id) = current {
+            if layer_id == ancestor {
+                return true;
+            }
+            current = self.layers.get(&layer_id).and_then(|layer| layer.parent);
+        }
+        false
+    }
+}
+
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
