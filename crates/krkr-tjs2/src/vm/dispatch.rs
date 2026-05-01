@@ -163,17 +163,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             if let Some(primary) = primary {
                 let primary_has_member = self.runtime.heap[primary.0].get_raw(name).is_some();
                 if primary_has_member || (bind_this.is_none() && flags.ensure) {
+                    if let Some(this_obj) = bind_this {
+                        self.set_bound_member(this_obj, name, value);
+                        return Ok(());
+                    }
+                    if let Some(this_obj) = caller_this
+                        && primary_has_member
+                    {
+                        self.set_bound_member(this_obj, name, value);
+                        return Ok(());
+                    }
                     return self.prop_set_handle(primary, name, value, flags, caller_this);
                 }
             }
             if let Some(this_obj) = bind_this {
-                let mut value = self.materialize_code_object(value);
-                if let Variant::Closure(closure) = &mut value
-                    && closure.this_obj.is_none()
-                {
-                    closure.this_obj = Some(this_obj);
-                }
-                self.runtime.heap[this_obj.0].set(name, value);
+                self.set_bound_member(this_obj, name, value);
                 return Ok(());
             }
             return self.prop_set_handle(fallback, name, value, flags, caller_this);
@@ -187,7 +191,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         {
             return Ok(());
         }
-
+        if !flags.ignore_prop {
+            let mut current = self.super_class_handle(handle)?;
+            while let Some(class_handle) = current {
+                if let Some(existing) = self.runtime.heap[class_handle.0].get_raw(name)
+                    && self
+                        .property_setter(existing, value.clone(), Some(handle))?
+                        .is_some()
+                {
+                    return Ok(());
+                }
+                current = self.super_class_handle(class_handle)?;
+            }
+        }
         let mut value = self.materialize_code_object(value);
         if let Variant::Closure(closure) = &mut value
             && closure.this_obj.is_none()
@@ -196,6 +212,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
         self.runtime.heap[handle.0].set(name, value);
         Ok(())
+    }
+
+    fn set_bound_member(&mut self, handle: ObjectHandle, name: &str, value: Variant) {
+        let mut value = self.materialize_code_object(value);
+        if let Variant::Closure(closure) = &mut value
+            && closure.this_obj.is_none()
+        {
+            closure.this_obj = Some(handle);
+        }
+        self.runtime.heap[handle.0].set(name, value);
     }
 
     pub(super) fn default_prop_get(

@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use krkr_core::LayerNode;
+use krkr_core::{AudioBus, AudioCommand, AudioSourceKind, LayerNode};
 use krkr_font::{FontSpec, FontSystem, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
@@ -53,8 +53,15 @@ fn construct_native_instance(
         "__className",
         Variant::String(spec.name.to_string()),
     );
-    install_methods(runtime, handle, spec.name, spec.methods);
-    install_special_methods(runtime, handle, spec.name);
+    if let Variant::Object(class_handle) = runtime.global_member(spec.name)
+        && runtime.object_super_class(handle).is_none()
+    {
+        runtime.set_object_super_class(handle, class_handle);
+    }
+    if spec.name != "WaveSoundBuffer" {
+        install_methods(runtime, handle, spec.name, spec.methods);
+        install_special_methods(runtime, handle, spec.name);
+    }
     install_properties(runtime, handle, spec.properties);
     apply_constructor_defaults(runtime, handle, spec.name, &args)?;
     Ok(Variant::Object(handle))
@@ -80,6 +87,9 @@ fn install_properties(
     properties: &'static [&'static str],
 ) {
     for property in properties {
+        if runtime.has_object_member(handle, property) {
+            continue;
+        }
         runtime.set_object_member(handle, *property, Variant::Void);
     }
 }
@@ -266,6 +276,9 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "status", Variant::String("unload".to_string()));
             runtime.set_object_member(handle, "volume", Variant::Integer(100000));
             runtime.set_object_member(handle, "pan", Variant::Integer(0));
+            runtime.set_object_member(handle, "looping", Variant::Integer(0));
+            let id = runtime.host_mut().register_native_audio_buffer(handle);
+            runtime.set_object_member(handle, "__nativeAudioId", Variant::Integer(id.0 as i64));
         }
         _ => {}
     }
@@ -300,6 +313,8 @@ fn install_special_methods(
         install_async_trigger_methods(runtime, handle);
     } else if class_name == "Window" {
         install_window_methods(runtime, handle);
+    } else if class_name == "WaveSoundBuffer" {
+        install_wave_sound_buffer_methods(runtime, handle);
     }
 }
 
@@ -622,6 +637,166 @@ fn register_native_method_preserving_script(
 fn install_async_trigger_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.register_object_native(handle, "trigger", async_trigger_trigger);
     runtime.register_object_native(handle, "cancel", async_trigger_cancel);
+}
+
+fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    runtime.register_object_native(handle, "open", wave_sound_buffer_open);
+    runtime.register_object_native(handle, "play", wave_sound_buffer_play);
+    runtime.register_object_native(handle, "stop", wave_sound_buffer_stop);
+    runtime.register_object_native(handle, "fade", wave_sound_buffer_fade);
+    runtime.register_object_native(handle, "stopFade", native_wave_noop);
+    runtime.register_object_native(handle, "setPos", wave_sound_buffer_set_pos);
+    runtime.register_object_native(handle, "freeDirectSound", native_wave_noop);
+    runtime.register_object_native(handle, "getVisBuffer", native_wave_noop);
+}
+
+fn wave_sound_buffer_open(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.open")?;
+    let storage = args
+        .first()
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .ok_or_else(|| TjsError::runtime("WaveSoundBuffer.open requires storage"))?;
+    runtime
+        .host_mut()
+        .open_native_audio_storage(this, storage)?;
+    runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
+    runtime.set_object_member(this, "position", Variant::Integer(0));
+    runtime.set_object_member(this, "samplePosition", Variant::Integer(0));
+    Ok(Variant::Void)
+}
+
+fn wave_sound_buffer_play(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.play")?;
+    sync_wave_buffer_settings(runtime, this)?;
+    let bus = if runtime.object_member(this, "looping").is_truthy() {
+        AudioBus::Bgm
+    } else {
+        AudioBus::SoundEffect
+    };
+    runtime
+        .host_mut()
+        .queue_native_audio_play(this, bus, AudioSourceKind::Static)?;
+    runtime.set_object_member(this, "status", Variant::String("play".to_string()));
+    runtime.set_object_member(this, "paused", Variant::Integer(0));
+    Ok(Variant::Void)
+}
+
+fn wave_sound_buffer_stop(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.stop")?;
+    if let Some(id) = runtime
+        .host()
+        .native_audio_buffer(this)
+        .map(|buffer| buffer.id)
+    {
+        runtime.host_mut().queue_audio_command(AudioCommand::Stop {
+            id,
+            fade_seconds: 0.0,
+        });
+    }
+    runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
+    runtime.set_object_member(this, "paused", Variant::Integer(0));
+    Ok(Variant::Void)
+}
+
+fn wave_sound_buffer_fade(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.fade")?;
+    let (target, millis) = if let Some(options) = args.first().and_then(variant_object) {
+        let target = object_member_i64(runtime, options, "volume")?.unwrap_or(0);
+        let millis = match object_member_i64(runtime, options, "time")? {
+            Some(value) => value,
+            None => object_member_i64(runtime, options, "period")?.unwrap_or(0),
+        }
+        .max(0);
+        (target.saturating_mul(1000), millis)
+    } else {
+        (
+            optional_integer(&args, 0)?.unwrap_or(0),
+            optional_integer(&args, 1)?.unwrap_or(0).max(0),
+        )
+    };
+    let volume = krkr_volume_to_linear(target);
+    runtime.set_object_member(this, "volume", Variant::Integer(target));
+    let id = if let Some(buffer) = runtime.host_mut().native_audio_buffer_mut(this) {
+        buffer.volume = volume;
+        Some(buffer.id)
+    } else {
+        None
+    };
+    if let Some(id) = id {
+        runtime
+            .host_mut()
+            .queue_audio_command(AudioCommand::SetVolume {
+                id,
+                volume,
+                fade_seconds: millis as f32 / 1000.0,
+            });
+    }
+    Ok(Variant::Void)
+}
+
+fn wave_sound_buffer_set_pos(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.setPos")?;
+    let position = optional_integer(&args, 0)?.unwrap_or(0).max(0);
+    runtime.set_object_member(this, "position", Variant::Integer(position));
+    runtime.set_object_member(this, "samplePosition", Variant::Integer(position));
+    Ok(Variant::Void)
+}
+
+fn native_wave_noop(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Void)
+}
+
+fn native_audio_this(
+    runtime: &Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    method: &str,
+) -> Result<ObjectHandle> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime(format!("{method} requires this")))?;
+    Ok(runtime.bound_this(this).unwrap_or(this))
+}
+
+fn sync_wave_buffer_settings(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> Result<()> {
+    let volume = runtime
+        .object_member(handle, "volume")
+        .to_integer()
+        .map(krkr_volume_to_linear)
+        .unwrap_or(1.0);
+    let looping = runtime.object_member(handle, "looping").is_truthy();
+    if let Some(buffer) = runtime.host_mut().native_audio_buffer_mut(handle) {
+        buffer.volume = volume;
+        buffer.looping = looping;
+    }
+    Ok(())
+}
+
+fn krkr_volume_to_linear(volume: i64) -> f32 {
+    (volume as f32 / 100000.0).clamp(0.0, 1.0)
 }
 
 fn async_trigger_trigger(
@@ -2251,6 +2426,17 @@ fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
         .filter(|value| !matches!(value, Variant::Void))
         .map(Variant::to_integer)
         .transpose()
+}
+
+fn object_member_i64(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Result<Option<i64>> {
+    match runtime.object_member(object, name) {
+        Variant::Void | Variant::Null => Ok(None),
+        value => value.to_integer().map(Some),
+    }
 }
 
 fn first_text_arg(args: &[Variant]) -> Result<String> {

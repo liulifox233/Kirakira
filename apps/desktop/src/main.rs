@@ -178,6 +178,14 @@ impl DesktopApp {
                         Ok(frame) => {
                             return_to_launcher_after_render =
                                 krkr_engine.host().termination_requested();
+                            let audio_commands = krkr_engine.host_mut().take_audio_commands();
+                            if let Err(error) = self.audio.apply_commands(audio_commands) {
+                                let message = format!("audio command failed: {error}");
+                                log_warn(&message);
+                                self.status =
+                                    Some(DesktopStatus::new(StatusLevel::Warning, message));
+                                self.engine.set_status_level(Some(StatusLevel::Warning));
+                            }
                             frame.output
                         }
                         Err(error) => {

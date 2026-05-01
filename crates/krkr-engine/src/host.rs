@@ -9,8 +9,8 @@ use std::{
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use krkr_core::{
-    DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
-    ResourceProvider,
+    AudioBus, AudioCommand, AudioInstanceId, AudioSourceKind, DrawCommand, FrameTransition,
+    ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceProvider,
 };
 use krkr_font::FontSystem;
 use krkr_kag::{KagParser, ParserSnapshot};
@@ -46,6 +46,9 @@ pub struct KrkrHost {
     image_cache: BTreeMap<String, LayerImage>,
     font_system: FontSystem,
     next_texture_id: u64,
+    next_audio_instance_id: u64,
+    native_audio_buffers: BTreeMap<ObjectHandle, NativeAudioBuffer>,
+    pending_audio_commands: Vec<AudioCommand>,
     text_encoding: String,
     termination_requested: bool,
 }
@@ -77,6 +80,9 @@ impl Default for KrkrHost {
             image_cache: BTreeMap::new(),
             font_system: FontSystem::new(),
             next_texture_id: 1,
+            next_audio_instance_id: 1,
+            native_audio_buffers: BTreeMap::new(),
+            pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
         }
@@ -113,6 +119,9 @@ impl KrkrHost {
             image_cache: BTreeMap::new(),
             font_system: FontSystem::new(),
             next_texture_id: 1,
+            next_audio_instance_id: 1,
+            native_audio_buffers: BTreeMap::new(),
+            pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
         })
@@ -385,6 +394,12 @@ impl KrkrHost {
         self.pending_async_triggers.remove(&handle);
         self.pending_layer_paints.remove(&handle);
         self.kag_parsers.remove(&handle);
+        if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
+            self.pending_audio_commands.push(AudioCommand::Stop {
+                id: buffer.id,
+                fade_seconds: 0.0,
+            });
+        }
 
         let Some(layer_id) = self.native_layers.get(&handle).copied() else {
             return;
@@ -409,6 +424,12 @@ impl KrkrHost {
             self.pending_async_triggers.remove(&handle);
             self.pending_layer_paints.remove(&handle);
             self.kag_parsers.remove(&handle);
+            if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
+                self.pending_audio_commands.push(AudioCommand::Stop {
+                    id: buffer.id,
+                    fade_seconds: 0.0,
+                });
+            }
         }
     }
 
@@ -555,6 +576,113 @@ impl KrkrHost {
         let image = LayerImage::new(texture_id, width, height, rgba);
         self.image_cache.insert(name.to_string(), image.clone());
         Ok(image)
+    }
+
+    pub(crate) fn register_native_audio_buffer(&mut self, handle: ObjectHandle) -> AudioInstanceId {
+        let id = AudioInstanceId(self.next_audio_instance_id);
+        self.next_audio_instance_id = self.next_audio_instance_id.saturating_add(1);
+        self.native_audio_buffers
+            .insert(handle, NativeAudioBuffer::new(id));
+        id
+    }
+
+    pub(crate) fn native_audio_buffer(&self, handle: ObjectHandle) -> Option<&NativeAudioBuffer> {
+        self.native_audio_buffers.get(&handle)
+    }
+
+    pub(crate) fn native_audio_buffer_mut(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Option<&mut NativeAudioBuffer> {
+        self.native_audio_buffers.get_mut(&handle)
+    }
+
+    pub(crate) fn open_native_audio_storage(
+        &mut self,
+        handle: ObjectHandle,
+        storage: impl Into<String>,
+    ) -> Result<()> {
+        let storage = storage.into();
+        let bytes = self.read_binary_storage(&storage)?;
+        if !self.native_audio_buffers.contains_key(&handle) {
+            let id = self.allocate_audio_instance_id();
+            self.native_audio_buffers
+                .insert(handle, NativeAudioBuffer::new(id));
+        }
+        let buffer = self
+            .native_audio_buffers
+            .get_mut(&handle)
+            .expect("native audio buffer was inserted");
+        buffer.storage = Some(storage);
+        buffer.bytes = Some(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn queue_native_audio_play(
+        &mut self,
+        handle: ObjectHandle,
+        bus: AudioBus,
+        kind: AudioSourceKind,
+    ) -> Result<()> {
+        let buffer = self
+            .native_audio_buffers
+            .get(&handle)
+            .ok_or_else(|| TjsError::runtime("WaveSoundBuffer is not initialized"))?;
+        let storage = buffer
+            .storage
+            .clone()
+            .ok_or_else(|| TjsError::runtime("WaveSoundBuffer has no opened storage"))?;
+        let bytes = buffer
+            .bytes
+            .clone()
+            .ok_or_else(|| TjsError::runtime("WaveSoundBuffer has no decoded source bytes"))?;
+        self.pending_audio_commands.push(AudioCommand::Play {
+            id: buffer.id,
+            bus,
+            kind,
+            storage,
+            bytes,
+            looping: buffer.looping,
+            volume: buffer.volume,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn queue_audio_command(&mut self, command: AudioCommand) {
+        self.pending_audio_commands.push(command);
+    }
+
+    pub fn take_audio_commands(&mut self) -> Vec<AudioCommand> {
+        std::mem::take(&mut self.pending_audio_commands)
+    }
+
+    pub(crate) fn queue_kag_audio_play(
+        &mut self,
+        storage: impl Into<String>,
+        bus: AudioBus,
+        kind: AudioSourceKind,
+        looping: bool,
+        volume: f32,
+    ) -> Result<AudioInstanceId> {
+        let storage = storage.into();
+        let bytes = self.read_binary_storage(&storage)?;
+        let id = self.allocate_audio_instance_id();
+        self.pending_audio_commands.push(AudioCommand::Play {
+            id,
+            bus,
+            kind,
+            storage,
+            bytes,
+            looping,
+            volume,
+        });
+        Ok(id)
+    }
+
+    fn allocate_audio_instance_id(&mut self) -> AudioInstanceId {
+        let id = AudioInstanceId(self.next_audio_instance_id);
+        self.next_audio_instance_id = self.next_audio_instance_id.saturating_add(1);
+        id
     }
 
     pub(crate) fn create_layer_image(
@@ -871,6 +999,27 @@ struct TimerState {
 }
 
 #[derive(Clone)]
+pub(crate) struct NativeAudioBuffer {
+    pub id: AudioInstanceId,
+    pub storage: Option<String>,
+    pub bytes: Option<Vec<u8>>,
+    pub looping: bool,
+    pub volume: f32,
+}
+
+impl NativeAudioBuffer {
+    fn new(id: AudioInstanceId) -> Self {
+        Self {
+            id,
+            storage: None,
+            bytes: None,
+            looping: false,
+            volume: 1.0,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ActiveTransition {
     method: String,
     elapsed: Duration,
@@ -958,18 +1107,41 @@ fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
     let name = normalize_storage_separators(name);
     clean_relative_path(&name)?;
     let path = Path::new(&name);
-    if path.extension().is_some() {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(is_known_storage_extension)
+    {
         return Ok(vec![name]);
     }
 
     let mut names = Vec::with_capacity(12);
     names.push(name.clone());
     for extension in [
-        "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "mpg", "mpeg",
+        "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "tcw", "mpg", "mpeg",
     ] {
         names.push(format!("{name}.{extension}"));
     }
     Ok(names)
+}
+
+fn is_known_storage_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "bmp"
+            | "webp"
+            | "ks"
+            | "tjs"
+            | "asd"
+            | "ogg"
+            | "wav"
+            | "tcw"
+            | "mpg"
+            | "mpeg"
+    )
 }
 
 fn normalize_auto_path(path: &str) -> Option<String> {
