@@ -941,6 +941,34 @@ impl KagRuntimeTask {
                 message_layer.page_break();
                 Ok(self.wait_click(message_layer, true))
             }
+            "font" | "deffont" => {
+                apply_message_font_tag(message_layer, tag)?;
+                Ok(TagAction::Continue)
+            }
+            "resetfont" => {
+                message_layer.font = krkr_core::FontSpec::default();
+                message_layer.style = krkr_core::TextStyle::default();
+                Ok(TagAction::Continue)
+            }
+            "style" => {
+                apply_message_style_tag(message_layer, tag);
+                Ok(TagAction::Continue)
+            }
+            "locate" => {
+                if let Some(x) = tag_i64(tag, "x")? {
+                    message_layer.cursor_x = x as i32;
+                }
+                if let Some(y) = tag_i64(tag, "y")? {
+                    message_layer.cursor_y = y as i32;
+                }
+                Ok(TagAction::Continue)
+            }
+            "ptext" => {
+                if let Some(text) = tag.literal_attr("text") {
+                    message_layer.append_text(text);
+                }
+                Ok(TagAction::Continue)
+            }
             "waitclick" => Ok(self.wait_click(message_layer, false)),
             "wait" => Ok(match tag_millis(tag, "time") {
                 Some(duration) => self.wait(KagTaskState::WaitingTimer {
@@ -1086,6 +1114,78 @@ fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
     tag.attr(name)
         .and_then(|value| value.raw().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn apply_message_font_tag(message_layer: &mut MessageLayerModel, tag: &Tag) -> Result<()> {
+    if let Some(face) = tag.literal_attr("face") {
+        message_layer.font.face = face.to_string();
+    }
+    if let Some(size) = tag_i64(tag, "size")? {
+        message_layer.font.height = size.max(1) as f32;
+    }
+    if let Some(height) = tag_i64(tag, "height")? {
+        message_layer.font.height = height.max(1) as f32;
+    }
+    if let Some(color) = parse_color_attr(tag, "color")? {
+        message_layer.style.color = color;
+    }
+    if let Some(value) = kag_bool_attr(tag, "bold") {
+        message_layer.font.bold = value;
+    }
+    if let Some(value) = kag_bool_attr(tag, "italic") {
+        message_layer.font.italic = value;
+    }
+    if let Some(value) = kag_bool_attr(tag, "underline") {
+        message_layer.font.underline = value;
+    }
+    if let Some(value) = kag_bool_attr(tag, "strikeout") {
+        message_layer.font.strikeout = value;
+    }
+    Ok(())
+}
+
+fn apply_message_style_tag(message_layer: &mut MessageLayerModel, tag: &Tag) {
+    if let Some(value) = kag_bool_attr(tag, "bold") {
+        message_layer.font.bold = value;
+    }
+    if let Some(value) = kag_bool_attr(tag, "italic") {
+        message_layer.font.italic = value;
+    }
+    if let Some(value) = kag_bool_attr(tag, "underline") {
+        message_layer.font.underline = value;
+    }
+    if let Some(value) = kag_bool_attr(tag, "strikeout") {
+        message_layer.font.strikeout = value;
+    }
+}
+
+fn parse_color_attr(tag: &Tag, name: &str) -> Result<Option<[u8; 4]>> {
+    let Some(value) = tag.literal_attr(name) else {
+        return Ok(None);
+    };
+    let color = match value {
+        "black" => 0x000000,
+        "white" => 0xffffff,
+        "red" => 0xff0000,
+        "green" => 0x00ff00,
+        "blue" => 0x0000ff,
+        value => {
+            let value = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .or_else(|| value.strip_prefix('#'))
+                .unwrap_or(value);
+            i64::from_str_radix(value, 16).map_err(|error| {
+                TjsError::runtime(format!("invalid KAG {name} color `{value}`: {error}"))
+            })?
+        }
+    };
+    Ok(Some([
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+        255,
+    ]))
 }
 
 fn object_i64(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Result<i64> {
@@ -1246,6 +1346,12 @@ fn is_builtin_tag(tagname: &str) -> bool {
         "ch" | "r"
             | "p"
             | "l"
+            | "font"
+            | "deffont"
+            | "resetfont"
+            | "style"
+            | "locate"
+            | "ptext"
             | "wait"
             | "waitclick"
             | "image"
@@ -2085,6 +2191,114 @@ mod tests {
         }));
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_font_methods_measure_and_layer_draw_text_updates_pixels() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var font = new Font();
+                font.height = 24;
+                global.textLayer = new Layer();
+                textLayer.setSize(96, 48);
+                textLayer.font.height = 24;
+                textLayer.drawText(4, 4, "A", 0xffffff, 255);
+                global.imageFunctionLayer = new Layer();
+                imageFunctionLayer.setSize(96, 48);
+                ImageFunction.drawText(imageFunctionLayer, 4, 4, "B", 0xffffff, 255);
+                return font.getTextWidth("A") + ":" + font.getTextHeight("A") + ":" + textLayer.__nativeLayerId + ":" + imageFunctionLayer.__nativeLayerId;
+                "#,
+            )
+            .expect("script");
+        let Variant::String(result) = result else {
+            panic!("expected string result");
+        };
+        let parts = result.split(':').collect::<Vec<_>>();
+        assert!(parts[0].parse::<i64>().expect("width") > 0);
+        assert!(parts[1].parse::<i64>().expect("height") > 0);
+        let layer_id = parts[2].parse::<u64>().expect("layer id");
+        let image_function_layer_id = parts[3].parse::<u64>().expect("image function layer id");
+        for layer_id in [layer_id, image_function_layer_id] {
+            let image = engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .and_then(|layer| layer.image.as_ref())
+                .expect("drawText image");
+            assert!(image.upload.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        }
+    }
+
+    #[test]
+    fn native_font_methods_treat_negative_height_as_pixel_size() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var font = new Font();
+                font.height = -24;
+                global.textLayer = new Layer();
+                textLayer.setSize(96, 48);
+                textLayer.font.height = -24;
+                textLayer.drawText(4, 4, "A", 0xffffff, 255);
+                return font.getTextHeight("A") + ":" + textLayer.__nativeLayerId;
+                "#,
+            )
+            .expect("script");
+        let Variant::String(result) = result else {
+            panic!("expected string result");
+        };
+        let parts = result.split(':').collect::<Vec<_>>();
+        assert!(parts[0].parse::<i64>().expect("height") >= 20);
+        let layer_id = parts[1].parse::<u64>().expect("layer id");
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("drawText image");
+        let alpha_pixels = image
+            .upload
+            .rgba
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] != 0)
+            .count();
+        assert!(alpha_pixels > 20, "alpha_pixels={alpha_pixels}");
+    }
+
+    #[test]
+    fn native_layer_draw_text_applies_edge_pixels() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.textLayer = new Layer();
+                textLayer.setSize(96, 48);
+                textLayer.font.height = -24;
+                textLayer.drawText(8, 8, "A", 0x000000, 255, true, 512, 0x0080ff, 1, 0, 0);
+                return textLayer.__nativeLayerId;
+                "#,
+            )
+            .expect("script");
+        let layer_id = result.to_integer().expect("layer id") as u64;
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("drawText image");
+        let colored_pixels = image
+            .upload
+            .rgba
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] != 0 && (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0))
+            .count();
+        assert!(colored_pixels > 0, "colored_pixels={colored_pixels}");
     }
 
     #[test]

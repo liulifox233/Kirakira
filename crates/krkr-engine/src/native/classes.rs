@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, time::Duration};
 
+use krkr_font::{FontSpec, FontSystem, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, Runtime, Variant},
@@ -275,6 +276,10 @@ fn install_special_methods(
         install_menu_item_methods(runtime, handle);
     } else if class_name == "Layer" {
         install_layer_methods(runtime, handle);
+    } else if class_name == "Font" {
+        install_font_methods(runtime, handle);
+    } else if class_name == "ImageFunction" {
+        install_image_function_methods(runtime, handle);
     } else if class_name == "AsyncTrigger" {
         install_async_trigger_methods(runtime, handle);
     } else if class_name == "Window" {
@@ -467,8 +472,62 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "operateRect", layer_operate_rect);
     register_native_method_preserving_script(runtime, handle, "piledCopy", layer_copy_rect);
     register_native_method_preserving_script(runtime, handle, "drawText", layer_draw_text);
+    register_native_method_preserving_script(runtime, handle, "drawGlyph", layer_draw_glyph);
     register_native_method_preserving_script(runtime, handle, "getProvincePixel", layer_zero);
     register_native_method_preserving_script(runtime, handle, "update", layer_update);
+}
+
+fn install_font_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_native_method_preserving_script(runtime, handle, "getTextWidth", font_get_text_width);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "getTextHeight",
+        font_get_text_height,
+    );
+    register_native_method_preserving_script(runtime, handle, "getEscWidthX", font_get_esc_width_x);
+    register_native_method_preserving_script(runtime, handle, "getEscWidthY", font_get_esc_width_y);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "getEscHeightX",
+        font_get_esc_height_x,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "getEscHeightY",
+        font_get_esc_height_y,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "getGlyphDrawRect",
+        font_get_glyph_draw_rect,
+    );
+    register_native_method_preserving_script(runtime, handle, "getList", font_get_list);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "mapPrerenderedFont",
+        font_map_prerendered_font,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "unmapPrerenderedFont",
+        font_unmap_prerendered_font,
+    );
+}
+
+fn install_image_function_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_native_method_preserving_script(runtime, handle, "drawText", image_function_draw_text);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "drawGlyph",
+        image_function_draw_glyph,
+    );
 }
 
 type NativeMethod =
@@ -1049,16 +1108,256 @@ fn layer_draw_text(
         .unwrap_or_default();
     let color = optional_integer(&args, 3)?.unwrap_or(0x00ff_ffff);
     let opacity = optional_integer(&args, 4)?;
-    let rgba = color_to_rgba(color, opacity);
-    mutate_layer_pixels(runtime, layer_id, |pixels, image_width, image_height| {
-        let mut cursor_x = x;
-        for ch in text.chars() {
-            if ch != ' ' && ch != '\t' {
-                fill_pixels(pixels, image_width, image_height, cursor_x, y, 7, 12, rgba);
-            }
-            cursor_x += 8;
+    let font = layer_font_spec(runtime, this)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let style = TextStyle {
+        color: color_to_rgba(color, opacity),
+        anti_alias: optional_integer(&args, 5)?.is_none_or(|value| value != 0),
+        shadow: None,
+    };
+    let effect = text_draw_effect(&args, opacity)?;
+    let metrics = runtime.host().font_system().text_metrics(&font, &text);
+    let min_width =
+        (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
+    let min_height =
+        (y.max(0) as f32 + metrics.height.ceil() + effect.max_bottom() as f32).max(1.0) as u32;
+    let font_system = runtime.host().font_system().clone();
+    mutate_layer_pixels_min(
+        runtime,
+        layer_id,
+        min_width,
+        min_height,
+        |pixels, width, height| {
+            effect.draw(
+                &font_system,
+                &font,
+                pixels,
+                width,
+                height,
+                x as i32,
+                y as i32,
+                &text,
+            );
+            font_system.draw_text_to_rgba(
+                &font, style, pixels, width, height, x as i32, y as i32, &text,
+            );
+        },
+    )?;
+    Ok(Variant::Void)
+}
+
+fn layer_draw_glyph(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let x = optional_integer(&args, 0)?.unwrap_or(0);
+    let y = optional_integer(&args, 1)?.unwrap_or(0);
+    let glyph = args
+        .get(2)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    let text = glyph
+        .chars()
+        .next()
+        .map(|ch| ch.to_string())
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Ok(Variant::Void);
+    }
+    let color = optional_integer(&args, 3)?.unwrap_or(0x00ff_ffff);
+    let opacity = optional_integer(&args, 4)?;
+    let font = layer_font_spec(runtime, this)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let style = TextStyle {
+        color: color_to_rgba(color, opacity),
+        anti_alias: optional_integer(&args, 5)?.is_none_or(|value| value != 0),
+        shadow: None,
+    };
+    let effect = text_draw_effect(&args, opacity)?;
+    let metrics = runtime.host().font_system().text_metrics(&font, &text);
+    let min_width =
+        (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
+    let min_height =
+        (y.max(0) as f32 + metrics.height.ceil() + effect.max_bottom() as f32).max(1.0) as u32;
+    let font_system = runtime.host().font_system().clone();
+    mutate_layer_pixels_min(
+        runtime,
+        layer_id,
+        min_width,
+        min_height,
+        |pixels, width, height| {
+            effect.draw(
+                &font_system,
+                &font,
+                pixels,
+                width,
+                height,
+                x as i32,
+                y as i32,
+                &text,
+            );
+            font_system.draw_text_to_rgba(
+                &font, style, pixels, width, height, x as i32, y as i32, &text,
+            );
+        },
+    )?;
+    Ok(Variant::Void)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TextDrawEffect {
+    color: [u8; 4],
+    width: i32,
+    offset_x: i32,
+    offset_y: i32,
+    anti_alias: bool,
+}
+
+impl TextDrawEffect {
+    fn none(anti_alias: bool) -> Self {
+        Self {
+            color: [0, 0, 0, 0],
+            width: 0,
+            offset_x: 0,
+            offset_y: 0,
+            anti_alias,
         }
-    })?;
+    }
+
+    fn is_visible(self) -> bool {
+        self.color[3] != 0 && (self.width > 0 || self.offset_x != 0 || self.offset_y != 0)
+    }
+
+    fn max_right(self) -> i32 {
+        if !self.is_visible() {
+            return 0;
+        }
+        (self.offset_x + self.width).max(self.width).max(0)
+    }
+
+    fn max_bottom(self) -> i32 {
+        if !self.is_visible() {
+            return 0;
+        }
+        (self.offset_y + self.width).max(self.width).max(0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        self,
+        font_system: &FontSystem,
+        font: &FontSpec,
+        pixels: &mut [u8],
+        width: u32,
+        height: u32,
+        x: i32,
+        y: i32,
+        text: &str,
+    ) {
+        if !self.is_visible() {
+            return;
+        }
+        let style = TextStyle {
+            color: self.color,
+            anti_alias: self.anti_alias,
+            shadow: None,
+        };
+        if self.width > 0 && self.offset_x == 0 && self.offset_y == 0 {
+            for dy in -self.width..=self.width {
+                for dx in -self.width..=self.width {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    font_system.draw_text_to_rgba(
+                        font,
+                        style,
+                        pixels,
+                        width,
+                        height,
+                        x + dx,
+                        y + dy,
+                        text,
+                    );
+                }
+            }
+            return;
+        }
+        let spread = self.width.max(0);
+        for dy in -spread..=spread {
+            for dx in -spread..=spread {
+                font_system.draw_text_to_rgba(
+                    font,
+                    style,
+                    pixels,
+                    width,
+                    height,
+                    x + self.offset_x + dx,
+                    y + self.offset_y + dy,
+                    text,
+                );
+            }
+        }
+    }
+}
+
+fn text_draw_effect(args: &[Variant], opacity: Option<i64>) -> Result<TextDrawEffect> {
+    let anti_alias = optional_integer(args, 5)?.is_none_or(|value| value != 0);
+    let Some(level) = optional_integer(args, 6)? else {
+        return Ok(TextDrawEffect::none(anti_alias));
+    };
+    let effect_color = optional_integer(args, 7)?.unwrap_or(0);
+    let effect_width = optional_integer(args, 8)?.unwrap_or(0).max(0) as i32;
+    let offset_x = optional_integer(args, 9)?.unwrap_or(0) as i32;
+    let offset_y = optional_integer(args, 10)?.unwrap_or(0) as i32;
+    let level = level.clamp(0, 255);
+    let alpha = opacity.map_or(level, |opacity| (level * opacity.clamp(0, 255) + 127) / 255);
+    Ok(TextDrawEffect {
+        color: color_to_rgba(effect_color, Some(alpha)),
+        width: effect_width,
+        offset_x,
+        offset_y,
+        anti_alias,
+    })
+}
+
+fn image_function_draw_text(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    dispatch_image_function_layer_call(runtime, this_obj, args, layer_draw_text)
+}
+
+fn image_function_draw_glyph(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    dispatch_image_function_layer_call(runtime, this_obj, args, layer_draw_glyph)
+}
+
+fn dispatch_image_function_layer_call(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+    function: NativeMethod,
+) -> Result<Variant> {
+    if let Some(target) = args.first().and_then(variant_object)
+        && native_layer_id(runtime, target)?.is_some()
+    {
+        return function(runtime, Some(target), args.into_iter().skip(1).collect());
+    }
+    if let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this))
+        && native_layer_id(runtime, this)?.is_some()
+    {
+        return function(runtime, Some(this), args);
+    }
     Ok(Variant::Void)
 }
 
@@ -1080,6 +1379,171 @@ fn layer_zero(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Integer(0))
+}
+
+fn font_get_text_width(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let font = this_font_spec(runtime, this_obj)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let text = first_text_arg(&args)?;
+    let width = runtime
+        .host()
+        .font_system()
+        .text_metrics(&font, &text)
+        .width;
+    Ok(Variant::Integer(width.ceil() as i64))
+}
+
+fn font_get_text_height(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let font = this_font_spec(runtime, this_obj)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let text = first_text_arg(&args)?;
+    let height = runtime
+        .host()
+        .font_system()
+        .text_metrics(&font, &text)
+        .height;
+    Ok(Variant::Integer(height.ceil() as i64))
+}
+
+fn font_get_esc_width_x(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let font = this_font_spec(runtime, this_obj)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let text = first_text_arg(&args)?;
+    let (x, _) = runtime.host().font_system().esc_width(&font, &text);
+    Ok(Variant::Integer(x.round() as i64))
+}
+
+fn font_get_esc_width_y(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let font = this_font_spec(runtime, this_obj)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let text = first_text_arg(&args)?;
+    let (_, y) = runtime.host().font_system().esc_width(&font, &text);
+    Ok(Variant::Integer(y.round() as i64))
+}
+
+fn font_get_esc_height_x(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let font = this_font_spec(runtime, this_obj)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let text = first_text_arg(&args)?;
+    let (x, _) = runtime.host().font_system().esc_height(&font, &text);
+    Ok(Variant::Integer(x.round() as i64))
+}
+
+fn font_get_esc_height_y(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let font = this_font_spec(runtime, this_obj)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let text = first_text_arg(&args)?;
+    let (_, y) = runtime.host().font_system().esc_height(&font, &text);
+    Ok(Variant::Integer(y.round() as i64))
+}
+
+fn font_get_glyph_draw_rect(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let font = this_font_spec(runtime, this_obj)?;
+    ensure_font_file_loaded(runtime, &font)?;
+    let text = first_text_arg(&args)?;
+    let Some(ch) = text.chars().next() else {
+        return construct_native_instance(runtime, &RECT_CLASS, None, Vec::new());
+    };
+    let rect = runtime
+        .host()
+        .font_system()
+        .glyph_draw_rect(&font, ch)
+        .unwrap_or_default();
+    construct_native_instance(
+        runtime,
+        &RECT_CLASS,
+        None,
+        vec![
+            Variant::Integer(rect.left as i64),
+            Variant::Integer(rect.top as i64),
+            Variant::Integer(rect.left as i64 + rect.width as i64),
+            Variant::Integer(rect.top as i64 + rect.height as i64),
+        ],
+    )
+}
+
+fn font_get_list(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let values = runtime
+        .host()
+        .font_system()
+        .families()
+        .into_iter()
+        .map(Variant::String)
+        .collect();
+    Ok(Variant::Object(runtime.alloc_array_object(values)))
+}
+
+fn font_map_prerendered_font(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .ok_or_else(|| TjsError::runtime("Font.mapPrerenderedFont requires a font name"))?;
+    let storage = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_else(|| name.clone());
+    let bytes = runtime.host().read_binary_storage(&storage)?;
+    runtime
+        .host_mut()
+        .font_system_mut()
+        .map_prerendered_font(name, bytes)
+        .map_err(TjsError::runtime)?;
+    Ok(Variant::Void)
+}
+
+fn font_unmap_prerendered_font(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .ok_or_else(|| TjsError::runtime("Font.unmapPrerenderedFont requires a font name"))?;
+    let unmapped = runtime
+        .host_mut()
+        .font_system_mut()
+        .unmap_prerendered_font(&name);
+    Ok(Variant::Integer(i64::from(unmapped)))
 }
 
 fn layer_bring_to_front(
@@ -1267,6 +1731,88 @@ fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
         .transpose()
 }
 
+fn first_text_arg(args: &[Variant]) -> Result<String> {
+    args.first()
+        .map(Variant::to_tjs_string)
+        .transpose()
+        .map(|text| text.unwrap_or_default())
+}
+
+fn this_font_spec(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Result<FontSpec> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(FontSpec::default());
+    };
+    font_spec_from_object(runtime, this)
+}
+
+fn layer_font_spec(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Result<FontSpec> {
+    match runtime.object_member(layer, "font") {
+        Variant::Object(font) => font_spec_from_object(runtime, font),
+        _ => Ok(FontSpec::default()),
+    }
+}
+
+fn font_spec_from_object(runtime: &Runtime<KrkrHost>, font: ObjectHandle) -> Result<FontSpec> {
+    let face = match runtime.object_member(font, "face") {
+        Variant::Void | Variant::Null => String::new(),
+        value => value.to_tjs_string()?,
+    };
+    let raw_height = runtime
+        .object_member(font, "height")
+        .to_integer()
+        .unwrap_or(FontSpec::default().height as i64);
+    let height = if raw_height == 0 {
+        FontSpec::default().height
+    } else {
+        raw_height.unsigned_abs().max(1) as f32
+    };
+    let rasterizer = match runtime.object_member(font, "rasterizer") {
+        Variant::Void | Variant::Null => String::new(),
+        value => value.to_tjs_string()?,
+    };
+    Ok(FontSpec {
+        face,
+        height,
+        bold: runtime
+            .object_member(font, "bold")
+            .to_integer()
+            .is_ok_and(|value| value != 0),
+        italic: runtime
+            .object_member(font, "italic")
+            .to_integer()
+            .is_ok_and(|value| value != 0),
+        strikeout: runtime
+            .object_member(font, "strikeout")
+            .to_integer()
+            .is_ok_and(|value| value != 0),
+        underline: runtime
+            .object_member(font, "underline")
+            .to_integer()
+            .is_ok_and(|value| value != 0),
+        angle: runtime
+            .object_member(font, "angle")
+            .to_integer()
+            .unwrap_or(0) as i32,
+        face_is_file_name: runtime
+            .object_member(font, "faceIsFileName")
+            .to_integer()
+            .is_ok_and(|value| value != 0),
+        rasterizer,
+    })
+}
+
+fn ensure_font_file_loaded(runtime: &mut Runtime<KrkrHost>, spec: &FontSpec) -> Result<()> {
+    if !spec.face_is_file_name || spec.face.is_empty() {
+        return Ok(());
+    }
+    let bytes = runtime.host().read_binary_storage(&spec.face)?;
+    runtime
+        .host_mut()
+        .font_system_mut()
+        .load_font_data(spec.face.clone(), bytes)
+        .map_err(TjsError::runtime)
+}
+
 fn required_integer(args: &[Variant], index: usize, context: &str) -> Result<i64> {
     optional_integer(args, index)?
         .ok_or_else(|| TjsError::runtime(format!("{context} is required")))
@@ -1305,6 +1851,19 @@ fn mutate_layer_pixels<F>(runtime: &mut Runtime<KrkrHost>, layer_id: u64, mutate
 where
     F: FnOnce(&mut [u8], u32, u32),
 {
+    mutate_layer_pixels_min(runtime, layer_id, 1, 1, mutate)
+}
+
+fn mutate_layer_pixels_min<F>(
+    runtime: &mut Runtime<KrkrHost>,
+    layer_id: u64,
+    min_width: u32,
+    min_height: u32,
+    mutate: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut [u8], u32, u32),
+{
     let Some(layer) = runtime.host().layer_tree().layer(layer_id).cloned() else {
         return Ok(());
     };
@@ -1313,12 +1872,14 @@ where
         .as_ref()
         .map(|image| image.upload.width)
         .unwrap_or_else(|| layer.image_width.max(layer.width).max(1.0) as u32)
+        .max(min_width)
         .max(1);
     let height = layer
         .image
         .as_ref()
         .map(|image| image.upload.height)
         .unwrap_or_else(|| layer.image_height.max(layer.height).max(1.0) as u32)
+        .max(min_height)
         .max(1);
     let mut pixels = layer
         .image

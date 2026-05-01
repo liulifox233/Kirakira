@@ -95,6 +95,12 @@ pub(crate) fn install_tvp_constants(runtime: &mut Runtime<KrkrHost>) {
         ("tkdlNone", 0),
         ("tkdlSimple", 1),
         ("tkdlVerbose", 2),
+        ("fsfFixedPitch", 1 << 0),
+        ("fsfSameCharSet", 1 << 1),
+        ("fsfNoVertical", 1 << 2),
+        ("fsfTrueTypeOnly", 1 << 3),
+        ("fsfUseFontFace", 1 << 4),
+        ("fsfIgnoreSymbol", 1 << 5),
     ] {
         runtime.set_global_member(name, Variant::Integer(value));
     }

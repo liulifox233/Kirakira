@@ -12,6 +12,7 @@ use krkr_core::{
     DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
     ResourceProvider,
 };
+use krkr_font::FontSystem;
 use krkr_kag::{KagParser, ParserSnapshot};
 use krkr_tjs2::{
     Result, TjsError,
@@ -42,6 +43,7 @@ pub struct KrkrHost {
     current_kag_page: String,
     current_kag_layer: String,
     image_cache: BTreeMap<String, LayerImage>,
+    font_system: FontSystem,
     next_texture_id: u64,
     text_encoding: String,
     termination_requested: bool,
@@ -71,6 +73,7 @@ impl Default for KrkrHost {
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
             image_cache: BTreeMap::new(),
+            font_system: FontSystem::new(),
             next_texture_id: 1,
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
@@ -105,6 +108,7 @@ impl KrkrHost {
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
             image_cache: BTreeMap::new(),
+            font_system: FontSystem::new(),
             next_texture_id: 1,
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
@@ -170,7 +174,7 @@ impl KrkrHost {
         decode_text_storage(name, &bytes, None, &self.text_encoding)
     }
 
-    fn read_binary_storage(&self, name: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read_binary_storage(&self, name: &str) -> Result<Vec<u8>> {
         self.storage_bytes(name)
     }
 
@@ -525,6 +529,14 @@ impl KrkrHost {
         let texture_id = self.next_texture_id;
         self.next_texture_id = self.next_texture_id.saturating_add(1);
         LayerImage::new(texture_id, width, height, Arc::<[u8]>::from(rgba))
+    }
+
+    pub(crate) fn font_system(&self) -> &FontSystem {
+        &self.font_system
+    }
+
+    pub(crate) fn font_system_mut(&mut self) -> &mut FontSystem {
+        &mut self.font_system
     }
 
     pub(crate) fn mutate_kag_layer<R>(

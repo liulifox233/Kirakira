@@ -1,9 +1,16 @@
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    sync::Arc,
+};
 
 use bytemuck::{Pod, Zeroable};
 use krkr_core::{
-    Color, DrawCommand, FrameOutput, ImageCommand, ImageUpload, Rect, Size, TextCommand, TextureId,
+    Color, DrawCommand, FrameOutput, FrameTransition, ImageCommand, ImageUpload, Rect, Size,
+    TextureId,
 };
+use krkr_font::FontSystem;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -52,6 +59,9 @@ pub struct Renderer {
     texture_pipeline: TexturePipelineResources,
     transition_pipeline: TransitionPipelineResources,
     textures: BTreeMap<TextureId, CachedTexture>,
+    text_font_system: FontSystem,
+    next_text_texture_id: TextureId,
+    frame_text_textures: BTreeSet<TextureId>,
     physical_size: PhysicalSize<u32>,
     scale_factor: f64,
 }
@@ -148,6 +158,9 @@ impl Renderer {
             texture_pipeline,
             transition_pipeline,
             textures: BTreeMap::new(),
+            text_font_system: FontSystem::new(),
+            next_text_texture_id: 1 << 60,
+            frame_text_textures: BTreeSet::new(),
             physical_size,
             scale_factor,
         })
@@ -193,7 +206,8 @@ impl Renderer {
         if self.physical_size.width == 0 || self.physical_size.height == 0 {
             return Ok(());
         }
-        self.upload_frame_images(frame);
+        let prepared = self.prepare_frame(frame);
+        self.upload_frame_images(&prepared);
 
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
@@ -216,7 +230,7 @@ impl Renderer {
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        if let Some(transition) = &frame.transition {
+        if let Some(transition) = &prepared.transition {
             let old_target = self.create_offscreen_target("krkr-ruri transition frozen target");
             let new_target = self.create_offscreen_target("krkr-ruri transition live target");
             self.render_commands_to_view(
@@ -233,7 +247,7 @@ impl Renderer {
                 "krkr-ruri transition live pass",
                 frame.clear_color,
                 frame.clip,
-                &frame.draw_commands,
+                &prepared.draw_commands,
             );
             self.render_crossfade_to_view(
                 &mut encoder,
@@ -250,13 +264,84 @@ impl Renderer {
                 "krkr-ruri render pass",
                 frame.clear_color,
                 frame.clip,
-                &frame.draw_commands,
+                &prepared.draw_commands,
             );
         }
 
         self.queue.submit(Some(encoder.finish()));
         surface_texture.present();
         Ok(())
+    }
+
+    fn prepare_frame(&mut self, frame: &FrameOutput) -> FrameOutput {
+        for texture_id in std::mem::take(&mut self.frame_text_textures) {
+            self.textures.remove(&texture_id);
+        }
+
+        let (draw_commands, mut image_uploads) = self.prepare_commands(&frame.draw_commands);
+        image_uploads.extend(frame.image_uploads.iter().cloned());
+        let transition = frame.transition.as_ref().map(|transition| {
+            let (frozen_draw_commands, mut frozen_image_uploads) =
+                self.prepare_commands(&transition.frozen_draw_commands);
+            frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
+            FrameTransition {
+                method: transition.method.clone(),
+                progress: transition.progress,
+                frozen_draw_commands,
+                frozen_image_uploads,
+            }
+        });
+
+        FrameOutput {
+            clear_color: frame.clear_color,
+            clip: frame.clip,
+            draw_commands,
+            image_uploads,
+            transition,
+        }
+    }
+
+    fn prepare_commands(
+        &mut self,
+        commands: &[DrawCommand],
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        let mut prepared = Vec::with_capacity(commands.len());
+        let mut uploads = Vec::new();
+        for command in commands {
+            match command {
+                DrawCommand::Text(text) => {
+                    let image = self
+                        .text_font_system
+                        .rasterize_text(&text.font, text.style, &text.text);
+                    if image.width == 0 || image.height == 0 {
+                        continue;
+                    }
+                    let texture_id = self.next_text_texture_id;
+                    self.next_text_texture_id = self.next_text_texture_id.saturating_add(1);
+                    self.frame_text_textures.insert(texture_id);
+                    uploads.push(ImageUpload::new(
+                        texture_id,
+                        image.width,
+                        image.height,
+                        Arc::from(image.rgba),
+                    ));
+                    prepared.push(DrawCommand::Image(ImageCommand {
+                        texture_id,
+                        rect: Rect::new(
+                            text.position.x,
+                            text.position.y,
+                            image.width as f32,
+                            image.height as f32,
+                        ),
+                        source_rect: Rect::new(0.0, 0.0, image.width as f32, image.height as f32),
+                        texture_size: Size::new(image.width as f32, image.height as f32),
+                        opacity: text.color.a,
+                    }));
+                }
+                _ => prepared.push(command.clone()),
+            }
+        }
+        (prepared, uploads)
     }
 
     fn upload_frame_images(&mut self, frame: &FrameOutput) {
@@ -469,7 +554,7 @@ impl Renderer {
                 DrawCommand::Rect(rect) => {
                     vertices.extend_from_slice(&self.rect_vertices(rect.rect, rect.color));
                 }
-                DrawCommand::Text(text) => self.push_text_vertices(&mut vertices, text),
+                DrawCommand::Text(_) => {}
                 DrawCommand::Image(image) => {
                     self.flush_rect_vertices(pass, &mut vertices);
                     self.draw_image(pass, image);
@@ -572,45 +657,6 @@ impl Renderer {
         ]
     }
 
-    fn push_text_vertices(&self, vertices: &mut Vec<Vertex>, command: &TextCommand) {
-        let pixel = (command.size / 7.0).max(1.0);
-        let advance = pixel * 6.0;
-        let line_advance = pixel * 9.0;
-        let mut origin = command.position;
-
-        for ch in command.text.chars() {
-            match ch {
-                '\n' => {
-                    origin.x = command.position.x;
-                    origin.y += line_advance;
-                }
-                ' ' => {
-                    origin.x += advance;
-                }
-                _ => {
-                    if let Some(pattern) = glyph_pattern(ch) {
-                        for (row, bits) in pattern.iter().enumerate() {
-                            for col in 0..5 {
-                                if bits & (1 << (4 - col)) != 0 {
-                                    let rect = Rect::new(
-                                        origin.x + col as f32 * pixel,
-                                        origin.y + row as f32 * pixel,
-                                        pixel,
-                                        pixel,
-                                    );
-                                    vertices.extend_from_slice(
-                                        &self.rect_vertices(rect, command.color),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    origin.x += advance;
-                }
-            }
-        }
-    }
-
     fn rect_vertices(&self, rect: Rect, color: Color) -> [Vertex; 6] {
         let scale = self.scale_factor as f32;
         let x0 = rect.x * scale;
@@ -659,139 +705,6 @@ impl Renderer {
             height: (y1 - y0) as u32,
         })
     }
-}
-
-fn glyph_pattern(ch: char) -> Option<[u8; 7]> {
-    let upper = ch.to_ascii_uppercase();
-    Some(match upper {
-        'A' => [
-            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'B' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
-        ],
-        'C' => [
-            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
-        ],
-        'D' => [
-            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
-        ],
-        'E' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
-        ],
-        'F' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'G' => [
-            0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111,
-        ],
-        'H' => [
-            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'I' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
-        ],
-        'J' => [
-            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
-        ],
-        'K' => [
-            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
-        ],
-        'L' => [
-            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
-        ],
-        'M' => [
-            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
-        ],
-        'N' => [
-            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
-        ],
-        'O' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'P' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'Q' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
-        ],
-        'R' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ],
-        'S' => [
-            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        'T' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'U' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'V' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
-        ],
-        'W' => [
-            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
-        ],
-        'X' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
-        ],
-        'Y' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'Z' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
-        ],
-        '0' => [
-            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
-        ],
-        '1' => [
-            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        '2' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
-        ],
-        '3' => [
-            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        '4' => [
-            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
-        ],
-        '5' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
-        ],
-        '6' => [
-            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
-        ],
-        '7' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
-        ],
-        '8' => [
-            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
-        ],
-        '9' => [
-            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
-        ],
-        '.' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
-        ],
-        ',' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b00100, 0b01000,
-        ],
-        '!' => [
-            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
-        ],
-        '?' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
-        ],
-        '-' => [
-            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
-        ],
-        ':' => [
-            0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000,
-        ],
-        _ => return None,
-    })
 }
 
 #[cfg(target_os = "macos")]

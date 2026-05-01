@@ -8,6 +8,7 @@ license.workspace = true
 encoding_rs.workspace = true
 image.workspace = true
 krkr-core.workspace = true
+krkr-font.workspace = true
 krkr-kag.workspace = true
 krkr-tjs2.workspace = true
 krkr-xp3.workspace = true

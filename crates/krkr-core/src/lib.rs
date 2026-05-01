@@ -4,6 +4,8 @@ use std::{
     sync::Arc,
 };
 
+pub use krkr_font::{FontSpec, TextStyle};
+
 pub trait ResourceStream: Read + Seek + Send {}
 
 impl<T> ResourceStream for T where T: Read + Seek + Send {}
@@ -112,6 +114,8 @@ pub struct TextCommand {
     pub text: String,
     pub color: Color,
     pub size: f32,
+    pub font: FontSpec,
+    pub style: TextStyle,
 }
 
 pub type TextureId = u64;
@@ -571,6 +575,10 @@ pub struct MessageLayerModel {
     pub lines: Vec<String>,
     pub waiting_for_click: bool,
     pub page: usize,
+    pub font: FontSpec,
+    pub style: TextStyle,
+    pub cursor_x: i32,
+    pub cursor_y: i32,
 }
 
 impl MessageLayerModel {
@@ -578,6 +586,10 @@ impl MessageLayerModel {
         self.lines.clear();
         self.waiting_for_click = false;
         self.page = 0;
+        self.font = FontSpec::default();
+        self.style = TextStyle::default();
+        self.cursor_x = 0;
+        self.cursor_y = 0;
     }
 
     pub fn clear_text(&mut self) {
@@ -1246,6 +1258,7 @@ impl Engine {
                 line,
                 palette::TEXT,
                 18.0,
+                Some((&message.font, &message.style)),
             );
             text_y += 21.0;
         }
@@ -1304,6 +1317,7 @@ impl Engine {
                 line,
                 palette::TEXT,
                 18.0,
+                Some((&message.font, &message.style)),
             );
             text_y += 23.0;
         }
@@ -1343,15 +1357,47 @@ fn rect(commands: &mut Vec<DrawCommand>, rect: Rect, color: Color) {
     }
 }
 
-fn text(commands: &mut Vec<DrawCommand>, position: Point, text: &str, color: Color, size: f32) {
+fn text(
+    commands: &mut Vec<DrawCommand>,
+    position: Point,
+    text: &str,
+    color: Color,
+    size: f32,
+    font_style: Option<(&FontSpec, &TextStyle)>,
+) {
     if !text.is_empty() && size > 0.0 {
+        let (font, style) = match font_style {
+            Some((font, style)) => (font.clone(), *style),
+            None => {
+                let font = FontSpec {
+                    height: size,
+                    ..FontSpec::default()
+                };
+                let style = TextStyle {
+                    color: color_to_u8(color),
+                    ..TextStyle::default()
+                };
+                (font, style)
+            }
+        };
         commands.push(DrawCommand::Text(TextCommand {
             position,
             text: text.to_string(),
             color,
             size,
+            font,
+            style,
         }));
     }
+}
+
+fn color_to_u8(color: Color) -> [u8; 4] {
+    [
+        (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
 }
 
 fn fit_rect(bounds: Rect, aspect_ratio: f32) -> Rect {
