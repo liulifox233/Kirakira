@@ -467,6 +467,35 @@ mod tests {
     }
 
     #[test]
+    fn native_class_object_method_call_uses_current_instance_this() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "native_class_object_call.tjs",
+            r#"
+            class KAGBuffer extends NativeBase {
+                var sbclass;
+                function KAGBuffer() {
+                    super.NativeBase();
+                    sbclass = global.NativeBase;
+                }
+                function callStoredBaseMethod() {
+                    return sbclass.nativeValue();
+                }
+            }
+            var buffer = new KAGBuffer();
+            return buffer.callStoredBaseMethod();
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::Integer(7)
+        );
+    }
+
+    #[test]
     fn new_native_constructor_does_not_reuse_caller_this() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);

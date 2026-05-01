@@ -531,7 +531,13 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let continuation = Continuation::CallerRegister {
                     dest: (inst.operands[0] != 0).then_some(inst.operands[0]),
                 };
-                match self.call_member_direct_cont(object_value, &name, args, continuation)? {
+                match self.call_member_direct_cont(
+                    object_value,
+                    &name,
+                    args,
+                    frame.this_obj,
+                    continuation,
+                )? {
                     CallOutcome::Immediate(value, Continuation::CallerRegister { dest }) => {
                         if let Some(dest) = dest {
                             frame.set(dest, value)?;
@@ -557,7 +563,13 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let continuation = Continuation::CallerRegister {
                     dest: (inst.operands[0] != 0).then_some(inst.operands[0]),
                 };
-                match self.call_member_direct_cont(object_value, &name, args, continuation)? {
+                match self.call_member_direct_cont(
+                    object_value,
+                    &name,
+                    args,
+                    frame.this_obj,
+                    continuation,
+                )? {
                     CallOutcome::Immediate(value, Continuation::CallerRegister { dest }) => {
                         if let Some(dest) = dest {
                             frame.set(dest, value)?;
