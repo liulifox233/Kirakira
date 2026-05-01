@@ -16,6 +16,61 @@ pub trait ResourceProvider: Send + Sync {
     fn exists(&self, path: &str) -> bool;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct AudioInstanceId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioBus {
+    Master,
+    Bgm,
+    SoundEffect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioSourceKind {
+    Static,
+    Streaming,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioCommand {
+    Play {
+        id: AudioInstanceId,
+        bus: AudioBus,
+        kind: AudioSourceKind,
+        storage: String,
+        bytes: Vec<u8>,
+        looping: bool,
+        volume: f32,
+    },
+    Stop {
+        id: AudioInstanceId,
+        fade_seconds: f32,
+    },
+    SetVolume {
+        id: AudioInstanceId,
+        volume: f32,
+        fade_seconds: f32,
+    },
+    Pause {
+        id: AudioInstanceId,
+        fade_seconds: f32,
+    },
+    Resume {
+        id: AudioInstanceId,
+        fade_seconds: f32,
+    },
+    StopBus {
+        bus: AudioBus,
+        fade_seconds: f32,
+    },
+    SetBusVolume {
+        bus: AudioBus,
+        volume: f32,
+        fade_seconds: f32,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Size {
     pub width: f32,

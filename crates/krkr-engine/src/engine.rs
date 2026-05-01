@@ -5,8 +5,9 @@ use std::{
 };
 
 use krkr_core::{
-    ButtonState, Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey,
-    FrameInput, FrameOutput, LayerId, MessageLayerModel, Point, PointerButton, Size,
+    AudioBus, AudioCommand, AudioSourceKind, ButtonState, Engine as CoreEngine,
+    EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput, FrameOutput, LayerId,
+    MessageLayerModel, Point, PointerButton, Size,
 };
 use krkr_kag::{Attribute, AttributeValue, KagParser, Tag};
 use krkr_tjs2::{
@@ -1095,6 +1096,48 @@ impl KagRuntimeTask {
                     Ok(TagAction::Continue)
                 }
             }
+            "playbgm" => {
+                play_kag_audio_tag(
+                    runtime,
+                    tag,
+                    AudioBus::Bgm,
+                    AudioSourceKind::Streaming,
+                    true,
+                )?;
+                Ok(TagAction::Continue)
+            }
+            "playse" | "playvoice" => {
+                play_kag_audio_tag(
+                    runtime,
+                    tag,
+                    AudioBus::SoundEffect,
+                    AudioSourceKind::Static,
+                    false,
+                )?;
+                Ok(TagAction::Continue)
+            }
+            "stopbgm" => {
+                runtime
+                    .host_mut()
+                    .queue_audio_command(AudioCommand::StopBus {
+                        bus: AudioBus::Bgm,
+                        fade_seconds: tag_millis(tag, "time")
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs_f32(),
+                    });
+                Ok(TagAction::Continue)
+            }
+            "stopse" | "stopvoice" => {
+                runtime
+                    .host_mut()
+                    .queue_audio_command(AudioCommand::StopBus {
+                        bus: AudioBus::SoundEffect,
+                        fade_seconds: tag_millis(tag, "time")
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs_f32(),
+                    });
+                Ok(TagAction::Continue)
+            }
             "wq" | "wf" | "wb" | "wm" => Ok(self.wait(KagTaskState::WaitingAudio)),
             "waitload" | "waittrig" => Ok(self.wait(KagTaskState::WaitingResource)),
             "s" => {
@@ -1205,6 +1248,29 @@ fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
     tag.attr(name)
         .and_then(|value| value.raw().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn play_kag_audio_tag(
+    runtime: &mut Runtime<KrkrHost>,
+    tag: &Tag,
+    bus: AudioBus,
+    kind: AudioSourceKind,
+    default_looping: bool,
+) -> Result<()> {
+    let storage = tag
+        .literal_attr("storage")
+        .or_else(|| tag.literal_attr("file"))
+        .or_else(|| tag.literal_attr("src"))
+        .ok_or_else(|| TjsError::runtime(format!("{} requires storage", tag.tagname)))?;
+    let looping = kag_bool_attr(tag, "loop").unwrap_or(default_looping)
+        || kag_bool_attr(tag, "looping").unwrap_or(false);
+    let volume = tag_i64(tag, "volume")?
+        .map(|value| (value as f32 / 100.0).clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    runtime
+        .host_mut()
+        .queue_kag_audio_play(storage, bus, kind, looping, volume)?;
+    Ok(())
 }
 
 fn apply_message_font_tag(message_layer: &mut MessageLayerModel, tag: &Tag) -> Result<()> {
@@ -4057,6 +4123,276 @@ mod tests {
                 "#,
             )
             .expect("script");
+    }
+
+    #[test]
+    fn wave_sound_buffer_queues_audio_commands() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("sound.wav"), b"not real audio").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.open("sound.wav");
+                buffer.looping = 1;
+                buffer.play();
+                buffer.fade(50000, 250);
+                buffer.stop();
+                "#,
+            )
+            .expect("script");
+
+        let commands = engine.host_mut().take_audio_commands();
+        assert_eq!(commands.len(), 3);
+        match &commands[0] {
+            AudioCommand::Play {
+                bus,
+                kind,
+                storage,
+                bytes,
+                looping,
+                volume,
+                ..
+            } => {
+                assert_eq!(*bus, AudioBus::Bgm);
+                assert_eq!(*kind, AudioSourceKind::Static);
+                assert_eq!(storage, "sound.wav");
+                assert_eq!(bytes, b"not real audio");
+                assert!(*looping);
+                assert_eq!(*volume, 1.0);
+            }
+            command => panic!("expected play command, got {command:?}"),
+        }
+        assert!(matches!(
+            commands[1],
+            AudioCommand::SetVolume {
+                volume: 0.5,
+                fade_seconds: 0.25,
+                ..
+            }
+        ));
+        assert!(matches!(commands[2], AudioCommand::Stop { .. }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_script_subclass_play_overrides_native_base_method() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("voice.ogg"), b"voice bytes").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class SESoundBuffer extends WaveSoundBuffer
+                {
+                    function SESoundBuffer()
+                    {
+                        super.WaveSoundBuffer();
+                    }
+
+                    function play(elm)
+                    {
+                        super.open(elm.storage);
+                        super.volume = 60000;
+                        super.play();
+                    }
+                }
+
+                var buffer = new SESoundBuffer();
+                buffer.play(%[ storage: "voice.ogg" ]);
+                buffer.fade(30000, 250);
+                "#,
+            )
+            .expect("script");
+
+        let commands = engine.host_mut().take_audio_commands();
+        assert_eq!(commands.len(), 2);
+        match &commands[0] {
+            AudioCommand::Play {
+                bus,
+                storage,
+                bytes,
+                looping,
+                volume,
+                ..
+            } => {
+                assert_eq!(*bus, AudioBus::SoundEffect);
+                assert_eq!(storage, "voice.ogg");
+                assert_eq!(bytes, b"voice bytes");
+                assert!(!*looping);
+                assert_eq!(*volume, 0.6);
+            }
+            command => panic!("expected play command, got {command:?}"),
+        }
+        assert!(matches!(
+            commands[1],
+            AudioCommand::SetVolume {
+                volume: 0.3,
+                fade_seconds: 0.25,
+                ..
+            }
+        ));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn se_sound_buffer_play_uses_script_volume_scale() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("voice.ogg"), b"voice bytes").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class SESoundBuffer extends WaveSoundBuffer
+                {
+                    var currentVolume = 100;
+
+                    function SESoundBuffer()
+                    {
+                        super.WaveSoundBuffer();
+                    }
+
+                    function play(elm)
+                    {
+                        super.open(elm.storage);
+                        super.volume = currentVolume * 1000;
+                        super.play();
+                    }
+
+                    property volume
+                    {
+                        setter(x)
+                        {
+                            currentVolume = x;
+                            super.volume = x * 1000;
+                        }
+                        getter
+                        {
+                            return super.volume \ 1000;
+                        }
+                    }
+                }
+
+                var buffer = new SESoundBuffer();
+                buffer.volume = 100;
+                buffer.play(%[ storage: "voice.ogg" ]);
+                "#,
+            )
+            .expect("script");
+
+        let commands = engine.host_mut().take_audio_commands();
+        match &commands[..] {
+            [
+                AudioCommand::Play {
+                    storage, volume, ..
+                },
+            ] => {
+                assert_eq!(storage, "voice.ogg");
+                assert_eq!(*volume, 1.0);
+            }
+            commands => panic!("expected one play command, got {commands:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_play_appends_audio_extension_for_dotted_storage_names() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("sound")).expect("create sound dir");
+        fs::write(
+            root.join("sound/09.clock_like_name.ogg"),
+            b"dotted audio bytes",
+        )
+        .expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                Storages.addAutoPath("sound/");
+                var buffer = new WaveSoundBuffer();
+                buffer.open("09.clock_like_name");
+                buffer.play();
+                "#,
+            )
+            .expect("script");
+
+        let commands = engine.host_mut().take_audio_commands();
+        match &commands[..] {
+            [AudioCommand::Play { storage, bytes, .. }] => {
+                assert_eq!(storage, "09.clock_like_name");
+                assert_eq!(bytes, b"dotted audio bytes");
+            }
+            commands => panic!("expected one play command, got {commands:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_audio_tags_queue_audio_commands() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("music.ogg"), b"bgm bytes").expect("write bgm");
+        fs::write(root.join("click.wav"), b"se bytes").expect("write se");
+        fs::write(
+            root.join("scenario.ks"),
+            "[playbgm storage=\"music.ogg\" volume=80]\n[playse storage=\"click.wav\"]\n[stopbgm time=250]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("scenario.ks").expect("scenario");
+        engine
+            .tick()
+            .expect("tick should process audio tags without backend");
+
+        let commands = engine.host_mut().take_audio_commands();
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(
+            &commands[0],
+            AudioCommand::Play {
+                bus: AudioBus::Bgm,
+                kind: AudioSourceKind::Streaming,
+                storage,
+                looping: true,
+                volume,
+                ..
+            } if storage == "music.ogg" && (*volume - 0.8).abs() < f32::EPSILON
+        ));
+        assert!(matches!(
+            &commands[1],
+            AudioCommand::Play {
+                bus: AudioBus::SoundEffect,
+                kind: AudioSourceKind::Static,
+                storage,
+                looping: false,
+                ..
+            } if storage == "click.wav"
+        ));
+        assert!(matches!(
+            commands[2],
+            AudioCommand::StopBus {
+                bus: AudioBus::Bgm,
+                fade_seconds: 0.25,
+            }
+        ));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

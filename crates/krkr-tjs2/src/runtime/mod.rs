@@ -253,6 +253,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.heap[object.0].get(name)
     }
 
+    pub fn has_object_member(&self, object: ObjectHandle, name: &str) -> bool {
+        self.heap[object.0].get_raw(name).is_some()
+    }
+
     pub fn object_valid(&self, object: ObjectHandle) -> bool {
         self.heap.get(object.0).is_some_and(|object| object.valid)
     }
@@ -292,6 +296,14 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     pub fn object_class_infos(&self, object: ObjectHandle) -> &[String] {
         &self.heap[object.0].class_infos
+    }
+
+    pub fn object_super_class(&self, object: ObjectHandle) -> Option<ObjectHandle> {
+        self.heap[object.0].super_class
+    }
+
+    pub fn set_object_super_class(&mut self, object: ObjectHandle, super_class: ObjectHandle) {
+        self.heap[object.0].super_class = Some(super_class);
     }
 
     pub fn execute_bytecode(&mut self, bytes: &[u8]) -> Result<Variant> {
