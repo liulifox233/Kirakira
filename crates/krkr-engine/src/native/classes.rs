@@ -20,6 +20,8 @@ pub(crate) fn install_native_class(
         },
     );
     runtime.add_object_class_info(handle, spec.name);
+    install_methods(runtime, handle, spec.name, spec.methods);
+    install_special_methods(runtime, handle, spec.name);
     install_methods(runtime, handle, spec.name, spec.static_methods);
     install_properties(runtime, handle, spec.static_properties);
     if global {
@@ -34,9 +36,10 @@ fn construct_native_instance(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let handle = this_obj
-        .filter(|handle| *handle != runtime.global_handle())
-        .unwrap_or_else(|| runtime.alloc_ordinary_object());
+    let existing_this = this_obj
+        .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+        .filter(|handle| *handle != runtime.global_handle());
+    let handle = existing_this.unwrap_or_else(|| runtime.alloc_ordinary_object());
     runtime.add_object_class_info(handle, spec.name);
     runtime.set_object_member(
         handle,
@@ -57,17 +60,11 @@ fn install_methods(
     methods: &'static [&'static str],
 ) {
     for method in methods {
-        if is_event_callback(method)
-            && !matches!(runtime.object_member(handle, method), Variant::Void)
-        {
+        if !matches!(runtime.object_member(handle, method), Variant::Void) {
             continue;
         }
         register_stub_method(runtime, handle, class_name, method);
     }
-}
-
-fn is_event_callback(method: &str) -> bool {
-    method.starts_with("on")
 }
 
 fn install_properties(
@@ -162,17 +159,30 @@ fn apply_constructor_defaults(
         "Layer" => {
             let window = args.first().cloned().unwrap_or_default();
             let parent = args.get(1).cloned().unwrap_or_default();
-            let parent_layer = match parent {
-                Variant::Object(parent) => runtime.host().native_layer(parent),
-                _ => None,
+            let window_object =
+                variant_object(&window).map(|window| runtime.bound_this(window).unwrap_or(window));
+            let parent_object =
+                variant_object(&parent).map(|parent| runtime.bound_this(parent).unwrap_or(parent));
+            let parent_layer = match parent_object {
+                Some(parent) => runtime.host().native_layer(parent),
+                None => None,
             };
+            let is_primary =
+                window_object.is_some() && matches!(parent, Variant::Void | Variant::Null);
+            let stored_window = window_object
+                .map(Variant::Object)
+                .unwrap_or_else(|| window.clone());
+            let stored_parent = parent_object
+                .map(Variant::Object)
+                .unwrap_or_else(|| parent.clone());
             let layer_id = runtime.host_mut().register_native_layer(
                 handle,
                 format!("native:{}", handle.0),
                 parent_layer,
+                is_primary,
             );
-            runtime.set_object_member(handle, "window", window.clone());
-            runtime.set_object_member(handle, "parent", parent.clone());
+            runtime.set_object_member(handle, "window", stored_window.clone());
+            runtime.set_object_member(handle, "parent", stored_parent.clone());
             runtime.set_object_member(handle, "__nativeLayerId", Variant::Integer(layer_id as i64));
             let children = runtime.alloc_array_object(Vec::new());
             runtime.set_object_member(handle, "children", Variant::Object(children));
@@ -184,16 +194,36 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "imageTop", Variant::Integer(0));
             runtime.set_object_member(handle, "imageWidth", Variant::Integer(0));
             runtime.set_object_member(handle, "imageHeight", Variant::Integer(0));
-            runtime.set_object_member(handle, "visible", Variant::Integer(0));
+            runtime.set_object_member(handle, "order", Variant::Integer(0));
+            runtime.set_object_member(handle, "absoluteOrderMode", Variant::Integer(0));
+            runtime.set_object_member(handle, "visible", Variant::Integer(i64::from(is_primary)));
             runtime.set_object_member(handle, "enabled", Variant::Integer(1));
             runtime.set_object_member(handle, "nodeEnabled", Variant::Integer(1));
+            runtime.set_object_member(handle, "nodeVisible", Variant::Integer(1));
             runtime.set_object_member(handle, "opacity", Variant::Integer(255));
+            runtime.set_object_member(
+                handle,
+                "type",
+                Variant::Integer(if is_primary { 1 } else { 2 }),
+            );
+            runtime.set_object_member(handle, "face", Variant::Integer(128));
+            runtime.set_object_member(handle, "hitType", Variant::Integer(0));
+            runtime.set_object_member(
+                handle,
+                "hitThreshold",
+                Variant::Integer(if is_primary { 0 } else { 16 }),
+            );
+            runtime.set_object_member(handle, "isPrimary", Variant::Integer(i64::from(is_primary)));
             runtime.set_object_member(handle, "cursor", Variant::Integer(0));
             runtime.set_object_member(handle, "hint", Variant::String(String::new()));
             runtime.set_object_member(handle, "showParentHint", Variant::Integer(1));
             let font = construct_native_instance(runtime, &FONT_CLASS, None, Vec::new())?;
             runtime.set_object_member(handle, "font", font);
-            if let Variant::Object(parent) = parent {
+            if is_primary && let Some(window) = window_object {
+                runtime.set_object_member(window, "primaryLayer", Variant::Object(handle));
+                runtime.set_object_member(window, "focusedLayer", Variant::Object(handle));
+            }
+            if let Some(parent) = parent_object {
                 let children = ensure_child_array(runtime, parent);
                 runtime.array_push(children, Variant::Object(handle));
             }
@@ -403,17 +433,49 @@ fn set_window_size_members(
 }
 
 fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    runtime.register_object_native(handle, "loadImages", layer_load_images);
-    runtime.register_object_native(handle, "setPos", layer_set_pos);
-    runtime.register_object_native(handle, "setSize", layer_set_size);
-    runtime.register_object_native(handle, "setImagePos", layer_set_image_pos);
-    runtime.register_object_native(handle, "setImageSize", layer_set_image_size);
-    runtime.register_object_native(handle, "setSizeToImageSize", layer_set_size_to_image_size);
-    runtime.register_object_native(handle, "bringToFront", layer_bring_to_front);
-    runtime.register_object_native(handle, "bringToBack", layer_bring_to_back);
-    runtime.register_object_native(handle, "assignImages", layer_assign_images);
-    runtime.register_object_native(handle, "beginTransition", layer_begin_transition);
-    runtime.register_object_native(handle, "update", layer_noop);
+    register_native_method_preserving_script(runtime, handle, "loadImages", layer_load_images);
+    register_native_method_preserving_script(runtime, handle, "setPos", layer_set_pos);
+    register_native_method_preserving_script(runtime, handle, "setSize", layer_set_size);
+    register_native_method_preserving_script(runtime, handle, "setImagePos", layer_set_image_pos);
+    register_native_method_preserving_script(runtime, handle, "setImageSize", layer_set_image_size);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "setSizeToImageSize",
+        layer_set_size_to_image_size,
+    );
+    register_native_method_preserving_script(runtime, handle, "bringToFront", layer_bring_to_front);
+    register_native_method_preserving_script(runtime, handle, "bringToBack", layer_bring_to_back);
+    register_native_method_preserving_script(runtime, handle, "assignImages", layer_assign_images);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "beginTransition",
+        layer_begin_transition,
+    );
+    register_native_method_preserving_script(runtime, handle, "fillRect", layer_fill_rect);
+    register_native_method_preserving_script(runtime, handle, "colorRect", layer_color_rect);
+    register_native_method_preserving_script(runtime, handle, "copyRect", layer_copy_rect);
+    register_native_method_preserving_script(runtime, handle, "operateRect", layer_operate_rect);
+    register_native_method_preserving_script(runtime, handle, "piledCopy", layer_copy_rect);
+    register_native_method_preserving_script(runtime, handle, "drawText", layer_draw_text);
+    register_native_method_preserving_script(runtime, handle, "getProvincePixel", layer_zero);
+    register_native_method_preserving_script(runtime, handle, "update", layer_update);
+}
+
+type NativeMethod =
+    fn(&mut Runtime<KrkrHost>, Option<ObjectHandle>, Vec<Variant>) -> Result<Variant>;
+
+fn register_native_method_preserving_script(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &'static str,
+    function: NativeMethod,
+) {
+    if matches!(runtime.object_member(handle, name), Variant::Closure(_)) {
+        return;
+    }
+    runtime.register_object_native(handle, name, function);
 }
 
 fn install_async_trigger_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -668,9 +730,21 @@ fn layer_set_image_size(
     let (this, layer_id) = this_layer_id(runtime, this_obj)?;
     let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
     let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
+    let image = (width > 0 && height > 0).then(|| {
+        runtime.host_mut().create_layer_image(
+            width as u32,
+            height as u32,
+            vec![0; width as usize * height as usize * 4],
+        )
+    });
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
         layer.image_width = width as f32;
         layer.image_height = height as f32;
+        if let Some(image) = image {
+            layer.image = Some(image);
+        } else {
+            layer.image = None;
+        }
     }
     runtime.set_object_member(this, "imageWidth", Variant::Integer(width));
     runtime.set_object_member(this, "imageHeight", Variant::Integer(height));
@@ -683,15 +757,42 @@ fn layer_set_size_to_image_size(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let (this, layer_id) = this_layer_id(runtime, this_obj)?;
-    let (width, height) = runtime
-        .host()
-        .layer_tree()
-        .layer(layer_id)
-        .map(|layer| (layer.image_width as i64, layer.image_height as i64))
-        .unwrap_or((0, 0));
+    let width = runtime
+        .object_member(this, "imageWidth")
+        .to_integer()?
+        .max(0);
+    let height = runtime
+        .object_member(this, "imageHeight")
+        .to_integer()?
+        .max(0);
+    let replacement_image = if width > 0 && height > 0 {
+        let needs_image = runtime
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .map(|image| image.upload.width != width as u32 || image.upload.height != height as u32)
+            .unwrap_or(true);
+        needs_image.then(|| {
+            runtime.host_mut().create_layer_image(
+                width as u32,
+                height as u32,
+                vec![0; width as usize * height as usize * 4],
+            )
+        })
+    } else {
+        None
+    };
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.image_width = width as f32;
+        layer.image_height = height as f32;
         layer.width = width as f32;
         layer.height = height as f32;
+        if width == 0 || height == 0 {
+            layer.image = None;
+        } else if let Some(image) = replacement_image {
+            layer.image = Some(image);
+        }
     }
     runtime.set_object_member(this, "width", Variant::Integer(width));
     runtime.set_object_member(this, "height", Variant::Integer(height));
@@ -735,6 +836,178 @@ fn layer_begin_transition(
     runtime.set_object_member(this, "visible", Variant::Integer(1));
     finish_immediate_transition(runtime, this);
     Ok(Variant::Void)
+}
+
+fn layer_fill_rect(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let Some((x, y, width, height)) = rect_args(&args)? else {
+        return Ok(Variant::Void);
+    };
+    let color = required_integer(&args, 4, "Layer.fillRect color")?;
+    let rgba = color_to_rgba(color, None);
+    mutate_layer_pixels(runtime, layer_id, |pixels, image_width, image_height| {
+        fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
+    })?;
+    Ok(Variant::Void)
+}
+
+fn layer_color_rect(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let Some((x, y, width, height)) = rect_args(&args)? else {
+        return Ok(Variant::Void);
+    };
+    let color = required_integer(&args, 4, "Layer.colorRect color")?;
+    let opacity = optional_integer(&args, 5)?;
+    let rgba = color_to_rgba(color, opacity);
+    mutate_layer_pixels(runtime, layer_id, |pixels, image_width, image_height| {
+        fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
+    })?;
+    Ok(Variant::Void)
+}
+
+fn layer_copy_rect(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    copy_rect_impl(runtime, this_obj, args, false)
+}
+
+fn layer_operate_rect(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    copy_rect_impl(runtime, this_obj, args, true)
+}
+
+fn copy_rect_impl(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+    alpha_blend: bool,
+) -> Result<Variant> {
+    let (this, dest_layer_id) = this_layer_id(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let dx = optional_integer(&args, 0)?.unwrap_or(0);
+    let dy = optional_integer(&args, 1)?.unwrap_or(0);
+    let Some(source_object) = args.get(2).and_then(variant_object) else {
+        return Ok(Variant::Void);
+    };
+    let sx = optional_integer(&args, 3)?.unwrap_or(0);
+    let sy = optional_integer(&args, 4)?.unwrap_or(0);
+    let width = optional_integer(&args, 5)?.unwrap_or(0);
+    let height = optional_integer(&args, 6)?.unwrap_or(0);
+    if width <= 0 || height <= 0 {
+        return Ok(Variant::Void);
+    }
+    let Some(source_layer_id) = native_layer_id(runtime, source_object)? else {
+        return Ok(Variant::Void);
+    };
+    let Some(source_image) = runtime
+        .host()
+        .layer_tree()
+        .layer(source_layer_id)
+        .and_then(|layer| layer.image.clone())
+    else {
+        return Ok(Variant::Void);
+    };
+    let source_pixels = source_image.upload.rgba.as_ref().to_vec();
+    let source_width = source_image.upload.width;
+    let source_height = source_image.upload.height;
+
+    mutate_layer_pixels(
+        runtime,
+        dest_layer_id,
+        |pixels, image_width, image_height| {
+            copy_pixels(
+                pixels,
+                image_width,
+                image_height,
+                &source_pixels,
+                source_width,
+                source_height,
+                dx,
+                dy,
+                sx,
+                sy,
+                width,
+                height,
+                alpha_blend,
+            );
+        },
+    )?;
+    Ok(Variant::Void)
+}
+
+fn layer_draw_text(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let x = optional_integer(&args, 0)?.unwrap_or(0);
+    let y = optional_integer(&args, 1)?.unwrap_or(0);
+    let text = args
+        .get(2)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    let color = optional_integer(&args, 3)?.unwrap_or(0x00ff_ffff);
+    let opacity = optional_integer(&args, 4)?;
+    let rgba = color_to_rgba(color, opacity);
+    mutate_layer_pixels(runtime, layer_id, |pixels, image_width, image_height| {
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            if ch != ' ' && ch != '\t' {
+                fill_pixels(pixels, image_width, image_height, cursor_x, y, 7, 12, rgba);
+            }
+            cursor_x += 8;
+        }
+    })?;
+    Ok(Variant::Void)
+}
+
+fn layer_update(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer.update requires this"))?;
+    if matches!(runtime.object_member(this, "onPaint"), Variant::Void) {
+        return Ok(Variant::Void);
+    }
+    runtime.call_object_method(this, "onPaint", Vec::new())?;
+    Ok(Variant::Void)
+}
+
+fn layer_zero(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Integer(0))
 }
 
 fn layer_bring_to_front(
@@ -859,19 +1132,178 @@ fn finish_immediate_transition(runtime: &mut Runtime<KrkrHost>, layer: ObjectHan
     );
 }
 
-fn layer_noop(
-    _runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
-) -> Result<Variant> {
-    Ok(Variant::Void)
-}
-
 fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
     args.get(index)
         .filter(|value| !matches!(value, Variant::Void))
         .map(Variant::to_integer)
         .transpose()
+}
+
+fn required_integer(args: &[Variant], index: usize, context: &str) -> Result<i64> {
+    optional_integer(args, index)?
+        .ok_or_else(|| TjsError::runtime(format!("{context} is required")))
+}
+
+fn rect_args(args: &[Variant]) -> Result<Option<(i64, i64, i64, i64)>> {
+    let x = optional_integer(args, 0)?.unwrap_or(0);
+    let y = optional_integer(args, 1)?.unwrap_or(0);
+    let width = optional_integer(args, 2)?.unwrap_or(0);
+    let height = optional_integer(args, 3)?.unwrap_or(0);
+    Ok((width > 0 && height > 0).then_some((x, y, width, height)))
+}
+
+fn is_province_face(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> bool {
+    runtime
+        .object_member(layer, "face")
+        .to_integer()
+        .is_ok_and(|face| face == 3)
+}
+
+fn color_to_rgba(color: i64, opacity: Option<i64>) -> [u8; 4] {
+    let color = color.max(0) as u32;
+    let r = ((color >> 16) & 0xff) as u8;
+    let g = ((color >> 8) & 0xff) as u8;
+    let b = (color & 0xff) as u8;
+    let a = match opacity {
+        Some(opacity) if opacity < 0 => 0,
+        Some(opacity) => opacity.clamp(0, 255) as u8,
+        None if color <= 0x00ff_ffff && color != 0 => 255,
+        None => ((color >> 24) & 0xff) as u8,
+    };
+    [r, g, b, a]
+}
+
+fn mutate_layer_pixels<F>(runtime: &mut Runtime<KrkrHost>, layer_id: u64, mutate: F) -> Result<()>
+where
+    F: FnOnce(&mut [u8], u32, u32),
+{
+    let Some(layer) = runtime.host().layer_tree().layer(layer_id).cloned() else {
+        return Ok(());
+    };
+    let width = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.width)
+        .unwrap_or_else(|| layer.image_width.max(layer.width).max(1.0) as u32)
+        .max(1);
+    let height = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.height)
+        .unwrap_or_else(|| layer.image_height.max(layer.height).max(1.0) as u32)
+        .max(1);
+    let mut pixels = layer
+        .image
+        .as_ref()
+        .filter(|image| image.upload.width == width && image.upload.height == height)
+        .map(|image| image.upload.rgba.as_ref().to_vec())
+        .unwrap_or_else(|| vec![0; width as usize * height as usize * 4]);
+
+    mutate(&mut pixels, width, height);
+
+    let image = runtime.host_mut().create_layer_image(width, height, pixels);
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        layer.image = Some(image);
+        layer.image_width = width as f32;
+        layer.image_height = height as f32;
+        if layer.width <= 0.0 {
+            layer.width = width as f32;
+        }
+        if layer.height <= 0.0 {
+            layer.height = height as f32;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_pixels(
+    pixels: &mut [u8],
+    image_width: u32,
+    image_height: u32,
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    rgba: [u8; 4],
+) {
+    let x0 = x.max(0) as u32;
+    let y0 = y.max(0) as u32;
+    let x1 = (x + width).clamp(0, image_width as i64) as u32;
+    let y1 = (y + height).clamp(0, image_height as i64) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let index = ((py * image_width + px) * 4) as usize;
+            pixels[index..index + 4].copy_from_slice(&rgba);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_pixels(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    dx: i64,
+    dy: i64,
+    sx: i64,
+    sy: i64,
+    width: i64,
+    height: i64,
+    alpha_blend: bool,
+) {
+    for row in 0..height {
+        let src_y = sy + row;
+        let dest_y = dy + row;
+        if src_y < 0 || dest_y < 0 || src_y >= source_height as i64 || dest_y >= dest_height as i64
+        {
+            continue;
+        }
+        for col in 0..width {
+            let src_x = sx + col;
+            let dest_x = dx + col;
+            if src_x < 0
+                || dest_x < 0
+                || src_x >= source_width as i64
+                || dest_x >= dest_width as i64
+            {
+                continue;
+            }
+            let src_index = ((src_y as u32 * source_width + src_x as u32) * 4) as usize;
+            let dest_index = ((dest_y as u32 * dest_width + dest_x as u32) * 4) as usize;
+            if alpha_blend {
+                blend_pixel(
+                    &mut dest[dest_index..dest_index + 4],
+                    &source[src_index..src_index + 4],
+                );
+            } else {
+                dest[dest_index..dest_index + 4].copy_from_slice(&source[src_index..src_index + 4]);
+            }
+        }
+    }
+}
+
+fn blend_pixel(dest: &mut [u8], src: &[u8]) {
+    let src_a = src[3] as f32 / 255.0;
+    let dest_a = dest[3] as f32 / 255.0;
+    let out_a = src_a + dest_a * (1.0 - src_a);
+    if out_a <= f32::EPSILON {
+        dest.copy_from_slice(&[0, 0, 0, 0]);
+        return;
+    }
+    for channel in 0..3 {
+        let src_c = src[channel] as f32 / 255.0;
+        let dest_c = dest[channel] as f32 / 255.0;
+        let out_c = (src_c * src_a + dest_c * dest_a * (1.0 - src_a)) / out_a;
+        dest[channel] = (out_c * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    dest[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 fn sync_layer_image_members(

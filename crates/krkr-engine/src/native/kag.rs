@@ -544,7 +544,17 @@ fn attributes_to_dictionary(
 }
 
 fn attribute_value_to_variant(value: &AttributeValue) -> Result<Variant> {
-    Ok(Variant::String(value.raw().to_string()))
+    Ok(raw_attribute_value_to_variant(value.raw()))
+}
+
+fn raw_attribute_value_to_variant(value: &str) -> Variant {
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
+        Variant::Integer(1)
+    } else if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") {
+        Variant::Integer(0)
+    } else {
+        Variant::String(value.to_string())
+    }
 }
 
 fn snapshot_from_object(

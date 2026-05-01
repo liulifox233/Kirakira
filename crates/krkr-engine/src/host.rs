@@ -314,13 +314,25 @@ impl KrkrHost {
         handle: ObjectHandle,
         name: impl Into<String>,
         parent: Option<LayerId>,
+        primary: bool,
     ) -> LayerId {
         if let Some(id) = self.native_layers.get(&handle) {
             return *id;
         }
 
-        let z_order = 20_000 + self.native_layers.len() as i32;
+        let z_order = if primary {
+            0
+        } else {
+            self.next_sibling_z_order(parent)
+        };
         let id = self.layer_tree.create_layer(name, parent, z_order);
+        if let Some(layer) = self.layer_tree.layer_mut(id)
+            && primary
+        {
+            layer.visible = true;
+            layer.opacity = 255;
+            layer.layer_type = 1;
+        }
         self.native_layers.insert(handle, id);
         id
     }
@@ -447,6 +459,17 @@ impl KrkrHost {
         Ok(image)
     }
 
+    pub(crate) fn create_layer_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> LayerImage {
+        let texture_id = self.next_texture_id;
+        self.next_texture_id = self.next_texture_id.saturating_add(1);
+        LayerImage::new(texture_id, width, height, Arc::<[u8]>::from(rgba))
+    }
+
     pub(crate) fn apply_immediate_transition(&mut self) {
         let back_layers = self
             .kag_layers
@@ -473,6 +496,16 @@ impl KrkrHost {
                 target.renderable = true;
             }
         }
+    }
+
+    fn next_sibling_z_order(&self, parent: Option<LayerId>) -> i32 {
+        self.layer_tree()
+            .layers()
+            .filter(|layer| layer.parent == parent)
+            .map(|layer| layer.z_order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 }
 

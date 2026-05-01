@@ -6,7 +6,7 @@ use std::{
 
 use krkr_core::{
     ButtonState, Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey,
-    FrameInput, FrameOutput, MessageLayerModel, Point, PointerButton, Size,
+    FrameInput, FrameOutput, LayerId, MessageLayerModel, Point, PointerButton, Size,
 };
 use krkr_kag::{Attribute, AttributeValue, KagParser, Tag};
 use krkr_tjs2::{
@@ -109,6 +109,7 @@ pub struct KrkrEngine {
     kag_budget: KagRunBudget,
     plugins: Vec<Box<dyn KrkrPlugin>>,
     cursor_position: Option<Point>,
+    hovered_layer: Option<LayerId>,
 }
 
 impl KrkrEngine {
@@ -128,6 +129,7 @@ impl KrkrEngine {
             kag_budget: config.kag_budget,
             plugins: Vec::new(),
             cursor_position: None,
+            hovered_layer: None,
         })
     }
 
@@ -385,6 +387,7 @@ impl KrkrEngine {
             match event {
                 EngineEvent::CursorMoved { position } => {
                     self.cursor_position = Some(*position);
+                    self.dispatch_layer_cursor_move(*position)?;
                 }
                 EngineEvent::PointerInput {
                     button: PointerButton::Primary,
@@ -419,17 +422,16 @@ impl KrkrEngine {
         let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
             return Ok(());
         };
-        let Some((layer_left, layer_top)) = self
+        let Some(origin) = self
             .tjs_runtime
             .host()
             .layer_tree()
-            .layer(layer_id)
-            .map(|layer| (layer.left, layer.top))
+            .absolute_position(layer_id)
         else {
             return Ok(());
         };
-        let x = (position.x - layer_left).round() as i64;
-        let y = (position.y - layer_top).round() as i64;
+        let x = (position.x - origin.x).round() as i64;
+        let y = (position.y - origin.y).round() as i64;
         self.tjs_runtime
             .call_object_method(
                 object,
@@ -444,9 +446,76 @@ impl KrkrEngine {
             .map(|_| ())
     }
 
+    fn dispatch_layer_cursor_move(&mut self, position: Point) -> Result<()> {
+        let hit_layer = self.tjs_runtime.host().layer_tree().hit_test(position);
+        if hit_layer != self.hovered_layer {
+            if let Some(layer_id) = self.hovered_layer {
+                self.call_layer_event(layer_id, "onMouseLeave", Vec::new())?;
+            }
+            self.hovered_layer = hit_layer;
+            if let Some(layer_id) = hit_layer {
+                self.call_layer_event(layer_id, "onMouseEnter", Vec::new())?;
+            }
+        }
+
+        if let Some(layer_id) = hit_layer
+            && let Some((x, y)) = self.layer_local_point(layer_id, position)
+        {
+            self.call_layer_event(
+                layer_id,
+                "onMouseMove",
+                vec![
+                    Variant::Integer(x),
+                    Variant::Integer(y),
+                    Variant::Integer(0),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn call_layer_event(
+        &mut self,
+        layer_id: LayerId,
+        method: &str,
+        args: Vec<Variant>,
+    ) -> Result<()> {
+        let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
+            return Ok(());
+        };
+        if matches!(
+            self.tjs_runtime.object_member(object, method),
+            Variant::Void
+        ) {
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(object, method, args)
+            .map(|_| ())
+    }
+
+    fn layer_local_point(&self, layer_id: LayerId, position: Point) -> Option<(i64, i64)> {
+        let origin = self
+            .tjs_runtime
+            .host()
+            .layer_tree()
+            .absolute_position(layer_id)?;
+        Some((
+            (position.x - origin.x).round() as i64,
+            (position.y - origin.y).round() as i64,
+        ))
+    }
+
     fn sync_native_layers_from_tjs(&mut self) -> Result<()> {
         let entries = self.tjs_runtime.host().native_layer_entries();
         for (handle, layer_id) in entries {
+            let parent = match self.tjs_runtime.object_member(handle, "parent") {
+                Variant::Object(parent) => {
+                    let parent = self.tjs_runtime.bound_this(parent).unwrap_or(parent);
+                    self.tjs_runtime.host().native_layer(parent)
+                }
+                _ => None,
+            };
             let left = object_i64(&self.tjs_runtime, handle, "left")?;
             let top = object_i64(&self.tjs_runtime, handle, "top")?;
             let width = object_i64(&self.tjs_runtime, handle, "width")?;
@@ -457,13 +526,16 @@ impl KrkrEngine {
             let image_height = object_i64(&self.tjs_runtime, handle, "imageHeight")?;
             let visible = object_i64(&self.tjs_runtime, handle, "visible")? != 0;
             let opacity = object_i64(&self.tjs_runtime, handle, "opacity")?.clamp(0, 255) as u8;
+            let enabled = object_i64(&self.tjs_runtime, handle, "enabled")? != 0;
+            let node_enabled = object_i64(&self.tjs_runtime, handle, "nodeEnabled")? != 0;
+            let layer_type = object_i64(&self.tjs_runtime, handle, "type")? as i32;
+            let face = object_i64(&self.tjs_runtime, handle, "face")? as i32;
+            let absolute = object_optional_i64(&self.tjs_runtime, handle, "absolute")?;
+            let order = object_optional_i64(&self.tjs_runtime, handle, "order")?;
 
-            if let Some(layer) = self
-                .tjs_runtime
-                .host_mut()
-                .layer_tree_mut()
-                .layer_mut(layer_id)
-            {
+            let layer_tree = self.tjs_runtime.host_mut().layer_tree_mut();
+            layer_tree.set_parent(layer_id, parent);
+            if let Some(layer) = layer_tree.layer_mut(layer_id) {
                 layer.left = left as f32;
                 layer.top = top as f32;
                 layer.width = width.max(0) as f32;
@@ -474,6 +546,13 @@ impl KrkrEngine {
                 layer.image_height = image_height.max(0) as f32;
                 layer.visible = visible;
                 layer.opacity = opacity;
+                layer.enabled = enabled;
+                layer.node_enabled = node_enabled;
+                layer.layer_type = layer_type;
+                layer.face = face;
+                if let Some(z_order) = absolute.or(order) {
+                    layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                }
             }
         }
         Ok(())
@@ -848,7 +927,17 @@ fn tag_variant(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<Variant> {
 }
 
 fn attribute_value_to_variant(value: &AttributeValue) -> Variant {
-    Variant::String(value.raw().to_string())
+    raw_attribute_value_to_variant(value.raw())
+}
+
+fn raw_attribute_value_to_variant(value: &str) -> Variant {
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
+        Variant::Integer(1)
+    } else if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") {
+        Variant::Integer(0)
+    } else {
+        Variant::String(value.to_string())
+    }
 }
 
 fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
@@ -859,6 +948,17 @@ fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
 
 fn object_i64(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Result<i64> {
     runtime.object_member(object, name).to_integer()
+}
+
+fn object_optional_i64(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Result<Option<i64>> {
+    match runtime.object_member(object, name) {
+        Variant::Void => Ok(None),
+        value => value.to_integer().map(Some),
+    }
 }
 
 fn object_positive_i64(
@@ -1251,6 +1351,28 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::Integer(1));
+    }
+
+    #[test]
+    fn nested_native_super_constructor_initializes_leaf_instance() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class BaseWindow extends Window {
+                    function BaseWindow() { super.Window(); }
+                }
+                class GameWindow extends BaseWindow {
+                    function GameWindow() { super.BaseWindow(); }
+                    function hasMenu() { return typeof menu != "undefined"; }
+                }
+                var window = new GameWindow();
+                return window.hasMenu() + ":" + (typeof window.menu != "undefined");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("1:1".to_string()));
     }
 
     #[test]
@@ -1748,6 +1870,74 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_load_images_keeps_native_this_through_nested_super_calls() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[255, 0, 0, 255]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.calls = "";
+                class KAGLayer extends Layer {
+                    function KAGLayer(win, par) { super.Layer(win, par); }
+                    function loadImages(storage) {
+                        global.calls += "K";
+                        return super.loadImages(storage);
+                    }
+                }
+                class AnimationLayer extends KAGLayer {
+                    function AnimationLayer(win, par) { super.KAGLayer(win, par); }
+                    function loadImages(elm) {
+                        global.calls += "A";
+                        return super.loadImages(elm.storage);
+                    }
+                }
+                class GraphicLayer extends AnimationLayer {
+                    function GraphicLayer(win, par) { super.AnimationLayer(win, par); }
+                    function loadImages(elm) {
+                        global.calls += "G";
+                        return super.loadImages(elm);
+                    }
+                }
+                class BaseLayer extends GraphicLayer {
+                    function BaseLayer(win, par) { super.GraphicLayer(win, par); }
+                    function loadImages(elm) {
+                        global.calls += "B";
+                        return super.loadImages(elm);
+                    }
+                }
+                var window = new Window();
+                var layer = new BaseLayer(window, null);
+                layer.visible = true;
+                layer.left = 11;
+                layer.loadImages(%[storage : "sprite.png"]);
+                return global.calls + ":" + layer.imageWidth + ":" + layer.imageHeight;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result, Variant::String("BGAK:1:1".to_string()));
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 11.0 && image.rect.width == 1.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn native_layer_load_images_preserves_existing_viewport_size() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -1769,6 +1959,46 @@ mod tests {
             .expect("script");
 
         assert_eq!(result, Variant::String("1280:720:2:3".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_set_size_to_image_size_uses_script_image_members() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.visible = true;
+                layer.imageWidth = 10;
+                layer.imageHeight = 12;
+                layer.setSizeToImageSize();
+                layer.fillRect(0, 0, 10, 12, 0xffffffff);
+                return layer.width + ":" + layer.height + ":" +
+                    layer.imageWidth + ":" + layer.imageHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("10:12:10:12".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.width == 10.0 && image.rect.height == 12.0
+            )
+        }));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -2069,7 +2299,7 @@ mod tests {
                 "#,
             )
             .expect("script");
-        assert_eq!(value, Variant::String("ch:A:r:true".to_string()));
+        assert_eq!(value, Variant::String("ch:A:r:1".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
