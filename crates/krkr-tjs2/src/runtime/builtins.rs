@@ -294,6 +294,7 @@ fn install_array_methods<H: TjsHost + 'static>(runtime: &mut Runtime<H>, handle:
     runtime.add_object_class_info(handle, "Array");
     runtime.register_object_native(handle, "add", array_push::<H>);
     runtime.register_object_native(handle, "push", array_push::<H>);
+    runtime.register_object_native(handle, "insert", array_insert::<H>);
     runtime.register_object_native(handle, "pop", array_pop::<H>);
     runtime.register_object_native(handle, "clear", array_clear::<H>);
     runtime.register_object_native(handle, "assign", array_assign::<H>);
@@ -334,6 +335,30 @@ fn array_push<H: TjsHost + 'static>(
             .map(|items| items.len() as i64)
             .unwrap_or(0),
     ))
+}
+
+fn array_insert<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.insert")?;
+    let Some(index) = args.first() else {
+        return Ok(Variant::Void);
+    };
+    let len = runtime.heap[handle.0]
+        .array_elements()
+        .map(|items| items.len())
+        .ok_or_else(|| TjsError::runtime("Array.insert called on a non-array object"))?;
+    let index = index.to_integer()?.clamp(0, len as i64) as usize;
+    for (offset, value) in args.into_iter().skip(1).enumerate() {
+        if !runtime.heap[handle.0].array_insert(index + offset, value) {
+            return Err(TjsError::runtime(
+                "Array.insert called on a non-array object",
+            ));
+        }
+    }
+    Ok(Variant::Void)
 }
 
 fn array_pop<H: TjsHost + 'static>(

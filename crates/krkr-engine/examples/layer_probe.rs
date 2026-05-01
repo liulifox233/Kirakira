@@ -1,6 +1,9 @@
 use std::{path::PathBuf, time::Duration};
 
-use krkr_core::{ButtonState, DrawCommand, EngineEvent, FrameInput, Point, PointerButton, Size};
+use krkr_core::{
+    ButtonState, DrawCommand, EngineEvent, FrameInput, ImageCommand, ImageUpload, Point,
+    PointerButton, Size,
+};
 use krkr_engine::{EngineInput, KrkrEngine};
 
 type AlphaBounds = (u32, u32, u32, u32);
@@ -18,10 +21,24 @@ fn main() {
     let delta = Duration::from_millis(1000 / 60);
     let click_through = std::env::var("KRKR_PROBE_CLICK_THROUGH").is_ok();
     let full_images = std::env::var("KRKR_PROBE_FULL").is_ok();
+    let frame_expression = std::env::var("KRKR_PROBE_FRAME_EXPR").ok();
+    let frame_expression_at = std::env::var("KRKR_PROBE_FRAME_EXPR_AT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
 
     let mut engine = KrkrEngine::for_project(&root).expect("engine");
     let startup = engine.execute_startup().expect("startup");
     println!("startup={startup}");
+    if std::env::var("KRKR_PROBE_IGNORE_UNKNOWN").is_ok() {
+        let value = engine
+            .execute_expression(
+                "probe_ignore_unknown.tjs",
+                "kag.onConductorUnknownTag = function(tagname, elm) { return 0; }",
+            )
+            .expect("ignore unknown");
+        println!("ignore_unknown={value}");
+    }
     if std::env::var("KRKR_PROBE_START").is_ok() {
         let start = engine
             .execute_expression(
@@ -31,6 +48,24 @@ fn main() {
             .expect("start");
         println!("start={start}");
     }
+    if let Ok(storage) = std::env::var("KRKR_PROBE_PROCESS") {
+        let label = std::env::var("KRKR_PROBE_LABEL").unwrap_or_default();
+        let expression = format!(
+            "kag.process({}, {}, true, true)",
+            tjs_string_literal(&storage),
+            tjs_string_literal(&label)
+        );
+        let value = engine
+            .execute_expression("probe_process.tjs", &expression)
+            .expect("process scenario");
+        println!("process={value} expr={expression}");
+    }
+    if let Ok(expression) = std::env::var("KRKR_PROBE_EXPR") {
+        let value = engine
+            .execute_expression("probe_expr.tjs", &expression)
+            .expect("probe expression");
+        println!("expr={value}");
+    }
     println!(
         "preferred_viewport={:?} has_kag_scenario={} state={:?}",
         engine.preferred_viewport_size(),
@@ -39,6 +74,14 @@ fn main() {
     );
 
     for frame_index in 0..frames {
+        if frame_expression_at == frame_index
+            && let Some(expression) = &frame_expression
+        {
+            let value = engine
+                .execute_expression("probe_frame_expr.tjs", expression)
+                .expect("probe frame expression");
+            println!("frame_expr@{frame_index}={value}");
+        }
         if click_through && frame_index == 750 {
             let value = engine
                 .execute_expression("probe_click_start.tjs", "kag.current.onButtonClick(0)")
@@ -59,7 +102,10 @@ fn main() {
                 delta,
             )
             .expect("update");
-        if frame_index % 30 == 0 || frame_index + 1 == frames {
+        if frame_index % 30 == 0
+            || (frame.output.transition.is_some() && frame_index % 15 == 0)
+            || frame_index + 1 == frames
+        {
             let images = frame
                 .output
                 .draw_commands
@@ -69,53 +115,46 @@ fn main() {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            let transition = frame.output.transition.as_ref().map(|transition| {
+                let frozen_images = transition
+                    .frozen_draw_commands
+                    .iter()
+                    .filter(|command| matches!(command, DrawCommand::Image(_)))
+                    .count();
+                format!(
+                    "{}:{:.3}:frozen_images={}",
+                    transition.method, transition.progress, frozen_images
+                )
+            });
             println!(
                 "frame={frame_index:03} tick={:?} reason={:?} images={} uploads={} transition={}",
                 frame.tick.state,
                 frame.tick.reason,
                 images.len(),
                 frame.output.image_uploads.len(),
-                frame.output.transition.is_some()
+                transition.unwrap_or_else(|| "none".to_string())
             );
             let image_limit = if full_images { images.len() } else { 12 };
             for image in images.iter().take(image_limit) {
-                let upload_stats = frame
-                    .output
-                    .image_uploads
+                print_image("  image", image, &frame.output.image_uploads, &engine);
+            }
+            if let Some(transition) = &frame.output.transition {
+                let frozen_images = transition
+                    .frozen_draw_commands
                     .iter()
-                    .find(|upload| upload.texture_id == image.texture_id)
-                    .map(|upload| rgba_stats(upload.width, upload.height, &upload.rgba));
-                let layers = engine
-                    .host()
-                    .layer_tree()
-                    .layers()
-                    .filter(|layer| {
-                        layer.image.as_ref().is_some_and(|layer_image| {
-                            layer_image.upload.texture_id == image.texture_id
-                        })
-                    })
-                    .map(|layer| {
-                        format!(
-                            "{}:{:?}:vis{}:rend{}",
-                            layer.id, layer.name, layer.visible, layer.renderable
-                        )
+                    .filter_map(|command| match command {
+                        DrawCommand::Image(image) => Some(image),
+                        _ => None,
                     })
                     .collect::<Vec<_>>();
-                println!(
-                    "  image texture={} rect=({},{} {}x{}) source=({},{} {}x{}) opacity={:.3} stats={:?} layers={:?}",
-                    image.texture_id,
-                    image.rect.x,
-                    image.rect.y,
-                    image.rect.width,
-                    image.rect.height,
-                    image.source_rect.x,
-                    image.source_rect.y,
-                    image.source_rect.width,
-                    image.source_rect.height,
-                    image.opacity,
-                    upload_stats,
-                    layers
-                );
+                let frozen_limit = if full_images {
+                    frozen_images.len()
+                } else {
+                    frozen_images.len().min(8)
+                };
+                for image in frozen_images.into_iter().take(frozen_limit) {
+                    print_image("  frozen", image, &transition.frozen_image_uploads, &engine);
+                }
             }
             let mut counts = std::collections::BTreeMap::<u64, usize>::new();
             for image in &images {
@@ -185,6 +224,49 @@ fn main() {
             bbox
         );
     }
+}
+
+fn tjs_string_literal(value: &str) -> String {
+    format!("{value:?}")
+}
+
+fn print_image(label: &str, image: &ImageCommand, uploads: &[ImageUpload], engine: &KrkrEngine) {
+    let upload_stats = uploads
+        .iter()
+        .find(|upload| upload.texture_id == image.texture_id)
+        .map(|upload| rgba_stats(upload.width, upload.height, &upload.rgba));
+    let layers = engine
+        .host()
+        .layer_tree()
+        .layers()
+        .filter(|layer| {
+            layer
+                .image
+                .as_ref()
+                .is_some_and(|layer_image| layer_image.upload.texture_id == image.texture_id)
+        })
+        .map(|layer| {
+            format!(
+                "{}:{:?}:vis{}:rend{}:pos{},{}",
+                layer.id, layer.name, layer.visible, layer.renderable, layer.left, layer.top
+            )
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{label} texture={} rect=({},{} {}x{}) source=({},{} {}x{}) opacity={:.3} stats={:?} layers={:?}",
+        image.texture_id,
+        image.rect.x,
+        image.rect.y,
+        image.rect.width,
+        image.rect.height,
+        image.source_rect.x,
+        image.source_rect.y,
+        image.source_rect.width,
+        image.source_rect.height,
+        image.opacity,
+        upload_stats,
+        layers
+    );
 }
 
 fn rgba_stats(width: u32, height: u32, rgba: &[u8]) -> RgbaStats {

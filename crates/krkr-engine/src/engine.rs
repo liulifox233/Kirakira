@@ -254,6 +254,9 @@ impl KrkrEngine {
         let tick = self.advance(delta)?;
         self.pump_layer_paints()?;
         self.sync_native_layers_from_tjs()?;
+        self.tjs_runtime
+            .host_mut()
+            .reapply_transition_live_layer_overrides();
         let suppressed_images = self.tjs_runtime.host().suppressed_transition_live_images();
         let output = self
             .core_engine
@@ -1046,6 +1049,11 @@ impl KagRuntimeTask {
                 apply_freeimage_tag(runtime, tag);
                 Ok(TagAction::Continue)
             }
+            "backlay" => {
+                let layer = tag.literal_attr("layer");
+                runtime.host_mut().backlay_kag_layers(layer);
+                Ok(TagAction::Continue)
+            }
             "current" => {
                 apply_current_tag(runtime, tag);
                 Ok(TagAction::Continue)
@@ -1416,6 +1424,7 @@ fn is_builtin_tag(tagname: &str) -> bool {
             | "layopt"
             | "position"
             | "freeimage"
+            | "backlay"
             | "current"
             | "trans"
             | "wt"
@@ -2109,6 +2118,43 @@ mod tests {
     }
 
     #[test]
+    fn kag_backlay_copies_fore_layers_for_transition() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 2, 1, &[255; 8]);
+        fs::write(
+            root.join("first.ks"),
+            concat!(
+                "[image storage=sprite.png layer=0 page=fore left=5 top=7 visible=true]",
+                "[backlay]",
+                "[trans method=crossfade time=1000][wt][s]"
+            ),
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("start transition");
+
+        assert_eq!(frame.tick.state, KagTaskState::WaitingTransition);
+        assert!(frame.output.transition.is_some());
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 5.0 && image.rect.y == 7.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn kag_image_tag_replaces_previous_layer_size_when_geometry_is_implicit() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -2525,6 +2571,48 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_set_pos_accepts_optional_size() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.visible = true;
+                layer.setImageSize(20, 30);
+                layer.fillRect(0, 0, 20, 30, 0xffffffff);
+                layer.setPos(12, 34, 20, 30);
+                return layer.left + ":" + layer.top + ":" +
+                    layer.width + ":" + layer.height;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("12:34:20:30".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 12.0
+                        && image.rect.y == 34.0
+                        && image.rect.width == 20.0
+                        && image.rect.height == 30.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn native_layer_load_images_accepts_kag_dictionary_options() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -2782,6 +2870,324 @@ mod tests {
                 .expect("clicks"),
             Variant::Integer(1)
         );
+    }
+
+    #[test]
+    fn native_kag_base_transition_uses_back_children_as_live_tree() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 4, 4, &[255; 64]);
+        write_png(root.join("new.png"), 4, 4, &[0, 255, 0, 255].repeat(16));
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(200, 200);
+                kag.back.base.visible = true;
+                kag.back.base.setSize(200, 200);
+                kag.fore.layers[0] = new Layer(null, kag.fore.base);
+                kag.back.layers[0] = new Layer(null, kag.back.base);
+                kag.fore.layers[0].loadImages(%[
+                    storage: "old.png",
+                    visible: true,
+                    left: 5,
+                    top: 7
+                ]);
+                kag.back.layers[0].loadImages(%[
+                    storage: "new.png",
+                    visible: true,
+                    left: 40,
+                    top: 50
+                ]);
+                "#,
+            )
+            .expect("setup");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                kag.fore.base.window = %[transCount: 1];
+                kag.fore.base.inTransition = true;
+                kag.fore.base.beginTransition(
+                    "crossfade",
+                    true,
+                    kag.back.base,
+                    %[time: 1000]
+                );
+                "#,
+            )
+            .expect("begin transition");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("transition frame");
+        let transition = frame.output.transition.as_ref().expect("transition");
+        assert!(transition.frozen_draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 5.0 && image.rect.y == 7.0
+            )
+        }));
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 40.0 && image.rect.y == 50.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_kag_base_transition_uses_unsynced_back_child_geometry() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 4, 4, &[255; 64]);
+        write_png(root.join("new.png"), 4, 4, &[0, 255, 0, 255].repeat(16));
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(200, 200);
+                kag.back.base.visible = true;
+                kag.back.base.setSize(200, 200);
+                kag.fore.layers[0] = new Layer(null, kag.fore.base);
+                kag.back.layers[0] = new Layer(null, kag.back.base);
+                kag.fore.layers[0].loadImages("old.png");
+                kag.fore.layers[0].setSizeToImageSize();
+                kag.fore.layers[0].setPos(5, 7, 4, 4);
+                kag.fore.layers[0].visible = true;
+                "#,
+            )
+            .expect("setup");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync fore");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                kag.back.layers[0].loadImages("new.png");
+                kag.back.layers[0].setSizeToImageSize();
+                kag.back.layers[0].left = 40;
+                kag.back.layers[0].top = 50;
+                kag.back.layers[0].visible = true;
+                kag.fore.base.beginTransition(
+                    "crossfade",
+                    true,
+                    kag.back.base,
+                    %[time: 1000]
+                );
+                "#,
+            )
+            .expect("begin transition");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("transition frame");
+        let transition = frame.output.transition.as_ref().expect("transition");
+        assert!(transition.frozen_draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 5.0 && image.rect.y == 7.0
+            )
+        }));
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 40.0 && image.rect.y == 50.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_kag_base_transition_uses_unsynced_back_child_visibility() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 4, 4, &[255; 64]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(200, 200);
+                kag.back.base.visible = true;
+                kag.back.base.setSize(200, 200);
+                kag.fore.layers[0] = new Layer(null, kag.fore.base);
+                kag.back.layers[0] = new Layer(null, kag.back.base);
+                kag.fore.layers[0].loadImages("sprite.png");
+                kag.fore.layers[0].setSizeToImageSize();
+                kag.fore.layers[0].setPos(5, 7, 4, 4);
+                kag.fore.layers[0].visible = true;
+                "#,
+            )
+            .expect("setup");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync fore");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                kag.back.layers[0].loadImages("sprite.png");
+                kag.back.layers[0].setSizeToImageSize();
+                kag.back.layers[0].left = 5;
+                kag.back.layers[0].top = 7;
+                kag.back.layers[0].visible = false;
+                kag.fore.base.beginTransition(
+                    "crossfade",
+                    true,
+                    kag.back.base,
+                    %[time: 1000]
+                );
+                "#,
+            )
+            .expect("begin transition");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("transition frame");
+        let transition = frame.output.transition.as_ref().expect("transition");
+        assert!(transition.frozen_draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 5.0 && image.rect.y == 7.0
+            )
+        }));
+        assert_eq!(image_command_count(&frame), 0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_kag_base_transition_materializes_back_children_for_page_exchange() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 4, 4, &[255; 64]);
+        write_png(root.join("new.png"), 4, 4, &[0, 255, 0, 255].repeat(16));
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(200, 200);
+                kag.back.base.visible = true;
+                kag.back.base.setSize(200, 200);
+                kag.fore.layers[0] = new Layer(null, kag.fore.base);
+                kag.back.layers[0] = new Layer(null, kag.back.base);
+                kag.fore.layers[0].loadImages("old.png");
+                kag.fore.layers[0].setSizeToImageSize();
+                kag.fore.layers[0].setPos(5, 7, 4, 4);
+                kag.fore.layers[0].visible = true;
+                kag.fore.base.onTransitionCompleted = function(dest, src) {
+                    var tmp = kag.fore;
+                    kag.fore = kag.back;
+                    kag.back = tmp;
+                };
+                "#,
+            )
+            .expect("setup");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync fore");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                kag.back.layers[0].loadImages("new.png");
+                kag.back.layers[0].setSizeToImageSize();
+                kag.back.layers[0].left = 40;
+                kag.back.layers[0].top = 50;
+                kag.back.layers[0].visible = true;
+                kag.fore.base.beginTransition(
+                    "crossfade",
+                    true,
+                    kag.back.base,
+                    %[time: 1000]
+                );
+                "#,
+            )
+            .expect("begin transition");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("transition frame");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 1.0), Vec::new()),
+                Duration::from_millis(1000),
+            )
+            .expect("complete transition");
+        assert!(frame.output.transition.is_none());
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 40.0 && image.rect.y == 50.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

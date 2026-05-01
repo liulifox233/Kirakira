@@ -597,6 +597,7 @@ impl KrkrHost {
             frozen_draw_commands,
             frozen_image_uploads,
             suppressed_live_images: BTreeSet::new(),
+            live_layer_overrides: BTreeMap::new(),
             native_completion: None,
         });
     }
@@ -605,9 +606,9 @@ impl KrkrHost {
         &mut self,
         method: &str,
         duration: Duration,
-        frozen_draw_commands: Vec<DrawCommand>,
-        frozen_image_uploads: Vec<ImageUpload>,
+        frozen_model: (Vec<DrawCommand>, Vec<ImageUpload>),
         suppressed_live_images: BTreeSet<LayerId>,
+        live_layer_overrides: BTreeMap<LayerId, LayerNode>,
         completion: NativeTransitionCompletion,
     ) {
         self.complete_active_transition();
@@ -621,9 +622,10 @@ impl KrkrHost {
             method: normalize_transition_method(method).to_string(),
             elapsed: Duration::ZERO,
             duration,
-            frozen_draw_commands,
-            frozen_image_uploads,
+            frozen_draw_commands: frozen_model.0,
+            frozen_image_uploads: frozen_model.1,
             suppressed_live_images,
+            live_layer_overrides,
             native_completion: Some(completion),
         });
     }
@@ -687,8 +689,43 @@ impl KrkrHost {
             .unwrap_or_default()
     }
 
+    pub(crate) fn reapply_transition_live_layer_overrides(&mut self) {
+        let Some(overrides) = self
+            .active_transition
+            .as_ref()
+            .map(|transition| transition.live_layer_overrides.clone())
+        else {
+            return;
+        };
+        for (layer_id, source) in overrides {
+            if let Some(dest) = self.layer_tree.layer_mut(layer_id) {
+                copy_layer_node_render_content(dest, &source);
+                dest.renderable = source.renderable;
+            }
+        }
+    }
+
     pub(crate) fn take_completed_native_transitions(&mut self) -> Vec<NativeTransitionCompletion> {
         std::mem::take(&mut self.completed_native_transitions)
+    }
+
+    pub(crate) fn backlay_kag_layers(&mut self, layer: Option<&str>) {
+        match layer {
+            Some(layer) => self.copy_fore_kag_layer_to_pending(layer),
+            None => {
+                if self.kag_layers.is_empty() {
+                    self.ensure_kag_layer("fore", "base");
+                }
+                let layers = self.kag_layers.keys().cloned().collect::<Vec<_>>();
+                for layer in layers {
+                    self.copy_fore_kag_layer_to_pending(&layer);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn pending_kag_layer_names(&self) -> Vec<String> {
+        self.pending_kag_layers.keys().cloned().collect()
     }
 
     fn pending_kag_layer_mut(&mut self, layer: &str) -> &mut LayerNode {
@@ -701,6 +738,13 @@ impl KrkrHost {
         self.pending_kag_layers
             .entry(layer.to_string())
             .or_insert(base)
+    }
+
+    fn copy_fore_kag_layer_to_pending(&mut self, layer: &str) {
+        let layer_id = self.ensure_kag_layer("fore", layer);
+        if let Some(base) = self.layer_tree.layer(layer_id).cloned() {
+            self.pending_kag_layers.insert(layer.to_string(), base);
+        }
     }
 
     fn apply_pending_kag_layers(&mut self) {
@@ -752,6 +796,24 @@ fn normalize_kag_page(page: &str) -> &str {
     }
 }
 
+fn copy_layer_node_render_content(dest: &mut LayerNode, source: &LayerNode) {
+    dest.left = source.left;
+    dest.top = source.top;
+    dest.width = source.width;
+    dest.height = source.height;
+    dest.image_left = source.image_left;
+    dest.image_top = source.image_top;
+    dest.image_width = source.image_width;
+    dest.image_height = source.image_height;
+    dest.visible = source.visible;
+    dest.enabled = source.enabled;
+    dest.node_enabled = source.node_enabled;
+    dest.opacity = source.opacity;
+    dest.layer_type = source.layer_type;
+    dest.face = source.face;
+    dest.image = source.image.clone();
+}
+
 fn normalize_transition_method(method: &str) -> &str {
     match method {
         "crossfade" | "" => "crossfade",
@@ -791,6 +853,7 @@ struct ActiveTransition {
     frozen_draw_commands: Vec<DrawCommand>,
     frozen_image_uploads: Vec<ImageUpload>,
     suppressed_live_images: BTreeSet<LayerId>,
+    live_layer_overrides: BTreeMap<LayerId, LayerNode>,
     native_completion: Option<NativeTransitionCompletion>,
 }
 

@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use krkr_core::LayerNode;
 use krkr_font::{FontSpec, FontSystem, TextStyle};
@@ -875,14 +878,28 @@ fn layer_set_pos(
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let left = optional_integer(&args, 0)?.unwrap_or(0);
     let top = optional_integer(&args, 1)?.unwrap_or(0);
+    let width = optional_integer(&args, 2)?.map(|value| value.max(0));
+    let height = optional_integer(&args, 3)?.map(|value| value.max(0));
     if let Some(target) = target {
         mutate_render_layer(runtime, &target, |layer| {
             layer.left = left as f32;
             layer.top = top as f32;
+            if let Some(width) = width {
+                layer.width = width as f32;
+            }
+            if let Some(height) = height {
+                layer.height = height as f32;
+            }
         });
     }
     runtime.set_object_member(this, "left", Variant::Integer(left));
     runtime.set_object_member(this, "top", Variant::Integer(top));
+    if let Some(width) = width {
+        runtime.set_object_member(this, "width", Variant::Integer(width));
+    }
+    if let Some(height) = height {
+        runtime.set_object_member(this, "height", Variant::Integer(height));
+    }
     Ok(Variant::Void)
 }
 
@@ -1074,6 +1091,13 @@ fn layer_begin_transition(
         .get(2)
         .and_then(variant_object)
         .or_else(|| variant_object(&runtime.object_member(this, "comp")));
+    let with_children = args
+        .get(1)
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(1)
+        != 0;
     let method = args
         .first()
         .filter(|value| !matches!(value, Variant::Void))
@@ -1115,6 +1139,8 @@ fn layer_begin_transition(
         });
     }
     runtime.set_object_member(this, "visible", Variant::Integer(1));
+    let live_layer_overrides =
+        kag_base_children_transition_live_overrides(runtime, this, source, with_children)?;
     if duration == 0 {
         if !paired_comp
             && let Some(source_layer_id) = source_layer_id
@@ -1130,9 +1156,9 @@ fn layer_begin_transition(
         runtime.host_mut().begin_native_transition(
             &method,
             Duration::from_millis(duration),
-            frozen.0,
-            frozen.1,
+            frozen,
             suppressed_images,
+            live_layer_overrides,
             NativeTransitionCompletion {
                 dest: this,
                 source,
@@ -1165,6 +1191,167 @@ fn materialize_kag_back_to_native(
         native_layer.renderable = renderable;
     }
     Ok(())
+}
+
+fn kag_base_children_transition_live_overrides(
+    runtime: &mut Runtime<KrkrHost>,
+    dest: ObjectHandle,
+    source: Option<ObjectHandle>,
+    with_children: bool,
+) -> Result<BTreeMap<u64, LayerNode>> {
+    if !with_children {
+        return Ok(BTreeMap::new());
+    }
+    if !matches!(
+        kag_layer_target(runtime, dest),
+        Some(RenderLayerTarget::Kag { page, layer }) if page == "fore" && layer == "base"
+    ) {
+        return Ok(BTreeMap::new());
+    }
+    let Some(source) = source else {
+        return Ok(BTreeMap::new());
+    };
+    if !matches!(
+        kag_layer_target(runtime, source),
+        Some(RenderLayerTarget::Kag { page, layer }) if page == "back" && layer == "base"
+    ) {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut overrides = BTreeMap::new();
+    let pending_layers = runtime.host().pending_kag_layer_names();
+    for layer_name in pending_layers {
+        let Some(source_layer) = kag_layer_object_snapshot(runtime, "back", &layer_name)? else {
+            continue;
+        };
+        if let Some(back_handle) = kag_page_layer_handle(runtime, "back", &layer_name)
+            && let Some(back_layer_id) = native_layer_id(runtime, back_handle)?
+            && let Some(back_layer) = runtime.host_mut().layer_tree_mut().layer_mut(back_layer_id)
+        {
+            copy_render_content(back_layer, &source_layer);
+            back_layer.renderable = false;
+        }
+
+        let Some(fore_handle) = kag_page_layer_handle(runtime, "fore", &layer_name) else {
+            continue;
+        };
+        let Some(layer_id) = native_layer_id(runtime, fore_handle)? else {
+            continue;
+        };
+        let Some(mut override_layer) = runtime.host().layer_tree().layer(layer_id).cloned() else {
+            continue;
+        };
+        copy_render_content(&mut override_layer, &source_layer);
+        override_layer.renderable = true;
+        if let Some(dest_layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+            copy_render_content(dest_layer, &source_layer);
+            dest_layer.renderable = true;
+        }
+        overrides.insert(layer_id, override_layer);
+    }
+    Ok(overrides)
+}
+
+fn kag_layer_object_snapshot(
+    runtime: &Runtime<KrkrHost>,
+    page: &str,
+    layer: &str,
+) -> Result<Option<LayerNode>> {
+    let Some(mut snapshot) = runtime.host().kag_layer(page, layer).cloned() else {
+        return Ok(None);
+    };
+    if layer == "base" || layer == "background" {
+        return Ok(Some(snapshot));
+    }
+    let Some(handle) = kag_page_layer_handle(runtime, page, layer) else {
+        return Ok(Some(snapshot));
+    };
+    apply_script_layer_members(runtime, handle, &mut snapshot)?;
+    Ok(Some(snapshot))
+}
+
+fn apply_script_layer_members(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    layer: &mut LayerNode,
+) -> Result<()> {
+    layer.left = layer_member_i64(runtime, handle, "left", layer.left as i64)? as f32;
+    layer.top = layer_member_i64(runtime, handle, "top", layer.top as i64)? as f32;
+    layer.width =
+        layer_member_i64(runtime, handle, "width", layer.width.max(0.0) as i64)?.max(0) as f32;
+    layer.height =
+        layer_member_i64(runtime, handle, "height", layer.height.max(0.0) as i64)?.max(0) as f32;
+    layer.image_left =
+        layer_member_i64(runtime, handle, "imageLeft", layer.image_left as i64)? as f32;
+    layer.image_top = layer_member_i64(runtime, handle, "imageTop", layer.image_top as i64)? as f32;
+    layer.image_width = layer_member_i64(
+        runtime,
+        handle,
+        "imageWidth",
+        layer.image_width.max(0.0) as i64,
+    )?
+    .max(0) as f32;
+    layer.image_height = layer_member_i64(
+        runtime,
+        handle,
+        "imageHeight",
+        layer.image_height.max(0.0) as i64,
+    )?
+    .max(0) as f32;
+    layer.visible = layer_member_i64(runtime, handle, "visible", i64::from(layer.visible))? != 0;
+    layer.opacity =
+        layer_member_i64(runtime, handle, "opacity", i64::from(layer.opacity))?.clamp(0, 255) as u8;
+    layer.enabled = layer_member_i64(runtime, handle, "enabled", i64::from(layer.enabled))? != 0;
+    layer.node_enabled = layer_member_i64(
+        runtime,
+        handle,
+        "nodeEnabled",
+        i64::from(layer.node_enabled),
+    )? != 0;
+    layer.layer_type =
+        layer_member_i64(runtime, handle, "type", i64::from(layer.layer_type))? as i32;
+    layer.face = layer_member_i64(runtime, handle, "face", i64::from(layer.face))? as i32;
+    Ok(())
+}
+
+fn layer_member_i64(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &str,
+    fallback: i64,
+) -> Result<i64> {
+    match runtime.object_member(handle, name) {
+        Variant::Void => Ok(fallback),
+        value => value.to_integer(),
+    }
+}
+
+fn kag_page_layer_handle(
+    runtime: &Runtime<KrkrHost>,
+    page: &str,
+    layer: &str,
+) -> Option<ObjectHandle> {
+    let Variant::Object(kag) = runtime.global_member("kag") else {
+        return None;
+    };
+    let Variant::Object(page_object) = runtime.object_member(kag, page) else {
+        return None;
+    };
+    if layer == "base" || layer == "background" {
+        return variant_object(&runtime.object_member(page_object, "base"))
+            .map(|handle| runtime.bound_this(handle).unwrap_or(handle));
+    }
+
+    let (array_name, index) = if let Some(index) = layer.strip_prefix("message") {
+        ("messages", index)
+    } else {
+        ("layers", layer)
+    };
+    let Variant::Object(array) = runtime.object_member(page_object, array_name) else {
+        return None;
+    };
+    variant_object(&runtime.object_member(array, index))
+        .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
 }
 
 fn copy_render_state(dest: &mut LayerNode, source: &LayerNode) {
