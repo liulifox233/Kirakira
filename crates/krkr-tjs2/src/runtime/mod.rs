@@ -162,9 +162,9 @@ impl<H: TjsHost + 'static> Runtime<H> {
     }
 
     pub fn alloc_array_object(&mut self, elements: Vec<Variant>) -> ObjectHandle {
-        let mut object = Object::array(elements);
-        object.class_infos.push("Array".to_string());
-        self.alloc_object(object)
+        let handle = self.alloc_object(Object::array(elements));
+        builtins::install_array_methods(self, handle);
+        handle
     }
 
     pub fn array_push(&mut self, object: ObjectHandle, value: Variant) -> bool {

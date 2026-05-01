@@ -114,6 +114,18 @@ impl Object {
         true
     }
 
+    pub fn array_erase(&mut self, index: usize) -> Option<Variant> {
+        let ObjectKind::Array { elements } = &mut self.kind else {
+            return None;
+        };
+        if index >= elements.len() {
+            return None;
+        }
+        let value = elements.remove(index);
+        self.sync_array_members();
+        Some(value)
+    }
+
     pub fn array_remove_value(&mut self, value: &Variant) -> bool {
         let ObjectKind::Array { elements } = &mut self.kind else {
             return false;
