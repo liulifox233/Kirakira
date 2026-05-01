@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -254,8 +254,7 @@ impl KrkrEngine {
         let tick = self.advance(delta)?;
         self.pump_layer_paints()?;
         self.sync_native_layers_from_tjs()?;
-        let mut suppressed_images = self.tjs_runtime.host().suppressed_transition_live_images();
-        suppressed_images.extend(self.kag_back_layer_images());
+        let suppressed_images = self.tjs_runtime.host().suppressed_transition_live_images();
         let output = self
             .core_engine
             .tick_running_with_layers_suppressing_images(
@@ -313,54 +312,6 @@ impl KrkrEngine {
             &mut self.message_layer,
             self.kag_budget,
         )
-    }
-
-    fn kag_back_layer_images(&self) -> BTreeSet<LayerId> {
-        let mut layers = BTreeSet::new();
-        let Variant::Object(kag) = self.tjs_runtime.global_member("kag") else {
-            return layers;
-        };
-        let Variant::Object(back) = self.tjs_runtime.object_member(kag, "back") else {
-            return layers;
-        };
-        self.collect_kag_page_layer_images(back, &mut layers);
-        layers
-    }
-
-    fn collect_kag_page_layer_images(&self, page: ObjectHandle, layers: &mut BTreeSet<LayerId>) {
-        if let Variant::Object(base) = self.tjs_runtime.object_member(page, "base") {
-            self.insert_native_layer_image(base, layers);
-        }
-        self.collect_kag_layer_array(page, "layers", layers);
-        self.collect_kag_layer_array(page, "messages", layers);
-    }
-
-    fn collect_kag_layer_array(
-        &self,
-        page: ObjectHandle,
-        member: &str,
-        layers: &mut BTreeSet<LayerId>,
-    ) {
-        let Variant::Object(array) = self.tjs_runtime.object_member(page, member) else {
-            return;
-        };
-        let Ok(count) = self.tjs_runtime.object_member(array, "count").to_integer() else {
-            return;
-        };
-        for index in 0..count.max(0) {
-            if let Variant::Object(layer) =
-                self.tjs_runtime.object_member(array, &index.to_string())
-            {
-                self.insert_native_layer_image(layer, layers);
-            }
-        }
-    }
-
-    fn insert_native_layer_image(&self, handle: ObjectHandle, layers: &mut BTreeSet<LayerId>) {
-        let handle = self.tjs_runtime.bound_this(handle).unwrap_or(handle);
-        if let Some(layer_id) = self.tjs_runtime.host().native_layer(handle) {
-            layers.insert(layer_id);
-        }
     }
 
     fn pump_tjs_events(&mut self) -> Result<()> {
@@ -664,8 +615,61 @@ impl KrkrEngine {
             let absolute = object_optional_i64(&self.tjs_runtime, handle, "absolute")?;
             let order = object_optional_i64(&self.tjs_runtime, handle, "order")?;
 
+            let kag_target = self.kag_object_layer_target(handle);
+            if let Some((page, layer_name)) = kag_target.as_ref().filter(|(page, _)| page == "back")
+            {
+                let source = self
+                    .tjs_runtime
+                    .host()
+                    .layer_tree()
+                    .layer(layer_id)
+                    .cloned();
+                if let Some(layer) = self
+                    .tjs_runtime
+                    .host_mut()
+                    .layer_tree_mut()
+                    .layer_mut(layer_id)
+                {
+                    layer.renderable = false;
+                }
+                self.tjs_runtime
+                    .host_mut()
+                    .mutate_kag_layer(page, layer_name, |layer| {
+                        if layer.image.is_none()
+                            && let Some(source) = &source
+                            && source.image.is_some()
+                        {
+                            layer.image = source.image.clone();
+                        }
+                        layer.left = left as f32;
+                        layer.top = top as f32;
+                        layer.width = width.max(0) as f32;
+                        layer.height = height.max(0) as f32;
+                        layer.image_left = image_left as f32;
+                        layer.image_top = image_top as f32;
+                        layer.image_width = image_width.max(0) as f32;
+                        layer.image_height = image_height.max(0) as f32;
+                        layer.visible = visible;
+                        layer.opacity = opacity;
+                        layer.enabled = enabled;
+                        layer.node_enabled = node_enabled;
+                        layer.layer_type = layer_type;
+                        layer.face = face;
+                        if let Some(z_order) = absolute.or(order) {
+                            layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                        }
+                    });
+                continue;
+            }
+
             let layer_tree = self.tjs_runtime.host_mut().layer_tree_mut();
-            layer_tree.set_parent(layer_id, parent);
+            let render_parent = if matches!(kag_target.as_ref(), Some((page, layer_name)) if page == "fore" && layer_name == "base")
+            {
+                None
+            } else {
+                parent
+            };
+            layer_tree.set_parent(layer_id, render_parent);
             if let Some(layer) = layer_tree.layer_mut(layer_id) {
                 layer.left = left as f32;
                 layer.top = top as f32;
@@ -676,6 +680,9 @@ impl KrkrEngine {
                 layer.image_width = image_width.max(0) as f32;
                 layer.image_height = image_height.max(0) as f32;
                 layer.visible = visible;
+                if matches!(kag_target.as_ref(), Some((page, _)) if page == "fore") {
+                    layer.renderable = true;
+                }
                 layer.opacity = opacity;
                 layer.enabled = enabled;
                 layer.node_enabled = node_enabled;
@@ -687,6 +694,57 @@ impl KrkrEngine {
             }
         }
         Ok(())
+    }
+
+    fn kag_object_layer_target(&self, handle: ObjectHandle) -> Option<(String, String)> {
+        let handle = self.tjs_runtime.bound_this(handle).unwrap_or(handle);
+        let Variant::Object(kag) = self.tjs_runtime.global_member("kag") else {
+            return None;
+        };
+
+        for page in ["fore", "back"] {
+            let Variant::Object(page_object) = self.tjs_runtime.object_member(kag, page) else {
+                continue;
+            };
+            if self.same_object(self.tjs_runtime.object_member(page_object, "base"), handle) {
+                return Some((page.to_string(), "base".to_string()));
+            }
+            if let Some(index) = self.kag_layer_array_index(page_object, "layers", handle) {
+                return Some((page.to_string(), index.to_string()));
+            }
+            if let Some(index) = self.kag_layer_array_index(page_object, "messages", handle) {
+                return Some((page.to_string(), format!("message{index}")));
+            }
+        }
+
+        None
+    }
+
+    fn kag_layer_array_index(
+        &self,
+        page_object: ObjectHandle,
+        member: &str,
+        handle: ObjectHandle,
+    ) -> Option<i64> {
+        let Variant::Object(array) = self.tjs_runtime.object_member(page_object, member) else {
+            return None;
+        };
+        let Ok(count) = self.tjs_runtime.object_member(array, "count").to_integer() else {
+            return None;
+        };
+        (0..count.max(0)).find(|index| {
+            self.same_object(
+                self.tjs_runtime.object_member(array, &index.to_string()),
+                handle,
+            )
+        })
+    }
+
+    fn same_object(&self, value: Variant, handle: ObjectHandle) -> bool {
+        let Variant::Object(candidate) = value else {
+            return false;
+        };
+        self.tjs_runtime.bound_this(candidate).unwrap_or(candidate) == handle
     }
 
     pub fn register_plugin<P>(&mut self, plugin: P) -> Result<()>
@@ -2535,6 +2593,248 @@ mod tests {
     }
 
     #[test]
+    fn native_kag_back_message_draw_text_is_staged_until_transition() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.back.messages[0] = new Layer();
+                kag.back.messages[0].visible = true;
+                kag.back.messages[0].setSize(160, 48);
+                kag.back.messages[0].font.height = -24;
+                kag.back.messages[0].drawText(4, 4, "BACK", 0xffffff, 255);
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("pre-transition update");
+        assert_eq!(image_command_count(&frame), 0);
+
+        engine.host_mut().apply_immediate_transition();
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("post-transition update");
+        assert_eq!(image_command_count(&frame), 1);
+    }
+
+    #[test]
+    fn native_kag_fore_message_draw_text_renders_once() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.fore.messages[0] = new Layer();
+                kag.fore.messages[0].visible = true;
+                kag.fore.messages[0].setSize(160, 48);
+                kag.fore.messages[0].font.height = -24;
+                kag.fore.messages[0].drawText(4, 4, "FORE", 0xffffff, 255);
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(image_command_count(&frame), 1);
+    }
+
+    #[test]
+    fn native_kag_fore_base_keeps_native_tree_for_hit_testing() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.clicks = 0;
+                kag.onPrimaryClick = function() { this.clicks++; };
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(100, 100);
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(5.0, 5.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.clicks")
+                .expect("clicks"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn native_kag_exchange_restores_fore_tree_rendering_and_hit_testing() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(null, kag.fore.base), layers: [], messages: []];
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(100, 100);
+                kag.back.base.visible = true;
+                kag.back.base.setSize(100, 100);
+                kag.back.messages[0] = new Layer(null, kag.back.base);
+                kag.back.messages[0].visible = true;
+                kag.back.messages[0].setSize(20, 20);
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync back staging");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var tmp = kag.fore;
+                kag.fore = kag.back;
+                kag.back = tmp;
+                kag.clicks = 0;
+                kag.fore.messages[0].setImageSize(20, 20);
+                kag.fore.messages[0].colorRect(0, 0, 20, 20, 0xffffff, 255);
+                kag.fore.messages[0].onMouseDown = function(x, y, shift) {
+                    kag.clicks++;
+                };
+                "#,
+            )
+            .expect("exchange");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync fore");
+        assert_eq!(image_command_count(&frame), 1);
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(5.0, 5.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.clicks")
+                .expect("clicks"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn native_layer_exchange_info_swaps_staged_comp_backing_before_page_exchange() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(
+            root.join("new.png"),
+            2,
+            1,
+            &[0, 255, 0, 255, 0, 255, 0, 255],
+        );
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(null, kag.fore.base), layers: [], messages: []];
+                kag.fore.base.comp = kag.back.base;
+                kag.back.base.comp = kag.fore.base;
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(2, 1);
+                kag.fore.base.setImageSize(2, 1);
+                kag.back.base.loadImages("new.png");
+                kag.fore.base.beginTransition("crossfade", true, kag.back.base, %[]);
+                kag.fore.base.exchangeInfo();
+                var tmp = kag.fore;
+                kag.fore = kag.back;
+                kag.back = tmp;
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert!(frame.output.image_uploads.iter().any(|upload| {
+            upload.width == 2
+                && upload.height == 1
+                && upload.rgba.chunks_exact(4).all(|pixel| pixel[1] == 255)
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn native_layer_assign_images_copies_source_image_to_destination() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -2574,6 +2874,55 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_operate_rect_marks_image_modified_for_script_clear() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parent = new Layer();
+                parent.visible = true;
+                parent.setSize(32, 32);
+                parent.setImageSize(32, 32);
+                parent.imageModified = false;
+
+                var line = new Layer();
+                line.visible = false;
+                line.setImageSize(4, 4);
+                line.colorRect(0, 0, 4, 4, 0xffffff, 255);
+
+                parent.operateRect(0, 0, line, 0, 0, 4, 4);
+                var wasModified = parent.imageModified;
+                if(parent.imageModified) parent.colorRect(0, 0, 32, 32, 0);
+                parent.imageModified = false;
+                return wasModified;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::Integer(1));
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        let parent_upload = frame
+            .output
+            .image_uploads
+            .iter()
+            .find(|upload| upload.width == 32 && upload.height == 32)
+            .expect("parent upload");
+        assert!(
+            parent_upload
+                .rgba
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == 0)
+        );
     }
 
     #[test]
@@ -3559,6 +3908,15 @@ mod tests {
     fn write_png(path: PathBuf, width: u32, height: u32, rgba: &[u8]) {
         let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).expect("rgba image");
         image.save(path).expect("write png");
+    }
+
+    fn image_command_count(frame: &EngineFrame) -> usize {
+        frame
+            .output
+            .draw_commands
+            .iter()
+            .filter(|command| matches!(command, krkr_core::DrawCommand::Image(_)))
+            .count()
     }
 
     fn image_test_engine(root: &Path) -> KrkrEngine {

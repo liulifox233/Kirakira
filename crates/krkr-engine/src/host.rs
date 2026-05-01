@@ -482,6 +482,18 @@ impl KrkrHost {
         }
     }
 
+    pub(crate) fn kag_layer(&self, page: &str, layer: &str) -> Option<&LayerNode> {
+        if normalize_kag_page(page) == "back"
+            && let Some(node) = self.pending_kag_layers.get(layer)
+        {
+            return Some(node);
+        }
+
+        self.kag_layers
+            .get(layer)
+            .and_then(|layer_id| self.layer_tree.layer(*layer_id))
+    }
+
     pub(crate) fn current_kag_page(&self) -> &str {
         &self.current_kag_page
     }
