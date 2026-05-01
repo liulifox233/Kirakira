@@ -455,6 +455,12 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
         "beginTransition",
         layer_begin_transition,
     );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "stopTransition",
+        layer_stop_transition,
+    );
     register_native_method_preserving_script(runtime, handle, "fillRect", layer_fill_rect);
     register_native_method_preserving_script(runtime, handle, "colorRect", layer_color_rect);
     register_native_method_preserving_script(runtime, handle, "copyRect", layer_copy_rect);
@@ -820,6 +826,7 @@ fn layer_begin_transition(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
+    finish_current_transition(runtime)?;
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
@@ -890,6 +897,19 @@ fn layer_begin_transition(
             },
         );
     }
+    Ok(Variant::Void)
+}
+
+fn layer_stop_transition(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
+    runtime.host_mut().complete_native_transition_for(this);
+    finish_completed_native_transitions(runtime)?;
     Ok(Variant::Void)
 }
 
@@ -1182,6 +1202,62 @@ fn finish_immediate_transition(runtime: &mut Runtime<KrkrHost>, layer: ObjectHan
         "transCount",
         Variant::Integer(trans_count.saturating_sub(1).max(0)),
     );
+}
+
+fn finish_current_transition(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+    runtime.host_mut().complete_active_transition();
+    finish_completed_native_transitions(runtime)
+}
+
+pub(crate) fn finish_completed_native_transitions(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+    let completions = runtime.host_mut().take_completed_native_transitions();
+    for completion in completions {
+        finish_native_transition(runtime, completion)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_native_transition(
+    runtime: &mut Runtime<KrkrHost>,
+    completion: NativeTransitionCompletion,
+) -> Result<()> {
+    if !runtime.object_valid(completion.dest) {
+        return Ok(());
+    }
+
+    if !matches!(
+        runtime.object_member(completion.dest, "onTransitionCompleted"),
+        Variant::Void
+    ) {
+        let source = completion
+            .source
+            .filter(|source| runtime.object_valid(*source))
+            .map(Variant::Object)
+            .unwrap_or_default();
+        runtime.call_object_method(
+            completion.dest,
+            "onTransitionCompleted",
+            vec![Variant::Object(completion.dest), source],
+        )?;
+        if completion.paired_comp
+            && let Some(source) = completion.source
+            && runtime.object_valid(source)
+        {
+            runtime.set_object_member(source, "visible", Variant::Integer(1));
+        }
+    } else {
+        runtime.set_object_member(completion.dest, "inTransition", Variant::Integer(0));
+        if let Variant::Object(window) = runtime.object_member(completion.dest, "window")
+            && let Ok(trans_count) = runtime.object_member(window, "transCount").to_integer()
+        {
+            runtime.set_object_member(
+                window,
+                "transCount",
+                Variant::Integer(trans_count.saturating_sub(1).max(0)),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
