@@ -140,7 +140,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let global = self.runtime.global;
             let this_obj = this_obj.or(Some(global));
             let this_proxy = self.runtime.alloc_proxy_bound(this_obj, global, None);
-            let super_class = self.super_class_for_parts(&file, &code_handles, &object);
+            let super_class = self.super_class_for_parts(&code_handles, &object)?;
             let super_proxy = self.runtime.alloc_proxy_bound(
                 super_class.or(this_obj),
                 global,
@@ -272,13 +272,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 class_handle,
                 class_name,
                 constructor_args,
+                run_constructor,
                 target,
             } => {
                 for info in self.runtime.heap[class_handle.0].class_infos.clone() {
                     self.add_class_info(instance, info);
                 }
                 let object_value = Variant::Object(instance);
-                if !class_name.is_empty()
+                if run_constructor
+                    && !class_name.is_empty()
                     && let Some(constructor) = self.runtime.heap[instance.0].get_raw(&class_name)
                     && !matches!(constructor, Variant::Void)
                 {
@@ -438,7 +440,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             88 => {
                 let class_name = frame.get(inst.operands[1])?.to_tjs_string()?;
-                let value = self.instance_of(&frame.get(inst.operands[0])?, &class_name);
+                let value = self.instance_of(&frame.get(inst.operands[0])?, &class_name)?;
                 frame.set(inst.operands[0], Variant::Integer(i64::from(value)))?;
             }
             89 => {
@@ -674,28 +676,49 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             125 => {
                 let object_handle = self.resolve_object(frame.get(inst.operands[0])?)?;
                 let info = frame.get(inst.operands[1])?;
-                let mut copied_object_infos = false;
-                if let Ok(info_handle) = self.resolve_object(info.clone()) {
-                    let should_update_super =
-                        matches!(
-                            self.runtime.heap[object_handle.0].kind,
-                            ObjectKind::InterCode {
-                                context: BytecodeContextType::Class,
-                                ..
-                            }
-                        ) || self.runtime.heap[object_handle.0].super_class.is_none();
-                    if should_update_super {
-                        self.runtime.heap[object_handle.0].super_class = Some(info_handle);
+                if let Ok(getter_handle) = self.resolve_object(info.clone())
+                    && matches!(
+                        self.runtime.heap[object_handle.0].kind,
+                        ObjectKind::InterCode {
+                            context: BytecodeContextType::Class,
+                            ..
+                        }
+                    )
+                    && matches!(
+                        self.runtime.heap[getter_handle.0].kind,
+                        ObjectKind::InterCode {
+                            context: BytecodeContextType::SuperClassGetter,
+                            ..
+                        }
+                    )
+                {
+                    let Some(instance) = frame.this_obj else {
+                        return Err(TjsError::runtime(
+                            "class extender has no destination this object",
+                        ));
+                    };
+                    match self.apply_class_extender(
+                        object_handle,
+                        getter_handle,
+                        instance,
+                        Continuation::CallerRegister { dest: None },
+                    )? {
+                        CallOutcome::Immediate(_, Continuation::CallerRegister { dest: None }) => {}
+                        CallOutcome::Immediate(_, continuation) => {
+                            return Err(TjsError::runtime(format!(
+                                "unexpected class extender continuation {continuation:?}"
+                            )));
+                        }
+                        CallOutcome::Frame(call_frame) => {
+                            return Ok(Step::Call {
+                                frame: call_frame,
+                                resume_pc: next_pc,
+                            });
+                        }
                     }
-                    let infos = self.runtime.heap[info_handle.0].class_infos.clone();
-                    copied_object_infos = !infos.is_empty();
-                    for info in infos {
-                        self.add_class_info(object_handle, info);
-                    }
+                    return Ok(Step::Next(pc));
                 }
-                if !copied_object_infos {
-                    self.add_class_info(object_handle, info.to_tjs_string()?);
-                }
+                self.add_class_info(object_handle, info.to_tjs_string()?);
             }
             126 => {
                 let Some(dest) = frame.this_obj else {
@@ -783,14 +806,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     }
 
     fn super_class_for_parts(
-        &self,
-        _file: &BytecodeFile,
+        &mut self,
         code_handles: &[ObjectHandle],
         object: &CodeObject,
-    ) -> Option<ObjectHandle> {
-        let class_object = object.parent?;
-        let class_handle = *code_handles.get(class_object)?;
-        self.runtime.heap[class_handle.0].super_class
+    ) -> Result<Option<ObjectHandle>> {
+        if object.context_type == BytecodeContextType::SuperClassGetter {
+            return Ok(None);
+        }
+        let Some(class_object) = object.parent else {
+            return Ok(None);
+        };
+        let Some(class_handle) = code_handles.get(class_object).copied() else {
+            return Ok(None);
+        };
+        self.super_class_handle(class_handle)
     }
 
     pub(super) fn value_debug_type(&self, value: &Variant) -> String {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::bytecode::{BytecodeContextType, CallArgs, CodeObject, Instruction};
 use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
 use crate::runtime::{Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant};
@@ -76,20 +78,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         } = kind
         {
             if let Some(primary) = primary {
-                if bind_this.is_some() && self.handle_class_name_matches(primary, name) {
-                    return Ok(Variant::Closure(Closure::new(primary, bind_this)));
-                }
                 let value =
                     self.prop_get_handle(primary, name, flags, bind_this.or(caller_this))?;
                 if !matches!(value, Variant::Void) {
                     return Ok(self.bind_proxy_value(value, bind_this));
+                }
+                if bind_this.is_some() && self.handle_class_name_matches(primary, name) {
+                    return Ok(Variant::Closure(Closure::new(primary, bind_this)));
                 }
             }
             return self.prop_get_handle(fallback, name, flags, caller_this);
         }
 
         let Some(value) = self.runtime.heap[handle.0].get_raw(name) else {
-            if let Some(class_handle) = self.runtime.heap[handle.0].super_class {
+            if let Some(class_handle) = self.super_class_handle(handle)? {
                 let receiver = caller_this.or(Some(handle));
                 let value = self.prop_get_handle(class_handle, name, flags, receiver)?;
                 if !matches!(value, Variant::Void) {
@@ -821,6 +823,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     class_handle,
                     class_name: name,
                     constructor_args: args,
+                    run_constructor: true,
                     target: Box::new(continuation),
                 },
             )?;
@@ -848,6 +851,42 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         args: Vec<Variant>,
         continuation: Continuation,
     ) -> Result<CallOutcome> {
+        self.initialize_inter_code_instance_with_constructor(
+            file_id,
+            object_index,
+            instance,
+            args,
+            true,
+            continuation,
+        )
+    }
+
+    fn initialize_inter_code_class_body(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+        instance: ObjectHandle,
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
+        self.initialize_inter_code_instance_with_constructor(
+            file_id,
+            object_index,
+            instance,
+            Vec::new(),
+            false,
+            continuation,
+        )
+    }
+
+    fn initialize_inter_code_instance_with_constructor(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+        instance: ObjectHandle,
+        args: Vec<Variant>,
+        run_constructor: bool,
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
         let file = self.runtime.script_file(file_id)?;
         let code_handles = self.runtime.script_code_handles(file_id)?;
         let name = file.objects[object_index]
@@ -872,10 +911,110 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 class_handle,
                 class_name: name,
                 constructor_args: args,
+                run_constructor,
                 target: Box::new(continuation),
             },
         )?;
         Ok(CallOutcome::Frame(Box::new(frame)))
+    }
+
+    pub(super) fn apply_class_extender(
+        &mut self,
+        class_handle: ObjectHandle,
+        getter_handle: ObjectHandle,
+        instance: ObjectHandle,
+        continuation: Continuation,
+    ) -> Result<CallOutcome> {
+        let Some(super_handle) =
+            self.resolve_super_class_from_getter(class_handle, getter_handle)?
+        else {
+            return Ok(CallOutcome::Immediate(Variant::Void, continuation));
+        };
+
+        match self.runtime.heap[super_handle.0].kind {
+            ObjectKind::InterCode {
+                file_id,
+                object_index,
+                context: BytecodeContextType::Class,
+            } => {
+                self.initialize_inter_code_class_body(file_id, object_index, instance, continuation)
+            }
+            _ => Ok(CallOutcome::Immediate(Variant::Void, continuation)),
+        }
+    }
+
+    pub(super) fn super_class_handle(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>> {
+        if let Some(super_handle) = self.runtime.heap[handle.0].super_class {
+            return Ok(Some(super_handle));
+        }
+
+        let ObjectKind::InterCode {
+            file_id,
+            object_index,
+            context: BytecodeContextType::Class,
+        } = self.runtime.heap[handle.0].kind
+        else {
+            return Ok(None);
+        };
+        let file = self.runtime.script_file(file_id)?;
+        let Some(getter_index) = file.objects[object_index].super_class_getter else {
+            return Ok(None);
+        };
+        let code_handles = self.runtime.script_code_handles(file_id)?;
+        let getter_handle = code_handles[getter_index];
+        self.resolve_super_class_from_getter(handle, getter_handle)
+    }
+
+    fn resolve_super_class_from_getter(
+        &mut self,
+        class_handle: ObjectHandle,
+        getter_handle: ObjectHandle,
+    ) -> Result<Option<ObjectHandle>> {
+        let ObjectKind::InterCode {
+            file_id,
+            object_index,
+            context: BytecodeContextType::SuperClassGetter,
+        } = self.runtime.heap[getter_handle.0].kind
+        else {
+            return Err(TjsError::runtime(
+                "class extender does not reference a superclass getter",
+            ));
+        };
+
+        let value = self.execute_file_object_with_this_preserving_active(
+            file_id,
+            object_index,
+            Vec::new(),
+            Some(self.runtime.global),
+        )?;
+        if matches!(value, Variant::Void | Variant::Null) {
+            return Ok(None);
+        }
+        let super_handle = self.resolve_object(value)?;
+        if self.runtime.heap[class_handle.0].super_class.is_none() {
+            self.runtime.heap[class_handle.0].super_class = Some(super_handle);
+        }
+        Ok(Some(super_handle))
+    }
+
+    fn execute_file_object_with_this_preserving_active(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+        args: Vec<Variant>,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<Variant> {
+        let saved_file_id = self.file_id;
+        let saved_file = Arc::clone(&self.file);
+        let saved_code_handles = self.code_handles.clone();
+        let result = self.execute_file_object_with_this(file_id, object_index, args, this_obj);
+        self.file_id = saved_file_id;
+        self.file = saved_file;
+        self.code_handles = saved_code_handles;
+        result
     }
 
     fn call_string_method(&self, value: String, name: &str, args: Vec<Variant>) -> Result<Variant> {
@@ -1055,14 +1194,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
-    pub(super) fn instance_of(&self, value: &Variant, class_name: &str) -> bool {
+    pub(super) fn instance_of(&mut self, value: &Variant, class_name: &str) -> Result<bool> {
         let Ok(handle) = self.resolve_object(value.clone()) else {
-            return false;
+            return Ok(false);
         };
-        self.runtime.heap[handle.0]
-            .class_infos
-            .iter()
-            .any(|info| info == class_name)
+        let mut seen = Vec::new();
+        let mut current = Some(handle);
+        while let Some(handle) = current {
+            if seen.contains(&handle.0) {
+                return Ok(false);
+            }
+            seen.push(handle.0);
+            if self.runtime.heap[handle.0]
+                .class_infos
+                .iter()
+                .any(|info| info == class_name)
+            {
+                return Ok(true);
+            }
+            current = self.super_class_handle(handle)?;
+        }
+        Ok(false)
     }
 
     pub(super) fn add_class_info(&mut self, handle: ObjectHandle, info: String) {
@@ -1091,10 +1243,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 .cloned()
                 .ok_or_else(|| TjsError::runtime("property name missing"))?;
             let handle = self.code_handles[property.object];
-            if self.runtime.heap[dest.0].get_raw(&name).is_none() {
-                self.runtime.heap[dest.0]
-                    .set(name, Variant::Closure(Closure::new(handle, Some(dest))));
-            }
+            self.runtime.heap[dest.0].set(name, Variant::Closure(Closure::new(handle, Some(dest))));
         }
         Ok(())
     }

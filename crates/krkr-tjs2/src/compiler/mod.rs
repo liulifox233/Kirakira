@@ -277,6 +277,55 @@ mod tests {
     }
 
     #[test]
+    fn class_extender_initializes_base_body_before_constructor_once() {
+        assert_eq!(
+            execute_source(
+                "class_extender_body.tjs",
+                r#"
+                    class Base {
+                        var value = 40;
+                        function Base() { value += 2; }
+                        function getValue() { return value; }
+                    }
+                    class Child extends Base {
+                        function Child() { super.Base(); }
+                    }
+                    var c = new Child();
+                    return c.getValue();
+                "#
+            )
+            .expect("execute"),
+            Variant::Integer(42)
+        );
+    }
+
+    #[test]
+    fn repeated_instances_do_not_pollute_class_super_chain() {
+        assert_eq!(
+            execute_source(
+                "class_super_chain.tjs",
+                r#"
+                    class Root {
+                        function rootValue() { return "root"; }
+                    }
+                    class Middle extends Root {
+                        function Middle() { }
+                    }
+                    class Leaf extends Middle {
+                        function Leaf() { super.Middle(); }
+                    }
+                    var first = new Leaf();
+                    var second = new Leaf();
+                    return typeof Leaf.rootValue + ":" + second.rootValue() + ":" +
+                        (Leaf instanceof "Root") + ":" + (second instanceof "Root");
+                "#
+            )
+            .expect("execute"),
+            Variant::String("Object:root:1:1".to_string())
+        );
+    }
+
+    #[test]
     fn super_native_constructor_and_method_bind_leaf_instance() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);
@@ -299,6 +348,33 @@ mod tests {
         assert_eq!(
             runtime.execute_file(&file).expect("execute"),
             Variant::String("7:1".to_string())
+        );
+    }
+
+    #[test]
+    fn native_base_class_remains_visible_through_script_chain() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "native_chain.tjs",
+            r#"
+            class Middle extends NativeBase {
+                function Middle() { super.NativeBase(); }
+            }
+            class Child extends Middle {
+                function Child() { super.Middle(); }
+            }
+            var first = new Child();
+            var second = new Child();
+            return typeof Child.nativeValue + ":" + second.nativeValue() + ":" +
+                (Child instanceof "NativeBase") + ":" + (second instanceof "NativeBase");
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("Object:7:1:1".to_string())
         );
     }
 
