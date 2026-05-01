@@ -399,13 +399,15 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
             MirInst::RegisterMembers => self.emit_op(126),
             MirInst::ApplyClassExtender {
                 class_object,
-                extender,
+                getter,
             } => {
                 let class = self.alloc_reg();
-                let data = self.data_for_const_value(&MirConst::CodeObject(*class_object))?;
-                self.emit(&[1, class, data]);
-                let extender = self.ensure_reg(*extender)?;
-                self.emit(&[125, class, extender]);
+                let class_data = self.data_for_const_value(&MirConst::CodeObject(*class_object))?;
+                self.emit(&[1, class, class_data]);
+                let getter_reg = self.alloc_reg();
+                let getter_data = self.data_for_const_value(&MirConst::CodeObject(*getter))?;
+                self.emit(&[1, getter_reg, getter_data]);
+                self.emit(&[125, class, getter_reg]);
             }
             MirInst::BuildArray { dst, elements } => self.emit_build_array(*dst, elements)?,
             MirInst::BuildDictionary { dst, entries } => {

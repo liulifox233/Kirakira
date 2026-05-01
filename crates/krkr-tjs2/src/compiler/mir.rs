@@ -432,10 +432,10 @@ impl MirObject {
             }
             MirInst::ApplyClassExtender {
                 class_object,
-                extender,
+                getter,
             } => {
                 module.require_object(*class_object)?;
-                self.validate_value(module, *extender)
+                module.require_object(*getter)
             }
             MirInst::BuildArray { dst, elements } => {
                 self.validate_slot(*dst)?;
@@ -942,7 +942,7 @@ pub enum MirInst {
     RegisterMembers,
     ApplyClassExtender {
         class_object: ObjectId,
-        extender: Value,
+        getter: ObjectId,
     },
     BuildArray {
         dst: SlotId,
@@ -1727,14 +1727,15 @@ impl ObjectBuilder {
             lowerer.add_span(decl.span),
         );
 
-        for extender in &decl.extends {
-            let value = class_object.lower_expr(lowerer, extender)?;
+        for (index, extender) in decl.extends.iter().enumerate() {
+            let getter = lowerer.lower_super_class_getter(class_name, class_id, extender)?;
             class_object.emit(MirInst::ApplyClassExtender {
                 class_object: class_id,
-                extender: value,
+                getter,
             });
-            let getter = lowerer.lower_super_class_getter(class_name, class_id, extender)?;
-            class_object.object.super_class_getter = Some(getter);
+            if index == 0 {
+                class_object.object.super_class_getter = Some(getter);
+            }
         }
 
         for member in &decl.body {

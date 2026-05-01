@@ -31,6 +31,7 @@ pub(super) enum Continuation {
         class_handle: ObjectHandle,
         class_name: String,
         constructor_args: Vec<Variant>,
+        run_constructor: bool,
         target: Box<Continuation>,
     },
 }
