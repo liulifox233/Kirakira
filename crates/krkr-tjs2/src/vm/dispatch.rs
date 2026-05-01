@@ -627,7 +627,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         dest_reg: i16,
     ) -> Result<Variant> {
         let base_depth = self.runtime.call_depth;
-        match self.call_member_direct_cont(object_value, name, args, Continuation::Root)? {
+        match self.call_member_direct_cont(object_value, name, args, None, Continuation::Root)? {
             CallOutcome::Immediate(value, Continuation::Root) => {
                 Ok(if dest_reg == 0 { Variant::Void } else { value })
             }
@@ -646,6 +646,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         object_value: Variant,
         name: &str,
         args: Vec<Variant>,
+        caller_this: Option<ObjectHandle>,
         continuation: Continuation,
     ) -> Result<CallOutcome> {
         let receiver_type = self.value_debug_type(&object_value);
@@ -687,9 +688,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             })?;
         let callee_type = self.value_debug_type(&member);
         let receiver = self.receiver_this(handle);
+        let receiver_this = if let Some(this_obj) = caller_this
+            && self.is_class_in_instance_chain(this_obj, handle)?
+        {
+            this_obj
+        } else {
+            receiver
+        };
         self.call_value(
             member,
-            closure_this.or(Some(receiver)),
+            closure_this.or(Some(receiver_this)),
             args,
             false,
             continuation,
@@ -702,6 +710,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 callee_type: Some(callee_type),
             })
         })
+    }
+
+    fn is_class_in_instance_chain(
+        &mut self,
+        instance: ObjectHandle,
+        class_handle: ObjectHandle,
+    ) -> Result<bool> {
+        let mut seen = Vec::new();
+        let mut current = self.super_class_handle(instance)?;
+        while let Some(handle) = current {
+            if handle == class_handle {
+                return Ok(true);
+            }
+            if seen.contains(&handle.0) {
+                return Ok(false);
+            }
+            seen.push(handle.0);
+            current = self.super_class_handle(handle)?;
+        }
+        Ok(false)
     }
 
     pub fn call_object_method(

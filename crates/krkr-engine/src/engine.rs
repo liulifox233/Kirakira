@@ -361,6 +361,16 @@ impl KrkrEngine {
                 kind: TjsEventKind::AsyncTrigger,
             })
             .collect::<Vec<_>>();
+        events.extend(
+            self.tjs_runtime
+                .host_mut()
+                .take_due_audio_fade_completions()
+                .into_iter()
+                .map(|handle| TjsEvent {
+                    handle,
+                    kind: TjsEventKind::AudioFadeCompleted,
+                }),
+        );
 
         for handle in self.tjs_runtime.host().timer_handles() {
             let enabled = self
@@ -425,6 +435,7 @@ impl KrkrEngine {
         let method = match event.kind {
             TjsEventKind::Timer => "onTimer",
             TjsEventKind::AsyncTrigger => "onFire",
+            TjsEventKind::AudioFadeCompleted => "onFadeCompleted",
         };
         if matches!(
             self.tjs_runtime.object_member(event.handle, method),
@@ -788,6 +799,7 @@ struct TjsEvent {
 enum TjsEventKind {
     Timer,
     AsyncTrigger,
+    AudioFadeCompleted,
 }
 
 #[derive(Clone, Debug)]
@@ -4303,6 +4315,146 @@ mod tests {
                 assert_eq!(*volume, 1.0);
             }
             commands => panic!("expected one play command, got {commands:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_class_object_fade_uses_current_instance() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("music.ogg"), b"music bytes").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class KAGSoundBuffer
+                {
+                    var sbclass;
+                    function KAGSoundBuffer(sbclass)
+                    {
+                        this.sbclass = sbclass;
+                    }
+                    function fadeOutAndStop(time)
+                    {
+                        sbclass.fade(0, time, 0);
+                    }
+                }
+
+                class KAGWaveSoundBuffer extends WaveSoundBuffer, KAGSoundBuffer
+                {
+                    function KAGWaveSoundBuffer()
+                    {
+                        super.WaveSoundBuffer();
+                        KAGSoundBuffer(global.WaveSoundBuffer);
+                    }
+                }
+
+                var buffer = new KAGWaveSoundBuffer();
+                buffer.open("music.ogg");
+                buffer.looping = 1;
+                buffer.play();
+                buffer.fadeOutAndStop(1000);
+                "#,
+            )
+            .expect("script");
+
+        let commands = engine.host_mut().take_audio_commands();
+        match &commands[..] {
+            [
+                AudioCommand::Play { id: play_id, .. },
+                AudioCommand::SetVolume {
+                    id,
+                    volume,
+                    fade_seconds,
+                },
+            ] => {
+                assert_eq!(id, play_id);
+                assert_eq!(*volume, 0.0);
+                assert_eq!(*fade_seconds, 1.0);
+            }
+            commands => panic!("expected play then fade command, got {commands:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_fade_completion_runs_script_callback() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("music.ogg"), b"music bytes").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class KAGSoundBuffer
+                {
+                    var sbclass;
+                    var inFadeAndStop = false;
+
+                    function KAGSoundBuffer(sbclass)
+                    {
+                        this.sbclass = sbclass;
+                    }
+
+                    function fadeOutAndStop(time)
+                    {
+                        inFadeAndStop = true;
+                        sbclass.fade(0, time, 0);
+                    }
+
+                    function onFadeCompleted()
+                    {
+                        if(inFadeAndStop)
+                        {
+                            sbclass.stop();
+                            inFadeAndStop = false;
+                        }
+                    }
+                }
+
+                class KAGWaveSoundBuffer extends WaveSoundBuffer, KAGSoundBuffer
+                {
+                    function KAGWaveSoundBuffer()
+                    {
+                        super.WaveSoundBuffer();
+                        KAGSoundBuffer(global.WaveSoundBuffer);
+                    }
+                }
+
+                var buffer = new KAGWaveSoundBuffer();
+                buffer.open("music.ogg");
+                buffer.looping = 1;
+                buffer.play();
+                buffer.fadeOutAndStop(0);
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        let commands = engine.host_mut().take_audio_commands();
+        match &commands[..] {
+            [
+                AudioCommand::Play { id: play_id, .. },
+                AudioCommand::SetVolume { id: fade_id, .. },
+                AudioCommand::Stop { id: stop_id, .. },
+            ] => {
+                assert_eq!(fade_id, play_id);
+                assert_eq!(stop_id, play_id);
+            }
+            commands => panic!("expected play, fade, then stop, got {commands:?}"),
         }
 
         fs::remove_dir_all(root).expect("cleanup");

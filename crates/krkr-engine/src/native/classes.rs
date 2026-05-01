@@ -644,7 +644,7 @@ fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: Ob
     runtime.register_object_native(handle, "play", wave_sound_buffer_play);
     runtime.register_object_native(handle, "stop", wave_sound_buffer_stop);
     runtime.register_object_native(handle, "fade", wave_sound_buffer_fade);
-    runtime.register_object_native(handle, "stopFade", native_wave_noop);
+    runtime.register_object_native(handle, "stopFade", wave_sound_buffer_stop_fade);
     runtime.register_object_native(handle, "setPos", wave_sound_buffer_set_pos);
     runtime.register_object_native(handle, "freeDirectSound", native_wave_noop);
     runtime.register_object_native(handle, "getVisBuffer", native_wave_noop);
@@ -697,6 +697,7 @@ fn wave_sound_buffer_stop(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.stop")?;
+    runtime.host_mut().cancel_audio_fade_completion(this);
     if let Some(id) = runtime
         .host()
         .native_audio_buffer(this)
@@ -709,6 +710,16 @@ fn wave_sound_buffer_stop(
     }
     runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
     runtime.set_object_member(this, "paused", Variant::Integer(0));
+    Ok(Variant::Void)
+}
+
+fn wave_sound_buffer_stop_fade(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.stopFade")?;
+    runtime.host_mut().cancel_audio_fade_completion(this);
     Ok(Variant::Void)
 }
 
@@ -748,6 +759,9 @@ fn wave_sound_buffer_fade(
                 volume,
                 fade_seconds: millis as f32 / 1000.0,
             });
+        runtime
+            .host_mut()
+            .schedule_audio_fade_completion(this, millis);
     }
     Ok(Variant::Void)
 }

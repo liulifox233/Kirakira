@@ -48,6 +48,7 @@ pub struct KrkrHost {
     next_texture_id: u64,
     next_audio_instance_id: u64,
     native_audio_buffers: BTreeMap<ObjectHandle, NativeAudioBuffer>,
+    pending_audio_fade_completions: BTreeMap<ObjectHandle, i64>,
     pending_audio_commands: Vec<AudioCommand>,
     text_encoding: String,
     termination_requested: bool,
@@ -82,6 +83,7 @@ impl Default for KrkrHost {
             next_texture_id: 1,
             next_audio_instance_id: 1,
             native_audio_buffers: BTreeMap::new(),
+            pending_audio_fade_completions: BTreeMap::new(),
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
@@ -121,6 +123,7 @@ impl KrkrHost {
             next_texture_id: 1,
             next_audio_instance_id: 1,
             native_audio_buffers: BTreeMap::new(),
+            pending_audio_fade_completions: BTreeMap::new(),
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             termination_requested: false,
@@ -393,6 +396,7 @@ impl KrkrHost {
         self.timers.remove(&handle);
         self.pending_async_triggers.remove(&handle);
         self.pending_layer_paints.remove(&handle);
+        self.pending_audio_fade_completions.remove(&handle);
         self.kag_parsers.remove(&handle);
         if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
             self.pending_audio_commands.push(AudioCommand::Stop {
@@ -423,6 +427,7 @@ impl KrkrHost {
             self.timers.remove(&handle);
             self.pending_async_triggers.remove(&handle);
             self.pending_layer_paints.remove(&handle);
+            self.pending_audio_fade_completions.remove(&handle);
             self.kag_parsers.remove(&handle);
             if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
                 self.pending_audio_commands.push(AudioCommand::Stop {
@@ -478,6 +483,28 @@ impl KrkrHost {
         std::mem::take(&mut self.pending_async_triggers)
             .into_iter()
             .collect()
+    }
+
+    pub(crate) fn schedule_audio_fade_completion(&mut self, handle: ObjectHandle, millis: i64) {
+        let due = self.now_millis().saturating_add(millis.max(0));
+        self.pending_audio_fade_completions.insert(handle, due);
+    }
+
+    pub(crate) fn cancel_audio_fade_completion(&mut self, handle: ObjectHandle) {
+        self.pending_audio_fade_completions.remove(&handle);
+    }
+
+    pub(crate) fn take_due_audio_fade_completions(&mut self) -> Vec<ObjectHandle> {
+        let now = self.now_millis();
+        let due = self
+            .pending_audio_fade_completions
+            .iter()
+            .filter_map(|(handle, due)| (*due <= now).then_some(*handle))
+            .collect::<Vec<_>>();
+        for handle in &due {
+            self.pending_audio_fade_completions.remove(handle);
+        }
+        due
     }
 
     pub(crate) fn request_layer_paint(&mut self, handle: ObjectHandle) {
