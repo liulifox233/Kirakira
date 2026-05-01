@@ -31,6 +31,7 @@ pub struct KrkrHost {
     native_layers: BTreeMap<ObjectHandle, LayerId>,
     timers: BTreeMap<ObjectHandle, TimerState>,
     pending_async_triggers: BTreeSet<ObjectHandle>,
+    pending_layer_paints: BTreeSet<ObjectHandle>,
     kag_layers: BTreeMap<String, LayerId>,
     current_kag_page: String,
     current_kag_layer: String,
@@ -56,6 +57,7 @@ impl Default for KrkrHost {
             native_layers: BTreeMap::new(),
             timers: BTreeMap::new(),
             pending_async_triggers: BTreeSet::new(),
+            pending_layer_paints: BTreeSet::new(),
             kag_layers: BTreeMap::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
@@ -86,6 +88,7 @@ impl KrkrHost {
             native_layers: BTreeMap::new(),
             timers: BTreeMap::new(),
             pending_async_triggers: BTreeSet::new(),
+            pending_layer_paints: BTreeSet::new(),
             kag_layers: BTreeMap::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
@@ -354,6 +357,38 @@ impl KrkrHost {
             .find_map(|(handle, id)| (*id == layer_id).then_some(*handle))
     }
 
+    pub(crate) fn invalidate_native_object(&mut self, handle: ObjectHandle) {
+        self.timers.remove(&handle);
+        self.pending_async_triggers.remove(&handle);
+        self.pending_layer_paints.remove(&handle);
+        self.kag_parsers.remove(&handle);
+
+        let Some(layer_id) = self.native_layers.get(&handle).copied() else {
+            return;
+        };
+
+        let mut removed_layer_ids = BTreeSet::new();
+        self.collect_layer_subtree_ids(layer_id, &mut removed_layer_ids);
+        for layer_id in &removed_layer_ids {
+            self.layer_tree.remove_layer(*layer_id);
+        }
+
+        let removed_handles = self
+            .native_layers
+            .iter()
+            .filter_map(|(handle, layer_id)| {
+                removed_layer_ids.contains(layer_id).then_some(*handle)
+            })
+            .collect::<Vec<_>>();
+        for handle in removed_handles {
+            self.native_layers.remove(&handle);
+            self.timers.remove(&handle);
+            self.pending_async_triggers.remove(&handle);
+            self.pending_layer_paints.remove(&handle);
+            self.kag_parsers.remove(&handle);
+        }
+    }
+
     pub(crate) fn register_timer(&mut self, handle: ObjectHandle) {
         self.timers.entry(handle).or_insert(TimerState {
             next_fire_millis: None,
@@ -397,6 +432,16 @@ impl KrkrHost {
 
     pub(crate) fn take_pending_async_triggers(&mut self) -> Vec<ObjectHandle> {
         std::mem::take(&mut self.pending_async_triggers)
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn request_layer_paint(&mut self, handle: ObjectHandle) {
+        self.pending_layer_paints.insert(handle);
+    }
+
+    pub(crate) fn take_pending_layer_paints(&mut self) -> Vec<ObjectHandle> {
+        std::mem::take(&mut self.pending_layer_paints)
             .into_iter()
             .collect()
     }
@@ -506,6 +551,20 @@ impl KrkrHost {
             .max()
             .unwrap_or(0)
             .saturating_add(1)
+    }
+
+    fn collect_layer_subtree_ids(&self, root: LayerId, output: &mut BTreeSet<LayerId>) {
+        if !output.insert(root) {
+            return;
+        }
+        let children = self
+            .layer_tree()
+            .layers()
+            .filter_map(|layer| (layer.parent == Some(root)).then_some(layer.id))
+            .collect::<Vec<_>>();
+        for child in children {
+            self.collect_layer_subtree_ids(child, output);
+        }
     }
 }
 
@@ -727,6 +786,10 @@ impl TjsHost for KrkrHost {
 
     fn log(&mut self, message: &str) {
         KrkrHost::log(self, message);
+    }
+
+    fn invalidate_object(&mut self, handle: ObjectHandle) {
+        self.invalidate_native_object(handle);
     }
 }
 

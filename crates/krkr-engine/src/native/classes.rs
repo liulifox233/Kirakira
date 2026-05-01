@@ -995,10 +995,7 @@ fn layer_update(
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer.update requires this"))?;
-    if matches!(runtime.object_member(this, "onPaint"), Variant::Void) {
-        return Ok(Variant::Void);
-    }
-    runtime.call_object_method(this, "onPaint", Vec::new())?;
+    runtime.host_mut().request_layer_paint(this);
     Ok(Variant::Void)
 }
 

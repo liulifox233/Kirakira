@@ -41,6 +41,8 @@ pub trait TjsHost {
     }
 
     fn log(&mut self, _message: &str) {}
+
+    fn invalidate_object(&mut self, _handle: ObjectHandle) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -249,6 +251,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     pub fn object_member(&self, object: ObjectHandle, name: &str) -> Variant {
         self.heap[object.0].get(name)
+    }
+
+    pub fn object_valid(&self, object: ObjectHandle) -> bool {
+        self.heap.get(object.0).is_some_and(|object| object.valid)
     }
 
     pub fn bound_this(&self, object: ObjectHandle) -> Option<ObjectHandle> {

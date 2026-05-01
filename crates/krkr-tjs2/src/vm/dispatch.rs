@@ -87,6 +87,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     return Ok(Variant::Closure(Closure::new(primary, bind_this)));
                 }
             }
+            if let Some(this_obj) = bind_this
+                && let Some(value) = self.runtime.heap[this_obj.0].get_raw(name)
+            {
+                return Ok(value);
+            }
             return self.prop_get_handle(fallback, name, flags, caller_this);
         }
 
@@ -150,13 +155,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<()> {
         let kind = self.runtime.heap[handle.0].kind.clone();
         if let ObjectKind::Proxy {
-            primary, fallback, ..
+            primary,
+            fallback,
+            bind_this,
         } = kind
         {
-            if let Some(primary) = primary
-                && (flags.ensure || self.runtime.heap[primary.0].get_raw(name).is_some())
-            {
-                return self.prop_set_handle(primary, name, value, flags, caller_this);
+            if let Some(primary) = primary {
+                let primary_has_member = self.runtime.heap[primary.0].get_raw(name).is_some();
+                if primary_has_member || (bind_this.is_none() && flags.ensure) {
+                    return self.prop_set_handle(primary, name, value, flags, caller_this);
+                }
+            }
+            if let Some(this_obj) = bind_this {
+                let mut value = self.materialize_code_object(value);
+                if let Variant::Closure(closure) = &mut value
+                    && closure.this_obj.is_none()
+                {
+                    closure.this_obj = Some(this_obj);
+                }
+                self.runtime.heap[this_obj.0].set(name, value);
+                return Ok(());
             }
             return self.prop_set_handle(fallback, name, value, flags, caller_this);
         }
