@@ -463,6 +463,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let value = match self.resolve_object(frame.get(inst.operands[0])?) {
                     Ok(handle) => {
                         self.runtime.heap[handle.0].valid = false;
+                        self.runtime.host_mut().invalidate_object(handle);
                         Variant::Integer(1)
                     }
                     Err(_) => Variant::Integer(0),

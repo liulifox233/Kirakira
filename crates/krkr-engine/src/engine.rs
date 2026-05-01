@@ -251,6 +251,7 @@ impl KrkrEngine {
         self.handle_input_events(&input.events)?;
         self.pump_tjs_events()?;
         let tick = self.advance(delta)?;
+        self.pump_layer_paints()?;
         self.sync_native_layers_from_tjs()?;
         let output = self.core_engine.tick_running_with_layers(
             input.frame,
@@ -263,6 +264,35 @@ impl KrkrEngine {
             message_layer: self.message_layer.clone(),
             location: self.kag_location(),
         })
+    }
+
+    fn pump_layer_paints(&mut self) -> Result<()> {
+        const MAX_LAYER_PAINT_PASSES: usize = 1024;
+
+        for _ in 0..MAX_LAYER_PAINT_PASSES {
+            let layers = self.tjs_runtime.host_mut().take_pending_layer_paints();
+            if layers.is_empty() {
+                return Ok(());
+            }
+            for layer in layers {
+                if !self.tjs_runtime.object_valid(layer) {
+                    continue;
+                }
+                if matches!(
+                    self.tjs_runtime.object_member(layer, "onPaint"),
+                    Variant::Void
+                ) {
+                    continue;
+                }
+                self.tjs_runtime
+                    .call_object_method(layer, "onPaint", Vec::new())?;
+            }
+        }
+
+        self.tjs_runtime
+            .host_mut()
+            .log("layer paint pump reached its per-frame pass budget; remaining paints deferred");
+        Ok(())
     }
 
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
@@ -509,6 +539,9 @@ impl KrkrEngine {
     fn sync_native_layers_from_tjs(&mut self) -> Result<()> {
         let entries = self.tjs_runtime.host().native_layer_entries();
         for (handle, layer_id) in entries {
+            if !self.tjs_runtime.object_valid(handle) {
+                continue;
+            }
             let parent = match self.tjs_runtime.object_member(handle, "parent") {
                 Variant::Object(parent) => {
                     let parent = self.tjs_runtime.bound_this(parent).unwrap_or(parent);
@@ -1964,6 +1997,37 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_super_size_assignment_updates_bound_instance() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("button.png"), 6, 2, &[255; 48]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class ButtonLikeLayer extends Layer {
+                    function ButtonLikeLayer() { super.Layer(...); }
+                    function loadButtonImage(storage) {
+                        super.loadImages(storage);
+                        super.width = imageWidth \ 3;
+                        super.height = imageHeight;
+                    }
+                }
+                var layer = new ButtonLikeLayer();
+                layer.loadButtonImage("button.png");
+                return layer.width + ":" + layer.height + ":" + layer.imageWidth;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("2:2:6".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn native_set_size_to_image_size_uses_script_image_members() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -2149,6 +2213,70 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_invalidate_removes_child_from_render_tree_and_hit_testing() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parentLayer = new Layer();
+                parentLayer.setPos(10, 20);
+                parentLayer.setSize(100, 100);
+                parentLayer.visible = true;
+
+                global.buttonClicks = 0;
+                global.buttonLayer = new Layer(null, parentLayer);
+                buttonLayer.setPos(3, 4);
+                buttonLayer.setSize(5, 6);
+                buttonLayer.setImageSize(5, 6);
+                buttonLayer.fillRect(0, 0, 5, 6, 0xffffffff);
+                buttonLayer.visible = true;
+                buttonLayer.onMouseUp = function(x, y, button, shift) {
+                    global.buttonClicks += 1;
+                };
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("initial frame");
+        assert_eq!(frame.output.image_uploads.len(), 1);
+
+        engine
+            .execute_script("cleanup.tjs", "invalidate buttonLayer;")
+            .expect("invalidate");
+        let frame = engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(14.0, 25.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("post-invalidate frame");
+
+        assert_eq!(frame.output.image_uploads.len(), 0);
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "buttonClicks")
+                .expect("buttonClicks"),
+            Variant::Integer(0)
+        );
+    }
+
+    #[test]
     fn update_dispatches_primary_pointer_release_to_top_native_layer() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -2263,6 +2391,61 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn layer_update_defers_on_paint_until_after_mouse_handler_returns() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class ProbeLayer extends Layer {
+                    var hot = false;
+                    function ProbeLayer() {
+                        super.Layer(...);
+                        setPos(10, 20);
+                        setSize(2, 4);
+                        setImageSize(6, 4);
+                        visible = true;
+                    }
+                    function onMouseEnter() {
+                        update();
+                        hot = true;
+                    }
+                    function onPaint() {
+                        imageLeft = hot ? -4 : 0;
+                    }
+                }
+                global.testLayer = new ProbeLayer();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::CursorMoved {
+                        position: Point::new(11.0, 22.0),
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("hover frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "testLayer.imageLeft")
+                .expect("imageLeft"),
+            Variant::Integer(-4)
+        );
     }
 
     #[test]

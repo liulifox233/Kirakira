@@ -53,9 +53,20 @@ fn output_to_result<T>(output: FrontendOutput<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::ObjectHandle;
+    use crate::runtime::{ObjectHandle, TjsHost};
 
     use super::*;
+
+    #[derive(Default)]
+    struct InvalidateTrackingHost {
+        invalidated: Vec<ObjectHandle>,
+    }
+
+    impl TjsHost for InvalidateTrackingHost {
+        fn invalidate_object(&mut self, handle: ObjectHandle) {
+            self.invalidated.push(handle);
+        }
+    }
 
     #[test]
     fn public_compiler_glue_parses_source() {
@@ -326,6 +337,38 @@ mod tests {
     }
 
     #[test]
+    fn backslash_operator_performs_integer_division() {
+        assert_eq!(
+            execute_source(
+                "idiv.tjs",
+                r#"var x = 690; x \= 3; return x + ":" + (10 \ 4);"#
+            )
+            .expect("execute"),
+            Variant::String("230:2".to_string())
+        );
+    }
+
+    #[test]
+    fn invalidate_operator_notifies_runtime_host() {
+        let file = compile_source_to_bytecode(
+            "invalidate_host.tjs",
+            r#"
+            var object = %[];
+            invalidate object;
+            return 1;
+            "#,
+        )
+        .expect("bytecode");
+        let mut runtime = Runtime::with_host(InvalidateTrackingHost::default());
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::Integer(1)
+        );
+        assert_eq!(runtime.host().invalidated.len(), 1);
+    }
+
+    #[test]
     fn super_native_constructor_and_method_bind_leaf_instance() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);
@@ -379,6 +422,31 @@ mod tests {
     }
 
     #[test]
+    fn super_native_instance_member_access_uses_bound_instance() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "native_super_member.tjs",
+            r#"
+            class Child extends NativeBase {
+                function Child() { super.NativeBase(); }
+                function setNativeSlot(value) { super.nativeSlot = value; }
+                function getNativeSlot() { return super.nativeSlot; }
+            }
+            var c = new Child();
+            c.setNativeSlot(23);
+            return c.nativeSlot + ":" + c.getNativeSlot() + ":" + typeof global.nativeSlot;
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("23:23:undefined".to_string())
+        );
+    }
+
+    #[test]
     fn new_native_constructor_does_not_reuse_caller_this() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);
@@ -424,6 +492,7 @@ mod tests {
                     .unwrap_or_else(|| runtime.alloc_ordinary_object());
                 runtime.add_object_class_info(handle, "NativeBase");
                 runtime.set_object_member(handle, "initialized", Variant::Integer(1));
+                runtime.set_object_member(handle, "nativeSlot", Variant::Integer(0));
                 runtime.register_object_native(handle, "nativeValue", native_base_value);
                 Ok(Variant::Object(handle))
             },
