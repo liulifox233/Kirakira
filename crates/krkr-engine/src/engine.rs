@@ -33,7 +33,7 @@ impl Default for KagRunBudget {
     fn default() -> Self {
         Self {
             max_tags_per_tick: 1000,
-            max_wall_time: Duration::from_millis(2),
+            max_wall_time: Duration::from_millis(16),
         }
     }
 }
@@ -320,6 +320,8 @@ impl KrkrEngine {
     fn pump_tjs_events(&mut self) -> Result<()> {
         const MAX_NATIVE_EVENT_PASSES: usize = 1024;
 
+        self.fire_continuous_handlers()?;
+
         for _ in 0..MAX_NATIVE_EVENT_PASSES {
             let events = self.collect_due_tjs_events()?;
             if events.is_empty() {
@@ -333,6 +335,16 @@ impl KrkrEngine {
         self.tjs_runtime
             .host_mut()
             .log("native event pump reached its per-frame pass budget; remaining events deferred");
+        Ok(())
+    }
+
+    fn fire_continuous_handlers(&mut self) -> Result<()> {
+        for handler in self.tjs_runtime.host().continuous_handlers() {
+            if matches!(handler, Variant::Void) {
+                continue;
+            }
+            self.tjs_runtime.call_function(handler, Vec::new())?;
+        }
         Ok(())
     }
 
@@ -1037,6 +1049,18 @@ impl KagRuntimeTask {
                 }),
                 None => self.wait_click(message_layer, false),
             }),
+            "eval" => {
+                execute_eval_tag(runtime, tag)?;
+                Ok(TagAction::Continue)
+            }
+            "trace" => {
+                execute_trace_tag(runtime, tag)?;
+                Ok(TagAction::Continue)
+            }
+            "cm" | "ct" | "er" => {
+                message_layer.clear_text();
+                Ok(TagAction::Continue)
+            }
             "image" => {
                 apply_image_tag(runtime, tag)?;
                 Ok(TagAction::Continue)
@@ -1077,6 +1101,7 @@ impl KagRuntimeTask {
                 self.state = KagTaskState::Finished;
                 Ok(TagAction::Yield(KagYieldReason::Finished))
             }
+            "defstyle" | "resetstyle" | "ruby" => Ok(TagAction::Continue),
             _ => Ok(TagAction::Continue),
         }
     }
@@ -1254,6 +1279,24 @@ fn parse_color_attr(tag: &Tag, name: &str) -> Result<Option<[u8; 4]>> {
     ]))
 }
 
+fn execute_eval_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
+    let expression = tag
+        .literal_attr("exp")
+        .ok_or_else(|| TjsError::runtime("KAG eval tag requires exp"))?;
+    execute_expression_on_runtime(runtime, "kag eval", expression).map(|_| ())
+}
+
+fn execute_trace_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
+    let Some(expression) = tag.literal_attr("exp") else {
+        return Ok(());
+    };
+    let value = execute_expression_on_runtime(runtime, "kag trace", expression)?;
+    runtime
+        .host_mut()
+        .log(&format!("KAG trace `{expression}` => {value}"));
+    Ok(())
+}
+
 fn object_i64(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Result<i64> {
     runtime.object_member(object, name).to_integer()
 }
@@ -1420,6 +1463,11 @@ fn is_builtin_tag(tagname: &str) -> bool {
             | "ptext"
             | "wait"
             | "waitclick"
+            | "eval"
+            | "trace"
+            | "cm"
+            | "ct"
+            | "er"
             | "image"
             | "layopt"
             | "position"
@@ -1434,6 +1482,9 @@ fn is_builtin_tag(tagname: &str) -> bool {
             | "wm"
             | "waitload"
             | "waittrig"
+            | "defstyle"
+            | "resetstyle"
+            | "ruby"
             | "s"
     )
 }
@@ -1522,6 +1573,34 @@ mod tests {
             engine.preferred_viewport_size(),
             Some(Size::new(1280.0, 720.0))
         );
+    }
+
+    #[test]
+    fn window_add_tracks_children_and_primary_layer() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var layer = new Layer(window, null);
+                window.add(layer);
+                var before = window.children.count + ":" +
+                    (window.primaryLayer === layer) + ":" +
+                    (window.focusedLayer === layer) + ":" +
+                    (Window.mainWindow === window);
+                window.add(layer);
+                var deduped = window.children.count;
+                window.remove(layer);
+                return before + ":" + deduped + ":" + window.children.count + ":" +
+                    (window.primaryLayer === void) + ":" +
+                    (window.focusedLayer === void);
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1:1:1:1:1:0:1:1".to_string()));
     }
 
     #[test]
@@ -1930,6 +2009,51 @@ mod tests {
                 .expect("f value"),
             Variant::Integer(7)
         );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_eval_tag_executes_tjs_expression_before_embedded_text() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[eval exp=\"f.value = 7\"][emb exp=\"f.value\"]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script("inline.tjs", "var f = new Dictionary();")
+            .expect("setup globals");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["7".to_string()]);
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "f.value")
+                .expect("f value"),
+            Variant::Integer(7)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_clear_message_tags_clear_default_message_text() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[cm]B[er]C[ct]D").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["D".to_string()]);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -3543,7 +3667,6 @@ mod tests {
             .expect("script");
 
         assert_eq!(result, Variant::String("0:0:1".to_string()));
-
         let frame = engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
@@ -3551,6 +3674,38 @@ mod tests {
             )
             .expect("update");
         assert!(frame.output.transition.is_none());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_free_image_clears_uploaded_image() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[0, 255, 0, 255]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.visible = true;
+                layer.loadImages("sprite.png");
+                layer.freeImage();
+                return layer.imageWidth + ":" + layer.imageHeight + ":" + layer.width;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("0:0:1".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(frame.output.image_uploads.is_empty());
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -3617,6 +3772,44 @@ mod tests {
                 .expect("buttonClicks"),
             Variant::Integer(0)
         );
+    }
+
+    #[test]
+    fn native_layer_fill_rect_creates_solid_rgba_image() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.visible = true;
+                layer.setImageSize(2, 2);
+                layer.setSizeToImageSize();
+                layer.fillRect(1, 0, 1, 2, 0x80402010);
+                return layer.imageWidth + ":" + layer.imageHeight + ":" + layer.width;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("2:2:2".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(frame.output.image_uploads.len(), 1);
+        assert_eq!(
+            frame.output.image_uploads[0].rgba.as_ref(),
+            &[
+                0, 0, 0, 0, 0x40, 0x20, 0x10, 0x80, 0, 0, 0, 0, 0x40, 0x20, 0x10, 0x80
+            ]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -4260,6 +4453,60 @@ mod tests {
             engine.tjs_runtime().global_member("timerProbeCount"),
             Variant::Integer(1)
         );
+    }
+
+    #[test]
+    fn system_continuous_handler_runs_once_per_update_until_removed() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "continuous.tjs",
+                r#"
+                global.continuousCount = 0;
+                function continuousProbe() { global.continuousCount++; }
+                System.addContinuousHandler(continuousProbe);
+                "#,
+            )
+            .expect("script");
+
+        let input = EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new());
+        engine
+            .update(input.clone(), Duration::from_millis(16))
+            .expect("first update");
+        engine
+            .update(input, Duration::from_millis(16))
+            .expect("second update");
+        assert_eq!(
+            engine.tjs_runtime().global_member("continuousCount"),
+            Variant::Integer(2)
+        );
+
+        engine
+            .execute_script(
+                "continuous.tjs",
+                "System.removeContinuousHandler(continuousProbe);",
+            )
+            .expect("remove handler");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(16),
+            )
+            .expect("third update");
+        assert_eq!(
+            engine.tjs_runtime().global_member("continuousCount"),
+            Variant::Integer(2)
+        );
+    }
+
+    #[test]
+    fn system_exit_sets_host_termination_request() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script("system.tjs", "System.exit();")
+            .expect("exit");
+
+        assert!(engine.host().termination_requested());
     }
 
     #[test]

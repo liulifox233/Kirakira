@@ -16,7 +16,7 @@ use krkr_font::FontSystem;
 use krkr_kag::{KagParser, ParserSnapshot};
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, TjsHost},
+    runtime::{ObjectHandle, TjsHost, Variant},
 };
 use krkr_xp3::Xp3ResourceProvider;
 
@@ -36,6 +36,7 @@ pub struct KrkrHost {
     timers: BTreeMap<ObjectHandle, TimerState>,
     pending_async_triggers: BTreeSet<ObjectHandle>,
     pending_layer_paints: BTreeSet<ObjectHandle>,
+    continuous_handlers: Vec<Variant>,
     kag_layers: BTreeMap<String, LayerId>,
     pending_kag_layers: BTreeMap<String, LayerNode>,
     active_transition: Option<ActiveTransition>,
@@ -66,6 +67,7 @@ impl Default for KrkrHost {
             timers: BTreeMap::new(),
             pending_async_triggers: BTreeSet::new(),
             pending_layer_paints: BTreeSet::new(),
+            continuous_handlers: Vec::new(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
             active_transition: None,
@@ -101,6 +103,7 @@ impl KrkrHost {
             timers: BTreeMap::new(),
             pending_async_triggers: BTreeSet::new(),
             pending_layer_paints: BTreeSet::new(),
+            continuous_handlers: Vec::new(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
             active_transition: None,
@@ -129,6 +132,10 @@ impl KrkrHost {
 
     pub fn termination_requested(&self) -> bool {
         self.termination_requested
+    }
+
+    pub(crate) fn request_termination(&mut self) {
+        self.termination_requested = true;
     }
 
     pub fn text_encoding(&self) -> &str {
@@ -460,6 +467,24 @@ impl KrkrHost {
         std::mem::take(&mut self.pending_layer_paints)
             .into_iter()
             .collect()
+    }
+
+    pub(crate) fn add_continuous_handler(&mut self, handler: Variant) {
+        if !matches!(handler, Variant::Void)
+            && !self.continuous_handlers.iter().any(|item| item == &handler)
+        {
+            self.continuous_handlers.push(handler);
+        }
+    }
+
+    pub(crate) fn remove_continuous_handler(&mut self, handler: &Variant) -> bool {
+        let before = self.continuous_handlers.len();
+        self.continuous_handlers.retain(|item| item != handler);
+        before != self.continuous_handlers.len()
+    }
+
+    pub(crate) fn continuous_handlers(&self) -> Vec<Variant> {
+        self.continuous_handlers.clone()
     }
 
     pub(crate) fn ensure_kag_layer(&mut self, page: &str, layer: &str) -> LayerId {
