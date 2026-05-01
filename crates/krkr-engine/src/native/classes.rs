@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, time::Duration};
 
+use krkr_core::LayerNode;
 use krkr_font::{FontSpec, FontSystem, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
@@ -454,6 +455,7 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "bringToFront", layer_bring_to_front);
     register_native_method_preserving_script(runtime, handle, "bringToBack", layer_bring_to_back);
     register_native_method_preserving_script(runtime, handle, "assignImages", layer_assign_images);
+    register_native_method_preserving_script(runtime, handle, "exchangeInfo", layer_exchange_info);
     register_native_method_preserving_script(
         runtime,
         handle,
@@ -533,6 +535,12 @@ fn install_image_function_methods(runtime: &mut Runtime<KrkrHost>, handle: Objec
 type NativeMethod =
     fn(&mut Runtime<KrkrHost>, Option<ObjectHandle>, Vec<Variant>) -> Result<Variant>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RenderLayerTarget {
+    Native(u64),
+    Kag { page: String, layer: String },
+}
+
 fn register_native_method_preserving_script(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
@@ -582,6 +590,125 @@ fn this_layer_id(
     Ok((this, id))
 }
 
+fn this_render_layer_target(
+    runtime: &Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+) -> Result<(ObjectHandle, Option<RenderLayerTarget>)> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
+    let this = runtime.bound_this(this).unwrap_or(this);
+    Ok((this, render_layer_target(runtime, this)?))
+}
+
+fn render_layer_target(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Result<Option<RenderLayerTarget>> {
+    if let Some(RenderLayerTarget::Kag { page, layer }) = kag_layer_target(runtime, handle)
+        && page == "back"
+    {
+        return Ok(Some(RenderLayerTarget::Kag { page, layer }));
+    }
+    native_layer_id(runtime, handle).map(|id| id.map(RenderLayerTarget::Native))
+}
+
+fn kag_layer_target(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Option<RenderLayerTarget> {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    let Variant::Object(kag) = runtime.global_member("kag") else {
+        return None;
+    };
+
+    for page in ["fore", "back"] {
+        let Variant::Object(page_object) = runtime.object_member(kag, page) else {
+            continue;
+        };
+        if let Some(layer) = kag_page_layer_target(runtime, page_object, handle) {
+            return Some(RenderLayerTarget::Kag {
+                page: page.to_string(),
+                layer,
+            });
+        }
+    }
+
+    None
+}
+
+fn kag_page_layer_target(
+    runtime: &Runtime<KrkrHost>,
+    page_object: ObjectHandle,
+    handle: ObjectHandle,
+) -> Option<String> {
+    if same_object(runtime, runtime.object_member(page_object, "base"), handle) {
+        return Some("base".to_string());
+    }
+    if let Some(index) = kag_layer_array_index(runtime, page_object, "layers", handle) {
+        return Some(index.to_string());
+    }
+    if let Some(index) = kag_layer_array_index(runtime, page_object, "messages", handle) {
+        return Some(format!("message{index}"));
+    }
+    None
+}
+
+fn kag_layer_array_index(
+    runtime: &Runtime<KrkrHost>,
+    page_object: ObjectHandle,
+    member: &str,
+    handle: ObjectHandle,
+) -> Option<i64> {
+    let Variant::Object(array) = runtime.object_member(page_object, member) else {
+        return None;
+    };
+    let Ok(count) = runtime.object_member(array, "count").to_integer() else {
+        return None;
+    };
+    (0..count.max(0)).find(|index| {
+        same_object(
+            runtime,
+            runtime.object_member(array, &index.to_string()),
+            handle,
+        )
+    })
+}
+
+fn same_object(runtime: &Runtime<KrkrHost>, value: Variant, handle: ObjectHandle) -> bool {
+    let Variant::Object(candidate) = value else {
+        return false;
+    };
+    runtime.bound_this(candidate).unwrap_or(candidate) == handle
+}
+
+fn render_layer_snapshot(
+    runtime: &Runtime<KrkrHost>,
+    target: &RenderLayerTarget,
+) -> Option<LayerNode> {
+    match target {
+        RenderLayerTarget::Native(layer_id) => {
+            runtime.host().layer_tree().layer(*layer_id).cloned()
+        }
+        RenderLayerTarget::Kag { page, layer } => runtime.host().kag_layer(page, layer).cloned(),
+    }
+}
+
+fn mutate_render_layer<R>(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &RenderLayerTarget,
+    mutate: impl FnOnce(&mut LayerNode) -> R,
+) -> Option<R> {
+    match target {
+        RenderLayerTarget::Native(layer_id) => runtime
+            .host_mut()
+            .layer_tree_mut()
+            .layer_mut(*layer_id)
+            .map(mutate),
+        RenderLayerTarget::Kag { page, layer } => {
+            Some(runtime.host_mut().mutate_kag_layer(page, layer, mutate))
+        }
+    }
+}
+
 fn layer_load_images(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -628,9 +755,9 @@ fn layer_load_images(
     let image = runtime.host_mut().load_image_storage(&storage)?;
     let size = image.size();
 
-    match native_layer_id(runtime, this)? {
-        Some(layer_id) => {
-            if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+    match render_layer_target(runtime, this)? {
+        Some(target) => {
+            mutate_render_layer(runtime, &target, |layer| {
                 layer.set_image(image);
                 layer.visible = visible;
                 if let Some(left) = left {
@@ -648,7 +775,7 @@ fn layer_load_images(
                 if let Some(opacity) = opacity {
                     layer.opacity = opacity.clamp(0, 255) as u8;
                 }
-            }
+            });
         }
         None => {
             let page = match options {
@@ -681,6 +808,7 @@ fn layer_load_images(
         }
     }
     sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
+    mark_image_modified(runtime, this);
     runtime.set_object_member(this, "visible", Variant::Integer(i64::from(visible)));
     if let Some(left) = left {
         runtime.set_object_member(this, "left", Variant::Integer(left));
@@ -744,12 +872,14 @@ fn layer_set_pos(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let left = optional_integer(&args, 0)?.unwrap_or(0);
     let top = optional_integer(&args, 1)?.unwrap_or(0);
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.left = left as f32;
-        layer.top = top as f32;
+    if let Some(target) = target {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.left = left as f32;
+            layer.top = top as f32;
+        });
     }
     runtime.set_object_member(this, "left", Variant::Integer(left));
     runtime.set_object_member(this, "top", Variant::Integer(top));
@@ -761,12 +891,14 @@ fn layer_set_size(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
     let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.width = width as f32;
-        layer.height = height as f32;
+    if let Some(target) = target {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.width = width as f32;
+            layer.height = height as f32;
+        });
     }
     runtime.set_object_member(this, "width", Variant::Integer(width));
     runtime.set_object_member(this, "height", Variant::Integer(height));
@@ -778,12 +910,14 @@ fn layer_set_image_pos(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let left = optional_integer(&args, 0)?.unwrap_or(0);
     let top = optional_integer(&args, 1)?.unwrap_or(0);
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.image_left = left as f32;
-        layer.image_top = top as f32;
+    if let Some(target) = target {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.image_left = left as f32;
+            layer.image_top = top as f32;
+        });
     }
     runtime.set_object_member(this, "imageLeft", Variant::Integer(left));
     runtime.set_object_member(this, "imageTop", Variant::Integer(top));
@@ -795,7 +929,7 @@ fn layer_set_image_size(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
     let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
     let image = (width > 0 && height > 0).then(|| {
@@ -805,17 +939,20 @@ fn layer_set_image_size(
             vec![0; width as usize * height as usize * 4],
         )
     });
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.image_width = width as f32;
-        layer.image_height = height as f32;
-        if let Some(image) = image {
-            layer.image = Some(image);
-        } else {
-            layer.image = None;
-        }
+    if let Some(target) = target {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.image_width = width as f32;
+            layer.image_height = height as f32;
+            if let Some(image) = image {
+                layer.image = Some(image);
+            } else {
+                layer.image = None;
+            }
+        });
     }
     runtime.set_object_member(this, "imageWidth", Variant::Integer(width));
     runtime.set_object_member(this, "imageHeight", Variant::Integer(height));
+    mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
 
@@ -824,7 +961,7 @@ fn layer_set_size_to_image_size(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let width = runtime
         .object_member(this, "imageWidth")
         .to_integer()?
@@ -834,11 +971,10 @@ fn layer_set_size_to_image_size(
         .to_integer()?
         .max(0);
     let replacement_image = if width > 0 && height > 0 {
-        let needs_image = runtime
-            .host()
-            .layer_tree()
-            .layer(layer_id)
-            .and_then(|layer| layer.image.as_ref())
+        let needs_image = target
+            .as_ref()
+            .and_then(|target| render_layer_snapshot(runtime, target))
+            .and_then(|layer| layer.image)
             .map(|image| image.upload.width != width as u32 || image.upload.height != height as u32)
             .unwrap_or(true);
         needs_image.then(|| {
@@ -851,19 +987,25 @@ fn layer_set_size_to_image_size(
     } else {
         None
     };
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.image_width = width as f32;
-        layer.image_height = height as f32;
-        layer.width = width as f32;
-        layer.height = height as f32;
-        if width == 0 || height == 0 {
-            layer.image = None;
-        } else if let Some(image) = replacement_image {
-            layer.image = Some(image);
-        }
+    let replaces_content = width == 0 || height == 0 || replacement_image.is_some();
+    if let Some(target) = target {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.image_width = width as f32;
+            layer.image_height = height as f32;
+            layer.width = width as f32;
+            layer.height = height as f32;
+            if width == 0 || height == 0 {
+                layer.image = None;
+            } else if let Some(image) = replacement_image {
+                layer.image = Some(image);
+            }
+        });
     }
     runtime.set_object_member(this, "width", Variant::Integer(width));
     runtime.set_object_member(this, "height", Variant::Integer(height));
+    if replaces_content {
+        mark_image_modified(runtime, this);
+    }
     Ok(Variant::Void)
 }
 
@@ -872,11 +1014,50 @@ fn layer_assign_images(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let Some(source) = args.first().and_then(variant_object) else {
         return Ok(Variant::Void);
     };
-    copy_layer_images(runtime, this, layer_id, source)?;
+    if let Some(target) = target {
+        copy_layer_images(runtime, this, &target, source)?;
+    }
+    Ok(Variant::Void)
+}
+
+fn layer_exchange_info(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
+    let Some(comp) = variant_object(&runtime.object_member(this, "comp"))
+        .map(|comp| runtime.bound_this(comp).unwrap_or(comp))
+    else {
+        return Ok(Variant::Void);
+    };
+    let Some(this_layer_id) = native_layer_id(runtime, this)? else {
+        return Ok(Variant::Void);
+    };
+    let Some(comp_layer_id) = native_layer_id(runtime, comp)? else {
+        return Ok(Variant::Void);
+    };
+
+    let Some(this_layer) = runtime.host().layer_tree().layer(this_layer_id).cloned() else {
+        return Ok(Variant::Void);
+    };
+    let Some(comp_layer) = runtime.host().layer_tree().layer(comp_layer_id).cloned() else {
+        return Ok(Variant::Void);
+    };
+
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(this_layer_id) {
+        copy_render_state(layer, &comp_layer);
+    }
+    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(comp_layer_id) {
+        copy_render_state(layer, &this_layer);
+    }
+
     Ok(Variant::Void)
 }
 
@@ -923,17 +1104,20 @@ fn layer_begin_transition(
     let paired_comp = source
         .map(|source| runtime.bound_this(source).unwrap_or(source))
         .is_some_and(|source| Some(source) == comp);
-    if let Some(layer_id) = native_layer_id(runtime, this)? {
+    if let Some(target) = render_layer_target(runtime, this)? {
         if let Some(source) = source {
-            copy_layer_images(runtime, this, layer_id, source)?;
+            materialize_kag_back_to_native(runtime, source)?;
+            copy_layer_images(runtime, this, &target, source)?;
         }
-        if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        mutate_render_layer(runtime, &target, |layer| {
             layer.visible = true;
-        }
+            layer.renderable = true;
+        });
     }
     runtime.set_object_member(this, "visible", Variant::Integer(1));
     if duration == 0 {
-        if let Some(source_layer_id) = source_layer_id
+        if !paired_comp
+            && let Some(source_layer_id) = source_layer_id
             && let Some(source_layer) = runtime
                 .host_mut()
                 .layer_tree_mut()
@@ -959,6 +1143,53 @@ fn layer_begin_transition(
     Ok(Variant::Void)
 }
 
+fn materialize_kag_back_to_native(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Result<()> {
+    let Some(RenderLayerTarget::Kag { page, layer }) = kag_layer_target(runtime, handle) else {
+        return Ok(());
+    };
+    if page != "back" {
+        return Ok(());
+    }
+    let Some(layer_id) = native_layer_id(runtime, handle)? else {
+        return Ok(());
+    };
+    let Some(snapshot) = runtime.host().kag_layer(&page, &layer).cloned() else {
+        return Ok(());
+    };
+    if let Some(native_layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        let renderable = native_layer.renderable;
+        copy_render_content(native_layer, &snapshot);
+        native_layer.renderable = renderable;
+    }
+    Ok(())
+}
+
+fn copy_render_state(dest: &mut LayerNode, source: &LayerNode) {
+    copy_render_content(dest, source);
+    dest.renderable = source.renderable;
+}
+
+fn copy_render_content(dest: &mut LayerNode, source: &LayerNode) {
+    dest.left = source.left;
+    dest.top = source.top;
+    dest.width = source.width;
+    dest.height = source.height;
+    dest.image_left = source.image_left;
+    dest.image_top = source.image_top;
+    dest.image_width = source.image_width;
+    dest.image_height = source.image_height;
+    dest.visible = source.visible;
+    dest.enabled = source.enabled;
+    dest.node_enabled = source.node_enabled;
+    dest.opacity = source.opacity;
+    dest.layer_type = source.layer_type;
+    dest.face = source.face;
+    dest.image = source.image.clone();
+}
+
 fn layer_stop_transition(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -977,7 +1208,7 @@ fn layer_fill_rect(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     if is_province_face(runtime, this) {
         return Ok(Variant::Void);
     }
@@ -986,9 +1217,12 @@ fn layer_fill_rect(
     };
     let color = required_integer(&args, 4, "Layer.fillRect color")?;
     let rgba = color_to_rgba(color, None);
-    mutate_layer_pixels(runtime, layer_id, |pixels, image_width, image_height| {
-        fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
-    })?;
+    if let Some(target) = target {
+        mutate_layer_pixels(runtime, &target, |pixels, image_width, image_height| {
+            fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
+        })?;
+        mark_image_modified(runtime, this);
+    }
     Ok(Variant::Void)
 }
 
@@ -997,7 +1231,7 @@ fn layer_color_rect(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     if is_province_face(runtime, this) {
         return Ok(Variant::Void);
     }
@@ -1007,9 +1241,12 @@ fn layer_color_rect(
     let color = required_integer(&args, 4, "Layer.colorRect color")?;
     let opacity = optional_integer(&args, 5)?;
     let rgba = color_to_rgba(color, opacity);
-    mutate_layer_pixels(runtime, layer_id, |pixels, image_width, image_height| {
-        fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
-    })?;
+    if let Some(target) = target {
+        mutate_layer_pixels(runtime, &target, |pixels, image_width, image_height| {
+            fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
+        })?;
+        mark_image_modified(runtime, this);
+    }
     Ok(Variant::Void)
 }
 
@@ -1035,7 +1272,7 @@ fn copy_rect_impl(
     args: Vec<Variant>,
     alpha_blend: bool,
 ) -> Result<Variant> {
-    let (this, dest_layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
     if is_province_face(runtime, this) {
         return Ok(Variant::Void);
     }
@@ -1051,14 +1288,14 @@ fn copy_rect_impl(
     if width <= 0 || height <= 0 {
         return Ok(Variant::Void);
     }
-    let Some(source_layer_id) = native_layer_id(runtime, source_object)? else {
+    let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
-    let Some(source_image) = runtime
-        .host()
-        .layer_tree()
-        .layer(source_layer_id)
-        .and_then(|layer| layer.image.clone())
+    let Some(source_target) = render_layer_target(runtime, source_object)? else {
+        return Ok(Variant::Void);
+    };
+    let Some(source_image) =
+        render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
     else {
         return Ok(Variant::Void);
     };
@@ -1068,7 +1305,7 @@ fn copy_rect_impl(
 
     mutate_layer_pixels(
         runtime,
-        dest_layer_id,
+        &dest_target,
         |pixels, image_width, image_height| {
             copy_pixels(
                 pixels,
@@ -1087,6 +1324,7 @@ fn copy_rect_impl(
             );
         },
     )?;
+    mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
 
@@ -1095,10 +1333,13 @@ fn layer_draw_text(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     if is_province_face(runtime, this) {
         return Ok(Variant::Void);
     }
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
     let x = optional_integer(&args, 0)?.unwrap_or(0);
     let y = optional_integer(&args, 1)?.unwrap_or(0);
     let text = args
@@ -1124,7 +1365,7 @@ fn layer_draw_text(
     let font_system = runtime.host().font_system().clone();
     mutate_layer_pixels_min(
         runtime,
-        layer_id,
+        &target,
         min_width,
         min_height,
         |pixels, width, height| {
@@ -1143,6 +1384,7 @@ fn layer_draw_text(
             );
         },
     )?;
+    mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
 
@@ -1151,10 +1393,13 @@ fn layer_draw_glyph(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, layer_id) = this_layer_id(runtime, this_obj)?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
     if is_province_face(runtime, this) {
         return Ok(Variant::Void);
     }
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
     let x = optional_integer(&args, 0)?.unwrap_or(0);
     let y = optional_integer(&args, 1)?.unwrap_or(0);
     let glyph = args
@@ -1188,7 +1433,7 @@ fn layer_draw_glyph(
     let font_system = runtime.host().font_system().clone();
     mutate_layer_pixels_min(
         runtime,
-        layer_id,
+        &target,
         min_width,
         min_height,
         |pixels, width, height| {
@@ -1207,6 +1452,7 @@ fn layer_draw_glyph(
             );
         },
     )?;
+    mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
 
@@ -1580,18 +1826,18 @@ fn layer_bring_to_back(
 fn copy_layer_images(
     runtime: &mut Runtime<KrkrHost>,
     dest_object: ObjectHandle,
-    dest_layer_id: u64,
+    dest_target: &RenderLayerTarget,
     source_object: ObjectHandle,
 ) -> Result<()> {
-    let Some(source_layer_id) = native_layer_id(runtime, source_object)? else {
+    let Some(source_target) = render_layer_target(runtime, source_object)? else {
         return Ok(());
     };
-    let Some(source) = runtime.host().layer_tree().layer(source_layer_id).cloned() else {
+    let Some(source) = render_layer_snapshot(runtime, &source_target) else {
         return Ok(());
     };
 
     let mut resized_to_source = false;
-    if let Some(dest) = runtime.host_mut().layer_tree_mut().layer_mut(dest_layer_id) {
+    mutate_render_layer(runtime, dest_target, |dest| {
         dest.image = source.image.clone();
         dest.image_left = source.image_left;
         dest.image_top = source.image_top;
@@ -1602,7 +1848,7 @@ fn copy_layer_images(
             dest.height = source.height;
             resized_to_source = true;
         }
-    }
+    });
 
     runtime.set_object_member(
         dest_object,
@@ -1632,6 +1878,7 @@ fn copy_layer_images(
             Variant::Integer(source.height as i64),
         );
     }
+    mark_image_modified(runtime, dest_object);
     Ok(())
 }
 
@@ -1833,6 +2080,11 @@ fn is_province_face(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> bool {
         .is_ok_and(|face| face == 3)
 }
 
+fn mark_image_modified(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) {
+    let layer = runtime.bound_this(layer).unwrap_or(layer);
+    runtime.set_object_member(layer, "imageModified", Variant::Integer(1));
+}
+
 fn color_to_rgba(color: i64, opacity: Option<i64>) -> [u8; 4] {
     let color = color.max(0) as u32;
     let r = ((color >> 16) & 0xff) as u8;
@@ -1847,16 +2099,20 @@ fn color_to_rgba(color: i64, opacity: Option<i64>) -> [u8; 4] {
     [r, g, b, a]
 }
 
-fn mutate_layer_pixels<F>(runtime: &mut Runtime<KrkrHost>, layer_id: u64, mutate: F) -> Result<()>
+fn mutate_layer_pixels<F>(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &RenderLayerTarget,
+    mutate: F,
+) -> Result<()>
 where
     F: FnOnce(&mut [u8], u32, u32),
 {
-    mutate_layer_pixels_min(runtime, layer_id, 1, 1, mutate)
+    mutate_layer_pixels_min(runtime, target, 1, 1, mutate)
 }
 
 fn mutate_layer_pixels_min<F>(
     runtime: &mut Runtime<KrkrHost>,
-    layer_id: u64,
+    target: &RenderLayerTarget,
     min_width: u32,
     min_height: u32,
     mutate: F,
@@ -1864,7 +2120,7 @@ fn mutate_layer_pixels_min<F>(
 where
     F: FnOnce(&mut [u8], u32, u32),
 {
-    let Some(layer) = runtime.host().layer_tree().layer(layer_id).cloned() else {
+    let Some(layer) = render_layer_snapshot(runtime, target) else {
         return Ok(());
     };
     let width = layer
@@ -1891,7 +2147,7 @@ where
     mutate(&mut pixels, width, height);
 
     let image = runtime.host_mut().create_layer_image(width, height, pixels);
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+    mutate_render_layer(runtime, target, |layer| {
         layer.image = Some(image);
         layer.image_width = width as f32;
         layer.image_height = height as f32;
@@ -1901,7 +2157,7 @@ where
         if layer.height <= 0.0 {
             layer.height = height as f32;
         }
-    }
+    });
     Ok(())
 }
 
@@ -2340,6 +2596,7 @@ pub(crate) static LAYER_CLASS: NativeClassSpec = NativeClassSpec {
         "beginTransition",
         "stopTransition",
         "assignImages",
+        "exchangeInfo",
         "dump",
         "copyToBitmapFromMainImage",
         "copyFromBitmapToMainImage",
