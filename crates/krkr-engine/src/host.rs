@@ -4,11 +4,14 @@ use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
-use krkr_core::{LayerId, LayerImage, LayerTree, ResourceProvider};
+use krkr_core::{
+    DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
+    ResourceProvider,
+};
 use krkr_kag::{KagParser, ParserSnapshot};
 use krkr_tjs2::{
     Result, TjsError,
@@ -33,6 +36,9 @@ pub struct KrkrHost {
     pending_async_triggers: BTreeSet<ObjectHandle>,
     pending_layer_paints: BTreeSet<ObjectHandle>,
     kag_layers: BTreeMap<String, LayerId>,
+    pending_kag_layers: BTreeMap<String, LayerNode>,
+    active_transition: Option<ActiveTransition>,
+    completed_native_transitions: Vec<NativeTransitionCompletion>,
     current_kag_page: String,
     current_kag_layer: String,
     image_cache: BTreeMap<String, LayerImage>,
@@ -59,6 +65,9 @@ impl Default for KrkrHost {
             pending_async_triggers: BTreeSet::new(),
             pending_layer_paints: BTreeSet::new(),
             kag_layers: BTreeMap::new(),
+            pending_kag_layers: BTreeMap::new(),
+            active_transition: None,
+            completed_native_transitions: Vec::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
             image_cache: BTreeMap::new(),
@@ -90,6 +99,9 @@ impl KrkrHost {
             pending_async_triggers: BTreeSet::new(),
             pending_layer_paints: BTreeSet::new(),
             kag_layers: BTreeMap::new(),
+            pending_kag_layers: BTreeMap::new(),
+            active_transition: None,
+            completed_native_transitions: Vec::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
             image_cache: BTreeMap::new(),
@@ -447,18 +459,18 @@ impl KrkrHost {
     }
 
     pub(crate) fn ensure_kag_layer(&mut self, page: &str, layer: &str) -> LayerId {
-        let page = normalize_kag_page(page);
-        let key = format!("{page}:{layer}");
+        let _ = normalize_kag_page(page);
+        let key = layer.to_string();
         match self.kag_layers.entry(key) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
                 let id = self.layer_tree.create_layer(
-                    format!("{page}:{layer}"),
+                    format!("kag:{layer}"),
                     None,
                     kag_layer_z_order(layer),
                 );
                 if let Some(node) = self.layer_tree.layer_mut(id) {
-                    node.renderable = page == "fore";
+                    node.renderable = true;
                 }
                 entry.insert(id);
                 id
@@ -515,25 +527,143 @@ impl KrkrHost {
         LayerImage::new(texture_id, width, height, Arc::<[u8]>::from(rgba))
     }
 
-    pub(crate) fn apply_immediate_transition(&mut self) {
-        let back_layers = self
-            .kag_layers
-            .iter()
-            .filter_map(|(key, source_id)| {
-                let layer = key.strip_prefix("back:")?;
-                Some((layer.to_string(), *source_id))
-            })
-            .collect::<Vec<_>>();
+    pub(crate) fn mutate_kag_layer<R>(
+        &mut self,
+        page: &str,
+        layer: &str,
+        mutate: impl FnOnce(&mut LayerNode) -> R,
+    ) -> R {
+        if normalize_kag_page(page) == "back" {
+            let node = self.pending_kag_layer_mut(layer);
+            mutate(node)
+        } else {
+            let layer_id = self.ensure_kag_layer("fore", layer);
+            let node = self
+                .layer_tree
+                .layer_mut(layer_id)
+                .expect("created KAG layer must exist");
+            mutate(node)
+        }
+    }
 
-        for (layer, source_id) in back_layers {
+    pub(crate) fn apply_immediate_transition(&mut self) {
+        self.apply_pending_kag_layers();
+        self.active_transition = None;
+    }
+
+    pub(crate) fn begin_kag_transition(&mut self, method: &str, duration: Duration) {
+        if self.pending_kag_layers.is_empty() {
+            self.active_transition = None;
+            return;
+        }
+
+        if duration.is_zero() {
+            self.apply_immediate_transition();
+            return;
+        }
+
+        let (frozen_draw_commands, frozen_image_uploads) = self.layer_tree.draw_model();
+        self.apply_pending_kag_layers();
+        self.active_transition = Some(ActiveTransition {
+            method: normalize_transition_method(method).to_string(),
+            elapsed: Duration::ZERO,
+            duration,
+            frozen_draw_commands,
+            frozen_image_uploads,
+            suppressed_live_images: BTreeSet::new(),
+            native_completion: None,
+        });
+    }
+
+    pub(crate) fn begin_native_transition(
+        &mut self,
+        method: &str,
+        duration: Duration,
+        frozen_draw_commands: Vec<DrawCommand>,
+        frozen_image_uploads: Vec<ImageUpload>,
+        suppressed_live_images: BTreeSet<LayerId>,
+        completion: NativeTransitionCompletion,
+    ) {
+        if duration.is_zero() {
+            self.completed_native_transitions.push(completion);
+            self.active_transition = None;
+            return;
+        }
+
+        self.active_transition = Some(ActiveTransition {
+            method: normalize_transition_method(method).to_string(),
+            elapsed: Duration::ZERO,
+            duration,
+            frozen_draw_commands,
+            frozen_image_uploads,
+            suppressed_live_images,
+            native_completion: Some(completion),
+        });
+    }
+
+    pub(crate) fn advance_transition(&mut self, delta: Duration) {
+        let Some(transition) = &mut self.active_transition else {
+            return;
+        };
+        transition.elapsed = transition.elapsed.saturating_add(delta);
+        if transition.elapsed >= transition.duration {
+            if let Some(completion) = transition.native_completion.take() {
+                self.completed_native_transitions.push(completion);
+            }
+            self.active_transition = None;
+        }
+    }
+
+    pub(crate) fn has_active_transition(&self) -> bool {
+        self.active_transition.is_some()
+    }
+
+    pub(crate) fn frame_transition(&self) -> Option<FrameTransition> {
+        let transition = self.active_transition.as_ref()?;
+        let progress = if transition.duration.is_zero() {
+            1.0
+        } else {
+            transition.elapsed.as_secs_f32() / transition.duration.as_secs_f32()
+        };
+        Some(FrameTransition {
+            method: transition.method.clone(),
+            progress: progress.clamp(0.0, 1.0),
+            frozen_draw_commands: transition.frozen_draw_commands.clone(),
+            frozen_image_uploads: transition.frozen_image_uploads.clone(),
+        })
+    }
+
+    pub(crate) fn suppressed_transition_live_images(&self) -> BTreeSet<LayerId> {
+        self.active_transition
+            .as_ref()
+            .map(|transition| transition.suppressed_live_images.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn take_completed_native_transitions(&mut self) -> Vec<NativeTransitionCompletion> {
+        std::mem::take(&mut self.completed_native_transitions)
+    }
+
+    fn pending_kag_layer_mut(&mut self, layer: &str) -> &mut LayerNode {
+        let layer_id = self.ensure_kag_layer("fore", layer);
+        let base = self
+            .layer_tree
+            .layer(layer_id)
+            .cloned()
+            .expect("created KAG layer must exist");
+        self.pending_kag_layers
+            .entry(layer.to_string())
+            .or_insert(base)
+    }
+
+    fn apply_pending_kag_layers(&mut self) {
+        let pending_layers = std::mem::take(&mut self.pending_kag_layers);
+        for (layer, source) in pending_layers {
             let target_id = self.ensure_kag_layer("fore", &layer);
-            let Some(source) = self.layer_tree.layer(source_id).cloned() else {
-                continue;
-            };
             if let Some(target) = self.layer_tree.layer_mut(target_id) {
-                let z_order = target.z_order;
                 let id = target.id;
                 let name = target.name.clone();
+                let z_order = target.z_order;
                 *target = source;
                 target.id = id;
                 target.name = name;
@@ -575,6 +705,13 @@ fn normalize_kag_page(page: &str) -> &str {
     }
 }
 
+fn normalize_transition_method(method: &str) -> &str {
+    match method {
+        "crossfade" | "" => "crossfade",
+        _ => "crossfade",
+    }
+}
+
 fn kag_layer_z_order(layer: &str) -> i32 {
     if layer == "base" || layer == "background" {
         return 0;
@@ -597,6 +734,24 @@ struct ProjectLayer {
 #[derive(Clone)]
 struct TimerState {
     next_fire_millis: Option<i64>,
+}
+
+#[derive(Clone)]
+struct ActiveTransition {
+    method: String,
+    elapsed: Duration,
+    duration: Duration,
+    frozen_draw_commands: Vec<DrawCommand>,
+    frozen_image_uploads: Vec<ImageUpload>,
+    suppressed_live_images: BTreeSet<LayerId>,
+    native_completion: Option<NativeTransitionCompletion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeTransitionCompletion {
+    pub dest: ObjectHandle,
+    pub source: Option<ObjectHandle>,
+    pub paired_comp: bool,
 }
 
 #[derive(Clone)]

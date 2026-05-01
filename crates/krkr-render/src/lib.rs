@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use krkr_core::{
-    Color, DrawCommand, FrameOutput, ImageCommand, Rect, Size, TextCommand, TextureId,
+    Color, DrawCommand, FrameOutput, ImageCommand, ImageUpload, Rect, Size, TextCommand, TextureId,
 };
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
@@ -50,6 +50,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     texture_pipeline: TexturePipelineResources,
+    transition_pipeline: TransitionPipelineResources,
     textures: BTreeMap<TextureId, CachedTexture>,
     physical_size: PhysicalSize<u32>,
     scale_factor: f64,
@@ -136,6 +137,7 @@ impl Renderer {
 
         let pipeline = create_rect_pipeline(&device, format);
         let texture_pipeline = TexturePipelineResources::new(&device, format);
+        let transition_pipeline = TransitionPipelineResources::new(&device, format);
 
         Ok(Self {
             surface,
@@ -144,6 +146,7 @@ impl Renderer {
             config,
             pipeline,
             texture_pipeline,
+            transition_pipeline,
             textures: BTreeMap::new(),
             physical_size,
             scale_factor,
@@ -204,40 +207,51 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
         };
 
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let physical_clip = frame.clip.and_then(|clip| self.physical_rect(clip));
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("krkr-ruri render encoder"),
             });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("krkr-ruri render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu_color(frame.clear_color)),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
 
-            if let Some(clip) = physical_clip {
-                pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
-            }
-            if frame.clip.is_none() || physical_clip.is_some() {
-                self.draw_commands(&mut pass, &frame.draw_commands);
-            }
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        if let Some(transition) = &frame.transition {
+            let old_target = self.create_offscreen_target("krkr-ruri transition frozen target");
+            let new_target = self.create_offscreen_target("krkr-ruri transition live target");
+            self.render_commands_to_view(
+                &mut encoder,
+                &old_target.view,
+                "krkr-ruri transition frozen pass",
+                frame.clear_color,
+                None,
+                &transition.frozen_draw_commands,
+            );
+            self.render_commands_to_view(
+                &mut encoder,
+                &new_target.view,
+                "krkr-ruri transition live pass",
+                frame.clear_color,
+                frame.clip,
+                &frame.draw_commands,
+            );
+            self.render_crossfade_to_view(
+                &mut encoder,
+                &view,
+                frame.clear_color,
+                &old_target.view,
+                &new_target.view,
+                transition.progress,
+            );
+        } else {
+            self.render_commands_to_view(
+                &mut encoder,
+                &view,
+                "krkr-ruri render pass",
+                frame.clear_color,
+                frame.clip,
+                &frame.draw_commands,
+            );
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -246,7 +260,14 @@ impl Renderer {
     }
 
     fn upload_frame_images(&mut self, frame: &FrameOutput) {
-        for upload in &frame.image_uploads {
+        self.upload_images(&frame.image_uploads);
+        if let Some(transition) = &frame.transition {
+            self.upload_images(&transition.frozen_image_uploads);
+        }
+    }
+
+    fn upload_images(&mut self, uploads: &[ImageUpload]) {
+        for upload in uploads {
             let needs_upload = self.textures.get(&upload.texture_id).is_none_or(|texture| {
                 texture.width != upload.width || texture.height != upload.height
             });
@@ -315,6 +336,128 @@ impl Renderer {
         }
     }
 
+    fn render_commands_to_view(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        label: &'static str,
+        clear_color: Color,
+        clip: Option<Rect>,
+        commands: &[DrawCommand],
+    ) {
+        let physical_clip = clip.and_then(|clip| self.physical_rect(clip));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu_color(clear_color)),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        if let Some(clip) = physical_clip {
+            pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        }
+        if clip.is_none() || physical_clip.is_some() {
+            self.draw_commands(&mut pass, commands);
+        }
+    }
+
+    fn render_crossfade_to_view(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        clear_color: Color,
+        old_view: &wgpu::TextureView,
+        new_view: &wgpu::TextureView,
+        progress: f32,
+    ) {
+        let progress = progress.clamp(0.0, 1.0);
+        let uniform_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("krkr-ruri transition uniforms"),
+                contents: bytemuck::cast_slice(&[TransitionUniforms {
+                    progress,
+                    _padding: [0.0; 3],
+                }]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("krkr-ruri transition bind group"),
+            layout: &self.transition_pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(old_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.texture_pipeline.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(new_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.texture_pipeline.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("krkr-ruri transition composite pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu_color(clear_color)),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.draw_transition_fullscreen(&mut pass, &bind_group);
+    }
+
+    fn create_offscreen_target(&self, label: &'static str) -> OffscreenTarget {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        OffscreenTarget {
+            _texture: texture,
+            view,
+        }
+    }
+
     fn draw_commands<'pass>(
         &'pass self,
         pass: &mut wgpu::RenderPass<'pass>,
@@ -374,6 +517,33 @@ impl Renderer {
             });
         pass.set_pipeline(&self.texture_pipeline.pipeline);
         pass.set_bind_group(0, &texture.bind_group, &[]);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.draw(0..vertices.len() as u32, 0..1);
+    }
+
+    fn draw_transition_fullscreen<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        bind_group: &'pass wgpu::BindGroup,
+    ) {
+        let tint = [1.0, 1.0, 1.0, 1.0];
+        let vertices = [
+            TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint),
+            TexturedVertex::new([1.0, 1.0], [1.0, 0.0], tint),
+            TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint),
+            TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint),
+            TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint),
+            TexturedVertex::new([-1.0, -1.0], [0.0, 1.0], tint),
+        ];
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("krkr-ruri fullscreen texture vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        pass.set_pipeline(&self.transition_pipeline.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.draw(0..vertices.len() as u32, 0..1);
     }
@@ -771,12 +941,112 @@ impl TexturePipelineResources {
     }
 }
 
+struct TransitionPipelineResources {
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
+impl TransitionPipelineResources {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("krkr-ruri transition bind group layout"),
+            entries: &[
+                texture_bind_group_layout_entry(0),
+                sampler_bind_group_layout_entry(1),
+                texture_bind_group_layout_entry(2),
+                sampler_bind_group_layout_entry(3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::include_wgsl!("transition.wgsl"));
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("krkr-ruri transition pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("krkr-ruri transition pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[TexturedVertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        Self {
+            bind_group_layout,
+            pipeline,
+        }
+    }
+}
+
+fn texture_bind_group_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn sampler_bind_group_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
 struct CachedTexture {
     width: u32,
     height: u32,
     _texture: wgpu::Texture,
     _view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+}
+
+struct OffscreenTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -826,6 +1096,13 @@ struct TexturedVertex {
     position: [f32; 2],
     tex_coord: [f32; 2],
     tint: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TransitionUniforms {
+    progress: f32,
+    _padding: [f32; 3],
 }
 
 impl TexturedVertex {

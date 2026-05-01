@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -16,7 +16,7 @@ use krkr_tjs2::{
 
 use crate::{
     globals::install_tvp_globals,
-    host::KrkrHost,
+    host::{KrkrHost, NativeTransitionCompletion},
     kag::EngineKagHost,
     plugin::KrkrPlugin,
     script::{execute_expression_on_runtime, execute_script_on_runtime},
@@ -253,11 +253,17 @@ impl KrkrEngine {
         let tick = self.advance(delta)?;
         self.pump_layer_paints()?;
         self.sync_native_layers_from_tjs()?;
-        let output = self.core_engine.tick_running_with_layers(
-            input.frame,
-            self.tjs_runtime.host().layer_tree(),
-            &self.message_layer,
-        );
+        let mut suppressed_images = self.tjs_runtime.host().suppressed_transition_live_images();
+        suppressed_images.extend(self.kag_back_layer_images());
+        let output = self
+            .core_engine
+            .tick_running_with_layers_suppressing_images(
+                input.frame,
+                self.tjs_runtime.host().layer_tree(),
+                &self.message_layer,
+                &suppressed_images,
+            )
+            .with_transition(self.tjs_runtime.host().frame_transition());
         Ok(EngineFrame {
             output,
             tick,
@@ -296,13 +302,125 @@ impl KrkrEngine {
     }
 
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
-        self.kag_task.update_wait(delta);
+        self.tjs_runtime.host_mut().advance_transition(delta);
+        self.finish_completed_native_transitions()?;
+        let transition_active = self.tjs_runtime.host().has_active_transition();
+        self.kag_task.update_wait(delta, transition_active);
         self.kag_task.run_until_yield(
             &mut self.kag_parser,
             &mut self.tjs_runtime,
             &mut self.message_layer,
             self.kag_budget,
         )
+    }
+
+    fn finish_completed_native_transitions(&mut self) -> Result<()> {
+        let completions = self
+            .tjs_runtime
+            .host_mut()
+            .take_completed_native_transitions();
+        for completion in completions {
+            self.finish_native_transition(completion)?;
+        }
+        Ok(())
+    }
+
+    fn kag_back_layer_images(&self) -> BTreeSet<LayerId> {
+        let mut layers = BTreeSet::new();
+        let Variant::Object(kag) = self.tjs_runtime.global_member("kag") else {
+            return layers;
+        };
+        let Variant::Object(back) = self.tjs_runtime.object_member(kag, "back") else {
+            return layers;
+        };
+        self.collect_kag_page_layer_images(back, &mut layers);
+        layers
+    }
+
+    fn collect_kag_page_layer_images(&self, page: ObjectHandle, layers: &mut BTreeSet<LayerId>) {
+        if let Variant::Object(base) = self.tjs_runtime.object_member(page, "base") {
+            self.insert_native_layer_image(base, layers);
+        }
+        self.collect_kag_layer_array(page, "layers", layers);
+        self.collect_kag_layer_array(page, "messages", layers);
+    }
+
+    fn collect_kag_layer_array(
+        &self,
+        page: ObjectHandle,
+        member: &str,
+        layers: &mut BTreeSet<LayerId>,
+    ) {
+        let Variant::Object(array) = self.tjs_runtime.object_member(page, member) else {
+            return;
+        };
+        let Ok(count) = self.tjs_runtime.object_member(array, "count").to_integer() else {
+            return;
+        };
+        for index in 0..count.max(0) {
+            if let Variant::Object(layer) =
+                self.tjs_runtime.object_member(array, &index.to_string())
+            {
+                self.insert_native_layer_image(layer, layers);
+            }
+        }
+    }
+
+    fn insert_native_layer_image(&self, handle: ObjectHandle, layers: &mut BTreeSet<LayerId>) {
+        let handle = self.tjs_runtime.bound_this(handle).unwrap_or(handle);
+        if let Some(layer_id) = self.tjs_runtime.host().native_layer(handle) {
+            layers.insert(layer_id);
+        }
+    }
+
+    fn finish_native_transition(&mut self, completion: NativeTransitionCompletion) -> Result<()> {
+        if !self.tjs_runtime.object_valid(completion.dest) {
+            return Ok(());
+        }
+
+        if !matches!(
+            self.tjs_runtime
+                .object_member(completion.dest, "onTransitionCompleted"),
+            Variant::Void
+        ) {
+            let source = completion
+                .source
+                .filter(|source| self.tjs_runtime.object_valid(*source))
+                .map(Variant::Object)
+                .unwrap_or_default();
+            self.tjs_runtime.call_object_method(
+                completion.dest,
+                "onTransitionCompleted",
+                vec![Variant::Object(completion.dest), source],
+            )?;
+            if completion.paired_comp
+                && let Some(source) = completion.source
+                && self.tjs_runtime.object_valid(source)
+            {
+                self.tjs_runtime
+                    .set_object_member(source, "visible", Variant::Integer(1));
+            }
+        } else {
+            self.tjs_runtime.set_object_member(
+                completion.dest,
+                "inTransition",
+                Variant::Integer(0),
+            );
+            if let Variant::Object(window) =
+                self.tjs_runtime.object_member(completion.dest, "window")
+                && let Ok(trans_count) = self
+                    .tjs_runtime
+                    .object_member(window, "transCount")
+                    .to_integer()
+            {
+                self.tjs_runtime.set_object_member(
+                    window,
+                    "transCount",
+                    Variant::Integer(trans_count.saturating_sub(1).max(0)),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn pump_tjs_events(&mut self) -> Result<()> {
@@ -672,7 +790,7 @@ impl KagRuntimeTask {
         }
     }
 
-    fn update_wait(&mut self, delta: Duration) {
+    fn update_wait(&mut self, delta: Duration, transition_active: bool) {
         if let KagTaskState::WaitingTimer { remaining } = self.state.clone() {
             self.state = if delta >= remaining {
                 KagTaskState::Running
@@ -681,6 +799,8 @@ impl KagRuntimeTask {
                     remaining: remaining - delta,
                 }
             };
+        } else if self.state == KagTaskState::WaitingTransition && !transition_active {
+            self.state = KagTaskState::Running;
         }
     }
 
@@ -864,9 +984,18 @@ impl KagRuntimeTask {
                 apply_current_tag(runtime, tag);
                 Ok(TagAction::Continue)
             }
-            "trans" | "wt" => {
-                runtime.host_mut().apply_immediate_transition();
+            "trans" => {
+                let method = tag.literal_attr("method").unwrap_or("crossfade");
+                let duration = tag_millis(tag, "time").unwrap_or(Duration::ZERO);
+                runtime.host_mut().begin_kag_transition(method, duration);
                 Ok(TagAction::Continue)
+            }
+            "wt" => {
+                if runtime.host().has_active_transition() {
+                    Ok(self.wait(KagTaskState::WaitingTransition))
+                } else {
+                    Ok(TagAction::Continue)
+                }
             }
             "wq" | "wf" | "wb" | "wm" => Ok(self.wait(KagTaskState::WaitingAudio)),
             "waitload" | "waittrig" => Ok(self.wait(KagTaskState::WaitingResource)),
@@ -1014,40 +1143,42 @@ fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
     let image_size = image.size();
     let has_explicit_width = tag.literal_attr("width").is_some();
     let has_explicit_height = tag.literal_attr("height").is_some();
-    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.set_image(image);
-        if !has_explicit_width {
-            layer.width = image_size.width;
-        }
-        if !has_explicit_height {
-            layer.height = image_size.height;
-        }
-        layer.visible = kag_bool_attr(tag, "visible").unwrap_or(true);
-        apply_tag_geometry(layer, tag)?;
-    }
-    Ok(())
+    runtime
+        .host_mut()
+        .mutate_kag_layer(&page, &layer_name, |layer| {
+            layer.set_image(image);
+            if !has_explicit_width {
+                layer.width = image_size.width;
+            }
+            if !has_explicit_height {
+                layer.height = image_size.height;
+            }
+            layer.visible = kag_bool_attr(tag, "visible").unwrap_or(true);
+            apply_tag_geometry(layer, tag)
+        })
 }
 
 fn apply_layer_options_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
     let (page, layer_name) = kag_target(runtime, tag);
-    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        apply_tag_geometry(layer, tag)?;
-        if let Some(visible) = kag_bool_attr(tag, "visible") {
-            layer.visible = visible;
-        }
-    }
-    Ok(())
+    runtime
+        .host_mut()
+        .mutate_kag_layer(&page, &layer_name, |layer| {
+            apply_tag_geometry(layer, tag)?;
+            if let Some(visible) = kag_bool_attr(tag, "visible") {
+                layer.visible = visible;
+            }
+            Ok(())
+        })
 }
 
 fn apply_freeimage_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) {
     let (page, layer_name) = kag_target(runtime, tag);
-    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.clear_image();
-        layer.visible = false;
-    }
+    runtime
+        .host_mut()
+        .mutate_kag_layer(&page, &layer_name, |layer| {
+            layer.clear_image();
+            layer.visible = false;
+        });
 }
 
 fn apply_current_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) {
@@ -1061,13 +1192,15 @@ fn apply_current_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) {
     runtime
         .host_mut()
         .set_current_kag_layer(page.clone(), layer_name.clone());
-    let layer_id = runtime.host_mut().ensure_kag_layer(&page, &layer_name);
+    runtime.host_mut().ensure_kag_layer(&page, &layer_name);
     runtime
         .host_mut()
         .log(&format!("KAG current layer set to {page}:{layer_name}"));
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        layer.visible = kag_bool_attr(tag, "visible").unwrap_or(layer.visible);
-    }
+    runtime
+        .host_mut()
+        .mutate_kag_layer(&page, &layer_name, |layer| {
+            layer.visible = kag_bool_attr(tag, "visible").unwrap_or(layer.visible);
+        });
 }
 
 fn apply_tag_geometry(layer: &mut krkr_core::LayerNode, tag: &Tag) -> Result<()> {
@@ -1760,6 +1893,78 @@ mod tests {
     }
 
     #[test]
+    fn kag_timed_transition_freezes_fore_applies_back_and_waits() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("fore.png"), 2, 1, &[255; 8]);
+        write_png(root.join("back.png"), 4, 3, &[0; 48]);
+        fs::write(
+            root.join("first.ks"),
+            concat!(
+                "[image storage=fore.png layer=base page=fore]",
+                "[image storage=back.png layer=base page=back]",
+                "[trans method=crossfade time=1000][wt][s]"
+            ),
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("start transition");
+
+        assert_eq!(frame.tick.state, KagTaskState::WaitingTransition);
+        let transition = frame.output.transition.as_ref().expect("transition");
+        assert_eq!(transition.method, "crossfade");
+        assert_eq!(transition.progress, 0.0);
+        assert!(transition.frozen_draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.width == 2.0 && image.rect.height == 1.0
+            )
+        }));
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.width == 4.0 && image.rect.height == 3.0
+            )
+        }));
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.5), Vec::new()),
+                Duration::from_millis(500),
+            )
+            .expect("mid transition");
+        assert_eq!(frame.tick.state, KagTaskState::WaitingTransition);
+        assert_eq!(
+            frame
+                .output
+                .transition
+                .as_ref()
+                .map(|transition| transition.progress),
+            Some(0.5)
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.6), Vec::new()),
+                Duration::from_millis(600),
+            )
+            .expect("finish transition");
+        assert_eq!(frame.tick.state, KagTaskState::Finished);
+        assert!(frame.output.transition.is_none());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn kag_image_tag_replaces_previous_layer_size_when_geometry_is_implicit() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -2207,7 +2412,79 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("update");
-        assert_eq!(frame.output.image_uploads.len(), 2);
+        assert_eq!(frame.output.image_uploads.len(), 1);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_timed_transition_completes_through_update() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 1, 1, &[255, 0, 0, 255]);
+        write_png(
+            root.join("new.png"),
+            2,
+            1,
+            &[0, 255, 0, 255, 0, 255, 0, 255],
+        );
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.loadImages("new.png");
+                global.dest = new Layer();
+                dest.loadImages("old.png");
+                dest.visible = true;
+                dest.inTransition = true;
+                dest.window = %[transCount: 1, completed: 0];
+                dest.onTransitionCompleted = function(destLayer, srcLayer) {
+                    this.inTransition = false;
+                    this.window.transCount--;
+                    this.window.completed++;
+                    this.window.completedWidth = this.imageWidth;
+                    this.window.sourceWidth = srcLayer.imageWidth;
+                };
+                dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                return dest.inTransition + ":" + dest.window.transCount + ":" + dest.imageWidth;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:1:2".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.5), Vec::new()),
+                Duration::from_millis(500),
+            )
+            .expect("mid update");
+        assert!(frame.output.transition.is_some());
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "dest.window.transCount")
+                .expect("trans count"),
+            Variant::Integer(1)
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.5), Vec::new()),
+                Duration::from_millis(500),
+            )
+            .expect("finish update");
+        assert!(frame.output.transition.is_none());
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "dest.inTransition + ':' + dest.window.transCount + ':' + dest.window.completed + ':' + dest.window.completedWidth + ':' + dest.window.sourceWidth"
+                )
+                .expect("completion"),
+            Variant::String("0:0:1:2:2".to_string())
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

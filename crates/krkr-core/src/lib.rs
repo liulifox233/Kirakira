@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, Read, Seek},
     sync::Arc,
 };
@@ -153,11 +153,35 @@ pub enum DrawCommand {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct FrameTransition {
+    pub method: String,
+    pub progress: f32,
+    pub frozen_draw_commands: Vec<DrawCommand>,
+    pub frozen_image_uploads: Vec<ImageUpload>,
+}
+
+impl FrameTransition {
+    pub fn crossfade(
+        progress: f32,
+        frozen_draw_commands: Vec<DrawCommand>,
+        frozen_image_uploads: Vec<ImageUpload>,
+    ) -> Self {
+        Self {
+            method: "crossfade".to_string(),
+            progress: progress.clamp(0.0, 1.0),
+            frozen_draw_commands,
+            frozen_image_uploads,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FrameOutput {
     pub clear_color: Color,
     pub clip: Option<Rect>,
     pub draw_commands: Vec<DrawCommand>,
     pub image_uploads: Vec<ImageUpload>,
+    pub transition: Option<FrameTransition>,
 }
 
 impl FrameOutput {
@@ -167,6 +191,7 @@ impl FrameOutput {
             clip: None,
             draw_commands,
             image_uploads: Vec::new(),
+            transition: None,
         }
     }
 
@@ -177,6 +202,11 @@ impl FrameOutput {
 
     pub fn with_image_uploads(mut self, image_uploads: Vec<ImageUpload>) -> Self {
         self.image_uploads = image_uploads;
+        self
+    }
+
+    pub fn with_transition(mut self, transition: Option<FrameTransition>) -> Self {
+        self.transition = transition;
         self
     }
 }
@@ -418,20 +448,23 @@ impl LayerTree {
     }
 
     pub fn draw_model(&self) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
-        let mut commands = Vec::new();
-        let mut uploads = Vec::new();
+        self.draw_model_suppressing_images(&BTreeSet::new())
+    }
+
+    pub fn draw_model_suppressing_images(
+        &self,
+        suppressed_images: &BTreeSet<LayerId>,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        let mut model = LayerDrawModel {
+            suppressed_images,
+            commands: Vec::new(),
+            uploads: Vec::new(),
+        };
         let clip = Rect::new(0.0, 0.0, f32::MAX / 4.0, f32::MAX / 4.0);
         for root in self.sorted_children(None) {
-            self.draw_layer(
-                root.id,
-                Point::new(0.0, 0.0),
-                clip,
-                1.0,
-                &mut commands,
-                &mut uploads,
-            );
+            self.draw_layer(root.id, Point::new(0.0, 0.0), clip, 1.0, &mut model);
         }
-        (commands, uploads)
+        (model.commands, model.uploads)
     }
 
     fn draw_layer(
@@ -440,8 +473,7 @@ impl LayerTree {
         parent_origin: Point,
         parent_clip: Rect,
         parent_opacity: f32,
-        commands: &mut Vec<DrawCommand>,
-        uploads: &mut Vec<ImageUpload>,
+        model: &mut LayerDrawModel<'_>,
     ) {
         let Some(layer) = self.layers.get(&id) else {
             return;
@@ -456,15 +488,17 @@ impl LayerTree {
         };
         let opacity = parent_opacity * layer.opacity as f32 / 255.0;
 
-        if let Some(command) = layer.image_command(origin, clip, parent_opacity) {
-            commands.push(DrawCommand::Image(command));
+        if !model.suppressed_images.contains(&id)
+            && let Some(command) = layer.image_command(origin, clip, parent_opacity)
+        {
+            model.commands.push(DrawCommand::Image(command));
             if let Some(image) = &layer.image {
-                uploads.push(image.upload.clone());
+                model.uploads.push(image.upload.clone());
             }
         }
 
         for child in self.sorted_children(Some(id)) {
-            self.draw_layer(child.id, origin, clip, opacity, commands, uploads);
+            self.draw_layer(child.id, origin, clip, opacity, model);
         }
     }
 
@@ -516,6 +550,12 @@ impl LayerTree {
         }
         false
     }
+}
+
+struct LayerDrawModel<'a> {
+    suppressed_images: &'a BTreeSet<LayerId>,
+    commands: Vec<DrawCommand>,
+    uploads: Vec<ImageUpload>,
 }
 
 fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
@@ -877,11 +917,22 @@ impl Engine {
         layers: &LayerTree,
         message: &MessageLayerModel,
     ) -> FrameOutput {
+        self.tick_running_with_layers_suppressing_images(input, layers, message, &BTreeSet::new())
+    }
+
+    pub fn tick_running_with_layers_suppressing_images(
+        &mut self,
+        input: FrameInput,
+        layers: &LayerTree,
+        message: &MessageLayerModel,
+        suppressed_images: &BTreeSet<LayerId>,
+    ) -> FrameOutput {
         if !input.viewport_size.is_empty() {
             self.viewport_size = input.viewport_size;
         }
 
-        let (mut draw_commands, image_uploads) = layers.draw_model();
+        let (mut draw_commands, image_uploads) =
+            layers.draw_model_suppressing_images(suppressed_images);
         self.draw_message_overlay(&mut draw_commands, message);
 
         FrameOutput::new(palette::RUNTIME_BACKGROUND, draw_commands)
@@ -1527,6 +1578,31 @@ mod tests {
                 DrawCommand::Image(first),
                 DrawCommand::Image(second)
             ] if first.texture_id == 1 && second.texture_id == 2
+        ));
+    }
+
+    #[test]
+    fn layer_tree_suppresses_layer_image_without_hiding_children() {
+        let pixels = std::sync::Arc::<[u8]>::from(vec![255, 255, 255, 255]);
+        let parent_image = LayerImage::new(1, 1, 1, pixels.clone());
+        let child_image = LayerImage::new(2, 1, 1, pixels);
+        let mut layers = LayerTree::new();
+        let parent = layers.create_layer("parent", None, 0);
+        let child = layers.create_layer("child", Some(parent), 0);
+        for (id, image) in [(parent, parent_image), (child, child_image)] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 1.0;
+            layer.height = 1.0;
+            layer.visible = true;
+            layer.set_image(image);
+        }
+
+        let (commands, uploads) = layers.draw_model_suppressing_images(&BTreeSet::from([parent]));
+
+        assert_eq!(uploads.len(), 1);
+        assert!(matches!(
+            &commands[..],
+            [DrawCommand::Image(image)] if image.texture_id == 2
         ));
     }
 
