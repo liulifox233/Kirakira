@@ -481,7 +481,10 @@ impl KrkrEngine {
                     button: PointerButton::Primary,
                     state: ButtonState::Pressed,
                 } => {
-                    self.dispatch_layer_pointer_event("onMouseDown")?;
+                    let target = self.dispatch_layer_pointer_event("onMouseDown")?;
+                    if self.should_fire_primary_click(target) {
+                        self.fire_kag_primary_click(false)?;
+                    }
                 }
                 EngineEvent::PointerInput {
                     button: PointerButton::Primary,
@@ -493,22 +496,25 @@ impl KrkrEngine {
                 EngineEvent::KeyboardInput {
                     key: EngineKey::Enter | EngineKey::Space,
                     state: ButtonState::Pressed,
-                } => self.signal_kag_click(),
+                } => {
+                    self.fire_kag_primary_click(true)?;
+                    self.signal_kag_click();
+                }
                 _ => {}
             }
         }
         Ok(())
     }
 
-    fn dispatch_layer_pointer_event(&mut self, method: &str) -> Result<()> {
+    fn dispatch_layer_pointer_event(&mut self, method: &str) -> Result<Option<ObjectHandle>> {
         let Some(position) = self.cursor_position else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(layer_id) = self.tjs_runtime.host().layer_tree().hit_test(position) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(origin) = self
             .tjs_runtime
@@ -516,7 +522,7 @@ impl KrkrEngine {
             .layer_tree()
             .absolute_position(layer_id)
         else {
-            return Ok(());
+            return Ok(None);
         };
         let x = (position.x - origin.x).round() as i64;
         let y = (position.y - origin.y).round() as i64;
@@ -531,6 +537,40 @@ impl KrkrEngine {
                     Variant::Integer(0),
                 ],
             )
+            .map(|_| Some(object))
+    }
+
+    fn should_fire_primary_click(&self, target: Option<ObjectHandle>) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        matches!(
+            self.tjs_runtime.object_member(target, "linkNum"),
+            Variant::Void
+        ) && !self
+            .tjs_runtime
+            .object_member(target, "isPrimary")
+            .is_truthy()
+    }
+
+    fn fire_kag_primary_click(&mut self, keyboard: bool) -> Result<()> {
+        let Variant::Object(kag) = self.tjs_runtime.global_member("kag") else {
+            return Ok(());
+        };
+        let method = if keyboard
+            && !matches!(
+                self.tjs_runtime.object_member(kag, "onPrimaryClickByKey"),
+                Variant::Void
+            ) {
+            "onPrimaryClickByKey"
+        } else {
+            "onPrimaryClick"
+        };
+        if matches!(self.tjs_runtime.object_member(kag, method), Variant::Void) {
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(kag, method, Vec::new())
             .map(|_| ())
     }
 
@@ -2661,6 +2701,66 @@ mod tests {
                 .execute_expression("inline.tjs", "testLayer.clicked")
                 .expect("clicked"),
             Variant::String("5:6:0:0".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn primary_pointer_press_fires_kag_primary_click_for_non_link_layer() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var kag = new Dictionary();
+                kag.clicks = 0;
+                kag.onPrimaryClick = function() {
+                    this.clicks++;
+                };
+                var rootLayer = new Layer();
+                rootLayer.setSize(100, 100);
+                rootLayer.visible = true;
+                var childLayer = new Layer(void, rootLayer);
+                childLayer.setPos(10, 20);
+                childLayer.setSize(30, 40);
+                childLayer.visible = true;
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(15.0, 26.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.clicks")
+                .expect("clicks"),
+            Variant::Integer(1)
         );
 
         fs::remove_dir_all(root).expect("cleanup");
