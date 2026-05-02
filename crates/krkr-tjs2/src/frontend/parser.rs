@@ -1194,10 +1194,7 @@ impl Parser {
                     break;
                 }
                 if self.is(&TokenKind::RightBracket) {
-                    return Err(TjsError::parse(
-                        self.current().span,
-                        "constant array literals do not allow trailing holes",
-                    ));
+                    break;
                 }
             }
             let end = self.expect(&TokenKind::RightBracket)?.span.end;
@@ -1269,10 +1266,7 @@ impl Parser {
                 break;
             }
             if constant && self.is(&TokenKind::RightBracket) {
-                return Err(TjsError::parse(
-                    self.current().span,
-                    "constant dictionary literals do not allow trailing separators",
-                ));
+                break;
             }
         }
         let end = self.expect(&TokenKind::RightBracket)?.span.end;
@@ -2071,10 +2065,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_final_collapse_parameters_and_const_dictionary_trailing_separator() {
+    fn rejects_non_final_collapse_parameters_and_invalid_const_dictionary_keys() {
         assert!(parse("function f(rest*, tail) {}").is_err());
         assert!(parse("function f(rest*,) {}").is_err());
-        assert!(parse("var d = (const)%[\"x\", 1,];").is_err());
+        assert!(parse("var d = (const)%[\"x\", 1,];").is_ok());
         assert!(parse("var d = (const)%[void, 1];").is_err());
         assert!(parse("var d = (const)%[-1, 1];").is_err());
         assert!(parse("var d = (const)%[(const)[], 1];").is_err());

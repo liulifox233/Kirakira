@@ -1,6 +1,6 @@
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{ObjectHandle, Runtime, TjsHost, Variant},
 };
 
 use crate::{
@@ -35,7 +35,11 @@ fn scripts_exec_storage(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = required_arg_string(&args, 0, "Scripts.execStorage")?;
-    let source = runtime.host().read_text_storage(&name)?;
+    let mode = arg_string(&args, 1)?.unwrap_or_default();
+    if let Some(value) = read_binary_struct_storage(runtime, &name, &mode)? {
+        return Ok(value);
+    }
+    let source = runtime.host_mut().read_text(&name, &mode)?;
     execute_script_on_runtime(runtime, &name, &source)
 }
 
@@ -45,8 +49,61 @@ fn scripts_eval_storage(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = required_arg_string(&args, 0, "Scripts.evalStorage")?;
-    let source = runtime.host().read_text_storage(&name)?;
-    execute_expression_on_runtime(runtime, &name, &source)
+    let mode = arg_string(&args, 1)?.unwrap_or_default();
+    if let Some(value) = read_binary_struct_storage(runtime, &name, &mode)? {
+        return Ok(value);
+    }
+    let source = runtime.host_mut().read_text(&name, &mode)?;
+    let value = execute_expression_on_runtime(runtime, &name, &source)?;
+    normalize_kag_system_variable_struct(runtime, &name, &value);
+    Ok(value)
+}
+
+fn read_binary_struct_storage(
+    runtime: &mut Runtime<KrkrHost>,
+    name: &str,
+    mode: &str,
+) -> Result<Option<Variant>> {
+    let Ok(bytes) = runtime.host_mut().read_binary(name, mode) else {
+        return Ok(None);
+    };
+    if bytes.starts_with(b"KBAD100\0") {
+        return runtime.decode_binary_struct(&bytes);
+    }
+    Ok(None)
+}
+
+fn normalize_kag_system_variable_struct(
+    runtime: &mut Runtime<KrkrHost>,
+    name: &str,
+    value: &Variant,
+) {
+    if !name.ends_with("sc.ksd") {
+        return;
+    }
+    let Variant::Object(scflags) = value else {
+        return;
+    };
+    let Variant::Object(se_flags) = runtime.object_member(*scflags, "se") else {
+        return;
+    };
+    let count = runtime
+        .object_member(se_flags, "count")
+        .to_integer()
+        .unwrap_or(0)
+        .max(0) as usize;
+    let mut elements = Vec::with_capacity(count);
+    for index in 0..count {
+        elements.push(match runtime.object_member(se_flags, &index.to_string()) {
+            Variant::Null => Variant::Void,
+            value => value,
+        });
+    }
+    while matches!(elements.last(), Some(Variant::Void)) {
+        elements.pop();
+    }
+    let normalized = runtime.alloc_array_object(elements);
+    runtime.set_object_member(*scflags, "se", Variant::Object(normalized));
 }
 
 fn scripts_compile_storage(

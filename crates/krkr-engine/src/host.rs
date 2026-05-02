@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs,
-    io::{self, Read},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
+use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioSourceKind, DrawCommand, FrameTransition,
     ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceProvider,
@@ -140,6 +141,10 @@ impl KrkrHost {
         self.project_root.as_deref()
     }
 
+    pub fn data_path(&self) -> Option<PathBuf> {
+        self.project_root.as_ref().map(|root| root.join("savedata"))
+    }
+
     pub fn logs(&self) -> &[String] {
         &self.logs
     }
@@ -215,11 +220,12 @@ impl KrkrHost {
         self.storage_bytes(name)
     }
 
-    fn write_text_storage(&self, name: &str, text: &str) -> Result<()> {
-        self.write_binary_storage(name, text.as_bytes())
+    fn write_text_storage(&self, name: &str, mode: &str, text: &str) -> Result<()> {
+        let bytes = encode_tjs_text_stream(text, mode)?;
+        self.write_binary_storage(name, mode, &bytes)
     }
 
-    fn write_binary_storage(&self, name: &str, bytes: &[u8]) -> Result<()> {
+    fn write_binary_storage(&self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
         let root = self
             .project_root
             .as_ref()
@@ -228,7 +234,18 @@ impl KrkrHost {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
-        fs::write(&path, bytes).map_err(io_error)
+        if let Some(offset) = storage_mode_offset(mode) {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(io_error)?;
+            file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+            file.write_all(bytes).map_err(io_error)
+        } else {
+            fs::write(&path, bytes).map_err(io_error)
+        }
     }
 
     fn storage_bytes(&self, name: &str) -> Result<Vec<u8>> {
@@ -1394,6 +1411,10 @@ fn decode_text_storage(
     encoding_hint: Option<&'static Encoding>,
     configured_encoding: &str,
 ) -> Result<String> {
+    if let Some(text) = decode_tjs_text_stream(bytes)? {
+        return Ok(text);
+    }
+
     if let Ok(text) = String::from_utf8(bytes.to_vec()) {
         return Ok(text);
     }
@@ -1423,6 +1444,123 @@ fn decode_text_storage(
     Ok(text.into_owned())
 }
 
+fn decode_tjs_text_stream(bytes: &[u8]) -> Result<Option<String>> {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return decode_utf16le(&bytes[2..]).map(Some);
+    }
+    if !bytes.starts_with(&[0xfe, 0xfe]) || bytes.len() < 5 {
+        return Ok(None);
+    }
+    let mode = bytes[2];
+    if bytes[3] != 0xff || bytes[4] != 0xfe {
+        return Ok(None);
+    }
+    match mode {
+        0 => {
+            let mut units = utf16le_units(&bytes[5..]);
+            for unit in &mut units {
+                if *unit >= 0x20 {
+                    *unit ^= ((*unit & 0x00fe) << 8) ^ 1;
+                }
+            }
+            String::from_utf16(&units)
+                .map(Some)
+                .map_err(|error| TjsError::runtime(format!("invalid UTF-16 text stream: {error}")))
+        }
+        1 => {
+            let mut units = utf16le_units(&bytes[5..]);
+            for unit in &mut units {
+                *unit = swap_adjacent_bits(*unit);
+            }
+            String::from_utf16(&units)
+                .map(Some)
+                .map_err(|error| TjsError::runtime(format!("invalid UTF-16 text stream: {error}")))
+        }
+        2 => {
+            if bytes.len() < 21 {
+                return Err(TjsError::runtime("compressed text stream is truncated"));
+            }
+            let compressed_len = u64::from_le_bytes(
+                bytes[5..13]
+                    .try_into()
+                    .expect("slice length checked for compressed length"),
+            ) as usize;
+            let uncompressed_len = u64::from_le_bytes(
+                bytes[13..21]
+                    .try_into()
+                    .expect("slice length checked for uncompressed length"),
+            ) as usize;
+            let compressed = bytes
+                .get(21..21 + compressed_len)
+                .ok_or_else(|| TjsError::runtime("compressed text stream is truncated"))?;
+            let mut decoder = ZlibDecoder::new(compressed);
+            let mut decoded = Vec::with_capacity(uncompressed_len);
+            decoder.read_to_end(&mut decoded).map_err(io_error)?;
+            if decoded.len() != uncompressed_len {
+                return Err(TjsError::runtime("compressed text stream length mismatch"));
+            }
+            decode_utf16le(&decoded).map(Some)
+        }
+        _ => Err(TjsError::runtime(format!(
+            "unsupported text stream mode {mode}"
+        ))),
+    }
+}
+
+fn encode_tjs_text_stream(text: &str, mode: &str) -> Result<Vec<u8>> {
+    let mut payload = utf16le_bytes(text);
+    if mode.contains('z') {
+        let level = mode
+            .split('z')
+            .nth(1)
+            .and_then(|rest| rest.chars().next())
+            .and_then(|ch| ch.to_digit(10))
+            .unwrap_or(6);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
+        encoder.write_all(&payload).map_err(io_error)?;
+        let compressed = encoder.finish().map_err(io_error)?;
+        let mut bytes = vec![0xfe, 0xfe, 2, 0xff, 0xfe];
+        bytes.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&compressed);
+        return Ok(bytes);
+    }
+    if mode.contains('c') {
+        for chunk in payload.chunks_exact_mut(2) {
+            let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+            chunk.copy_from_slice(&swap_adjacent_bits(unit).to_le_bytes());
+        }
+        let mut bytes = vec![0xfe, 0xfe, 1, 0xff, 0xfe];
+        bytes.extend_from_slice(&payload);
+        return Ok(bytes);
+    }
+    let mut bytes = vec![0xff, 0xfe];
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
+fn decode_utf16le(bytes: &[u8]) -> Result<String> {
+    String::from_utf16(&utf16le_units(bytes))
+        .map_err(|error| TjsError::runtime(format!("invalid UTF-16 text stream: {error}")))
+}
+
+fn utf16le_units(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect()
+}
+
+fn utf16le_bytes(text: &str) -> Vec<u8> {
+    text.encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+fn swap_adjacent_bits(value: u16) -> u16 {
+    ((value & 0xaaaa) >> 1) | ((value & 0x5555) << 1)
+}
+
 fn normalize_storage_separators(path: &str) -> String {
     path.replace('\\', "/")
 }
@@ -1446,21 +1584,43 @@ fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(root.join(clean_relative_path(name)?))
 }
 
+fn storage_mode_offset(mode: &str) -> Option<u64> {
+    let offset = mode
+        .split('o')
+        .nth(1)?
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!offset.is_empty()).then(|| offset.parse().ok()).flatten()
+}
+
 impl TjsHost for KrkrHost {
-    fn read_text(&mut self, name: &str, _mode: &str) -> Result<String> {
+    fn read_text(&mut self, name: &str, mode: &str) -> Result<String> {
+        if storage_mode_offset(mode).is_some() {
+            let bytes = self.read_binary(name, mode)?;
+            return decode_text_storage(name, &bytes, None, &self.text_encoding);
+        }
         self.read_text_storage(name)
     }
 
-    fn read_binary(&mut self, name: &str, _mode: &str) -> Result<Vec<u8>> {
-        self.read_binary_storage(name)
+    fn read_binary(&mut self, name: &str, mode: &str) -> Result<Vec<u8>> {
+        let bytes = self.read_binary_storage(name)?;
+        if let Some(offset) = storage_mode_offset(mode) {
+            let offset = offset as usize;
+            if offset >= bytes.len() {
+                return Ok(Vec::new());
+            }
+            return Ok(bytes[offset..].to_vec());
+        }
+        Ok(bytes)
     }
 
-    fn write_text(&mut self, name: &str, _mode: &str, text: &str) -> Result<()> {
-        self.write_text_storage(name, text)
+    fn write_text(&mut self, name: &str, mode: &str, text: &str) -> Result<()> {
+        self.write_text_storage(name, mode, text)
     }
 
-    fn write_binary(&mut self, name: &str, _mode: &str, bytes: &[u8]) -> Result<()> {
-        self.write_binary_storage(name, bytes)
+    fn write_binary(&mut self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
+        self.write_binary_storage(name, mode, bytes)
     }
 
     fn now_millis(&mut self) -> i64 {
@@ -1620,6 +1780,30 @@ mod tests {
             host.read_binary_storage("sc_title_bt_GALLERY.png")
                 .expect("read mixed-case resource"),
             b"gallery"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn storage_mode_offset_reads_and_writes_struct_tail() {
+        let root = temp_root("offset");
+        fs::create_dir_all(&root).expect("create root");
+        let mut host = KrkrHost::for_project(&root).expect("host");
+
+        host.write_binary("savedata/bookmark.bmp", "", b"thumbnail")
+            .expect("write thumbnail");
+        host.write_text("savedata/bookmark.bmp", "o9", "%[\"answer\" => 42]")
+            .expect("write struct tail");
+
+        let bytes = host
+            .read_binary("savedata/bookmark.bmp", "")
+            .expect("read all");
+        assert!(bytes.starts_with(b"thumbnail"));
+        assert_eq!(bytes[9..11], [0xff, 0xfe]);
+        assert_eq!(
+            host.read_text("savedata/bookmark.bmp", "o9")
+                .expect("read tail"),
+            "%[\"answer\" => 42]"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

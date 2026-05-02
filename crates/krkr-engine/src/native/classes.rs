@@ -7,7 +7,7 @@ use krkr_core::{AudioBus, AudioCommand, AudioSourceKind, LayerNode};
 use krkr_font::{FontSpec, FontSystem, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{Closure, ObjectHandle, Runtime, Variant},
+    runtime::{Closure, ObjectHandle, Runtime, TjsHost, Variant},
 };
 
 use crate::host::{KrkrHost, NativeTransitionCompletion};
@@ -525,10 +525,72 @@ fn menu_item_noop(
 }
 
 fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_native_method_preserving_script(runtime, handle, "close", window_close);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "onCloseQuery",
+        window_on_close_query,
+    );
     runtime.register_object_native(handle, "add", window_add);
     runtime.register_object_native(handle, "remove", window_remove);
     runtime.register_object_native(handle, "setSize", window_set_size);
     runtime.register_object_native(handle, "setInnerSize", window_set_inner_size);
+}
+
+fn window_close(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = require_window_this(runtime, this_obj, "Window.close")?;
+    runtime.set_object_member(this, "visible", Variant::Integer(0));
+    runtime.set_object_member(this, "__nativeClosed", Variant::Integer(1));
+    if is_main_window(runtime, this) {
+        runtime.host_mut().request_termination();
+    }
+    Ok(Variant::Void)
+}
+
+fn window_on_close_query(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = require_window_this(runtime, this_obj, "Window.onCloseQuery")?;
+    let can_close = args.first().map(Variant::is_truthy).unwrap_or(true);
+    runtime.set_object_member(
+        this,
+        "__nativeCanClose",
+        Variant::Integer(i64::from(can_close)),
+    );
+    if can_close {
+        runtime.set_object_member(this, "visible", Variant::Integer(0));
+        runtime.set_object_member(this, "__nativeClosed", Variant::Integer(1));
+        if is_main_window(runtime, this) {
+            runtime.host_mut().request_termination();
+        }
+    }
+    Ok(Variant::Void)
+}
+
+fn require_window_this(
+    runtime: &Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    method: &str,
+) -> Result<ObjectHandle> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime(format!("{method} requires this")))?;
+    Ok(runtime.bound_this(this).unwrap_or(this))
+}
+
+fn is_main_window(runtime: &Runtime<KrkrHost>, window: ObjectHandle) -> bool {
+    let Variant::Object(window_class) = runtime.global_member("Window") else {
+        return false;
+    };
+    let Variant::Object(main_window) = runtime.object_member(window_class, "mainWindow") else {
+        return false;
+    };
+    runtime.bound_this(main_window).unwrap_or(main_window) == window
 }
 
 fn window_add(
@@ -612,6 +674,12 @@ fn set_window_size_members(
 fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     register_native_method_preserving_script(runtime, handle, "finalize", layer_void);
     register_native_method_preserving_script(runtime, handle, "loadImages", layer_load_images);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "saveLayerImage",
+        layer_save_layer_image,
+    );
     register_native_method_preserving_script(runtime, handle, "freeImage", layer_free_image);
     register_native_method_preserving_script(runtime, handle, "setPos", layer_set_pos);
     register_native_method_preserving_script(runtime, handle, "setSize", layer_set_size);
@@ -1469,6 +1537,160 @@ fn layer_load_images(
         );
     }
     Ok(Variant::Void)
+}
+
+fn layer_save_layer_image(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
+    let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
+        return Err(TjsError::runtime("Layer.saveLayerImage requires storage"));
+    };
+    let path = path.to_tjs_string()?;
+    let mode = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_else(|| "bmp".to_string());
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
+    let layer = render_layer_snapshot(runtime, &target)
+        .ok_or_else(|| TjsError::runtime("Layer.saveLayerImage target is not available"))?;
+    let width = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.width)
+        .unwrap_or_else(|| {
+            layer_property_value(runtime, this, "imageWidth")
+                .to_integer()
+                .unwrap_or(0)
+                .max(0) as u32
+        });
+    let height = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.height)
+        .unwrap_or_else(|| {
+            layer_property_value(runtime, this, "imageHeight")
+                .to_integer()
+                .unwrap_or(0)
+                .max(0) as u32
+        });
+    let pixels = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.rgba.as_ref().to_vec())
+        .unwrap_or_else(|| vec![0; width as usize * height as usize * 4]);
+    let bytes = encode_layer_bmp(width, height, &pixels, &mode)?;
+    runtime.host_mut().write_binary(&path, "", &bytes)?;
+    Ok(Variant::Void)
+}
+
+fn encode_layer_bmp(width: u32, height: u32, rgba: &[u8], mode: &str) -> Result<Vec<u8>> {
+    let pixel_bytes = match mode {
+        "bmp" | "bmp32" => 4usize,
+        "bmp24" => 3usize,
+        "bmp8" => 1usize,
+        _ => {
+            return Err(TjsError::runtime(format!(
+                "invalid image save type `{mode}`"
+            )));
+        }
+    };
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let min_len = width_usize
+        .checked_mul(height_usize)
+        .and_then(|len| len.checked_mul(4))
+        .ok_or_else(|| TjsError::runtime("Layer.saveLayerImage image is too large"))?;
+    if rgba.len() < min_len {
+        return Err(TjsError::runtime(
+            "Layer.saveLayerImage image buffer is too small",
+        ));
+    }
+
+    let row_stride = (width_usize * pixel_bytes).div_ceil(4) * 4;
+    let palette_size = if pixel_bytes == 1 { 1024 } else { 0 };
+    let pixel_offset = 14 + 40 + palette_size;
+    let file_size = pixel_offset + row_stride * height_usize;
+    let mut out = Vec::with_capacity(file_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&((pixel_bytes * 8) as u16).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    if pixel_bytes == 1 {
+        for r in 0..6u16 {
+            for g in 0..7u16 {
+                for b in 0..6u16 {
+                    out.extend_from_slice(&[
+                        (r * 255 / 5) as u8,
+                        (g * 255 / 6) as u8,
+                        (b * 255 / 5) as u8,
+                        0,
+                    ]);
+                }
+            }
+        }
+        for _ in 252..256 {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+        }
+    }
+
+    let mut row = vec![0u8; row_stride];
+    for y in (0..height_usize).rev() {
+        row.fill(0);
+        for x in 0..width_usize {
+            let src = (y * width_usize + x) * 4;
+            let r = rgba[src];
+            let g = rgba[src + 1];
+            let b = rgba[src + 2];
+            let a = rgba[src + 3];
+            match pixel_bytes {
+                4 => {
+                    let dest = x * 4;
+                    row[dest] = b;
+                    row[dest + 1] = g;
+                    row[dest + 2] = r;
+                    row[dest + 3] = a;
+                }
+                3 => {
+                    let dest = x * 3;
+                    row[dest] = b;
+                    row[dest + 1] = g;
+                    row[dest + 2] = r;
+                }
+                1 => {
+                    let ri = nearest_palette_index(r, 5);
+                    let gi = nearest_palette_index(g, 6);
+                    let bi = nearest_palette_index(b, 5);
+                    row[x] = (ri * 42 + gi * 6 + bi) as u8;
+                }
+                _ => unreachable!("known pixel width"),
+            }
+        }
+        out.extend_from_slice(&row);
+    }
+    Ok(out)
+}
+
+fn nearest_palette_index(value: u8, max_index: u16) -> u16 {
+    ((value as u16 * max_index + 127) / 255).min(max_index)
 }
 
 fn load_images_storage(runtime: &Runtime<KrkrHost>, value: &Variant) -> Result<Option<String>> {

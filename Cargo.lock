@@ -975,6 +975,7 @@ name = "krkr-engine"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "flate2",
  "image",
  "krkr-core",
  "krkr-font",

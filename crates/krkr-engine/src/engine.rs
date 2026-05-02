@@ -43,6 +43,30 @@ impl Default for KagRunBudget {
 pub struct EngineConfig {
     pub project_root: Option<PathBuf>,
     pub kag_budget: KagRunBudget,
+    pub system_metrics: SystemMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SystemMetrics {
+    pub screen_width: i64,
+    pub screen_height: i64,
+    pub desktop_left: i64,
+    pub desktop_top: i64,
+    pub desktop_width: i64,
+    pub desktop_height: i64,
+}
+
+impl Default for SystemMetrics {
+    fn default() -> Self {
+        Self {
+            screen_width: 1920,
+            screen_height: 1080,
+            desktop_left: 0,
+            desktop_top: 0,
+            desktop_width: 1920,
+            desktop_height: 1080,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +149,7 @@ impl KrkrEngine {
         };
         let mut tjs_runtime = Runtime::with_host(host);
         install_tvp_globals(&mut tjs_runtime);
+        install_system_metrics(&mut tjs_runtime, config.system_metrics);
         Ok(Self {
             tjs_runtime,
             kag_parser: KagParser::new(),
@@ -171,6 +196,206 @@ impl KrkrEngine {
         let height = object_positive_i64(&self.tjs_runtime, window, "innerHeight")
             .or_else(|| object_positive_i64(&self.tjs_runtime, window, "height"))?;
         Some(Size::new(width as f32, height as f32))
+    }
+
+    pub fn persist_runtime_state(&mut self) -> Result<()> {
+        let Some(window) = self.runtime_window_object() else {
+            return Ok(());
+        };
+        self.sync_kag_system_state_for_persist(window);
+        if matches!(
+            self.tjs_runtime
+                .object_member(window, "saveSystemVariables"),
+            Variant::Void
+        ) {
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(window, "saveSystemVariables", Vec::new())
+            .map(|_| ())
+    }
+
+    fn sync_kag_system_state_for_persist(&mut self, window: ObjectHandle) {
+        let Variant::Object(scflags) = self.tjs_runtime.object_member(window, "scflags") else {
+            return;
+        };
+
+        let full_screen = i64::from(
+            self.tjs_runtime
+                .object_member(window, "fullScreen")
+                .is_truthy(),
+        );
+        self.tjs_runtime
+            .set_object_member(window, "fullScreened", Variant::Integer(full_screen));
+        self.tjs_runtime
+            .set_object_member(scflags, "fullScreen", Variant::Integer(full_screen));
+
+        self.sync_kag_bgm_system_state(window, scflags);
+        self.sync_kag_se_system_state(window, scflags);
+        self.sync_kag_sflags_audio_state(window);
+    }
+
+    fn sync_kag_bgm_system_state(&mut self, window: ObjectHandle, scflags: ObjectHandle) {
+        let Variant::Object(bgm) = self.tjs_runtime.object_member(window, "bgm") else {
+            return;
+        };
+        let Variant::Object(buffer) = self.tjs_runtime.object_member(bgm, "currentBuffer") else {
+            return;
+        };
+        let Some(volume2) = self
+            .tjs_runtime
+            .host()
+            .native_audio_buffer(buffer)
+            .map(|buffer| buffer.volume2)
+        else {
+            return;
+        };
+
+        let bgm_flags = ensure_object_member(&mut self.tjs_runtime, scflags, "bgm");
+        if object_member_is_false(&self.tjs_runtime, bgm_flags, "enable") {
+            return;
+        }
+        self.tjs_runtime
+            .set_object_member(bgm_flags, "globalVolume", Variant::Integer(volume2));
+    }
+
+    fn sync_kag_se_system_state(&mut self, window: ObjectHandle, scflags: ObjectHandle) {
+        let Variant::Object(se) = self.tjs_runtime.object_member(window, "se") else {
+            return;
+        };
+        let count = self
+            .tjs_runtime
+            .object_member(se, "count")
+            .to_integer()
+            .unwrap_or(0)
+            .max(0) as usize;
+        if count == 0 {
+            return;
+        }
+
+        let mut volumes = vec![None; count];
+        let mut last_live_index = None;
+        for (index, volume_slot) in volumes.iter_mut().enumerate() {
+            let Variant::Object(buffer) = self.tjs_runtime.object_member(se, &index.to_string())
+            else {
+                continue;
+            };
+            let Some(volume2) = self
+                .tjs_runtime
+                .host()
+                .native_audio_buffer(buffer)
+                .map(|buffer| buffer.volume2)
+            else {
+                continue;
+            };
+            *volume_slot = Some(volume2);
+            last_live_index = Some(index);
+        }
+
+        let Some(last_live_index) = last_live_index else {
+            return;
+        };
+        let se_flags = self.tjs_runtime.alloc_array_object(Vec::new());
+        for volume in volumes.into_iter().take(last_live_index + 1) {
+            let Some(volume) = volume else {
+                self.tjs_runtime.array_push(se_flags, Variant::Void);
+                continue;
+            };
+            let item_flags = self.alloc_dictionary_object();
+            self.tjs_runtime.set_object_member(
+                item_flags,
+                "globalVolume",
+                Variant::Integer(volume),
+            );
+            self.tjs_runtime
+                .array_push(se_flags, Variant::Object(item_flags));
+        }
+        self.tjs_runtime
+            .set_object_member(scflags, "se", Variant::Object(se_flags));
+    }
+
+    fn alloc_dictionary_object(&mut self) -> ObjectHandle {
+        let handle = self.tjs_runtime.alloc_ordinary_object();
+        self.tjs_runtime.add_object_class_info(handle, "Dictionary");
+        handle
+    }
+
+    fn sync_kag_sflags_audio_state(&mut self, window: ObjectHandle) {
+        let Variant::Object(sflags) = self.tjs_runtime.object_member(window, "sflags") else {
+            return;
+        };
+
+        if let Some(volume) = self.kag_bgm_volume2(window) {
+            self.set_existing_sflag_volume_percent(sflags, "bgm_vol", volume);
+        }
+        if let Some(volume) = self.kag_se_volume2(window, 0) {
+            self.set_existing_sflag_volume_percent(sflags, "se_vol", volume);
+        }
+        if let Some(volume) = self.kag_se_volume2(window, 2) {
+            self.set_existing_sflag_volume_percent(sflags, "sysse_vol", volume);
+        }
+        if let Some(volume) = self.kag_se_volume2(window, 3) {
+            self.set_existing_sflag_volume_percent(sflags, "cv_vol", volume);
+        }
+    }
+
+    fn kag_bgm_volume2(&self, window: ObjectHandle) -> Option<i64> {
+        let Variant::Object(bgm) = self.tjs_runtime.object_member(window, "bgm") else {
+            return None;
+        };
+        let Variant::Object(buffer) = self.tjs_runtime.object_member(bgm, "currentBuffer") else {
+            return None;
+        };
+        self.tjs_runtime
+            .host()
+            .native_audio_buffer(buffer)
+            .map(|buffer| buffer.volume2)
+    }
+
+    fn kag_se_volume2(&self, window: ObjectHandle, index: usize) -> Option<i64> {
+        let Variant::Object(se) = self.tjs_runtime.object_member(window, "se") else {
+            return None;
+        };
+        let Variant::Object(buffer) = self.tjs_runtime.object_member(se, &index.to_string()) else {
+            return None;
+        };
+        self.tjs_runtime
+            .host()
+            .native_audio_buffer(buffer)
+            .map(|buffer| buffer.volume2)
+    }
+
+    fn set_existing_sflag_volume_percent(
+        &mut self,
+        sflags: ObjectHandle,
+        name: &str,
+        volume2: i64,
+    ) {
+        if !self.tjs_runtime.has_object_member(sflags, name) {
+            return;
+        }
+        self.tjs_runtime.set_object_member(
+            sflags,
+            name,
+            Variant::Integer(volume2_to_kag_percent(volume2)),
+        );
+    }
+
+    pub fn request_runtime_close(&mut self) -> Result<()> {
+        let Some(window) = self.runtime_window_object() else {
+            self.tjs_runtime.host_mut().request_termination();
+            return Ok(());
+        };
+        if matches!(
+            self.tjs_runtime.object_member(window, "close"),
+            Variant::Void
+        ) {
+            self.tjs_runtime.host_mut().request_termination();
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(window, "close", Vec::new())
+            .map(|_| ())
     }
 
     pub fn window_fullscreen(&self) -> bool {
@@ -1999,6 +2224,43 @@ fn layer_property_backing_key(name: &str) -> String {
     format!("__nativeLayerProperty${name}")
 }
 
+fn install_system_metrics(runtime: &mut Runtime<KrkrHost>, metrics: SystemMetrics) {
+    let Variant::Object(system) = runtime.global_member("System") else {
+        return;
+    };
+    for (name, value) in [
+        ("screenWidth", metrics.screen_width),
+        ("screenHeight", metrics.screen_height),
+        ("desktopLeft", metrics.desktop_left),
+        ("desktopTop", metrics.desktop_top),
+        ("desktopWidth", metrics.desktop_width),
+        ("desktopHeight", metrics.desktop_height),
+    ] {
+        runtime.set_object_member(system, name, Variant::Integer(value.max(0)));
+    }
+}
+
+fn ensure_object_member(
+    runtime: &mut Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> ObjectHandle {
+    if let Variant::Object(handle) = runtime.object_member(object, name) {
+        return handle;
+    }
+    let handle = runtime.alloc_ordinary_object();
+    runtime.set_object_member(object, name, Variant::Object(handle));
+    handle
+}
+
+fn object_member_is_false(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> bool {
+    matches!(runtime.object_member(object, name), Variant::Integer(0))
+}
+
+fn volume2_to_kag_percent(volume2: i64) -> i64 {
+    (volume2.clamp(0, 100000) + 500) / 1000
+}
+
 fn object_positive_i64(
     runtime: &Runtime<KrkrHost>,
     object: ObjectHandle,
@@ -2273,6 +2535,96 @@ mod tests {
                 .expect("script"),
             Variant::Integer(3)
         );
+    }
+
+    #[test]
+    fn dictionary_save_struct_persists_to_system_data_path() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var path = System.dataPath + "vars.ksd";
+                var saved = %[];
+                saved.answer = 42;
+                saved.name = "kirakira";
+                (Dictionary.saveStruct incontextof saved)(path, "");
+                var loaded = Scripts.evalStorage(path);
+                return loaded.answer + ":" + loaded.name;
+                "#,
+            )
+            .expect("save and load");
+
+        assert_eq!(result, Variant::String("42:kirakira".to_string()));
+        assert!(root.join("savedata/vars.ksd").is_file());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn structured_persistence_supports_krkr_modes_and_binary_format() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var textPath = System.dataPath + "vars_c.ksd";
+                var zipPath = System.dataPath + "vars_z.ksd";
+                var binPath = System.dataPath + "vars_b.ksd";
+                var saved = %[];
+                saved.answer = 42;
+                saved.child = %[];
+                saved.child.name = "nested";
+                saved.list = new Array();
+                saved.list.add(7);
+                saved.list.add("item");
+                (Dictionary.saveStruct incontextof saved)(textPath, "c");
+                (Dictionary.saveStruct incontextof saved)(zipPath, "z1");
+                (Dictionary.saveStruct incontextof saved)(binPath, "b");
+                var c = Scripts.evalStorage(textPath, "c");
+                var z = Scripts.evalStorage(zipPath, "z1");
+                var be = Scripts.evalStorage(binPath, "b");
+                var b = new Dictionary();
+                b.loadStruct(binPath, "b");
+                return c.child.name + ":" + z.list[1] + ":" + b.answer + ":" + be.child.name;
+                "#,
+            )
+            .expect("save and load modes");
+
+        assert_eq!(result, Variant::String("nested:item:42:nested".to_string()));
+        let bytes = fs::read(root.join("savedata/vars_b.ksd")).expect("binary struct");
+        assert!(bytes.starts_with(b"KBAD100\0"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn layer_save_layer_image_writes_krkr_bmp24_thumbnail() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(2, 1);
+                layer.fillRect(0, 0, 2, 1, 0x204080);
+                layer.saveLayerImage(System.dataPath + "thumb.bmp", "bmp24");
+                "#,
+            )
+            .expect("save thumbnail");
+
+        let bytes = fs::read(root.join("savedata/thumb.bmp")).expect("bmp");
+        assert_eq!(&bytes[0..2], b"BM");
+        assert_eq!(bytes.len(), 54 + 8);
+        assert_eq!(u16::from_le_bytes([bytes[28], bytes[29]]), 24);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -2813,6 +3165,7 @@ mod tests {
                 max_tags_per_tick: 2,
                 max_wall_time: Duration::from_secs(1),
             },
+            ..EngineConfig::default()
         })
         .expect("engine");
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -7013,6 +7366,200 @@ mod tests {
     }
 
     #[test]
+    fn persist_runtime_state_calls_kag_save_system_variables() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "persist.tjs",
+                r#"
+                global.saved = 0;
+                global.kag = new Window();
+                kag.saveSystemVariables = function() { global.saved++; };
+                "#,
+            )
+            .expect("script");
+
+        engine.persist_runtime_state().expect("persist");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("saved"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn persist_runtime_state_syncs_kag_system_audio_state() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "persist_audio.tjs",
+                r#"
+                global.saved = "";
+                global.kag = new Window();
+                kag.fullScreen = false;
+                kag.fullScreened = true;
+                kag.scflags = %[];
+                kag.sflags = %[];
+                kag.sflags.bgm_vol = void;
+                kag.sflags.se_vol = void;
+                kag.sflags.cv_vol = void;
+                kag.bgm = %[];
+                kag.bgm.currentBuffer = new WaveSoundBuffer(kag);
+                kag.bgm.currentBuffer.volume2 = 35000;
+                kag.se = [];
+                var se0 = new WaveSoundBuffer(kag);
+                se0.volume2 = 55000;
+                kag.se.add(se0);
+                var se1 = new WaveSoundBuffer(kag);
+                se1.volume2 = 56000;
+                kag.se.add(se1);
+                var se2 = new WaveSoundBuffer(kag);
+                se2.volume2 = 57000;
+                kag.se.add(se2);
+                var se3 = new WaveSoundBuffer(kag);
+                se3.volume2 = 60000;
+                kag.se.add(se3);
+                kag.saveSystemVariables = function() {
+                    global.saved = scflags.fullScreen + ":" +
+                        scflags.bgm.globalVolume + ":" + scflags.se[0].globalVolume + ":" +
+                        sflags.bgm_vol + ":" + sflags.se_vol + ":" + sflags.cv_vol;
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine.persist_runtime_state().expect("persist");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("saved"),
+            Variant::String("0:35000:55000:35:55:60".to_string())
+        );
+        assert_eq!(
+            engine
+                .execute_expression("persist_audio_count.tjs", "kag.scflags.se.count")
+                .expect("se count"),
+            Variant::Integer(4)
+        );
+    }
+
+    #[test]
+    fn scripts_eval_storage_normalizes_legacy_kag_se_null_entries() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("datasc.ksd"),
+            r#"(const) %[
+ "se" => (const) [
+  null,
+  (const) %[
+   "globalVolume" => 12000,
+  ],
+  null,
+ ],
+]"#,
+        )
+        .expect("write scflags");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_expression(
+                "normalize_scflags.tjs",
+                r#"
+                (function() {
+                    var d = Scripts.evalStorage("datasc.ksd");
+                    return (d.se[0] === void ? 1 : 0) + ":" +
+                        d.se.count + ":" + d.se[1].globalVolume;
+                })()
+                "#,
+            )
+            .expect("eval storage");
+
+        assert_eq!(value, Variant::String("1:2:12000".to_string()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn system_metrics_override_screen_size_globals() {
+        let engine = KrkrEngine::new(EngineConfig {
+            system_metrics: SystemMetrics {
+                screen_width: 2560,
+                screen_height: 1440,
+                desktop_left: 10,
+                desktop_top: 20,
+                desktop_width: 2500,
+                desktop_height: 1400,
+            },
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+
+        let Variant::Object(system) = engine.tjs_runtime().global_member("System") else {
+            panic!("System should be an object");
+        };
+        assert_eq!(
+            engine.tjs_runtime().object_member(system, "screenWidth"),
+            Variant::Integer(2560)
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(system, "screenHeight"),
+            Variant::Integer(1440)
+        );
+    }
+
+    #[test]
+    fn request_runtime_close_uses_script_close_then_native_window_close() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "close.tjs",
+                r#"
+                global.saved = 0;
+                class GameWindow extends Window {
+                    function GameWindow() { super.Window(); }
+                    function close() {
+                        global.saved++;
+                        super.close(...);
+                    }
+                }
+                global.kag = new GameWindow();
+                "#,
+            )
+            .expect("script");
+
+        engine.request_runtime_close().expect("close");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("saved"),
+            Variant::Integer(1)
+        );
+        assert!(engine.host().termination_requested());
+    }
+
+    #[test]
+    fn window_on_close_query_respects_can_close_argument() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let denied = engine
+            .execute_script(
+                "close_query.tjs",
+                r#"
+                global.kag = new Window();
+                kag.onCloseQuery(false);
+                return kag.__nativeCanClose + ":" + (kag.__nativeClosed === void);
+                "#,
+            )
+            .expect("deny close");
+
+        assert_eq!(denied, Variant::String("0:1".to_string()));
+        assert!(!engine.host().termination_requested());
+
+        engine
+            .execute_script("close_query_accept.tjs", "kag.onCloseQuery(true);")
+            .expect("accept close");
+
+        assert!(engine.host().termination_requested());
+    }
+
+    #[test]
     fn native_async_trigger_callback_runs_from_update() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -7143,6 +7690,7 @@ mod tests {
                 max_tags_per_tick: 1000,
                 max_wall_time: Duration::from_secs(1),
             },
+            ..EngineConfig::default()
         })
         .expect("engine")
     }
