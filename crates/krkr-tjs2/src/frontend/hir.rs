@@ -171,20 +171,29 @@ impl Analyzer {
                         syntax::VarKind::Var => BindingKind::Var,
                         syntax::VarKind::Const => BindingKind::Const,
                     };
-                    self.declare_ident(&mut declaration.name, binding_kind, declaration.span);
+                    if declaration.name.binding.is_none() {
+                        self.declare_ident(&mut declaration.name, binding_kind, declaration.span);
+                    }
                 }
             }
             syntax::StmtKind::FunctionDecl(decl) => {
-                if let Some(name) = &mut decl.name {
+                if let Some(name) = &mut decl.name
+                    && name.binding.is_none()
+                {
                     self.declare_ident(name, BindingKind::Function, decl.span);
                 }
                 self.function(decl);
             }
             syntax::StmtKind::ClassDecl(decl) => {
-                self.declare_ident(&mut decl.name, BindingKind::Class, decl.span);
+                if decl.name.binding.is_none() {
+                    self.declare_ident(&mut decl.name, BindingKind::Class, decl.span);
+                }
                 self.enter_scope(ScopeKind::Class, decl.span);
                 for extender in &mut decl.extends {
                     self.expr(extender);
+                }
+                for member in &mut decl.body {
+                    self.predeclare_class_member(member);
                 }
                 for member in &mut decl.body {
                     self.statement(member);
@@ -192,7 +201,9 @@ impl Analyzer {
                 self.leave_scope();
             }
             syntax::StmtKind::PropertyDecl(decl) => {
-                self.declare_ident(&mut decl.name, BindingKind::Property, decl.span);
+                if decl.name.binding.is_none() {
+                    self.declare_ident(&mut decl.name, BindingKind::Property, decl.span);
+                }
                 self.enter_scope(ScopeKind::Property, decl.span);
                 if let Some(getter) = &mut decl.getter {
                     self.function(getter);
@@ -272,6 +283,40 @@ impl Analyzer {
                 }
                 self.switch_depth -= 1;
             }
+        }
+    }
+
+    fn predeclare_class_member(&mut self, statement: &mut syntax::Stmt) {
+        match &mut statement.kind {
+            syntax::StmtKind::Var { kind, declarations } => {
+                let binding_kind = match kind {
+                    syntax::VarKind::Var => BindingKind::Var,
+                    syntax::VarKind::Const => BindingKind::Const,
+                };
+                for declaration in declarations {
+                    if declaration.name.binding.is_none() {
+                        self.declare_ident(&mut declaration.name, binding_kind, declaration.span);
+                    }
+                }
+            }
+            syntax::StmtKind::FunctionDecl(decl) => {
+                if let Some(name) = &mut decl.name
+                    && name.binding.is_none()
+                {
+                    self.declare_ident(name, BindingKind::Function, decl.span);
+                }
+            }
+            syntax::StmtKind::ClassDecl(decl) => {
+                if decl.name.binding.is_none() {
+                    self.declare_ident(&mut decl.name, BindingKind::Class, decl.span);
+                }
+            }
+            syntax::StmtKind::PropertyDecl(decl) => {
+                if decl.name.binding.is_none() {
+                    self.declare_ident(&mut decl.name, BindingKind::Property, decl.span);
+                }
+            }
+            _ => {}
         }
     }
 

@@ -271,6 +271,15 @@ impl KrkrHost {
                         encoding_hint: layer.encoding_hint,
                     }));
                 }
+                if let Some(path) =
+                    resolve_case_insensitive_path(&layer.root, &candidate).map_err(io_error)?
+                    && path.is_file()
+                {
+                    return Ok(Some(LocatedStorage {
+                        path,
+                        encoding_hint: layer.encoding_hint,
+                    }));
+                }
             }
         }
         Ok(None)
@@ -1273,6 +1282,44 @@ fn path_to_storage_name(path: &Path) -> String {
     normalize_storage_separators(&path.to_string_lossy())
 }
 
+fn resolve_case_insensitive_path(root: &Path, relative: &Path) -> io::Result<Option<PathBuf>> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Ok(None);
+        };
+        let exact = current.join(part);
+        if exact.exists() {
+            current = exact;
+            continue;
+        }
+
+        let Some(part) = part.to_str() else {
+            return Ok(None);
+        };
+        if !current.is_dir() {
+            return Ok(None);
+        }
+        let mut matched = None;
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(part)
+            {
+                matched = Some(entry.path());
+                break;
+            }
+        }
+        let Some(path) = matched else {
+            return Ok(None);
+        };
+        current = path;
+    }
+    Ok(Some(current))
+}
+
 fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
     let name = normalize_storage_separators(name);
     clean_relative_path(&name)?;
@@ -1556,6 +1603,23 @@ mod tests {
                 "data.xp3",
                 "patch.xp3"
             ]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn filesystem_storage_lookup_falls_back_to_case_insensitive_match() {
+        let root = temp_root("case");
+        fs::create_dir_all(root.join("patch")).expect("create patch");
+        fs::write(root.join("patch/sc_title_bt_Gallery.png"), b"gallery")
+            .expect("write mixed-case resource");
+
+        let host = KrkrHost::for_project(&root).expect("host");
+
+        assert_eq!(
+            host.read_binary_storage("sc_title_bt_GALLERY.png")
+                .expect("read mixed-case resource"),
+            b"gallery"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

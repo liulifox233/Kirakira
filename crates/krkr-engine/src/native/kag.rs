@@ -4,7 +4,7 @@ use krkr_kag::{
 };
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeFunction, ObjectHandle, Runtime, Variant, VmNativeFunction},
     vm::Vm,
 };
 
@@ -39,18 +39,80 @@ fn kag_parser_constructor(
 }
 
 fn install_kag_parser_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    runtime.register_object_vm_native(handle, "loadScenario", kag_load_scenario);
-    runtime.register_object_vm_native(handle, "goToLabel", kag_go_to_label);
-    runtime.register_object_vm_native(handle, "callLabel", kag_call_label);
-    runtime.register_object_vm_native(handle, "getNextTag", kag_get_next_tag);
-    runtime.register_object_vm_native(handle, "assign", kag_assign);
-    runtime.register_object_vm_native(handle, "clear", kag_clear);
-    runtime.register_object_vm_native(handle, "store", kag_store);
-    runtime.register_object_vm_native(handle, "restore", kag_restore);
-    runtime.register_object_vm_native(handle, "clearCallStack", kag_clear_call_stack);
-    runtime.register_object_vm_native(handle, "interrupt", kag_interrupt);
-    runtime.register_object_vm_native(handle, "resetInterrupt", kag_reset_interrupt);
-    runtime.register_object_vm_native(handle, "popMacroArgs", kag_pop_macro_args);
+    register_kag_native_method_preserving_script(runtime, handle, "finalize", kag_finalize);
+    register_kag_vm_native_method_preserving_script(
+        runtime,
+        handle,
+        "loadScenario",
+        kag_load_scenario,
+    );
+    register_kag_vm_native_method_preserving_script(runtime, handle, "goToLabel", kag_go_to_label);
+    register_kag_vm_native_method_preserving_script(runtime, handle, "callLabel", kag_call_label);
+    register_kag_vm_native_method_preserving_script(
+        runtime,
+        handle,
+        "getNextTag",
+        kag_get_next_tag,
+    );
+    register_kag_vm_native_method_preserving_script(runtime, handle, "assign", kag_assign);
+    register_kag_vm_native_method_preserving_script(runtime, handle, "clear", kag_clear);
+    register_kag_vm_native_method_preserving_script(runtime, handle, "store", kag_store);
+    register_kag_vm_native_method_preserving_script(runtime, handle, "restore", kag_restore);
+    register_kag_vm_native_method_preserving_script(
+        runtime,
+        handle,
+        "clearCallStack",
+        kag_clear_call_stack,
+    );
+    register_kag_vm_native_method_preserving_script(runtime, handle, "interrupt", kag_interrupt);
+    register_kag_vm_native_method_preserving_script(
+        runtime,
+        handle,
+        "resetInterrupt",
+        kag_reset_interrupt,
+    );
+    register_kag_vm_native_method_preserving_script(
+        runtime,
+        handle,
+        "popMacroArgs",
+        kag_pop_macro_args,
+    );
+}
+
+fn register_kag_native_method_preserving_script<F>(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &'static str,
+    function: F,
+) where
+    F: NativeFunction<KrkrHost> + 'static,
+{
+    if !matches!(runtime.object_member(handle, name), Variant::Void) {
+        return;
+    }
+    runtime.register_object_native(handle, name, function);
+}
+
+fn register_kag_vm_native_method_preserving_script<F>(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &'static str,
+    function: F,
+) where
+    F: VmNativeFunction<KrkrHost> + 'static,
+{
+    if !matches!(runtime.object_member(handle, name), Variant::Void) {
+        return;
+    }
+    runtime.register_object_vm_native(handle, name, function);
+}
+
+fn kag_finalize(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Void)
 }
 
 fn kag_load_scenario(

@@ -88,6 +88,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 }
             }
             if let Some(this_obj) = bind_this
+                && !flags.no_bound_instance_fallback
                 && let Some(value) = self.runtime.heap[this_obj.0].get_raw(name)
             {
                 return Ok(value);
@@ -736,7 +737,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .prop_get_handle(
                 handle,
                 name,
-                DispatchFlags::default(),
+                DispatchFlags::no_bound_instance_fallback(),
                 closure_this.or(Some(handle)),
             )
             .map_err(|error| {
@@ -811,6 +812,52 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             ))),
             CallOutcome::Frame(frame) => self.run_call_stack(vec![*frame], base_depth),
         }
+    }
+
+    pub(super) fn invalidate_object(&mut self, handle: ObjectHandle) -> Result<bool> {
+        if !self.runtime.heap[handle.0].valid {
+            return Ok(false);
+        }
+        if self.runtime.heap[handle.0].invalidating {
+            return Ok(false);
+        }
+
+        self.runtime.heap[handle.0].invalidating = true;
+        let result = (|| {
+            let finalize =
+                self.prop_get_handle(handle, "finalize", DispatchFlags::default(), Some(handle))?;
+            if !matches!(finalize, Variant::Void) {
+                let base_depth = self.runtime.call_depth;
+                match self.call_value(
+                    finalize,
+                    Some(handle),
+                    Vec::new(),
+                    false,
+                    Continuation::Root,
+                )? {
+                    CallOutcome::Immediate(_, Continuation::Root) => {}
+                    CallOutcome::Immediate(_, continuation) => {
+                        return Err(TjsError::runtime(format!(
+                            "unexpected finalize continuation {continuation:?}"
+                        )));
+                    }
+                    CallOutcome::Frame(frame) => {
+                        self.run_call_stack(vec![*frame], base_depth)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            self.runtime.heap[handle.0].invalidating = false;
+            return Err(error);
+        }
+
+        self.runtime.heap[handle.0].valid = false;
+        self.runtime.heap[handle.0].invalidating = false;
+        self.runtime.host_mut().invalidate_object(handle);
+        Ok(true)
     }
 
     pub(super) fn call_value(

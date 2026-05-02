@@ -23,6 +23,7 @@ pub(super) struct DispatchFlags {
     must_exist: bool,
     ignore_prop: bool,
     hidden: bool,
+    no_bound_instance_fallback: bool,
 }
 
 pub struct Vm<'bc, 'rt, H: TjsHost = NoHost> {
@@ -461,11 +462,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             93 => {
                 let value = match self.resolve_object(frame.get(inst.operands[0])?) {
-                    Ok(handle) => {
-                        self.runtime.heap[handle.0].valid = false;
-                        self.runtime.host_mut().invalidate_object(handle);
-                        Variant::Integer(1)
-                    }
+                    Ok(handle) => Variant::Integer(i64::from(self.invalidate_object(handle)?)),
                     Err(_) => Variant::Integer(0),
                 };
                 frame.set(inst.operands[0], value)?;
@@ -999,6 +996,13 @@ impl DispatchFlags {
     fn must_exist() -> Self {
         Self {
             must_exist: true,
+            ..Self::default()
+        }
+    }
+
+    fn no_bound_instance_fallback() -> Self {
+        Self {
+            no_bound_instance_fallback: true,
             ..Self::default()
         }
     }

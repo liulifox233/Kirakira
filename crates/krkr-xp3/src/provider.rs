@@ -60,10 +60,19 @@ impl Xp3ResourceProvider {
 
     pub fn get_entry(&self, path: &str) -> Option<&Xp3Entry> {
         let normalized = normalize_entry_name(path).ok()?;
-        self.archives
-            .iter()
-            .rev()
-            .find_map(|archive| archive.get_entry(&normalized))
+        for archive in self.archives.iter().rev() {
+            if let Some(entry) = archive.get_entry(&normalized) {
+                return Some(entry);
+            }
+            if let Some(entry) = archive
+                .entries()
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&normalized))
+            {
+                return Some(entry);
+            }
+        }
+        None
     }
 }
 
@@ -71,13 +80,21 @@ impl ResourceProvider for Xp3ResourceProvider {
     fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>> {
         let normalized = normalize_entry_name(path).map_err(xp3_error_to_io)?;
         for archive in self.archives.iter().rev() {
-            if archive.get_entry(&normalized).is_none() {
+            let entry_name = if archive.get_entry(&normalized).is_some() {
+                normalized.clone()
+            } else if let Some(entry) = archive
+                .entries()
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&normalized))
+            {
+                entry.name.clone()
+            } else {
                 continue;
-            }
+            };
             let stream = archive
-                .open_by_name(&normalized)
+                .open_by_name(&entry_name)
                 .map_err(xp3_error_to_io)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, normalized.clone()))?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, entry_name.clone()))?;
             return Ok(Box::new(stream));
         }
 

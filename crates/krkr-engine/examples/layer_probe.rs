@@ -26,6 +26,11 @@ fn main() {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    let frame_expression_each = std::env::var("KRKR_PROBE_FRAME_EXPR_EACH").is_ok();
+    let probe_events = std::env::var("KRKR_PROBE_EVENTS")
+        .ok()
+        .map(|value| parse_probe_events(&value))
+        .unwrap_or_default();
 
     let mut engine = KrkrEngine::for_project(&root).expect("engine");
     let startup = engine.execute_startup().expect("startup");
@@ -74,7 +79,7 @@ fn main() {
     );
 
     for frame_index in 0..frames {
-        if frame_expression_at == frame_index
+        if (frame_expression_each || frame_expression_at == frame_index)
             && let Some(expression) = &frame_expression
         {
             let value = engine
@@ -88,7 +93,9 @@ fn main() {
                 .expect("script start click");
             println!("script_start_click={value}");
         }
-        let events = if click_through {
+        let events = if !probe_events.is_empty() {
+            probe_events_for_frame(&probe_events, frame_index)
+        } else if click_through {
             probe_click_events(frame_index)
         } else {
             Vec::new()
@@ -228,6 +235,51 @@ fn main() {
 
 fn tjs_string_literal(value: &str) -> String {
     format!("{value:?}")
+}
+
+fn parse_probe_events(value: &str) -> Vec<(usize, EngineEvent)> {
+    value
+        .split(';')
+        .filter_map(|item| {
+            let mut parts = item.split(':');
+            let frame = parts.next()?.parse::<usize>().ok()?;
+            let kind = parts.next()?;
+            match kind {
+                "move" => {
+                    let x = parts.next()?.parse::<f32>().ok()?;
+                    let y = parts.next()?.parse::<f32>().ok()?;
+                    Some((
+                        frame,
+                        EngineEvent::CursorMoved {
+                            position: Point::new(x, y),
+                        },
+                    ))
+                }
+                "down" => Some((
+                    frame,
+                    EngineEvent::PointerInput {
+                        button: PointerButton::Primary,
+                        state: ButtonState::Pressed,
+                    },
+                )),
+                "up" => Some((
+                    frame,
+                    EngineEvent::PointerInput {
+                        button: PointerButton::Primary,
+                        state: ButtonState::Released,
+                    },
+                )),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn probe_events_for_frame(events: &[(usize, EngineEvent)], frame: usize) -> Vec<EngineEvent> {
+    events
+        .iter()
+        .filter_map(|(event_frame, event)| (*event_frame == frame).then_some(*event))
+        .collect()
 }
 
 fn print_image(label: &str, image: &ImageCommand, uploads: &[ImageUpload], engine: &KrkrEngine) {
