@@ -467,6 +467,41 @@ mod tests {
     }
 
     #[test]
+    fn super_finalize_uses_declaring_class_super_chain() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "native_super_finalize.tjs",
+            r#"
+            global.trace = "";
+            class Middle extends NativeBase {
+                function Middle() { super.NativeBase(); }
+                function finalize() {
+                    global.trace += "M";
+                    super.finalize(...);
+                }
+            }
+            class Child extends Middle {
+                function Child() { super.Middle(); }
+                function finalize() {
+                    global.trace += "C";
+                    super.finalize(...);
+                }
+            }
+            var c = new Child();
+            invalidate c;
+            return global.trace + ":" + (isvalid c);
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("CMN:0".to_string())
+        );
+    }
+
+    #[test]
     fn native_class_object_method_call_uses_current_instance_this() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);
@@ -543,11 +578,15 @@ mod tests {
                 runtime.set_object_member(handle, "initialized", Variant::Integer(1));
                 runtime.set_object_member(handle, "nativeSlot", Variant::Integer(0));
                 runtime.register_object_native(handle, "nativeValue", native_base_value);
+                if matches!(runtime.object_member(handle, "finalize"), Variant::Void) {
+                    runtime.register_object_native(handle, "finalize", native_base_finalize);
+                }
                 Ok(Variant::Object(handle))
             },
         );
         runtime.add_object_class_info(constructor, "NativeBase");
         runtime.register_object_native(constructor, "nativeValue", native_base_value);
+        runtime.register_object_native(constructor, "finalize", native_base_finalize);
         runtime.set_global_member("NativeBase", Variant::Object(constructor));
     }
 
@@ -562,6 +601,16 @@ mod tests {
             Variant::Void => Variant::Integer(0),
             _ => Variant::Integer(7),
         })
+    }
+
+    fn native_base_finalize(
+        runtime: &mut Runtime,
+        _this_obj: Option<ObjectHandle>,
+        _args: Vec<Variant>,
+    ) -> Result<Variant> {
+        let trace = runtime.global_member("trace").to_tjs_string()?;
+        runtime.set_global_member("trace", Variant::String(format!("{trace}N")));
+        Ok(Variant::Void)
     }
 
     #[test]
@@ -584,6 +633,30 @@ mod tests {
             )
             .expect("execute"),
             Variant::Integer(11)
+        );
+    }
+
+    #[test]
+    fn class_property_identifier_assignment_uses_setter() {
+        assert_eq!(
+            execute_source(
+                "class_property_identifier_set.tjs",
+                r#"
+                    class C {
+                        var stored = 0;
+                        function setValue(v) { value = v; }
+                        property value {
+                            getter { return stored; }
+                            setter(v) { stored = v * 3; }
+                        }
+                    }
+                    var c = new C();
+                    c.setValue(7);
+                    return c.value + ":" + c.stored;
+                "#
+            )
+            .expect("execute"),
+            Variant::String("21:21".to_string())
         );
     }
 

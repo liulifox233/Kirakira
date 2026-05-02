@@ -1152,6 +1152,7 @@ pub fn lower_hir_program(
 struct BindingInfo {
     is_global: bool,
     scope_kind: hir::ScopeKind,
+    kind: hir::BindingKind,
 }
 
 struct Lowerer<'a> {
@@ -1176,6 +1177,7 @@ impl<'a> Lowerer<'a> {
                 BindingInfo {
                     is_global,
                     scope_kind,
+                    kind: binding.kind,
                 },
             );
         }
@@ -1217,6 +1219,13 @@ impl<'a> Lowerer<'a> {
             .binding
             .and_then(|id| self.binding(id))
             .is_some_and(|binding| binding.scope_kind == hir::ScopeKind::Class)
+    }
+
+    fn ident_is_property(&self, ident: &syntax::Ident) -> bool {
+        ident
+            .binding
+            .and_then(|id| self.binding(id))
+            .is_some_and(|binding| binding.kind == hir::BindingKind::Property)
     }
 
     fn intern_string(&mut self, text: &str) -> StringId {
@@ -2970,7 +2979,11 @@ impl ObjectBuilder {
         Ok(Place::Member {
             object: Value::Slot(SlotId::ThisProxy),
             key: MemberKey::Direct(lowerer.intern_string(&ident.name)),
-            flags: FLAGS_IGNORE_PROP_SET,
+            flags: if lowerer.ident_is_property(ident) {
+                FLAGS_DEFAULT_SET
+            } else {
+                FLAGS_IGNORE_PROP_SET
+            },
         })
     }
 

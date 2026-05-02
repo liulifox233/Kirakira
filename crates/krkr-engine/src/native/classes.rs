@@ -610,6 +610,7 @@ fn set_window_size_members(
 }
 
 fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_native_method_preserving_script(runtime, handle, "finalize", layer_void);
     register_native_method_preserving_script(runtime, handle, "loadImages", layer_load_images);
     register_native_method_preserving_script(runtime, handle, "freeImage", layer_free_image);
     register_native_method_preserving_script(runtime, handle, "setPos", layer_set_pos);
@@ -659,6 +660,7 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "setMode", layer_void);
     register_native_method_preserving_script(runtime, handle, "removeMode", layer_void);
     register_native_method_preserving_script(runtime, handle, "releaseCapture", layer_void);
+    register_native_method_preserving_script(runtime, handle, "onHitTest", layer_on_hit_test);
     register_native_method_preserving_script(runtime, handle, "onKeyDown", layer_on_key_down);
     register_native_method_preserving_script(runtime, handle, "onKeyUp", layer_on_key_up);
     register_native_method_preserving_script(
@@ -887,7 +889,9 @@ fn apply_layer_property_to_render(
             "type" => layer.layer_type = integer as i32,
             "face" => layer.face = integer as i32,
             "hitType" => layer.hit_type = integer as i32,
-            "hitThreshold" => layer.hit_threshold = integer.clamp(0, 255) as u8,
+            "hitThreshold" => {
+                layer.hit_threshold = integer.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+            }
             _ => {}
         });
     }
@@ -1713,6 +1717,14 @@ fn layer_exchange_info(
     else {
         return Ok(Variant::Void);
     };
+    exchange_native_layer_info(runtime, this, comp)
+}
+
+fn exchange_native_layer_info(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    comp: ObjectHandle,
+) -> Result<Variant> {
     let Some(this_layer_id) = native_layer_id(runtime, this)? else {
         return Ok(Variant::Void);
     };
@@ -1726,6 +1738,8 @@ fn layer_exchange_info(
     let Some(comp_layer) = runtime.host().layer_tree().layer(comp_layer_id).cloned() else {
         return Ok(Variant::Void);
     };
+    let this_is_primary = layer_property_value(runtime, this, "isPrimary").is_truthy();
+    let comp_is_primary = layer_property_value(runtime, comp, "isPrimary").is_truthy();
 
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(this_layer_id) {
         copy_render_state(layer, &comp_layer);
@@ -1733,6 +1747,20 @@ fn layer_exchange_info(
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(comp_layer_id) {
         copy_render_state(layer, &this_layer);
     }
+    apply_layer_node_state_to_script(runtime, this, &comp_layer);
+    apply_layer_node_state_to_script(runtime, comp, &this_layer);
+    set_layer_property_storage(
+        runtime,
+        this,
+        "isPrimary",
+        Variant::Integer(i64::from(comp_is_primary)),
+    );
+    set_layer_property_storage(
+        runtime,
+        comp,
+        "isPrimary",
+        Variant::Integer(i64::from(this_is_primary)),
+    );
 
     Ok(Variant::Void)
 }
@@ -1978,7 +2006,7 @@ fn apply_script_layer_members(
         "hitThreshold",
         i64::from(layer.hit_threshold),
     )?
-    .clamp(0, 255) as u8;
+    .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     Ok(())
 }
 
@@ -2022,6 +2050,33 @@ fn kag_page_layer_handle(
 fn copy_render_state(dest: &mut LayerNode, source: &LayerNode) {
     copy_render_content(dest, source);
     dest.renderable = source.renderable;
+}
+
+fn apply_layer_node_state_to_script(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    layer: &LayerNode,
+) {
+    for (name, value) in [
+        ("left", layer.left.round() as i64),
+        ("top", layer.top.round() as i64),
+        ("width", layer.width.max(0.0).round() as i64),
+        ("height", layer.height.max(0.0).round() as i64),
+        ("imageLeft", layer.image_left.round() as i64),
+        ("imageTop", layer.image_top.round() as i64),
+        ("imageWidth", layer.image_width.max(0.0).round() as i64),
+        ("imageHeight", layer.image_height.max(0.0).round() as i64),
+        ("visible", i64::from(layer.visible)),
+        ("enabled", i64::from(layer.enabled)),
+        ("nodeEnabled", i64::from(layer.node_enabled)),
+        ("opacity", i64::from(layer.opacity)),
+        ("type", i64::from(layer.layer_type)),
+        ("face", i64::from(layer.face)),
+        ("hitType", i64::from(layer.hit_type)),
+        ("hitThreshold", i64::from(layer.hit_threshold)),
+    ] {
+        set_layer_property_storage(runtime, handle, name, Variant::Integer(value));
+    }
 }
 
 fn copy_render_content(dest: &mut LayerNode, source: &LayerNode) {
@@ -2844,6 +2899,23 @@ fn layer_void(
     Ok(Variant::Void)
 }
 
+fn layer_on_hit_test(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Void);
+    };
+    let hit = args.get(2).is_some_and(Variant::is_truthy);
+    runtime.set_object_member(
+        this,
+        "__nativeHitTestWork",
+        Variant::Integer(i64::from(hit)),
+    );
+    Ok(Variant::Void)
+}
+
 fn layer_zero(
     _runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -3169,6 +3241,12 @@ pub(crate) fn finish_native_transition(
 ) -> Result<()> {
     if !runtime.object_valid(completion.dest) {
         return Ok(());
+    }
+    if completion.paired_comp
+        && let Some(source) = completion.source
+        && runtime.object_valid(source)
+    {
+        exchange_native_layer_info(runtime, completion.dest, source)?;
     }
 
     if !matches!(

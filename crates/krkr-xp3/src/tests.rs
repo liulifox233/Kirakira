@@ -355,6 +355,7 @@ fn xp3_resource_provider_reads_entries_with_patch_priority() {
     assert_eq!(provider.archive_count(), 2);
     assert_eq!(provider.entry_count(), 4);
     assert!(provider.exists("scenario\\start.ks"));
+    assert!(provider.exists("SCENARIO\\START.KS"));
     assert!(provider.exists("scenario/base_only.ks"));
     assert!(provider.exists("scenario/patch_only.ks"));
     assert!(!provider.exists("../outside.ks"));
@@ -366,6 +367,14 @@ fn xp3_resource_provider_reads_entries_with_patch_priority() {
         .expect("open patched entry")
         .read_to_string(&mut contents)
         .expect("read patched entry");
+    assert_eq!(contents, "patch");
+
+    contents.clear();
+    provider
+        .open("SCENARIO/START.KS")
+        .expect("open patched entry with different case")
+        .read_to_string(&mut contents)
+        .expect("read patched entry with different case");
     assert_eq!(contents, "patch");
 
     contents.clear();

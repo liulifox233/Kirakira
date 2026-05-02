@@ -10,6 +10,7 @@ pub struct Object {
     pub class_infos: Vec<String>,
     pub super_class: Option<ObjectHandle>,
     pub valid: bool,
+    pub invalidating: bool,
 }
 
 impl Default for Object {
@@ -20,6 +21,7 @@ impl Default for Object {
             class_infos: Vec::new(),
             super_class: None,
             valid: true,
+            invalidating: false,
         }
     }
 }

@@ -309,7 +309,7 @@ pub struct LayerNode {
     pub layer_type: i32,
     pub face: i32,
     pub hit_type: i32,
-    pub hit_threshold: u8,
+    pub hit_threshold: i32,
     pub image: Option<LayerImage>,
 }
 
@@ -368,7 +368,7 @@ impl LayerNode {
 
     fn alpha_hit_test(&self, origin: Point, point: Point) -> bool {
         let Some(image) = &self.image else {
-            return true;
+            return self.hit_threshold <= 0;
         };
         let x = (point.x - origin.x - self.image_left).floor() as i64;
         let y = (point.y - origin.y - self.image_top).floor() as i64;
@@ -376,7 +376,7 @@ impl LayerNode {
             return false;
         }
         let index = ((y as u32 * image.upload.width + x as u32) * 4 + 3) as usize;
-        image.upload.rgba[index] >= self.hit_threshold
+        i32::from(image.upload.rgba[index]) >= self.hit_threshold
     }
 
     fn image_command(
@@ -521,13 +521,16 @@ impl LayerTree {
     }
 
     pub fn hit_test(&self, point: Point) -> Option<LayerId> {
+        self.hit_test_all(point).into_iter().next()
+    }
+
+    pub fn hit_test_all(&self, point: Point) -> Vec<LayerId> {
+        let mut hits = Vec::new();
         let roots = self.sorted_children(None);
         for root in roots.into_iter().rev() {
-            if let Some(layer_id) = self.hit_test_layer(root.id, Point::new(0.0, 0.0), point) {
-                return Some(layer_id);
-            }
+            self.hit_test_layer_all(root.id, Point::new(0.0, 0.0), point, &mut hits);
         }
-        None
+        hits
     }
 
     pub fn draw_model(&self) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
@@ -585,8 +588,16 @@ impl LayerTree {
         }
     }
 
-    fn hit_test_layer(&self, id: LayerId, parent_origin: Point, point: Point) -> Option<LayerId> {
-        let layer = self.layers.get(&id)?;
+    fn hit_test_layer_all(
+        &self,
+        id: LayerId,
+        parent_origin: Point,
+        point: Point,
+        hits: &mut Vec<LayerId>,
+    ) {
+        let Some(layer) = self.layers.get(&id) else {
+            return;
+        };
         if !layer.renderable
             || !layer.visible
             || !layer.enabled
@@ -595,22 +606,22 @@ impl LayerTree {
             || layer.width <= 0.0
             || layer.height <= 0.0
         {
-            return None;
+            return;
         }
 
         let origin = Point::new(parent_origin.x + layer.left, parent_origin.y + layer.top);
         let rect = Rect::new(origin.x, origin.y, layer.width, layer.height);
         if !rect.contains(point) {
-            return None;
+            return;
         }
 
         for child in self.sorted_children(Some(id)).into_iter().rev() {
-            if let Some(layer_id) = self.hit_test_layer(child.id, origin, point) {
-                return Some(layer_id);
-            }
+            self.hit_test_layer_all(child.id, origin, point, hits);
         }
 
-        layer.hit_test(origin, point).then_some(id)
+        if layer.hit_test(origin, point) {
+            hits.push(id);
+        }
     }
 
     fn sorted_children(&self, parent: Option<LayerId>) -> Vec<&LayerNode> {

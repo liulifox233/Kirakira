@@ -576,9 +576,16 @@ fn map_window_point_to_content(position: Point, window_size: Size, content_size:
         return position;
     }
 
+    let scale =
+        (window_size.width / content_size.width).min(window_size.height / content_size.height);
+    let rendered_width = content_size.width * scale;
+    let rendered_height = content_size.height * scale;
+    let x_offset = (window_size.width - rendered_width) * 0.5;
+    let y_offset = (window_size.height - rendered_height) * 0.5;
+
     Point::new(
-        position.x * content_size.width / window_size.width,
-        position.y * content_size.height / window_size.height,
+        (position.x - x_offset) / scale,
+        (position.y - y_offset) / scale,
     )
 }
 
@@ -690,6 +697,17 @@ mod tests {
         );
 
         assert_eq!(point, Point::new(400.0, 300.0));
+    }
+
+    #[test]
+    fn maps_letterboxed_window_points_to_runtime_content_space() {
+        let point = map_window_point_to_content(
+            Point::new(120.0, 180.0),
+            Size::new(1000.0, 600.0),
+            Size::new(800.0, 600.0),
+        );
+
+        assert_eq!(point, Point::new(20.0, 180.0));
     }
 
     #[test]
