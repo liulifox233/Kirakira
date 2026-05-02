@@ -98,6 +98,11 @@ pub struct EngineTickResult {
     pub elapsed: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineInputResult {
+    pub unhandled_escape_pressed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineInput {
     pub frame: FrameInput,
@@ -122,6 +127,7 @@ pub struct KagLocation {
 pub struct EngineFrame {
     pub output: FrameOutput,
     pub tick: EngineTickResult,
+    pub input: EngineInputResult,
     pub message_layer: MessageLayerModel,
     pub location: KagLocation,
 }
@@ -139,6 +145,7 @@ pub struct KrkrEngine {
     pressed_layer: Option<LayerId>,
     captured_layer: Option<LayerId>,
     pending_input_events: VecDeque<EngineEvent>,
+    input_result: EngineInputResult,
 }
 
 impl KrkrEngine {
@@ -163,6 +170,7 @@ impl KrkrEngine {
             pressed_layer: None,
             captured_layer: None,
             pending_input_events: VecDeque::new(),
+            input_result: EngineInputResult::default(),
         })
     }
 
@@ -488,6 +496,7 @@ impl KrkrEngine {
     }
 
     pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
+        self.input_result = EngineInputResult::default();
         self.pending_input_events.extend(input.events);
         self.pump_tjs_events()?;
         let tick = self.advance(delta)?;
@@ -509,6 +518,7 @@ impl KrkrEngine {
         Ok(EngineFrame {
             output,
             tick,
+            input: self.input_result,
             message_layer: self.message_layer.clone(),
             location: self.kag_location(),
         })
@@ -802,10 +812,16 @@ impl KrkrEngine {
                     button: PointerButton::Secondary,
                     state: ButtonState::Pressed,
                 } => {
-                    self.dispatch_window_pointer_event("onMouseDown", 1)?;
+                    let handled_by_window = self.dispatch_window_pointer_event("onMouseDown", 1)?;
                     let raw_target = self.layer_at_cursor()?;
+                    let handled_by_layer = raw_target.is_some_and(|layer_id| {
+                        self.layer_has_script_handler(layer_id, "onMouseDown")
+                    });
                     self.dispatch_layer_pointer_event("onMouseDown", 1, raw_target)?;
                     self.captured_layer = raw_target;
+                    if !handled_by_window && !handled_by_layer {
+                        self.fire_kag_secondary_click()?;
+                    }
                 }
                 EngineEvent::PointerInput {
                     button: PointerButton::Secondary,
@@ -819,15 +835,27 @@ impl KrkrEngine {
                         self.captured_layer.or(release_hit),
                     )?;
                     self.captured_layer = None;
-                    self.fire_kag_secondary_click()?;
                 }
-                EngineEvent::KeyboardInput { key, state } => {
+                EngineEvent::MouseWheel { delta } => {
+                    self.dispatch_window_mouse_wheel(*delta)?;
+                    self.dispatch_layer_mouse_wheel(*delta)?;
+                }
+                EngineEvent::KeyboardInput { key, state, repeat } => {
+                    let shift = self.current_shift_state(*repeat);
                     let handled = match state {
                         ButtonState::Pressed => {
-                            self.dispatch_focused_layer_key_event("onKeyDown", *key)?
+                            let handled_by_window =
+                                self.dispatch_window_key_event("onKeyDown", *key, shift)?;
+                            let handled_by_layer =
+                                self.dispatch_focused_layer_key_event("onKeyDown", *key, shift)?;
+                            handled_by_window || handled_by_layer
                         }
                         ButtonState::Released => {
-                            self.dispatch_focused_layer_key_event("onKeyUp", *key)?
+                            let handled_by_window =
+                                self.dispatch_window_key_event("onKeyUp", *key, shift)?;
+                            let handled_by_layer =
+                                self.dispatch_focused_layer_key_event("onKeyUp", *key, shift)?;
+                            handled_by_window || handled_by_layer
                         }
                     };
                     if matches!(state, ButtonState::Pressed)
@@ -836,6 +864,12 @@ impl KrkrEngine {
                     {
                         self.fire_kag_primary_click(true)?;
                         self.signal_kag_click();
+                    }
+                    if matches!(state, ButtonState::Pressed)
+                        && matches!(key, EngineKey::Escape)
+                        && !handled
+                    {
+                        self.input_result.unhandled_escape_pressed = true;
                     }
                 }
                 EngineEvent::PointerInput { .. } => {}
@@ -848,13 +882,13 @@ impl KrkrEngine {
         let key = match event {
             EngineEvent::KeyboardInput { key, .. } => engine_key_vk_code(*key),
             EngineEvent::PointerInput { button, .. } => pointer_button_vk_code(*button),
-            EngineEvent::CursorMoved { .. } => None,
+            EngineEvent::CursorMoved { .. } | EngineEvent::MouseWheel { .. } => None,
         };
         let state = match event {
             EngineEvent::KeyboardInput { state, .. } | EngineEvent::PointerInput { state, .. } => {
                 *state
             }
-            EngineEvent::CursorMoved { .. } => return,
+            EngineEvent::CursorMoved { .. } | EngineEvent::MouseWheel { .. } => return,
         };
         if let Some(key) = key {
             self.tjs_runtime
@@ -863,7 +897,39 @@ impl KrkrEngine {
         }
     }
 
-    fn dispatch_focused_layer_key_event(&mut self, method: &str, key: EngineKey) -> Result<bool> {
+    fn current_shift_state(&self, repeat: bool) -> i64 {
+        let host = self.tjs_runtime.host();
+        let mut shift = 0;
+        if host.key_state(0x10) {
+            shift |= 1 << 0;
+        }
+        if host.key_state(0x12) {
+            shift |= 1 << 1;
+        }
+        if host.key_state(0x11) {
+            shift |= 1 << 2;
+        }
+        if host.key_state(0x01) {
+            shift |= 1 << 3;
+        }
+        if host.key_state(0x02) {
+            shift |= 1 << 4;
+        }
+        if host.key_state(0x04) {
+            shift |= 1 << 5;
+        }
+        if repeat {
+            shift |= 1 << 7;
+        }
+        shift
+    }
+
+    fn dispatch_focused_layer_key_event(
+        &mut self,
+        method: &str,
+        key: EngineKey,
+        shift: i64,
+    ) -> Result<bool> {
         let Some(key_code) = engine_key_vk_code(key) else {
             return Ok(false);
         };
@@ -892,26 +958,52 @@ impl KrkrEngine {
                 method,
                 vec![
                     Variant::Integer(key_code),
-                    Variant::Integer(0),
+                    Variant::Integer(shift),
                     Variant::Integer(1),
                 ],
             )
             .map(|_| handled_by_script)
     }
 
-    fn dispatch_window_pointer_event(&mut self, method: &str, button: i64) -> Result<()> {
-        let Some(position) = self.cursor_position else {
-            return Ok(());
+    fn dispatch_window_key_event(
+        &mut self,
+        method: &str,
+        key: EngineKey,
+        shift: i64,
+    ) -> Result<bool> {
+        let Some(key_code) = engine_key_vk_code(key) else {
+            return Ok(false);
         };
         let Some(window) = self.runtime_window_object() else {
-            return Ok(());
+            return Ok(false);
         };
-        if matches!(
-            self.tjs_runtime.object_member(window, method),
-            Variant::Void
-        ) {
-            return Ok(());
+        let handler = self.tjs_runtime.object_member(window, method);
+        if matches!(handler, Variant::Void) {
+            return Ok(false);
         }
+        let handled_by_script = !self.tjs_runtime.variant_is_native_function(&handler);
+        self.tjs_runtime
+            .call_object_method(
+                window,
+                method,
+                vec![Variant::Integer(key_code), Variant::Integer(shift)],
+            )
+            .map(|_| handled_by_script)
+    }
+
+    fn dispatch_window_pointer_event(&mut self, method: &str, button: i64) -> Result<bool> {
+        let Some(position) = self.cursor_position else {
+            return Ok(false);
+        };
+        let Some(window) = self.runtime_window_object() else {
+            return Ok(false);
+        };
+        let shift = self.current_shift_state(false);
+        let handler = self.tjs_runtime.object_member(window, method);
+        if matches!(handler, Variant::Void) {
+            return Ok(false);
+        }
+        let handled_by_script = !self.tjs_runtime.variant_is_native_function(&handler);
         self.tjs_runtime
             .call_object_method(
                 window,
@@ -920,7 +1012,34 @@ impl KrkrEngine {
                     Variant::Integer(position.x.round() as i64),
                     Variant::Integer(position.y.round() as i64),
                     Variant::Integer(button),
-                    Variant::Integer(0),
+                    Variant::Integer(shift),
+                ],
+            )
+            .map(|_| handled_by_script)
+    }
+
+    fn dispatch_window_mouse_wheel(&mut self, delta: i32) -> Result<()> {
+        let Some(position) = self.cursor_position else {
+            return Ok(());
+        };
+        let Some(window) = self.runtime_window_object() else {
+            return Ok(());
+        };
+        if matches!(
+            self.tjs_runtime.object_member(window, "onMouseWheel"),
+            Variant::Void
+        ) {
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(
+                window,
+                "onMouseWheel",
+                vec![
+                    Variant::Integer(self.current_shift_state(false)),
+                    Variant::Integer(delta as i64),
+                    Variant::Integer(position.x.round() as i64),
+                    Variant::Integer(position.y.round() as i64),
                 ],
             )
             .map(|_| ())
@@ -982,6 +1101,7 @@ impl KrkrEngine {
         };
         let x = (position.x - origin.x).round() as i64;
         let y = (position.y - origin.y).round() as i64;
+        let shift = self.current_shift_state(false);
         self.tjs_runtime
             .call_object_method(
                 object,
@@ -990,7 +1110,7 @@ impl KrkrEngine {
                     Variant::Integer(x),
                     Variant::Integer(y),
                     Variant::Integer(button),
-                    Variant::Integer(0),
+                    Variant::Integer(shift),
                 ],
             )
             .map(|_| Some(LayerEventTarget { layer_id, object }))
@@ -1052,6 +1172,7 @@ impl KrkrEngine {
     }
 
     fn dispatch_layer_cursor_move(&mut self, position: Point) -> Result<()> {
+        let shift = self.current_shift_state(false);
         if let Some(captured_layer) = self.captured_layer
             && let Some((x, y)) = self.layer_local_point(captured_layer, position)
         {
@@ -1061,7 +1182,7 @@ impl KrkrEngine {
                 vec![
                     Variant::Integer(x),
                     Variant::Integer(y),
-                    Variant::Integer(0),
+                    Variant::Integer(shift),
                 ],
             )?;
             return Ok(());
@@ -1090,11 +1211,49 @@ impl KrkrEngine {
                 vec![
                     Variant::Integer(x),
                     Variant::Integer(y),
-                    Variant::Integer(0),
+                    Variant::Integer(shift),
                 ],
             )?;
         }
         Ok(())
+    }
+
+    fn dispatch_layer_mouse_wheel(&mut self, delta: i32) -> Result<()> {
+        let Some(position) = self.cursor_position else {
+            return Ok(());
+        };
+        let Some(window) = self.runtime_window_object() else {
+            return Ok(());
+        };
+        let Variant::Object(focused_layer) = self.tjs_runtime.object_member(window, "focusedLayer")
+        else {
+            return Ok(());
+        };
+        let focused_layer = self
+            .tjs_runtime
+            .bound_this(focused_layer)
+            .unwrap_or(focused_layer);
+        if !self.tjs_runtime.object_valid(focused_layer)
+            || matches!(
+                self.tjs_runtime
+                    .object_member(focused_layer, "onMouseWheel"),
+                Variant::Void
+            )
+        {
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(
+                focused_layer,
+                "onMouseWheel",
+                vec![
+                    Variant::Integer(self.current_shift_state(false)),
+                    Variant::Integer(delta as i64),
+                    Variant::Integer(position.x.round() as i64),
+                    Variant::Integer(position.y.round() as i64),
+                ],
+            )
+            .map(|_| ())
     }
 
     fn layer_at_cursor(&mut self) -> Result<Option<LayerId>> {
@@ -3093,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn kag_rclick_secondary_release_jumps_to_config_target() {
+    fn kag_rclick_secondary_press_jumps_to_config_target() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
         fs::write(
@@ -3116,7 +3275,7 @@ mod tests {
                     FrameInput::new(Size::new(320.0, 240.0), 0.0),
                     vec![EngineEvent::PointerInput {
                         button: PointerButton::Secondary,
-                        state: ButtonState::Released,
+                        state: ButtonState::Pressed,
                     }],
                 ),
                 Duration::ZERO,
@@ -3127,6 +3286,60 @@ mod tests {
         assert_eq!(engine.message_layer.lines, vec!["AC".to_string()]);
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn secondary_release_does_not_repeat_script_right_click_handler() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.toggles = 0;
+                global.kag = new Dictionary();
+                kag.onPrimaryRightClick = function() { global.toggles++; };
+
+                var window = new Window();
+                var root = new Layer(window, null);
+                var layer = new Layer(window, root);
+                layer.setSize(100, 100);
+                layer.hitThreshold = 0;
+                layer.visible = true;
+                layer.onMouseDown = function(x, y, button, shift) {
+                    if(button == mbRight) kag.onPrimaryRightClick();
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(10.0, 10.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Secondary,
+                            state: ButtonState::Pressed,
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Secondary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("right click update");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "toggles")
+                .expect("toggles"),
+            Variant::Integer(1)
+        );
     }
 
     #[test]
@@ -6068,10 +6281,12 @@ mod tests {
                         EngineEvent::KeyboardInput {
                             key: EngineKey::Enter,
                             state: ButtonState::Pressed,
+                            repeat: false,
                         },
                         EngineEvent::KeyboardInput {
                             key: EngineKey::Enter,
                             state: ButtonState::Released,
+                            repeat: false,
                         },
                     ],
                 ),
@@ -6111,6 +6326,7 @@ mod tests {
                     vec![EngineEvent::KeyboardInput {
                         key: EngineKey::Enter,
                         state: ButtonState::Pressed,
+                        repeat: false,
                     }],
                 ),
                 Duration::ZERO,
@@ -6152,6 +6368,7 @@ mod tests {
                     vec![EngineEvent::KeyboardInput {
                         key: EngineKey::Right,
                         state: ButtonState::Pressed,
+                        repeat: false,
                     }],
                 ),
                 Duration::ZERO,
@@ -6201,10 +6418,12 @@ mod tests {
                         EngineEvent::KeyboardInput {
                             key: EngineKey::Left,
                             state: ButtonState::Pressed,
+                            repeat: false,
                         },
                         EngineEvent::KeyboardInput {
                             key: EngineKey::Left,
                             state: ButtonState::Released,
+                            repeat: false,
                         },
                     ],
                 ),
@@ -6217,6 +6436,232 @@ mod tests {
                 .execute_expression("inline.tjs", "states")
                 .expect("states"),
             Variant::String("1:0".to_string())
+        );
+    }
+
+    #[test]
+    fn keyboard_events_are_sent_to_window_and_focused_layer_with_shift_flags() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.windowEvents = "";
+                global.layerEvents = "";
+                var window = new Window();
+                window.onKeyDown = function(key, shift) {
+                    global.windowEvents += "down:" + key + ":" + shift + ";";
+                };
+                window.onKeyUp = function(key, shift) {
+                    global.windowEvents += "up:" + key + ":" + shift + ";";
+                };
+                var root = new Layer(window, null);
+                var layer = new Layer(window, root);
+                layer.visible = true;
+                layer.focusable = true;
+                layer.onKeyDown = function(key, shift, process) {
+                    global.layerEvents += "down:" + key + ":" + shift + ":" + process + ";";
+                };
+                layer.onKeyUp = function(key, shift, process) {
+                    global.layerEvents += "up:" + key + ":" + shift + ":" + process + ";";
+                };
+                layer.focus();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Control,
+                            state: ButtonState::Pressed,
+                            repeat: false,
+                        },
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Character('A'),
+                            state: ButtonState::Pressed,
+                            repeat: true,
+                        },
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Escape,
+                            state: ButtonState::Pressed,
+                            repeat: false,
+                        },
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Control,
+                            state: ButtonState::Released,
+                            repeat: false,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("key frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "windowEvents")
+                .expect("window events"),
+            Variant::String("down:17:4;down:65:132;down:27:4;up:17:0;".to_string())
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "layerEvents")
+                .expect("layer events"),
+            Variant::String("down:17:4:1;down:65:132:1;down:27:4:1;up:17:0:1;".to_string())
+        );
+    }
+
+    #[test]
+    fn keyboard_primary_click_fallback_does_not_repeat_window_handler() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.clicks = 0;
+                global.kag = new Dictionary();
+                kag.onPrimaryClickByKey = function() { global.clicks++; };
+
+                var window = new Window();
+                window.onKeyDown = function(key, shift) {
+                    if(key == VK_RETURN) kag.onPrimaryClickByKey();
+                };
+                var root = new Layer(window, null);
+                var layer = new Layer(window, root);
+                layer.visible = true;
+                layer.focusable = true;
+                layer.focus();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::KeyboardInput {
+                        key: EngineKey::Enter,
+                        state: ButtonState::Pressed,
+                        repeat: false,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("key frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "clicks")
+                .expect("clicks"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn escape_input_reports_unhandled_only_without_script_handler() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var root = new Layer(window, null);
+                var layer = new Layer(window, root);
+                layer.visible = true;
+                layer.focusable = true;
+                layer.focus();
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::KeyboardInput {
+                        key: EngineKey::Escape,
+                        state: ButtonState::Pressed,
+                        repeat: false,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("escape frame");
+        assert!(frame.input.unhandled_escape_pressed);
+
+        engine
+            .execute_script(
+                "escape_handler.tjs",
+                "window.onKeyDown = function(key, shift) { global.escapeHandled = key == VK_ESCAPE; };",
+            )
+            .expect("handler");
+        let frame = engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::KeyboardInput {
+                        key: EngineKey::Escape,
+                        state: ButtonState::Pressed,
+                        repeat: false,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("handled escape frame");
+        assert!(!frame.input.unhandled_escape_pressed);
+        assert_eq!(
+            engine
+                .execute_expression("escape_handler.tjs", "escapeHandled")
+                .expect("escape handled"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_events_are_sent_to_window_with_position_delta_and_shift() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.wheel = "";
+                var window = new Window();
+                window.onMouseWheel = function(shift, delta, x, y) {
+                    global.wheel += "" + shift + ":" + delta + ":" + x + ":" + y;
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Shift,
+                            state: ButtonState::Pressed,
+                            repeat: false,
+                        },
+                        EngineEvent::CursorMoved {
+                            position: Point::new(12.4, 34.6),
+                        },
+                        EngineEvent::MouseWheel { delta: 120 },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("wheel frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "wheel")
+                .expect("wheel"),
+            Variant::String("1:120:12:35".to_string())
         );
     }
 
