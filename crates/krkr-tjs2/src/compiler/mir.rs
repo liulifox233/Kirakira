@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::error::{Result, Span, TjsError};
 use crate::frontend::{hir, syntax};
@@ -1141,6 +1141,7 @@ pub fn lower_hir_program(
         lowerer.add_span(program.span),
     );
     top.lower_statements(&mut lowerer, &program.statements)?;
+    lowerer.lower_pending_objects()?;
     lowerer.module.objects.push(top.finish());
     lowerer.module.objects.sort_by_key(|object| object.id);
     optimize_module(&mut lowerer.module);
@@ -1155,11 +1156,34 @@ struct BindingInfo {
     kind: hir::BindingKind,
 }
 
+#[derive(Clone, Debug)]
+enum ObjectJob {
+    Function {
+        id: ObjectId,
+        decl: Box<syntax::FunctionDecl>,
+        context: ContextType,
+        parent: Option<ObjectId>,
+    },
+    Class {
+        id: ObjectId,
+        name: StringId,
+        decl: Box<syntax::ClassDecl>,
+        parent: ObjectId,
+    },
+    SuperClassGetter {
+        id: ObjectId,
+        name: StringId,
+        parent: ObjectId,
+        expr: syntax::Expr,
+    },
+}
+
 struct Lowerer<'a> {
     module: MirModule,
     source_text: &'a str,
     next_object_id: u32,
     bindings: BTreeMap<syntax::BindingId, BindingInfo>,
+    object_jobs: VecDeque<ObjectJob>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -1200,6 +1224,7 @@ impl<'a> Lowerer<'a> {
             source_text,
             next_object_id: 1,
             bindings,
+            object_jobs: VecDeque::new(),
         }
     }
 
@@ -1272,16 +1297,12 @@ impl<'a> Lowerer<'a> {
         parent: Option<ObjectId>,
     ) -> Result<ObjectId> {
         let id = self.next_object_id();
-        let name = self.intern_string(
-            decl.name
-                .as_ref()
-                .map(|name| name.name.as_str())
-                .unwrap_or("(anonymous)"),
-        );
-        let mut object = ObjectBuilder::new(id, name, context, parent, self.add_span(decl.span));
-        object.bind_params(self, decl)?;
-        object.lower_stmt(self, &decl.body)?;
-        self.module.objects.push(object.finish());
+        self.object_jobs.push_back(ObjectJob::Function {
+            id,
+            decl: Box::new(decl.clone()),
+            context,
+            parent,
+        });
         Ok(id)
     }
 
@@ -1292,17 +1313,123 @@ impl<'a> Lowerer<'a> {
         expr: &syntax::Expr,
     ) -> Result<ObjectId> {
         let id = self.next_object_id();
-        let mut object = ObjectBuilder::new(
+        self.object_jobs.push_back(ObjectJob::SuperClassGetter {
             id,
             name,
-            ContextType::SuperClassGetter,
-            Some(parent),
-            self.add_span(expr.span),
-        );
-        let value = object.lower_expr(self, expr)?;
-        object.terminate_return_through_regions(self, Some(value));
-        self.module.objects.push(object.finish());
+            parent,
+            expr: expr.clone(),
+        });
         Ok(id)
+    }
+
+    fn lower_pending_objects(&mut self) -> Result<()> {
+        while let Some(job) = self.object_jobs.pop_front() {
+            match job {
+                ObjectJob::Function {
+                    id,
+                    decl,
+                    context,
+                    parent,
+                } => {
+                    let name = self.intern_string(
+                        decl.name
+                            .as_ref()
+                            .map(|name| name.name.as_str())
+                            .unwrap_or("(anonymous)"),
+                    );
+                    let mut object =
+                        ObjectBuilder::new(id, name, context, parent, self.add_span(decl.span));
+                    object.bind_params(self, &decl)?;
+                    object.lower_stmt(self, &decl.body)?;
+                    self.module.objects.push(object.finish());
+                }
+                ObjectJob::Class {
+                    id,
+                    name,
+                    decl,
+                    parent,
+                } => {
+                    let mut class_object = ObjectBuilder::new(
+                        id,
+                        name,
+                        ContextType::Class,
+                        Some(parent),
+                        self.add_span(decl.span),
+                    );
+
+                    for (index, extender) in decl.extends.iter().enumerate() {
+                        let getter = self.lower_super_class_getter(name, id, extender)?;
+                        class_object.emit(MirInst::ApplyClassExtender {
+                            class_object: id,
+                            getter,
+                        });
+                        if index == 0 {
+                            class_object.object.super_class_getter = Some(getter);
+                        }
+                    }
+
+                    for member in &decl.body {
+                        match &member.kind {
+                            syntax::StmtKind::FunctionDecl(function) => {
+                                let member_id = self.lower_function_object(
+                                    function,
+                                    ContextType::Function,
+                                    Some(id),
+                                )?;
+                                let member_name = self
+                                    .intern_string(function.name.as_ref().map_or("", |n| &n.name));
+                                class_object.object.properties.push(PropertyRegistration {
+                                    name: member_name,
+                                    object: member_id,
+                                });
+                            }
+                            syntax::StmtKind::PropertyDecl(property) => {
+                                let property_id = self.next_object_id();
+                                let property_name = self.intern_string(&property.name.name);
+                                let mut property_object = ObjectBuilder::new(
+                                    property_id,
+                                    property_name,
+                                    ContextType::Property,
+                                    Some(id),
+                                    self.add_span(property.span),
+                                );
+                                class_object.populate_property_accessors(
+                                    self,
+                                    &mut property_object,
+                                    property,
+                                )?;
+                                self.module.objects.push(property_object.finish());
+                                class_object.object.properties.push(PropertyRegistration {
+                                    name: property_name,
+                                    object: property_id,
+                                });
+                            }
+                            _ => class_object.lower_stmt(self, member)?,
+                        }
+                    }
+                    class_object.emit(MirInst::RegisterMembers);
+                    self.module.objects.push(class_object.finish());
+                }
+                ObjectJob::SuperClassGetter {
+                    id,
+                    name,
+                    parent,
+                    expr,
+                } => {
+                    let mut object = ObjectBuilder::new(
+                        id,
+                        name,
+                        ContextType::SuperClassGetter,
+                        Some(parent),
+                        self.add_span(expr.span),
+                    );
+                    let value = object.lower_expr(self, &expr)?;
+                    object.terminate_return_through_regions(self, Some(value));
+                    self.module.objects.push(object.finish());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1344,6 +1471,142 @@ enum ControlFrame {
 enum PendingExit {
     Goto(BlockId),
     Return(Option<Value>),
+}
+
+enum StmtTask<'a> {
+    Stmt(&'a syntax::Stmt),
+    StartBlock(BlockId),
+    GotoIfOpen(BlockId),
+    LeaveTryIfOpen {
+        region: ExceptionRegionId,
+        next: BlockId,
+    },
+    SetTerminator(Terminator),
+    ControlPush(ControlFrame),
+    ControlPop,
+    ActiveRegionPop,
+    WithPop,
+    DoWhileCondition {
+        condition: &'a syntax::Expr,
+        body_block: BlockId,
+        after_block: BlockId,
+    },
+    ForStep {
+        step: Option<&'a syntax::Expr>,
+        cond_block: BlockId,
+    },
+}
+
+enum ExprTask<'a> {
+    Expr(&'a syntax::Expr),
+    PushValue(Value),
+    DiscardValue,
+    StartBlock(BlockId),
+    GotoIfOpen(BlockId),
+    ReadPlaceToValue,
+    WritePlace(&'a syntax::Expr),
+    ApplyIgnorePropToPlace,
+    MemberPlaceAfterObject {
+        property: &'a str,
+        flags: DispatchFlags,
+    },
+    DefaultPropertyPlaceAfterObject {
+        flags: DispatchFlags,
+    },
+    IndexPlaceAfterObject {
+        index: &'a syntax::Expr,
+        flags: DispatchFlags,
+    },
+    IndexPlaceAfterIndex {
+        object: Value,
+        flags: DispatchFlags,
+    },
+    CallTarget(&'a syntax::Expr),
+    CallTargetValueAfter,
+    CallTargetMemberAfterObject {
+        property: &'a str,
+        flags: DispatchFlags,
+    },
+    CallTargetDefaultPropertyAfterObject {
+        flags: DispatchFlags,
+    },
+    CallTargetIndexAfterObject {
+        index: &'a syntax::Expr,
+        flags: DispatchFlags,
+    },
+    CallTargetIndexAfterIndex {
+        object: Value,
+        flags: DispatchFlags,
+    },
+    CallArgs(&'a [syntax::CallArg]),
+    BuildCallArgs {
+        args: &'a [syntax::CallArg],
+        value_count: usize,
+        saw_expanded: bool,
+    },
+    AfterUnary(syntax::UnaryOp),
+    AfterBinary(syntax::BinaryOp),
+    AfterInContextOf,
+    AfterInstanceOf,
+    AfterAssignment(syntax::AssignOp),
+    AfterSwap,
+    AfterDelete,
+    AfterPrefixUpdate(syntax::UnaryOp),
+    AfterPostfixUpdate(syntax::UnaryOp),
+    AfterPostfixEval,
+    AfterTypeOfValue,
+    AfterTypeOfPlace,
+    AfterPropAccess,
+    AfterShortCircuitLhs {
+        op: syntax::BinaryOp,
+        rhs: &'a syntax::Expr,
+    },
+    EmitShortCircuitShortcut {
+        block: BlockId,
+        result: SlotId,
+        shortcut: Value,
+        done_block: BlockId,
+    },
+    AfterShortCircuitRhs {
+        result: SlotId,
+        done_block: BlockId,
+    },
+    AfterIfOperatorCond {
+        lhs: &'a syntax::Expr,
+    },
+    AfterConditionalCond {
+        then_expr: &'a syntax::Expr,
+        else_expr: &'a syntax::Expr,
+        result: SlotId,
+    },
+    AfterConditionalBranch {
+        result: SlotId,
+        done_block: BlockId,
+    },
+    AfterCallArgs,
+    AfterNewCallee {
+        args: &'a [syntax::CallArg],
+    },
+    AfterNewArgs {
+        callee: Value,
+    },
+    BuildArray {
+        elements: &'a [syntax::ArrayElement],
+        value_count: usize,
+    },
+    BuildDictionary {
+        plan: Vec<DictionaryKeyPlan>,
+        value_count: usize,
+    },
+    FinishComma {
+        count: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DictionaryKeyPlan {
+    Direct(StringId),
+    Computed,
 }
 
 impl ObjectBuilder {
@@ -1581,16 +1844,78 @@ impl ObjectBuilder {
         lowerer: &mut Lowerer<'_>,
         statements: &[syntax::Stmt],
     ) -> Result<()> {
-        for statement in statements {
-            self.lower_stmt(lowerer, statement)?;
+        let mut tasks = Vec::new();
+        push_stmt_tasks(&mut tasks, statements);
+        self.run_stmt_tasks(lowerer, &mut tasks)
+    }
+
+    fn lower_stmt(&mut self, lowerer: &mut Lowerer<'_>, statement: &syntax::Stmt) -> Result<()> {
+        let mut tasks = vec![StmtTask::Stmt(statement)];
+        self.run_stmt_tasks(lowerer, &mut tasks)
+    }
+
+    fn run_stmt_tasks<'a>(
+        &mut self,
+        lowerer: &mut Lowerer<'_>,
+        tasks: &mut Vec<StmtTask<'a>>,
+    ) -> Result<()> {
+        while let Some(task) = tasks.pop() {
+            match task {
+                StmtTask::Stmt(statement) => self.push_stmt_task(lowerer, statement, tasks)?,
+                StmtTask::StartBlock(block) => self.start_block(block),
+                StmtTask::GotoIfOpen(target) => {
+                    if self.current_open() {
+                        self.set_terminator(Terminator::Goto(target));
+                    }
+                }
+                StmtTask::LeaveTryIfOpen { region, next } => {
+                    if self.current_open() {
+                        self.set_terminator(Terminator::LeaveTry { region, next });
+                    }
+                }
+                StmtTask::SetTerminator(terminator) => self.set_terminator(terminator),
+                StmtTask::ControlPush(frame) => self.control_stack.push(frame),
+                StmtTask::ControlPop => {
+                    self.control_stack.pop();
+                }
+                StmtTask::ActiveRegionPop => {
+                    self.active_regions.pop();
+                }
+                StmtTask::WithPop => {
+                    self.with_stack.pop();
+                }
+                StmtTask::DoWhileCondition {
+                    condition,
+                    body_block,
+                    after_block,
+                } => {
+                    let cond = self.lower_expr(lowerer, condition)?;
+                    self.set_terminator(Terminator::Branch {
+                        cond: Condition::Truthy(cond),
+                        then_block: body_block,
+                        else_block: after_block,
+                    });
+                }
+                StmtTask::ForStep { step, cond_block } => {
+                    if let Some(step) = step {
+                        self.lower_expr(lowerer, step)?;
+                    }
+                    self.set_terminator(Terminator::Goto(cond_block));
+                }
+            }
         }
         Ok(())
     }
 
-    fn lower_stmt(&mut self, lowerer: &mut Lowerer<'_>, statement: &syntax::Stmt) -> Result<()> {
+    fn push_stmt_task<'a>(
+        &mut self,
+        lowerer: &mut Lowerer<'_>,
+        statement: &'a syntax::Stmt,
+        tasks: &mut Vec<StmtTask<'a>>,
+    ) -> Result<()> {
         match &statement.kind {
             syntax::StmtKind::Empty => {}
-            syntax::StmtKind::Block(statements) => self.lower_statements(lowerer, statements)?,
+            syntax::StmtKind::Block(statements) => push_stmt_tasks(tasks, statements),
             syntax::StmtKind::Expr(expr) => {
                 self.lower_expr(lowerer, expr)?;
             }
@@ -1623,35 +1948,235 @@ impl ObjectBuilder {
                 condition,
                 then_branch,
                 else_branch,
-            } => self.lower_if_stmt(lowerer, condition, then_branch, else_branch.as_deref())?,
+            } => {
+                let cond = self.lower_expr(lowerer, condition)?;
+                let then_block = self.new_block(Some(lowerer.add_span(then_branch.span)));
+                let else_block =
+                    self.new_block(else_branch.as_ref().map(|stmt| lowerer.add_span(stmt.span)));
+                let join_block = self.new_block(None);
+                self.set_terminator(Terminator::Branch {
+                    cond: Condition::Truthy(cond),
+                    then_block,
+                    else_block,
+                });
+
+                tasks.push(StmtTask::StartBlock(join_block));
+                tasks.push(StmtTask::GotoIfOpen(join_block));
+                if let Some(else_branch) = else_branch {
+                    tasks.push(StmtTask::Stmt(else_branch.as_ref()));
+                }
+                tasks.push(StmtTask::StartBlock(else_block));
+                tasks.push(StmtTask::GotoIfOpen(join_block));
+                tasks.push(StmtTask::Stmt(then_branch.as_ref()));
+                tasks.push(StmtTask::StartBlock(then_block));
+            }
             syntax::StmtKind::While { condition, body } => {
-                self.lower_while_stmt(lowerer, condition, body)?
+                let cond_block = self.new_block(Some(lowerer.add_span(condition.span)));
+                let body_block = self.new_block(Some(lowerer.add_span(body.span)));
+                let after_block = self.new_block(None);
+                self.set_terminator(Terminator::Goto(cond_block));
+
+                self.start_block(cond_block);
+                let cond = self.lower_expr(lowerer, condition)?;
+                self.set_terminator(Terminator::Branch {
+                    cond: Condition::Truthy(cond),
+                    then_block: body_block,
+                    else_block: after_block,
+                });
+
+                tasks.push(StmtTask::StartBlock(after_block));
+                tasks.push(StmtTask::ControlPop);
+                tasks.push(StmtTask::GotoIfOpen(cond_block));
+                tasks.push(StmtTask::Stmt(body.as_ref()));
+                tasks.push(StmtTask::StartBlock(body_block));
+                tasks.push(StmtTask::ControlPush(ControlFrame::Loop {
+                    break_block: after_block,
+                    continue_block: cond_block,
+                }));
             }
             syntax::StmtKind::DoWhile { body, condition } => {
-                self.lower_do_while_stmt(lowerer, body, condition)?
+                let body_block = self.new_block(Some(lowerer.add_span(body.span)));
+                let cond_block = self.new_block(Some(lowerer.add_span(condition.span)));
+                let after_block = self.new_block(None);
+                self.set_terminator(Terminator::Goto(body_block));
+
+                tasks.push(StmtTask::StartBlock(after_block));
+                tasks.push(StmtTask::DoWhileCondition {
+                    condition,
+                    body_block,
+                    after_block,
+                });
+                tasks.push(StmtTask::StartBlock(cond_block));
+                tasks.push(StmtTask::ControlPop);
+                tasks.push(StmtTask::GotoIfOpen(cond_block));
+                tasks.push(StmtTask::Stmt(body.as_ref()));
+                tasks.push(StmtTask::StartBlock(body_block));
+                tasks.push(StmtTask::ControlPush(ControlFrame::Loop {
+                    break_block: after_block,
+                    continue_block: cond_block,
+                }));
             }
             syntax::StmtKind::For {
                 init,
                 condition,
                 step,
                 body,
-            } => self.lower_for_stmt(
-                lowerer,
-                init.as_ref(),
-                condition.as_ref(),
-                step.as_ref(),
-                body,
-            )?,
+            } => {
+                if let Some(init) = init {
+                    self.lower_for_init(lowerer, init)?;
+                }
+
+                let cond_block =
+                    self.new_block(condition.as_ref().map(|expr| lowerer.add_span(expr.span)));
+                let body_block = self.new_block(Some(lowerer.add_span(body.span)));
+                let step_block =
+                    self.new_block(step.as_ref().map(|expr| lowerer.add_span(expr.span)));
+                let after_block = self.new_block(None);
+                self.set_terminator(Terminator::Goto(cond_block));
+
+                self.start_block(cond_block);
+                if let Some(condition) = condition {
+                    let cond = self.lower_expr(lowerer, condition)?;
+                    self.set_terminator(Terminator::Branch {
+                        cond: Condition::Truthy(cond),
+                        then_block: body_block,
+                        else_block: after_block,
+                    });
+                } else {
+                    self.set_terminator(Terminator::Goto(body_block));
+                }
+
+                tasks.push(StmtTask::StartBlock(after_block));
+                tasks.push(StmtTask::ForStep {
+                    step: step.as_ref(),
+                    cond_block,
+                });
+                tasks.push(StmtTask::StartBlock(step_block));
+                tasks.push(StmtTask::ControlPop);
+                tasks.push(StmtTask::GotoIfOpen(step_block));
+                tasks.push(StmtTask::Stmt(body.as_ref()));
+                tasks.push(StmtTask::StartBlock(body_block));
+                tasks.push(StmtTask::ControlPush(ControlFrame::Loop {
+                    break_block: after_block,
+                    continue_block: step_block,
+                }));
+            }
             syntax::StmtKind::With { object, body } => {
-                self.lower_with_stmt(lowerer, object, body)?
+                let value = self.lower_expr(lowerer, object)?;
+                let value = self.copy_to_temp(value);
+                self.with_stack.push(value);
+                tasks.push(StmtTask::WithPop);
+                tasks.push(StmtTask::Stmt(body.as_ref()));
             }
             syntax::StmtKind::Break => self.lower_break(lowerer)?,
             syntax::StmtKind::Continue => self.lower_continue(lowerer)?,
-            syntax::StmtKind::Try { body, catch } => self.lower_try_stmt(lowerer, body, catch)?,
+            syntax::StmtKind::Try { body, catch } => {
+                self.ensure_open();
+                let body_block = self.new_block(Some(lowerer.add_span(body.span)));
+                let catch_block = self.new_block(catch.as_ref().map(|c| lowerer.add_span(c.span)));
+                let after_block = self.new_block(None);
+                self.set_terminator(Terminator::Goto(body_block));
+
+                let exception_slot = if let Some(catch) = catch
+                    && let Some(binding) = &catch.binding
+                {
+                    self.local(lowerer, binding.binding, Some(&binding.name), catch.span)
+                } else {
+                    self.temp()
+                };
+
+                let region = ExceptionRegionId(self.object.exception_regions.len() as u32);
+                let parent = self.active_regions.last().copied();
+                self.object.exception_regions.push(ExceptionRegion {
+                    id: region,
+                    parent,
+                    entry: body_block,
+                    protected_blocks: Vec::new(),
+                    catch: catch_block,
+                    exception_slot,
+                });
+                self.active_regions.push(region);
+                self.mark_block_for_active_regions(body_block);
+
+                tasks.push(StmtTask::StartBlock(after_block));
+                tasks.push(StmtTask::GotoIfOpen(after_block));
+                if let Some(catch) = catch {
+                    tasks.push(StmtTask::Stmt(catch.body.as_ref()));
+                } else {
+                    tasks.push(StmtTask::SetTerminator(Terminator::Unreachable));
+                }
+                tasks.push(StmtTask::StartBlock(catch_block));
+                tasks.push(StmtTask::ActiveRegionPop);
+                tasks.push(StmtTask::LeaveTryIfOpen {
+                    region,
+                    next: after_block,
+                });
+                tasks.push(StmtTask::Stmt(body.as_ref()));
+                tasks.push(StmtTask::StartBlock(body_block));
+            }
             syntax::StmtKind::Switch {
                 discriminant,
                 cases,
-            } => self.lower_switch_stmt(lowerer, discriminant, cases)?,
+            } => {
+                let discriminant_value = self.lower_expr(lowerer, discriminant)?;
+                let discriminant = self.copy_to_temp(discriminant_value);
+                let after_block = self.new_block(None);
+                if cases.is_empty() {
+                    self.set_terminator(Terminator::Goto(after_block));
+                    self.start_block(after_block);
+                    return Ok(());
+                }
+
+                let body_blocks = cases
+                    .iter()
+                    .map(|case| self.new_block(Some(lowerer.add_span(case.span))))
+                    .collect::<Vec<_>>();
+                let test_blocks = cases
+                    .iter()
+                    .filter(|case| case.test.is_some())
+                    .map(|case| self.new_block(Some(lowerer.add_span(case.span))))
+                    .collect::<Vec<_>>();
+                let default_body = cases
+                    .iter()
+                    .position(|case| case.test.is_none())
+                    .map(|index| body_blocks[index]);
+                let fallback = default_body.unwrap_or(after_block);
+
+                let first_test = test_blocks.first().copied().unwrap_or(fallback);
+                self.set_terminator(Terminator::Goto(first_test));
+
+                let mut test_iter = test_blocks.iter().copied().peekable();
+                for (case_index, case) in cases.iter().enumerate() {
+                    let Some(test) = &case.test else {
+                        continue;
+                    };
+                    let test_block = test_iter.next().expect("test block for case");
+                    let next_test = test_iter.peek().copied().unwrap_or(fallback);
+                    self.start_block(test_block);
+                    let value = self.lower_expr(lowerer, test)?;
+                    self.set_terminator(Terminator::Branch {
+                        cond: Condition::Compare {
+                            op: CompareOp::Equal,
+                            lhs: discriminant,
+                            rhs: value,
+                        },
+                        then_block: body_blocks[case_index],
+                        else_block: next_test,
+                    });
+                }
+
+                tasks.push(StmtTask::StartBlock(after_block));
+                tasks.push(StmtTask::ControlPop);
+                for (index, case) in cases.iter().enumerate().rev() {
+                    let next = body_blocks.get(index + 1).copied().unwrap_or(after_block);
+                    tasks.push(StmtTask::GotoIfOpen(next));
+                    push_stmt_tasks(tasks, &case.body);
+                    tasks.push(StmtTask::StartBlock(body_blocks[index]));
+                }
+                tasks.push(StmtTask::ControlPush(ControlFrame::Switch {
+                    break_block: after_block,
+                }));
+            }
             syntax::StmtKind::Case { test } => {
                 if let Some(test) = test {
                     self.lower_expr(lowerer, test)?;
@@ -1728,62 +2253,12 @@ impl ObjectBuilder {
     ) -> Result<()> {
         let class_id = lowerer.next_object_id();
         let class_name = lowerer.intern_string(&decl.name.name);
-        let mut class_object = ObjectBuilder::new(
-            class_id,
-            class_name,
-            ContextType::Class,
-            Some(self.object.id),
-            lowerer.add_span(decl.span),
-        );
-
-        for (index, extender) in decl.extends.iter().enumerate() {
-            let getter = lowerer.lower_super_class_getter(class_name, class_id, extender)?;
-            class_object.emit(MirInst::ApplyClassExtender {
-                class_object: class_id,
-                getter,
-            });
-            if index == 0 {
-                class_object.object.super_class_getter = Some(getter);
-            }
-        }
-
-        for member in &decl.body {
-            match &member.kind {
-                syntax::StmtKind::FunctionDecl(function) => {
-                    let member_id = lowerer.lower_function_object(
-                        function,
-                        ContextType::Function,
-                        Some(class_id),
-                    )?;
-                    let member_name =
-                        lowerer.intern_string(function.name.as_ref().map_or("", |n| &n.name));
-                    class_object.object.properties.push(PropertyRegistration {
-                        name: member_name,
-                        object: member_id,
-                    });
-                }
-                syntax::StmtKind::PropertyDecl(property) => {
-                    let property_id = lowerer.next_object_id();
-                    let property_name = lowerer.intern_string(&property.name.name);
-                    let mut property_object = ObjectBuilder::new(
-                        property_id,
-                        property_name,
-                        ContextType::Property,
-                        Some(class_id),
-                        lowerer.add_span(property.span),
-                    );
-                    self.populate_property_accessors(lowerer, &mut property_object, property)?;
-                    lowerer.module.objects.push(property_object.finish());
-                    class_object.object.properties.push(PropertyRegistration {
-                        name: property_name,
-                        object: property_id,
-                    });
-                }
-                _ => class_object.lower_stmt(lowerer, member)?,
-            }
-        }
-        class_object.emit(MirInst::RegisterMembers);
-        lowerer.module.objects.push(class_object.finish());
+        lowerer.object_jobs.push_back(ObjectJob::Class {
+            id: class_id,
+            name: class_name,
+            decl: Box::new(decl.clone()),
+            parent: self.object.id,
+        });
 
         let value = Value::Const(lowerer.add_const(MirConst::CodeObject(class_id)));
         let place = self.ident_declaration_place(lowerer, &decl.name, decl.span);
@@ -1871,157 +2346,6 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn lower_if_stmt(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        condition: &syntax::Expr,
-        then_branch: &syntax::Stmt,
-        else_branch: Option<&syntax::Stmt>,
-    ) -> Result<()> {
-        let cond = self.lower_expr(lowerer, condition)?;
-        let then_block = self.new_block(Some(lowerer.add_span(then_branch.span)));
-        let else_block = self.new_block(else_branch.map(|stmt| lowerer.add_span(stmt.span)));
-        let join_block = self.new_block(None);
-        self.set_terminator(Terminator::Branch {
-            cond: Condition::Truthy(cond),
-            then_block,
-            else_block,
-        });
-
-        self.start_block(then_block);
-        self.lower_stmt(lowerer, then_branch)?;
-        if self.current_open() {
-            self.set_terminator(Terminator::Goto(join_block));
-        }
-
-        self.start_block(else_block);
-        if let Some(else_branch) = else_branch {
-            self.lower_stmt(lowerer, else_branch)?;
-        }
-        if self.current_open() {
-            self.set_terminator(Terminator::Goto(join_block));
-        }
-
-        self.start_block(join_block);
-        Ok(())
-    }
-
-    fn lower_while_stmt(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        condition: &syntax::Expr,
-        body: &syntax::Stmt,
-    ) -> Result<()> {
-        let cond_block = self.new_block(Some(lowerer.add_span(condition.span)));
-        let body_block = self.new_block(Some(lowerer.add_span(body.span)));
-        let after_block = self.new_block(None);
-        self.set_terminator(Terminator::Goto(cond_block));
-
-        self.start_block(cond_block);
-        let cond = self.lower_expr(lowerer, condition)?;
-        self.set_terminator(Terminator::Branch {
-            cond: Condition::Truthy(cond),
-            then_block: body_block,
-            else_block: after_block,
-        });
-
-        self.control_stack.push(ControlFrame::Loop {
-            break_block: after_block,
-            continue_block: cond_block,
-        });
-        self.start_block(body_block);
-        self.lower_stmt(lowerer, body)?;
-        if self.current_open() {
-            self.set_terminator(Terminator::Goto(cond_block));
-        }
-        self.control_stack.pop();
-        self.start_block(after_block);
-        Ok(())
-    }
-
-    fn lower_do_while_stmt(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        body: &syntax::Stmt,
-        condition: &syntax::Expr,
-    ) -> Result<()> {
-        let body_block = self.new_block(Some(lowerer.add_span(body.span)));
-        let cond_block = self.new_block(Some(lowerer.add_span(condition.span)));
-        let after_block = self.new_block(None);
-        self.set_terminator(Terminator::Goto(body_block));
-
-        self.control_stack.push(ControlFrame::Loop {
-            break_block: after_block,
-            continue_block: cond_block,
-        });
-        self.start_block(body_block);
-        self.lower_stmt(lowerer, body)?;
-        if self.current_open() {
-            self.set_terminator(Terminator::Goto(cond_block));
-        }
-        self.control_stack.pop();
-
-        self.start_block(cond_block);
-        let cond = self.lower_expr(lowerer, condition)?;
-        self.set_terminator(Terminator::Branch {
-            cond: Condition::Truthy(cond),
-            then_block: body_block,
-            else_block: after_block,
-        });
-        self.start_block(after_block);
-        Ok(())
-    }
-
-    fn lower_for_stmt(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        init: Option<&syntax::ForInit>,
-        condition: Option<&syntax::Expr>,
-        step: Option<&syntax::Expr>,
-        body: &syntax::Stmt,
-    ) -> Result<()> {
-        if let Some(init) = init {
-            self.lower_for_init(lowerer, init)?;
-        }
-
-        let cond_block = self.new_block(condition.map(|expr| lowerer.add_span(expr.span)));
-        let body_block = self.new_block(Some(lowerer.add_span(body.span)));
-        let step_block = self.new_block(step.map(|expr| lowerer.add_span(expr.span)));
-        let after_block = self.new_block(None);
-        self.set_terminator(Terminator::Goto(cond_block));
-
-        self.start_block(cond_block);
-        if let Some(condition) = condition {
-            let cond = self.lower_expr(lowerer, condition)?;
-            self.set_terminator(Terminator::Branch {
-                cond: Condition::Truthy(cond),
-                then_block: body_block,
-                else_block: after_block,
-            });
-        } else {
-            self.set_terminator(Terminator::Goto(body_block));
-        }
-
-        self.control_stack.push(ControlFrame::Loop {
-            break_block: after_block,
-            continue_block: step_block,
-        });
-        self.start_block(body_block);
-        self.lower_stmt(lowerer, body)?;
-        if self.current_open() {
-            self.set_terminator(Terminator::Goto(step_block));
-        }
-        self.control_stack.pop();
-
-        self.start_block(step_block);
-        if let Some(step) = step {
-            self.lower_expr(lowerer, step)?;
-        }
-        self.set_terminator(Terminator::Goto(cond_block));
-        self.start_block(after_block);
-        Ok(())
-    }
-
     fn lower_for_init(&mut self, lowerer: &mut Lowerer<'_>, init: &syntax::ForInit) -> Result<()> {
         match init {
             syntax::ForInit::Var { declarations, .. } => {
@@ -2034,20 +2358,6 @@ impl ObjectBuilder {
             }
         }
         Ok(())
-    }
-
-    fn lower_with_stmt(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        object: &syntax::Expr,
-        body: &syntax::Stmt,
-    ) -> Result<()> {
-        let value = self.lower_expr(lowerer, object)?;
-        let value = self.copy_to_temp(value);
-        self.with_stack.push(value);
-        let result = self.lower_stmt(lowerer, body);
-        self.with_stack.pop();
-        result
     }
 
     fn lower_break(&mut self, lowerer: &mut Lowerer<'_>) -> Result<()> {
@@ -2080,132 +2390,6 @@ impl ObjectBuilder {
             return Err(TjsError::mir("continue statement has no target"));
         };
         self.terminate_exit_through_regions(lowerer, PendingExit::Goto(target));
-        Ok(())
-    }
-
-    fn lower_try_stmt(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        body: &syntax::Stmt,
-        catch: &Option<syntax::CatchClause>,
-    ) -> Result<()> {
-        self.ensure_open();
-        let body_block = self.new_block(Some(lowerer.add_span(body.span)));
-        let catch_block = self.new_block(catch.as_ref().map(|c| lowerer.add_span(c.span)));
-        let after_block = self.new_block(None);
-        self.set_terminator(Terminator::Goto(body_block));
-
-        let exception_slot = if let Some(catch) = catch
-            && let Some(binding) = &catch.binding
-        {
-            self.local(lowerer, binding.binding, Some(&binding.name), catch.span)
-        } else {
-            self.temp()
-        };
-
-        let region = ExceptionRegionId(self.object.exception_regions.len() as u32);
-        let parent = self.active_regions.last().copied();
-        self.object.exception_regions.push(ExceptionRegion {
-            id: region,
-            parent,
-            entry: body_block,
-            protected_blocks: Vec::new(),
-            catch: catch_block,
-            exception_slot,
-        });
-        self.active_regions.push(region);
-        self.mark_block_for_active_regions(body_block);
-
-        self.start_block(body_block);
-        self.lower_stmt(lowerer, body)?;
-        if self.current_open() {
-            self.set_terminator(Terminator::LeaveTry {
-                region,
-                next: after_block,
-            });
-        }
-        self.active_regions.pop();
-
-        self.start_block(catch_block);
-        if let Some(catch) = catch {
-            self.lower_stmt(lowerer, &catch.body)?;
-        } else {
-            self.set_terminator(Terminator::Unreachable);
-        }
-        if self.current_open() {
-            self.set_terminator(Terminator::Goto(after_block));
-        }
-
-        self.start_block(after_block);
-        Ok(())
-    }
-
-    fn lower_switch_stmt(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        discriminant: &syntax::Expr,
-        cases: &[syntax::SwitchCase],
-    ) -> Result<()> {
-        let discriminant_value = self.lower_expr(lowerer, discriminant)?;
-        let discriminant = self.copy_to_temp(discriminant_value);
-        let after_block = self.new_block(None);
-        if cases.is_empty() {
-            self.set_terminator(Terminator::Goto(after_block));
-            self.start_block(after_block);
-            return Ok(());
-        }
-
-        let body_blocks = cases
-            .iter()
-            .map(|case| self.new_block(Some(lowerer.add_span(case.span))))
-            .collect::<Vec<_>>();
-        let test_blocks = cases
-            .iter()
-            .filter(|case| case.test.is_some())
-            .map(|case| self.new_block(Some(lowerer.add_span(case.span))))
-            .collect::<Vec<_>>();
-        let default_body = cases
-            .iter()
-            .position(|case| case.test.is_none())
-            .map(|index| body_blocks[index]);
-        let fallback = default_body.unwrap_or(after_block);
-
-        let first_test = test_blocks.first().copied().unwrap_or(fallback);
-        self.set_terminator(Terminator::Goto(first_test));
-
-        let mut test_iter = test_blocks.iter().copied().peekable();
-        for (case_index, case) in cases.iter().enumerate() {
-            let Some(test) = &case.test else {
-                continue;
-            };
-            let test_block = test_iter.next().expect("test block for case");
-            let next_test = test_iter.peek().copied().unwrap_or(fallback);
-            self.start_block(test_block);
-            let value = self.lower_expr(lowerer, test)?;
-            self.set_terminator(Terminator::Branch {
-                cond: Condition::Compare {
-                    op: CompareOp::Equal,
-                    lhs: discriminant,
-                    rhs: value,
-                },
-                then_block: body_blocks[case_index],
-                else_block: next_test,
-            });
-        }
-
-        self.control_stack.push(ControlFrame::Switch {
-            break_block: after_block,
-        });
-        for (index, case) in cases.iter().enumerate() {
-            self.start_block(body_blocks[index]);
-            self.lower_statements(lowerer, &case.body)?;
-            if self.current_open() {
-                let next = body_blocks.get(index + 1).copied().unwrap_or(after_block);
-                self.set_terminator(Terminator::Goto(next));
-            }
-        }
-        self.control_stack.pop();
-        self.start_block(after_block);
         Ok(())
     }
 
@@ -2276,23 +2460,453 @@ impl ObjectBuilder {
     }
 
     fn lower_expr(&mut self, lowerer: &mut Lowerer<'_>, expr: &syntax::Expr) -> Result<Value> {
+        let mut tasks = vec![ExprTask::Expr(expr)];
+        let mut values = Vec::new();
+        let mut places = Vec::new();
+        let mut call_targets = Vec::new();
+        let mut arg_lists = Vec::new();
+        while let Some(task) = tasks.pop() {
+            self.run_expr_task(
+                lowerer,
+                task,
+                &mut tasks,
+                &mut values,
+                &mut places,
+                &mut call_targets,
+                &mut arg_lists,
+            )?;
+        }
+        pop_value(&mut values)
+    }
+
+    fn run_expr_task<'a>(
+        &mut self,
+        lowerer: &mut Lowerer<'_>,
+        task: ExprTask<'a>,
+        tasks: &mut Vec<ExprTask<'a>>,
+        values: &mut Vec<Value>,
+        places: &mut Vec<Place>,
+        call_targets: &mut Vec<CallTarget>,
+        arg_lists: &mut Vec<ArgList>,
+    ) -> Result<()> {
+        match task {
+            ExprTask::Expr(expr) => self.push_expr_task(lowerer, expr, tasks, values, places)?,
+            ExprTask::PushValue(value) => values.push(value),
+            ExprTask::DiscardValue => {
+                pop_value(values)?;
+            }
+            ExprTask::StartBlock(block) => self.start_block(block),
+            ExprTask::GotoIfOpen(target) => {
+                if self.current_open() {
+                    self.set_terminator(Terminator::Goto(target));
+                }
+            }
+            ExprTask::ReadPlaceToValue => {
+                let place = pop_place(places)?;
+                values.push(self.read_place(place));
+            }
+            ExprTask::WritePlace(expr) => {
+                self.push_write_place_task(lowerer, expr, tasks, places)?;
+            }
+            ExprTask::ApplyIgnorePropToPlace => {
+                let place = pop_place(places)?;
+                places.push(place_with_ignore_prop(place));
+            }
+            ExprTask::MemberPlaceAfterObject { property, flags } => {
+                let object = pop_value(values)?;
+                places.push(Place::Member {
+                    object,
+                    key: MemberKey::Direct(lowerer.intern_string(property)),
+                    flags,
+                });
+            }
+            ExprTask::DefaultPropertyPlaceAfterObject { flags } => {
+                let object = pop_value(values)?;
+                places.push(Place::DefaultProperty { object, flags });
+            }
+            ExprTask::IndexPlaceAfterObject { index, flags } => {
+                let object = pop_value(values)?;
+                tasks.push(ExprTask::IndexPlaceAfterIndex { object, flags });
+                tasks.push(ExprTask::Expr(index));
+            }
+            ExprTask::IndexPlaceAfterIndex { object, flags } => {
+                let index = pop_value(values)?;
+                places.push(Place::Member {
+                    object,
+                    key: MemberKey::Computed(index),
+                    flags,
+                });
+            }
+            ExprTask::CallTarget(callee) => {
+                self.push_call_target_task(lowerer, callee, tasks, call_targets)?;
+            }
+            ExprTask::CallTargetValueAfter => {
+                call_targets.push(CallTarget::Value(pop_value(values)?));
+            }
+            ExprTask::CallTargetMemberAfterObject { property, flags } => {
+                let object = pop_value(values)?;
+                call_targets.push(CallTarget::Member {
+                    object,
+                    key: MemberKey::Direct(lowerer.intern_string(property)),
+                    flags,
+                });
+            }
+            ExprTask::CallTargetDefaultPropertyAfterObject { flags } => {
+                let object = pop_value(values)?;
+                call_targets.push(CallTarget::DefaultProperty { object, flags });
+            }
+            ExprTask::CallTargetIndexAfterObject { index, flags } => {
+                let object = pop_value(values)?;
+                tasks.push(ExprTask::CallTargetIndexAfterIndex { object, flags });
+                tasks.push(ExprTask::Expr(index));
+            }
+            ExprTask::CallTargetIndexAfterIndex { object, flags } => {
+                let index = pop_value(values)?;
+                call_targets.push(CallTarget::Member {
+                    object,
+                    key: MemberKey::Computed(index),
+                    flags,
+                });
+            }
+            ExprTask::CallArgs(args) => {
+                self.push_call_args_task(args, tasks, arg_lists);
+            }
+            ExprTask::BuildCallArgs {
+                args,
+                value_count,
+                saw_expanded,
+            } => {
+                let lowered = split_values(values, value_count)?;
+                if saw_expanded {
+                    let mut iter = lowered.into_iter();
+                    let mut expanded = Vec::with_capacity(args.len());
+                    for arg in args {
+                        match arg {
+                            syntax::CallArg::Value(_) => {
+                                expanded.push(ArgPart::Normal(next_value(&mut iter)?));
+                            }
+                            syntax::CallArg::Expand(Some(_)) => {
+                                expanded.push(ArgPart::Expand(next_value(&mut iter)?));
+                            }
+                            syntax::CallArg::Expand(None) => expanded.push(ArgPart::UnnamedExpand),
+                            syntax::CallArg::Omitted => {
+                                arg_lists.push(ArgList::OmittedCallerArgs);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    arg_lists.push(ArgList::Expanded(expanded));
+                } else {
+                    arg_lists.push(ArgList::Normal(lowered));
+                }
+            }
+            ExprTask::AfterUnary(op) => {
+                let src = pop_value(values)?;
+                let dst = self.temp();
+                self.emit_unary_expr(dst, op, src)?;
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterBinary(op) => {
+                let rhs = pop_value(values)?;
+                let lhs = pop_value(values)?;
+                let dst = self.temp();
+                if let Some(op) = compare_op(op) {
+                    self.emit(MirInst::Compare { dst, op, lhs, rhs });
+                } else if let Some(op) = binary_op(op) {
+                    self.emit(MirInst::Binary { dst, op, lhs, rhs });
+                } else {
+                    return Err(TjsError::mir("unsupported binary operator"));
+                }
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterInContextOf => {
+                let this_obj = pop_value(values)?;
+                let closure = pop_value(values)?;
+                let dst = self.temp();
+                self.emit(MirInst::ChangeThis {
+                    dst,
+                    closure,
+                    this_obj,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterInstanceOf => {
+                let class_name = pop_value(values)?;
+                let value = pop_value(values)?;
+                let dst = self.temp();
+                self.emit(MirInst::IsInstanceOf {
+                    dst,
+                    value,
+                    class_name,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterAssignment(op) => {
+                let value = pop_value(values)?;
+                let place = pop_place(places)?;
+                let dst = self.temp();
+                if op == syntax::AssignOp::Assign {
+                    self.emit(MirInst::Assign {
+                        place,
+                        value,
+                        result: Some(dst),
+                    });
+                } else if let Some(op) = assign_binary_op(op) {
+                    self.emit(MirInst::AssignOp {
+                        place,
+                        op,
+                        rhs: value,
+                        result: Some(dst),
+                    });
+                } else {
+                    return Err(TjsError::mir("unsupported assignment operator"));
+                }
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterSwap => {
+                let right = pop_place(places)?;
+                let left = pop_place(places)?;
+                self.emit(MirInst::Swap { left, right });
+                values.push(lowerer.const_void());
+            }
+            ExprTask::AfterDelete => {
+                let place = pop_place(places)?;
+                let dst = self.temp();
+                self.emit(MirInst::Delete {
+                    dst: Some(dst),
+                    place,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterPrefixUpdate(op) => {
+                let place = pop_place(places)?;
+                let dst = self.temp();
+                self.emit(MirInst::Update {
+                    place,
+                    op: update_op_from_unary(op)?,
+                    result: Some(dst),
+                    result_value: UpdateResultValue::New,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterPostfixUpdate(op) => {
+                let place = pop_place(places)?;
+                let dst = self.temp();
+                self.emit(MirInst::Update {
+                    place,
+                    op: update_op_from_unary(op)?,
+                    result: Some(dst),
+                    result_value: UpdateResultValue::Old,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterPostfixEval => {
+                let source = pop_value(values)?;
+                let dst = self.temp();
+                self.emit(MirInst::Eval {
+                    dst: Some(dst),
+                    source,
+                    mode: EvalMode::Expression,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterTypeOfValue => {
+                let value = pop_value(values)?;
+                let dst = self.temp();
+                self.emit(MirInst::TypeOfValue { dst, value });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterTypeOfPlace => {
+                let place = pop_place(places)?;
+                let dst = self.temp();
+                self.emit(MirInst::TypeOfPlace { dst, place });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterPropAccess => {
+                let object = pop_value(values)?;
+                values.push(self.read_place(Place::DefaultProperty {
+                    object,
+                    flags: FLAGS_DEFAULT_GET,
+                }));
+            }
+            ExprTask::AfterShortCircuitLhs { op, rhs } => {
+                self.push_short_circuit_tasks(lowerer, op, rhs, tasks, values)?;
+            }
+            ExprTask::EmitShortCircuitShortcut {
+                block,
+                result,
+                shortcut,
+                done_block,
+            } => {
+                self.start_block(block);
+                self.emit(MirInst::Copy {
+                    dst: result,
+                    src: shortcut,
+                });
+                self.set_terminator(Terminator::Goto(done_block));
+            }
+            ExprTask::AfterShortCircuitRhs { result, done_block } => {
+                let rhs = pop_value(values)?;
+                self.emit(MirInst::ToBoolean {
+                    dst: result,
+                    src: rhs,
+                });
+                self.set_terminator(Terminator::Goto(done_block));
+            }
+            ExprTask::AfterIfOperatorCond { lhs } => {
+                let cond = pop_value(values)?;
+                let then_block = self.new_block(Some(lowerer.add_span(lhs.span)));
+                let done_block = self.new_block(None);
+                self.set_terminator(Terminator::Branch {
+                    cond: Condition::Truthy(cond),
+                    then_block,
+                    else_block: done_block,
+                });
+                tasks.push(ExprTask::PushValue(lowerer.const_void()));
+                tasks.push(ExprTask::StartBlock(done_block));
+                tasks.push(ExprTask::GotoIfOpen(done_block));
+                tasks.push(ExprTask::DiscardValue);
+                tasks.push(ExprTask::Expr(lhs));
+                tasks.push(ExprTask::StartBlock(then_block));
+            }
+            ExprTask::AfterConditionalCond {
+                then_expr,
+                else_expr,
+                result,
+            } => {
+                let cond = pop_value(values)?;
+                let then_block = self.new_block(Some(lowerer.add_span(then_expr.span)));
+                let else_block = self.new_block(Some(lowerer.add_span(else_expr.span)));
+                let done_block = self.new_block(None);
+                self.set_terminator(Terminator::Branch {
+                    cond: Condition::Truthy(cond),
+                    then_block,
+                    else_block,
+                });
+                tasks.push(ExprTask::PushValue(Value::Slot(result)));
+                tasks.push(ExprTask::StartBlock(done_block));
+                tasks.push(ExprTask::AfterConditionalBranch { result, done_block });
+                tasks.push(ExprTask::Expr(else_expr));
+                tasks.push(ExprTask::StartBlock(else_block));
+                tasks.push(ExprTask::AfterConditionalBranch { result, done_block });
+                tasks.push(ExprTask::Expr(then_expr));
+                tasks.push(ExprTask::StartBlock(then_block));
+            }
+            ExprTask::AfterConditionalBranch { result, done_block } => {
+                let value = pop_value(values)?;
+                self.emit(MirInst::Copy {
+                    dst: result,
+                    src: value,
+                });
+                self.set_terminator(Terminator::Goto(done_block));
+            }
+            ExprTask::AfterCallArgs => {
+                let args = pop_arg_list(arg_lists)?;
+                let target = pop_call_target(call_targets)?;
+                let dst = self.temp();
+                self.emit(MirInst::Call {
+                    dst: Some(dst),
+                    target,
+                    args,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::AfterNewCallee { args } => {
+                let callee = pop_value(values)?;
+                tasks.push(ExprTask::AfterNewArgs { callee });
+                tasks.push(ExprTask::CallArgs(args));
+            }
+            ExprTask::AfterNewArgs { callee } => {
+                let args = pop_arg_list(arg_lists)?;
+                let dst = self.temp();
+                self.emit(MirInst::New {
+                    dst: Some(dst),
+                    callee,
+                    args,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::BuildArray {
+                elements,
+                value_count,
+            } => {
+                let lowered_values = split_values(values, value_count)?;
+                let mut lowered_values = lowered_values.into_iter();
+                let mut lowered = Vec::with_capacity(elements.len());
+                for element in elements {
+                    match element {
+                        syntax::ArrayElement::Value(_) => {
+                            lowered.push(ArrayElement::Value(next_value(&mut lowered_values)?));
+                        }
+                        syntax::ArrayElement::Hole => lowered.push(ArrayElement::Hole),
+                    }
+                }
+                let dst = self.temp();
+                self.emit(MirInst::BuildArray {
+                    dst,
+                    elements: lowered,
+                });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::BuildDictionary { plan, value_count } => {
+                let lowered_values = split_values(values, value_count)?;
+                let mut lowered_values = lowered_values.into_iter();
+                let mut entries = Vec::with_capacity(plan.len());
+                for key_plan in plan {
+                    let key = match key_plan {
+                        DictionaryKeyPlan::Direct(id) => DictionaryKey::Direct(id),
+                        DictionaryKeyPlan::Computed => {
+                            DictionaryKey::Computed(next_value(&mut lowered_values)?)
+                        }
+                    };
+                    let value = next_value(&mut lowered_values)?;
+                    entries.push(DictionaryEntry { key, value });
+                }
+                let dst = self.temp();
+                self.emit(MirInst::BuildDictionary { dst, entries });
+                values.push(Value::Slot(dst));
+            }
+            ExprTask::FinishComma { count } => {
+                if count == 0 {
+                    values.push(lowerer.const_void());
+                } else {
+                    let lowered = split_values(values, count)?;
+                    values.push(*lowered.last().expect("non-empty comma expression"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn push_expr_task<'a>(
+        &mut self,
+        lowerer: &mut Lowerer<'_>,
+        expr: &'a syntax::Expr,
+        tasks: &mut Vec<ExprTask<'a>>,
+        values: &mut Vec<Value>,
+        places: &mut Vec<Place>,
+    ) -> Result<()> {
         match &expr.kind {
-            syntax::ExprKind::Void => Ok(lowerer.const_void()),
-            syntax::ExprKind::Null => Ok(Value::Const(lowerer.add_const(MirConst::NullObject))),
-            syntax::ExprKind::Bool(value) => Ok(lowerer.const_bool(*value)),
+            syntax::ExprKind::Void => values.push(lowerer.const_void()),
+            syntax::ExprKind::Null => {
+                values.push(Value::Const(lowerer.add_const(MirConst::NullObject)));
+            }
+            syntax::ExprKind::Bool(value) => values.push(lowerer.const_bool(*value)),
             syntax::ExprKind::Integer(value) => {
-                Ok(Value::Const(lowerer.add_const(MirConst::Integer(*value))))
+                values.push(Value::Const(lowerer.add_const(MirConst::Integer(*value))));
             }
             syntax::ExprKind::Real(value) => {
-                Ok(Value::Const(lowerer.add_const(MirConst::Real(*value))))
+                values.push(Value::Const(lowerer.add_const(MirConst::Real(*value))));
             }
             syntax::ExprKind::String(value) => {
                 let id = lowerer.intern_string(value);
-                Ok(Value::Const(lowerer.add_const(MirConst::String(id))))
+                values.push(Value::Const(lowerer.add_const(MirConst::String(id))));
             }
-            syntax::ExprKind::Octet(value) => Ok(Value::Const(
-                lowerer.add_const(MirConst::Octet(value.clone())),
-            )),
+            syntax::ExprKind::Octet(value) => {
+                values.push(Value::Const(
+                    lowerer.add_const(MirConst::Octet(value.clone())),
+                ));
+            }
             syntax::ExprKind::RegExp { pattern, flags } => {
                 let dst = self.temp();
                 let pattern = lowerer.intern_string(pattern);
@@ -2302,84 +2916,197 @@ impl ObjectBuilder {
                     pattern,
                     flags,
                 });
-                Ok(Value::Slot(dst))
+                values.push(Value::Slot(dst));
             }
-            syntax::ExprKind::Identifier(ident) => self.read_ident(lowerer, ident, expr.span),
-            syntax::ExprKind::This => Ok(Value::Slot(SlotId::This)),
-            syntax::ExprKind::Super => Ok(Value::Slot(SlotId::SuperProxy)),
+            syntax::ExprKind::Identifier(ident) => {
+                values.push(self.read_ident(lowerer, ident, expr.span)?);
+            }
+            syntax::ExprKind::This => values.push(Value::Slot(SlotId::This)),
+            syntax::ExprKind::Super => values.push(Value::Slot(SlotId::SuperProxy)),
             syntax::ExprKind::Global => {
                 let dst = self.temp();
                 self.emit(MirInst::LoadGlobal { dst });
-                Ok(Value::Slot(dst))
+                values.push(Value::Slot(dst));
             }
-            syntax::ExprKind::Nan => Ok(Value::Const(lowerer.add_const(MirConst::Real(f64::NAN)))),
-            syntax::ExprKind::Infinity => Ok(Value::Const(
-                lowerer.add_const(MirConst::Real(f64::INFINITY)),
-            )),
+            syntax::ExprKind::Nan => {
+                values.push(Value::Const(lowerer.add_const(MirConst::Real(f64::NAN))));
+            }
+            syntax::ExprKind::Infinity => {
+                values.push(Value::Const(
+                    lowerer.add_const(MirConst::Real(f64::INFINITY)),
+                ));
+            }
             syntax::ExprKind::Array(elements) | syntax::ExprKind::ConstArray(elements) => {
-                self.lower_array(lowerer, elements)
+                let value_count = elements
+                    .iter()
+                    .filter(|element| matches!(element, syntax::ArrayElement::Value(_)))
+                    .count();
+                tasks.push(ExprTask::BuildArray {
+                    elements,
+                    value_count,
+                });
+                for element in elements.iter().rev() {
+                    if let syntax::ArrayElement::Value(expr) = element {
+                        tasks.push(ExprTask::Expr(expr));
+                    }
+                }
             }
             syntax::ExprKind::Dictionary(entries) | syntax::ExprKind::ConstDictionary(entries) => {
-                self.lower_dictionary(lowerer, entries)
+                let mut plan = Vec::with_capacity(entries.len());
+                let mut value_count = 0;
+                for entry in entries {
+                    match &entry.key.kind {
+                        syntax::ExprKind::Identifier(name) => {
+                            plan.push(DictionaryKeyPlan::Direct(lowerer.intern_string(&name.name)));
+                        }
+                        syntax::ExprKind::String(name) => {
+                            plan.push(DictionaryKeyPlan::Direct(lowerer.intern_string(name)));
+                        }
+                        _ => {
+                            plan.push(DictionaryKeyPlan::Computed);
+                            value_count += 1;
+                        }
+                    }
+                    value_count += 1;
+                }
+                tasks.push(ExprTask::BuildDictionary { plan, value_count });
+                for entry in entries.iter().rev() {
+                    tasks.push(ExprTask::Expr(&entry.value));
+                    if !matches!(
+                        &entry.key.kind,
+                        syntax::ExprKind::Identifier(_) | syntax::ExprKind::String(_)
+                    ) {
+                        tasks.push(ExprTask::Expr(&entry.key));
+                    }
+                }
             }
-            syntax::ExprKind::Unary { op, expr } => self.lower_unary(lowerer, *op, expr),
-            syntax::ExprKind::Binary { op, lhs, rhs } => self.lower_binary(lowerer, *op, lhs, rhs),
+            syntax::ExprKind::Unary { op, expr: inner } => match op {
+                syntax::UnaryOp::IgnoreProp => {
+                    if is_member_read_candidate(inner) {
+                        tasks.push(ExprTask::ReadPlaceToValue);
+                        self.push_member_read_place_task(
+                            lowerer,
+                            inner,
+                            FLAGS_IGNORE_PROP_GET,
+                            tasks,
+                            places,
+                        )?;
+                    } else {
+                        tasks.push(ExprTask::Expr(inner));
+                    }
+                }
+                syntax::UnaryOp::PropAccess => {
+                    tasks.push(ExprTask::AfterPropAccess);
+                    tasks.push(ExprTask::Expr(inner));
+                }
+                syntax::UnaryOp::Delete => {
+                    tasks.push(ExprTask::AfterDelete);
+                    tasks.push(ExprTask::WritePlace(inner));
+                }
+                syntax::UnaryOp::Increment | syntax::UnaryOp::Decrement => {
+                    tasks.push(ExprTask::AfterPrefixUpdate(*op));
+                    tasks.push(ExprTask::WritePlace(inner));
+                }
+                syntax::UnaryOp::TypeOf if is_member_read_candidate(inner) => {
+                    tasks.push(ExprTask::AfterTypeOfPlace);
+                    self.push_member_read_place_task(
+                        lowerer,
+                        inner,
+                        FLAGS_DEFAULT_GET,
+                        tasks,
+                        places,
+                    )?;
+                }
+                syntax::UnaryOp::TypeOf => {
+                    tasks.push(ExprTask::AfterTypeOfValue);
+                    tasks.push(ExprTask::Expr(inner));
+                }
+                _ => {
+                    tasks.push(ExprTask::AfterUnary(*op));
+                    tasks.push(ExprTask::Expr(inner));
+                }
+            },
+            syntax::ExprKind::Binary { op, lhs, rhs } => match op {
+                syntax::BinaryOp::LogicalOr | syntax::BinaryOp::LogicalAnd => {
+                    tasks.push(ExprTask::AfterShortCircuitLhs { op: *op, rhs });
+                    tasks.push(ExprTask::Expr(lhs));
+                }
+                syntax::BinaryOp::If => {
+                    tasks.push(ExprTask::AfterIfOperatorCond { lhs });
+                    tasks.push(ExprTask::Expr(rhs));
+                }
+                syntax::BinaryOp::InContextOf => {
+                    tasks.push(ExprTask::AfterInContextOf);
+                    tasks.push(ExprTask::Expr(rhs));
+                    tasks.push(ExprTask::Expr(lhs));
+                }
+                syntax::BinaryOp::InstanceOf => {
+                    tasks.push(ExprTask::AfterInstanceOf);
+                    tasks.push(ExprTask::Expr(rhs));
+                    tasks.push(ExprTask::Expr(lhs));
+                }
+                _ => {
+                    tasks.push(ExprTask::AfterBinary(*op));
+                    tasks.push(ExprTask::Expr(rhs));
+                    tasks.push(ExprTask::Expr(lhs));
+                }
+            },
             syntax::ExprKind::Assignment { op, target, value } => {
-                self.lower_assignment(lowerer, *op, target, value)
+                if *op == syntax::AssignOp::Swap {
+                    tasks.push(ExprTask::AfterSwap);
+                    tasks.push(ExprTask::WritePlace(value));
+                    tasks.push(ExprTask::WritePlace(target));
+                } else {
+                    tasks.push(ExprTask::AfterAssignment(*op));
+                    tasks.push(ExprTask::Expr(value));
+                    tasks.push(ExprTask::WritePlace(target));
+                }
             }
             syntax::ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
-            } => self.lower_conditional_expr(lowerer, condition, then_expr, else_expr),
+            } => {
+                let result = self.temp();
+                tasks.push(ExprTask::AfterConditionalCond {
+                    then_expr,
+                    else_expr,
+                    result,
+                });
+                tasks.push(ExprTask::Expr(condition));
+            }
             syntax::ExprKind::Member { object, property } => {
-                let object = self.lower_expr(lowerer, object)?;
-                let key = MemberKey::Direct(lowerer.intern_string(property));
-                Ok(self.read_place(Place::Member {
-                    object,
-                    key,
+                tasks.push(ExprTask::ReadPlaceToValue);
+                tasks.push(ExprTask::MemberPlaceAfterObject {
+                    property,
                     flags: FLAGS_DEFAULT_GET,
-                }))
+                });
+                tasks.push(ExprTask::Expr(object));
             }
             syntax::ExprKind::WithMember { property } => {
-                let object = self.with_member_object();
-                let key = MemberKey::Direct(lowerer.intern_string(property));
-                Ok(self.read_place(Place::Member {
-                    object,
-                    key,
+                places.push(Place::Member {
+                    object: self.with_member_object(),
+                    key: MemberKey::Direct(lowerer.intern_string(property)),
                     flags: FLAGS_DEFAULT_GET,
-                }))
+                });
+                tasks.push(ExprTask::ReadPlaceToValue);
             }
             syntax::ExprKind::Index { object, index } => {
-                let object = self.lower_expr(lowerer, object)?;
-                let index = self.lower_expr(lowerer, index)?;
-                Ok(self.read_place(Place::Member {
-                    object,
-                    key: MemberKey::Computed(index),
+                tasks.push(ExprTask::ReadPlaceToValue);
+                tasks.push(ExprTask::IndexPlaceAfterObject {
+                    index,
                     flags: FLAGS_DEFAULT_GET,
-                }))
+                });
+                tasks.push(ExprTask::Expr(object));
             }
             syntax::ExprKind::Call { callee, args } => {
-                let target = self.lower_call_target(lowerer, callee)?;
-                let args = self.lower_call_args(lowerer, args)?;
-                let dst = self.temp();
-                self.emit(MirInst::Call {
-                    dst: Some(dst),
-                    target,
-                    args,
-                });
-                Ok(Value::Slot(dst))
+                tasks.push(ExprTask::AfterCallArgs);
+                tasks.push(ExprTask::CallArgs(args));
+                tasks.push(ExprTask::CallTarget(callee));
             }
             syntax::ExprKind::New { callee, args } => {
-                let callee = self.lower_expr(lowerer, callee)?;
-                let args = self.lower_call_args(lowerer, args)?;
-                let dst = self.temp();
-                self.emit(MirInst::New {
-                    dst: Some(dst),
-                    callee,
-                    args,
-                });
-                Ok(Value::Slot(dst))
+                tasks.push(ExprTask::AfterNewCallee { args });
+                tasks.push(ExprTask::Expr(callee));
             }
             syntax::ExprKind::Function(decl) => {
                 let id = lowerer.lower_function_object(
@@ -2387,91 +3114,242 @@ impl ObjectBuilder {
                     ContextType::ExprFunction,
                     Some(self.object.id),
                 )?;
-                Ok(Value::Const(lowerer.add_const(MirConst::CodeObject(id))))
+                values.push(Value::Const(lowerer.add_const(MirConst::CodeObject(id))));
             }
-            syntax::ExprKind::Postfix { op, expr } => {
+            syntax::ExprKind::Postfix { op, expr: inner } => {
                 if *op == syntax::UnaryOp::Eval {
-                    let source = self.lower_expr(lowerer, expr)?;
-                    let dst = self.temp();
-                    self.emit(MirInst::Eval {
-                        dst: Some(dst),
-                        source,
-                        mode: EvalMode::Expression,
-                    });
-                    return Ok(Value::Slot(dst));
+                    tasks.push(ExprTask::AfterPostfixEval);
+                    tasks.push(ExprTask::Expr(inner));
+                } else {
+                    tasks.push(ExprTask::AfterPostfixUpdate(*op));
+                    tasks.push(ExprTask::WritePlace(inner));
                 }
-
-                let place = self.expr_to_place(lowerer, expr)?;
-                let dst = self.temp();
-                let op = match op {
-                    syntax::UnaryOp::Increment => UpdateOp::Inc,
-                    syntax::UnaryOp::Decrement => UpdateOp::Dec,
-                    _ => return Err(TjsError::mir("unsupported postfix operator")),
-                };
-                self.emit(MirInst::Update {
-                    place,
-                    op,
-                    result: Some(dst),
-                    result_value: UpdateResultValue::Old,
-                });
-                Ok(Value::Slot(dst))
             }
             syntax::ExprKind::Comma(exprs) => {
-                let mut last = lowerer.const_void();
-                for expr in exprs {
-                    last = self.lower_expr(lowerer, expr)?;
+                tasks.push(ExprTask::FinishComma { count: exprs.len() });
+                for expr in exprs.iter().rev() {
+                    tasks.push(ExprTask::Expr(expr));
                 }
-                Ok(last)
+            }
+        }
+        Ok(())
+    }
+
+    fn push_write_place_task<'a>(
+        &mut self,
+        lowerer: &mut Lowerer<'_>,
+        expr: &'a syntax::Expr,
+        tasks: &mut Vec<ExprTask<'a>>,
+        places: &mut Vec<Place>,
+    ) -> Result<()> {
+        match &expr.kind {
+            syntax::ExprKind::Unary {
+                op: syntax::UnaryOp::IgnoreProp,
+                expr,
+            } => {
+                tasks.push(ExprTask::ApplyIgnorePropToPlace);
+                tasks.push(ExprTask::WritePlace(expr));
+            }
+            syntax::ExprKind::Unary {
+                op: syntax::UnaryOp::PropAccess,
+                expr,
+            } => {
+                tasks.push(ExprTask::DefaultPropertyPlaceAfterObject {
+                    flags: FLAGS_DEFAULT_SET,
+                });
+                tasks.push(ExprTask::Expr(expr));
+            }
+            syntax::ExprKind::Identifier(ident) => {
+                places.push(self.ident_write_place(lowerer, ident, expr.span)?);
+            }
+            syntax::ExprKind::WithMember { property } => {
+                places.push(Place::Member {
+                    object: self.with_member_object(),
+                    key: MemberKey::Direct(lowerer.intern_string(property)),
+                    flags: FLAGS_ENSURE_SET,
+                });
+            }
+            syntax::ExprKind::Member { object, property } => {
+                tasks.push(ExprTask::MemberPlaceAfterObject {
+                    property,
+                    flags: FLAGS_ENSURE_SET,
+                });
+                tasks.push(ExprTask::Expr(object));
+            }
+            syntax::ExprKind::Index { object, index } => {
+                tasks.push(ExprTask::IndexPlaceAfterObject {
+                    index,
+                    flags: FLAGS_ENSURE_SET,
+                });
+                tasks.push(ExprTask::Expr(object));
+            }
+            _ => return Err(TjsError::mir("expression is not assignable")),
+        }
+        Ok(())
+    }
+
+    fn push_member_read_place_task<'a>(
+        &mut self,
+        lowerer: &mut Lowerer<'_>,
+        expr: &'a syntax::Expr,
+        flags: DispatchFlags,
+        tasks: &mut Vec<ExprTask<'a>>,
+        places: &mut Vec<Place>,
+    ) -> Result<()> {
+        match &expr.kind {
+            syntax::ExprKind::WithMember { property } => {
+                places.push(Place::Member {
+                    object: self.with_member_object(),
+                    key: MemberKey::Direct(lowerer.intern_string(property)),
+                    flags,
+                });
+            }
+            syntax::ExprKind::Member { object, property } => {
+                tasks.push(ExprTask::MemberPlaceAfterObject { property, flags });
+                tasks.push(ExprTask::Expr(object));
+            }
+            syntax::ExprKind::Index { object, index } => {
+                tasks.push(ExprTask::IndexPlaceAfterObject { index, flags });
+                tasks.push(ExprTask::Expr(object));
+            }
+            _ => return Err(TjsError::mir("expression does not name a member place")),
+        }
+        Ok(())
+    }
+
+    fn push_call_target_task<'a>(
+        &mut self,
+        lowerer: &mut Lowerer<'_>,
+        callee: &'a syntax::Expr,
+        tasks: &mut Vec<ExprTask<'a>>,
+        call_targets: &mut Vec<CallTarget>,
+    ) -> Result<()> {
+        match &callee.kind {
+            syntax::ExprKind::Member { object, property } => {
+                tasks.push(ExprTask::CallTargetMemberAfterObject {
+                    property,
+                    flags: FLAGS_DEFAULT_GET,
+                });
+                tasks.push(ExprTask::Expr(object));
+            }
+            syntax::ExprKind::WithMember { property } => {
+                call_targets.push(CallTarget::Member {
+                    object: self.with_member_object(),
+                    key: MemberKey::Direct(lowerer.intern_string(property)),
+                    flags: FLAGS_DEFAULT_GET,
+                });
+            }
+            syntax::ExprKind::Index { object, index } => {
+                tasks.push(ExprTask::CallTargetIndexAfterObject {
+                    index,
+                    flags: FLAGS_DEFAULT_GET,
+                });
+                tasks.push(ExprTask::Expr(object));
+            }
+            syntax::ExprKind::Unary {
+                op: syntax::UnaryOp::PropAccess,
+                expr,
+            } => {
+                tasks.push(ExprTask::CallTargetDefaultPropertyAfterObject {
+                    flags: FLAGS_DEFAULT_GET,
+                });
+                tasks.push(ExprTask::Expr(expr));
+            }
+            _ => {
+                tasks.push(ExprTask::CallTargetValueAfter);
+                tasks.push(ExprTask::Expr(callee));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_call_args_task<'a>(
+        &mut self,
+        args: &'a [syntax::CallArg],
+        tasks: &mut Vec<ExprTask<'a>>,
+        arg_lists: &mut Vec<ArgList>,
+    ) {
+        if args.len() == 1 && matches!(args[0], syntax::CallArg::Omitted) {
+            arg_lists.push(ArgList::OmittedCallerArgs);
+            return;
+        }
+        if args
+            .iter()
+            .any(|arg| matches!(arg, syntax::CallArg::Omitted))
+        {
+            arg_lists.push(ArgList::OmittedCallerArgs);
+            return;
+        }
+
+        let mut value_count = 0;
+        let mut saw_expanded = false;
+        for arg in args {
+            match arg {
+                syntax::CallArg::Value(_) => value_count += 1,
+                syntax::CallArg::Expand(Some(_)) => {
+                    saw_expanded = true;
+                    value_count += 1;
+                }
+                syntax::CallArg::Expand(None) => saw_expanded = true,
+                syntax::CallArg::Omitted => {}
+            }
+        }
+        tasks.push(ExprTask::BuildCallArgs {
+            args,
+            value_count,
+            saw_expanded,
+        });
+        for arg in args.iter().rev() {
+            match arg {
+                syntax::CallArg::Value(expr) | syntax::CallArg::Expand(Some(expr)) => {
+                    tasks.push(ExprTask::Expr(expr));
+                }
+                syntax::CallArg::Expand(None) | syntax::CallArg::Omitted => {}
             }
         }
     }
 
-    fn lower_unary(
+    fn push_short_circuit_tasks<'a>(
         &mut self,
         lowerer: &mut Lowerer<'_>,
-        op: syntax::UnaryOp,
-        expr: &syntax::Expr,
-    ) -> Result<Value> {
-        match op {
-            syntax::UnaryOp::IgnoreProp => return self.lower_ignore_prop(lowerer, expr),
-            syntax::UnaryOp::PropAccess => return self.lower_prop_access(lowerer, expr),
-            syntax::UnaryOp::Delete => {
-                let place = self.expr_to_place(lowerer, expr)?;
-                let dst = self.temp();
-                self.emit(MirInst::Delete {
-                    dst: Some(dst),
-                    place,
-                });
-                return Ok(Value::Slot(dst));
-            }
-            syntax::UnaryOp::Increment | syntax::UnaryOp::Decrement => {
-                let place = self.expr_to_place(lowerer, expr)?;
-                let dst = self.temp();
-                let op = if op == syntax::UnaryOp::Increment {
-                    UpdateOp::Inc
-                } else {
-                    UpdateOp::Dec
-                };
-                self.emit(MirInst::Update {
-                    place,
-                    op,
-                    result: Some(dst),
-                    result_value: UpdateResultValue::New,
-                });
-                return Ok(Value::Slot(dst));
-            }
-            syntax::UnaryOp::TypeOf => {
-                if let Some(place) = self.member_read_place(lowerer, expr, FLAGS_DEFAULT_GET)? {
-                    let dst = self.temp();
-                    self.emit(MirInst::TypeOfPlace { dst, place });
-                    return Ok(Value::Slot(dst));
-                }
-            }
-            _ => {}
-        }
+        op: syntax::BinaryOp,
+        rhs: &'a syntax::Expr,
+        tasks: &mut Vec<ExprTask<'a>>,
+        values: &mut Vec<Value>,
+    ) -> Result<()> {
+        let result = self.temp();
+        let lhs = pop_value(values)?;
+        let rhs_block = self.new_block(Some(lowerer.add_span(rhs.span)));
+        let done_block = self.new_block(None);
+        let shortcut_value = op == syntax::BinaryOp::LogicalOr;
+        let shortcut = lowerer.const_bool(shortcut_value);
+        let evaluate_when = if op == syntax::BinaryOp::LogicalOr {
+            Condition::Falsey(lhs)
+        } else {
+            Condition::Truthy(lhs)
+        };
+        let shortcut_block = self.new_block(None);
+        self.set_terminator(Terminator::Branch {
+            cond: evaluate_when,
+            then_block: rhs_block,
+            else_block: shortcut_block,
+        });
 
-        let src = self.lower_expr(lowerer, expr)?;
-        let dst = self.temp();
+        tasks.push(ExprTask::PushValue(Value::Slot(result)));
+        tasks.push(ExprTask::StartBlock(done_block));
+        tasks.push(ExprTask::AfterShortCircuitRhs { result, done_block });
+        tasks.push(ExprTask::Expr(rhs));
+        tasks.push(ExprTask::StartBlock(rhs_block));
+        tasks.push(ExprTask::EmitShortCircuitShortcut {
+            block: shortcut_block,
+            result,
+            shortcut,
+            done_block,
+        });
+        Ok(())
+    }
+
+    fn emit_unary_expr(&mut self, dst: SlotId, op: syntax::UnaryOp, src: Value) -> Result<()> {
         match op {
             syntax::UnaryOp::Plus => self.emit(MirInst::Convert {
                 dst,
@@ -2530,422 +3408,11 @@ impl ObjectBuilder {
             | syntax::UnaryOp::PropAccess
             | syntax::UnaryOp::Delete
             | syntax::UnaryOp::Increment
-            | syntax::UnaryOp::Decrement => unreachable!("handled before lowering operand"),
-        }
-        Ok(Value::Slot(dst))
-    }
-
-    fn lower_binary(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        op: syntax::BinaryOp,
-        lhs: &syntax::Expr,
-        rhs: &syntax::Expr,
-    ) -> Result<Value> {
-        match op {
-            syntax::BinaryOp::LogicalOr | syntax::BinaryOp::LogicalAnd => {
-                return self.lower_short_circuit(lowerer, op, lhs, rhs);
-            }
-            syntax::BinaryOp::If => return self.lower_if_operator(lowerer, lhs, rhs),
-            syntax::BinaryOp::InContextOf => {
-                let closure = self.lower_expr(lowerer, lhs)?;
-                let this_obj = self.lower_expr(lowerer, rhs)?;
-                let dst = self.temp();
-                self.emit(MirInst::ChangeThis {
-                    dst,
-                    closure,
-                    this_obj,
-                });
-                return Ok(Value::Slot(dst));
-            }
-            syntax::BinaryOp::InstanceOf => {
-                let value = self.lower_expr(lowerer, lhs)?;
-                let class_name = self.lower_expr(lowerer, rhs)?;
-                let dst = self.temp();
-                self.emit(MirInst::IsInstanceOf {
-                    dst,
-                    value,
-                    class_name,
-                });
-                return Ok(Value::Slot(dst));
-            }
-            _ => {}
-        }
-
-        let lhs = self.lower_expr(lowerer, lhs)?;
-        let rhs = self.lower_expr(lowerer, rhs)?;
-        let dst = self.temp();
-        if let Some(op) = compare_op(op) {
-            self.emit(MirInst::Compare { dst, op, lhs, rhs });
-        } else if let Some(op) = binary_op(op) {
-            self.emit(MirInst::Binary { dst, op, lhs, rhs });
-        } else {
-            return Err(TjsError::mir("unsupported binary operator"));
-        }
-        Ok(Value::Slot(dst))
-    }
-
-    fn lower_short_circuit(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        op: syntax::BinaryOp,
-        lhs: &syntax::Expr,
-        rhs: &syntax::Expr,
-    ) -> Result<Value> {
-        let result = self.temp();
-        let lhs = self.lower_expr(lowerer, lhs)?;
-        let rhs_block = self.new_block(Some(lowerer.add_span(rhs.span)));
-        let done_block = self.new_block(None);
-        let shortcut_value = op == syntax::BinaryOp::LogicalOr;
-        let shortcut = lowerer.const_bool(shortcut_value);
-        let evaluate_when = if op == syntax::BinaryOp::LogicalOr {
-            Condition::Falsey(lhs)
-        } else {
-            Condition::Truthy(lhs)
-        };
-        let shortcut_block = self.new_block(None);
-        self.set_terminator(Terminator::Branch {
-            cond: evaluate_when,
-            then_block: rhs_block,
-            else_block: shortcut_block,
-        });
-
-        self.start_block(shortcut_block);
-        self.emit(MirInst::Copy {
-            dst: result,
-            src: shortcut,
-        });
-        self.set_terminator(Terminator::Goto(done_block));
-
-        self.start_block(rhs_block);
-        let rhs = self.lower_expr(lowerer, rhs)?;
-        self.emit(MirInst::ToBoolean {
-            dst: result,
-            src: rhs,
-        });
-        self.set_terminator(Terminator::Goto(done_block));
-
-        self.start_block(done_block);
-        Ok(Value::Slot(result))
-    }
-
-    fn lower_if_operator(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        lhs: &syntax::Expr,
-        rhs: &syntax::Expr,
-    ) -> Result<Value> {
-        let cond = self.lower_expr(lowerer, rhs)?;
-        let then_block = self.new_block(Some(lowerer.add_span(lhs.span)));
-        let done_block = self.new_block(None);
-        self.set_terminator(Terminator::Branch {
-            cond: Condition::Truthy(cond),
-            then_block,
-            else_block: done_block,
-        });
-        self.start_block(then_block);
-        self.lower_expr(lowerer, lhs)?;
-        if self.current_open() {
-            self.set_terminator(Terminator::Goto(done_block));
-        }
-        self.start_block(done_block);
-        Ok(lowerer.const_void())
-    }
-
-    fn lower_conditional_expr(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        condition: &syntax::Expr,
-        then_expr: &syntax::Expr,
-        else_expr: &syntax::Expr,
-    ) -> Result<Value> {
-        let result = self.temp();
-        let cond = self.lower_expr(lowerer, condition)?;
-        let then_block = self.new_block(Some(lowerer.add_span(then_expr.span)));
-        let else_block = self.new_block(Some(lowerer.add_span(else_expr.span)));
-        let done_block = self.new_block(None);
-        self.set_terminator(Terminator::Branch {
-            cond: Condition::Truthy(cond),
-            then_block,
-            else_block,
-        });
-
-        self.start_block(then_block);
-        let value = self.lower_expr(lowerer, then_expr)?;
-        self.emit(MirInst::Copy {
-            dst: result,
-            src: value,
-        });
-        self.set_terminator(Terminator::Goto(done_block));
-
-        self.start_block(else_block);
-        let value = self.lower_expr(lowerer, else_expr)?;
-        self.emit(MirInst::Copy {
-            dst: result,
-            src: value,
-        });
-        self.set_terminator(Terminator::Goto(done_block));
-
-        self.start_block(done_block);
-        Ok(Value::Slot(result))
-    }
-
-    fn lower_assignment(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        op: syntax::AssignOp,
-        target: &syntax::Expr,
-        value: &syntax::Expr,
-    ) -> Result<Value> {
-        if op == syntax::AssignOp::Swap {
-            let left = self.expr_to_place(lowerer, target)?;
-            let right = self.expr_to_place(lowerer, value)?;
-            self.emit(MirInst::Swap { left, right });
-            return Ok(lowerer.const_void());
-        }
-
-        let place = self.expr_to_place(lowerer, target)?;
-        let value = self.lower_expr(lowerer, value)?;
-        let dst = self.temp();
-        if op == syntax::AssignOp::Assign {
-            self.emit(MirInst::Assign {
-                place,
-                value,
-                result: Some(dst),
-            });
-        } else if let Some(op) = assign_binary_op(op) {
-            self.emit(MirInst::AssignOp {
-                place,
-                op,
-                rhs: value,
-                result: Some(dst),
-            });
-        } else {
-            return Err(TjsError::mir("unsupported assignment operator"));
-        }
-        Ok(Value::Slot(dst))
-    }
-
-    fn lower_ignore_prop(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        expr: &syntax::Expr,
-    ) -> Result<Value> {
-        if let Some(place) = self.member_read_place(lowerer, expr, FLAGS_IGNORE_PROP_GET)? {
-            return Ok(self.read_place(place));
-        }
-        self.lower_expr(lowerer, expr)
-    }
-
-    fn lower_prop_access(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        expr: &syntax::Expr,
-    ) -> Result<Value> {
-        let object = self.lower_expr(lowerer, expr)?;
-        Ok(self.read_place(Place::DefaultProperty {
-            object,
-            flags: FLAGS_DEFAULT_GET,
-        }))
-    }
-
-    fn lower_array(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        elements: &[syntax::ArrayElement],
-    ) -> Result<Value> {
-        let mut lowered = Vec::new();
-        for element in elements {
-            match element {
-                syntax::ArrayElement::Value(expr) => {
-                    lowered.push(ArrayElement::Value(self.lower_expr(lowerer, expr)?));
-                }
-                syntax::ArrayElement::Hole => lowered.push(ArrayElement::Hole),
+            | syntax::UnaryOp::Decrement => {
+                return Err(TjsError::mir("unsupported unary operator"));
             }
         }
-        let dst = self.temp();
-        self.emit(MirInst::BuildArray {
-            dst,
-            elements: lowered,
-        });
-        Ok(Value::Slot(dst))
-    }
-
-    fn lower_dictionary(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        entries: &[syntax::DictionaryEntry],
-    ) -> Result<Value> {
-        let mut lowered = Vec::new();
-        for entry in entries {
-            let key = match &entry.key.kind {
-                syntax::ExprKind::Identifier(name) => {
-                    DictionaryKey::Direct(lowerer.intern_string(&name.name))
-                }
-                syntax::ExprKind::String(name) => {
-                    DictionaryKey::Direct(lowerer.intern_string(name))
-                }
-                _ => DictionaryKey::Computed(self.lower_expr(lowerer, &entry.key)?),
-            };
-            let value = self.lower_expr(lowerer, &entry.value)?;
-            lowered.push(DictionaryEntry { key, value });
-        }
-        let dst = self.temp();
-        self.emit(MirInst::BuildDictionary {
-            dst,
-            entries: lowered,
-        });
-        Ok(Value::Slot(dst))
-    }
-
-    fn lower_call_target(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        callee: &syntax::Expr,
-    ) -> Result<CallTarget> {
-        match &callee.kind {
-            syntax::ExprKind::Member { object, property } => {
-                let object = self.lower_expr(lowerer, object)?;
-                Ok(CallTarget::Member {
-                    object,
-                    key: MemberKey::Direct(lowerer.intern_string(property)),
-                    flags: FLAGS_DEFAULT_GET,
-                })
-            }
-            syntax::ExprKind::WithMember { property } => Ok(CallTarget::Member {
-                object: self.with_member_object(),
-                key: MemberKey::Direct(lowerer.intern_string(property)),
-                flags: FLAGS_DEFAULT_GET,
-            }),
-            syntax::ExprKind::Index { object, index } => {
-                let object = self.lower_expr(lowerer, object)?;
-                let index = self.lower_expr(lowerer, index)?;
-                Ok(CallTarget::Member {
-                    object,
-                    key: MemberKey::Computed(index),
-                    flags: FLAGS_DEFAULT_GET,
-                })
-            }
-            syntax::ExprKind::Unary {
-                op: syntax::UnaryOp::PropAccess,
-                expr,
-            } => {
-                let object = self.lower_expr(lowerer, expr)?;
-                Ok(CallTarget::DefaultProperty {
-                    object,
-                    flags: FLAGS_DEFAULT_GET,
-                })
-            }
-            _ => Ok(CallTarget::Value(self.lower_expr(lowerer, callee)?)),
-        }
-    }
-
-    fn lower_call_args(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        args: &[syntax::CallArg],
-    ) -> Result<ArgList> {
-        if args.len() == 1 && matches!(args[0], syntax::CallArg::Omitted) {
-            return Ok(ArgList::OmittedCallerArgs);
-        }
-
-        let mut normal = Vec::new();
-        let mut expanded = Vec::new();
-        let mut saw_expanded = false;
-        for arg in args {
-            match arg {
-                syntax::CallArg::Value(expr) => {
-                    let value = self.lower_expr(lowerer, expr)?;
-                    normal.push(value);
-                    expanded.push(ArgPart::Normal(value));
-                }
-                syntax::CallArg::Expand(Some(expr)) => {
-                    saw_expanded = true;
-                    expanded.push(ArgPart::Expand(self.lower_expr(lowerer, expr)?));
-                }
-                syntax::CallArg::Expand(None) => {
-                    saw_expanded = true;
-                    expanded.push(ArgPart::UnnamedExpand);
-                }
-                syntax::CallArg::Omitted => return Ok(ArgList::OmittedCallerArgs),
-            }
-        }
-        if saw_expanded {
-            Ok(ArgList::Expanded(expanded))
-        } else {
-            Ok(ArgList::Normal(normal))
-        }
-    }
-
-    fn expr_to_place(&mut self, lowerer: &mut Lowerer<'_>, expr: &syntax::Expr) -> Result<Place> {
-        match &expr.kind {
-            syntax::ExprKind::Unary {
-                op: syntax::UnaryOp::IgnoreProp,
-                expr,
-            } => Ok(place_with_ignore_prop(self.expr_to_place(lowerer, expr)?)),
-            syntax::ExprKind::Unary {
-                op: syntax::UnaryOp::PropAccess,
-                expr,
-            } => {
-                let object = self.lower_expr(lowerer, expr)?;
-                Ok(Place::DefaultProperty {
-                    object,
-                    flags: FLAGS_DEFAULT_SET,
-                })
-            }
-            syntax::ExprKind::Identifier(ident) => {
-                self.ident_write_place(lowerer, ident, expr.span)
-            }
-            syntax::ExprKind::WithMember { property } => Ok(Place::Member {
-                object: self.with_member_object(),
-                key: MemberKey::Direct(lowerer.intern_string(property)),
-                flags: FLAGS_ENSURE_SET,
-            }),
-            syntax::ExprKind::Member { object, property } => {
-                let object = self.lower_expr(lowerer, object)?;
-                Ok(Place::Member {
-                    object,
-                    key: MemberKey::Direct(lowerer.intern_string(property)),
-                    flags: FLAGS_ENSURE_SET,
-                })
-            }
-            syntax::ExprKind::Index { object, index } => {
-                let object = self.lower_expr(lowerer, object)?;
-                let index = self.lower_expr(lowerer, index)?;
-                Ok(Place::Member {
-                    object,
-                    key: MemberKey::Computed(index),
-                    flags: FLAGS_ENSURE_SET,
-                })
-            }
-            _ => Err(TjsError::mir("expression is not assignable")),
-        }
-    }
-
-    fn member_read_place(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        expr: &syntax::Expr,
-        flags: DispatchFlags,
-    ) -> Result<Option<Place>> {
-        Ok(Some(match &expr.kind {
-            syntax::ExprKind::WithMember { property } => Place::Member {
-                object: self.with_member_object(),
-                key: MemberKey::Direct(lowerer.intern_string(property)),
-                flags,
-            },
-            syntax::ExprKind::Member { object, property } => Place::Member {
-                object: self.lower_expr(lowerer, object)?,
-                key: MemberKey::Direct(lowerer.intern_string(property)),
-                flags,
-            },
-            syntax::ExprKind::Index { object, index } => Place::Member {
-                object: self.lower_expr(lowerer, object)?,
-                key: MemberKey::Computed(self.lower_expr(lowerer, index)?),
-                flags,
-            },
-            _ => return Ok(None),
-        }))
+        Ok(())
     }
 
     fn read_ident(
@@ -3044,6 +3511,65 @@ impl ObjectBuilder {
             self.emit(MirInst::LoadGlobal { dst });
             Value::Slot(dst)
         }
+    }
+}
+
+fn push_stmt_tasks<'a>(tasks: &mut Vec<StmtTask<'a>>, statements: &'a [syntax::Stmt]) {
+    for statement in statements.iter().rev() {
+        tasks.push(StmtTask::Stmt(statement));
+    }
+}
+
+fn pop_value(values: &mut Vec<Value>) -> Result<Value> {
+    values
+        .pop()
+        .ok_or_else(|| TjsError::mir("expression value stack underflow"))
+}
+
+fn pop_place(places: &mut Vec<Place>) -> Result<Place> {
+    places
+        .pop()
+        .ok_or_else(|| TjsError::mir("expression place stack underflow"))
+}
+
+fn pop_call_target(call_targets: &mut Vec<CallTarget>) -> Result<CallTarget> {
+    call_targets
+        .pop()
+        .ok_or_else(|| TjsError::mir("call target stack underflow"))
+}
+
+fn pop_arg_list(arg_lists: &mut Vec<ArgList>) -> Result<ArgList> {
+    arg_lists
+        .pop()
+        .ok_or_else(|| TjsError::mir("call argument stack underflow"))
+}
+
+fn split_values(values: &mut Vec<Value>, count: usize) -> Result<Vec<Value>> {
+    if values.len() < count {
+        return Err(TjsError::mir("expression value stack underflow"));
+    }
+    Ok(values.split_off(values.len() - count))
+}
+
+fn next_value(iter: &mut impl Iterator<Item = Value>) -> Result<Value> {
+    iter.next()
+        .ok_or_else(|| TjsError::mir("expression value stack underflow"))
+}
+
+fn is_member_read_candidate(expr: &syntax::Expr) -> bool {
+    matches!(
+        expr.kind,
+        syntax::ExprKind::WithMember { .. }
+            | syntax::ExprKind::Member { .. }
+            | syntax::ExprKind::Index { .. }
+    )
+}
+
+fn update_op_from_unary(op: syntax::UnaryOp) -> Result<UpdateOp> {
+    match op {
+        syntax::UnaryOp::Increment => Ok(UpdateOp::Inc),
+        syntax::UnaryOp::Decrement => Ok(UpdateOp::Dec),
+        _ => Err(TjsError::mir("unsupported update operator")),
     }
 }
 
@@ -3468,5 +3994,52 @@ mod tests {
         assert!(snapshot.contains("Class"));
         assert!(snapshot.contains("ApplyClassExtender"));
         assert!(snapshot.contains("Expanded"));
+    }
+
+    #[test]
+    fn lowers_deep_statement_nesting_iteratively() {
+        let span = Span::empty(0);
+        let mut statement = syntax::Stmt::new(syntax::StmtKind::Empty, span);
+        for _ in 0..2048 {
+            statement = syntax::Stmt::new(syntax::StmtKind::Block(vec![statement]), span);
+        }
+        let program = hir::Program {
+            statements: vec![statement],
+            span,
+            scopes: Vec::new(),
+            bindings: Vec::new(),
+        };
+        let module = lower_hir_program(&program, "deep.tjs", "").expect("lower");
+        module.validate().expect("valid MIR");
+    }
+
+    #[test]
+    fn lowers_deep_expression_nesting_iteratively() {
+        let span = Span::empty(0);
+        let mut expr = syntax::Expr::new(syntax::ExprKind::Integer(0), span);
+        for _ in 0..2048 {
+            expr = syntax::Expr::new(
+                syntax::ExprKind::Binary {
+                    op: syntax::BinaryOp::Add,
+                    lhs: Box::new(expr),
+                    rhs: Box::new(syntax::Expr::new(syntax::ExprKind::Integer(1), span)),
+                },
+                span,
+            );
+        }
+        let program = hir::Program {
+            statements: vec![syntax::Stmt::new(syntax::StmtKind::Expr(expr), span)],
+            span,
+            scopes: Vec::new(),
+            bindings: Vec::new(),
+        };
+        let module = lower_hir_program(&program, "deep_expr.tjs", "").expect("lower");
+        module.validate().expect("valid MIR");
+    }
+
+    #[test]
+    fn if_operator_discards_then_value_in_larger_expression() {
+        let module = lower("return 2 + (side_effect() if false);");
+        module.validate().expect("valid MIR");
     }
 }

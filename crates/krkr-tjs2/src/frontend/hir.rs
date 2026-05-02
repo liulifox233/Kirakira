@@ -118,16 +118,135 @@ struct Analyzer {
     switch_depth: u32,
 }
 
+enum AnalyzeTask<'a> {
+    Stmt(&'a mut syntax::Stmt),
+    Expr(&'a mut syntax::Expr),
+    ForInit(&'a mut syntax::ForInit),
+    Function(&'a mut syntax::FunctionDecl),
+    VarDecl {
+        kind: syntax::VarKind,
+        decl: &'a mut syntax::VarDecl,
+        declare_if_unbound: bool,
+    },
+    DeclareIdent {
+        kind: BindingKind,
+        ident: &'a mut syntax::Ident,
+        span: Span,
+        declare_if_unbound: bool,
+    },
+    EnterScope(ScopeKind, Span),
+    LeaveScope,
+    EnterLoop,
+    LeaveLoop,
+    EnterSwitch,
+    LeaveSwitch,
+    RestoreControl {
+        loop_depth: u32,
+        switch_depth: u32,
+    },
+    PredeclareClassMembersAndVisit(&'a mut Vec<syntax::Stmt>),
+    CatchClause(&'a mut syntax::CatchClause),
+}
+
 impl Analyzer {
     fn program(&mut self, program: &mut syntax::Program) {
         self.enter_scope(ScopeKind::Global, program.span);
-        for statement in &mut program.statements {
-            self.statement(statement);
+        let mut tasks = Vec::new();
+        push_statements(&mut tasks, &mut program.statements);
+        while let Some(task) = tasks.pop() {
+            self.run_task(task, &mut tasks);
         }
         self.leave_scope();
     }
 
-    fn statement(&mut self, statement: &mut syntax::Stmt) {
+    fn run_task<'a>(&mut self, task: AnalyzeTask<'a>, tasks: &mut Vec<AnalyzeTask<'a>>) {
+        match task {
+            AnalyzeTask::Stmt(statement) => {
+                self.push_statement_tasks(statement, tasks);
+            }
+            AnalyzeTask::Expr(expr) => {
+                self.push_expr_tasks(expr, tasks);
+            }
+            AnalyzeTask::ForInit(init) => {
+                self.push_for_init_tasks(init, tasks);
+            }
+            AnalyzeTask::Function(decl) => {
+                self.push_function_tasks(decl, tasks);
+            }
+            AnalyzeTask::VarDecl {
+                kind,
+                decl,
+                declare_if_unbound,
+            } => {
+                let binding_kind = match kind {
+                    syntax::VarKind::Var => BindingKind::Var,
+                    syntax::VarKind::Const => BindingKind::Const,
+                };
+                tasks.push(AnalyzeTask::DeclareIdent {
+                    kind: binding_kind,
+                    ident: &mut decl.name,
+                    span: decl.span,
+                    declare_if_unbound,
+                });
+                if let Some(initializer) = &mut decl.initializer {
+                    tasks.push(AnalyzeTask::Expr(initializer));
+                }
+            }
+            AnalyzeTask::DeclareIdent {
+                kind,
+                ident,
+                span,
+                declare_if_unbound,
+            } => {
+                if !declare_if_unbound || ident.binding.is_none() {
+                    self.declare_ident(ident, kind, span);
+                }
+            }
+            AnalyzeTask::EnterScope(kind, span) => {
+                self.enter_scope(kind, span);
+            }
+            AnalyzeTask::LeaveScope => self.leave_scope(),
+            AnalyzeTask::EnterLoop => {
+                self.loop_depth += 1;
+            }
+            AnalyzeTask::LeaveLoop => {
+                self.loop_depth -= 1;
+            }
+            AnalyzeTask::EnterSwitch => {
+                self.switch_depth += 1;
+            }
+            AnalyzeTask::LeaveSwitch => {
+                self.switch_depth -= 1;
+            }
+            AnalyzeTask::RestoreControl {
+                loop_depth,
+                switch_depth,
+            } => {
+                self.loop_depth = loop_depth;
+                self.switch_depth = switch_depth;
+            }
+            AnalyzeTask::PredeclareClassMembersAndVisit(body) => {
+                for member in body.iter_mut() {
+                    self.predeclare_class_member(member);
+                }
+                push_statements(tasks, body);
+            }
+            AnalyzeTask::CatchClause(catch) => {
+                self.enter_scope(ScopeKind::Catch, catch.span);
+                if let Some(binding) = &mut catch.binding {
+                    self.declare_ident(binding, BindingKind::Catch, catch.span);
+                }
+                tasks.push(AnalyzeTask::LeaveScope);
+                tasks.push(AnalyzeTask::Stmt(catch.body.as_mut()));
+            }
+        }
+    }
+
+    fn push_statement_tasks<'a>(
+        &mut self,
+        statement: &'a mut syntax::Stmt,
+        tasks: &mut Vec<AnalyzeTask<'a>>,
+    ) {
         match &mut statement.kind {
             syntax::StmtKind::Empty | syntax::StmtKind::Debugger => {}
             syntax::StmtKind::Break => {
@@ -148,32 +267,25 @@ impl Analyzer {
                     self.error(statement.span, "case statement is not inside a switch");
                 }
                 if let Some(test) = test {
-                    self.expr(test);
+                    tasks.push(AnalyzeTask::Expr(test));
                 }
             }
             syntax::StmtKind::Block(statements) => {
-                self.enter_scope(ScopeKind::Block, statement.span);
-                for statement in statements {
-                    self.statement(statement);
-                }
-                self.leave_scope();
+                tasks.push(AnalyzeTask::LeaveScope);
+                push_statements(tasks, statements);
+                tasks.push(AnalyzeTask::EnterScope(ScopeKind::Block, statement.span));
             }
             syntax::StmtKind::Expr(expr)
             | syntax::StmtKind::Return(Some(expr))
-            | syntax::StmtKind::Throw(expr) => self.expr(expr),
+            | syntax::StmtKind::Throw(expr) => tasks.push(AnalyzeTask::Expr(expr)),
             syntax::StmtKind::Return(None) => {}
             syntax::StmtKind::Var { kind, declarations } => {
-                for declaration in declarations {
-                    if let Some(initializer) = &mut declaration.initializer {
-                        self.expr(initializer);
-                    }
-                    let binding_kind = match kind {
-                        syntax::VarKind::Var => BindingKind::Var,
-                        syntax::VarKind::Const => BindingKind::Const,
-                    };
-                    if declaration.name.binding.is_none() {
-                        self.declare_ident(&mut declaration.name, binding_kind, declaration.span);
-                    }
+                for declaration in declarations.iter_mut().rev() {
+                    tasks.push(AnalyzeTask::VarDecl {
+                        kind: *kind,
+                        decl: declaration,
+                        declare_if_unbound: true,
+                    });
                 }
             }
             syntax::StmtKind::FunctionDecl(decl) => {
@@ -182,54 +294,47 @@ impl Analyzer {
                 {
                     self.declare_ident(name, BindingKind::Function, decl.span);
                 }
-                self.function(decl);
+                tasks.push(AnalyzeTask::Function(decl));
             }
             syntax::StmtKind::ClassDecl(decl) => {
                 if decl.name.binding.is_none() {
                     self.declare_ident(&mut decl.name, BindingKind::Class, decl.span);
                 }
-                self.enter_scope(ScopeKind::Class, decl.span);
-                for extender in &mut decl.extends {
-                    self.expr(extender);
-                }
-                for member in &mut decl.body {
-                    self.predeclare_class_member(member);
-                }
-                for member in &mut decl.body {
-                    self.statement(member);
-                }
-                self.leave_scope();
+                tasks.push(AnalyzeTask::LeaveScope);
+                tasks.push(AnalyzeTask::PredeclareClassMembersAndVisit(&mut decl.body));
+                push_exprs(tasks, &mut decl.extends);
+                tasks.push(AnalyzeTask::EnterScope(ScopeKind::Class, decl.span));
             }
             syntax::StmtKind::PropertyDecl(decl) => {
                 if decl.name.binding.is_none() {
                     self.declare_ident(&mut decl.name, BindingKind::Property, decl.span);
                 }
-                self.enter_scope(ScopeKind::Property, decl.span);
-                if let Some(getter) = &mut decl.getter {
-                    self.function(getter);
-                }
+                tasks.push(AnalyzeTask::LeaveScope);
                 if let Some(setter) = &mut decl.setter {
-                    self.function(setter);
+                    tasks.push(AnalyzeTask::Function(setter));
                 }
-                self.leave_scope();
+                if let Some(getter) = &mut decl.getter {
+                    tasks.push(AnalyzeTask::Function(getter));
+                }
+                tasks.push(AnalyzeTask::EnterScope(ScopeKind::Property, decl.span));
             }
             syntax::StmtKind::If {
                 condition,
                 then_branch,
                 else_branch,
             } => {
-                self.expr(condition);
-                self.statement(then_branch);
                 if let Some(else_branch) = else_branch {
-                    self.statement(else_branch);
+                    tasks.push(AnalyzeTask::Stmt(else_branch.as_mut()));
                 }
+                tasks.push(AnalyzeTask::Stmt(then_branch.as_mut()));
+                tasks.push(AnalyzeTask::Expr(condition));
             }
             syntax::StmtKind::While { condition, body }
             | syntax::StmtKind::DoWhile { condition, body } => {
-                self.expr(condition);
-                self.loop_depth += 1;
-                self.statement(body);
-                self.loop_depth -= 1;
+                tasks.push(AnalyzeTask::LeaveLoop);
+                tasks.push(AnalyzeTask::Stmt(body.as_mut()));
+                tasks.push(AnalyzeTask::EnterLoop);
+                tasks.push(AnalyzeTask::Expr(condition));
             }
             syntax::StmtKind::For {
                 init,
@@ -237,51 +342,45 @@ impl Analyzer {
                 step,
                 body,
             } => {
-                if let Some(init) = init {
-                    self.for_init(init);
+                tasks.push(AnalyzeTask::LeaveLoop);
+                tasks.push(AnalyzeTask::Stmt(body.as_mut()));
+                tasks.push(AnalyzeTask::EnterLoop);
+                if let Some(step) = step {
+                    tasks.push(AnalyzeTask::Expr(step));
                 }
                 if let Some(condition) = condition {
-                    self.expr(condition);
+                    tasks.push(AnalyzeTask::Expr(condition));
                 }
-                if let Some(step) = step {
-                    self.expr(step);
+                if let Some(init) = init {
+                    tasks.push(AnalyzeTask::ForInit(init));
                 }
-                self.loop_depth += 1;
-                self.statement(body);
-                self.loop_depth -= 1;
             }
             syntax::StmtKind::With { object, body } => {
-                self.expr(object);
-                self.enter_scope(ScopeKind::With, body.span);
-                self.statement(body);
-                self.leave_scope();
+                let body_span = body.span;
+                tasks.push(AnalyzeTask::LeaveScope);
+                tasks.push(AnalyzeTask::Stmt(body.as_mut()));
+                tasks.push(AnalyzeTask::EnterScope(ScopeKind::With, body_span));
+                tasks.push(AnalyzeTask::Expr(object));
             }
             syntax::StmtKind::Try { body, catch } => {
-                self.statement(body);
                 if let Some(catch) = catch {
-                    self.enter_scope(ScopeKind::Catch, catch.span);
-                    if let Some(binding) = &mut catch.binding {
-                        self.declare_ident(binding, BindingKind::Catch, catch.span);
-                    }
-                    self.statement(&mut catch.body);
-                    self.leave_scope();
+                    tasks.push(AnalyzeTask::CatchClause(catch));
                 }
+                tasks.push(AnalyzeTask::Stmt(body.as_mut()));
             }
             syntax::StmtKind::Switch {
                 discriminant,
                 cases,
             } => {
-                self.expr(discriminant);
-                self.switch_depth += 1;
-                for case in cases {
+                tasks.push(AnalyzeTask::LeaveSwitch);
+                for case in cases.iter_mut().rev() {
+                    push_statements(tasks, &mut case.body);
                     if let Some(test) = &mut case.test {
-                        self.expr(test);
-                    }
-                    for statement in &mut case.body {
-                        self.statement(statement);
+                        tasks.push(AnalyzeTask::Expr(test));
                     }
                 }
-                self.switch_depth -= 1;
+                tasks.push(AnalyzeTask::EnterSwitch);
+                tasks.push(AnalyzeTask::Expr(discriminant));
             }
         }
     }
@@ -320,7 +419,11 @@ impl Analyzer {
         }
     }
 
-    fn function(&mut self, decl: &mut syntax::FunctionDecl) {
+    fn push_function_tasks<'a>(
+        &mut self,
+        decl: &'a mut syntax::FunctionDecl,
+        tasks: &mut Vec<AnalyzeTask<'a>>,
+    ) {
         self.validate_params(decl);
         let outer_loop_depth = self.loop_depth;
         let outer_switch_depth = self.switch_depth;
@@ -337,15 +440,17 @@ impl Analyzer {
                 self.declare_ident(name, kind, param.span);
             }
         }
-        for param in &mut decl.params {
+        tasks.push(AnalyzeTask::RestoreControl {
+            loop_depth: outer_loop_depth,
+            switch_depth: outer_switch_depth,
+        });
+        tasks.push(AnalyzeTask::LeaveScope);
+        tasks.push(AnalyzeTask::Stmt(decl.body.as_mut()));
+        for param in decl.params.iter_mut().rev() {
             if let Some(default) = &mut param.default {
-                self.expr(default);
+                tasks.push(AnalyzeTask::Expr(default));
             }
         }
-        self.statement(&mut decl.body);
-        self.leave_scope();
-        self.loop_depth = outer_loop_depth;
-        self.switch_depth = outer_switch_depth;
     }
 
     fn validate_params(&mut self, decl: &syntax::FunctionDecl) {
@@ -367,25 +472,30 @@ impl Analyzer {
         }
     }
 
-    fn for_init(&mut self, init: &mut syntax::ForInit) {
+    fn push_for_init_tasks<'a>(
+        &mut self,
+        init: &'a mut syntax::ForInit,
+        tasks: &mut Vec<AnalyzeTask<'a>>,
+    ) {
         match init {
             syntax::ForInit::Var { kind, declarations } => {
-                for declaration in declarations {
-                    if let Some(initializer) = &mut declaration.initializer {
-                        self.expr(initializer);
-                    }
-                    let binding_kind = match kind {
-                        syntax::VarKind::Var => BindingKind::Var,
-                        syntax::VarKind::Const => BindingKind::Const,
-                    };
-                    self.declare_ident(&mut declaration.name, binding_kind, declaration.span);
+                for declaration in declarations.iter_mut().rev() {
+                    tasks.push(AnalyzeTask::VarDecl {
+                        kind: *kind,
+                        decl: declaration,
+                        declare_if_unbound: false,
+                    });
                 }
             }
-            syntax::ForInit::Expr(expr) => self.expr(expr),
+            syntax::ForInit::Expr(expr) => tasks.push(AnalyzeTask::Expr(expr)),
         }
     }
 
-    fn expr(&mut self, expr: &mut syntax::Expr) {
+    fn push_expr_tasks<'a>(
+        &mut self,
+        expr: &'a mut syntax::Expr,
+        tasks: &mut Vec<AnalyzeTask<'a>>,
+    ) {
         match &mut expr.kind {
             syntax::ExprKind::Void
             | syntax::ExprKind::Null
@@ -405,20 +515,19 @@ impl Analyzer {
                 ident.binding = self.find_binding(&ident.name);
             }
             syntax::ExprKind::Array(elements) | syntax::ExprKind::ConstArray(elements) => {
-                for element in elements {
+                for element in elements.iter_mut().rev() {
                     if let syntax::ArrayElement::Value(expr) = element {
-                        self.expr(expr);
+                        tasks.push(AnalyzeTask::Expr(expr));
                     }
                 }
             }
             syntax::ExprKind::Dictionary(entries) | syntax::ExprKind::ConstDictionary(entries) => {
-                for entry in entries {
-                    self.expr(&mut entry.key);
-                    self.expr(&mut entry.value);
+                for entry in entries.iter_mut().rev() {
+                    tasks.push(AnalyzeTask::Expr(&mut entry.value));
+                    tasks.push(AnalyzeTask::Expr(&mut entry.key));
                 }
             }
             syntax::ExprKind::Unary { op, expr: inner } => {
-                self.expr(inner);
                 if matches!(
                     op,
                     syntax::UnaryOp::Delete
@@ -428,52 +537,53 @@ impl Analyzer {
                 ) {
                     self.require_lvalue(inner, expr.span);
                 }
+                tasks.push(AnalyzeTask::Expr(inner.as_mut()));
             }
             syntax::ExprKind::Binary { lhs, rhs, .. } => {
-                self.expr(lhs);
-                self.expr(rhs);
+                tasks.push(AnalyzeTask::Expr(rhs.as_mut()));
+                tasks.push(AnalyzeTask::Expr(lhs.as_mut()));
             }
             syntax::ExprKind::Assignment { target, value, .. } => {
-                self.expr(target);
-                self.expr(value);
                 self.require_lvalue(target, target.span);
+                tasks.push(AnalyzeTask::Expr(value.as_mut()));
+                tasks.push(AnalyzeTask::Expr(target.as_mut()));
             }
             syntax::ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.expr(condition);
-                self.expr(then_expr);
-                self.expr(else_expr);
+                tasks.push(AnalyzeTask::Expr(else_expr.as_mut()));
+                tasks.push(AnalyzeTask::Expr(then_expr.as_mut()));
+                tasks.push(AnalyzeTask::Expr(condition.as_mut()));
             }
-            syntax::ExprKind::Member { object, .. } => self.expr(object),
+            syntax::ExprKind::Member { object, .. } => {
+                tasks.push(AnalyzeTask::Expr(object.as_mut()));
+            }
             syntax::ExprKind::Index { object, index } => {
-                self.expr(object);
-                self.expr(index);
+                tasks.push(AnalyzeTask::Expr(index.as_mut()));
+                tasks.push(AnalyzeTask::Expr(object.as_mut()));
             }
             syntax::ExprKind::Call { callee, args } | syntax::ExprKind::New { callee, args } => {
-                self.expr(callee);
-                for arg in args {
+                for arg in args.iter_mut().rev() {
                     match arg {
                         syntax::CallArg::Value(expr) | syntax::CallArg::Expand(Some(expr)) => {
-                            self.expr(expr);
+                            tasks.push(AnalyzeTask::Expr(expr));
                         }
                         syntax::CallArg::Expand(None) | syntax::CallArg::Omitted => {}
                     }
                 }
+                tasks.push(AnalyzeTask::Expr(callee.as_mut()));
             }
-            syntax::ExprKind::Function(decl) => self.function(decl),
+            syntax::ExprKind::Function(decl) => tasks.push(AnalyzeTask::Function(decl.as_mut())),
             syntax::ExprKind::Postfix { op, expr: inner } => {
-                self.expr(inner);
                 if matches!(op, syntax::UnaryOp::Increment | syntax::UnaryOp::Decrement) {
                     self.require_lvalue(inner, expr.span);
                 }
+                tasks.push(AnalyzeTask::Expr(inner.as_mut()));
             }
             syntax::ExprKind::Comma(exprs) => {
-                for expr in exprs {
-                    self.expr(expr);
-                }
+                push_exprs(tasks, exprs);
             }
         }
     }
@@ -547,24 +657,41 @@ impl Analyzer {
     }
 }
 
+fn push_statements<'a>(tasks: &mut Vec<AnalyzeTask<'a>>, statements: &'a mut [syntax::Stmt]) {
+    for statement in statements.iter_mut().rev() {
+        tasks.push(AnalyzeTask::Stmt(statement));
+    }
+}
+
+fn push_exprs<'a>(tasks: &mut Vec<AnalyzeTask<'a>>, exprs: &'a mut [syntax::Expr]) {
+    for expr in exprs.iter_mut().rev() {
+        tasks.push(AnalyzeTask::Expr(expr));
+    }
+}
+
 fn is_lvalue(expr: &syntax::Expr) -> bool {
-    match &expr.kind {
-        syntax::ExprKind::Identifier(_)
-        | syntax::ExprKind::Member { .. }
-        | syntax::ExprKind::WithMember { .. }
-        | syntax::ExprKind::Index { .. } => true,
-        syntax::ExprKind::Unary {
-            op: syntax::UnaryOp::IgnoreProp | syntax::UnaryOp::PropAccess,
-            expr,
-        } => is_lvalue(expr),
-        _ => false,
+    let mut current = expr;
+    loop {
+        match &current.kind {
+            syntax::ExprKind::Identifier(_)
+            | syntax::ExprKind::Member { .. }
+            | syntax::ExprKind::WithMember { .. }
+            | syntax::ExprKind::Index { .. } => return true,
+            syntax::ExprKind::Unary {
+                op: syntax::UnaryOp::IgnoreProp | syntax::UnaryOp::PropAccess,
+                expr,
+            } => current = expr,
+            _ => return false,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BindingKind;
-    use crate::frontend::syntax::{ExprKind, StmtKind};
+    use super::{BindingKind, analyze_program};
+    use crate::Span;
+    use crate::frontend::syntax::ExprKind;
+    use crate::frontend::syntax::{Program as SyntaxProgram, Stmt, StmtKind};
     use crate::{FrontendOptions, analyze_script};
 
     #[test]
@@ -707,5 +834,23 @@ mod tests {
         assert_eq!(diagnostic.source_name.as_deref(), Some("foo.tjs"));
         assert_eq!(diagnostic.start.map(|location| location.line), Some(2));
         assert_eq!(diagnostic.start.map(|location| location.column), Some(2));
+    }
+
+    #[test]
+    fn analyze_program_handles_deep_block_nesting_iteratively() {
+        let span = Span::empty(0);
+        let mut statement = Stmt::new(StmtKind::Empty, span);
+        for _ in 0..2048 {
+            statement = Stmt::new(StmtKind::Block(vec![statement]), span);
+        }
+        let output = analyze_program(
+            SyntaxProgram {
+                statements: vec![statement],
+                span,
+            },
+            Vec::new(),
+        );
+        assert!(output.diagnostics.is_empty());
+        assert!(output.value.is_some());
     }
 }
