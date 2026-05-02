@@ -2493,15 +2493,15 @@ fn layer_draw_text(
         (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
     let min_height =
         (y.max(0) as f32 + metrics.height.ceil() + effect.max_bottom() as f32).max(1.0) as u32;
-    let font_system = runtime.host().font_system().clone();
-    mutate_layer_pixels_min(
+    mutate_layer_pixels_min_with_host(
         runtime,
         &target,
         min_width,
         min_height,
-        |pixels, width, height| {
+        |host, pixels, width, height| {
+            let font_system = host.font_system();
             effect.draw(
-                &font_system,
+                font_system,
                 &font,
                 pixels,
                 width,
@@ -2561,15 +2561,15 @@ fn layer_draw_glyph(
         (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
     let min_height =
         (y.max(0) as f32 + metrics.height.ceil() + effect.max_bottom() as f32).max(1.0) as u32;
-    let font_system = runtime.host().font_system().clone();
-    mutate_layer_pixels_min(
+    mutate_layer_pixels_min_with_host(
         runtime,
         &target,
         min_width,
         min_height,
-        |pixels, width, height| {
+        |host, pixels, width, height| {
+            let font_system = host.font_system();
             effect.draw(
-                &font_system,
+                font_system,
                 &font,
                 pixels,
                 width,
@@ -3665,6 +3665,27 @@ fn mutate_layer_pixels_min<F>(
 where
     F: FnOnce(&mut [u8], u32, u32),
 {
+    mutate_layer_pixels_min_with_host(
+        runtime,
+        target,
+        min_width,
+        min_height,
+        |_, pixels, width, height| {
+            mutate(pixels, width, height);
+        },
+    )
+}
+
+fn mutate_layer_pixels_min_with_host<F>(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &RenderLayerTarget,
+    min_width: u32,
+    min_height: u32,
+    mutate: F,
+) -> Result<()>
+where
+    F: FnOnce(&KrkrHost, &mut [u8], u32, u32),
+{
     let Some(layer) = render_layer_snapshot(runtime, target) else {
         return Ok(());
     };
@@ -3689,7 +3710,7 @@ where
         .map(|image| image.upload.rgba.as_ref().to_vec())
         .unwrap_or_else(|| vec![0; width as usize * height as usize * 4]);
 
-    mutate(&mut pixels, width, height);
+    mutate(runtime.host(), &mut pixels, width, height);
 
     let image = runtime.host_mut().create_layer_image(width, height, pixels);
     mutate_render_layer(runtime, target, |layer| {

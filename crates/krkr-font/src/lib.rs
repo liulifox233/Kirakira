@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 use fontdb::{Database, Family, Query, Source, Stretch, Style as FontStyle, Weight};
 use swash::{
@@ -114,16 +114,32 @@ pub struct GlyphImage {
     pub data: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FontSystem {
     db: Database,
     named_file_faces: BTreeMap<String, Vec<fontdb::ID>>,
     prerendered_fonts: BTreeMap<String, Arc<[u8]>>,
+    glyph_ids: RefCell<BTreeMap<(FontFaceKey, char), Option<u16>>>,
+    face_metrics: RefCell<BTreeMap<FaceMetricsKey, swash::Metrics>>,
+    glyph_images: RefCell<BTreeMap<RenderedGlyphKey, Arc<GlyphImage>>>,
 }
 
 impl Default for FontSystem {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Clone for FontSystem {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            named_file_faces: self.named_file_faces.clone(),
+            prerendered_fonts: self.prerendered_fonts.clone(),
+            glyph_ids: RefCell::new(BTreeMap::new()),
+            face_metrics: RefCell::new(BTreeMap::new()),
+            glyph_images: RefCell::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -135,6 +151,9 @@ impl FontSystem {
             db,
             named_file_faces: BTreeMap::new(),
             prerendered_fonts: BTreeMap::new(),
+            glyph_ids: RefCell::new(BTreeMap::new()),
+            face_metrics: RefCell::new(BTreeMap::new()),
+            glyph_images: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -160,6 +179,7 @@ impl FontSystem {
         }
         self.named_file_faces
             .insert(name, ids.into_iter().collect());
+        self.clear_caches();
         Ok(())
     }
 
@@ -180,11 +200,16 @@ impl FontSystem {
         self.named_file_faces
             .insert(name.clone(), ids.into_iter().collect());
         self.prerendered_fonts.insert(name, Arc::from(data));
+        self.clear_caches();
         Ok(())
     }
 
     pub fn unmap_prerendered_font(&mut self, name: &str) -> bool {
-        self.prerendered_fonts.remove(name).is_some()
+        let removed = self.prerendered_fonts.remove(name).is_some();
+        if removed {
+            self.clear_caches();
+        }
+        removed
     }
 
     pub fn text_metrics(&self, spec: &FontSpec, text: &str) -> TextMetrics {
@@ -430,9 +455,24 @@ impl FontSystem {
         glyph_id: u16,
         x: f32,
         y: f32,
-    ) -> Option<GlyphImage> {
-        let mut rendered = None;
+    ) -> Option<Arc<GlyphImage>> {
         let size = spec.resolved_height();
+        let x_subpixel = subpixel_bin(x);
+        let y_subpixel = subpixel_bin(y);
+        let key = RenderedGlyphKey {
+            face: FontFaceKey(face),
+            glyph_id,
+            size_bits: size.to_bits(),
+            bold: spec.bold,
+            italic: spec.italic,
+            x_subpixel,
+            y_subpixel,
+        };
+        if let Some(image) = self.glyph_images.borrow().get(&key).cloned() {
+            return Some(image);
+        }
+
+        let mut rendered = None;
         self.with_font(face, |font| {
             let mut context = ScaleContext::new();
             let mut scaler = context.builder(font).size(size).hint(true).build();
@@ -443,7 +483,10 @@ impl FontSystem {
             ]);
             renderer
                 .format(Format::Alpha)
-                .offset(Vector::new(x.fract(), y.fract()))
+                .offset(Vector::new(
+                    subpixel_offset(x_subpixel),
+                    subpixel_offset(y_subpixel),
+                ))
                 .embolden(if spec.bold {
                     (size / 28.0).max(0.35)
                 } else {
@@ -455,7 +498,7 @@ impl FontSystem {
                 Content::SubpixelMask => GlyphContent::Subpixel,
                 Content::Color => GlyphContent::Color,
             };
-            rendered = Some(GlyphImage {
+            rendered = Some(Arc::new(GlyphImage {
                 key: GlyphKey {
                     face: FontFaceKey(face),
                     glyph_id,
@@ -469,13 +512,25 @@ impl FontSystem {
                 height: image.placement.height,
                 content,
                 data: image.data,
-            });
+            }));
             Some(())
         })?;
-        rendered
+        if let Some(image) = rendered {
+            self.glyph_images.borrow_mut().insert(key, image.clone());
+            Some(image)
+        } else {
+            None
+        }
     }
 
     fn face_metrics(&self, face: fontdb::ID, size: f32) -> swash::Metrics {
+        let key = FaceMetricsKey {
+            face: FontFaceKey(face),
+            size_bits: size.to_bits(),
+        };
+        if let Some(metrics) = self.face_metrics.borrow().get(&key).copied() {
+            return metrics;
+        }
         let mut metrics = None;
         self.with_font(face, |font| {
             let mut context = ShapeContext::new();
@@ -483,7 +538,7 @@ impl FontSystem {
             metrics = Some(shaper.metrics());
             Some(())
         });
-        metrics.unwrap_or_else(|| swash::Metrics {
+        let metrics = metrics.unwrap_or_else(|| swash::Metrics {
             units_per_em: 1,
             glyph_count: 0,
             is_monospace: false,
@@ -501,7 +556,9 @@ impl FontSystem {
             underline_offset: 0.0,
             strikeout_offset: size * 0.35,
             stroke_size: 1.0,
-        })
+        });
+        self.face_metrics.borrow_mut().insert(key, metrics);
+        metrics
     }
 
     fn select_face(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
@@ -579,6 +636,10 @@ impl FontSystem {
     }
 
     fn glyph_id(&self, face: fontdb::ID, ch: char) -> Option<u16> {
+        let key = (FontFaceKey(face), ch);
+        if let Some(glyph_id) = self.glyph_ids.borrow().get(&key).copied() {
+            return glyph_id;
+        }
         let mut glyph_id = None;
         self.with_font(face, |font| {
             let mapped = font.charmap().map(ch);
@@ -587,6 +648,7 @@ impl FontSystem {
             }
             Some(())
         });
+        self.glyph_ids.borrow_mut().insert(key, glyph_id);
         glyph_id
     }
 
@@ -605,6 +667,29 @@ impl FontSystem {
             FontRef::from_index(data, index as usize).and_then(f)
         })?
     }
+
+    fn clear_caches(&self) {
+        self.glyph_ids.borrow_mut().clear();
+        self.face_metrics.borrow_mut().clear();
+        self.glyph_images.borrow_mut().clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FaceMetricsKey {
+    face: FontFaceKey,
+    size_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RenderedGlyphKey {
+    face: FontFaceKey,
+    glyph_id: u16,
+    size_bits: u32,
+    bold: bool,
+    italic: bool,
+    x_subpixel: u8,
+    y_subpixel: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -657,6 +742,14 @@ fn rotate_vector(x: f32, y: f32, angle_tenths: i32) -> (f32, f32) {
     let cos = radians.cos();
     let sin = radians.sin();
     (x * cos - y * sin, x * sin + y * cos)
+}
+
+fn subpixel_bin(value: f32) -> u8 {
+    (value.rem_euclid(1.0) * 64.0).floor().clamp(0.0, 63.0) as u8
+}
+
+fn subpixel_offset(bin: u8) -> f32 {
+    f32::from(bin.min(63)) / 64.0
 }
 
 fn blit_glyph(
