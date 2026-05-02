@@ -15,7 +15,8 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
