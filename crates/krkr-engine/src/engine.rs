@@ -506,15 +506,16 @@ impl KrkrEngine {
             .host_mut()
             .reapply_transition_live_layer_overrides();
         let suppressed_images = self.tjs_runtime.host().suppressed_transition_live_images();
+        let transition = self.tjs_runtime.host().frame_transition();
         let output = self
             .core_engine
-            .tick_running_with_layers_suppressing_images(
+            .tick_running_with_layers_suppressing_images_and_transition(
                 input.frame,
                 self.tjs_runtime.host().layer_tree(),
                 &self.message_layer,
                 &suppressed_images,
-            )
-            .with_transition(self.tjs_runtime.host().frame_transition());
+                transition,
+            );
         Ok(EngineFrame {
             output,
             tick,
@@ -4996,15 +4997,24 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("update");
-        assert_eq!(frame.output.image_uploads.len(), 2);
+        assert_eq!(frame.output.image_uploads.len(), 1);
+        let images = frame
+            .output
+            .draw_commands
+            .iter()
+            .filter_map(|command| match command {
+                krkr_core::DrawCommand::Image(image) => Some(image),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(images.len(), 2);
         assert_eq!(
-            frame
-                .output
-                .draw_commands
-                .iter()
-                .filter(|command| matches!(command, krkr_core::DrawCommand::Image(_)))
-                .count(),
-            2
+            images[0].texture_id,
+            frame.output.image_uploads[0].texture_id
+        );
+        assert_eq!(
+            images[1].texture_id,
+            frame.output.image_uploads[0].texture_id
         );
 
         fs::remove_dir_all(root).expect("cleanup");

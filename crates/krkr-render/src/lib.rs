@@ -209,11 +209,12 @@ impl Renderer {
     }
 
     pub fn render(&mut self, frame: &FrameOutput) -> Result<(), RenderError> {
+        let prepared = self.prepare_frame(frame);
+        self.upload_frame_images(&prepared);
+        self.retain_frame_textures(&prepared);
         if self.physical_size.width == 0 || self.physical_size.height == 0 {
             return Ok(());
         }
-        let prepared = self.prepare_frame(frame);
-        self.upload_frame_images(&prepared);
 
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
@@ -425,6 +426,16 @@ impl Renderer {
                 },
             );
         }
+    }
+
+    fn retain_frame_textures(&mut self, frame: &FrameOutput) {
+        let mut referenced = BTreeSet::new();
+        collect_image_texture_ids(&frame.draw_commands, &mut referenced);
+        if let Some(transition) = &frame.transition {
+            collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced);
+        }
+        self.textures
+            .retain(|texture_id, _| referenced.contains(texture_id));
     }
 
     fn render_commands_to_view(
@@ -749,6 +760,14 @@ fn preferred_backends() -> wgpu::Backends {
 #[cfg(not(target_os = "macos"))]
 fn preferred_backends() -> wgpu::Backends {
     wgpu::Backends::PRIMARY
+}
+
+fn collect_image_texture_ids(commands: &[DrawCommand], texture_ids: &mut BTreeSet<TextureId>) {
+    for command in commands {
+        if let DrawCommand::Image(image) = command {
+            texture_ids.insert(image.texture_id);
+        }
+    }
 }
 
 fn create_rect_pipeline(
