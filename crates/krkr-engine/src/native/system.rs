@@ -49,6 +49,7 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
         ("platformName", Variant::String("Kirakira".to_string())),
         ("osName", Variant::String(std::env::consts::OS.to_string())),
         ("exePath", Variant::String(exe_path(runtime))),
+        ("dataPath", Variant::String(data_path(runtime))),
         ("personalPath", Variant::String(temp_path())),
         ("appDataPath", Variant::String(temp_path())),
         ("eventDisabled", Variant::Integer(0)),
@@ -80,6 +81,14 @@ fn exe_path(runtime: &Runtime<KrkrHost>) -> String {
         .project_root()
         .map(|path| format!("{}/", path.display()))
         .unwrap_or_default()
+}
+
+fn data_path(runtime: &Runtime<KrkrHost>) -> String {
+    runtime
+        .host()
+        .data_path()
+        .map(|path| format!("{}/", path.display()))
+        .unwrap_or_else(temp_path)
 }
 
 fn temp_path() -> String {

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 encoding_rs.workspace = true
+flate2.workspace = true
 image.workspace = true
 krkr-core.workspace = true
 krkr-font.workspace = true

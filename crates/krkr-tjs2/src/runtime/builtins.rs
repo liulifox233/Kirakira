@@ -3,6 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::compile_source_to_bytecode;
 use crate::error::{Result, TjsError};
 use crate::runtime::object::Object;
 use crate::runtime::value::{ObjectHandle, Variant};
@@ -302,6 +303,11 @@ pub(crate) fn install_array_methods<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "pop", array_pop::<H>);
     runtime.register_object_native(handle, "clear", array_clear::<H>);
     runtime.register_object_native(handle, "assign", array_assign::<H>);
+    runtime.register_object_native(handle, "assignStruct", array_assign_struct::<H>);
+    runtime.register_object_native(handle, "load", array_load::<H>);
+    runtime.register_object_native(handle, "save", array_save::<H>);
+    runtime.register_object_native(handle, "saveStruct", array_save_struct::<H>);
+    runtime.register_object_native(handle, "loadStruct", array_load_struct::<H>);
     runtime.register_object_native(handle, "join", array_join::<H>);
     runtime.register_object_native(handle, "reverse", array_reverse::<H>);
 }
@@ -313,7 +319,7 @@ fn install_dictionary_methods<H: TjsHost + 'static>(
     runtime.add_object_class_info(handle, "Dictionary");
     runtime.register_object_native(handle, "clear", dictionary_clear::<H>);
     runtime.register_object_native(handle, "assign", dictionary_assign::<H>);
-    runtime.register_object_native(handle, "assignStruct", dictionary_assign::<H>);
+    runtime.register_object_native(handle, "assignStruct", dictionary_assign_struct::<H>);
     runtime.register_object_native(handle, "saveStruct", dictionary_save_struct::<H>);
     runtime.register_object_native(handle, "loadStruct", dictionary_load_struct::<H>);
 }
@@ -447,6 +453,121 @@ fn array_assign<H: TjsHost + 'static>(
     Ok(Variant::Object(dest))
 }
 
+fn array_assign_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let dest = require_this(this_obj, "Array.assignStruct")?;
+    let Some(Variant::Object(src)) = args.first().cloned() else {
+        return Ok(Variant::Object(dest));
+    };
+    assign_array_struct(runtime, dest, src)?;
+    Ok(Variant::Object(dest))
+}
+
+fn array_load<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.load")?;
+    let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
+        return Ok(Variant::Integer(0));
+    };
+    let path = path.to_tjs_string()?;
+    let mode = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
+        return Ok(Variant::Integer(0));
+    };
+    runtime.heap[handle.0] = Object::array(
+        text.lines()
+            .map(|line| Variant::String(line.to_string()))
+            .collect(),
+    );
+    install_array_methods(runtime, handle);
+    Ok(Variant::Integer(1))
+}
+
+fn array_save<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.save")?;
+    let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
+        return Ok(Variant::Void);
+    };
+    let path = path.to_tjs_string()?;
+    let mode = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    let elements = runtime.heap[handle.0]
+        .array_elements()
+        .ok_or_else(|| TjsError::runtime("Array.save called on a non-array object"))?;
+    let lines = elements
+        .iter()
+        .map(Variant::to_tjs_string)
+        .collect::<Result<Vec<_>>>()?
+        .join("\n");
+    runtime.host_mut().write_text(&path, &mode, &lines)?;
+    Ok(Variant::Object(handle))
+}
+
+fn array_save_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.saveStruct")?;
+    save_structured_value(runtime, handle, &args)?;
+    Ok(Variant::Object(handle))
+}
+
+fn array_load_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.loadStruct")?;
+    let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
+        return Ok(Variant::Integer(0));
+    };
+    let path = path.to_tjs_string()?;
+    let mode = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    if mode.contains('b') {
+        let Ok(bytes) = runtime.host_mut().read_binary(&path, &mode) else {
+            return Ok(Variant::Integer(0));
+        };
+        let Some(Variant::Object(src)) = decode_binary_struct(runtime, &bytes)? else {
+            return Ok(Variant::Integer(0));
+        };
+        assign_array_struct(runtime, handle, src)?;
+        return Ok(Variant::Integer(1));
+    }
+    let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
+        return Ok(Variant::Integer(0));
+    };
+    let wrapped = format!("return ({text});");
+    if let Ok(Variant::Object(src)) =
+        compile_source_to_bytecode(&path, &wrapped).and_then(|file| runtime.execute_file(&file))
+    {
+        assign_array_struct(runtime, handle, src)?;
+        return Ok(Variant::Integer(1));
+    }
+    Ok(Variant::Integer(0))
+}
+
 fn array_join<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
@@ -512,14 +633,36 @@ fn dictionary_assign<H: TjsHost + 'static>(
     Ok(Variant::Object(dest))
 }
 
+fn dictionary_assign_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let dest = require_this(this_obj, "Dictionary.assignStruct")?;
+    let Some(Variant::Object(src)) = args.first().cloned() else {
+        return Ok(Variant::Object(dest));
+    };
+    assign_dictionary_struct(runtime, dest, src)?;
+    Ok(Variant::Object(dest))
+}
+
 fn dictionary_save_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Dictionary.saveStruct")?;
+    save_structured_value(runtime, handle, &args)?;
+    Ok(Variant::Object(handle))
+}
+
+fn save_structured_value<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    handle: ObjectHandle,
+    args: &[Variant],
+) -> Result<()> {
     let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
-        return Ok(Variant::Void);
+        return Ok(());
     };
     let path = path.to_tjs_string()?;
     let mode = args
@@ -527,10 +670,17 @@ fn dictionary_save_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    let mut serializer = DictionaryStructSerializer::new(runtime);
-    let text = serializer.value(&Variant::Object(handle), 0);
-    runtime.host_mut().write_text(&path, &mode, &text)?;
-    Ok(Variant::Void)
+    if mode.contains('b') {
+        let mut serializer = BinaryStructSerializer::new(runtime);
+        let mut bytes = Vec::from(BINARY_STRUCT_HEADER);
+        serializer.value(&Variant::Object(handle), &mut bytes)?;
+        runtime.host_mut().write_binary(&path, &mode, &bytes)?;
+    } else {
+        let mut serializer = StructTextSerializer::new(runtime);
+        let text = serializer.value(&Variant::Object(handle), 0);
+        runtime.host_mut().write_text(&path, &mode, &text)?;
+    }
+    Ok(())
 }
 
 fn dictionary_load_struct<H: TjsHost + 'static>(
@@ -548,9 +698,26 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
+    if mode.contains('b') {
+        let Ok(bytes) = runtime.host_mut().read_binary(&path, &mode) else {
+            return Ok(Variant::Integer(0));
+        };
+        let Some(Variant::Object(src)) = decode_binary_struct(runtime, &bytes)? else {
+            return Ok(Variant::Integer(0));
+        };
+        assign_dictionary_struct(runtime, handle, src)?;
+        return Ok(Variant::Integer(1));
+    }
     let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
         return Ok(Variant::Integer(0));
     };
+    let wrapped = format!("return ({text});");
+    if let Ok(Variant::Object(src)) =
+        compile_source_to_bytecode(&path, &wrapped).and_then(|file| runtime.execute_file(&file))
+    {
+        assign_dictionary_struct(runtime, handle, src)?;
+        return Ok(Variant::Integer(1));
+    }
     runtime.heap[handle.0].members.clear();
     install_dictionary_methods(runtime, handle);
     for line in text.lines() {
@@ -562,12 +729,92 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
     Ok(Variant::Integer(1))
 }
 
-struct DictionaryStructSerializer<'a, H: TjsHost> {
+fn assign_array_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    dest: ObjectHandle,
+    src: ObjectHandle,
+) -> Result<()> {
+    if !runtime.heap[dest.0].array_clear() {
+        return Err(TjsError::runtime(
+            "Array.assignStruct called on a non-array object",
+        ));
+    }
+    let Some(elements) = runtime.heap[src.0].array_elements().map(Vec::from) else {
+        return Ok(());
+    };
+    let mut stack = BTreeSet::new();
+    stack.insert(src);
+    for value in elements {
+        let value = deep_clone_struct_value(runtime, &value, &mut stack)?;
+        runtime.heap[dest.0].array_push(value);
+    }
+    install_array_methods(runtime, dest);
+    Ok(())
+}
+
+fn assign_dictionary_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    dest: ObjectHandle,
+    src: ObjectHandle,
+) -> Result<()> {
+    runtime.heap[dest.0].members.clear();
+    install_dictionary_methods(runtime, dest);
+    let entries = dictionary_struct_entries(runtime, src);
+    let mut stack = BTreeSet::new();
+    stack.insert(src);
+    for (key, value) in entries {
+        let value = deep_clone_struct_value(runtime, &value, &mut stack)?;
+        runtime.heap[dest.0].set(key, value);
+    }
+    Ok(())
+}
+
+fn deep_clone_struct_value<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    value: &Variant,
+    stack: &mut BTreeSet<ObjectHandle>,
+) -> Result<Variant> {
+    match value {
+        Variant::Object(handle) if runtime.heap[handle.0].array_elements().is_some() => {
+            if !stack.insert(*handle) {
+                return Ok(Variant::Null);
+            }
+            let elements = runtime.heap[handle.0]
+                .array_elements()
+                .map(Vec::from)
+                .unwrap_or_default();
+            let dest = runtime.alloc_array_object(Vec::new());
+            for element in elements {
+                let element = deep_clone_struct_value(runtime, &element, stack)?;
+                runtime.heap[dest.0].array_push(element);
+            }
+            stack.remove(handle);
+            Ok(Variant::Object(dest))
+        }
+        Variant::Object(handle) if is_dictionary_object(runtime, *handle) => {
+            if !stack.insert(*handle) {
+                return Ok(Variant::Null);
+            }
+            let entries = dictionary_struct_entries(runtime, *handle);
+            let dest = runtime.alloc_ordinary_object();
+            install_dictionary_methods(runtime, dest);
+            for (key, value) in entries {
+                let value = deep_clone_struct_value(runtime, &value, stack)?;
+                runtime.heap[dest.0].set(key, value);
+            }
+            stack.remove(handle);
+            Ok(Variant::Object(dest))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+struct StructTextSerializer<'a, H: TjsHost> {
     runtime: &'a Runtime<H>,
     active: BTreeSet<ObjectHandle>,
 }
 
-impl<'a, H: TjsHost + 'static> DictionaryStructSerializer<'a, H> {
+impl<'a, H: TjsHost + 'static> StructTextSerializer<'a, H> {
     const MAX_DEPTH: usize = 32;
 
     fn new(runtime: &'a Runtime<H>) -> Self {
@@ -585,45 +832,100 @@ impl<'a, H: TjsHost + 'static> DictionaryStructSerializer<'a, H> {
             Variant::Void => "void".to_string(),
             Variant::Null => "null".to_string(),
             Variant::Integer(value) => value.to_string(),
-            Variant::Real(value) => value.to_string(),
+            Variant::Real(value) => real_literal(*value),
             Variant::String(value) => tjs_quote(value),
-            Variant::Octet(_) => "void".to_string(),
+            Variant::Octet(value) => octet_literal(value),
             Variant::Object(handle) => self.object(*handle, depth),
-            Variant::Closure(_) | Variant::CodeObject(_) => "void".to_string(),
+            Variant::Closure(_) | Variant::CodeObject(_) => "null".to_string(),
         }
     }
 
     fn object(&mut self, handle: ObjectHandle, depth: usize) -> String {
         if !self.active.insert(handle) {
-            return "void".to_string();
+            return "null /* object recursion detected */".to_string();
         }
         let text = if let Some(elements) = self.runtime.heap[handle.0].array_elements() {
-            let elements = elements
-                .iter()
-                .map(|value| self.value(value, depth + 1))
-                .collect::<Vec<_>>();
-            format!("[{}]", elements.join(", "))
+            self.array(elements, depth)
+        } else if is_dictionary_object(self.runtime, handle) {
+            self.dictionary(handle, depth)
         } else {
-            let entries = self.runtime.heap[handle.0]
-                .members
-                .iter()
-                .filter(|(key, _)| !is_native_member_name(key))
-                .map(|(key, value)| {
-                    format!("{} => {}", tjs_quote(key), self.value(value, depth + 1))
-                })
-                .collect::<Vec<_>>();
-            format!("%[{}]", entries.join(", "))
+            "null".to_string()
         };
         self.active.remove(&handle);
         text
     }
+
+    fn array(&mut self, elements: &[Variant], depth: usize) -> String {
+        let indent = " ".repeat(depth);
+        let child_indent = " ".repeat(depth + 1);
+        let mut out = String::from("(const) [\n");
+        for value in elements {
+            out.push_str(&child_indent);
+            out.push_str(&self.value(value, depth + 1));
+            out.push_str(",\n");
+        }
+        out.push_str(&indent);
+        out.push(']');
+        out
+    }
+
+    fn dictionary(&mut self, handle: ObjectHandle, depth: usize) -> String {
+        let indent = " ".repeat(depth);
+        let child_indent = " ".repeat(depth + 1);
+        let mut out = String::from("(const) %[\n");
+        for (key, value) in dictionary_struct_entries(self.runtime, handle) {
+            out.push_str(&child_indent);
+            out.push_str(&tjs_quote(&key));
+            out.push_str(" => ");
+            out.push_str(&self.value(&value, depth + 1));
+            out.push_str(",\n");
+        }
+        out.push_str(&indent);
+        out.push(']');
+        out
+    }
 }
 
 fn is_native_member_name(key: &str) -> bool {
-    matches!(
-        key,
-        "clear" | "assign" | "assignStruct" | "saveStruct" | "loadStruct"
-    )
+    key.starts_with("__")
+        || matches!(
+            key,
+            "clear"
+                | "assign"
+                | "assignStruct"
+                | "saveStruct"
+                | "loadStruct"
+                | "load"
+                | "save"
+                | "add"
+                | "push"
+                | "insert"
+                | "erase"
+                | "pop"
+                | "join"
+                | "reverse"
+                | "count"
+                | "length"
+        )
+}
+
+fn is_dictionary_object<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) -> bool {
+    runtime.heap[handle.0]
+        .class_infos
+        .iter()
+        .any(|info| info == "Dictionary")
+}
+
+fn dictionary_struct_entries<H: TjsHost>(
+    runtime: &Runtime<H>,
+    handle: ObjectHandle,
+) -> Vec<(String, Variant)> {
+    runtime.heap[handle.0]
+        .members
+        .iter()
+        .filter(|(key, _)| !is_native_member_name(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 fn tjs_quote(value: &str) -> String {
@@ -635,11 +937,389 @@ fn tjs_quote(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            ch if ch.is_control() => out.push_str(&format!("\\x{:02x}", ch as u32)),
             _ => out.push(ch),
         }
     }
     out.push('"');
     out
+}
+
+fn real_literal(value: f64) -> String {
+    if value.is_nan() {
+        "0.0/0.0".to_string()
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            "-1.0/0.0".to_string()
+        } else {
+            "1.0/0.0".to_string()
+        }
+    } else {
+        let text = value.to_string();
+        if text.contains(['.', 'e', 'E']) {
+            text
+        } else {
+            format!("{text}.0")
+        }
+    }
+}
+
+fn octet_literal(bytes: &[u8]) -> String {
+    let mut out = String::from("<%");
+    for byte in bytes {
+        out.push_str(&format!(" {byte:02x}"));
+    }
+    if !bytes.is_empty() {
+        out.push(' ');
+    }
+    out.push_str("%>");
+    out
+}
+
+const BINARY_STRUCT_HEADER: &[u8; 8] = b"KBAD100\0";
+
+struct BinaryStructSerializer<'a, H: TjsHost> {
+    runtime: &'a Runtime<H>,
+    active: BTreeSet<ObjectHandle>,
+}
+
+impl<'a, H: TjsHost + 'static> BinaryStructSerializer<'a, H> {
+    fn new(runtime: &'a Runtime<H>) -> Self {
+        Self {
+            runtime,
+            active: BTreeSet::new(),
+        }
+    }
+
+    fn value(&mut self, value: &Variant, out: &mut Vec<u8>) -> Result<()> {
+        match value {
+            Variant::Void => out.push(0xc1),
+            Variant::Null => out.push(0xc0),
+            Variant::Integer(value) => put_binary_integer(out, *value),
+            Variant::Real(value) => {
+                out.push(0xcb);
+                out.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            Variant::String(value) => put_binary_string(out, value)?,
+            Variant::Octet(value) => put_binary_octet(out, value)?,
+            Variant::Object(handle) => self.object(*handle, out)?,
+            Variant::Closure(_) | Variant::CodeObject(_) => out.push(0xc0),
+        }
+        Ok(())
+    }
+
+    fn object(&mut self, handle: ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+        if !self.active.insert(handle) {
+            out.push(0xc0);
+            return Ok(());
+        }
+        if let Some(elements) = self.runtime.heap[handle.0].array_elements() {
+            let elements = Vec::from(elements);
+            put_binary_array_header(out, elements.len())?;
+            for value in elements {
+                self.value(&value, out)?;
+            }
+        } else if is_dictionary_object(self.runtime, handle) {
+            let entries = dictionary_struct_entries(self.runtime, handle);
+            put_binary_map_header(out, entries.len())?;
+            for (key, value) in entries {
+                put_binary_string(out, &key)?;
+                self.value(&value, out)?;
+            }
+        } else {
+            out.push(0xc0);
+        }
+        self.active.remove(&handle);
+        Ok(())
+    }
+}
+
+fn put_binary_integer(out: &mut Vec<u8>, value: i64) {
+    if value < 0 {
+        if value >= -32 {
+            out.push(value as i8 as u8);
+        } else if value >= i8::MIN as i64 {
+            out.push(0xd0);
+            out.push(value as i8 as u8);
+        } else if value >= i16::MIN as i64 {
+            out.push(0xd1);
+            out.extend_from_slice(&(value as i16).to_le_bytes());
+        } else if value >= i32::MIN as i64 {
+            out.push(0xd2);
+            out.extend_from_slice(&(value as i32).to_le_bytes());
+        } else {
+            out.push(0xd3);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    } else if value <= 0x7f {
+        out.push(value as u8);
+    } else if value <= u8::MAX as i64 {
+        out.push(0xcc);
+        out.push(value as u8);
+    } else if value <= u16::MAX as i64 {
+        out.push(0xcd);
+        out.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value <= u32::MAX as i64 {
+        out.push(0xce);
+        out.extend_from_slice(&(value as u32).to_le_bytes());
+    } else {
+        out.push(0xcf);
+        out.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+}
+
+fn put_binary_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    put_binary_string_header(out, units.len())?;
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn put_binary_string_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len <= 0x1f {
+        out.push(0xa0 + len as u8);
+    } else if len <= u8::MAX as usize {
+        out.push(0xc4);
+        out.push(len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0xc5);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else if len <= u32::MAX as usize {
+        out.push(0xc6);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary string is too large"));
+    }
+    Ok(())
+}
+
+fn put_binary_octet(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    if value.len() <= 5 {
+        out.push(0xd4 + value.len() as u8);
+    } else if value.len() <= u16::MAX as usize {
+        out.push(0xda);
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    } else if value.len() <= u32::MAX as usize {
+        out.push(0xdb);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary octet is too large"));
+    }
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn put_binary_array_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len <= 0x0f {
+        out.push(0x90 + len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0xdc);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else if len <= u32::MAX as usize {
+        out.push(0xdd);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary array is too large"));
+    }
+    Ok(())
+}
+
+fn put_binary_map_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len <= 0x0f {
+        out.push(0x80 + len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0xde);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else if len <= u32::MAX as usize {
+        out.push(0xdf);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary dictionary is too large"));
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_binary_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    bytes: &[u8],
+) -> Result<Option<Variant>> {
+    let payload = if bytes.starts_with(BINARY_STRUCT_HEADER) {
+        &bytes[BINARY_STRUCT_HEADER.len()..]
+    } else {
+        bytes
+    };
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    let mut decoder = BinaryStructDecoder {
+        runtime,
+        bytes: payload,
+        index: 0,
+    };
+    decoder.value().map(Some)
+}
+
+struct BinaryStructDecoder<'a, H: TjsHost> {
+    runtime: &'a mut Runtime<H>,
+    bytes: &'a [u8],
+    index: usize,
+}
+
+impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
+    fn value(&mut self) -> Result<Variant> {
+        let ty = self.read_u8()?;
+        match ty {
+            0x00..=0x7f => Ok(Variant::Integer(ty as i64)),
+            0xe0..=0xff => Ok(Variant::Integer((ty as i8) as i64)),
+            0xc0 => Ok(Variant::Null),
+            0xc1 => Ok(Variant::Void),
+            0xc2 => Ok(Variant::Integer(1)),
+            0xc3 => Ok(Variant::Integer(0)),
+            0xc4 => {
+                let len = self.read_u8()? as usize;
+                self.string(len)
+            }
+            0xc5 => {
+                let len = self.read_u16()? as usize;
+                self.string(len)
+            }
+            0xc6 => {
+                let len = self.read_u32()? as usize;
+                self.string(len)
+            }
+            0xca => Ok(Variant::Real(f32::from_bits(self.read_u32()?) as f64)),
+            0xcb => Ok(Variant::Real(f64::from_bits(self.read_u64()?))),
+            0xcc => Ok(Variant::Integer(self.read_u8()? as i64)),
+            0xcd => Ok(Variant::Integer(self.read_u16()? as i64)),
+            0xce => Ok(Variant::Integer(self.read_u32()? as i64)),
+            0xcf => Ok(Variant::Integer(self.read_u64()? as i64)),
+            0xd0 => Ok(Variant::Integer((self.read_u8()? as i8) as i64)),
+            0xd1 => Ok(Variant::Integer(self.read_i16()? as i64)),
+            0xd2 => Ok(Variant::Integer(self.read_i32()? as i64)),
+            0xd3 => Ok(Variant::Integer(self.read_i64()?)),
+            0xd4..=0xd9 => self.octet((ty - 0xd4) as usize),
+            0xda => {
+                let len = self.read_u16()? as usize;
+                self.octet(len)
+            }
+            0xdb => {
+                let len = self.read_u32()? as usize;
+                self.octet(len)
+            }
+            0xdc => {
+                let len = self.read_u16()? as usize;
+                self.array(len)
+            }
+            0xdd => {
+                let len = self.read_u32()? as usize;
+                self.array(len)
+            }
+            0xde => {
+                let len = self.read_u16()? as usize;
+                self.dictionary(len)
+            }
+            0xdf => {
+                let len = self.read_u32()? as usize;
+                self.dictionary(len)
+            }
+            0xa0..=0xbf => self.string((ty - 0xa0) as usize),
+            0x90..=0x9f => self.array((ty - 0x90) as usize),
+            0x80..=0x8f => self.dictionary((ty - 0x80) as usize),
+            _ => Err(TjsError::runtime("invalid binary struct tag")),
+        }
+    }
+
+    fn string(&mut self, len: usize) -> Result<Variant> {
+        let byte_len = len
+            .checked_mul(2)
+            .ok_or_else(|| TjsError::runtime("binary string is too large"))?;
+        let bytes = self.read_bytes(byte_len)?;
+        let units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        Ok(Variant::String(String::from_utf16_lossy(&units)))
+    }
+
+    fn octet(&mut self, len: usize) -> Result<Variant> {
+        Ok(Variant::Octet(self.read_bytes(len)?.to_vec()))
+    }
+
+    fn array(&mut self, len: usize) -> Result<Variant> {
+        let handle = self.runtime.alloc_array_object(Vec::new());
+        for _ in 0..len {
+            let value = self.value()?;
+            self.runtime.heap[handle.0].array_push(value);
+        }
+        Ok(Variant::Object(handle))
+    }
+
+    fn dictionary(&mut self, len: usize) -> Result<Variant> {
+        let handle = self.runtime.alloc_ordinary_object();
+        install_dictionary_methods(self.runtime, handle);
+        for _ in 0..len {
+            let Variant::String(key) = self.value()? else {
+                return Err(TjsError::runtime("binary dictionary key is not a string"));
+            };
+            let value = self.value()?;
+            self.runtime.heap[handle.0].set(key, value);
+        }
+        Ok(Variant::Object(handle))
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(self.read_bytes(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16> {
+        let bytes = self.read_bytes(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        let bytes = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        let bytes = self.read_bytes(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        let bytes = self.read_bytes(2)?;
+        Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        let bytes = self.read_bytes(4)?;
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_i64(&mut self) -> Result<i64> {
+        let bytes = self.read_bytes(8)?;
+        Ok(i64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .index
+            .checked_add(len)
+            .ok_or_else(|| TjsError::runtime("binary struct index overflow"))?;
+        if end > self.bytes.len() {
+            return Err(TjsError::runtime("truncated binary struct"));
+        }
+        let bytes = &self.bytes[self.index..end];
+        self.index = end;
+        Ok(bytes)
+    }
 }
 
 fn parse_struct_value(value: &str) -> Variant {

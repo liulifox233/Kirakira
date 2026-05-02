@@ -395,6 +395,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.execute_file(&file)
     }
 
+    pub fn decode_binary_struct(&mut self, bytes: &[u8]) -> Result<Option<Variant>> {
+        builtins::decode_binary_struct(self, bytes)
+    }
+
     pub fn execute_file(&mut self, file: &BytecodeFile) -> Result<Variant> {
         let file_id = self.install_script_file(Arc::new(file.clone()));
         let mut vm = Vm::new(file_id, self)?;

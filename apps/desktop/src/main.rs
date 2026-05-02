@@ -5,7 +5,9 @@ use krkr_core::{
     ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Panel, Point,
     PointerButton, Size, StatusLevel, UiAction,
 };
-use krkr_engine::{EngineInput as KrkrEngineInput, KrkrEngine};
+use krkr_engine::{
+    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, SystemMetrics,
+};
 use krkr_platform::{pick_folder, show_error};
 use krkr_render::{RenderError, Renderer};
 use winit::{
@@ -77,6 +79,7 @@ struct DesktopApp {
     initial_project_root: Option<PathBuf>,
     status: Option<DesktopStatus>,
     last_frame: Instant,
+    exit_after_runtime_close: bool,
 }
 
 impl DesktopApp {
@@ -94,6 +97,7 @@ impl DesktopApp {
             initial_project_root,
             status: None,
             last_frame: Instant::now(),
+            exit_after_runtime_close: false,
         }
     }
 
@@ -231,8 +235,14 @@ impl DesktopApp {
             }
         }
 
-        if return_to_launcher_after_render && let Some(window) = self.window.as_ref().cloned() {
-            self.return_to_launcher(&window);
+        if return_to_launcher_after_render {
+            if self.exit_after_runtime_close {
+                self.persist_running_project();
+                self.exit_after_runtime_close = false;
+                event_loop.exit();
+            } else if let Some(window) = self.window.as_ref().cloned() {
+                self.return_to_launcher(&window);
+            }
         }
     }
 
@@ -302,7 +312,11 @@ impl DesktopApp {
             return;
         }
 
-        let mut krkr_engine = match KrkrEngine::for_project(&root) {
+        let mut krkr_engine = match KrkrEngine::new(KrkrEngineConfig {
+            project_root: Some(root.clone()),
+            system_metrics: system_metrics_for_window(window),
+            ..KrkrEngineConfig::default()
+        }) {
             Ok(engine) => engine,
             Err(error) => {
                 let message = format!("engine initialization failed: {error}");
@@ -357,6 +371,8 @@ impl DesktopApp {
     }
 
     fn return_to_launcher(&mut self, window: &Window) {
+        self.persist_running_project();
+        self.exit_after_runtime_close = false;
         self.state = DesktopState::Launcher;
         self.krkr_engine = None;
         self.runtime_viewport_size = None;
@@ -372,6 +388,30 @@ impl DesktopApp {
             Some(window),
         );
         log_info("returned to launcher from engine shell");
+    }
+
+    fn persist_running_project(&mut self) {
+        let Some(krkr_engine) = &mut self.krkr_engine else {
+            return;
+        };
+        if let Err(error) = krkr_engine.persist_runtime_state() {
+            log_warn(&format!(
+                "failed to persist runtime state before shutdown: {error}"
+            ));
+        }
+    }
+
+    fn request_running_project_close(&mut self, exit_after_close: bool) -> bool {
+        let Some(krkr_engine) = &mut self.krkr_engine else {
+            return false;
+        };
+        self.exit_after_runtime_close = exit_after_close;
+        if let Err(error) = krkr_engine.request_runtime_close() {
+            log_warn(&format!("failed to request runtime close: {error}"));
+            self.persist_running_project();
+            return false;
+        }
+        true
     }
 
     fn resize_window_for_runtime(&mut self, window: &Window, size: Size) {
@@ -485,7 +525,17 @@ impl ApplicationHandler for DesktopApp {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.state == DesktopState::Running {
+                    if self.request_running_project_close(true) {
+                        window.request_redraw();
+                    } else {
+                        event_loop.exit();
+                    }
+                } else {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(size) => self.resize_renderer(size),
             WindowEvent::ScaleFactorChanged { .. } => {
                 self.resize_renderer(window.inner_size());
@@ -532,7 +582,9 @@ impl ApplicationHandler for DesktopApp {
                     && event.state == ElementState::Pressed
                     && matches!(map_key(&event.logical_key), Some(EngineKey::Escape))
                 {
-                    self.return_to_launcher(&window);
+                    if !self.request_running_project_close(false) {
+                        self.return_to_launcher(&window);
+                    }
                     window.request_redraw();
                     return;
                 }
@@ -606,6 +658,31 @@ fn apply_window_fullscreen(window: &Window, enabled: bool) {
         log_info("entered fullscreen");
     } else {
         log_info("left fullscreen");
+    }
+}
+
+fn system_metrics_for_window(window: &Window) -> SystemMetrics {
+    if let Some(monitor) = window.current_monitor() {
+        let size = monitor.size();
+        let position = monitor.position();
+        return SystemMetrics {
+            screen_width: size.width as i64,
+            screen_height: size.height as i64,
+            desktop_left: position.x as i64,
+            desktop_top: position.y as i64,
+            desktop_width: size.width as i64,
+            desktop_height: size.height as i64,
+        };
+    }
+
+    let size = window.inner_size();
+    SystemMetrics {
+        screen_width: size.width as i64,
+        screen_height: size.height as i64,
+        desktop_left: 0,
+        desktop_top: 0,
+        desktop_width: size.width as i64,
+        desktop_height: size.height as i64,
     }
 }
 

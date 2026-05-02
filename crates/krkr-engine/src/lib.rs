@@ -9,7 +9,7 @@ mod script;
 
 pub use engine::{
     EngineConfig, EngineFrame, EngineInput, EngineTickResult, KagLocation, KagRunBudget,
-    KagTaskState, KagYieldReason, KrkrEngine,
+    KagTaskState, KagYieldReason, KrkrEngine, SystemMetrics,
 };
 pub use host::KrkrHost;
 pub use plugin::KrkrPlugin;
