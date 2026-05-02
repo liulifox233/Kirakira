@@ -13,6 +13,7 @@ pub(crate) fn install_storages(runtime: &mut Runtime<KrkrHost>) {
     let storages = install_static_object(runtime, "Storages");
     runtime.register_object_native(storages, "addAutoPath", storages_add_auto_path);
     runtime.register_object_native(storages, "removeAutoPath", storages_remove_auto_path);
+    runtime.register_object_native(storages, "setTextEncoding", storages_set_text_encoding);
     runtime.register_object_native(storages, "getFullPath", storages_get_full_path);
     runtime.register_object_native(storages, "getPlacedPath", storages_get_placed_path);
     runtime.register_object_native(storages, "isExistentStorage", storages_exists);
@@ -48,6 +49,20 @@ fn storages_remove_auto_path(
         .transpose()?
         .is_some_and(|path| runtime.host_mut().remove_auto_path(&path));
     Ok(Variant::Integer(i64::from(removed)))
+}
+
+fn storages_set_text_encoding(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    if let Some(encoding) = arg_string(&args, 0)? {
+        runtime.host_mut().set_text_encoding(encoding.clone());
+        if let Variant::Object(scripts) = runtime.global_member("Scripts") {
+            runtime.set_object_member(scripts, "textEncoding", Variant::String(encoding));
+        }
+    }
+    Ok(Variant::Void)
 }
 
 fn storages_get_full_path(

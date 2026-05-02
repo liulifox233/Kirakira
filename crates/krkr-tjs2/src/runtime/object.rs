@@ -195,4 +195,7 @@ pub enum ObjectKind {
     VmNativeFunction {
         id: usize,
     },
+    NativeProperty {
+        id: usize,
+    },
 }

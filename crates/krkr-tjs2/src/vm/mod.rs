@@ -140,7 +140,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let global = self.runtime.global;
             let this_obj = this_obj.or(Some(global));
             let this_proxy = self.runtime.alloc_proxy_bound(this_obj, global, None);
-            let super_class = self.super_class_for_parts(&code_handles, &object)?;
+            let super_class = self.super_class_for_parts(file.as_ref(), &code_handles, &object)?;
             let super_proxy = self.runtime.alloc_proxy_bound(
                 super_class.or(this_obj),
                 global,
@@ -820,19 +820,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
 
     fn super_class_for_parts(
         &mut self,
+        file: &BytecodeFile,
         code_handles: &[ObjectHandle],
         object: &CodeObject,
     ) -> Result<Option<ObjectHandle>> {
         if object.context_type == BytecodeContextType::SuperClassGetter {
             return Ok(None);
         }
-        let Some(class_object) = object.parent else {
-            return Ok(None);
-        };
-        let Some(class_handle) = code_handles.get(class_object).copied() else {
-            return Ok(None);
-        };
-        self.super_class_handle(class_handle)
+        let mut current = object.parent;
+        while let Some(object_index) = current {
+            let Some(parent) = file.objects.get(object_index) else {
+                return Ok(None);
+            };
+            if parent.context_type == BytecodeContextType::Class {
+                let Some(class_handle) = code_handles.get(object_index).copied() else {
+                    return Ok(None);
+                };
+                return self.super_class_handle(class_handle);
+            }
+            current = parent.parent;
+        }
+        Ok(None)
     }
 
     pub(super) fn value_debug_type(&self, value: &Variant) -> String {
@@ -876,6 +884,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             crate::runtime::ObjectKind::NativeFunction { .. } => "NativeFunction".to_string(),
             crate::runtime::ObjectKind::VmNativeFunction { .. } => "VmNativeFunction".to_string(),
+            crate::runtime::ObjectKind::NativeProperty { .. } => "NativeProperty".to_string(),
         };
         if !object.class_infos.is_empty() {
             label.push('<');

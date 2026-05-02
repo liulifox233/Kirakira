@@ -161,15 +161,34 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         } = kind
         {
             if let Some(primary) = primary {
-                let primary_has_member = self.runtime.heap[primary.0].get_raw(name).is_some();
+                let primary_value = self.runtime.heap[primary.0].get_raw(name);
+                let primary_has_member = primary_value.is_some();
                 if primary_has_member || (bind_this.is_none() && flags.ensure) {
                     if let Some(this_obj) = bind_this {
+                        if let Some(existing) = primary_value.clone()
+                            && (!flags.ignore_prop
+                                || self.runtime.variant_is_native_property(&existing))
+                            && self
+                                .property_setter(existing, value.clone(), Some(this_obj))?
+                                .is_some()
+                        {
+                            return Ok(());
+                        }
                         self.set_bound_member(this_obj, name, value);
                         return Ok(());
                     }
                     if let Some(this_obj) = caller_this
                         && primary_has_member
                     {
+                        if let Some(existing) = primary_value.clone()
+                            && (!flags.ignore_prop
+                                || self.runtime.variant_is_native_property(&existing))
+                            && self
+                                .property_setter(existing, value.clone(), Some(this_obj))?
+                                .is_some()
+                        {
+                            return Ok(());
+                        }
                         self.set_bound_member(this_obj, name, value);
                         return Ok(());
                     }
@@ -183,8 +202,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return self.prop_set_handle(fallback, name, value, flags, caller_this);
         }
 
-        if !flags.ignore_prop
-            && let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
+        if let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
+            && (!flags.ignore_prop || self.runtime.variant_is_native_property(&existing))
             && self
                 .property_setter(existing, value.clone(), caller_this)?
                 .is_some()
@@ -249,6 +268,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             return Err(TjsError::runtime("property has no getter"));
         }
+        if let ObjectKind::NativeProperty { id } = kind {
+            let property = self
+                .runtime
+                .native_properties
+                .get(id)
+                .cloned()
+                .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
+            return property.get(self.runtime, closure_this.or(caller_this));
+        }
         self.prop_get_handle(
             handle,
             "value",
@@ -284,6 +312,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             return Err(TjsError::runtime("property has no setter"));
         }
+        if let ObjectKind::NativeProperty { id } = kind {
+            let property = self
+                .runtime
+                .native_properties
+                .get(id)
+                .cloned()
+                .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
+            property.set(self.runtime, closure_this.or(caller_this), value)?;
+            return Ok(());
+        }
         self.prop_set_handle(
             handle,
             "value",
@@ -301,24 +339,36 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let Ok((handle, closure_this)) = self.closure_parts(value) else {
             return Ok(None);
         };
-        let ObjectKind::InterCode {
-            file_id,
-            object_index,
-            context: BytecodeContextType::Property,
-        } = self.runtime.heap[handle.0].kind
-        else {
-            return Ok(None);
-        };
-        let file = self.runtime.script_file(file_id)?;
-        let Some(getter) = file.objects[object_index].prop_getter else {
-            return Ok(None);
-        };
-        Ok(Some(self.execute_file_object_with_this(
-            file_id,
-            getter,
-            Vec::new(),
-            closure_this.or(caller_this),
-        )?))
+        match self.runtime.heap[handle.0].kind {
+            ObjectKind::InterCode {
+                file_id,
+                object_index,
+                context: BytecodeContextType::Property,
+            } => {
+                let file = self.runtime.script_file(file_id)?;
+                let Some(getter) = file.objects[object_index].prop_getter else {
+                    return Ok(None);
+                };
+                Ok(Some(self.execute_file_object_with_this(
+                    file_id,
+                    getter,
+                    Vec::new(),
+                    closure_this.or(caller_this),
+                )?))
+            }
+            ObjectKind::NativeProperty { id } => {
+                let property = self
+                    .runtime
+                    .native_properties
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
+                Ok(Some(
+                    property.get(self.runtime, closure_this.or(caller_this))?,
+                ))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(super) fn property_setter(
@@ -330,25 +380,36 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let Ok((handle, closure_this)) = self.closure_parts(target) else {
             return Ok(None);
         };
-        let ObjectKind::InterCode {
-            file_id,
-            object_index,
-            context: BytecodeContextType::Property,
-        } = self.runtime.heap[handle.0].kind
-        else {
-            return Ok(None);
-        };
-        let file = self.runtime.script_file(file_id)?;
-        let Some(setter) = file.objects[object_index].prop_setter else {
-            return Ok(None);
-        };
-        self.execute_file_object_with_this(
-            file_id,
-            setter,
-            vec![value],
-            closure_this.or(caller_this),
-        )?;
-        Ok(Some(()))
+        match self.runtime.heap[handle.0].kind {
+            ObjectKind::InterCode {
+                file_id,
+                object_index,
+                context: BytecodeContextType::Property,
+            } => {
+                let file = self.runtime.script_file(file_id)?;
+                let Some(setter) = file.objects[object_index].prop_setter else {
+                    return Ok(None);
+                };
+                self.execute_file_object_with_this(
+                    file_id,
+                    setter,
+                    vec![value],
+                    closure_this.or(caller_this),
+                )?;
+                Ok(Some(()))
+            }
+            ObjectKind::NativeProperty { id } => {
+                let property = self
+                    .runtime
+                    .native_properties
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
+                property.set(self.runtime, closure_this.or(caller_this), value)?;
+                Ok(Some(()))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(super) fn delete_member(&mut self, target: Variant, name: &str) -> Result<bool> {
@@ -859,7 +920,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     self.call_handle(fallback, proxy_this, args, is_new, continuation)
                 }
             }
-            ObjectKind::Ordinary | ObjectKind::Array { .. } => {
+            ObjectKind::Ordinary | ObjectKind::Array { .. } | ObjectKind::NativeProperty { .. } => {
                 Err(TjsError::runtime("object is not callable"))
             }
         }

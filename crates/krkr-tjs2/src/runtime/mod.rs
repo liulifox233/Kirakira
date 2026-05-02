@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::bytecode::BytecodeFile;
+use crate::bytecode::{BytecodeContextType, BytecodeFile};
 use crate::error::{Result, TjsError};
 use crate::vm::Vm;
 
@@ -104,12 +104,49 @@ where
     }
 }
 
+pub trait NativeProperty<H: TjsHost>: Send + Sync {
+    fn get(&self, runtime: &mut Runtime<H>, this_obj: Option<ObjectHandle>) -> Result<Variant>;
+
+    fn set(
+        &self,
+        runtime: &mut Runtime<H>,
+        this_obj: Option<ObjectHandle>,
+        value: Variant,
+    ) -> Result<()>;
+}
+
+struct NativePropertyAccessors<G, S> {
+    getter: G,
+    setter: S,
+}
+
+impl<H, G, S> NativeProperty<H> for NativePropertyAccessors<G, S>
+where
+    H: TjsHost,
+    G: Fn(&mut Runtime<H>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync,
+    S: Fn(&mut Runtime<H>, Option<ObjectHandle>, Variant) -> Result<()> + Send + Sync,
+{
+    fn get(&self, runtime: &mut Runtime<H>, this_obj: Option<ObjectHandle>) -> Result<Variant> {
+        (self.getter)(runtime, this_obj)
+    }
+
+    fn set(
+        &self,
+        runtime: &mut Runtime<H>,
+        this_obj: Option<ObjectHandle>,
+        value: Variant,
+    ) -> Result<()> {
+        (self.setter)(runtime, this_obj, value)
+    }
+}
+
 pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) heap: Vec<Object>,
     pub(crate) global: ObjectHandle,
     pub(crate) script_files: Vec<ScriptFile>,
     pub(crate) native_functions: Vec<Arc<dyn NativeFunction<H>>>,
     pub(crate) vm_native_functions: Vec<Arc<dyn VmNativeFunction<H>>>,
+    pub(crate) native_properties: Vec<Arc<dyn NativeProperty<H>>>,
     pub(crate) call_depth: usize,
     pub(crate) max_call_depth: usize,
     host: H,
@@ -141,6 +178,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
             script_files: Vec::new(),
             native_functions: Vec::new(),
             vm_native_functions: Vec::new(),
+            native_properties: Vec::new(),
             call_depth: 0,
             max_call_depth: 1024,
             host,
@@ -245,6 +283,22 @@ impl<H: TjsHost + 'static> Runtime<H> {
         handle
     }
 
+    pub fn register_object_native_property<G, S>(
+        &mut self,
+        object: ObjectHandle,
+        name: impl Into<String>,
+        getter: G,
+        setter: S,
+    ) -> ObjectHandle
+    where
+        G: Fn(&mut Runtime<H>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync + 'static,
+        S: Fn(&mut Runtime<H>, Option<ObjectHandle>, Variant) -> Result<()> + Send + Sync + 'static,
+    {
+        let handle = self.alloc_native_property(getter, setter);
+        self.heap[object.0].set(name, Variant::Object(handle));
+        handle
+    }
+
     pub fn global_member(&self, name: &str) -> Variant {
         self.heap[self.global.0].get(name)
     }
@@ -275,6 +329,36 @@ impl<H: TjsHost + 'static> Runtime<H> {
         value: Variant,
     ) {
         self.heap[object.0].set(name, value);
+    }
+
+    pub fn object_member_is_property(&self, object: ObjectHandle, name: &str) -> bool {
+        self.heap[object.0]
+            .get_raw(name)
+            .is_some_and(|value| self.variant_is_property(&value))
+    }
+
+    pub fn variant_is_property(&self, value: &Variant) -> bool {
+        match value {
+            Variant::Closure(closure) => self.object_is_property(closure.object),
+            Variant::Object(handle) => self.object_is_property(*handle),
+            _ => false,
+        }
+    }
+
+    pub fn variant_is_native_property(&self, value: &Variant) -> bool {
+        match value {
+            Variant::Closure(closure) => self.object_is_native_property(closure.object),
+            Variant::Object(handle) => self.object_is_native_property(*handle),
+            _ => false,
+        }
+    }
+
+    pub fn variant_is_native_function(&self, value: &Variant) -> bool {
+        match value {
+            Variant::Closure(closure) => self.object_is_native_function(closure.object),
+            Variant::Object(handle) => self.object_is_native_function(*handle),
+            _ => false,
+        }
     }
 
     pub fn delete_object_member(&mut self, object: ObjectHandle, name: &str) -> bool {
@@ -363,6 +447,33 @@ impl<H: TjsHost + 'static> Runtime<H> {
         handle
     }
 
+    fn object_is_property(&self, handle: ObjectHandle) -> bool {
+        self.heap.get(handle.0).is_some_and(|object| {
+            matches!(
+                object.kind,
+                ObjectKind::InterCode {
+                    context: BytecodeContextType::Property,
+                    ..
+                } | ObjectKind::NativeProperty { .. }
+            )
+        })
+    }
+
+    fn object_is_native_property(&self, handle: ObjectHandle) -> bool {
+        self.heap
+            .get(handle.0)
+            .is_some_and(|object| matches!(object.kind, ObjectKind::NativeProperty { .. }))
+    }
+
+    fn object_is_native_function(&self, handle: ObjectHandle) -> bool {
+        self.heap.get(handle.0).is_some_and(|object| {
+            matches!(
+                object.kind,
+                ObjectKind::NativeFunction { .. } | ObjectKind::VmNativeFunction { .. }
+            )
+        })
+    }
+
     pub(crate) fn install_script_file(&mut self, file: Arc<BytecodeFile>) -> usize {
         let file_id = self.script_files.len();
         let mut code_handles = Vec::with_capacity(file.objects.len());
@@ -443,5 +554,16 @@ impl<H: TjsHost + 'static> Runtime<H> {
         let id = self.vm_native_functions.len();
         self.vm_native_functions.push(Arc::new(function));
         self.alloc_object(Object::new(ObjectKind::VmNativeFunction { id }))
+    }
+
+    pub(crate) fn alloc_native_property<G, S>(&mut self, getter: G, setter: S) -> ObjectHandle
+    where
+        G: Fn(&mut Runtime<H>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync + 'static,
+        S: Fn(&mut Runtime<H>, Option<ObjectHandle>, Variant) -> Result<()> + Send + Sync + 'static,
+    {
+        let id = self.native_properties.len();
+        self.native_properties
+            .push(Arc::new(NativePropertyAccessors { getter, setter }));
+        self.alloc_object(Object::new(ObjectKind::NativeProperty { id }))
     }
 }

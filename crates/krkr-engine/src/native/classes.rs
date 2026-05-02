@@ -7,7 +7,7 @@ use krkr_core::{AudioBus, AudioCommand, AudioSourceKind, LayerNode};
 use krkr_font::{FontSpec, FontSystem, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{Closure, ObjectHandle, Runtime, Variant},
 };
 
 use crate::host::{KrkrHost, NativeTransitionCompletion};
@@ -29,6 +29,7 @@ pub(crate) fn install_native_class(
     runtime.add_object_class_info(handle, spec.name);
     install_methods(runtime, handle, spec.name, spec.methods);
     install_special_methods(runtime, handle, spec.name);
+    install_native_properties(runtime, handle, spec.name);
     install_methods(runtime, handle, spec.name, spec.static_methods);
     install_properties(runtime, handle, spec.static_properties);
     if global {
@@ -64,6 +65,7 @@ fn construct_native_instance(
     }
     install_properties(runtime, handle, spec.properties);
     apply_constructor_defaults(runtime, handle, spec.name, &args)?;
+    install_instance_native_properties(runtime, handle, spec.name);
     Ok(Variant::Object(handle))
 }
 
@@ -91,6 +93,83 @@ fn install_properties(
             continue;
         }
         runtime.set_object_member(handle, *property, Variant::Void);
+    }
+}
+
+fn install_native_properties(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    class_name: &'static str,
+) {
+    match class_name {
+        "Layer" => install_layer_native_properties(runtime, handle, false),
+        "WaveSoundBuffer" => install_wave_native_properties(runtime, handle, false),
+        _ => {}
+    }
+}
+
+fn install_instance_native_properties(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    class_name: &'static str,
+) {
+    if class_name == "WaveSoundBuffer" {
+        install_wave_native_properties(runtime, handle, true);
+    }
+}
+
+fn install_layer_native_properties(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    preserve_script_properties: bool,
+) {
+    for &property in LAYER_NATIVE_PROPERTIES {
+        if preserve_script_properties && runtime.object_member_is_property(handle, property) {
+            continue;
+        }
+        runtime.register_object_native_property(
+            handle,
+            property,
+            move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
+                layer_native_property_get(runtime, this_obj, property)
+            },
+            move |runtime: &mut Runtime<KrkrHost>,
+                  this_obj: Option<ObjectHandle>,
+                  value: Variant| {
+                layer_native_property_set(runtime, this_obj, property, value)
+            },
+        );
+    }
+}
+
+fn install_wave_native_properties(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    preserve_script_properties: bool,
+) {
+    for &property in WAVE_NATIVE_PROPERTIES {
+        if preserve_script_properties && runtime.object_member_is_property(handle, property) {
+            continue;
+        }
+        let property_handle = runtime.register_object_native_property(
+            handle,
+            property,
+            move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
+                wave_native_property_get(runtime, this_obj, property)
+            },
+            move |runtime: &mut Runtime<KrkrHost>,
+                  this_obj: Option<ObjectHandle>,
+                  value: Variant| {
+                wave_native_property_set(runtime, this_obj, property, value)
+            },
+        );
+        if preserve_script_properties {
+            runtime.set_object_member(
+                handle,
+                property,
+                Variant::Closure(Closure::new(property_handle, Some(handle))),
+            );
+        }
     }
 }
 
@@ -154,6 +233,7 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "height", Variant::Integer(0));
             runtime.set_object_member(handle, "innerWidth", Variant::Integer(0));
             runtime.set_object_member(handle, "innerHeight", Variant::Integer(0));
+            runtime.set_object_member(handle, "fullScreen", Variant::Integer(0));
             let children = runtime.alloc_array_object(Vec::new());
             runtime.set_object_member(handle, "children", Variant::Object(children));
             let menu = alloc_menu_item_object(runtime, Some(handle), String::new());
@@ -210,44 +290,59 @@ fn apply_constructor_defaults(
                 parent_layer,
                 is_primary,
             );
-            runtime.set_object_member(handle, "window", stored_window.clone());
-            runtime.set_object_member(handle, "parent", stored_parent.clone());
+            set_layer_property_storage(runtime, handle, "window", stored_window.clone());
+            set_layer_property_storage(runtime, handle, "parent", stored_parent.clone());
             runtime.set_object_member(handle, "__nativeLayerId", Variant::Integer(layer_id as i64));
             let children = runtime.alloc_array_object(Vec::new());
-            runtime.set_object_member(handle, "children", Variant::Object(children));
-            runtime.set_object_member(handle, "left", Variant::Integer(0));
-            runtime.set_object_member(handle, "top", Variant::Integer(0));
-            runtime.set_object_member(handle, "width", Variant::Integer(0));
-            runtime.set_object_member(handle, "height", Variant::Integer(0));
-            runtime.set_object_member(handle, "imageLeft", Variant::Integer(0));
-            runtime.set_object_member(handle, "imageTop", Variant::Integer(0));
-            runtime.set_object_member(handle, "imageWidth", Variant::Integer(0));
-            runtime.set_object_member(handle, "imageHeight", Variant::Integer(0));
-            runtime.set_object_member(handle, "order", Variant::Integer(0));
-            runtime.set_object_member(handle, "absoluteOrderMode", Variant::Integer(0));
-            runtime.set_object_member(handle, "visible", Variant::Integer(i64::from(is_primary)));
-            runtime.set_object_member(handle, "enabled", Variant::Integer(1));
-            runtime.set_object_member(handle, "nodeEnabled", Variant::Integer(1));
-            runtime.set_object_member(handle, "nodeVisible", Variant::Integer(1));
-            runtime.set_object_member(handle, "opacity", Variant::Integer(255));
-            runtime.set_object_member(
+            set_layer_property_storage(runtime, handle, "children", Variant::Object(children));
+            set_layer_property_storage(runtime, handle, "left", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "top", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "width", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "height", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "imageWidth", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "imageHeight", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "order", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "absoluteOrderMode", Variant::Integer(0));
+            set_layer_property_storage(
+                runtime,
+                handle,
+                "visible",
+                Variant::Integer(i64::from(is_primary)),
+            );
+            set_layer_property_storage(runtime, handle, "enabled", Variant::Integer(1));
+            set_layer_property_storage(runtime, handle, "nodeEnabled", Variant::Integer(1));
+            set_layer_property_storage(runtime, handle, "nodeVisible", Variant::Integer(1));
+            set_layer_property_storage(runtime, handle, "opacity", Variant::Integer(255));
+            set_layer_property_storage(
+                runtime,
                 handle,
                 "type",
                 Variant::Integer(if is_primary { 1 } else { 2 }),
             );
-            runtime.set_object_member(handle, "face", Variant::Integer(128));
-            runtime.set_object_member(handle, "hitType", Variant::Integer(0));
-            runtime.set_object_member(
+            set_layer_property_storage(runtime, handle, "face", Variant::Integer(128));
+            set_layer_property_storage(runtime, handle, "hitType", Variant::Integer(0));
+            set_layer_property_storage(
+                runtime,
                 handle,
                 "hitThreshold",
                 Variant::Integer(if is_primary { 0 } else { 16 }),
             );
-            runtime.set_object_member(handle, "isPrimary", Variant::Integer(i64::from(is_primary)));
-            runtime.set_object_member(handle, "cursor", Variant::Integer(0));
-            runtime.set_object_member(handle, "hint", Variant::String(String::new()));
-            runtime.set_object_member(handle, "showParentHint", Variant::Integer(1));
+            set_layer_property_storage(
+                runtime,
+                handle,
+                "isPrimary",
+                Variant::Integer(i64::from(is_primary)),
+            );
+            runtime.set_object_member(handle, "focusable", Variant::Integer(0));
+            runtime.set_object_member(handle, "joinFocusChain", Variant::Integer(1));
+            runtime.set_object_member(handle, "focused", Variant::Integer(i64::from(is_primary)));
+            set_layer_property_storage(runtime, handle, "cursor", Variant::Integer(0));
+            set_layer_property_storage(runtime, handle, "hint", Variant::String(String::new()));
+            set_layer_property_storage(runtime, handle, "showParentHint", Variant::Integer(1));
             let font = construct_native_instance(runtime, &FONT_CLASS, None, Vec::new())?;
-            runtime.set_object_member(handle, "font", font);
+            set_layer_property_storage(runtime, handle, "font", font);
             if is_primary && let Some(window) = window_object {
                 runtime.set_object_member(window, "primaryLayer", Variant::Object(handle));
                 runtime.set_object_member(window, "focusedLayer", Variant::Object(handle));
@@ -558,6 +653,32 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "drawGlyph", layer_draw_glyph);
     register_native_method_preserving_script(runtime, handle, "getProvincePixel", layer_zero);
     register_native_method_preserving_script(runtime, handle, "update", layer_update);
+    register_native_method_preserving_script(runtime, handle, "focus", layer_focus);
+    register_native_method_preserving_script(runtime, handle, "focusPrev", layer_focus_prev);
+    register_native_method_preserving_script(runtime, handle, "focusNext", layer_focus_next);
+    register_native_method_preserving_script(runtime, handle, "setMode", layer_void);
+    register_native_method_preserving_script(runtime, handle, "removeMode", layer_void);
+    register_native_method_preserving_script(runtime, handle, "releaseCapture", layer_void);
+    register_native_method_preserving_script(runtime, handle, "onKeyDown", layer_on_key_down);
+    register_native_method_preserving_script(runtime, handle, "onKeyUp", layer_on_key_up);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "onSearchPrevFocusable",
+        layer_set_focus_work,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "onSearchNextFocusable",
+        layer_set_focus_work,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "onBeforeFocus",
+        layer_set_focus_work,
+    );
 }
 
 fn install_font_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -622,6 +743,275 @@ enum RenderLayerTarget {
     Kag { page: String, layer: String },
 }
 
+const LAYER_NATIVE_PROPERTIES: &[&str] = &[
+    "window",
+    "parent",
+    "children",
+    "order",
+    "absoluteOrderMode",
+    "visible",
+    "nodeVisible",
+    "opacity",
+    "isPrimary",
+    "left",
+    "top",
+    "width",
+    "height",
+    "imageLeft",
+    "imageTop",
+    "imageWidth",
+    "imageHeight",
+    "type",
+    "face",
+    "hitType",
+    "hitThreshold",
+    "cursor",
+    "hint",
+    "showParentHint",
+    "enabled",
+    "nodeEnabled",
+    "font",
+];
+
+fn layer_native_property_get(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    name: &str,
+) -> Result<Variant> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Void);
+    };
+    Ok(layer_property_value(runtime, this, name))
+}
+
+fn layer_native_property_set(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    name: &str,
+    value: Variant,
+) -> Result<()> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(());
+    };
+    let value = normalize_layer_property_value(name, value)?;
+    set_layer_property_storage(runtime, this, name, value.clone());
+    apply_layer_property_to_render(runtime, this, name, &value)
+}
+
+fn layer_property_value(runtime: &Runtime<KrkrHost>, handle: ObjectHandle, name: &str) -> Variant {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    let direct = runtime.object_member(handle, name);
+    if !runtime.variant_is_property(&direct) && !matches!(direct, Variant::Void) {
+        return direct;
+    }
+    let stored = runtime.object_member(handle, &layer_property_backing_key(name));
+    if !matches!(stored, Variant::Void) {
+        return stored;
+    }
+    if runtime.variant_is_property(&direct) {
+        Variant::Void
+    } else {
+        direct
+    }
+}
+
+fn layer_property_i64(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &str,
+    fallback: i64,
+) -> Result<i64> {
+    match layer_property_value(runtime, handle, name) {
+        Variant::Void => Ok(fallback),
+        value => value.to_integer(),
+    }
+}
+
+fn set_layer_property_storage(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &str,
+    value: Variant,
+) {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    runtime.set_object_member(handle, layer_property_backing_key(name), value.clone());
+    if !runtime.object_member_is_property(handle, name) {
+        runtime.set_object_member(handle, name, value);
+    }
+}
+
+fn normalize_layer_property_value(name: &str, value: Variant) -> Result<Variant> {
+    match name {
+        "width" | "height" | "imageWidth" | "imageHeight" | "clipWidth" | "clipHeight" => {
+            Ok(Variant::Integer(value.to_integer()?.max(0)))
+        }
+        "opacity" => Ok(Variant::Integer(value.to_integer()?.clamp(0, 255))),
+        "left" | "top" | "imageLeft" | "imageTop" | "order" | "absoluteOrderMode" | "visible"
+        | "nodeVisible" | "enabled" | "nodeEnabled" | "type" | "face" | "hitType"
+        | "hitThreshold" | "cursor" | "isPrimary" | "showParentHint" => {
+            Ok(Variant::Integer(value.to_integer()?))
+        }
+        _ => Ok(value),
+    }
+}
+
+fn apply_layer_property_to_render(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &str,
+    value: &Variant,
+) -> Result<()> {
+    let Some(target) = render_layer_target(runtime, handle)? else {
+        return Ok(());
+    };
+    let integer = match name {
+        "left" | "top" | "width" | "height" | "imageLeft" | "imageTop" | "imageWidth"
+        | "imageHeight" | "visible" | "enabled" | "nodeEnabled" | "opacity" | "type" | "face"
+        | "hitType" | "hitThreshold" => Some(value.to_integer()?),
+        _ => None,
+    };
+    if let Some(integer) = integer {
+        mutate_render_layer(runtime, &target, |layer| match name {
+            "left" => layer.left = integer as f32,
+            "top" => layer.top = integer as f32,
+            "width" => layer.width = integer.max(0) as f32,
+            "height" => layer.height = integer.max(0) as f32,
+            "imageLeft" => layer.image_left = integer as f32,
+            "imageTop" => layer.image_top = integer as f32,
+            "imageWidth" => layer.image_width = integer.max(0) as f32,
+            "imageHeight" => layer.image_height = integer.max(0) as f32,
+            "visible" => layer.visible = integer != 0,
+            "enabled" => layer.enabled = integer != 0,
+            "nodeEnabled" => layer.node_enabled = integer != 0,
+            "opacity" => layer.opacity = integer.clamp(0, 255) as u8,
+            "type" => layer.layer_type = integer as i32,
+            "face" => layer.face = integer as i32,
+            "hitType" => layer.hit_type = integer as i32,
+            "hitThreshold" => layer.hit_threshold = integer.clamp(0, 255) as u8,
+            _ => {}
+        });
+    }
+    Ok(())
+}
+
+fn layer_property_backing_key(name: &str) -> String {
+    format!("__nativeLayerProperty${name}")
+}
+
+const WAVE_NATIVE_PROPERTIES: &[&str] = &[
+    "looping",
+    "volume",
+    "volume2",
+    "pan",
+    "globalVolume",
+    "globalFocusMode",
+    "useVisBuffer",
+];
+
+fn wave_native_property_get(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    name: &str,
+) -> Result<Variant> {
+    if name == "globalVolume" {
+        return Ok(Variant::Integer(
+            runtime.host().native_audio_global_volume(),
+        ));
+    }
+    if matches!(name, "globalFocusMode" | "useVisBuffer") {
+        return Ok(runtime.object_member(
+            runtime.global_handle(),
+            &wave_static_property_backing_key(name),
+        ));
+    }
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Void);
+    };
+    let value = runtime
+        .host()
+        .native_audio_buffer(this)
+        .map(|buffer| match name {
+            "looping" => Variant::Integer(i64::from(buffer.looping)),
+            "volume" => Variant::Integer(buffer.volume),
+            "volume2" => Variant::Integer(buffer.volume2),
+            "pan" => Variant::Integer(buffer.pan),
+            _ => Variant::Void,
+        })
+        .unwrap_or_else(|| runtime.object_member(this, &wave_property_backing_key(name)));
+    Ok(value)
+}
+
+fn wave_native_property_set(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    name: &str,
+    value: Variant,
+) -> Result<()> {
+    if name == "globalVolume" {
+        let volume = value.to_integer()?.clamp(0, 100000);
+        runtime.host_mut().set_native_audio_global_volume(volume);
+        runtime.set_object_member(
+            runtime.global_handle(),
+            wave_static_property_backing_key(name),
+            Variant::Integer(volume),
+        );
+        return Ok(());
+    }
+    if matches!(name, "globalFocusMode" | "useVisBuffer") {
+        runtime.set_object_member(
+            runtime.global_handle(),
+            wave_static_property_backing_key(name),
+            value,
+        );
+        return Ok(());
+    }
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(());
+    };
+    match name {
+        "looping" => {
+            let looping = value.is_truthy();
+            runtime.host_mut().set_native_audio_looping(this, looping);
+            set_wave_property_storage(runtime, this, name, Variant::Integer(i64::from(looping)));
+        }
+        "volume" => {
+            let volume = value.to_integer()?.clamp(0, 100000);
+            runtime.host_mut().set_native_audio_volume(this, volume);
+            set_wave_property_storage(runtime, this, name, Variant::Integer(volume));
+        }
+        "volume2" => {
+            let volume = value.to_integer()?.clamp(0, 100000);
+            runtime.host_mut().set_native_audio_volume2(this, volume);
+            set_wave_property_storage(runtime, this, name, Variant::Integer(volume));
+        }
+        "pan" => {
+            let pan = value.to_integer()?.clamp(-100000, 100000);
+            runtime.host_mut().set_native_audio_pan(this, pan);
+            set_wave_property_storage(runtime, this, name, Variant::Integer(pan));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn set_wave_property_storage(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &str,
+    value: Variant,
+) {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    runtime.set_object_member(handle, wave_property_backing_key(name), value);
+}
+
+fn wave_property_backing_key(name: &str) -> String {
+    format!("__nativeWaveProperty${name}")
+}
+
+fn wave_static_property_backing_key(name: &str) -> String {
+    format!("__nativeWaveStaticProperty${name}")
+}
+
 fn register_native_method_preserving_script(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
@@ -678,7 +1068,11 @@ fn wave_sound_buffer_play(
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.play")?;
     sync_wave_buffer_settings(runtime, this)?;
-    let bus = if runtime.object_member(this, "looping").is_truthy() {
+    let bus = if runtime
+        .host()
+        .native_audio_buffer(this)
+        .is_some_and(|buffer| buffer.looping)
+    {
         AudioBus::Bgm
     } else {
         AudioBus::SoundEffect
@@ -708,6 +1102,7 @@ fn wave_sound_buffer_stop(
             fade_seconds: 0.0,
         });
     }
+    runtime.host_mut().mark_native_audio_stopped(this);
     runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
     runtime.set_object_member(this, "paused", Variant::Integer(0));
     Ok(Variant::Void)
@@ -743,22 +1138,12 @@ fn wave_sound_buffer_fade(
             optional_integer(&args, 1)?.unwrap_or(0).max(0),
         )
     };
-    let volume = krkr_volume_to_linear(target);
-    runtime.set_object_member(this, "volume", Variant::Integer(target));
-    let id = if let Some(buffer) = runtime.host_mut().native_audio_buffer_mut(this) {
-        buffer.volume = volume;
-        Some(buffer.id)
-    } else {
-        None
-    };
-    if let Some(id) = id {
-        runtime
-            .host_mut()
-            .queue_audio_command(AudioCommand::SetVolume {
-                id,
-                volume,
-                fade_seconds: millis as f32 / 1000.0,
-            });
+    set_wave_property_storage(runtime, this, "volume", Variant::Integer(target));
+    let fade_seconds = millis as f32 / 1000.0;
+    runtime
+        .host_mut()
+        .set_native_audio_volume_with_fade(this, target, fade_seconds);
+    if runtime.host().native_audio_buffer(this).is_some() {
         runtime
             .host_mut()
             .schedule_audio_fade_completion(this, millis);
@@ -796,21 +1181,10 @@ fn native_audio_this(
 }
 
 fn sync_wave_buffer_settings(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> Result<()> {
-    let volume = runtime
-        .object_member(handle, "volume")
-        .to_integer()
-        .map(krkr_volume_to_linear)
-        .unwrap_or(1.0);
-    let looping = runtime.object_member(handle, "looping").is_truthy();
-    if let Some(buffer) = runtime.host_mut().native_audio_buffer_mut(handle) {
-        buffer.volume = volume;
-        buffer.looping = looping;
+    if runtime.host().native_audio_buffer(handle).is_none() {
+        return Err(TjsError::runtime("WaveSoundBuffer is not initialized"));
     }
     Ok(())
-}
-
-fn krkr_volume_to_linear(volume: i64) -> f32 {
-    (volume as f32 / 100000.0).clamp(0.0, 1.0)
 }
 
 fn async_trigger_trigger(
@@ -1064,21 +1438,31 @@ fn layer_load_images(
     }
     sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
     mark_image_modified(runtime, this);
-    runtime.set_object_member(this, "visible", Variant::Integer(i64::from(visible)));
+    set_layer_property_storage(
+        runtime,
+        this,
+        "visible",
+        Variant::Integer(i64::from(visible)),
+    );
     if let Some(left) = left {
-        runtime.set_object_member(this, "left", Variant::Integer(left));
+        set_layer_property_storage(runtime, this, "left", Variant::Integer(left));
     }
     if let Some(top) = top {
-        runtime.set_object_member(this, "top", Variant::Integer(top));
+        set_layer_property_storage(runtime, this, "top", Variant::Integer(top));
     }
     if let Some(width) = width {
-        runtime.set_object_member(this, "width", Variant::Integer(width.max(0)));
+        set_layer_property_storage(runtime, this, "width", Variant::Integer(width.max(0)));
     }
     if let Some(height) = height {
-        runtime.set_object_member(this, "height", Variant::Integer(height.max(0)));
+        set_layer_property_storage(runtime, this, "height", Variant::Integer(height.max(0)));
     }
     if let Some(opacity) = opacity {
-        runtime.set_object_member(this, "opacity", Variant::Integer(opacity.clamp(0, 255)));
+        set_layer_property_storage(
+            runtime,
+            this,
+            "opacity",
+            Variant::Integer(opacity.clamp(0, 255)),
+        );
     }
     Ok(Variant::Void)
 }
@@ -1169,13 +1553,13 @@ fn layer_set_pos(
             }
         });
     }
-    runtime.set_object_member(this, "left", Variant::Integer(left));
-    runtime.set_object_member(this, "top", Variant::Integer(top));
+    set_layer_property_storage(runtime, this, "left", Variant::Integer(left));
+    set_layer_property_storage(runtime, this, "top", Variant::Integer(top));
     if let Some(width) = width {
-        runtime.set_object_member(this, "width", Variant::Integer(width));
+        set_layer_property_storage(runtime, this, "width", Variant::Integer(width));
     }
     if let Some(height) = height {
-        runtime.set_object_member(this, "height", Variant::Integer(height));
+        set_layer_property_storage(runtime, this, "height", Variant::Integer(height));
     }
     Ok(Variant::Void)
 }
@@ -1194,8 +1578,8 @@ fn layer_set_size(
             layer.height = height as f32;
         });
     }
-    runtime.set_object_member(this, "width", Variant::Integer(width));
-    runtime.set_object_member(this, "height", Variant::Integer(height));
+    set_layer_property_storage(runtime, this, "width", Variant::Integer(width));
+    set_layer_property_storage(runtime, this, "height", Variant::Integer(height));
     Ok(Variant::Void)
 }
 
@@ -1213,8 +1597,8 @@ fn layer_set_image_pos(
             layer.image_top = top as f32;
         });
     }
-    runtime.set_object_member(this, "imageLeft", Variant::Integer(left));
-    runtime.set_object_member(this, "imageTop", Variant::Integer(top));
+    set_layer_property_storage(runtime, this, "imageLeft", Variant::Integer(left));
+    set_layer_property_storage(runtime, this, "imageTop", Variant::Integer(top));
     Ok(Variant::Void)
 }
 
@@ -1244,8 +1628,8 @@ fn layer_set_image_size(
             }
         });
     }
-    runtime.set_object_member(this, "imageWidth", Variant::Integer(width));
-    runtime.set_object_member(this, "imageHeight", Variant::Integer(height));
+    set_layer_property_storage(runtime, this, "imageWidth", Variant::Integer(width));
+    set_layer_property_storage(runtime, this, "imageHeight", Variant::Integer(height));
     mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
@@ -1256,12 +1640,10 @@ fn layer_set_size_to_image_size(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
-    let width = runtime
-        .object_member(this, "imageWidth")
+    let width = layer_property_value(runtime, this, "imageWidth")
         .to_integer()?
         .max(0);
-    let height = runtime
-        .object_member(this, "imageHeight")
+    let height = layer_property_value(runtime, this, "imageHeight")
         .to_integer()?
         .max(0);
     let replacement_image = if width > 0 && height > 0 {
@@ -1295,8 +1677,8 @@ fn layer_set_size_to_image_size(
             }
         });
     }
-    runtime.set_object_member(this, "width", Variant::Integer(width));
-    runtime.set_object_member(this, "height", Variant::Integer(height));
+    set_layer_property_storage(runtime, this, "width", Variant::Integer(width));
+    set_layer_property_storage(runtime, this, "height", Variant::Integer(height));
     if replaces_content {
         mark_image_modified(runtime, this);
     }
@@ -1415,7 +1797,7 @@ fn layer_begin_transition(
             layer.renderable = true;
         });
     }
-    runtime.set_object_member(this, "visible", Variant::Integer(1));
+    set_layer_property_storage(runtime, this, "visible", Variant::Integer(1));
     let live_layer_overrides =
         kag_base_children_transition_live_overrides(runtime, this, source, with_children)?;
     if duration == 0 {
@@ -1588,6 +1970,15 @@ fn apply_script_layer_members(
     layer.layer_type =
         layer_member_i64(runtime, handle, "type", i64::from(layer.layer_type))? as i32;
     layer.face = layer_member_i64(runtime, handle, "face", i64::from(layer.face))? as i32;
+    layer.hit_type =
+        layer_member_i64(runtime, handle, "hitType", i64::from(layer.hit_type))? as i32;
+    layer.hit_threshold = layer_member_i64(
+        runtime,
+        handle,
+        "hitThreshold",
+        i64::from(layer.hit_threshold),
+    )?
+    .clamp(0, 255) as u8;
     Ok(())
 }
 
@@ -1597,10 +1988,7 @@ fn layer_member_i64(
     name: &str,
     fallback: i64,
 ) -> Result<i64> {
-    match runtime.object_member(handle, name) {
-        Variant::Void => Ok(fallback),
-        value => value.to_integer(),
-    }
+    layer_property_i64(runtime, handle, name, fallback)
 }
 
 fn kag_page_layer_handle(
@@ -1651,6 +2039,8 @@ fn copy_render_content(dest: &mut LayerNode, source: &LayerNode) {
     dest.opacity = source.opacity;
     dest.layer_type = source.layer_type;
     dest.face = source.face;
+    dest.hit_type = source.hit_type;
+    dest.hit_threshold = source.hit_threshold;
     dest.image = source.image.clone();
 }
 
@@ -2083,6 +2473,377 @@ fn layer_update(
     Ok(Variant::Void)
 }
 
+fn layer_focus(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer.focus requires this"))?;
+    if layer_set_focus_to(runtime, this, true)? {
+        Ok(Variant::Object(this))
+    } else {
+        Ok(Variant::Null)
+    }
+}
+
+fn layer_focus_prev(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer.focusPrev requires this"))?;
+    layer_focus_relative(runtime, this, false)
+}
+
+fn layer_focus_next(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer.focusNext requires this"))?;
+    layer_focus_relative(runtime, this, true)
+}
+
+fn layer_focus_relative(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    forward: bool,
+) -> Result<Variant> {
+    let Some(window) = layer_window_object(runtime, this) else {
+        return Ok(Variant::Null);
+    };
+    let focusables = focusable_layers_for_window(runtime, window, this);
+    if focusables.is_empty() {
+        return Ok(Variant::Null);
+    }
+
+    let focused = focused_layer(runtime, window);
+    let target = if let Some(focused) = focused {
+        let Some(index) = focusables.iter().position(|layer| *layer == focused) else {
+            return focus_first_layer(runtime, focusables[0], forward);
+        };
+        if focusables.len() == 1 {
+            return Ok(Variant::Null);
+        }
+        let next_index = if forward {
+            (index + 1) % focusables.len()
+        } else {
+            (index + focusables.len() - 1) % focusables.len()
+        };
+        focusables[next_index]
+    } else {
+        focusables[0]
+    };
+
+    let method = if forward {
+        "onSearchNextFocusable"
+    } else {
+        "onSearchPrevFocusable"
+    };
+    let target = layer_focus_work(runtime, this, method, Some(target), Vec::new())?;
+    let Some(target) = target else {
+        return Ok(Variant::Null);
+    };
+    focus_first_layer(runtime, target, forward)
+}
+
+fn focus_first_layer(
+    runtime: &mut Runtime<KrkrHost>,
+    target: ObjectHandle,
+    forward: bool,
+) -> Result<Variant> {
+    if layer_set_focus_to(runtime, target, forward)? {
+        Ok(Variant::Object(target))
+    } else {
+        Ok(Variant::Null)
+    }
+}
+
+fn layer_set_focus_to(
+    runtime: &mut Runtime<KrkrHost>,
+    target: ObjectHandle,
+    direction: bool,
+) -> Result<bool> {
+    if !layer_is_node_focusable(runtime, target) {
+        return Ok(false);
+    }
+    let Some(window) = layer_window_object(runtime, target) else {
+        return Ok(false);
+    };
+    let previous = focused_layer(runtime, window);
+    let target = layer_focus_work(
+        runtime,
+        target,
+        "onBeforeFocus",
+        Some(target),
+        vec![
+            previous.map(Variant::Object).unwrap_or(Variant::Null),
+            Variant::Integer(i64::from(direction)),
+        ],
+    )?;
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    if !layer_is_node_focusable(runtime, target) || previous == Some(target) {
+        return Ok(false);
+    }
+
+    if let Some(previous) = previous {
+        runtime.set_object_member(previous, "focused", Variant::Integer(0));
+        if !matches!(runtime.object_member(previous, "onBlur"), Variant::Void) {
+            runtime.call_object_method(previous, "onBlur", vec![Variant::Object(target)])?;
+        }
+    }
+
+    runtime.set_object_member(target, "focused", Variant::Integer(1));
+    runtime.set_object_member(window, "focusedLayer", Variant::Object(target));
+    if !matches!(runtime.object_member(target, "onFocus"), Variant::Void) {
+        runtime.call_object_method(
+            target,
+            "onFocus",
+            vec![
+                previous.map(Variant::Object).unwrap_or(Variant::Null),
+                Variant::Integer(i64::from(direction)),
+            ],
+        )?;
+    }
+    Ok(true)
+}
+
+fn layer_focus_work(
+    runtime: &mut Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    method: &str,
+    candidate: Option<ObjectHandle>,
+    mut extra_args: Vec<Variant>,
+) -> Result<Option<ObjectHandle>> {
+    let candidate_value = candidate.map(Variant::Object).unwrap_or(Variant::Null);
+    runtime.set_object_member(layer, "__nativeFocusWork", candidate_value.clone());
+    let mut args = vec![candidate_value];
+    args.append(&mut extra_args);
+    if !matches!(runtime.object_member(layer, method), Variant::Void) {
+        runtime.call_object_method(layer, method, args)?;
+    }
+    Ok(match runtime.object_member(layer, "__nativeFocusWork") {
+        Variant::Object(handle) => Some(runtime.bound_this(handle).unwrap_or(handle)),
+        _ => None,
+    })
+}
+
+fn layer_set_focus_work(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Void);
+    };
+    let value = args.first().cloned().unwrap_or(Variant::Null);
+    runtime.set_object_member(this, "__nativeFocusWork", value);
+    Ok(Variant::Void)
+}
+
+fn focused_layer(runtime: &Runtime<KrkrHost>, window: ObjectHandle) -> Option<ObjectHandle> {
+    match runtime.object_member(window, "focusedLayer") {
+        Variant::Object(handle) => Some(runtime.bound_this(handle).unwrap_or(handle)),
+        _ => None,
+    }
+}
+
+fn layer_window_object(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Option<ObjectHandle> {
+    variant_object(&layer_property_value(runtime, layer, "window"))
+        .map(|window| runtime.bound_this(window).unwrap_or(window))
+}
+
+fn focusable_layers_for_window(
+    runtime: &Runtime<KrkrHost>,
+    window: ObjectHandle,
+    fallback_root: ObjectHandle,
+) -> Vec<ObjectHandle> {
+    let root = match runtime.object_member(window, "primaryLayer") {
+        Variant::Object(root) => runtime.bound_this(root).unwrap_or(root),
+        _ => fallback_root,
+    };
+    let mut layers = Vec::new();
+    let mut visited = BTreeSet::new();
+    collect_focusable_layers(runtime, root, &mut visited, &mut layers);
+    layers
+}
+
+fn collect_focusable_layers(
+    runtime: &Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    visited: &mut BTreeSet<ObjectHandle>,
+    layers: &mut Vec<ObjectHandle>,
+) {
+    let layer = runtime.bound_this(layer).unwrap_or(layer);
+    if !visited.insert(layer) {
+        return;
+    }
+    if layer_is_node_focusable(runtime, layer) && layer_joins_focus_chain(runtime, layer) {
+        layers.push(layer);
+    }
+    for child in layer_children(runtime, layer) {
+        collect_focusable_layers(runtime, child, visited, layers);
+    }
+}
+
+fn layer_children(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Vec<ObjectHandle> {
+    let Variant::Object(children) = layer_property_value(runtime, layer, "children") else {
+        return Vec::new();
+    };
+    let count = runtime
+        .object_member(children, "count")
+        .to_integer()
+        .unwrap_or(0)
+        .max(0);
+    (0..count)
+        .filter_map(|index| {
+            variant_object(&runtime.object_member(children, &index.to_string()))
+                .map(|child| runtime.bound_this(child).unwrap_or(child))
+        })
+        .collect()
+}
+
+fn layer_joins_focus_chain(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> bool {
+    match runtime.object_member(layer, "joinFocusChain") {
+        Variant::Void => true,
+        value => value.is_truthy(),
+    }
+}
+
+fn layer_is_node_focusable(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> bool {
+    if !runtime.object_member(layer, "focusable").is_truthy()
+        || !layer_property_value(runtime, layer, "visible").is_truthy()
+        || !layer_property_value(runtime, layer, "enabled").is_truthy()
+    {
+        return false;
+    }
+
+    let mut parent = variant_object(&layer_property_value(runtime, layer, "parent"))
+        .map(|parent| runtime.bound_this(parent).unwrap_or(parent));
+    while let Some(layer) = parent {
+        if !layer_property_value(runtime, layer, "visible").is_truthy()
+            || !layer_property_value(runtime, layer, "enabled").is_truthy()
+        {
+            return false;
+        }
+        parent = variant_object(&layer_property_value(runtime, layer, "parent"))
+            .map(|parent| runtime.bound_this(parent).unwrap_or(parent));
+    }
+    true
+}
+
+fn layer_on_key_down(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Void);
+    };
+    if key_event_should_process(&args) {
+        let key = optional_integer(&args, 0)?.unwrap_or(0);
+        let shift = optional_integer(&args, 1)?.unwrap_or(0);
+        layer_default_key_down(runtime, this, key, shift)?;
+    }
+    Ok(Variant::Void)
+}
+
+fn layer_on_key_up(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Void);
+    };
+    if key_event_should_process(&args) {
+        let key = optional_integer(&args, 0)?.unwrap_or(0);
+        let shift = optional_integer(&args, 1)?.unwrap_or(0);
+        layer_default_key_up(runtime, this, key, shift)?;
+    }
+    Ok(Variant::Void)
+}
+
+fn key_event_should_process(args: &[Variant]) -> bool {
+    args.get(2).is_none_or(Variant::is_truthy)
+}
+
+fn layer_default_key_down(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    key: i64,
+    shift: i64,
+) -> Result<()> {
+    let no_shift = shift & ((1 << 0) | (1 << 1) | (1 << 2)) == 0;
+    if no_shift && matches!(key, 0x09 | 0x27 | 0x28) {
+        layer_focus_relative(runtime, this, true)?;
+    } else if key == 0x25 || key == 0x26 || (key == 0x09 && shift & (1 << 0) != 0) {
+        layer_focus_relative(runtime, this, false)?;
+    } else if no_shift && matches!(key, 0x0d | 0x1b) {
+        layer_fire_parent_key_event(runtime, this, "onKeyDown", key, shift)?;
+    }
+    Ok(())
+}
+
+fn layer_default_key_up(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    key: i64,
+    shift: i64,
+) -> Result<()> {
+    let no_shift = shift & ((1 << 0) | (1 << 1) | (1 << 2)) == 0;
+    if no_shift && matches!(key, 0x0d | 0x1b) {
+        layer_fire_parent_key_event(runtime, this, "onKeyUp", key, shift)?;
+    }
+    Ok(())
+}
+
+fn layer_fire_parent_key_event(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    method: &str,
+    key: i64,
+    shift: i64,
+) -> Result<()> {
+    let Some(parent) = variant_object(&layer_property_value(runtime, this, "parent"))
+        .map(|parent| runtime.bound_this(parent).unwrap_or(parent))
+    else {
+        return Ok(());
+    };
+    if !layer_property_value(runtime, parent, "nodeEnabled").is_truthy()
+        || matches!(runtime.object_member(parent, method), Variant::Void)
+    {
+        return Ok(());
+    }
+    runtime
+        .call_object_method(
+            parent,
+            method,
+            vec![
+                Variant::Integer(key),
+                Variant::Integer(shift),
+                Variant::Integer(1),
+            ],
+        )
+        .map(|_| ())
+}
+
+fn layer_void(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Void)
+}
+
 fn layer_zero(
     _runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -2314,29 +3075,39 @@ fn copy_layer_images(
         }
     });
 
-    runtime.set_object_member(
+    set_layer_property_storage(
+        runtime,
         dest_object,
         "imageLeft",
         Variant::Integer(source.image_left as i64),
     );
-    runtime.set_object_member(
+    set_layer_property_storage(
+        runtime,
         dest_object,
         "imageTop",
         Variant::Integer(source.image_top as i64),
     );
-    runtime.set_object_member(
+    set_layer_property_storage(
+        runtime,
         dest_object,
         "imageWidth",
         Variant::Integer(source.image_width as i64),
     );
-    runtime.set_object_member(
+    set_layer_property_storage(
+        runtime,
         dest_object,
         "imageHeight",
         Variant::Integer(source.image_height as i64),
     );
     if resized_to_source {
-        runtime.set_object_member(dest_object, "width", Variant::Integer(source.width as i64));
-        runtime.set_object_member(
+        set_layer_property_storage(
+            runtime,
+            dest_object,
+            "width",
+            Variant::Integer(source.width as i64),
+        );
+        set_layer_property_storage(
+            runtime,
             dest_object,
             "height",
             Variant::Integer(source.height as i64),
@@ -2468,7 +3239,7 @@ fn this_font_spec(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -
 }
 
 fn layer_font_spec(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Result<FontSpec> {
-    match runtime.object_member(layer, "font") {
+    match layer_property_value(runtime, layer, "font") {
         Variant::Object(font) => font_spec_from_object(runtime, font),
         _ => Ok(FontSpec::default()),
     }
@@ -2549,8 +3320,7 @@ fn rect_args(args: &[Variant]) -> Result<Option<(i64, i64, i64, i64)>> {
 }
 
 fn is_province_face(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> bool {
-    runtime
-        .object_member(layer, "face")
+    layer_property_value(runtime, layer, "face")
         .to_integer()
         .is_ok_and(|face| face == 3)
 }
@@ -2732,25 +3502,23 @@ fn sync_layer_image_members(
     width: i64,
     height: i64,
 ) {
-    runtime.set_object_member(this, "imageLeft", Variant::Integer(0));
-    runtime.set_object_member(this, "imageTop", Variant::Integer(0));
-    runtime.set_object_member(this, "imageWidth", Variant::Integer(width));
-    runtime.set_object_member(this, "imageHeight", Variant::Integer(height));
-    if runtime
-        .object_member(this, "width")
+    set_layer_property_storage(runtime, this, "imageLeft", Variant::Integer(0));
+    set_layer_property_storage(runtime, this, "imageTop", Variant::Integer(0));
+    set_layer_property_storage(runtime, this, "imageWidth", Variant::Integer(width));
+    set_layer_property_storage(runtime, this, "imageHeight", Variant::Integer(height));
+    if layer_property_value(runtime, this, "width")
         .to_integer()
         .unwrap_or(0)
         <= 0
     {
-        runtime.set_object_member(this, "width", Variant::Integer(width));
+        set_layer_property_storage(runtime, this, "width", Variant::Integer(width));
     }
-    if runtime
-        .object_member(this, "height")
+    if layer_property_value(runtime, this, "height")
         .to_integer()
         .unwrap_or(0)
         <= 0
     {
-        runtime.set_object_member(this, "height", Variant::Integer(height));
+        set_layer_property_storage(runtime, this, "height", Variant::Integer(height));
     }
 }
 

@@ -64,6 +64,7 @@ pub struct Renderer {
     frame_text_textures: BTreeSet<TextureId>,
     physical_size: PhysicalSize<u32>,
     scale_factor: f64,
+    content_size: Option<Size>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +164,7 @@ impl Renderer {
             frame_text_textures: BTreeSet::new(),
             physical_size,
             scale_factor,
+            content_size: None,
         })
     }
 
@@ -184,6 +186,10 @@ impl Renderer {
             self.physical_size.width as f32 / self.scale_factor as f32,
             self.physical_size.height as f32 / self.scale_factor as f32,
         )
+    }
+
+    pub fn set_content_size(&mut self, content_size: Option<Size>) {
+        self.content_size = content_size.filter(|size| !size.is_empty());
     }
 
     pub fn viewport(&self) -> RenderViewport {
@@ -634,11 +640,11 @@ impl Renderer {
     }
 
     fn image_vertices(&self, command: &ImageCommand) -> [TexturedVertex; 6] {
-        let scale = self.scale_factor as f32;
-        let x0 = command.rect.x * scale;
-        let y0 = command.rect.y * scale;
-        let x1 = (command.rect.x + command.rect.width) * scale;
-        let y1 = (command.rect.y + command.rect.height) * scale;
+        let transform = self.render_transform();
+        let x0 = command.rect.x * transform.x_scale;
+        let y0 = command.rect.y * transform.y_scale;
+        let x1 = (command.rect.x + command.rect.width) * transform.x_scale;
+        let y1 = (command.rect.y + command.rect.height) * transform.y_scale;
         let tx0 = command.source_rect.x / command.texture_size.width.max(1.0);
         let ty0 = command.source_rect.y / command.texture_size.height.max(1.0);
         let tx1 = (command.source_rect.x + command.source_rect.width)
@@ -658,11 +664,11 @@ impl Renderer {
     }
 
     fn rect_vertices(&self, rect: Rect, color: Color) -> [Vertex; 6] {
-        let scale = self.scale_factor as f32;
-        let x0 = rect.x * scale;
-        let y0 = rect.y * scale;
-        let x1 = (rect.x + rect.width) * scale;
-        let y1 = (rect.y + rect.height) * scale;
+        let transform = self.render_transform();
+        let x0 = rect.x * transform.x_scale;
+        let y0 = rect.y * transform.y_scale;
+        let x1 = (rect.x + rect.width) * transform.x_scale;
+        let y1 = (rect.y + rect.height) * transform.y_scale;
         let color = [color.r, color.g, color.b, color.a];
 
         [
@@ -682,15 +688,19 @@ impl Renderer {
     }
 
     fn physical_rect(&self, rect: Rect) -> Option<PhysicalRect> {
-        let scale = self.scale_factor as f32;
+        let transform = self.render_transform();
         let target_width = self.config.width as f32;
         let target_height = self.config.height as f32;
-        let x0 = (rect.x * scale).floor().clamp(0.0, target_width);
-        let y0 = (rect.y * scale).floor().clamp(0.0, target_height);
-        let x1 = ((rect.x + rect.width) * scale)
+        let x0 = (rect.x * transform.x_scale)
+            .floor()
+            .clamp(0.0, target_width);
+        let y0 = (rect.y * transform.y_scale)
+            .floor()
+            .clamp(0.0, target_height);
+        let x1 = ((rect.x + rect.width) * transform.x_scale)
             .ceil()
             .clamp(0.0, target_width);
-        let y1 = ((rect.y + rect.height) * scale)
+        let y1 = ((rect.y + rect.height) * transform.y_scale)
             .ceil()
             .clamp(0.0, target_height);
 
@@ -705,6 +715,20 @@ impl Renderer {
             height: (y1 - y0) as u32,
         })
     }
+
+    fn render_transform(&self) -> RenderTransform {
+        let content_size = self.content_size.unwrap_or_else(|| self.logical_size());
+        RenderTransform {
+            x_scale: self.config.width as f32 / content_size.width.max(1.0),
+            y_scale: self.config.height as f32 / content_size.height.max(1.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RenderTransform {
+    x_scale: f32,
+    y_scale: f32,
 }
 
 #[cfg(target_os = "macos")]
