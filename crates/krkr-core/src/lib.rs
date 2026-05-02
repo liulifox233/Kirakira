@@ -777,9 +777,13 @@ pub enum EngineEvent {
         button: PointerButton,
         state: ButtonState,
     },
+    MouseWheel {
+        delta: i32,
+    },
     KeyboardInput {
         key: EngineKey,
         state: ButtonState,
+        repeat: bool,
     },
 }
 
@@ -970,6 +974,7 @@ impl Engine {
             EngineEvent::KeyboardInput {
                 key: EngineKey::Escape,
                 state: ButtonState::Pressed,
+                ..
             } => {
                 if self.panel == Panel::Settings {
                     self.panel = Panel::Launcher;
@@ -980,10 +985,13 @@ impl Engine {
             EngineEvent::KeyboardInput {
                 key: EngineKey::Enter | EngineKey::Space,
                 state: ButtonState::Pressed,
+                ..
             } => {
                 self.activate(self.hovered);
             }
-            EngineEvent::PointerInput { .. } | EngineEvent::KeyboardInput { .. } => {}
+            EngineEvent::PointerInput { .. }
+            | EngineEvent::MouseWheel { .. }
+            | EngineEvent::KeyboardInput { .. } => {}
         }
     }
 

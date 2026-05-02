@@ -13,7 +13,7 @@ use krkr_render::{RenderError, Renderer};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
-    event::{ElementState, MouseButton, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
     window::{Fullscreen, Window, WindowAttributes, WindowId},
@@ -189,7 +189,23 @@ impl DesktopApp {
                         std::time::Duration::from_secs_f32(delta_seconds.max(0.0)),
                     ) {
                         Ok(frame) => {
-                            return_to_launcher_after_render =
+                            if frame.input.unhandled_escape_pressed
+                                && !krkr_engine.host().termination_requested()
+                            {
+                                self.exit_after_runtime_close = false;
+                                if let Err(error) = krkr_engine.request_runtime_close() {
+                                    log_warn(&format!(
+                                        "failed to request runtime close from Escape fallback: {error}"
+                                    ));
+                                    if let Err(error) = krkr_engine.persist_runtime_state() {
+                                        log_warn(&format!(
+                                            "failed to persist runtime state before Escape fallback close: {error}"
+                                        ));
+                                    }
+                                    return_to_launcher_after_render = true;
+                                }
+                            }
+                            return_to_launcher_after_render |=
                                 krkr_engine.host().termination_requested();
                             let audio_commands = krkr_engine.host_mut().take_audio_commands();
                             if let Err(error) = self.audio.apply_commands(audio_commands) {
@@ -577,18 +593,18 @@ impl ApplicationHandler for DesktopApp {
                     window.request_redraw();
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if self.state == DesktopState::Running
-                    && event.state == ElementState::Pressed
-                    && matches!(map_key(&event.logical_key), Some(EngineKey::Escape))
-                {
-                    if !self.request_running_project_close(false) {
-                        self.return_to_launcher(&window);
-                    }
-                    window.request_redraw();
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta = map_wheel_delta(delta);
+                if delta == 0 {
                     return;
                 }
-
+                if self.state == DesktopState::Running {
+                    self.pending_runtime_events
+                        .push(EngineEvent::MouseWheel { delta });
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
                 if matches!(self.state, DesktopState::Launcher | DesktopState::Settings)
                     && let Some(key) = map_key(&event.logical_key)
                 {
@@ -596,6 +612,7 @@ impl ApplicationHandler for DesktopApp {
                         EngineEvent::KeyboardInput {
                             key,
                             state: map_button_state(event.state),
+                            repeat: event.repeat,
                         },
                         &window,
                     );
@@ -607,6 +624,7 @@ impl ApplicationHandler for DesktopApp {
                         .push(EngineEvent::KeyboardInput {
                             key,
                             state: map_button_state(event.state),
+                            repeat: event.repeat,
                         });
                     window.request_redraw();
                 }
@@ -701,6 +719,20 @@ fn map_mouse_button(button: MouseButton) -> PointerButton {
         MouseButton::Back => PointerButton::Other(3),
         MouseButton::Forward => PointerButton::Other(4),
         MouseButton::Other(value) => PointerButton::Other(value),
+    }
+}
+
+fn map_wheel_delta(delta: MouseScrollDelta) -> i32 {
+    let y = match delta {
+        MouseScrollDelta::LineDelta(_, y) => y * 120.0,
+        MouseScrollDelta::PixelDelta(position) => position.y as f32,
+    };
+    if y.abs() < f32::EPSILON {
+        0
+    } else if y.abs() < 1.0 {
+        y.signum() as i32
+    } else {
+        y.round() as i32
     }
 }
 
