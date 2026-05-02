@@ -176,6 +176,12 @@ pub struct TextCommand {
 pub type TextureId = u64;
 pub type LayerId = u64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UploadedImageState {
+    width: u32,
+    height: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImageUpload {
     pub texture_id: TextureId,
@@ -652,6 +658,14 @@ struct LayerDrawModel<'a> {
     uploads: Vec<ImageUpload>,
 }
 
+fn collect_image_texture_ids(commands: &[DrawCommand], texture_ids: &mut BTreeSet<TextureId>) {
+    for command in commands {
+        if let DrawCommand::Image(image) = command {
+            texture_ids.insert(image.texture_id);
+        }
+    }
+}
+
 fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
     let x0 = a.x.max(b.x);
     let y0 = a.y.max(b.y);
@@ -923,6 +937,7 @@ impl UiLayout {
 #[derive(Debug)]
 pub struct Engine {
     viewport_size: Size,
+    uploaded_images: BTreeMap<TextureId, UploadedImageState>,
     cursor_position: Option<Point>,
     panel: Panel,
     hovered: Option<UiElement>,
@@ -937,6 +952,7 @@ impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             viewport_size: config.initial_viewport,
+            uploaded_images: BTreeMap::new(),
             cursor_position: None,
             panel: Panel::Launcher,
             hovered: None,
@@ -1050,6 +1066,32 @@ impl Engine {
         message: &MessageLayerModel,
         suppressed_images: &BTreeSet<LayerId>,
     ) -> FrameOutput {
+        let output =
+            self.running_layer_frame_output(input, layers, message, suppressed_images, None);
+        self.finalize_frame_output(output)
+    }
+
+    pub fn tick_running_with_layers_suppressing_images_and_transition(
+        &mut self,
+        input: FrameInput,
+        layers: &LayerTree,
+        message: &MessageLayerModel,
+        suppressed_images: &BTreeSet<LayerId>,
+        transition: Option<FrameTransition>,
+    ) -> FrameOutput {
+        let output =
+            self.running_layer_frame_output(input, layers, message, suppressed_images, transition);
+        self.finalize_frame_output(output)
+    }
+
+    fn running_layer_frame_output(
+        &mut self,
+        input: FrameInput,
+        layers: &LayerTree,
+        message: &MessageLayerModel,
+        suppressed_images: &BTreeSet<LayerId>,
+        transition: Option<FrameTransition>,
+    ) -> FrameOutput {
         if !input.viewport_size.is_empty() {
             self.viewport_size = input.viewport_size;
         }
@@ -1060,6 +1102,40 @@ impl Engine {
 
         FrameOutput::new(palette::RUNTIME_BACKGROUND, draw_commands)
             .with_image_uploads(image_uploads)
+            .with_transition(transition)
+    }
+
+    fn filter_new_image_uploads(&mut self, uploads: Vec<ImageUpload>) -> Vec<ImageUpload> {
+        uploads
+            .into_iter()
+            .filter(|upload| {
+                let state = UploadedImageState {
+                    width: upload.width,
+                    height: upload.height,
+                };
+                if self.uploaded_images.get(&upload.texture_id) == Some(&state) {
+                    return false;
+                }
+                self.uploaded_images.insert(upload.texture_id, state);
+                true
+            })
+            .collect()
+    }
+
+    fn finalize_frame_output(&mut self, mut output: FrameOutput) -> FrameOutput {
+        output.image_uploads = self.filter_new_image_uploads(output.image_uploads);
+        if let Some(transition) = &mut output.transition {
+            transition.frozen_image_uploads =
+                self.filter_new_image_uploads(std::mem::take(&mut transition.frozen_image_uploads));
+        }
+        let mut referenced_textures = BTreeSet::new();
+        collect_image_texture_ids(&output.draw_commands, &mut referenced_textures);
+        if let Some(transition) = &output.transition {
+            collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced_textures);
+        }
+        self.uploaded_images
+            .retain(|texture_id, _| referenced_textures.contains(texture_id));
+        output
     }
 
     pub fn view_model(&self) -> LauncherViewModel {
@@ -1700,6 +1776,76 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, DrawCommand::Text(text) if text.text == "World"))
         );
+    }
+
+    #[test]
+    fn running_layer_uploads_are_emitted_only_once_per_texture() {
+        let pixels = std::sync::Arc::<[u8]>::from(vec![255, 255, 255, 255]);
+        let image = LayerImage::new(42, 1, 1, pixels);
+        let mut layers = LayerTree::new();
+        let id = layers.create_layer("image", None, 0);
+        {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 1.0;
+            layer.height = 1.0;
+            layer.visible = true;
+            layer.set_image(image);
+        }
+
+        let mut engine = Engine::new(EngineConfig::default());
+        let first = engine.tick_running_with_layers(
+            FrameInput::new(Size::new(320.0, 240.0), 0.0),
+            &layers,
+            &MessageLayerModel::default(),
+        );
+        let second = engine.tick_running_with_layers(
+            FrameInput::new(Size::new(320.0, 240.0), 0.0),
+            &layers,
+            &MessageLayerModel::default(),
+        );
+
+        assert_eq!(first.image_uploads.len(), 1);
+        assert!(second.image_uploads.is_empty());
+        assert_eq!(first.draw_commands, second.draw_commands);
+    }
+
+    #[test]
+    fn running_layer_uploads_are_reemitted_after_texture_leaves_frame() {
+        let pixels = std::sync::Arc::<[u8]>::from(vec![255, 255, 255, 255]);
+        let image = LayerImage::new(42, 1, 1, pixels);
+        let mut layers = LayerTree::new();
+        let id = layers.create_layer("image", None, 0);
+        {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 1.0;
+            layer.height = 1.0;
+            layer.visible = true;
+            layer.set_image(image);
+        }
+
+        let mut engine = Engine::new(EngineConfig::default());
+        let first = engine.tick_running_with_layers(
+            FrameInput::new(Size::new(320.0, 240.0), 0.0),
+            &layers,
+            &MessageLayerModel::default(),
+        );
+        layers.layer_mut(id).expect("layer").visible = false;
+        let hidden = engine.tick_running_with_layers(
+            FrameInput::new(Size::new(320.0, 240.0), 0.0),
+            &layers,
+            &MessageLayerModel::default(),
+        );
+        layers.layer_mut(id).expect("layer").visible = true;
+        let visible_again = engine.tick_running_with_layers(
+            FrameInput::new(Size::new(320.0, 240.0), 0.0),
+            &layers,
+            &MessageLayerModel::default(),
+        );
+
+        assert_eq!(first.image_uploads.len(), 1);
+        assert!(hidden.image_uploads.is_empty());
+        assert_eq!(visible_again.image_uploads.len(), 1);
+        assert_eq!(visible_again.image_uploads[0].texture_id, 42);
     }
 
     #[test]
