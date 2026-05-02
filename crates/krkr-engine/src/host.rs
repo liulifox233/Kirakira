@@ -1630,7 +1630,7 @@ mod tests {
             .expect("system clock")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "krkr-ruri-engine-host-{prefix}-{}-{nanos}",
+            "Kirakira-engine-host-{prefix}-{}-{nanos}",
             std::process::id()
         ))
     }

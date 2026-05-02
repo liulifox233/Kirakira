@@ -124,6 +124,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("krkr-ruri-platform-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("Kirakira-platform-{}-{nanos}", std::process::id()))
     }
 }

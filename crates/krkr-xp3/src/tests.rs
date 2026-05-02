@@ -692,7 +692,7 @@ fn temp_root(prefix: &str) -> PathBuf {
         .expect("system clock should be after epoch")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "krkr-ruri-xp3-{prefix}-{}-{nanos}",
+        "Kirakira-xp3-{prefix}-{}-{nanos}",
         std::process::id()
     ))
 }
