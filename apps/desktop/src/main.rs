@@ -23,7 +23,7 @@ fn main() -> ExitCode {
         Err(error) => {
             let message = format!("failed to create event loop: {error}");
             log_error(&message);
-            show_error("krkr-ruri startup failed", &message);
+            show_error("Kirakira startup failed", &message);
             return ExitCode::FAILURE;
         }
     };
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
         Err(error) => {
             let message = format!("krkr-desktop failed: {error}");
             log_error(&message);
-            show_error("krkr-ruri failed", &message);
+            show_error("Kirakira failed", &message);
             ExitCode::FAILURE
         }
     }
@@ -104,7 +104,7 @@ impl DesktopApp {
 
         log_info("creating desktop window");
         let attributes = WindowAttributes::default()
-            .with_title("krkr-ruri")
+            .with_title("Kirakira")
             .with_inner_size(LogicalSize::new(960.0, 600.0))
             .with_min_inner_size(LogicalSize::new(420.0, 320.0));
         let window = match event_loop.create_window(attributes) {
@@ -120,9 +120,9 @@ impl DesktopApp {
             Ok(renderer) => renderer,
             Err(error) => {
                 let message = format!("renderer initialization failed: {error}");
-                window.set_title(&format!("krkr-ruri - {message}"));
+                window.set_title(&format!("Kirakira - {message}"));
                 log_error(&message);
-                show_error("krkr-ruri renderer failed", &message);
+                show_error("Kirakira renderer failed", &message);
                 self.state = DesktopState::FatalError;
                 self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
                 self.window = Some(window);
@@ -225,7 +225,7 @@ impl DesktopApp {
                 RenderError::OutOfMemory => {
                     let message = "GPU surface is out of memory; exiting".to_string();
                     log_error(&message);
-                    show_error("krkr-ruri renderer failed", &message);
+                    show_error("Kirakira renderer failed", &message);
                     event_loop.exit();
                 }
             }
@@ -443,11 +443,11 @@ impl DesktopApp {
 
         match &self.status {
             Some(status) => format!(
-                "krkr-ruri - {state} - {}: {}",
+                "Kirakira - {state} - {}: {}",
                 status_level_label(status.level),
                 truncate_for_title(&status.message)
             ),
-            None => format!("krkr-ruri - {state}"),
+            None => format!("Kirakira - {state}"),
         }
     }
 
@@ -459,7 +459,7 @@ impl DesktopApp {
     ) {
         let message = format!("{summary}: {error}");
         log_error(&message);
-        show_error("krkr-ruri startup failed", &message);
+        show_error("Kirakira startup failed", &message);
         self.state = DesktopState::FatalError;
         self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
         event_loop.exit();

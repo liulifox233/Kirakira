@@ -1,6 +1,6 @@
-# krkr-ruri
+# Kirakira
 
-`krkr-ruri` is a lightweight, high-performance, modern KRKR game emulator.
+`Kirakira` is a lightweight, high-performance, modern KRKR game emulator.
 
 ## Run
 

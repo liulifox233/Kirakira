@@ -107,7 +107,7 @@ impl Renderer {
             .map_err(|_| RendererInitError::AdapterUnavailable)?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("krkr-ruri device"),
+                label: Some("Kirakira device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -230,19 +230,19 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("krkr-ruri render encoder"),
+                label: Some("Kirakira render encoder"),
             });
 
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         if let Some(transition) = &prepared.transition {
-            let old_target = self.create_offscreen_target("krkr-ruri transition frozen target");
-            let new_target = self.create_offscreen_target("krkr-ruri transition live target");
+            let old_target = self.create_offscreen_target("Kirakira transition frozen target");
+            let new_target = self.create_offscreen_target("Kirakira transition live target");
             self.render_commands_to_view(
                 &mut encoder,
                 &old_target.view,
-                "krkr-ruri transition frozen pass",
+                "Kirakira transition frozen pass",
                 frame.clear_color,
                 None,
                 &transition.frozen_draw_commands,
@@ -250,7 +250,7 @@ impl Renderer {
             self.render_commands_to_view(
                 &mut encoder,
                 &new_target.view,
-                "krkr-ruri transition live pass",
+                "Kirakira transition live pass",
                 frame.clear_color,
                 frame.clip,
                 &prepared.draw_commands,
@@ -267,7 +267,7 @@ impl Renderer {
             self.render_commands_to_view(
                 &mut encoder,
                 &view,
-                "krkr-ruri render pass",
+                "Kirakira render pass",
                 frame.clear_color,
                 frame.clip,
                 &prepared.draw_commands,
@@ -367,7 +367,7 @@ impl Renderer {
             }
 
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("krkr-ruri uploaded texture"),
+                label: Some("Kirakira uploaded texture"),
                 size: wgpu::Extent3d {
                     width: upload.width.max(1),
                     height: upload.height.max(1),
@@ -401,7 +401,7 @@ impl Renderer {
             );
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("krkr-ruri texture bind group"),
+                label: Some("Kirakira texture bind group"),
                 layout: &self.texture_pipeline.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -475,7 +475,7 @@ impl Renderer {
         let uniform_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("krkr-ruri transition uniforms"),
+                label: Some("Kirakira transition uniforms"),
                 contents: bytemuck::cast_slice(&[TransitionUniforms {
                     progress,
                     _padding: [0.0; 3],
@@ -483,7 +483,7 @@ impl Renderer {
                 usage: wgpu::BufferUsages::UNIFORM,
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("krkr-ruri transition bind group"),
+            label: Some("Kirakira transition bind group"),
             layout: &self.transition_pipeline.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -509,7 +509,7 @@ impl Renderer {
             ],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("krkr-ruri transition composite pass"),
+            label: Some("Kirakira transition composite pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 depth_slice: None,
@@ -581,7 +581,7 @@ impl Renderer {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("krkr-ruri rect vertices"),
+                label: Some("Kirakira rect vertices"),
                 contents: bytemuck::cast_slice(vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -602,7 +602,7 @@ impl Renderer {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("krkr-ruri image vertices"),
+                label: Some("Kirakira image vertices"),
                 contents: bytemuck::cast_slice(&vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -629,7 +629,7 @@ impl Renderer {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("krkr-ruri fullscreen texture vertices"),
+                label: Some("Kirakira fullscreen texture vertices"),
                 contents: bytemuck::cast_slice(&vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
@@ -757,13 +757,13 @@ fn create_rect_pipeline(
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::include_wgsl!("rect.wgsl"));
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("krkr-ruri rect pipeline layout"),
+        label: Some("Kirakira rect pipeline layout"),
         bind_group_layouts: &[],
         immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("krkr-ruri rect pipeline"),
+        label: Some("Kirakira rect pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -806,7 +806,7 @@ struct TexturePipelineResources {
 impl TexturePipelineResources {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("krkr-ruri texture bind group layout"),
+            label: Some("Kirakira texture bind group layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -827,7 +827,7 @@ impl TexturePipelineResources {
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("krkr-ruri texture sampler"),
+            label: Some("Kirakira texture sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -838,12 +838,12 @@ impl TexturePipelineResources {
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("texture.wgsl"));
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("krkr-ruri texture pipeline layout"),
+            label: Some("Kirakira texture pipeline layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("krkr-ruri texture pipeline"),
+            label: Some("Kirakira texture pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -896,7 +896,7 @@ struct TransitionPipelineResources {
 impl TransitionPipelineResources {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("krkr-ruri transition bind group layout"),
+            label: Some("Kirakira transition bind group layout"),
             entries: &[
                 texture_bind_group_layout_entry(0),
                 sampler_bind_group_layout_entry(1),
@@ -916,12 +916,12 @@ impl TransitionPipelineResources {
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("transition.wgsl"));
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("krkr-ruri transition pipeline layout"),
+            label: Some("Kirakira transition pipeline layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("krkr-ruri transition pipeline"),
+            label: Some("Kirakira transition pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,

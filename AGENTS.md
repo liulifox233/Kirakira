@@ -2,7 +2,7 @@
 
 ## Project Philosophy
 
-`krkr-ruri` is a lightweight, high-performance, modern KRKR game emulator. It targets KRKR2/KRKRZ compatibility and full cross-platform reach across Linux, macOS, Windows, Android, iOS, and Web without C++ glue code.
+`Kirakira` is a lightweight, high-performance, modern KRKR game emulator. It targets KRKR2/KRKRZ compatibility and full cross-platform reach across Linux, macOS, Windows, Android, iOS, and Web without C++ glue code.
 
 ## Architecture
 

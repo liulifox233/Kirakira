@@ -45,8 +45,8 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(system, "getArgument", system_get_argument);
 
     for (name, value) in [
-        ("versionString", Variant::String("krkr-ruri".to_string())),
-        ("platformName", Variant::String("krkr-ruri".to_string())),
+        ("versionString", Variant::String("Kirakira".to_string())),
+        ("platformName", Variant::String("Kirakira".to_string())),
         ("osName", Variant::String(std::env::consts::OS.to_string())),
         ("exePath", Variant::String(exe_path(runtime))),
         ("personalPath", Variant::String(temp_path())),
@@ -59,7 +59,7 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
         ("exeBits", Variant::Integer((usize::BITS) as i64)),
         ("osBits", Variant::Integer((usize::BITS) as i64)),
         ("exitOnNoWindowStartup", Variant::Integer(0)),
-        ("title", Variant::String("krkr-ruri".to_string())),
+        ("title", Variant::String("Kirakira".to_string())),
         ("screenWidth", Variant::Integer(960)),
         ("screenHeight", Variant::Integer(600)),
         ("desktopLeft", Variant::Integer(0)),

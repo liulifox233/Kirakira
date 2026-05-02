@@ -7117,7 +7117,7 @@ mod tests {
             .as_nanos();
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "krkr-ruri-engine-{}-{nanos}-{id}",
+            "Kirakira-engine-{}-{nanos}-{id}",
             std::process::id()
         ))
     }
