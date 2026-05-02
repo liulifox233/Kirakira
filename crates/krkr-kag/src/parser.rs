@@ -416,6 +416,18 @@ impl KagParser {
         self.move_to(Some(&storage), Some(label), None::<&mut ()>)
     }
 
+    pub fn go_to_with<H>(
+        &mut self,
+        storage: Option<&str>,
+        target: Option<&str>,
+        host: &mut H,
+    ) -> Result<()>
+    where
+        H: KagHost,
+    {
+        self.move_to(storage, target, Some(host))
+    }
+
     pub fn call_label(&mut self, label: &str) -> Result<()> {
         if label.trim().is_empty() {
             self.push_call_frame()?;
@@ -425,6 +437,22 @@ impl KagParser {
         let preserved_params = self.macro_params.clone();
         self.push_call_frame()?;
         self.move_to(Some(&storage), Some(label), None::<&mut ()>)?;
+        self.macro_params = preserved_params;
+        Ok(())
+    }
+
+    pub fn call_with<H>(
+        &mut self,
+        storage: Option<&str>,
+        target: Option<&str>,
+        host: &mut H,
+    ) -> Result<()>
+    where
+        H: KagHost,
+    {
+        let preserved_params = self.macro_params.clone();
+        self.push_call_frame()?;
+        self.move_to(storage, target, Some(host))?;
         self.macro_params = preserved_params;
         Ok(())
     }

@@ -48,9 +48,11 @@ pub struct KrkrHost {
     next_texture_id: u64,
     next_audio_instance_id: u64,
     native_audio_buffers: BTreeMap<ObjectHandle, NativeAudioBuffer>,
+    native_audio_global_volume: i64,
     pending_audio_fade_completions: BTreeMap<ObjectHandle, i64>,
     pending_audio_commands: Vec<AudioCommand>,
     text_encoding: String,
+    pressed_keys: BTreeSet<i64>,
     termination_requested: bool,
 }
 
@@ -83,9 +85,11 @@ impl Default for KrkrHost {
             next_texture_id: 1,
             next_audio_instance_id: 1,
             native_audio_buffers: BTreeMap::new(),
+            native_audio_global_volume: 100000,
             pending_audio_fade_completions: BTreeMap::new(),
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
+            pressed_keys: BTreeSet::new(),
             termination_requested: false,
         }
     }
@@ -123,9 +127,11 @@ impl KrkrHost {
             next_texture_id: 1,
             next_audio_instance_id: 1,
             native_audio_buffers: BTreeMap::new(),
+            native_audio_global_volume: 100000,
             pending_audio_fade_completions: BTreeMap::new(),
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
+            pressed_keys: BTreeSet::new(),
             termination_requested: false,
         })
     }
@@ -156,6 +162,18 @@ impl KrkrHost {
 
     pub fn set_text_encoding(&mut self, encoding: impl Into<String>) {
         self.text_encoding = encoding.into();
+    }
+
+    pub(crate) fn set_key_state(&mut self, key: i64, pressed: bool) {
+        if pressed {
+            self.pressed_keys.insert(key);
+        } else {
+            self.pressed_keys.remove(&key);
+        }
+    }
+
+    pub(crate) fn key_state(&self, key: i64) -> bool {
+        self.pressed_keys.contains(&key)
     }
 
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
@@ -219,7 +237,7 @@ impl KrkrHost {
         }
 
         if let Some(provider) = &self.xp3_provider {
-            for candidate in storage_lookup_names(name)? {
+            for candidate in self.storage_candidates(name)? {
                 if provider.exists(&candidate) {
                     let mut stream = provider.open(&candidate).map_err(io_error)?;
                     let mut bytes = Vec::new();
@@ -279,13 +297,22 @@ impl KrkrHost {
     }
 
     fn fs_candidates(&self, name: &str) -> Result<Vec<PathBuf>> {
+        self.storage_candidates(name)?
+            .into_iter()
+            .map(|candidate| clean_relative_path(&candidate))
+            .collect()
+    }
+
+    fn storage_candidates(&self, name: &str) -> Result<Vec<String>> {
         let names = storage_lookup_names(name)?;
         let mut candidates = Vec::with_capacity(names.len() * (self.auto_paths.len() + 1));
         for name in names {
             let clean = clean_relative_path(&name)?;
-            candidates.push(clean.clone());
+            push_unique_storage_candidate(&mut candidates, &clean);
             for auto_path in self.auto_paths.iter().rev() {
-                candidates.extend(auto_path_candidates(auto_path, &clean));
+                for candidate in auto_path_candidates(auto_path, &clean) {
+                    push_unique_storage_candidate(&mut candidates, &candidate);
+                }
             }
         }
         Ok(candidates)
@@ -617,11 +644,74 @@ impl KrkrHost {
         self.native_audio_buffers.get(&handle)
     }
 
-    pub(crate) fn native_audio_buffer_mut(
+    pub(crate) fn native_audio_global_volume(&self) -> i64 {
+        self.native_audio_global_volume
+    }
+
+    pub(crate) fn set_native_audio_global_volume(&mut self, volume: i64) {
+        self.native_audio_global_volume = clamp_krkr_volume(volume);
+        self.queue_all_native_audio_volume_updates();
+    }
+
+    pub(crate) fn set_native_audio_volume(&mut self, handle: ObjectHandle, volume: i64) {
+        self.set_native_audio_volume_with_fade(handle, volume, 0.0);
+    }
+
+    pub(crate) fn set_native_audio_volume_with_fade(
         &mut self,
         handle: ObjectHandle,
-    ) -> Option<&mut NativeAudioBuffer> {
-        self.native_audio_buffers.get_mut(&handle)
+        volume: i64,
+        fade_seconds: f32,
+    ) {
+        let global_volume = self.native_audio_global_volume;
+        let Some(buffer) = self.native_audio_buffers.get_mut(&handle) else {
+            return;
+        };
+        buffer.volume = clamp_krkr_volume(volume);
+        if buffer.playing {
+            let id = buffer.id;
+            let volume = buffer.effective_volume(global_volume);
+            self.pending_audio_commands.push(AudioCommand::SetVolume {
+                id,
+                volume,
+                fade_seconds,
+            });
+        }
+    }
+
+    pub(crate) fn set_native_audio_volume2(&mut self, handle: ObjectHandle, volume: i64) {
+        let global_volume = self.native_audio_global_volume;
+        let Some(buffer) = self.native_audio_buffers.get_mut(&handle) else {
+            return;
+        };
+        buffer.volume2 = clamp_krkr_volume(volume);
+        if buffer.playing {
+            let id = buffer.id;
+            let volume = buffer.effective_volume(global_volume);
+            self.pending_audio_commands.push(AudioCommand::SetVolume {
+                id,
+                volume,
+                fade_seconds: 0.0,
+            });
+        }
+    }
+
+    pub(crate) fn set_native_audio_looping(&mut self, handle: ObjectHandle, looping: bool) {
+        if let Some(buffer) = self.native_audio_buffers.get_mut(&handle) {
+            buffer.looping = looping;
+        }
+    }
+
+    pub(crate) fn set_native_audio_pan(&mut self, handle: ObjectHandle, pan: i64) {
+        if let Some(buffer) = self.native_audio_buffers.get_mut(&handle) {
+            buffer.pan = pan.clamp(-100000, 100000);
+        }
+    }
+
+    pub(crate) fn mark_native_audio_stopped(&mut self, handle: ObjectHandle) {
+        if let Some(buffer) = self.native_audio_buffers.get_mut(&handle) {
+            buffer.playing = false;
+        }
     }
 
     pub(crate) fn open_native_audio_storage(
@@ -653,7 +743,7 @@ impl KrkrHost {
     ) -> Result<()> {
         let buffer = self
             .native_audio_buffers
-            .get(&handle)
+            .get_mut(&handle)
             .ok_or_else(|| TjsError::runtime("WaveSoundBuffer is not initialized"))?;
         let storage = buffer
             .storage
@@ -663,14 +753,18 @@ impl KrkrHost {
             .bytes
             .clone()
             .ok_or_else(|| TjsError::runtime("WaveSoundBuffer has no decoded source bytes"))?;
+        let id = buffer.id;
+        let looping = buffer.looping;
+        let volume = buffer.effective_volume(self.native_audio_global_volume);
+        buffer.playing = true;
         self.pending_audio_commands.push(AudioCommand::Play {
-            id: buffer.id,
+            id,
             bus,
             kind,
             storage,
             bytes,
-            looping: buffer.looping,
-            volume: buffer.volume,
+            looping,
+            volume,
         });
         Ok(())
     }
@@ -710,6 +804,23 @@ impl KrkrHost {
         let id = AudioInstanceId(self.next_audio_instance_id);
         self.next_audio_instance_id = self.next_audio_instance_id.saturating_add(1);
         id
+    }
+
+    fn queue_all_native_audio_volume_updates(&mut self) {
+        let global_volume = self.native_audio_global_volume;
+        let updates = self
+            .native_audio_buffers
+            .values()
+            .filter(|buffer| buffer.playing)
+            .map(|buffer| (buffer.id, buffer.effective_volume(global_volume)))
+            .collect::<Vec<_>>();
+        for (id, volume) in updates {
+            self.pending_audio_commands.push(AudioCommand::SetVolume {
+                id,
+                volume,
+                fade_seconds: 0.0,
+            });
+        }
     }
 
     pub(crate) fn create_layer_image(
@@ -1031,7 +1142,10 @@ pub(crate) struct NativeAudioBuffer {
     pub storage: Option<String>,
     pub bytes: Option<Vec<u8>>,
     pub looping: bool,
-    pub volume: f32,
+    pub volume: i64,
+    pub volume2: i64,
+    pub pan: i64,
+    pub playing: bool,
 }
 
 impl NativeAudioBuffer {
@@ -1041,9 +1155,27 @@ impl NativeAudioBuffer {
             storage: None,
             bytes: None,
             looping: false,
-            volume: 1.0,
+            volume: 100000,
+            volume2: 100000,
+            pan: 0,
+            playing: false,
         }
     }
+
+    fn effective_volume(&self, global_volume: i64) -> f32 {
+        krkr_volume_product_to_linear(self.volume, self.volume2, global_volume)
+    }
+}
+
+fn clamp_krkr_volume(volume: i64) -> i64 {
+    volume.clamp(0, 100000)
+}
+
+fn krkr_volume_product_to_linear(volume: i64, volume2: i64, global_volume: i64) -> f32 {
+    let volume = clamp_krkr_volume(volume) as f32 / 100000.0;
+    let volume2 = clamp_krkr_volume(volume2) as f32 / 100000.0;
+    let global_volume = clamp_krkr_volume(global_volume) as f32 / 100000.0;
+    (volume * volume2 * global_volume).clamp(0.0, 1.0)
 }
 
 #[derive(Clone)]
@@ -1130,6 +1262,17 @@ fn auto_path_candidates(auto_path: &str, clean: &Path) -> Vec<PathBuf> {
     vec![auto_relative.join(clean)]
 }
 
+fn push_unique_storage_candidate(candidates: &mut Vec<String>, path: &Path) {
+    let candidate = path_to_storage_name(path);
+    if !candidates.iter().any(|item| item == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn path_to_storage_name(path: &Path) -> String {
+    normalize_storage_separators(&path.to_string_lossy())
+}
+
 fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
     let name = normalize_storage_separators(name);
     clean_relative_path(&name)?;
@@ -1172,9 +1315,9 @@ fn is_known_storage_extension(extension: &str) -> bool {
 }
 
 fn normalize_auto_path(path: &str) -> Option<String> {
-    let mut path = normalize_storage_separators(path);
-    if path.ends_with('>') {
-        path.pop();
+    let path = normalize_storage_separators(path);
+    if let Some((_, inner_path)) = path.split_once('>') {
+        return Some(inner_path.trim_start_matches('/').to_string());
     }
     if path.is_empty() {
         return Some(String::new());
@@ -1185,7 +1328,11 @@ fn normalize_auto_path(path: &str) -> Option<String> {
             .and_then(|name| name.to_str())
             .map(str::to_string)
             .filter(|name| !name.ends_with(".xp3"))
-    } else if path.extension().is_some_and(|ext| ext == "xp3") {
+    } else if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
+    {
         path.file_stem()
             .and_then(|stem| stem.to_str())
             .map(str::to_string)
@@ -1283,20 +1430,37 @@ impl TjsHost for KrkrHost {
 }
 
 fn open_project_archives(root: &Path) -> Result<Option<Xp3ResourceProvider>> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Ok(None);
-    };
-    let mut archives = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "xp3"))
-        .collect::<Vec<_>>();
-    archives.sort();
+    let archives = project_archive_paths(root);
     if archives.is_empty() {
         return Ok(None);
     }
     Xp3ResourceProvider::open_archives(archives)
         .map(Some)
         .map_err(|error| TjsError::runtime(format!("failed to open XP3 archives: {error}")))
+}
+
+fn project_archive_paths(root: &Path) -> Vec<PathBuf> {
+    let mut archives = xp3_files_in_directory(&root.join("sys"));
+    archives.extend(xp3_files_in_directory(root));
+    archives
+}
+
+fn xp3_files_in_directory(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut archives = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
+        })
+        .collect::<Vec<_>>();
+    archives.sort();
+    archives
 }
 
 fn clean_relative_path(path: &str) -> Result<PathBuf> {
@@ -1326,4 +1490,84 @@ fn clean_relative_path(path: &str) -> Result<PathBuf> {
 
 fn io_error(error: io::Error) -> TjsError {
     TjsError::runtime(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_candidates_apply_auto_paths_to_xp3_lookups() {
+        let mut host = KrkrHost::default();
+        host.add_auto_path("bgimage/");
+        host.add_auto_path("/tmp/game/sys/bgimage.xp3>");
+
+        let candidates = host.storage_candidates("白").expect("candidates");
+
+        assert!(candidates.iter().any(|candidate| candidate == "白.jpg"));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "bgimage/白.jpg")
+        );
+    }
+
+    #[test]
+    fn normalize_auto_path_uses_archive_inner_prefix() {
+        assert_eq!(
+            normalize_auto_path("/tmp/game/sys/bgimage.xp3>"),
+            Some(String::new())
+        );
+        assert_eq!(
+            normalize_auto_path("/tmp/game/sys/bgimage.xp3>patch/"),
+            Some("patch/".to_string())
+        );
+        assert_eq!(
+            normalize_auto_path("/tmp/game/bgimage/"),
+            Some("bgimage".to_string())
+        );
+    }
+
+    #[test]
+    fn project_archive_paths_include_sys_archives_before_root_archives() {
+        let root = temp_root("archives");
+        fs::create_dir_all(root.join("sys")).expect("create sys");
+        fs::write(root.join("data.xp3"), []).expect("write data archive");
+        fs::write(root.join("patch.xp3"), []).expect("write patch archive");
+        fs::write(root.join("sys/bgimage.xp3"), []).expect("write bg archive");
+        fs::write(root.join("sys/fgimage.XP3"), []).expect("write fg archive");
+        fs::write(root.join("sys/readme.txt"), []).expect("write readme");
+
+        let paths = project_archive_paths(&root)
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .expect("strip root")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                "sys/bgimage.xp3",
+                "sys/fgimage.XP3",
+                "data.xp3",
+                "patch.xp3"
+            ]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "krkr-ruri-engine-host-{prefix}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 }

@@ -132,11 +132,15 @@ fn system_inform(
 }
 
 fn system_get_key_state(
-    _runtime: &mut Runtime<KrkrHost>,
+    runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
+    args: Vec<Variant>,
 ) -> Result<Variant> {
-    Ok(Variant::Integer(0))
+    let Some(key) = args.first() else {
+        return Ok(Variant::Integer(0));
+    };
+    let key = key.to_integer()?;
+    Ok(Variant::Integer(i64::from(runtime.host().key_state(key))))
 }
 
 fn system_shell_execute(

@@ -14,7 +14,7 @@ use winit::{
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
-    window::{Window, WindowAttributes, WindowId},
+    window::{Fullscreen, Window, WindowAttributes, WindowId},
 };
 
 fn main() -> ExitCode {
@@ -70,6 +70,7 @@ struct DesktopApp {
     engine: Engine,
     audio: AudioSystem,
     krkr_engine: Option<KrkrEngine>,
+    runtime_viewport_size: Option<Size>,
     pending_runtime_events: Vec<EngineEvent>,
     state: DesktopState,
     project_root: Option<PathBuf>,
@@ -86,6 +87,7 @@ impl DesktopApp {
             engine: Engine::new(EngineConfig::default()),
             audio: AudioSystem::new(),
             krkr_engine: None,
+            runtime_viewport_size: None,
             pending_runtime_events: Vec::new(),
             state: DesktopState::Launcher,
             project_root: None,
@@ -152,12 +154,19 @@ impl DesktopApp {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
+        let window = self.window.clone();
 
         let now = Instant::now();
         let delta_seconds = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        let frame_input = FrameInput::new(renderer.logical_size(), delta_seconds);
+        let window_logical_size = renderer.logical_size();
+        let content_size = if self.state == DesktopState::Running {
+            self.runtime_viewport_size.unwrap_or(window_logical_size)
+        } else {
+            window_logical_size
+        };
+        let frame_input = FrameInput::new(content_size, delta_seconds);
         let mut return_to_launcher_after_render = false;
         let frame = match self.state {
             DesktopState::Launcher => {
@@ -186,6 +195,9 @@ impl DesktopApp {
                                     Some(DesktopStatus::new(StatusLevel::Warning, message));
                                 self.engine.set_status_level(Some(StatusLevel::Warning));
                             }
+                            if let Some(window) = window.as_deref() {
+                                apply_window_fullscreen(window, krkr_engine.window_fullscreen());
+                            }
                             frame.output
                         }
                         Err(error) => {
@@ -206,6 +218,8 @@ impl DesktopApp {
             }
         };
 
+        let render_content_size = (self.state == DesktopState::Running).then_some(content_size);
+        renderer.set_content_size(render_content_size);
         if let Err(error) = renderer.render(&frame) {
             match error {
                 RenderError::OutOfMemory => {
@@ -326,11 +340,16 @@ impl DesktopApp {
             log_info(&format!("loaded startup.ks for {}", root.display()));
         }
 
-        if let Some(size) = krkr_engine.preferred_viewport_size() {
+        let preferred_size = krkr_engine.preferred_viewport_size();
+        if let Some(size) = preferred_size {
             self.resize_window_for_runtime(window, size);
         }
+        apply_window_fullscreen(window, krkr_engine.window_fullscreen());
 
         self.krkr_engine = Some(krkr_engine);
+        self.runtime_viewport_size = preferred_size
+            .filter(|size| !size.is_empty())
+            .or_else(|| self.renderer.as_ref().map(Renderer::logical_size));
         self.project_root = Some(root.clone());
         self.state = DesktopState::Running;
         self.clear_status(Some(window));
@@ -340,7 +359,12 @@ impl DesktopApp {
     fn return_to_launcher(&mut self, window: &Window) {
         self.state = DesktopState::Launcher;
         self.krkr_engine = None;
+        self.runtime_viewport_size = None;
         self.pending_runtime_events.clear();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_content_size(None);
+        }
+        apply_window_fullscreen(window, false);
         self.engine.set_panel(Panel::Launcher);
         self.set_status(
             StatusLevel::Info,
@@ -363,6 +387,16 @@ impl DesktopApp {
             "requested runtime viewport: {}x{}",
             width as u32, height as u32
         ));
+    }
+
+    fn runtime_pointer_position(&self, position: Point) -> Point {
+        let Some(content_size) = self.runtime_viewport_size else {
+            return position;
+        };
+        let Some(renderer) = &self.renderer else {
+            return position;
+        };
+        map_window_point_to_content(position, renderer.logical_size(), content_size)
     }
 
     fn set_status(
@@ -468,9 +502,10 @@ impl ApplicationHandler for DesktopApp {
                     window.request_redraw();
                 } else if self.state == DesktopState::Running {
                     let position = position.to_logical::<f64>(window.scale_factor());
-                    self.pending_runtime_events.push(EngineEvent::CursorMoved {
-                        position: Point::new(position.x as f32, position.y as f32),
-                    });
+                    let position = self
+                        .runtime_pointer_position(Point::new(position.x as f32, position.y as f32));
+                    self.pending_runtime_events
+                        .push(EngineEvent::CursorMoved { position });
                     window.request_redraw();
                 }
             }
@@ -536,6 +571,37 @@ impl ApplicationHandler for DesktopApp {
     }
 }
 
+fn map_window_point_to_content(position: Point, window_size: Size, content_size: Size) -> Point {
+    if window_size.is_empty() || content_size.is_empty() {
+        return position;
+    }
+
+    Point::new(
+        position.x * content_size.width / window_size.width,
+        position.y * content_size.height / window_size.height,
+    )
+}
+
+fn apply_window_fullscreen(window: &Window, enabled: bool) {
+    let active = window.fullscreen().is_some();
+    if active == enabled {
+        return;
+    }
+
+    let fullscreen = if enabled {
+        Some(Fullscreen::Borderless(window.current_monitor()))
+    } else {
+        None
+    };
+    window.set_fullscreen(fullscreen);
+    window.request_redraw();
+    if enabled {
+        log_info("entered fullscreen");
+    } else {
+        log_info("left fullscreen");
+    }
+}
+
 fn map_button_state(state: ElementState) -> ButtonState {
     match state {
         ElementState::Pressed => ButtonState::Pressed,
@@ -559,6 +625,23 @@ fn map_key(key: &Key) -> Option<EngineKey> {
         Key::Named(NamedKey::Escape) => Some(EngineKey::Escape),
         Key::Named(NamedKey::Enter) => Some(EngineKey::Enter),
         Key::Named(NamedKey::Space) => Some(EngineKey::Space),
+        Key::Named(NamedKey::Tab) => Some(EngineKey::Tab),
+        Key::Named(NamedKey::ArrowLeft) => Some(EngineKey::Left),
+        Key::Named(NamedKey::ArrowUp) => Some(EngineKey::Up),
+        Key::Named(NamedKey::ArrowRight) => Some(EngineKey::Right),
+        Key::Named(NamedKey::ArrowDown) => Some(EngineKey::Down),
+        Key::Named(NamedKey::PageUp) => Some(EngineKey::PageUp),
+        Key::Named(NamedKey::PageDown) => Some(EngineKey::PageDown),
+        Key::Named(NamedKey::Backspace) => Some(EngineKey::Backspace),
+        Key::Named(NamedKey::Delete) => Some(EngineKey::Delete),
+        Key::Named(NamedKey::Shift) => Some(EngineKey::Shift),
+        Key::Named(NamedKey::Control) => Some(EngineKey::Control),
+        Key::Named(NamedKey::Alt) => Some(EngineKey::Alt),
+        Key::Character(text) => text
+            .chars()
+            .next()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| EngineKey::Character(ch.to_ascii_uppercase())),
         _ => None,
     }
 }
@@ -592,4 +675,34 @@ fn log_warn(message: &str) {
 
 fn log_error(message: &str) {
     eprintln!("[krkr-desktop][error] {message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_fullscreen_window_points_to_runtime_content_space() {
+        let point = map_window_point_to_content(
+            Point::new(960.0, 540.0),
+            Size::new(1920.0, 1080.0),
+            Size::new(800.0, 600.0),
+        );
+
+        assert_eq!(point, Point::new(400.0, 300.0));
+    }
+
+    #[test]
+    fn keeps_pointer_position_when_sizes_are_empty() {
+        let point = Point::new(12.0, 34.0);
+
+        assert_eq!(
+            map_window_point_to_content(point, Size::new(0.0, 1080.0), Size::new(800.0, 600.0)),
+            point
+        );
+        assert_eq!(
+            map_window_point_to_content(point, Size::new(1920.0, 1080.0), Size::new(800.0, 0.0)),
+            point
+        );
+    }
 }

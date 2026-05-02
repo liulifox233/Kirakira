@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -9,7 +9,7 @@ use krkr_core::{
     EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput, FrameOutput, LayerId,
     MessageLayerModel, Point, PointerButton, Size,
 };
-use krkr_kag::{Attribute, AttributeValue, KagParser, Tag};
+use krkr_kag::{Attribute, AttributeValue, KagParser, ParserSnapshot, Tag};
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, Runtime, Variant},
@@ -112,6 +112,8 @@ pub struct KrkrEngine {
     plugins: Vec<Box<dyn KrkrPlugin>>,
     cursor_position: Option<Point>,
     hovered_layer: Option<LayerId>,
+    pressed_layer: Option<LayerId>,
+    captured_layer: Option<LayerId>,
 }
 
 impl KrkrEngine {
@@ -132,6 +134,8 @@ impl KrkrEngine {
             plugins: Vec::new(),
             cursor_position: None,
             hovered_layer: None,
+            pressed_layer: None,
+            captured_layer: None,
         })
     }
 
@@ -159,14 +163,21 @@ impl KrkrEngine {
     }
 
     pub fn preferred_viewport_size(&self) -> Option<Size> {
-        let Variant::Object(window) = self.tjs_runtime.global_member("kag") else {
-            return None;
-        };
+        let window = self.runtime_window_object()?;
         let width = object_positive_i64(&self.tjs_runtime, window, "innerWidth")
             .or_else(|| object_positive_i64(&self.tjs_runtime, window, "width"))?;
         let height = object_positive_i64(&self.tjs_runtime, window, "innerHeight")
             .or_else(|| object_positive_i64(&self.tjs_runtime, window, "height"))?;
         Some(Size::new(width as f32, height as f32))
+    }
+
+    pub fn window_fullscreen(&self) -> bool {
+        let Some(window) = self.runtime_window_object() else {
+            return false;
+        };
+        self.tjs_runtime
+            .object_member(window, "fullScreen")
+            .is_truthy()
     }
 
     pub fn kag_parser(&self) -> &KagParser {
@@ -318,6 +329,23 @@ impl KrkrEngine {
         )
     }
 
+    fn runtime_window_object(&self) -> Option<ObjectHandle> {
+        if let Variant::Object(kag) = self.tjs_runtime.global_member("kag")
+            && has_window_state_member(&self.tjs_runtime, kag)
+        {
+            return Some(kag);
+        }
+
+        let Variant::Object(window_class) = self.tjs_runtime.global_member("Window") else {
+            return None;
+        };
+        let Variant::Object(window) = self.tjs_runtime.object_member(window_class, "mainWindow")
+        else {
+            return None;
+        };
+        Some(window)
+    }
+
     fn pump_tjs_events(&mut self) -> Result<()> {
         const MAX_NATIVE_EVENT_PASSES: usize = 1024;
 
@@ -450,6 +478,7 @@ impl KrkrEngine {
 
     fn handle_input_events(&mut self, events: &[EngineEvent]) -> Result<()> {
         for event in events {
+            self.update_input_key_state(event);
             match event {
                 EngineEvent::CursorMoved { position } => {
                     self.cursor_position = Some(*position);
@@ -459,8 +488,10 @@ impl KrkrEngine {
                     button: PointerButton::Primary,
                     state: ButtonState::Pressed,
                 } => {
-                    let target = self.dispatch_layer_pointer_event("onMouseDown")?;
-                    if self.should_fire_primary_click(target) {
+                    let target = self.dispatch_layer_pointer_event("onMouseDown", 0, None)?;
+                    self.pressed_layer = target.map(|target| target.layer_id);
+                    self.captured_layer = self.pressed_layer;
+                    if self.should_fire_primary_click(target.map(|target| target.object)) {
                         self.fire_kag_primary_click(false)?;
                     }
                 }
@@ -468,27 +499,125 @@ impl KrkrEngine {
                     button: PointerButton::Primary,
                     state: ButtonState::Released,
                 } => {
-                    self.dispatch_layer_pointer_event("onMouseUp")?;
+                    let release_hit = self.hit_layer_at_cursor();
+                    let target =
+                        self.dispatch_layer_pointer_event("onMouseUp", 0, self.captured_layer)?;
+                    if let (Some(pressed), Some(release_hit), Some(target)) =
+                        (self.pressed_layer, release_hit, target)
+                        && pressed == release_hit
+                        && pressed == target.layer_id
+                    {
+                        self.dispatch_layer_click(target.layer_id)?;
+                    }
+                    self.pressed_layer = None;
+                    self.captured_layer = None;
                     self.signal_kag_click();
                 }
-                EngineEvent::KeyboardInput {
-                    key: EngineKey::Enter | EngineKey::Space,
+                EngineEvent::PointerInput {
+                    button: PointerButton::Secondary,
                     state: ButtonState::Pressed,
                 } => {
-                    self.fire_kag_primary_click(true)?;
-                    self.signal_kag_click();
+                    let target = self.dispatch_layer_pointer_event("onMouseDown", 1, None)?;
+                    self.captured_layer = target.map(|target| target.layer_id);
                 }
-                _ => {}
+                EngineEvent::PointerInput {
+                    button: PointerButton::Secondary,
+                    state: ButtonState::Released,
+                } => {
+                    self.dispatch_layer_pointer_event("onMouseUp", 1, self.captured_layer)?;
+                    self.captured_layer = None;
+                    self.fire_kag_secondary_click()?;
+                }
+                EngineEvent::KeyboardInput { key, state } => {
+                    let handled = match state {
+                        ButtonState::Pressed => {
+                            self.dispatch_focused_layer_key_event("onKeyDown", *key)?
+                        }
+                        ButtonState::Released => {
+                            self.dispatch_focused_layer_key_event("onKeyUp", *key)?
+                        }
+                    };
+                    if matches!(state, ButtonState::Pressed)
+                        && matches!(key, EngineKey::Enter | EngineKey::Space)
+                        && !handled
+                    {
+                        self.fire_kag_primary_click(true)?;
+                        self.signal_kag_click();
+                    }
+                }
+                EngineEvent::PointerInput { .. } => {}
             }
         }
         Ok(())
     }
 
-    fn dispatch_layer_pointer_event(&mut self, method: &str) -> Result<Option<ObjectHandle>> {
+    fn update_input_key_state(&mut self, event: &EngineEvent) {
+        let key = match event {
+            EngineEvent::KeyboardInput { key, .. } => engine_key_vk_code(*key),
+            EngineEvent::PointerInput { button, .. } => pointer_button_vk_code(*button),
+            EngineEvent::CursorMoved { .. } => None,
+        };
+        let state = match event {
+            EngineEvent::KeyboardInput { state, .. } | EngineEvent::PointerInput { state, .. } => {
+                *state
+            }
+            EngineEvent::CursorMoved { .. } => return,
+        };
+        if let Some(key) = key {
+            self.tjs_runtime
+                .host_mut()
+                .set_key_state(key, matches!(state, ButtonState::Pressed));
+        }
+    }
+
+    fn dispatch_focused_layer_key_event(&mut self, method: &str, key: EngineKey) -> Result<bool> {
+        let Some(key_code) = engine_key_vk_code(key) else {
+            return Ok(false);
+        };
+        let Some(window) = self.runtime_window_object() else {
+            return Ok(false);
+        };
+        let Variant::Object(focused_layer) = self.tjs_runtime.object_member(window, "focusedLayer")
+        else {
+            return Ok(false);
+        };
+        let focused_layer = self
+            .tjs_runtime
+            .bound_this(focused_layer)
+            .unwrap_or(focused_layer);
+        if !self.tjs_runtime.object_valid(focused_layer) {
+            return Ok(false);
+        }
+        let handler = self.tjs_runtime.object_member(focused_layer, method);
+        if matches!(handler, Variant::Void) {
+            return Ok(false);
+        }
+        let handled_by_script = !self.tjs_runtime.variant_is_native_function(&handler);
+        self.tjs_runtime
+            .call_object_method(
+                focused_layer,
+                method,
+                vec![
+                    Variant::Integer(key_code),
+                    Variant::Integer(0),
+                    Variant::Integer(1),
+                ],
+            )
+            .map(|_| handled_by_script)
+    }
+
+    fn dispatch_layer_pointer_event(
+        &mut self,
+        method: &str,
+        button: i64,
+        layer_override: Option<LayerId>,
+    ) -> Result<Option<LayerEventTarget>> {
         let Some(position) = self.cursor_position else {
             return Ok(None);
         };
-        let Some(layer_id) = self.tjs_runtime.host().layer_tree().hit_test(position) else {
+        let Some(layer_id) =
+            layer_override.or_else(|| self.tjs_runtime.host().layer_tree().hit_test(position))
+        else {
             return Ok(None);
         };
         let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
@@ -511,11 +640,11 @@ impl KrkrEngine {
                 vec![
                     Variant::Integer(x),
                     Variant::Integer(y),
-                    Variant::Integer(0),
+                    Variant::Integer(button),
                     Variant::Integer(0),
                 ],
             )
-            .map(|_| Some(object))
+            .map(|_| Some(LayerEventTarget { layer_id, object }))
     }
 
     fn should_fire_primary_click(&self, target: Option<ObjectHandle>) -> bool {
@@ -552,7 +681,42 @@ impl KrkrEngine {
             .map(|_| ())
     }
 
+    fn fire_kag_secondary_click(&mut self) -> Result<()> {
+        if let Variant::Object(kag) = self.tjs_runtime.global_member("kag")
+            && !matches!(
+                self.tjs_runtime.object_member(kag, "onPrimaryRightClick"),
+                Variant::Void
+            )
+        {
+            return self
+                .tjs_runtime
+                .call_object_method(kag, "onPrimaryRightClick", Vec::new())
+                .map(|_| ());
+        }
+
+        self.kag_task.fire_right_click(
+            &mut self.kag_parser,
+            &mut self.tjs_runtime,
+            &mut self.message_layer,
+        )
+    }
+
     fn dispatch_layer_cursor_move(&mut self, position: Point) -> Result<()> {
+        if let Some(captured_layer) = self.captured_layer
+            && let Some((x, y)) = self.layer_local_point(captured_layer, position)
+        {
+            self.call_layer_event(
+                captured_layer,
+                "onMouseMove",
+                vec![
+                    Variant::Integer(x),
+                    Variant::Integer(y),
+                    Variant::Integer(0),
+                ],
+            )?;
+            return Ok(());
+        }
+
         let hit_layer = self.tjs_runtime.host().layer_tree().hit_test(position);
         if hit_layer != self.hovered_layer {
             if let Some(layer_id) = self.hovered_layer {
@@ -578,6 +742,33 @@ impl KrkrEngine {
             )?;
         }
         Ok(())
+    }
+
+    fn hit_layer_at_cursor(&self) -> Option<LayerId> {
+        self.cursor_position
+            .and_then(|position| self.tjs_runtime.host().layer_tree().hit_test(position))
+    }
+
+    fn dispatch_layer_click(&mut self, layer_id: LayerId) -> Result<()> {
+        let Some((x, y)) = self.cursor_position.and_then(|position| {
+            self.tjs_runtime
+                .host()
+                .layer_tree()
+                .absolute_position(layer_id)
+                .map(|origin| {
+                    (
+                        (position.x - origin.x).round() as i64,
+                        (position.y - origin.y).round() as i64,
+                    )
+                })
+        }) else {
+            return Ok(());
+        };
+        self.call_layer_event(
+            layer_id,
+            "onClick",
+            vec![Variant::Integer(x), Variant::Integer(y)],
+        )
     }
 
     fn call_layer_event(
@@ -639,6 +830,9 @@ impl KrkrEngine {
             let node_enabled = object_i64(&self.tjs_runtime, handle, "nodeEnabled")? != 0;
             let layer_type = object_i64(&self.tjs_runtime, handle, "type")? as i32;
             let face = object_i64(&self.tjs_runtime, handle, "face")? as i32;
+            let hit_type = object_i64(&self.tjs_runtime, handle, "hitType")? as i32;
+            let hit_threshold =
+                object_i64(&self.tjs_runtime, handle, "hitThreshold")?.clamp(0, 255) as u8;
             let absolute = object_optional_i64(&self.tjs_runtime, handle, "absolute")?;
             let order = object_optional_i64(&self.tjs_runtime, handle, "order")?;
 
@@ -682,6 +876,8 @@ impl KrkrEngine {
                         layer.node_enabled = node_enabled;
                         layer.layer_type = layer_type;
                         layer.face = face;
+                        layer.hit_type = hit_type;
+                        layer.hit_threshold = hit_threshold;
                         if let Some(z_order) = absolute.or(order) {
                             layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                         }
@@ -715,6 +911,8 @@ impl KrkrEngine {
                 layer.node_enabled = node_enabled;
                 layer.layer_type = layer_type;
                 layer.face = face;
+                layer.hit_type = hit_type;
+                layer.hit_threshold = hit_threshold;
                 if let Some(z_order) = absolute.or(order) {
                     layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 }
@@ -790,6 +988,12 @@ impl KrkrEngine {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LayerEventTarget {
+    layer_id: LayerId,
+    object: ObjectHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TjsEvent {
     handle: ObjectHandle,
     kind: TjsEventKind,
@@ -807,8 +1011,25 @@ struct KagRuntimeTask {
     state: KagTaskState,
     handler: Option<ObjectHandle>,
     pending_tags: VecDeque<Tag>,
+    temp_snapshots: BTreeMap<i64, KagTempSnapshot>,
+    right_click: RightClickAction,
     loaded: bool,
     clear_page_on_click: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KagTempSnapshot {
+    parser: ParserSnapshot,
+    message_layer: MessageLayerModel,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RightClickAction {
+    enabled: bool,
+    call: bool,
+    jump: bool,
+    storage: Option<String>,
+    target: Option<String>,
 }
 
 impl KagRuntimeTask {
@@ -817,6 +1038,8 @@ impl KagRuntimeTask {
             state: KagTaskState::Finished,
             handler: None,
             pending_tags: VecDeque::new(),
+            temp_snapshots: BTreeMap::new(),
+            right_click: RightClickAction::default(),
             loaded: false,
             clear_page_on_click: false,
         }
@@ -833,6 +1056,8 @@ impl KagRuntimeTask {
     fn start(&mut self) {
         self.state = KagTaskState::Running;
         self.pending_tags.clear();
+        self.temp_snapshots.clear();
+        self.right_click = RightClickAction::default();
         self.loaded = true;
         self.clear_page_on_click = false;
     }
@@ -933,7 +1158,7 @@ impl KagRuntimeTask {
             };
 
             tags_processed += 1;
-            let action = self.process_tag(runtime, message_layer, tag)?;
+            let action = self.process_tag(parser, runtime, message_layer, tag)?;
             match action {
                 TagAction::Continue => {}
                 TagAction::Yield(reason) => {
@@ -950,6 +1175,7 @@ impl KagRuntimeTask {
 
     fn process_tag(
         &mut self,
+        parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
         message_layer: &mut MessageLayerModel,
         tag: Tag,
@@ -962,7 +1188,7 @@ impl KagRuntimeTask {
             return self.apply_handler_step(tag, value);
         }
 
-        let default_action = self.process_builtin_tag(runtime, message_layer, &tag)?;
+        let default_action = self.process_builtin_tag(parser, runtime, message_layer, &tag)?;
         if matches!(default_action, TagAction::Continue)
             && let Some(handler) = self.handler
             && !is_builtin_tag(&tag.tagname)
@@ -1004,6 +1230,7 @@ impl KagRuntimeTask {
 
     fn process_builtin_tag(
         &mut self,
+        parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
         message_layer: &mut MessageLayerModel,
         tag: &Tag,
@@ -1091,6 +1318,49 @@ impl KagRuntimeTask {
                 runtime.host_mut().backlay_kag_layers(layer);
                 Ok(TagAction::Continue)
             }
+            "rclick" => {
+                self.apply_right_click_tag(tag);
+                Ok(TagAction::Continue)
+            }
+            "tempsave" => {
+                let place = tag_i64(tag, "place")?.unwrap_or(0);
+                self.temp_snapshots.insert(
+                    place,
+                    KagTempSnapshot {
+                        parser: parser.store(),
+                        message_layer: message_layer.clone(),
+                    },
+                );
+                Ok(TagAction::Continue)
+            }
+            "tempload" => {
+                let place = tag_i64(tag, "place")?.unwrap_or(0);
+                if let Some(snapshot) = self.temp_snapshots.get(&place).cloned() {
+                    parser
+                        .restore(snapshot.parser)
+                        .map_err(|error| TjsError::runtime(error.to_string()))?;
+                    *message_layer = snapshot.message_layer;
+                    self.pending_tags.clear();
+                    self.state = KagTaskState::Running;
+                }
+                Ok(TagAction::Continue)
+            }
+            "commit" | "history" => Ok(TagAction::Continue),
+            "gotostart" => {
+                if let Some(storage) = parser.cur_storage().map(str::to_string) {
+                    parser
+                        .set_cur_storage(storage)
+                        .map_err(|error| TjsError::runtime(error.to_string()))?;
+                    message_layer.clear();
+                    self.pending_tags.clear();
+                    self.state = KagTaskState::Running;
+                }
+                Ok(TagAction::Continue)
+            }
+            "laycount" => {
+                apply_laycount_tag(runtime, tag)?;
+                Ok(TagAction::Continue)
+            }
             "current" => {
                 apply_current_tag(runtime, tag);
                 Ok(TagAction::Continue)
@@ -1159,6 +1429,65 @@ impl KagRuntimeTask {
             "defstyle" | "resetstyle" | "ruby" => Ok(TagAction::Continue),
             _ => Ok(TagAction::Continue),
         }
+    }
+
+    fn apply_right_click_tag(&mut self, tag: &Tag) {
+        if let Some(enabled) = kag_bool_attr(tag, "enabled") {
+            self.right_click.enabled = enabled;
+        }
+        if let Some(call) = kag_bool_attr(tag, "call") {
+            self.right_click.call = call;
+            if call {
+                self.right_click.jump = false;
+            }
+        }
+        if let Some(jump) = kag_bool_attr(tag, "jump") {
+            self.right_click.jump = jump;
+            if jump {
+                self.right_click.call = false;
+            }
+        }
+        if let Some(storage) = tag.literal_attr("storage") {
+            self.right_click.storage = non_empty_string(storage);
+        }
+        if let Some(target) = tag.literal_attr("target") {
+            self.right_click.target = non_empty_string(target);
+        }
+    }
+
+    fn fire_right_click(
+        &mut self,
+        parser: &mut KagParser,
+        runtime: &mut Runtime<KrkrHost>,
+        message_layer: &mut MessageLayerModel,
+    ) -> Result<()> {
+        if !self.right_click.enabled {
+            return Ok(());
+        }
+        let storage = self.right_click.storage.clone();
+        let target = self.right_click.target.clone();
+        if storage.is_none() && target.is_none() {
+            return Ok(());
+        }
+
+        let mut host = EngineKagHost::new(runtime);
+        if self.right_click.call {
+            parser
+                .call_with(storage.as_deref(), target.as_deref(), &mut host)
+                .map_err(|error| TjsError::runtime(error.to_string()))?;
+        } else if self.right_click.jump {
+            parser
+                .go_to_with(storage.as_deref(), target.as_deref(), &mut host)
+                .map_err(|error| TjsError::runtime(error.to_string()))?;
+        } else {
+            return Ok(());
+        }
+
+        self.pending_tags.clear();
+        self.state = KagTaskState::Running;
+        self.clear_page_on_click = false;
+        message_layer.waiting_for_click = false;
+        Ok(())
     }
 
     fn apply_handler_step(&mut self, tag: Tag, value: Variant) -> Result<TagAction> {
@@ -1375,8 +1704,39 @@ fn execute_trace_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
     Ok(())
 }
 
+fn engine_key_vk_code(key: EngineKey) -> Option<i64> {
+    match key {
+        EngineKey::Escape => Some(0x1b),
+        EngineKey::Enter => Some(0x0d),
+        EngineKey::Space => Some(0x20),
+        EngineKey::Tab => Some(0x09),
+        EngineKey::Left => Some(0x25),
+        EngineKey::Up => Some(0x26),
+        EngineKey::Right => Some(0x27),
+        EngineKey::Down => Some(0x28),
+        EngineKey::PageUp => Some(0x21),
+        EngineKey::PageDown => Some(0x22),
+        EngineKey::Backspace => Some(0x08),
+        EngineKey::Delete => Some(0x2e),
+        EngineKey::Shift => Some(0x10),
+        EngineKey::Control => Some(0x11),
+        EngineKey::Alt => Some(0x12),
+        EngineKey::Character(ch) if ch.is_ascii() => Some(ch.to_ascii_uppercase() as i64),
+        EngineKey::Character(_) | EngineKey::Other => None,
+    }
+}
+
+fn pointer_button_vk_code(button: PointerButton) -> Option<i64> {
+    match button {
+        PointerButton::Primary => Some(0x01),
+        PointerButton::Secondary => Some(0x02),
+        PointerButton::Middle => Some(0x04),
+        PointerButton::Other(_) => None,
+    }
+}
+
 fn object_i64(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Result<i64> {
-    runtime.object_member(object, name).to_integer()
+    layer_object_member(runtime, object, name).to_integer()
 }
 
 fn object_optional_i64(
@@ -1384,10 +1744,30 @@ fn object_optional_i64(
     object: ObjectHandle,
     name: &str,
 ) -> Result<Option<i64>> {
-    match runtime.object_member(object, name) {
+    match layer_object_member(runtime, object, name) {
         Variant::Void => Ok(None),
         value => value.to_integer().map(Some),
     }
+}
+
+fn layer_object_member(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Variant {
+    let direct = runtime.object_member(object, name);
+    if !runtime.variant_is_property(&direct) && !matches!(direct, Variant::Void) {
+        return direct;
+    }
+    let stored = runtime.object_member(object, &layer_property_backing_key(name));
+    if !matches!(stored, Variant::Void) {
+        return stored;
+    }
+    if runtime.variant_is_property(&direct) {
+        Variant::Void
+    } else {
+        direct
+    }
+}
+
+fn layer_property_backing_key(name: &str) -> String {
+    format!("__nativeLayerProperty${name}")
 }
 
 fn object_positive_i64(
@@ -1399,6 +1779,12 @@ fn object_positive_i64(
         Variant::Void => None,
         value => value.to_integer().ok().filter(|value| *value > 0),
     }
+}
+
+fn has_window_state_member(runtime: &Runtime<KrkrHost>, object: ObjectHandle) -> bool {
+    ["innerWidth", "width", "fullScreen"]
+        .iter()
+        .any(|name| !matches!(runtime.object_member(object, name), Variant::Void))
 }
 
 fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
@@ -1527,6 +1913,28 @@ fn tag_i64(tag: &Tag, name: &str) -> Result<Option<i64>> {
         .transpose()
 }
 
+fn non_empty_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn apply_laycount_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
+    if let Some(layers) = tag_i64(tag, "layers")? {
+        for index in 0..layers.max(0) {
+            runtime
+                .host_mut()
+                .ensure_kag_layer("fore", &index.to_string());
+        }
+    }
+    if let Some(messages) = tag_i64(tag, "messages")? {
+        for index in 0..messages.max(0) {
+            runtime
+                .host_mut()
+                .ensure_kag_layer("fore", &format!("message{index}"));
+        }
+    }
+    Ok(())
+}
+
 fn is_builtin_tag(tagname: &str) -> bool {
     matches!(
         tagname,
@@ -1551,6 +1959,13 @@ fn is_builtin_tag(tagname: &str) -> bool {
             | "position"
             | "freeimage"
             | "backlay"
+            | "rclick"
+            | "tempsave"
+            | "tempload"
+            | "commit"
+            | "history"
+            | "gotostart"
+            | "laycount"
             | "current"
             | "trans"
             | "wt"
@@ -1654,6 +2069,52 @@ mod tests {
     }
 
     #[test]
+    fn window_fullscreen_tracks_runtime_window_state() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Window();
+                var initial = kag.fullScreen;
+                kag.fullScreen = true;
+                var enabled = kag.fullScreen;
+                kag.fullScreen = false;
+                return initial + ":" + enabled + ":" + kag.fullScreen;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("0:1:0".to_string()));
+        assert!(!engine.window_fullscreen());
+
+        engine
+            .execute_script("inline.tjs", "kag.fullScreen = true;")
+            .expect("script");
+        assert!(engine.window_fullscreen());
+    }
+
+    #[test]
+    fn window_fullscreen_falls_back_to_main_window() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                window.fullScreen = true;
+                return Window.mainWindow === window;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::Integer(1));
+        assert!(engine.window_fullscreen());
+    }
+
+    #[test]
     fn window_add_tracks_children_and_primary_layer() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
 
@@ -1741,6 +2202,24 @@ mod tests {
             Variant::Integer(8)
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn storages_set_text_encoding_updates_host_and_scripts_member() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                Storages.setTextEncoding("gbk");
+                return Scripts.textEncoding;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("gbk".to_string()));
+        assert_eq!(engine.host().text_encoding(), "gbk");
     }
 
     #[test]
@@ -1992,6 +2471,103 @@ mod tests {
         assert_eq!(tick.tags_processed, 1);
         assert_eq!(tick.state, KagTaskState::Finished);
         assert_eq!(tick.reason, KagYieldReason::Finished);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tempsave_and_tempload_restore_builtin_parser_state() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "AB[tempsave place=1]C[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        assert_eq!(
+            engine.tick().expect("first tick").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(engine.message_layer.lines, vec!["ABC".to_string()]);
+
+        let tag = test_tag("tempload", &[("place", "1")]);
+        let action = engine
+            .kag_task
+            .process_builtin_tag(
+                &mut engine.kag_parser,
+                &mut engine.tjs_runtime,
+                &mut engine.message_layer,
+                &tag,
+            )
+            .expect("tempload");
+        assert_eq!(action, TagAction::Continue);
+        assert_eq!(engine.message_layer.lines, vec!["AB".to_string()]);
+
+        assert_eq!(
+            engine.tick().expect("restored tick").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(engine.message_layer.lines, vec!["ABC".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_rclick_secondary_release_jumps_to_config_target() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "*start\n[rclick jump=true target=*config enabled=true]A[s]\n*config\nC[s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        assert_eq!(
+            engine.tick().expect("first tick").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(engine.message_layer.lines, vec!["A".to_string()]);
+
+        let frame = engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::PointerInput {
+                        button: PointerButton::Secondary,
+                        state: ButtonState::Released,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("right click update");
+
+        assert_eq!(frame.tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer.lines, vec!["AC".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_laycount_allocates_builtin_visual_and_message_layers() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[laycount layers=2 messages=3][s]")
+            .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        assert_eq!(engine.tick().expect("tick").state, KagTaskState::Finished);
+
+        let names = engine
+            .host()
+            .layer_tree()
+            .layers()
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>();
+        for expected in ["kag:0", "kag:1", "kag:message0", "kag:message2"] {
+            assert!(names.contains(&expected), "{expected} should be allocated");
+        }
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -2468,7 +3044,7 @@ mod tests {
             .execute_script(
                 "inline.tjs",
                 r#"
-                var layer = new Layer();
+                global.layer = new Layer();
                 layer.loadImages("sprite.png");
                 layer.left = 11;
                 layer.top = 13;
@@ -2686,7 +3262,7 @@ mod tests {
             .execute_script(
                 "inline.tjs",
                 r#"
-                var layer = new Layer();
+                global.layer = new Layer();
                 layer.setImageSize(1280, 720);
                 layer.setSizeToImageSize();
                 layer.loadImages("sprite.png");
@@ -2728,6 +3304,51 @@ mod tests {
             .expect("script");
 
         assert_eq!(result, Variant::String("2:2:6".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_constructor_preserves_script_property_setters() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class SliderLikeLayer extends Layer {
+                    var changes = 0;
+                    function SliderLikeLayer() { super.Layer(...); }
+                    property width {
+                        setter(x) {
+                            super.width = x;
+                            imageWidth = x;
+                            changes = changes + 1;
+                        }
+                        getter { return super.width; }
+                    }
+                    property height {
+                        setter(y) {
+                            super.height = y;
+                            imageHeight = y;
+                        }
+                        getter { return super.height; }
+                    }
+                }
+                var layer = new SliderLikeLayer();
+                var initial = layer.width + ":" + layer.imageWidth;
+                layer.width = 430;
+                layer.height = 24;
+                layer.width = 320;
+                return initial + ":" + layer.width + ":" + layer.imageWidth + ":" +
+                    layer.height + ":" + layer.imageHeight + ":" + layer.changes;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("0:0:320:320:24:24:2".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -3947,6 +4568,446 @@ mod tests {
     }
 
     #[test]
+    fn primary_pointer_press_release_dispatches_layer_click() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.events = "";
+                var layer = new Layer();
+                layer.setPos(10, 20);
+                layer.setSize(30, 40);
+                layer.visible = true;
+                layer.onMouseDown = function(x, y, button, shift) { global.events += "down:" + x + ":" + y + ";"; };
+                layer.onMouseUp = function(x, y, button, shift) { global.events += "up:" + x + ":" + y + ";"; };
+                layer.onClick = function(x, y) { global.events += "click:" + x + ":" + y; };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(15.0, 26.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "events")
+                .expect("events"),
+            Variant::String("down:5:6;up:5:6;click:5:6".to_string())
+        );
+    }
+
+    #[test]
+    fn layer_focus_updates_focused_layer_and_events() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var root = new Layer(window, null);
+                var child = new Layer(window, root);
+                root.focusable = true;
+                child.focusable = true;
+                child.visible = true;
+                root.events = "";
+                child.events = "";
+                root.onBlur = function() { events += "blur"; };
+                child.onFocus = function() { events += "focus"; };
+                child.focus();
+                return (window.focusedLayer === child) + ":" + root.focused + ":" +
+                    child.focused + ":" + root.events + ":" + child.events;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1:0:1:blur:focus".to_string()));
+    }
+
+    #[test]
+    fn layer_hit_testing_uses_alpha_mask_and_province_transparency() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.hits = 0;
+                global.layer = new Layer();
+                layer.setSize(2, 1);
+                layer.setImageSize(2, 1);
+                layer.fillRect(1, 0, 1, 1, 0xffffffff);
+                layer.visible = true;
+                layer.hitType = htMask;
+                layer.hitThreshold = 0;
+                layer.onMouseUp = function(x, y, button, shift) { global.hits++; };
+                "#,
+            )
+            .expect("script");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+
+        for position in [Point::new(0.2, 0.5), Point::new(1.2, 0.5)] {
+            engine
+                .update(
+                    EngineInput::new(
+                        FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                        vec![
+                            EngineEvent::CursorMoved { position },
+                            EngineEvent::PointerInput {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Released,
+                            },
+                        ],
+                    ),
+                    Duration::ZERO,
+                )
+                .expect("hit frame");
+        }
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "hits")
+                .expect("hits"),
+            Variant::Integer(2)
+        );
+
+        engine
+            .execute_script("inline.tjs", "layer.hitThreshold = 1;")
+            .expect("threshold");
+        for position in [Point::new(0.2, 0.5), Point::new(1.2, 0.5)] {
+            engine
+                .update(
+                    EngineInput::new(
+                        FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                        vec![
+                            EngineEvent::CursorMoved { position },
+                            EngineEvent::PointerInput {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Released,
+                            },
+                        ],
+                    ),
+                    Duration::ZERO,
+                )
+                .expect("threshold frame");
+        }
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "hits")
+                .expect("hits"),
+            Variant::Integer(3)
+        );
+
+        engine
+            .execute_script("inline.tjs", "layer.hitType = htProvince;")
+            .expect("province");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(1.2, 0.5),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("province frame");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "hits")
+                .expect("hits"),
+            Variant::Integer(3)
+        );
+    }
+
+    #[test]
+    fn captured_layer_receives_drag_move_until_release() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.moves = "";
+                var layer = new Layer();
+                layer.setPos(10, 10);
+                layer.setSize(10, 10);
+                layer.visible = true;
+                layer.onMouseMove = function(x, y, shift) { global.moves = "" + x + ":" + y; };
+                layer.onMouseUp = function(x, y, button, shift) { global.moves += ":up:" + x + ":" + y; };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(15.0, 15.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                        EngineEvent::CursorMoved {
+                            position: Point::new(50.0, 52.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("drag frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "moves")
+                .expect("moves"),
+            Variant::String("40:42:up:40:42".to_string())
+        );
+    }
+
+    #[test]
+    fn focused_layer_receives_key_down_up_and_can_click() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.events = "";
+                var window = new Window();
+                var root = new Layer(window, null);
+                var button = new Layer(window, root);
+                button.setSize(20, 10);
+                button.visible = true;
+                button.focusable = true;
+                button.pressed = false;
+                button.onKeyDown = function(key, shift, process) {
+                    if(process && key == VK_RETURN) {
+                        this.pressed = true;
+                        global.events += "down:" + shift + ":" + process + ";";
+                    }
+                };
+                button.onKeyUp = function(key, shift, process) {
+                    if(process && key == VK_RETURN) {
+                        var pressed = this.pressed;
+                        this.pressed = false;
+                        if(pressed) this.onClick(this.width \ 2, this.height \ 2);
+                    }
+                };
+                button.onClick = function(x, y) {
+                    global.events += "click:" + x + ":" + y;
+                };
+                button.focus();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Enter,
+                            state: ButtonState::Pressed,
+                        },
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Enter,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("key frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "events")
+                .expect("events"),
+            Variant::String("down:0:1;click:10:5".to_string())
+        );
+    }
+
+    #[test]
+    fn keyboard_primary_click_still_fires_without_script_layer_handler() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var root = new Layer(window, null);
+                global.kag = new Dictionary();
+                kag.clicks = 0;
+                kag.onPrimaryClickByKey = function() { this.clicks += 10; };
+                kag.onPrimaryClick = function() { this.clicks += 1; };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::KeyboardInput {
+                        key: EngineKey::Enter,
+                        state: ButtonState::Pressed,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("key frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.clicks")
+                .expect("clicks"),
+            Variant::Integer(10)
+        );
+    }
+
+    #[test]
+    fn native_layer_key_default_moves_focus_to_next_layer() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                var root = new Layer(window, null);
+                global.first = new Layer(window, root);
+                global.second = new Layer(window, root);
+                first.visible = true;
+                second.visible = true;
+                first.focusable = true;
+                second.focusable = true;
+                first.focus();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::KeyboardInput {
+                        key: EngineKey::Right,
+                        state: ButtonState::Pressed,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("key frame");
+
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    "return (window.focusedLayer === second) + ':' + first.focused + ':' + second.focused;"
+                )
+                .expect("focused"),
+            Variant::String("1:0:1".to_string())
+        );
+    }
+
+    #[test]
+    fn system_get_key_state_tracks_runtime_keyboard_events() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.states = "";
+                var window = new Window();
+                var root = new Layer(window, null);
+                var layer = new Layer(window, root);
+                layer.visible = true;
+                layer.focusable = true;
+                layer.onKeyDown = function(key, shift, process) {
+                    global.states += System.getKeyState(key);
+                };
+                layer.onKeyUp = function(key, shift, process) {
+                    global.states += ":" + System.getKeyState(key);
+                };
+                layer.focus();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Left,
+                            state: ButtonState::Pressed,
+                        },
+                        EngineEvent::KeyboardInput {
+                            key: EngineKey::Left,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("key frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "states")
+                .expect("states"),
+            Variant::String("1:0".to_string())
+        );
+    }
+
+    #[test]
     fn primary_pointer_press_fires_kag_primary_click_for_non_link_layer() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -4081,6 +5142,7 @@ mod tests {
                         setPos(10, 20);
                         setSize(2, 4);
                         setImageSize(6, 4);
+                        fillRect(0, 0, 6, 4, 0xffffffff);
                         visible = true;
                     }
                     function onMouseEnter() {
@@ -4188,6 +5250,98 @@ mod tests {
             }
         ));
         assert!(matches!(commands[2], AudioCommand::Stop { .. }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_volume2_and_global_volume_affect_playback_volume() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("sound.wav"), b"not real audio").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.open("sound.wav");
+                buffer.volume = 50000;
+                buffer.volume2 = 50000;
+                WaveSoundBuffer.globalVolume = 50000;
+                buffer.play();
+                buffer.volume2 = 25000;
+                return buffer.volume + ":" + buffer.volume2 + ":" + WaveSoundBuffer.globalVolume;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("50000:25000:50000".to_string()));
+        let commands = engine.host_mut().take_audio_commands();
+        match &commands[..] {
+            [
+                AudioCommand::Play { volume, .. },
+                AudioCommand::SetVolume {
+                    volume: updated, ..
+                },
+            ] => {
+                assert_eq!(*volume, 0.125);
+                assert_eq!(*updated, 0.0625);
+            }
+            commands => panic!("expected play then volume update, got {commands:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_subclass_direct_volume2_assignment_updates_audio() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("voice.ogg"), b"voice bytes").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class ConfigSoundBuffer extends WaveSoundBuffer
+                {
+                    function ConfigSoundBuffer()
+                    {
+                        super.WaveSoundBuffer();
+                    }
+
+                    function setConfigVolume(pos)
+                    {
+                        volume2 = pos * 1000;
+                    }
+                }
+
+                var buffer = new ConfigSoundBuffer();
+                buffer.open("voice.ogg");
+                buffer.play();
+                buffer.setConfigVolume(40);
+                return buffer.volume2;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::Integer(40000));
+        let commands = engine.host_mut().take_audio_commands();
+        match &commands[..] {
+            [
+                AudioCommand::Play { volume, .. },
+                AudioCommand::SetVolume {
+                    volume: updated, ..
+                },
+            ] => {
+                assert_eq!(*volume, 1.0);
+                assert_eq!(*updated, 0.4);
+            }
+            commands => panic!("expected play then subclass volume2 update, got {commands:?}"),
+        }
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -5031,6 +6185,21 @@ mod tests {
             engine.tjs_runtime().global_member("asyncProbeCount"),
             Variant::Integer(1)
         );
+    }
+
+    fn test_tag(name: &str, attrs: &[(&str, &str)]) -> Tag {
+        Tag::new(
+            name,
+            attrs
+                .iter()
+                .map(|(name, value)| {
+                    Attribute::named(*name, AttributeValue::Literal((*value).to_string()))
+                })
+                .collect(),
+            krkr_kag::TagOrigin::Bracket,
+            krkr_kag::SourceSpan::empty(0),
+            krkr_kag::SourceLocation::default(),
+        )
     }
 
     fn temp_root() -> PathBuf {

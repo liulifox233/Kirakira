@@ -308,6 +308,8 @@ pub struct LayerNode {
     pub z_order: i32,
     pub layer_type: i32,
     pub face: i32,
+    pub hit_type: i32,
+    pub hit_threshold: u8,
     pub image: Option<LayerImage>,
 }
 
@@ -338,6 +340,8 @@ impl LayerNode {
             z_order,
             layer_type: 2,
             face: 128,
+            hit_type: 0,
+            hit_threshold: 0,
             image: None,
         }
     }
@@ -353,6 +357,26 @@ impl LayerNode {
             self.image_width,
             self.image_height,
         )
+    }
+
+    fn hit_test(&self, origin: Point, point: Point) -> bool {
+        match self.hit_type {
+            1 => false,
+            _ => self.alpha_hit_test(origin, point),
+        }
+    }
+
+    fn alpha_hit_test(&self, origin: Point, point: Point) -> bool {
+        let Some(image) = &self.image else {
+            return true;
+        };
+        let x = (point.x - origin.x - self.image_left).floor() as i64;
+        let y = (point.y - origin.y - self.image_top).floor() as i64;
+        if x < 0 || y < 0 || x >= image.upload.width as i64 || y >= image.upload.height as i64 {
+            return false;
+        }
+        let index = ((y as u32 * image.upload.width + x as u32) * 4 + 3) as usize;
+        image.upload.rgba[index] >= self.hit_threshold
     }
 
     fn image_command(
@@ -586,7 +610,7 @@ impl LayerTree {
             }
         }
 
-        Some(id)
+        layer.hit_test(origin, point).then_some(id)
     }
 
     fn sorted_children(&self, parent: Option<LayerId>) -> Vec<&LayerNode> {
@@ -717,6 +741,19 @@ pub enum EngineKey {
     Escape,
     Enter,
     Space,
+    Tab,
+    Left,
+    Up,
+    Right,
+    Down,
+    PageUp,
+    PageDown,
+    Backspace,
+    Delete,
+    Shift,
+    Control,
+    Alt,
+    Character(char),
     Other,
 }
 
