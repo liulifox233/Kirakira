@@ -1178,16 +1178,16 @@ enum ObjectJob {
     },
 }
 
-struct Lowerer<'a> {
+struct Lowerer {
     module: MirModule,
-    source_text: &'a str,
+    source_spans: SourceSpanMapper,
     next_object_id: u32,
     bindings: BTreeMap<syntax::BindingId, BindingInfo>,
     object_jobs: VecDeque<ObjectJob>,
 }
 
-impl<'a> Lowerer<'a> {
-    fn new(program: &hir::Program, source_name: &str, source_text: &'a str) -> Self {
+impl Lowerer {
+    fn new(program: &hir::Program, source_name: &str, source_text: &str) -> Self {
         let mut bindings = BTreeMap::new();
         for binding in &program.bindings {
             let scope_kind = program
@@ -1221,7 +1221,7 @@ impl<'a> Lowerer<'a> {
                 objects: Vec::new(),
                 top_level: ObjectId(0),
             },
-            source_text,
+            source_spans: SourceSpanMapper::new(source_text),
             next_object_id: 1,
             bindings,
             object_jobs: VecDeque::new(),
@@ -1280,7 +1280,7 @@ impl<'a> Lowerer<'a> {
         let id = SpanId(self.module.spans.len() as u32);
         self.module
             .spans
-            .push(span_to_source_span(span, self.source_text));
+            .push(self.source_spans.to_source_span(span));
         id
     }
 
@@ -1433,17 +1433,55 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-fn span_to_source_span(span: Span, source_text: &str) -> SourceSpan {
-    let start = span.start.min(source_text.len());
-    let end = span.end.min(source_text.len());
-    let utf16_start = source_text[..start].encode_utf16().count() as u32;
-    let utf16_end = source_text[..end].encode_utf16().count() as u32;
-    SourceSpan {
-        file: SourceFileId(0),
-        byte_start: start as u32,
-        byte_end: end as u32,
-        utf16_start,
-        utf16_end,
+struct SourceSpanMapper {
+    source_len: usize,
+    utf16_offsets: Utf16Offsets,
+}
+
+enum Utf16Offsets {
+    SameAsByte,
+    Prefix(Vec<u32>),
+}
+
+impl SourceSpanMapper {
+    fn new(source_text: &str) -> Self {
+        let utf16_offsets = if source_text.is_ascii() {
+            Utf16Offsets::SameAsByte
+        } else {
+            let mut offsets = vec![0; source_text.len() + 1];
+            let mut utf16_offset = 0;
+            for (byte_offset, ch) in source_text.char_indices() {
+                let next_byte_offset = byte_offset + ch.len_utf8();
+                offsets[byte_offset..next_byte_offset].fill(utf16_offset);
+                utf16_offset += ch.len_utf16() as u32;
+            }
+            offsets[source_text.len()] = utf16_offset;
+            Utf16Offsets::Prefix(offsets)
+        };
+
+        Self {
+            source_len: source_text.len(),
+            utf16_offsets,
+        }
+    }
+
+    fn to_source_span(&self, span: Span) -> SourceSpan {
+        let start = span.start.min(self.source_len);
+        let end = span.end.min(self.source_len);
+        SourceSpan {
+            file: SourceFileId(0),
+            byte_start: start as u32,
+            byte_end: end as u32,
+            utf16_start: self.utf16_offset(start),
+            utf16_end: self.utf16_offset(end),
+        }
+    }
+
+    fn utf16_offset(&self, byte_offset: usize) -> u32 {
+        match &self.utf16_offsets {
+            Utf16Offsets::SameAsByte => byte_offset as u32,
+            Utf16Offsets::Prefix(offsets) => offsets[byte_offset],
+        }
     }
 }
 
@@ -1656,11 +1694,7 @@ impl ObjectBuilder {
         self.object
     }
 
-    fn bind_params(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        decl: &syntax::FunctionDecl,
-    ) -> Result<()> {
+    fn bind_params(&mut self, lowerer: &mut Lowerer, decl: &syntax::FunctionDecl) -> Result<()> {
         for (index, param) in decl.params.iter().enumerate() {
             let name = param
                 .name
@@ -1800,7 +1834,7 @@ impl ObjectBuilder {
 
     fn local(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         binding: Option<syntax::BindingId>,
         name: Option<&str>,
         span: Span,
@@ -1841,7 +1875,7 @@ impl ObjectBuilder {
 
     fn lower_statements(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         statements: &[syntax::Stmt],
     ) -> Result<()> {
         let mut tasks = Vec::new();
@@ -1849,14 +1883,14 @@ impl ObjectBuilder {
         self.run_stmt_tasks(lowerer, &mut tasks)
     }
 
-    fn lower_stmt(&mut self, lowerer: &mut Lowerer<'_>, statement: &syntax::Stmt) -> Result<()> {
+    fn lower_stmt(&mut self, lowerer: &mut Lowerer, statement: &syntax::Stmt) -> Result<()> {
         let mut tasks = vec![StmtTask::Stmt(statement)];
         self.run_stmt_tasks(lowerer, &mut tasks)
     }
 
     fn run_stmt_tasks<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         tasks: &mut Vec<StmtTask<'a>>,
     ) -> Result<()> {
         while let Some(task) = tasks.pop() {
@@ -1909,7 +1943,7 @@ impl ObjectBuilder {
 
     fn push_stmt_task<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         statement: &'a syntax::Stmt,
         tasks: &mut Vec<StmtTask<'a>>,
     ) -> Result<()> {
@@ -2187,7 +2221,7 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn lower_var_decl(&mut self, lowerer: &mut Lowerer<'_>, decl: &syntax::VarDecl) -> Result<()> {
+    fn lower_var_decl(&mut self, lowerer: &mut Lowerer, decl: &syntax::VarDecl) -> Result<()> {
         let value = if let Some(initializer) = &decl.initializer {
             self.lower_expr(lowerer, initializer)?
         } else {
@@ -2216,7 +2250,7 @@ impl ObjectBuilder {
 
     fn lower_function_decl(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         decl: &syntax::FunctionDecl,
     ) -> Result<()> {
         let id =
@@ -2246,11 +2280,7 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn lower_class_decl(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        decl: &syntax::ClassDecl,
-    ) -> Result<()> {
+    fn lower_class_decl(&mut self, lowerer: &mut Lowerer, decl: &syntax::ClassDecl) -> Result<()> {
         let class_id = lowerer.next_object_id();
         let class_name = lowerer.intern_string(&decl.name.name);
         lowerer.object_jobs.push_back(ObjectJob::Class {
@@ -2284,7 +2314,7 @@ impl ObjectBuilder {
 
     fn lower_property_decl(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         decl: &syntax::PropertyDecl,
     ) -> Result<()> {
         let property_id = lowerer.next_object_id();
@@ -2323,7 +2353,7 @@ impl ObjectBuilder {
 
     fn populate_property_accessors(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         property_object: &mut ObjectBuilder,
         decl: &syntax::PropertyDecl,
     ) -> Result<()> {
@@ -2346,7 +2376,7 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn lower_for_init(&mut self, lowerer: &mut Lowerer<'_>, init: &syntax::ForInit) -> Result<()> {
+    fn lower_for_init(&mut self, lowerer: &mut Lowerer, init: &syntax::ForInit) -> Result<()> {
         match init {
             syntax::ForInit::Var { declarations, .. } => {
                 for declaration in declarations {
@@ -2360,7 +2390,7 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn lower_break(&mut self, lowerer: &mut Lowerer<'_>) -> Result<()> {
+    fn lower_break(&mut self, lowerer: &mut Lowerer) -> Result<()> {
         let Some(target) =
             self.control_stack
                 .iter()
@@ -2377,7 +2407,7 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn lower_continue(&mut self, lowerer: &mut Lowerer<'_>) -> Result<()> {
+    fn lower_continue(&mut self, lowerer: &mut Lowerer) -> Result<()> {
         let Some(target) = self
             .control_stack
             .iter()
@@ -2393,15 +2423,11 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn terminate_return_through_regions(
-        &mut self,
-        lowerer: &mut Lowerer<'_>,
-        value: Option<Value>,
-    ) {
+    fn terminate_return_through_regions(&mut self, lowerer: &mut Lowerer, value: Option<Value>) {
         self.terminate_exit_through_regions(lowerer, PendingExit::Return(value));
     }
 
-    fn terminate_exit_through_regions(&mut self, lowerer: &mut Lowerer<'_>, exit: PendingExit) {
+    fn terminate_exit_through_regions(&mut self, lowerer: &mut Lowerer, exit: PendingExit) {
         let keep_count = match exit {
             PendingExit::Goto(target) => self.active_region_prefix_for_target(target),
             PendingExit::Return(_) => 0,
@@ -2459,7 +2485,7 @@ impl ObjectBuilder {
             .is_some_and(|region| region.protected_blocks.contains(&target))
     }
 
-    fn lower_expr(&mut self, lowerer: &mut Lowerer<'_>, expr: &syntax::Expr) -> Result<Value> {
+    fn lower_expr(&mut self, lowerer: &mut Lowerer, expr: &syntax::Expr) -> Result<Value> {
         let mut tasks = vec![ExprTask::Expr(expr)];
         let mut values = Vec::new();
         let mut places = Vec::new();
@@ -2481,7 +2507,7 @@ impl ObjectBuilder {
 
     fn run_expr_task<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         task: ExprTask<'a>,
         tasks: &mut Vec<ExprTask<'a>>,
         values: &mut Vec<Value>,
@@ -2880,7 +2906,7 @@ impl ObjectBuilder {
 
     fn push_expr_task<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         expr: &'a syntax::Expr,
         tasks: &mut Vec<ExprTask<'a>>,
         values: &mut Vec<Value>,
@@ -3137,7 +3163,7 @@ impl ObjectBuilder {
 
     fn push_write_place_task<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         expr: &'a syntax::Expr,
         tasks: &mut Vec<ExprTask<'a>>,
         places: &mut Vec<Place>,
@@ -3190,7 +3216,7 @@ impl ObjectBuilder {
 
     fn push_member_read_place_task<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         expr: &'a syntax::Expr,
         flags: DispatchFlags,
         tasks: &mut Vec<ExprTask<'a>>,
@@ -3219,7 +3245,7 @@ impl ObjectBuilder {
 
     fn push_call_target_task<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         callee: &'a syntax::Expr,
         tasks: &mut Vec<ExprTask<'a>>,
         call_targets: &mut Vec<CallTarget>,
@@ -3311,7 +3337,7 @@ impl ObjectBuilder {
 
     fn push_short_circuit_tasks<'a>(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         op: syntax::BinaryOp,
         rhs: &'a syntax::Expr,
         tasks: &mut Vec<ExprTask<'a>>,
@@ -3417,7 +3443,7 @@ impl ObjectBuilder {
 
     fn read_ident(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         ident: &syntax::Ident,
         _span: Span,
     ) -> Result<Value> {
@@ -3435,7 +3461,7 @@ impl ObjectBuilder {
 
     fn ident_write_place(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         ident: &syntax::Ident,
         _span: Span,
     ) -> Result<Place> {
@@ -3456,7 +3482,7 @@ impl ObjectBuilder {
 
     fn ident_declaration_place(
         &mut self,
-        lowerer: &mut Lowerer<'_>,
+        lowerer: &mut Lowerer,
         ident: &syntax::Ident,
         span: Span,
     ) -> Place {
@@ -3480,7 +3506,7 @@ impl ObjectBuilder {
 
     fn resolve_local_ident_slot(
         &self,
-        lowerer: &Lowerer<'_>,
+        lowerer: &Lowerer,
         ident: &syntax::Ident,
     ) -> Result<Option<SlotId>> {
         let Some(binding) = ident.binding else {
@@ -4035,6 +4061,21 @@ mod tests {
         };
         let module = lower_hir_program(&program, "deep_expr.tjs", "").expect("lower");
         module.validate().expect("valid MIR");
+    }
+
+    #[test]
+    fn source_span_mapper_uses_precomputed_utf16_offsets() {
+        let mapper = SourceSpanMapper::new("a\u{e9}\u{10400}b");
+        let span = mapper.to_source_span(Span::new(1, 7));
+        assert_eq!(span.byte_start, 1);
+        assert_eq!(span.byte_end, 7);
+        assert_eq!(span.utf16_start, 1);
+        assert_eq!(span.utf16_end, 4);
+
+        let ascii = SourceSpanMapper::new("abc");
+        let span = ascii.to_source_span(Span::new(1, 2));
+        assert_eq!(span.utf16_start, 1);
+        assert_eq!(span.utf16_end, 2);
     }
 
     #[test]
