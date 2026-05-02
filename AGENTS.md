@@ -2,46 +2,17 @@
 
 ## Project Philosophy
 
-`krkr-ruri` is a high-performance, GPU-first, pure Rust runtime. It targets full cross-platform reach without C++ glue code.
-
-Do not use Flutter, ANGLE, Cocos2d-x, native UI toolkits, or any general UI framework. The engine is the UI: it renders its own launcher, settings, runtime surfaces, and overlays, similar in spirit to RetroArch.
-
-All pixel composition, transitions, effects, image presentation, and text rendering should be pushed onto the GPU. The CPU should focus on script execution, resource orchestration, and logic scheduling.
-
-Build through small, runnable vertical slices, but keep every slice aligned with the GPU-first architecture.
+`krkr-ruri` is a lightweight, high-performance, modern KRKR game emulator. It targets KRKR2/KRKRZ compatibility and full cross-platform reach across Linux, macOS, Windows, Android, iOS, and Web without C++ glue code.
 
 ## Architecture
 
 - `krkr-tjs2`: TJS2 language frontend, compiler, bytecode VM, object model, and language builtins.
-- `krkr-engine`: KRKR/TVP engine runtime. It owns the TJS runtime, registers TVP globals/native objects, coordinates project storage, XP3 access, and pure Rust plugin registration.
-- `krkr-core`: pure Rust shell state, input events, view models, draw lists. No platform UI or GPU APIs.
-- `krkr-render`: `wgpu` rendering, surface/device/pipeline management, GPU resources.
+- `krkr-kag`: KAG parser and scenario control flow. It handles labels, tags, macros, conditionals, script blocks, jump/call/return, parser snapshots, and host callbacks.
+- `krkr-engine`: KRKR/TVP engine runtime. It owns the TJS runtime and KAG parser, registers TVP globals/native objects, coordinates project storage, XP3 access, layers, transitions, timers/events, audio commands, and pure Rust plugin registration.
+- `krkr-core`: pure Rust shell/runtime state, input events, view models, draw lists, layer tree, message layer model, image upload metadata, and audio command model. No platform UI or GPU APIs.
+- `krkr-render`: `wgpu` rendering, surface/device/pipeline management, rectangles, uploaded textures, text texture presentation, clipping, content sizing, and transitions.
+- `krkr-font`: font discovery, metrics, glyph rasterization, and RGBA text image generation used before GPU texture upload.
 - `krkr-platform`: filesystem and minimal platform bridges. Keep native UI out of core and avoid platform UI components for engine surfaces.
-- `krkr-audio`: audio backend shell and future playback.
+- `krkr-audio`: Kira/CPAL audio backend for static/streaming playback, buses, volume, fade, pause/resume, and stop commands.
 - `krkr-xp3`: XP3 archive parsing and resource streaming.
-- `apps/desktop`: `winit` app lifecycle, input mapping, state transitions.
-
-## Working Rules
-
-- Follow existing crate boundaries before adding new abstractions.
-- Keep changes scoped; avoid unrelated refactors.
-- Prefer simple data structures and explicit state machines.
-- Add tests for core behavior, resource handling, and parsing logic as those areas grow.
-- Do not add text/image/audio/TJS/XP3 claims unless the feature is actually wired and verified.
-
-## Verification
-
-Run before handing off non-trivial code changes:
-
-```sh
-cargo fmt --all -- --check
-cargo check --workspace --all-targets
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-Manual desktop check when UI/rendering behavior changes:
-
-```sh
-cargo run -p krkr-desktop
-```
+- `apps/desktop`: `winit` app lifecycle, input mapping, launcher/settings/runtime state transitions, renderer/audio integration, project selection, and fullscreen/window sizing.
