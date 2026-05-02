@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
 
-use krkr_audio::AudioSystem;
+use krkr_audio::{AudioStatusLevel, AudioSystem};
 use krkr_core::{
     ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Panel, Point,
     PointerButton, Size, StatusLevel, UiAction,
@@ -155,6 +155,8 @@ impl DesktopApp {
     }
 
     fn handle_redraw(&mut self, event_loop: &ActiveEventLoop) {
+        self.report_audio_events();
+
         let Some(renderer) = &mut self.renderer else {
             return;
         };
@@ -208,7 +210,7 @@ impl DesktopApp {
                             return_to_launcher_after_render |=
                                 krkr_engine.host().termination_requested();
                             let audio_commands = krkr_engine.host_mut().take_audio_commands();
-                            if let Err(error) = self.audio.apply_commands(audio_commands) {
+                            if let Err(error) = self.audio.submit_commands(audio_commands) {
                                 let message = format!("audio command failed: {error}");
                                 log_warn(&message);
                                 self.status =
@@ -341,7 +343,6 @@ impl DesktopApp {
                 return;
             }
         };
-
         let has_startup_tjs = krkr_engine.host().storage_exists("startup.tjs");
         let has_startup_ks = krkr_engine.host().storage_exists("startup.ks");
         if has_startup_tjs || !has_startup_ks {
@@ -375,6 +376,13 @@ impl DesktopApp {
             self.resize_window_for_runtime(window, size);
         }
         apply_window_fullscreen(window, krkr_engine.window_fullscreen());
+        if let Err(error) = self
+            .audio
+            .set_resource_provider(krkr_engine.host().resource_provider())
+        {
+            let message = format!("audio worker unavailable: {error}");
+            self.set_status(StatusLevel::Warning, message, Some(window));
+        }
 
         self.krkr_engine = Some(krkr_engine);
         self.runtime_viewport_size = preferred_size
@@ -391,6 +399,9 @@ impl DesktopApp {
         self.exit_after_runtime_close = false;
         self.state = DesktopState::Launcher;
         self.krkr_engine = None;
+        if let Err(error) = self.audio.clear_resource_provider() {
+            log_warn(&format!("failed to clear audio resource provider: {error}"));
+        }
         self.runtime_viewport_size = None;
         self.pending_runtime_events.clear();
         if let Some(renderer) = &mut self.renderer {
@@ -453,6 +464,23 @@ impl DesktopApp {
             return position;
         };
         map_window_point_to_content(position, renderer.logical_size(), content_size)
+    }
+
+    fn report_audio_events(&mut self) {
+        for event in self.audio.drain_events() {
+            let level = match event.level {
+                AudioStatusLevel::Warning => StatusLevel::Warning,
+                AudioStatusLevel::Error => StatusLevel::Error,
+            };
+            let message = format!("audio: {}", event.message);
+            match level {
+                StatusLevel::Info => log_info(&message),
+                StatusLevel::Warning => log_warn(&message),
+                StatusLevel::Error => log_error(&message),
+            }
+            self.engine.set_status_level(Some(level));
+            self.status = Some(DesktopStatus::new(level, message));
+        }
     }
 
     fn set_status(

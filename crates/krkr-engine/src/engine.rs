@@ -5,7 +5,7 @@ use std::{
 };
 
 use krkr_core::{
-    AudioBus, AudioCommand, AudioSourceKind, ButtonState, Engine as CoreEngine,
+    AudioBus, AudioCommand, AudioLoadPolicy, ButtonState, Engine as CoreEngine,
     EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput, FrameOutput, LayerId,
     MessageLayerModel, Point, PointerButton, Size,
 };
@@ -1988,17 +1988,27 @@ impl KagRuntimeTask {
                     runtime,
                     tag,
                     AudioBus::Bgm,
-                    AudioSourceKind::Streaming,
+                    AudioLoadPolicy::Streaming,
                     true,
                 )?;
                 Ok(TagAction::Continue)
             }
-            "playse" | "playvoice" => {
+            "playse" => {
                 play_kag_audio_tag(
                     runtime,
                     tag,
                     AudioBus::SoundEffect,
-                    AudioSourceKind::Static,
+                    AudioLoadPolicy::StaticCached,
+                    false,
+                )?;
+                Ok(TagAction::Continue)
+            }
+            "playvoice" => {
+                play_kag_audio_tag(
+                    runtime,
+                    tag,
+                    AudioBus::SoundEffect,
+                    AudioLoadPolicy::Streaming,
                     false,
                 )?;
                 Ok(TagAction::Continue)
@@ -2200,7 +2210,7 @@ fn play_kag_audio_tag(
     runtime: &mut Runtime<KrkrHost>,
     tag: &Tag,
     bus: AudioBus,
-    kind: AudioSourceKind,
+    load_policy: AudioLoadPolicy,
     default_looping: bool,
 ) -> Result<()> {
     let storage = tag
@@ -2215,7 +2225,7 @@ fn play_kag_audio_tag(
         .unwrap_or(1.0);
     runtime
         .host_mut()
-        .queue_kag_audio_play(storage, bus, kind, looping, volume)?;
+        .queue_kag_audio_play(storage, bus, load_policy, looping, volume)?;
     Ok(())
 }
 
@@ -6890,35 +6900,43 @@ mod tests {
             .expect("script");
 
         let commands = engine.host_mut().take_audio_commands();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 4);
         match &commands[0] {
+            AudioCommand::Preload {
+                source,
+                load_policy,
+            } => {
+                assert_eq!(source.storage(), "sound.wav");
+                assert_eq!(*load_policy, AudioLoadPolicy::Auto);
+            }
+            command => panic!("expected preload command, got {command:?}"),
+        }
+        match &commands[1] {
             AudioCommand::Play {
                 bus,
-                kind,
-                storage,
-                bytes,
+                source,
+                load_policy,
                 looping,
                 volume,
                 ..
             } => {
                 assert_eq!(*bus, AudioBus::Bgm);
-                assert_eq!(*kind, AudioSourceKind::Static);
-                assert_eq!(storage, "sound.wav");
-                assert_eq!(bytes, b"not real audio");
+                assert_eq!(*load_policy, AudioLoadPolicy::Auto);
+                assert_eq!(source.storage(), "sound.wav");
                 assert!(*looping);
                 assert_eq!(*volume, 1.0);
             }
             command => panic!("expected play command, got {command:?}"),
         }
         assert!(matches!(
-            commands[1],
+            commands[2],
             AudioCommand::SetVolume {
                 volume: 0.5,
                 fade_seconds: 0.25,
                 ..
             }
         ));
-        assert!(matches!(commands[2], AudioCommand::Stop { .. }));
+        assert!(matches!(commands[3], AudioCommand::Stop { .. }));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -6950,6 +6968,7 @@ mod tests {
         let commands = engine.host_mut().take_audio_commands();
         match &commands[..] {
             [
+                AudioCommand::Preload { .. },
                 AudioCommand::Play { volume, .. },
                 AudioCommand::SetVolume {
                     volume: updated, ..
@@ -7001,6 +7020,7 @@ mod tests {
         let commands = engine.host_mut().take_audio_commands();
         match &commands[..] {
             [
+                AudioCommand::Preload { .. },
                 AudioCommand::Play { volume, .. },
                 AudioCommand::SetVolume {
                     volume: updated, ..
@@ -7049,26 +7069,36 @@ mod tests {
             .expect("script");
 
         let commands = engine.host_mut().take_audio_commands();
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 3);
         match &commands[0] {
+            AudioCommand::Preload {
+                source,
+                load_policy,
+            } => {
+                assert_eq!(source.storage(), "voice.ogg");
+                assert_eq!(*load_policy, AudioLoadPolicy::Auto);
+            }
+            command => panic!("expected preload command, got {command:?}"),
+        }
+        match &commands[1] {
             AudioCommand::Play {
                 bus,
-                storage,
-                bytes,
+                source,
+                load_policy,
                 looping,
                 volume,
                 ..
             } => {
                 assert_eq!(*bus, AudioBus::SoundEffect);
-                assert_eq!(storage, "voice.ogg");
-                assert_eq!(bytes, b"voice bytes");
+                assert_eq!(*load_policy, AudioLoadPolicy::Auto);
+                assert_eq!(source.storage(), "voice.ogg");
                 assert!(!*looping);
                 assert_eq!(*volume, 0.6);
             }
             command => panic!("expected play command, got {command:?}"),
         }
         assert!(matches!(
-            commands[1],
+            commands[2],
             AudioCommand::SetVolume {
                 volume: 0.3,
                 fade_seconds: 0.25,
@@ -7130,11 +7160,10 @@ mod tests {
         let commands = engine.host_mut().take_audio_commands();
         match &commands[..] {
             [
-                AudioCommand::Play {
-                    storage, volume, ..
-                },
+                AudioCommand::Preload { .. },
+                AudioCommand::Play { source, volume, .. },
             ] => {
-                assert_eq!(storage, "voice.ogg");
+                assert_eq!(source.storage(), "voice.ogg");
                 assert_eq!(*volume, 1.0);
             }
             commands => panic!("expected one play command, got {commands:?}"),
@@ -7188,6 +7217,7 @@ mod tests {
         let commands = engine.host_mut().take_audio_commands();
         match &commands[..] {
             [
+                AudioCommand::Preload { .. },
                 AudioCommand::Play { id: play_id, .. },
                 AudioCommand::SetVolume {
                     id,
@@ -7270,6 +7300,7 @@ mod tests {
         let commands = engine.host_mut().take_audio_commands();
         match &commands[..] {
             [
+                AudioCommand::Preload { .. },
                 AudioCommand::Play { id: play_id, .. },
                 AudioCommand::SetVolume { id: fade_id, .. },
                 AudioCommand::Stop { id: stop_id, .. },
@@ -7308,12 +7339,23 @@ mod tests {
 
         let commands = engine.host_mut().take_audio_commands();
         match &commands[..] {
-            [AudioCommand::Play { storage, bytes, .. }] => {
-                assert_eq!(storage, "09.clock_like_name");
-                assert_eq!(bytes, b"dotted audio bytes");
+            [
+                AudioCommand::Preload { source, .. },
+                AudioCommand::Play {
+                    source: play_source,
+                    ..
+                },
+            ] => {
+                assert_eq!(source.storage(), "09.clock_like_name");
+                assert_eq!(play_source.storage(), "09.clock_like_name");
             }
             commands => panic!("expected one play command, got {commands:?}"),
         }
+        let provider = engine
+            .host()
+            .resource_provider()
+            .expect("resource provider");
+        assert!(provider.exists("09.clock_like_name"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -7342,22 +7384,22 @@ mod tests {
             &commands[0],
             AudioCommand::Play {
                 bus: AudioBus::Bgm,
-                kind: AudioSourceKind::Streaming,
-                storage,
+                load_policy: AudioLoadPolicy::Streaming,
+                source,
                 looping: true,
                 volume,
                 ..
-            } if storage == "music.ogg" && (*volume - 0.8).abs() < f32::EPSILON
+            } if source.storage() == "music.ogg" && (*volume - 0.8).abs() < f32::EPSILON
         ));
         assert!(matches!(
             &commands[1],
             AudioCommand::Play {
                 bus: AudioBus::SoundEffect,
-                kind: AudioSourceKind::Static,
-                storage,
+                load_policy: AudioLoadPolicy::StaticCached,
+                source,
                 looping: false,
                 ..
-            } if storage == "click.wav"
+            } if source.storage() == "click.wav"
         ));
         assert!(matches!(
             commands[2],

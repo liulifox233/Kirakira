@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use krkr_core::{AudioBus, AudioCommand, AudioSourceKind, LayerNode};
+use krkr_core::{AudioBus, AudioCommand, AudioLoadPolicy, LayerNode};
 use krkr_font::{FontSpec, FontSystem, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
@@ -1151,7 +1151,7 @@ fn wave_sound_buffer_play(
     };
     runtime
         .host_mut()
-        .queue_native_audio_play(this, bus, AudioSourceKind::Static)?;
+        .queue_native_audio_play(this, bus, AudioLoadPolicy::Auto)?;
     runtime.set_object_member(this, "status", Variant::String("play".to_string()));
     runtime.set_object_member(this, "paused", Variant::Integer(0));
     Ok(Variant::Void)

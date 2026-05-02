@@ -4,15 +4,18 @@ use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use krkr_core::{
-    AudioBus, AudioCommand, AudioInstanceId, AudioSourceKind, DrawCommand, FrameTransition,
-    ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceProvider,
+    AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, DrawCommand,
+    FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceProvider,
 };
 use krkr_font::FontSystem;
 use krkr_kag::{KagParser, ParserSnapshot};
@@ -28,6 +31,7 @@ pub struct KrkrHost {
     fs_layers: Vec<ProjectLayer>,
     fs_lookup_cache: RefCell<BTreeMap<String, Option<LocatedStorage>>>,
     xp3_provider: Option<Xp3ResourceProvider>,
+    project_resources: Option<ProjectResourceProvider>,
     auto_paths: Vec<String>,
     logs: Vec<String>,
     linked_plugins: BTreeSet<String>,
@@ -66,6 +70,7 @@ impl Default for KrkrHost {
             fs_layers: Vec::new(),
             fs_lookup_cache: RefCell::new(BTreeMap::new()),
             xp3_provider: None,
+            project_resources: None,
             auto_paths: Vec::new(),
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
@@ -104,11 +109,14 @@ impl KrkrHost {
         let root = root.into();
         let fs_layers = project_layers(&root);
         let xp3_provider = open_project_archives(&root)?;
+        let project_resources =
+            ProjectResourceProvider::new(fs_layers.clone(), xp3_provider.clone(), Vec::new());
         Ok(Self {
             project_root: Some(root),
             fs_layers,
             fs_lookup_cache: RefCell::new(BTreeMap::new()),
             xp3_provider,
+            project_resources: Some(project_resources),
             auto_paths: Vec::new(),
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
@@ -147,6 +155,12 @@ impl KrkrHost {
 
     pub fn data_path(&self) -> Option<PathBuf> {
         self.project_root.as_ref().map(|root| root.join("savedata"))
+    }
+
+    pub fn resource_provider(&self) -> Option<Arc<dyn ResourceProvider>> {
+        self.project_resources
+            .as_ref()
+            .map(|provider| Arc::new(provider.clone()) as Arc<dyn ResourceProvider>)
     }
 
     pub fn logs(&self) -> &[String] {
@@ -189,6 +203,9 @@ impl KrkrHost {
         let path = normalize_storage_separators(&path.into());
         if !self.auto_paths.iter().any(|item| item == &path) {
             self.auto_paths.push(path);
+            if let Some(provider) = &self.project_resources {
+                provider.add_auto_path(self.auto_paths.last().expect("auto path was pushed"));
+            }
             self.clear_fs_lookup_cache();
         }
     }
@@ -198,6 +215,9 @@ impl KrkrHost {
         self.auto_paths.retain(|item| item != path);
         let removed = before != self.auto_paths.len();
         if removed {
+            if let Some(provider) = &self.project_resources {
+                provider.remove_auto_path(path);
+            }
             self.clear_fs_lookup_cache();
         }
         removed
@@ -777,7 +797,6 @@ impl KrkrHost {
         storage: impl Into<String>,
     ) -> Result<()> {
         let storage = storage.into();
-        let bytes = self.read_binary_storage(&storage)?;
         if !self.native_audio_buffers.contains_key(&handle) {
             let id = self.allocate_audio_instance_id();
             self.native_audio_buffers
@@ -787,8 +806,11 @@ impl KrkrHost {
             .native_audio_buffers
             .get_mut(&handle)
             .expect("native audio buffer was inserted");
-        buffer.storage = Some(storage);
-        buffer.bytes = Some(bytes);
+        buffer.storage = Some(storage.clone());
+        self.pending_audio_commands.push(AudioCommand::Preload {
+            source: AudioSourceRef::new(storage),
+            load_policy: AudioLoadPolicy::Auto,
+        });
         Ok(())
     }
 
@@ -796,7 +818,7 @@ impl KrkrHost {
         &mut self,
         handle: ObjectHandle,
         bus: AudioBus,
-        kind: AudioSourceKind,
+        load_policy: AudioLoadPolicy,
     ) -> Result<()> {
         let buffer = self
             .native_audio_buffers
@@ -806,10 +828,6 @@ impl KrkrHost {
             .storage
             .clone()
             .ok_or_else(|| TjsError::runtime("WaveSoundBuffer has no opened storage"))?;
-        let bytes = buffer
-            .bytes
-            .clone()
-            .ok_or_else(|| TjsError::runtime("WaveSoundBuffer has no decoded source bytes"))?;
         let id = buffer.id;
         let looping = buffer.looping;
         let volume = buffer.effective_volume(self.native_audio_global_volume);
@@ -817,9 +835,8 @@ impl KrkrHost {
         self.pending_audio_commands.push(AudioCommand::Play {
             id,
             bus,
-            kind,
-            storage,
-            bytes,
+            source: AudioSourceRef::new(storage),
+            load_policy,
             looping,
             volume,
         });
@@ -838,19 +855,17 @@ impl KrkrHost {
         &mut self,
         storage: impl Into<String>,
         bus: AudioBus,
-        kind: AudioSourceKind,
+        load_policy: AudioLoadPolicy,
         looping: bool,
         volume: f32,
     ) -> Result<AudioInstanceId> {
         let storage = storage.into();
-        let bytes = self.read_binary_storage(&storage)?;
         let id = self.allocate_audio_instance_id();
         self.pending_audio_commands.push(AudioCommand::Play {
             id,
             bus,
-            kind,
-            storage,
-            bytes,
+            source: AudioSourceRef::new(storage),
+            load_policy,
             looping,
             volume,
         });
@@ -1197,7 +1212,6 @@ struct TimerState {
 pub(crate) struct NativeAudioBuffer {
     pub id: AudioInstanceId,
     pub storage: Option<String>,
-    pub bytes: Option<Vec<u8>>,
     pub looping: bool,
     pub volume: i64,
     pub volume2: i64,
@@ -1210,7 +1224,6 @@ impl NativeAudioBuffer {
         Self {
             id,
             storage: None,
-            bytes: None,
             looping: false,
             volume: 100000,
             volume2: 100000,
@@ -1258,6 +1271,213 @@ pub(crate) struct NativeTransitionCompletion {
 struct LocatedStorage {
     path: PathBuf,
     encoding_hint: Option<&'static Encoding>,
+}
+
+#[derive(Clone)]
+pub struct ProjectResourceProvider {
+    inner: Arc<ProjectResourceProviderInner>,
+}
+
+struct ProjectResourceProviderInner {
+    fs_layers: Vec<ProjectLayer>,
+    fs_lookup_cache: Mutex<BTreeMap<String, Option<LocatedStorage>>>,
+    xp3_provider: Option<Xp3ResourceProvider>,
+    auto_paths: RwLock<Vec<String>>,
+    revision: AtomicU64,
+}
+
+impl ProjectResourceProvider {
+    fn new(
+        fs_layers: Vec<ProjectLayer>,
+        xp3_provider: Option<Xp3ResourceProvider>,
+        auto_paths: Vec<String>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ProjectResourceProviderInner {
+                fs_layers,
+                fs_lookup_cache: Mutex::new(BTreeMap::new()),
+                xp3_provider,
+                auto_paths: RwLock::new(auto_paths),
+                revision: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    fn add_auto_path(&self, path: &str) {
+        let path = normalize_storage_separators(path);
+        let Ok(mut auto_paths) = self.inner.auto_paths.write() else {
+            return;
+        };
+        if !auto_paths.iter().any(|item| item == &path) {
+            auto_paths.push(path);
+            self.clear_lookup_cache();
+            self.inner.revision.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn remove_auto_path(&self, path: &str) {
+        let Ok(mut auto_paths) = self.inner.auto_paths.write() else {
+            return;
+        };
+        let before = auto_paths.len();
+        auto_paths.retain(|item| item != path);
+        if before != auto_paths.len() {
+            self.clear_lookup_cache();
+            self.inner.revision.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn clear_lookup_cache(&self) {
+        if let Ok(mut cache) = self.inner.fs_lookup_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    fn auto_paths(&self) -> Vec<String> {
+        self.inner
+            .auto_paths
+            .read()
+            .map(|paths| paths.clone())
+            .unwrap_or_default()
+    }
+
+    fn open_storage(&self, name: &str) -> io::Result<Box<dyn krkr_core::ResourceStream>> {
+        if let Some(storage) = self.find_fs_storage(name)? {
+            return fs::File::open(&storage.path)
+                .map(|file| Box::new(file) as Box<dyn krkr_core::ResourceStream>);
+        }
+
+        if let Some(provider) = &self.inner.xp3_provider {
+            for candidate in self.storage_candidates(name)? {
+                if provider.exists(&candidate) {
+                    return provider.open(&candidate);
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("storage `{name}` not found"),
+        ))
+    }
+
+    fn storage_exists(&self, name: &str) -> bool {
+        if self.find_fs_storage(name).ok().flatten().is_some() {
+            return true;
+        }
+
+        let Some(provider) = &self.inner.xp3_provider else {
+            return false;
+        };
+        self.storage_candidates(name).is_ok_and(|candidates| {
+            candidates
+                .iter()
+                .any(|candidate| provider.exists(candidate))
+        })
+    }
+
+    fn find_fs_storage(&self, name: &str) -> io::Result<Option<LocatedStorage>> {
+        if let Some(storage) = self.find_absolute_storage(name) {
+            return Ok(Some(storage));
+        }
+
+        if let Ok(cache) = self.inner.fs_lookup_cache.lock()
+            && let Some(storage) = cache.get(name).cloned()
+        {
+            return Ok(storage);
+        }
+
+        for candidate in self.fs_candidates(name)? {
+            for layer in self.inner.fs_layers.iter().rev() {
+                let path = layer.root.join(&candidate);
+                if path.is_file() {
+                    let storage = Some(LocatedStorage {
+                        path,
+                        encoding_hint: layer.encoding_hint,
+                    });
+                    self.cache_fs_lookup(name, storage.clone());
+                    return Ok(storage);
+                }
+                if let Some(path) = resolve_case_insensitive_path(&layer.root, &candidate)?
+                    && path.is_file()
+                {
+                    let storage = Some(LocatedStorage {
+                        path,
+                        encoding_hint: layer.encoding_hint,
+                    });
+                    self.cache_fs_lookup(name, storage.clone());
+                    return Ok(storage);
+                }
+            }
+        }
+
+        self.cache_fs_lookup(name, None);
+        Ok(None)
+    }
+
+    fn cache_fs_lookup(&self, name: &str, storage: Option<LocatedStorage>) {
+        if let Ok(mut cache) = self.inner.fs_lookup_cache.lock() {
+            cache.insert(name.to_string(), storage);
+        }
+    }
+
+    fn find_absolute_storage(&self, name: &str) -> Option<LocatedStorage> {
+        let path = Path::new(name);
+        if !path.is_absolute() || !is_safe_absolute_storage_path(path) {
+            return None;
+        }
+        let path = path.to_path_buf();
+        if !path.is_file() {
+            return None;
+        }
+        Some(LocatedStorage {
+            encoding_hint: self
+                .inner
+                .fs_layers
+                .iter()
+                .find(|layer| path.starts_with(&layer.root))
+                .and_then(|layer| layer.encoding_hint)
+                .or_else(|| infer_encoding_from_path(&path)),
+            path,
+        })
+    }
+
+    fn fs_candidates(&self, name: &str) -> io::Result<Vec<PathBuf>> {
+        self.storage_candidates(name)?
+            .into_iter()
+            .map(|candidate| clean_relative_path(&candidate).map_err(tjs_error_to_io))
+            .collect()
+    }
+
+    fn storage_candidates(&self, name: &str) -> io::Result<Vec<String>> {
+        let names = storage_lookup_names(name).map_err(tjs_error_to_io)?;
+        let auto_paths = self.auto_paths();
+        let mut candidates = Vec::with_capacity(names.len() * (auto_paths.len() + 1));
+        for name in names {
+            let clean = clean_relative_path(&name).map_err(tjs_error_to_io)?;
+            push_unique_storage_candidate(&mut candidates, &clean);
+            for auto_path in auto_paths.iter().rev() {
+                for candidate in auto_path_candidates(auto_path, &clean) {
+                    push_unique_storage_candidate(&mut candidates, &candidate);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+}
+
+impl ResourceProvider for ProjectResourceProvider {
+    fn open(&self, path: &str) -> io::Result<Box<dyn krkr_core::ResourceStream>> {
+        self.open_storage(path)
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.storage_exists(path)
+    }
+
+    fn revision(&self) -> u64 {
+        self.inner.revision.load(Ordering::Relaxed)
+    }
 }
 
 fn project_layers(root: &Path) -> Vec<ProjectLayer> {
@@ -1728,6 +1948,10 @@ fn clean_relative_path(path: &str) -> Result<PathBuf> {
 
 fn io_error(error: io::Error) -> TjsError {
     TjsError::runtime(error.to_string())
+}
+
+fn tjs_error_to_io(error: TjsError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
 
 #[cfg(test)]

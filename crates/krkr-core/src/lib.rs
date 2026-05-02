@@ -14,6 +14,10 @@ pub trait ResourceProvider: Send + Sync {
     fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>>;
 
     fn exists(&self, path: &str) -> bool;
+
+    fn revision(&self) -> u64 {
+        0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -27,9 +31,28 @@ pub enum AudioBus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioSourceKind {
-    Static,
+pub enum AudioLoadPolicy {
+    Auto,
     Streaming,
+    StaticCached,
+    StaticUncached,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct AudioSourceRef {
+    pub storage: String,
+}
+
+impl AudioSourceRef {
+    pub fn new(storage: impl Into<String>) -> Self {
+        Self {
+            storage: storage.into(),
+        }
+    }
+
+    pub fn storage(&self) -> &str {
+        &self.storage
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,11 +60,14 @@ pub enum AudioCommand {
     Play {
         id: AudioInstanceId,
         bus: AudioBus,
-        kind: AudioSourceKind,
-        storage: String,
-        bytes: Vec<u8>,
+        source: AudioSourceRef,
+        load_policy: AudioLoadPolicy,
         looping: bool,
         volume: f32,
+    },
+    Preload {
+        source: AudioSourceRef,
+        load_policy: AudioLoadPolicy,
     },
     Stop {
         id: AudioInstanceId,
