@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -25,6 +26,7 @@ use krkr_xp3::Xp3ResourceProvider;
 pub struct KrkrHost {
     project_root: Option<PathBuf>,
     fs_layers: Vec<ProjectLayer>,
+    fs_lookup_cache: RefCell<BTreeMap<String, Option<LocatedStorage>>>,
     xp3_provider: Option<Xp3ResourceProvider>,
     auto_paths: Vec<String>,
     logs: Vec<String>,
@@ -62,6 +64,7 @@ impl Default for KrkrHost {
         Self {
             project_root: None,
             fs_layers: Vec::new(),
+            fs_lookup_cache: RefCell::new(BTreeMap::new()),
             xp3_provider: None,
             auto_paths: Vec::new(),
             logs: Vec::new(),
@@ -104,6 +107,7 @@ impl KrkrHost {
         Ok(Self {
             project_root: Some(root),
             fs_layers,
+            fs_lookup_cache: RefCell::new(BTreeMap::new()),
             xp3_provider,
             auto_paths: Vec::new(),
             logs: Vec::new(),
@@ -185,13 +189,18 @@ impl KrkrHost {
         let path = normalize_storage_separators(&path.into());
         if !self.auto_paths.iter().any(|item| item == &path) {
             self.auto_paths.push(path);
+            self.clear_fs_lookup_cache();
         }
     }
 
     pub fn remove_auto_path(&mut self, path: &str) -> bool {
         let before = self.auto_paths.len();
         self.auto_paths.retain(|item| item != path);
-        before != self.auto_paths.len()
+        let removed = before != self.auto_paths.len();
+        if removed {
+            self.clear_fs_lookup_cache();
+        }
+        removed
     }
 
     pub fn clear_archive_cache(&self) -> Result<()> {
@@ -234,7 +243,7 @@ impl KrkrHost {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
-        if let Some(offset) = storage_mode_offset(mode) {
+        let result = if let Some(offset) = storage_mode_offset(mode) {
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -245,7 +254,11 @@ impl KrkrHost {
             file.write_all(bytes).map_err(io_error)
         } else {
             fs::write(&path, bytes).map_err(io_error)
+        };
+        if result.is_ok() {
+            self.clear_fs_lookup_cache();
         }
+        result
     }
 
     fn storage_bytes(&self, name: &str) -> Result<Vec<u8>> {
@@ -279,27 +292,45 @@ impl KrkrHost {
         if self.project_root.is_none() {
             return Ok(None);
         };
+        if let Some(storage) = self.fs_lookup_cache.borrow().get(name).cloned() {
+            return Ok(storage);
+        }
         for candidate in self.fs_candidates(name)? {
             for layer in self.fs_layers.iter().rev() {
                 let path = layer.root.join(&candidate);
                 if path.is_file() {
-                    return Ok(Some(LocatedStorage {
+                    let storage = Some(LocatedStorage {
                         path,
                         encoding_hint: layer.encoding_hint,
-                    }));
+                    });
+                    self.fs_lookup_cache
+                        .borrow_mut()
+                        .insert(name.to_string(), storage.clone());
+                    return Ok(storage);
                 }
                 if let Some(path) =
                     resolve_case_insensitive_path(&layer.root, &candidate).map_err(io_error)?
                     && path.is_file()
                 {
-                    return Ok(Some(LocatedStorage {
+                    let storage = Some(LocatedStorage {
                         path,
                         encoding_hint: layer.encoding_hint,
-                    }));
+                    });
+                    self.fs_lookup_cache
+                        .borrow_mut()
+                        .insert(name.to_string(), storage.clone());
+                    return Ok(storage);
                 }
             }
         }
+        self.fs_lookup_cache
+            .borrow_mut()
+            .insert(name.to_string(), None);
         Ok(None)
+    }
+
+    fn clear_fs_lookup_cache(&self) {
+        self.fs_lookup_cache.borrow_mut().clear();
     }
 
     fn find_absolute_storage(&self, name: &str) -> Option<LocatedStorage> {
