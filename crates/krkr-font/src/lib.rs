@@ -188,10 +188,18 @@ impl FontSystem {
         name: impl Into<String>,
         data: Vec<u8>,
     ) -> Result<(), String> {
+        self.map_prerendered_font_arc(name, Arc::from(data))
+    }
+
+    pub fn map_prerendered_font_arc(
+        &mut self,
+        name: impl Into<String>,
+        data: Arc<[u8]>,
+    ) -> Result<(), String> {
         let name = name.into();
         let ids = self
             .db
-            .load_font_source(Source::Binary(Arc::new(data.clone())));
+            .load_font_source(Source::Binary(Arc::new(data.as_ref().to_vec())));
         if ids.is_empty() {
             return Err(format!(
                 "prerendered font `{name}` is not a supported font payload"
@@ -199,7 +207,7 @@ impl FontSystem {
         }
         self.named_file_faces
             .insert(name.clone(), ids.into_iter().collect());
-        self.prerendered_fonts.insert(name, Arc::from(data));
+        self.prerendered_fonts.insert(name, data);
         self.clear_caches();
         Ok(())
     }

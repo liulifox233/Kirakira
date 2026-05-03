@@ -10,7 +10,9 @@ use krkr_tjs2::{
     runtime::{Closure, ObjectHandle, Runtime, TjsHost, Variant},
 };
 
-use crate::host::{KrkrHost, NativeTransitionCompletion};
+use crate::host::{
+    CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KrkrHost, NativeTransitionCompletion,
+};
 
 use super::register_stub_method;
 
@@ -1453,7 +1455,7 @@ fn layer_load_images(
         None => None,
     };
 
-    let image = runtime.host_mut().load_image_storage(&storage)?;
+    let image = runtime.host_mut().load_image_storage_for_script(&storage)?;
     let size = image.size();
 
     match render_layer_target(runtime, this)? {
@@ -1587,6 +1589,111 @@ fn layer_save_layer_image(
     let bytes = encode_layer_bmp(width, height, &pixels, &mode)?;
     runtime.host_mut().write_binary(&path, "", &bytes)?;
     Ok(Variant::Void)
+}
+
+pub(crate) fn apply_completed_resource_loads(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+    let completions = runtime.host_mut().take_completed_image_loads();
+    for completion in completions {
+        apply_completed_image_load(runtime, completion)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_completed_image_load(
+    runtime: &mut Runtime<KrkrHost>,
+    completion: CompletedImageLoad,
+) -> Result<()> {
+    let image = completion.image;
+    let size = image.size();
+    apply_image_to_target(runtime, &completion.request, Some(image), Some(size))?;
+    if let Some(this) = completion.request.owner
+        && runtime.object_valid(this)
+    {
+        sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
+        mark_image_modified(runtime, this);
+        apply_layer_load_property_storage(runtime, this, &completion.request);
+    }
+    Ok(())
+}
+
+fn apply_image_to_target(
+    runtime: &mut Runtime<KrkrHost>,
+    request: &ImageLoadRequest,
+    image: Option<krkr_core::LayerImage>,
+    image_size: Option<krkr_core::Size>,
+) -> Result<()> {
+    match &request.target {
+        ImageLoadTarget::Kag { page, layer } => {
+            let image = image.clone();
+            runtime.host_mut().mutate_kag_layer(page, layer, |layer| {
+                if let Some(image) = image {
+                    layer.set_image(image);
+                }
+                apply_layer_load_geometry(layer, request, image_size);
+            });
+        }
+    }
+    Ok(())
+}
+
+fn apply_layer_load_geometry(
+    layer: &mut LayerNode,
+    request: &ImageLoadRequest,
+    image_size: Option<krkr_core::Size>,
+) {
+    layer.visible = request.visible;
+    if let Some(left) = request.left {
+        layer.left = left as f32;
+    }
+    if let Some(top) = request.top {
+        layer.top = top as f32;
+    }
+    if let Some(width) = request.width {
+        layer.width = width.max(0) as f32;
+    } else if let Some(size) = image_size {
+        layer.width = size.width;
+    }
+    if let Some(height) = request.height {
+        layer.height = height.max(0) as f32;
+    } else if let Some(size) = image_size {
+        layer.height = size.height;
+    }
+    if let Some(opacity) = request.opacity {
+        layer.opacity = opacity.clamp(0, 255) as u8;
+    }
+}
+
+fn apply_layer_load_property_storage(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    request: &ImageLoadRequest,
+) {
+    set_layer_property_storage(
+        runtime,
+        this,
+        "visible",
+        Variant::Integer(i64::from(request.visible)),
+    );
+    if let Some(left) = request.left {
+        set_layer_property_storage(runtime, this, "left", Variant::Integer(left));
+    }
+    if let Some(top) = request.top {
+        set_layer_property_storage(runtime, this, "top", Variant::Integer(top));
+    }
+    if let Some(width) = request.width {
+        set_layer_property_storage(runtime, this, "width", Variant::Integer(width.max(0)));
+    }
+    if let Some(height) = request.height {
+        set_layer_property_storage(runtime, this, "height", Variant::Integer(height.max(0)));
+    }
+    if let Some(opacity) = request.opacity {
+        set_layer_property_storage(
+            runtime,
+            this,
+            "opacity",
+            Variant::Integer(opacity.clamp(0, 255)),
+        );
+    }
 }
 
 fn encode_layer_bmp(width: u32, height: u32, rgba: &[u8], mode: &str) -> Result<Vec<u8>> {
@@ -3285,11 +3392,12 @@ fn font_map_prerendered_font(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_else(|| name.clone());
-    let bytes = runtime.host().read_binary_storage(&storage)?;
+    let data = runtime.host().read_resource_storage(&storage)?;
+    let bytes = data.to_arc_bytes().map_err(crate::storage::io_error)?;
     runtime
         .host_mut()
         .font_system_mut()
-        .map_prerendered_font(name, bytes)
+        .map_prerendered_font_arc(name, bytes)
         .map_err(TjsError::runtime)?;
     Ok(Variant::Void)
 }
@@ -3598,7 +3706,11 @@ fn ensure_font_file_loaded(runtime: &mut Runtime<KrkrHost>, spec: &FontSpec) -> 
     if !spec.face_is_file_name || spec.face.is_empty() {
         return Ok(());
     }
-    let bytes = runtime.host().read_binary_storage(&spec.face)?;
+    let data = runtime.host().read_resource_storage(&spec.face)?;
+    let bytes = data
+        .as_bytes()
+        .map(|bytes| bytes.into_owned())
+        .map_err(crate::storage::io_error)?;
     runtime
         .host_mut()
         .font_system_mut()
