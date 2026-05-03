@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     time::{Duration, Instant},
@@ -1409,6 +1410,7 @@ impl KrkrEngine {
 
     fn sync_native_layers_from_tjs(&mut self) -> Result<()> {
         let entries = self.tjs_runtime.host().native_layer_entries();
+        let kag_targets = self.collect_kag_layer_targets();
         for (handle, layer_id) in entries {
             if !self.tjs_runtime.object_valid(handle) {
                 continue;
@@ -1440,7 +1442,8 @@ impl KrkrEngine {
             let absolute = object_optional_i64(&self.tjs_runtime, handle, "absolute")?;
             let order = object_optional_i64(&self.tjs_runtime, handle, "order")?;
 
-            let kag_target = self.kag_object_layer_target(handle);
+            let target_handle = self.tjs_runtime.bound_this(handle).unwrap_or(handle);
+            let kag_target = kag_targets.get(&target_handle).cloned();
             if let Some((page, layer_name)) = kag_target.as_ref().filter(|(page, _)| page == "back")
             {
                 let source = self
@@ -1525,55 +1528,76 @@ impl KrkrEngine {
         Ok(())
     }
 
-    fn kag_object_layer_target(&self, handle: ObjectHandle) -> Option<(String, String)> {
-        let handle = self.tjs_runtime.bound_this(handle).unwrap_or(handle);
+    fn collect_kag_layer_targets(&self) -> BTreeMap<ObjectHandle, (String, String)> {
+        let mut targets = BTreeMap::new();
         let Variant::Object(kag) = self.tjs_runtime.global_member("kag") else {
-            return None;
+            return targets;
         };
 
         for page in ["fore", "back"] {
             let Variant::Object(page_object) = self.tjs_runtime.object_member(kag, page) else {
                 continue;
             };
-            if self.same_object(self.tjs_runtime.object_member(page_object, "base"), handle) {
-                return Some((page.to_string(), "base".to_string()));
+            if let Variant::Object(base) = self.tjs_runtime.object_member(page_object, "base") {
+                targets.insert(
+                    self.tjs_runtime.bound_this(base).unwrap_or(base),
+                    (page.to_string(), "base".to_string()),
+                );
             }
-            if let Some(index) = self.kag_layer_array_index(page_object, "layers", handle) {
-                return Some((page.to_string(), index.to_string()));
-            }
-            if let Some(index) = self.kag_layer_array_index(page_object, "messages", handle) {
-                return Some((page.to_string(), format!("message{index}")));
-            }
+            self.collect_kag_layer_array_targets(&mut targets, page, page_object, "layers", false);
+            self.collect_kag_layer_array_targets(&mut targets, page, page_object, "messages", true);
         }
 
-        None
+        targets
     }
 
-    fn kag_layer_array_index(
+    fn collect_kag_layer_array_targets(
         &self,
+        targets: &mut BTreeMap<ObjectHandle, (String, String)>,
+        page: &str,
         page_object: ObjectHandle,
         member: &str,
-        handle: ObjectHandle,
-    ) -> Option<i64> {
+        message_layers: bool,
+    ) {
         let Variant::Object(array) = self.tjs_runtime.object_member(page_object, member) else {
-            return None;
+            return;
         };
+        if let Some(elements) = self.tjs_runtime.array_elements(array) {
+            for (index, value) in elements.iter().enumerate() {
+                self.insert_kag_layer_target(targets, page, index, message_layers, value);
+            }
+            return;
+        }
         let Ok(count) = self.tjs_runtime.object_member(array, "count").to_integer() else {
-            return None;
+            return;
         };
-        (0..count.max(0)).find(|index| {
-            self.same_object(
-                self.tjs_runtime.object_member(array, &index.to_string()),
-                handle,
-            )
-        })
+        for index in 0..count.max(0) {
+            let value = self.tjs_runtime.object_member(array, &index.to_string());
+            self.insert_kag_layer_target(targets, page, index as usize, message_layers, &value);
+        }
     }
 
-    fn same_object(&self, value: Variant, handle: ObjectHandle) -> bool {
+    fn insert_kag_layer_target(
+        &self,
+        targets: &mut BTreeMap<ObjectHandle, (String, String)>,
+        page: &str,
+        index: usize,
+        message_layer: bool,
+        value: &Variant,
+    ) {
         let Variant::Object(candidate) = value else {
-            return false;
+            return;
         };
-        self.tjs_runtime.bound_this(candidate).unwrap_or(candidate) == handle
+        let handle = self
+            .tjs_runtime
+            .bound_this(*candidate)
+            .unwrap_or(*candidate);
+        let layer = if message_layer {
+            format!("message{index}")
+        } else {
+            index.to_string()
+        };
+        targets.insert(handle, (page.to_string(), layer));
     }
 
     pub fn register_plugin<P>(&mut self, plugin: P) -> Result<()>
@@ -2401,8 +2425,37 @@ fn layer_object_member(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: 
     }
 }
 
-fn layer_property_backing_key(name: &str) -> String {
-    format!("__nativeLayerProperty${name}")
+fn layer_property_backing_key(name: &str) -> Cow<'static, str> {
+    match name {
+        "window" => Cow::Borrowed("__nativeLayerProperty$window"),
+        "parent" => Cow::Borrowed("__nativeLayerProperty$parent"),
+        "children" => Cow::Borrowed("__nativeLayerProperty$children"),
+        "order" => Cow::Borrowed("__nativeLayerProperty$order"),
+        "absoluteOrderMode" => Cow::Borrowed("__nativeLayerProperty$absoluteOrderMode"),
+        "visible" => Cow::Borrowed("__nativeLayerProperty$visible"),
+        "nodeVisible" => Cow::Borrowed("__nativeLayerProperty$nodeVisible"),
+        "opacity" => Cow::Borrowed("__nativeLayerProperty$opacity"),
+        "isPrimary" => Cow::Borrowed("__nativeLayerProperty$isPrimary"),
+        "left" => Cow::Borrowed("__nativeLayerProperty$left"),
+        "top" => Cow::Borrowed("__nativeLayerProperty$top"),
+        "width" => Cow::Borrowed("__nativeLayerProperty$width"),
+        "height" => Cow::Borrowed("__nativeLayerProperty$height"),
+        "imageLeft" => Cow::Borrowed("__nativeLayerProperty$imageLeft"),
+        "imageTop" => Cow::Borrowed("__nativeLayerProperty$imageTop"),
+        "imageWidth" => Cow::Borrowed("__nativeLayerProperty$imageWidth"),
+        "imageHeight" => Cow::Borrowed("__nativeLayerProperty$imageHeight"),
+        "type" => Cow::Borrowed("__nativeLayerProperty$type"),
+        "face" => Cow::Borrowed("__nativeLayerProperty$face"),
+        "hitType" => Cow::Borrowed("__nativeLayerProperty$hitType"),
+        "hitThreshold" => Cow::Borrowed("__nativeLayerProperty$hitThreshold"),
+        "cursor" => Cow::Borrowed("__nativeLayerProperty$cursor"),
+        "hint" => Cow::Borrowed("__nativeLayerProperty$hint"),
+        "showParentHint" => Cow::Borrowed("__nativeLayerProperty$showParentHint"),
+        "enabled" => Cow::Borrowed("__nativeLayerProperty$enabled"),
+        "nodeEnabled" => Cow::Borrowed("__nativeLayerProperty$nodeEnabled"),
+        "font" => Cow::Borrowed("__nativeLayerProperty$font"),
+        _ => Cow::Owned(format!("__nativeLayerProperty${name}")),
+    }
 }
 
 fn install_system_metrics(runtime: &mut Runtime<KrkrHost>, metrics: SystemMetrics) {
@@ -7597,6 +7650,32 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("first.ks".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_passes_void_for_labels_without_page_name() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "*start\nA").expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.onLabel = function(label, page) {
+                    this.seenPage = page;
+                };
+                parser.loadScenario("first.ks");
+                parser.getNextTag();
+                return parser.seenPage === void ? "void" : parser.seenPage;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("void".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
     }

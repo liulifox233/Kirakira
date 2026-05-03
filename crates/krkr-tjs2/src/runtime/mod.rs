@@ -229,6 +229,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.heap[object.0].array_clear()
     }
 
+    pub fn array_elements(&self, object: ObjectHandle) -> Option<&[Variant]> {
+        self.heap.get(object.0)?.array_elements()
+    }
+
     pub fn alloc_native_function<F>(&mut self, function: F) -> ObjectHandle
     where
         F: NativeFunction<H> + 'static,
