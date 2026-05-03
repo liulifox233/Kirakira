@@ -181,7 +181,10 @@ fn kag_assign(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let Some(Variant::Object(source_handle)) = args.first().cloned() else {
+    let Some(source_handle) = args
+        .first()
+        .and_then(|value| kag_parser_object_handle(vm.runtime(), value))
+    else {
         return Err(TjsError::runtime("KAGParser.assign requires a KAGParser"));
     };
     let source = vm
@@ -314,6 +317,7 @@ where
     F: FnOnce(&mut KagParser, &mut Vm<KrkrHost>, ObjectHandle) -> Result<Variant>,
 {
     let handle = require_kag_this(this_obj, method)?;
+    let handle = vm.runtime().bound_this(handle).unwrap_or(handle);
     let mut parser = vm
         .runtime_mut()
         .host_mut()
@@ -338,6 +342,15 @@ where
 
 fn require_kag_this(this_obj: Option<ObjectHandle>, method: &str) -> Result<ObjectHandle> {
     this_obj.ok_or_else(|| TjsError::runtime(format!("{method} requires a KAGParser instance")))
+}
+
+fn kag_parser_object_handle(runtime: &Runtime<KrkrHost>, value: &Variant) -> Option<ObjectHandle> {
+    let handle = match value {
+        Variant::Object(handle) => *handle,
+        Variant::Closure(closure) => closure.object,
+        _ => return None,
+    };
+    Some(runtime.bound_this(handle).unwrap_or(handle))
 }
 
 fn sync_parser_from_members(
