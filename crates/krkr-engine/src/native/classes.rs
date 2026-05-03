@@ -2500,9 +2500,7 @@ fn layer_fill_rect(
     let color = required_integer(&args, 4, "Layer.fillRect color")?;
     let rgba = color_to_rgba(color, None);
     if let Some(target) = target {
-        mutate_layer_pixels(runtime, &target, |pixels, image_width, image_height| {
-            fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
-        })?;
+        fill_layer_pixels(runtime, &target, x, y, width, height, rgba)?;
         mark_image_modified(runtime, this);
     }
     Ok(Variant::Void)
@@ -2524,9 +2522,7 @@ fn layer_color_rect(
     let opacity = optional_integer(&args, 5)?;
     let rgba = color_to_rgba(color, opacity);
     if let Some(target) = target {
-        mutate_layer_pixels(runtime, &target, |pixels, image_width, image_height| {
-            fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
-        })?;
+        fill_layer_pixels(runtime, &target, x, y, width, height, rgba)?;
         mark_image_modified(runtime, this);
     }
     Ok(Variant::Void)
@@ -3881,6 +3877,88 @@ where
         }
     });
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_layer_pixels(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &RenderLayerTarget,
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    rgba: [u8; 4],
+) -> Result<()> {
+    let Some(layer) = render_layer_snapshot(runtime, target) else {
+        return Ok(());
+    };
+    let image_width = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.width)
+        .unwrap_or_else(|| layer.image_width.max(layer.width).max(1.0) as u32)
+        .max(1);
+    let image_height = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.height)
+        .unwrap_or_else(|| layer.image_height.max(layer.height).max(1.0) as u32)
+        .max(1);
+
+    let x0 = x.max(0) as u32;
+    let y0 = y.max(0) as u32;
+    let x1 = (x + width).clamp(0, image_width as i64) as u32;
+    let y1 = (y + height).clamp(0, image_height as i64) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return Ok(());
+    }
+
+    if x0 == 0 && y0 == 0 && x1 == image_width && y1 == image_height {
+        let mut pixels = vec![0; image_width as usize * image_height as usize * 4];
+        if rgba != [0, 0, 0, 0] {
+            fill_pixel_buffer(&mut pixels, rgba);
+        }
+        let image = runtime
+            .host_mut()
+            .create_layer_image(image_width, image_height, pixels);
+        mutate_render_layer(runtime, target, |layer| {
+            layer.image = Some(image);
+            layer.image_width = image_width as f32;
+            layer.image_height = image_height as f32;
+            if layer.width <= 0.0 {
+                layer.width = image_width as f32;
+            }
+            if layer.height <= 0.0 {
+                layer.height = image_height as f32;
+            }
+        });
+        return Ok(());
+    }
+
+    mutate_layer_pixels_min_with_host(
+        runtime,
+        target,
+        image_width,
+        image_height,
+        |_, pixels, _, _| {
+            fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
+        },
+    )
+}
+
+fn fill_pixel_buffer(pixels: &mut [u8], rgba: [u8; 4]) {
+    let pixel = u32::from_ne_bytes(rgba);
+    let mut offset = 0usize;
+    while offset + 4 <= pixels.len() {
+        unsafe {
+            pixels
+                .as_mut_ptr()
+                .add(offset)
+                .cast::<u32>()
+                .write_unaligned(pixel);
+        }
+        offset += 4;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
