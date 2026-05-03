@@ -465,6 +465,7 @@ impl FontSystem {
         y: i32,
         color: [u8; 4],
     ) {
+        self.prepare_layout_glyphs(spec, layout);
         for glyph in &layout.glyphs {
             let Some(image) = self.render_glyph(
                 glyph.face,
@@ -480,6 +481,102 @@ impl FontSystem {
             let draw_y = baseline_y.floor() as i32 - image.top;
             blit_glyph(dest, dest_width, dest_height, draw_x, draw_y, color, &image);
         }
+    }
+
+    fn prepare_layout_glyphs(&self, spec: &FontSpec, layout: &TextLayout) {
+        let size = spec.resolved_height();
+        let mut missing: BTreeMap<FontFaceKey, BTreeMap<RenderedGlyphKey, GlyphRenderRequest>> =
+            BTreeMap::new();
+        {
+            let cache = self.glyph_images.borrow();
+            for glyph in &layout.glyphs {
+                let x_subpixel = subpixel_bin(glyph.pen_x + glyph.x);
+                let y_subpixel = subpixel_bin(glyph.line_y - glyph.y);
+                let key = RenderedGlyphKey {
+                    face: FontFaceKey(glyph.face),
+                    glyph_id: glyph.glyph_id,
+                    size_bits: size.to_bits(),
+                    bold: spec.bold,
+                    italic: spec.italic,
+                    x_subpixel,
+                    y_subpixel,
+                };
+                if cache.contains_key(&key) {
+                    continue;
+                }
+                missing.entry(FontFaceKey(glyph.face)).or_default().insert(
+                    key,
+                    GlyphRenderRequest {
+                        key,
+                        glyph_id: glyph.glyph_id,
+                        x_subpixel,
+                        y_subpixel,
+                    },
+                );
+            }
+        }
+
+        for (face, requests) in missing {
+            self.render_missing_glyphs(face.0, spec, requests);
+        }
+    }
+
+    fn render_missing_glyphs(
+        &self,
+        face: fontdb::ID,
+        spec: &FontSpec,
+        requests: BTreeMap<RenderedGlyphKey, GlyphRenderRequest>,
+    ) {
+        let size = spec.resolved_height();
+        let embolden = if spec.bold {
+            (size / 28.0).max(0.35)
+        } else {
+            0.0
+        };
+        self.with_font(face, |font| {
+            let mut context = ScaleContext::new();
+            let mut scaler = context.builder(font).size(size).hint(true).build();
+            let mut renderer = Render::new(&[
+                GlyphSource::ColorOutline(0),
+                GlyphSource::ColorBitmap(StrikeWith::BestFit),
+                GlyphSource::Outline,
+            ]);
+            renderer.format(Format::Alpha).embolden(embolden);
+            for request in requests.into_values() {
+                if self.glyph_images.borrow().contains_key(&request.key) {
+                    continue;
+                }
+                renderer.offset(Vector::new(
+                    subpixel_offset(request.x_subpixel),
+                    subpixel_offset(request.y_subpixel),
+                ));
+                let Some(image) = renderer.render(&mut scaler, request.glyph_id) else {
+                    continue;
+                };
+                let content = match image.content {
+                    Content::Mask => GlyphContent::Alpha,
+                    Content::SubpixelMask => GlyphContent::Subpixel,
+                    Content::Color => GlyphContent::Color,
+                };
+                let rendered = Arc::new(GlyphImage {
+                    key: GlyphKey {
+                        face: FontFaceKey(face),
+                        glyph_id: request.glyph_id,
+                        size_px: size.round().max(1.0) as u32,
+                        bold: spec.bold,
+                        italic: spec.italic,
+                    },
+                    left: image.placement.left,
+                    top: image.placement.top,
+                    width: image.placement.width,
+                    height: image.placement.height,
+                    content,
+                    data: image.data,
+                });
+                self.glyph_images.borrow_mut().insert(request.key, rendered);
+            }
+            Some(())
+        });
     }
 
     fn render_glyph(
@@ -823,6 +920,14 @@ struct RenderedGlyphKey {
     y_subpixel: u8,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GlyphRenderRequest {
+    key: RenderedGlyphKey,
+    glyph_id: u16,
+    x_subpixel: u8,
+    y_subpixel: u8,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RgbaTextImage {
     pub width: u32,
@@ -898,75 +1003,132 @@ fn blit_glyph(
     color: [u8; 4],
     image: &GlyphImage,
 ) {
-    if image.width == 0 || image.height == 0 {
+    if image.width == 0 || image.height == 0 || color[3] == 0 {
         return;
     }
-    for row in 0..image.height as i32 {
-        let dest_y = y + row;
-        if dest_y < 0 || dest_y >= dest_height as i32 {
-            continue;
-        }
-        for col in 0..image.width as i32 {
-            let dest_x = x + col;
-            if dest_x < 0 || dest_x >= dest_width as i32 {
-                continue;
-            }
-            let src = glyph_pixel(image, col as u32, row as u32, color);
-            if src[3] == 0 {
-                continue;
-            }
-            let index = ((dest_y as u32 * dest_width + dest_x as u32) * 4) as usize;
-            blend_pixel(&mut dest[index..index + 4], src);
-        }
-    }
-}
 
-fn glyph_pixel(image: &GlyphImage, x: u32, y: u32, color: [u8; 4]) -> [u8; 4] {
-    let index = (y * image.width + x) as usize;
+    let col_start = (-x).max(0) as u32;
+    let row_start = (-y).max(0) as u32;
+    let col_end = (dest_width as i32 - x).min(image.width as i32).max(0) as u32;
+    let row_end = (dest_height as i32 - y).min(image.height as i32).max(0) as u32;
+    if col_start >= col_end || row_start >= row_end {
+        return;
+    }
+
+    let pixel_count = image.width as usize * image.height as usize;
     match image.content {
         GlyphContent::Alpha => {
-            let alpha = image.data.get(index).copied().unwrap_or(0);
-            [color[0], color[1], color[2], multiply_u8(alpha, color[3])]
+            if image.data.len() < pixel_count {
+                return;
+            }
+            for row in row_start..row_end {
+                let dest_y = (y + row as i32) as u32;
+                let dest_x = (x + col_start as i32) as u32;
+                let mut dest_index = ((dest_y * dest_width + dest_x) * 4) as usize;
+                let mut src_index = (row * image.width + col_start) as usize;
+                for _ in col_start..col_end {
+                    let src_a = multiply_u8(image.data[src_index], color[3]);
+                    if src_a != 0 {
+                        blend_pixel_channels(
+                            &mut dest[dest_index..dest_index + 4],
+                            color[0],
+                            color[1],
+                            color[2],
+                            src_a,
+                        );
+                    }
+                    src_index += 1;
+                    dest_index += 4;
+                }
+            }
         }
         GlyphContent::Subpixel => {
-            let index = index * 4;
-            let r = image.data.get(index).copied().unwrap_or(0);
-            let g = image.data.get(index + 1).copied().unwrap_or(0);
-            let b = image.data.get(index + 2).copied().unwrap_or(0);
-            let alpha = ((u16::from(r) + u16::from(g) + u16::from(b)) / 3) as u8;
-            [color[0], color[1], color[2], multiply_u8(alpha, color[3])]
+            if image.data.len() < pixel_count * 4 {
+                return;
+            }
+            for row in row_start..row_end {
+                let dest_y = (y + row as i32) as u32;
+                let dest_x = (x + col_start as i32) as u32;
+                let mut dest_index = ((dest_y * dest_width + dest_x) * 4) as usize;
+                let mut src_index = ((row * image.width + col_start) * 4) as usize;
+                for _ in col_start..col_end {
+                    let r = image.data[src_index];
+                    let g = image.data[src_index + 1];
+                    let b = image.data[src_index + 2];
+                    let alpha = ((u16::from(r) + u16::from(g) + u16::from(b)) / 3) as u8;
+                    let src_a = multiply_u8(alpha, color[3]);
+                    if src_a != 0 {
+                        blend_pixel_channels(
+                            &mut dest[dest_index..dest_index + 4],
+                            color[0],
+                            color[1],
+                            color[2],
+                            src_a,
+                        );
+                    }
+                    src_index += 4;
+                    dest_index += 4;
+                }
+            }
         }
         GlyphContent::Color => {
-            let index = index * 4;
-            [
-                image.data.get(index).copied().unwrap_or(0),
-                image.data.get(index + 1).copied().unwrap_or(0),
-                image.data.get(index + 2).copied().unwrap_or(0),
-                multiply_u8(image.data.get(index + 3).copied().unwrap_or(0), color[3]),
-            ]
+            if image.data.len() < pixel_count * 4 {
+                return;
+            }
+            for row in row_start..row_end {
+                let dest_y = (y + row as i32) as u32;
+                let dest_x = (x + col_start as i32) as u32;
+                let mut dest_index = ((dest_y * dest_width + dest_x) * 4) as usize;
+                let mut src_index = ((row * image.width + col_start) * 4) as usize;
+                for _ in col_start..col_end {
+                    let src_a = multiply_u8(image.data[src_index + 3], color[3]);
+                    if src_a != 0 {
+                        blend_pixel_channels(
+                            &mut dest[dest_index..dest_index + 4],
+                            image.data[src_index],
+                            image.data[src_index + 1],
+                            image.data[src_index + 2],
+                            src_a,
+                        );
+                    }
+                    src_index += 4;
+                    dest_index += 4;
+                }
+            }
         }
     }
 }
 
 fn multiply_u8(a: u8, b: u8) -> u8 {
-    ((u16::from(a) * u16::from(b) + 127) / 255) as u8
+    divide_by_255(u32::from(a) * u32::from(b)) as u8
 }
 
-fn blend_pixel(dest: &mut [u8], src: [u8; 4]) {
-    let src_a = src[3] as f32 / 255.0;
-    let dest_a = dest[3] as f32 / 255.0;
-    let out_a = src_a + dest_a * (1.0 - src_a);
-    if out_a <= f32::EPSILON {
-        dest.copy_from_slice(&[0, 0, 0, 0]);
+fn divide_by_255(value: u32) -> u32 {
+    (value + 127) / 255
+}
+
+fn blend_pixel_channels(dest: &mut [u8], src_r: u8, src_g: u8, src_b: u8, src_a: u8) {
+    if src_a == 0 {
         return;
     }
-    for channel in 0..3 {
-        let src_c = src[channel] as f32 / 255.0;
-        let dest_c = dest[channel] as f32 / 255.0;
-        let out_c = (src_c * src_a + dest_c * dest_a * (1.0 - src_a)) / out_a;
-        dest[channel] = (out_c * 255.0).round().clamp(0.0, 255.0) as u8;
+    let src_a = u32::from(src_a);
+    let dest_a = u32::from(dest[3]);
+    if src_a == 255 || dest_a == 0 {
+        dest.copy_from_slice(&[src_r, src_g, src_b, src_a as u8]);
+        return;
     }
-    dest[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+
+    let inv_src_a = 255 - src_a;
+    let denom = src_a * 255 + dest_a * inv_src_a;
+    dest[0] = blend_channel(src_r, src_a, dest[0], dest_a, inv_src_a, denom);
+    dest[1] = blend_channel(src_g, src_a, dest[1], dest_a, inv_src_a, denom);
+    dest[2] = blend_channel(src_b, src_a, dest[2], dest_a, inv_src_a, denom);
+    dest[3] = divide_by_255(denom) as u8;
+}
+
+fn blend_channel(src: u8, src_a: u32, dest: u8, dest_a: u32, inv_src_a: u32, denom: u32) -> u8 {
+    let value = u32::from(src) * src_a * 255 + u32::from(dest) * dest_a * inv_src_a;
+    ((value + denom / 2) / denom) as u8
 }
 
 #[cfg(test)]
