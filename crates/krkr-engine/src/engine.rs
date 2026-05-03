@@ -7681,6 +7681,32 @@ mod tests {
     }
 
     #[test]
+    fn tjs_kag_parser_assign_accepts_bound_source_proxy() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Parser extends KAGParser {
+                    function Parser() { super.KAGParser(); }
+                    function proxy() { return super; }
+                    function copyFrom(src) { super.assign(src); }
+                }
+                var source = new Parser();
+                source.onScenarioLoad = function(storage) { return "A\nB"; };
+                source.loadScenario("virtual.ks");
+                source.getNextTag();
+                source.getNextTag();
+                var target = new Parser();
+                target.copyFrom(source.proxy());
+                return target.getNextTag().text;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("B".to_string()));
+    }
+
+    #[test]
     fn tjs_kag_parser_process_callbacks_can_cancel_control_tags() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
