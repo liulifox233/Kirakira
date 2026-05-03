@@ -32,6 +32,7 @@ struct ProjectStorageInner {
     root: Option<PathBuf>,
     fs_layers: Vec<ProjectLayer>,
     lookup_cache: Mutex<HashMap<String, Option<LocatedResource>>>,
+    case_insensitive_dir_cache: Mutex<HashMap<PathBuf, HashMap<String, PathBuf>>>,
     raw_cache: Mutex<RawDataCache>,
     xp3_provider: Option<Xp3ResourceProvider>,
     auto_paths: RwLock<Vec<String>>,
@@ -119,6 +120,7 @@ impl ProjectStorage {
                 root,
                 fs_layers,
                 lookup_cache: Mutex::new(HashMap::new()),
+                case_insensitive_dir_cache: Mutex::new(HashMap::new()),
                 raw_cache: Mutex::new(RawDataCache::new(
                     RAW_CACHE_CAPACITY_BYTES,
                     RAW_CACHE_MAX_ENTRY_BYTES,
@@ -324,7 +326,7 @@ impl ProjectStorage {
                     layer.encoding_hint,
                 )?));
             }
-            if let Some(path) = resolve_case_insensitive_path(&layer.root, relative)?
+            if let Some(path) = self.resolve_case_insensitive_path(&layer.root, relative)?
                 && path.is_file()
             {
                 return Ok(Some(self.located_fs_storage(
@@ -335,6 +337,58 @@ impl ProjectStorage {
             }
         }
         Ok(None)
+    }
+
+    fn resolve_case_insensitive_path(
+        &self,
+        root: &Path,
+        relative: &Path,
+    ) -> io::Result<Option<PathBuf>> {
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            let Component::Normal(part) = component else {
+                return Ok(None);
+            };
+            let exact = current.join(part);
+            if exact.exists() {
+                current = exact;
+                continue;
+            }
+
+            let Some(part) = part.to_str() else {
+                return Ok(None);
+            };
+            if !current.is_dir() {
+                return Ok(None);
+            }
+            let Some(path) = self.case_insensitive_dir_entry(&current, part)? else {
+                return Ok(None);
+            };
+            current = path;
+        }
+        Ok(Some(current))
+    }
+
+    fn case_insensitive_dir_entry(&self, dir: &Path, name: &str) -> io::Result<Option<PathBuf>> {
+        let key = name.to_ascii_lowercase();
+        if let Ok(cache) = self.inner.case_insensitive_dir_cache.lock()
+            && let Some(entries) = cache.get(dir)
+        {
+            return Ok(entries.get(&key).cloned());
+        }
+
+        let mut entries = HashMap::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            entries
+                .entry(entry.file_name().to_string_lossy().to_ascii_lowercase())
+                .or_insert_with(|| entry.path());
+        }
+        let result = entries.get(&key).cloned();
+        if let Ok(mut cache) = self.inner.case_insensitive_dir_cache.lock() {
+            cache.insert(dir.to_path_buf(), entries);
+        }
+        Ok(result)
     }
 
     fn located_fs_storage(
@@ -419,6 +473,9 @@ impl ProjectStorage {
     fn invalidate_caches(&self) {
         self.inner.revision.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut cache) = self.inner.lookup_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.inner.case_insensitive_dir_cache.lock() {
             cache.clear();
         }
         self.clear_raw_cache();
@@ -684,44 +741,6 @@ fn push_unique_storage_candidate(candidates: &mut Vec<String>, path: &Path) {
 
 fn path_to_storage_name(path: &Path) -> String {
     normalize_storage_separators(&path.to_string_lossy())
-}
-
-fn resolve_case_insensitive_path(root: &Path, relative: &Path) -> io::Result<Option<PathBuf>> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return Ok(None);
-        };
-        let exact = current.join(part);
-        if exact.exists() {
-            current = exact;
-            continue;
-        }
-
-        let Some(part) = part.to_str() else {
-            return Ok(None);
-        };
-        if !current.is_dir() {
-            return Ok(None);
-        }
-        let mut matched = None;
-        for entry in fs::read_dir(&current)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(part)
-            {
-                matched = Some(entry.path());
-                break;
-            }
-        }
-        let Some(path) = matched else {
-            return Ok(None);
-        };
-        current = path;
-    }
-    Ok(Some(current))
 }
 
 fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
