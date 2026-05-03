@@ -97,6 +97,10 @@ pub trait KagHost {
         Ok(true)
     }
 
+    fn on_call_stack_depth(&mut self, _depth: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn on_after_return(&mut self, _frame: &CallFrame) -> Result<()> {
         Ok(())
     }
@@ -348,6 +352,25 @@ impl KagParser {
             .map(|(name, definition)| (name.as_str(), definition.source.as_str()))
     }
 
+    pub fn set_macro_definitions<I, N, S>(&mut self, definitions: I)
+    where
+        I: IntoIterator<Item = (N, S)>,
+        N: Into<String>,
+        S: Into<String>,
+    {
+        self.macros = definitions
+            .into_iter()
+            .map(|(name, source)| {
+                (
+                    name.into(),
+                    MacroDefinition {
+                        source: source.into(),
+                    },
+                )
+            })
+            .collect();
+    }
+
     pub fn macro_names(&self) -> impl Iterator<Item = &str> {
         self.macros.keys().map(String::as_str)
     }
@@ -466,12 +489,12 @@ impl KagParser {
     where
         H: KagHost,
     {
-        if self.interrupted {
-            self.interrupted = false;
-            return Ok(Some(Tag::interrupt()));
-        }
-
         loop {
+            if self.interrupted {
+                self.interrupted = false;
+                return Ok(Some(Tag::interrupt()));
+            }
+
             let item = self.next_raw_item()?;
 
             let mut tag = match item {
@@ -1189,7 +1212,9 @@ impl KagParser {
     {
         let storage = self.optional_attr_string(&tag, "storage", host)?;
         let target = self.optional_attr_string(&tag, "target", host)?;
+        host.on_call_stack_depth(self.call_stack.len())?;
         if !host.on_return(&tag, storage.as_deref(), target.as_deref())? {
+            self.interrupt();
             return Ok(());
         }
 

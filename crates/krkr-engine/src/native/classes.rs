@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use krkr_core::{AudioBus, AudioCommand, AudioLoadPolicy, LayerNode};
+use krkr_core::{AudioBus, AudioCommand, AudioLoadPolicy, LayerImage, LayerNode};
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
@@ -1987,28 +1987,60 @@ fn layer_set_image_size(
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
     let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
-    let image = (width > 0 && height > 0).then(|| {
-        runtime.host_mut().create_layer_image(
-            width as u32,
-            height as u32,
-            vec![0; width as usize * height as usize * 4],
-        )
-    });
+    let existing_image = target
+        .as_ref()
+        .and_then(|target| render_layer_snapshot(runtime, target))
+        .and_then(|layer| layer.image);
+    let image = resize_layer_image(runtime, existing_image, width as u32, height as u32);
     if let Some(target) = target {
         mutate_render_layer(runtime, &target, |layer| {
             layer.image_width = width as f32;
             layer.image_height = height as f32;
-            if let Some(image) = image {
-                layer.image = Some(image);
-            } else {
-                layer.image = None;
-            }
+            layer.image = image;
         });
     }
     set_layer_property_storage(runtime, this, "imageWidth", Variant::Integer(width));
     set_layer_property_storage(runtime, this, "imageHeight", Variant::Integer(height));
     mark_image_modified(runtime, this);
     Ok(Variant::Void)
+}
+
+fn resize_layer_image(
+    runtime: &mut Runtime<KrkrHost>,
+    existing: Option<LayerImage>,
+    width: u32,
+    height: u32,
+) -> Option<LayerImage> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let Some(existing) = existing else {
+        return Some(runtime.host_mut().create_layer_image(
+            width,
+            height,
+            vec![0; width as usize * height as usize * 4],
+        ));
+    };
+
+    if existing.upload.width == width && existing.upload.height == height {
+        return Some(existing);
+    }
+
+    let mut rgba = vec![0; width as usize * height as usize * 4];
+    let copy_width = existing.upload.width.min(width) as usize;
+    let copy_height = existing.upload.height.min(height) as usize;
+    let source_stride = existing.upload.width as usize * 4;
+    let dest_stride = width as usize * 4;
+    let copy_len = copy_width * 4;
+    for row in 0..copy_height {
+        let source_start = row * source_stride;
+        let dest_start = row * dest_stride;
+        rgba[dest_start..dest_start + copy_len]
+            .copy_from_slice(&existing.upload.rgba[source_start..source_start + copy_len]);
+    }
+
+    Some(runtime.host_mut().create_layer_image(width, height, rgba))
 }
 
 fn layer_set_size_to_image_size(
