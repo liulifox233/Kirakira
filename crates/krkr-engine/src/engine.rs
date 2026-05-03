@@ -5411,6 +5411,41 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_set_image_size_preserves_existing_pixels() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(2, 2);
+                layer.fillRect(0, 0, 2, 2, 0xff0000);
+                layer.setImageSize(3, 2);
+                return layer.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image");
+        assert_eq!(image.upload.width, 3);
+        assert_eq!(image.upload.height, 2);
+        assert_eq!(
+            image.upload.rgba.as_ref(),
+            &[
+                255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 0, 0,
+                0, 0,
+            ]
+        );
+    }
+
+    #[test]
     fn native_layer_invalidate_removes_child_from_render_tree_and_hit_testing() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -7801,6 +7836,54 @@ mod tests {
     }
 
     #[test]
+    fn tjs_kag_parser_stops_when_return_callback_interrupts_at_outer_call() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("system.ks"),
+            "*sys_config\n[call storage=\"config.ks\" target=*menu]A[return]B\n*sys_menu\nC",
+        )
+        .expect("write system scenario");
+        fs::write(root.join("config.ks"), "*menu\n[return]").expect("write config scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parser = new KAGParser();
+                parser.seen = "";
+                var tags = "";
+                parser.onReturn = function(elm) {
+                    this.seen += this.callStackDepth;
+                    if(this.callStackDepth == 1) {
+                        return false;
+                    }
+                    return true;
+                };
+                parser.loadScenario("system.ks");
+                parser.callLabel("*sys_config");
+                for(var i = 0; i < 4; i++) {
+                    var tag = parser.getNextTag();
+                    if(tag === void) {
+                        tags += "void";
+                        break;
+                    }
+                    tags += tag.tagname;
+                    if(tag.text !== void) tags += ":" + tag.text;
+                    tags += ",";
+                    if(tag.tagname == "interrupt") break;
+                }
+                return parser.seen + ":" + tags;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("21:ch:A,interrupt,".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn tjs_kag_parser_exposes_pop_macro_args() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -7825,6 +7908,44 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("serif:".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_kag_parser_syncs_macros_copied_through_dictionary_members() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("define.ks"),
+            "[macro name=button_chgimage][eval exp=\"global.changed = 1\"][endmacro]",
+        )
+        .expect("write macro scenario");
+        fs::write(root.join("config.ks"), "[button_chgimage][s]").expect("write config scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var main = new KAGParser();
+                main.loadScenario("define.ks");
+                main.getNextTag();
+
+                var extra = new KAGParser();
+                (Dictionary.assign incontextof extra.macros)(main.macros);
+                extra.clearCallStack();
+                extra.loadScenario("config.ks");
+
+                var expanded = extra.getNextTag();
+                return expanded.tagname + ":" + expanded.exp;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("eval:global.changed = 1".to_string())
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

@@ -369,6 +369,17 @@ fn sync_parser_from_members(
         &runtime.object_member(handle, "debugLevel"),
     )?);
 
+    if let Variant::Object(macros) = runtime.object_member(handle, "macros") {
+        let definitions = runtime
+            .object_members(macros)
+            .into_iter()
+            .filter_map(|(name, value)| match value {
+                Variant::String(source) => Some((name, source)),
+                _ => None,
+            });
+        parser.set_macro_definitions(definitions);
+    }
+
     if let Some(storage) = arg_string(&[runtime.object_member(handle, "curStorage")], 0)?
         && !storage.is_empty()
         && parser.cur_storage() != Some(storage.as_str())
@@ -587,6 +598,15 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
         _target: Option<&str>,
     ) -> krkr_kag::Result<bool> {
         self.call_process_event("onReturn", tag)
+    }
+
+    fn on_call_stack_depth(&mut self, depth: usize) -> krkr_kag::Result<()> {
+        self.vm.runtime_mut().set_object_member(
+            self.owner,
+            "callStackDepth",
+            Variant::Integer(depth as i64),
+        );
+        Ok(())
     }
 
     fn on_after_return(&mut self, _frame: &CallFrame) -> krkr_kag::Result<()> {

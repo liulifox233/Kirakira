@@ -319,6 +319,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.heap[object.0].get(name)
     }
 
+    pub fn object_members(&self, object: ObjectHandle) -> Vec<(String, Variant)> {
+        self.heap[object.0].members.clone().into_iter().collect()
+    }
+
     pub fn has_object_member(&self, object: ObjectHandle, name: &str) -> bool {
         self.heap[object.0].get_raw(name).is_some()
     }
