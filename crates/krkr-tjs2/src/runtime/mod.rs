@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use crate::bytecode::{BytecodeContextType, BytecodeFile};
+use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError};
 use crate::vm::Vm;
 
@@ -156,6 +156,14 @@ pub struct Runtime<H: TjsHost = NoHost> {
 pub(crate) struct ScriptFile {
     pub file: Arc<BytecodeFile>,
     pub code_handles: Vec<ObjectHandle>,
+    pub decoded_objects: Vec<Option<DecodedScriptObject>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DecodedScriptObject {
+    pub object: CodeObject,
+    pub instructions: Arc<[Instruction]>,
+    pub offset_to_index: Arc<BTreeMap<usize, usize>>,
 }
 
 impl Runtime<NoHost> {
@@ -495,8 +503,41 @@ impl<H: TjsHost + 'static> Runtime<H> {
             }
             code_handles.push(handle);
         }
-        self.script_files.push(ScriptFile { file, code_handles });
+        self.register_code_object_properties(file.as_ref(), &code_handles);
+        self.script_files.push(ScriptFile {
+            decoded_objects: vec![None; file.objects.len()],
+            file,
+            code_handles,
+        });
         file_id
+    }
+
+    fn register_code_object_properties(
+        &mut self,
+        file: &BytecodeFile,
+        code_handles: &[ObjectHandle],
+    ) {
+        for (object_index, object) in file.objects.iter().enumerate() {
+            if let Some(parent_index) = object.parent {
+                let parent_handle = code_handles[parent_index];
+                let object_handle = code_handles[object_index];
+                let Some(name) = object.name(file).map(str::to_string) else {
+                    continue;
+                };
+                let closure = Variant::Closure(Closure::new(object_handle, Some(parent_handle)));
+                self.heap[parent_handle.0].set(name, closure);
+            }
+
+            let owner_handle = code_handles[object_index];
+            for property in &object.properties {
+                let Some(name) = file.data.strings.get(property.name).cloned() else {
+                    continue;
+                };
+                let property_handle = code_handles[property.object];
+                let closure = Variant::Closure(Closure::new(property_handle, Some(owner_handle)));
+                self.heap[owner_handle.0].set(name, closure);
+            }
+        }
     }
 
     fn call_context_file_id(&mut self) -> usize {
@@ -524,6 +565,49 @@ impl<H: TjsHost + 'static> Runtime<H> {
             .get(file_id)
             .map(|script| script.code_handles.clone())
             .ok_or_else(|| TjsError::runtime(format!("script file {file_id} does not exist")))
+    }
+
+    pub(crate) fn decoded_script_object(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+    ) -> Result<DecodedScriptObject> {
+        let script = self
+            .script_files
+            .get_mut(file_id)
+            .ok_or_else(|| TjsError::runtime(format!("script file {file_id} does not exist")))?;
+        if let Some(decoded) = script
+            .decoded_objects
+            .get(object_index)
+            .and_then(Option::clone)
+        {
+            return Ok(decoded);
+        }
+
+        let object = script
+            .file
+            .objects
+            .get(object_index)
+            .cloned()
+            .ok_or_else(|| TjsError::runtime(format!("object {object_index} does not exist")))?;
+        let instructions = Arc::<[Instruction]>::from(object.decode_instructions()?);
+        let offset_to_index = instructions
+            .iter()
+            .enumerate()
+            .map(|(index, inst)| (inst.offset, index))
+            .collect::<BTreeMap<_, _>>();
+        let decoded = DecodedScriptObject {
+            object,
+            instructions,
+            offset_to_index: Arc::new(offset_to_index),
+        };
+        let Some(slot) = script.decoded_objects.get_mut(object_index) else {
+            return Err(TjsError::runtime(format!(
+                "object {object_index} does not exist"
+            )));
+        };
+        *slot = Some(decoded.clone());
+        Ok(decoded)
     }
 
     pub(crate) fn alloc_proxy_bound(

@@ -38,14 +38,13 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     pub fn new(file_id: usize, runtime: &'rt mut Runtime<H>) -> Result<Self> {
         let file = runtime.script_file(file_id)?;
         let code_handles = runtime.script_code_handles(file_id)?;
-        let mut vm = Self {
+        let vm = Self {
             file_id,
             file,
             runtime,
             code_handles,
             _file_lifetime: PhantomData,
         };
-        vm.register_code_object_properties();
         Ok(vm)
     }
 
@@ -122,33 +121,24 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<CallFrame> {
         let file = self.runtime.script_file(file_id)?;
         let code_handles = self.runtime.script_code_handles(file_id)?;
-        self.register_code_object_properties_for(file.as_ref(), &code_handles);
-        let object =
-            file.objects.get(object_index).cloned().ok_or_else(|| {
-                TjsError::runtime(format!("object {object_index} does not exist"))
-            })?;
-        self.runtime
-            .enter_call_frame()
-            .map_err(|error| error.with_stack_frame(self.stack_frame_for(&file, &object, 0)))?;
+        let decoded = self.runtime.decoded_script_object(file_id, object_index)?;
+        self.runtime.enter_call_frame().map_err(|error| {
+            error.with_stack_frame(self.stack_frame_for(&file, &decoded.object, 0))
+        })?;
         let result = (|| {
-            let instructions = object.decode_instructions()?;
-            let offset_to_index = instructions
-                .iter()
-                .enumerate()
-                .map(|(index, inst)| (inst.offset, index))
-                .collect::<BTreeMap<_, _>>();
             let caller_args = args.clone();
             let global = self.runtime.global;
             let this_obj = this_obj.or(Some(global));
             let this_proxy = self.runtime.alloc_proxy_bound(this_obj, global, None);
-            let super_class = self.super_class_for_parts(file.as_ref(), &code_handles, &object)?;
+            let super_class =
+                self.super_class_for_parts(file.as_ref(), &code_handles, &decoded.object)?;
             let super_proxy = self.runtime.alloc_proxy_bound(
                 super_class.or(this_obj),
                 global,
                 super_class.and(this_obj),
             );
-            let mut frame = Frame::new(&object, args, this_obj, this_proxy, super_proxy)?;
-            if let Some(collapse_base) = object.func_decl_collapse_base {
+            let mut frame = Frame::new(&decoded.object, args, this_obj, this_proxy, super_proxy)?;
+            if let Some(collapse_base) = decoded.object.func_decl_collapse_base {
                 let base = collapse_base as usize;
                 let rest = if caller_args.len() > base {
                     caller_args[base..].to_vec()
@@ -158,14 +148,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let array = self.runtime.alloc_array_object(rest);
                 frame.set(-4 - collapse_base as i16, Variant::Object(array))?;
             }
-            let pc = offset_to_index.get(&(0_usize)).copied().unwrap_or(0);
+            let pc = decoded
+                .offset_to_index
+                .get(&(0_usize))
+                .copied()
+                .unwrap_or(0);
             Ok(CallFrame {
                 file_id,
                 file,
                 code_handles,
-                object,
-                instructions,
-                offset_to_index,
+                object: decoded.object,
+                instructions: decoded.instructions,
+                offset_to_index: decoded.offset_to_index,
                 frame,
                 pc,
                 continuation,
@@ -747,40 +741,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
         }
         Ok(Step::Next(pc))
-    }
-
-    fn register_code_object_properties(&mut self) {
-        let file = Arc::clone(&self.file);
-        let code_handles = self.code_handles.clone();
-        self.register_code_object_properties_for(file.as_ref(), &code_handles);
-    }
-
-    fn register_code_object_properties_for(
-        &mut self,
-        file: &BytecodeFile,
-        code_handles: &[ObjectHandle],
-    ) {
-        for (object_index, object) in file.objects.iter().enumerate() {
-            if let Some(parent_index) = object.parent {
-                let parent_handle = code_handles[parent_index];
-                let object_handle = code_handles[object_index];
-                let Some(name) = object.name(file).map(str::to_string) else {
-                    continue;
-                };
-                let closure = Variant::Closure(Closure::new(object_handle, Some(parent_handle)));
-                self.runtime.heap[parent_handle.0].set(name, closure);
-            }
-
-            let owner_handle = code_handles[object_index];
-            for property in &object.properties {
-                let Some(name) = file.data.strings.get(property.name).cloned() else {
-                    continue;
-                };
-                let property_handle = code_handles[property.object];
-                let closure = Variant::Closure(Closure::new(property_handle, Some(owner_handle)));
-                self.runtime.heap[owner_handle.0].set(name, closure);
-            }
-        }
     }
 
     pub(super) fn data_slot_value(&self, object: &CodeObject, data_index: i16) -> Result<Variant> {
