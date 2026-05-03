@@ -517,12 +517,15 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
     }
 
     fn on_label(&mut self, event: LabelEvent<'_>) -> krkr_kag::Result<()> {
+        let page = event
+            .label
+            .page_name
+            .clone()
+            .map(Variant::String)
+            .unwrap_or(Variant::Void);
         self.call_event(
             "onLabel",
-            vec![
-                Variant::String(event.label.name.clone()),
-                Variant::String(event.label.page_name.clone().unwrap_or_default()),
-            ],
+            vec![Variant::String(event.label.name.clone()), page],
         )?;
         Ok(())
     }

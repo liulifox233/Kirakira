@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     time::Duration,
 };
@@ -906,7 +907,11 @@ fn set_layer_property_storage(
     value: Variant,
 ) {
     let handle = runtime.bound_this(handle).unwrap_or(handle);
-    runtime.set_object_member(handle, layer_property_backing_key(name), value.clone());
+    runtime.set_object_member(
+        handle,
+        layer_property_backing_key(name).into_owned(),
+        value.clone(),
+    );
     if !runtime.object_member_is_property(handle, name) {
         runtime.set_object_member(handle, name, value);
     }
@@ -968,8 +973,37 @@ fn apply_layer_property_to_render(
     Ok(())
 }
 
-fn layer_property_backing_key(name: &str) -> String {
-    format!("__nativeLayerProperty${name}")
+fn layer_property_backing_key(name: &str) -> Cow<'static, str> {
+    match name {
+        "window" => Cow::Borrowed("__nativeLayerProperty$window"),
+        "parent" => Cow::Borrowed("__nativeLayerProperty$parent"),
+        "children" => Cow::Borrowed("__nativeLayerProperty$children"),
+        "order" => Cow::Borrowed("__nativeLayerProperty$order"),
+        "absoluteOrderMode" => Cow::Borrowed("__nativeLayerProperty$absoluteOrderMode"),
+        "visible" => Cow::Borrowed("__nativeLayerProperty$visible"),
+        "nodeVisible" => Cow::Borrowed("__nativeLayerProperty$nodeVisible"),
+        "opacity" => Cow::Borrowed("__nativeLayerProperty$opacity"),
+        "isPrimary" => Cow::Borrowed("__nativeLayerProperty$isPrimary"),
+        "left" => Cow::Borrowed("__nativeLayerProperty$left"),
+        "top" => Cow::Borrowed("__nativeLayerProperty$top"),
+        "width" => Cow::Borrowed("__nativeLayerProperty$width"),
+        "height" => Cow::Borrowed("__nativeLayerProperty$height"),
+        "imageLeft" => Cow::Borrowed("__nativeLayerProperty$imageLeft"),
+        "imageTop" => Cow::Borrowed("__nativeLayerProperty$imageTop"),
+        "imageWidth" => Cow::Borrowed("__nativeLayerProperty$imageWidth"),
+        "imageHeight" => Cow::Borrowed("__nativeLayerProperty$imageHeight"),
+        "type" => Cow::Borrowed("__nativeLayerProperty$type"),
+        "face" => Cow::Borrowed("__nativeLayerProperty$face"),
+        "hitType" => Cow::Borrowed("__nativeLayerProperty$hitType"),
+        "hitThreshold" => Cow::Borrowed("__nativeLayerProperty$hitThreshold"),
+        "cursor" => Cow::Borrowed("__nativeLayerProperty$cursor"),
+        "hint" => Cow::Borrowed("__nativeLayerProperty$hint"),
+        "showParentHint" => Cow::Borrowed("__nativeLayerProperty$showParentHint"),
+        "enabled" => Cow::Borrowed("__nativeLayerProperty$enabled"),
+        "nodeEnabled" => Cow::Borrowed("__nativeLayerProperty$nodeEnabled"),
+        "font" => Cow::Borrowed("__nativeLayerProperty$font"),
+        _ => Cow::Owned(format!("__nativeLayerProperty${name}")),
+    }
 }
 
 const WAVE_NATIVE_PROPERTIES: &[&str] = &[
@@ -1364,6 +1398,12 @@ fn kag_layer_array_index(
     let Variant::Object(array) = runtime.object_member(page_object, member) else {
         return None;
     };
+    if let Some(elements) = runtime.array_elements(array) {
+        return elements
+            .iter()
+            .position(|value| same_object_ref(runtime, value, handle))
+            .map(|index| index as i64);
+    }
     let Ok(count) = runtime.object_member(array, "count").to_integer() else {
         return None;
     };
@@ -1377,10 +1417,14 @@ fn kag_layer_array_index(
 }
 
 fn same_object(runtime: &Runtime<KrkrHost>, value: Variant, handle: ObjectHandle) -> bool {
+    same_object_ref(runtime, &value, handle)
+}
+
+fn same_object_ref(runtime: &Runtime<KrkrHost>, value: &Variant, handle: ObjectHandle) -> bool {
     let Variant::Object(candidate) = value else {
         return false;
     };
-    runtime.bound_this(candidate).unwrap_or(candidate) == handle
+    runtime.bound_this(*candidate).unwrap_or(*candidate) == handle
 }
 
 fn render_layer_snapshot(
