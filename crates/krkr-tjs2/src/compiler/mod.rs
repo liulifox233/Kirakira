@@ -197,6 +197,27 @@ mod tests {
     }
 
     #[test]
+    fn string_sprintf_formats_common_krkr_patterns() {
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                r#"return "%04d/%02d/%02d %02d:%02d".sprintf(2026, 5, 3, 9, 4);"#
+            )
+            .expect("execute"),
+            Variant::String("2026/05/03 09:04".to_string())
+        );
+        assert_eq!(
+            execute_source("inline.tjs", r#"return "%4d%s".sprintf(75, "%");"#).expect("execute"),
+            Variant::String("  75%".to_string())
+        );
+        assert_eq!(
+            execute_source("inline.tjs", r#"return "%-5s:%+04d:%%".sprintf("ok", 7);"#)
+                .expect("execute"),
+            Variant::String("ok   :+007:%".to_string())
+        );
+    }
+
+    #[test]
     fn bare_method_calls_dispatch_through_receiver() {
         let result = execute_source(
             "inline.tjs",

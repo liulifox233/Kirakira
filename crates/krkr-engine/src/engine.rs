@@ -533,16 +533,7 @@ impl KrkrEngine {
 
     fn resume_modal_call_if_ready(&mut self) -> Result<()> {
         while let Some(window) = self.tjs_runtime.host().current_modal_window() {
-            let closed = !self.tjs_runtime.object_valid(window)
-                || !self
-                    .tjs_runtime
-                    .object_member(window, "visible")
-                    .is_truthy()
-                || self
-                    .tjs_runtime
-                    .object_member(window, "__nativeClosed")
-                    .is_truthy();
-            if !closed {
+            if !self.modal_window_is_closed(window) {
                 break;
             }
 
@@ -554,6 +545,18 @@ impl KrkrEngine {
             }
         }
         Ok(())
+    }
+
+    fn modal_window_is_closed(&self, window: ObjectHandle) -> bool {
+        !self.tjs_runtime.object_valid(window)
+            || !self
+                .tjs_runtime
+                .object_member(window, "visible")
+                .is_truthy()
+            || self
+                .tjs_runtime
+                .object_member(window, "__nativeClosed")
+                .is_truthy()
     }
 
     fn pump_layer_paints(&mut self) -> Result<()> {
@@ -602,6 +605,10 @@ impl KrkrEngine {
     }
 
     fn runtime_window_object(&self) -> Option<ObjectHandle> {
+        if let Some(window) = self.active_modal_window() {
+            return Some(window);
+        }
+
         if let Variant::Object(kag) = self.tjs_runtime.global_member("kag")
             && has_window_state_member(&self.tjs_runtime, kag)
         {
@@ -618,26 +625,61 @@ impl KrkrEngine {
         Some(window)
     }
 
+    fn active_modal_window(&self) -> Option<ObjectHandle> {
+        let window = self.tjs_runtime.host().current_modal_window()?;
+        (!self.modal_window_is_closed(window)).then_some(window)
+    }
+
     fn pump_tjs_events(&mut self) -> Result<()> {
         const MAX_NATIVE_EVENT_PASSES: usize = 1024;
 
+        if self.tjs_runtime.is_suspended() {
+            while let Some(event) = self.pending_input_events.pop_front() {
+                self.handle_input_event(event)?;
+                if self
+                    .tjs_runtime
+                    .host()
+                    .current_modal_window()
+                    .is_some_and(|window| self.modal_window_is_closed(window))
+                {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
         self.fire_continuous_handlers()?;
+        if self.tjs_runtime.is_suspended() {
+            return Ok(());
+        }
 
         for _ in 0..MAX_NATIVE_EVENT_PASSES {
             if self.fire_due_tjs_events(TjsEventPriority::Exclusive)? {
+                if self.tjs_runtime.is_suspended() {
+                    return Ok(());
+                }
                 continue;
             }
 
             if let Some(event) = self.pending_input_events.pop_front() {
                 self.handle_input_event(event)?;
+                if self.tjs_runtime.is_suspended() {
+                    return Ok(());
+                }
                 continue;
             }
 
             if self.fire_due_tjs_events(TjsEventPriority::Normal)? {
+                if self.tjs_runtime.is_suspended() {
+                    return Ok(());
+                }
                 continue;
             }
 
             if self.fire_due_tjs_events(TjsEventPriority::Idle)? {
+                if self.tjs_runtime.is_suspended() {
+                    return Ok(());
+                }
                 continue;
             }
 
@@ -656,6 +698,9 @@ impl KrkrEngine {
                 continue;
             }
             self.tjs_runtime.call_function(handler, Vec::new())?;
+            if self.tjs_runtime.is_suspended() {
+                break;
+            }
         }
         Ok(())
     }
@@ -665,10 +710,35 @@ impl KrkrEngine {
         if events.is_empty() {
             return Ok(false);
         }
-        for event in events {
+        let mut events = events.into_iter();
+        while let Some(event) = events.next() {
             self.fire_tjs_event(event)?;
+            if self.tjs_runtime.is_suspended() {
+                for event in events {
+                    self.defer_tjs_event(event);
+                }
+                break;
+            }
         }
         Ok(true)
+    }
+
+    fn defer_tjs_event(&mut self, event: TjsEvent) {
+        match event.kind {
+            TjsEventKind::Timer => {
+                self.tjs_runtime
+                    .host_mut()
+                    .set_timer_next_fire_millis(event.handle, Some(0));
+            }
+            TjsEventKind::AsyncTrigger => {
+                self.tjs_runtime.host_mut().trigger_async(event.handle);
+            }
+            TjsEventKind::AudioFadeCompleted => {
+                self.tjs_runtime
+                    .host_mut()
+                    .schedule_audio_fade_completion(event.handle, 0);
+            }
+        }
     }
 
     fn collect_due_tjs_events(&mut self, priority: TjsEventPriority) -> Result<Vec<TjsEvent>> {
@@ -721,6 +791,12 @@ impl KrkrEngine {
                 .object_member(handle, "interval")
                 .to_integer()?
                 .max(0);
+            if interval == 0 {
+                self.tjs_runtime
+                    .host_mut()
+                    .set_timer_next_fire_millis(handle, None);
+                continue;
+            }
             let next_fire = match self.tjs_runtime.host().timer_next_fire_millis(handle) {
                 Some(next_fire) => next_fire,
                 None => {
@@ -810,6 +886,7 @@ impl KrkrEngine {
                     button: PointerButton::Primary,
                     state: ButtonState::Pressed,
                 } => {
+                    let modal_active = self.active_modal_window().is_some();
                     self.dispatch_window_pointer_event("onMouseDown", 0)?;
                     let raw_target = self.layer_at_cursor()?;
                     let handled_by_script = raw_target.is_some_and(|layer_id| {
@@ -818,7 +895,10 @@ impl KrkrEngine {
                     self.dispatch_layer_pointer_event("onMouseDown", 0, raw_target)?;
                     self.pressed_layer = raw_target;
                     self.captured_layer = raw_target;
-                    if !handled_by_script && self.should_fire_primary_click(raw_target) {
+                    if !modal_active
+                        && !handled_by_script
+                        && self.should_fire_primary_click(raw_target)
+                    {
                         self.fire_kag_primary_click(false)?;
                     }
                 }
@@ -826,6 +906,7 @@ impl KrkrEngine {
                     button: PointerButton::Primary,
                     state: ButtonState::Released,
                 } => {
+                    let modal_active = self.active_modal_window().is_some();
                     self.dispatch_window_pointer_event("onMouseUp", 0)?;
                     let release_hit = self.layer_at_cursor()?;
                     self.dispatch_layer_pointer_event(
@@ -841,12 +922,15 @@ impl KrkrEngine {
                     }
                     self.pressed_layer = None;
                     self.captured_layer = None;
-                    self.signal_kag_click();
+                    if !modal_active {
+                        self.signal_kag_click();
+                    }
                 }
                 EngineEvent::PointerInput {
                     button: PointerButton::Secondary,
                     state: ButtonState::Pressed,
                 } => {
+                    let modal_active = self.active_modal_window().is_some();
                     let handled_by_window = self.dispatch_window_pointer_event("onMouseDown", 1)?;
                     let raw_target = self.layer_at_cursor()?;
                     let handled_by_layer = raw_target.is_some_and(|layer_id| {
@@ -854,7 +938,7 @@ impl KrkrEngine {
                     });
                     self.dispatch_layer_pointer_event("onMouseDown", 1, raw_target)?;
                     self.captured_layer = raw_target;
-                    if !handled_by_window && !handled_by_layer {
+                    if !modal_active && !handled_by_window && !handled_by_layer {
                         self.fire_kag_secondary_click()?;
                     }
                 }
@@ -896,6 +980,7 @@ impl KrkrEngine {
                     if matches!(state, ButtonState::Pressed)
                         && matches!(key, EngineKey::Enter | EngineKey::Space)
                         && !handled
+                        && self.active_modal_window().is_none()
                     {
                         self.fire_kag_primary_click(true)?;
                         self.signal_kag_click();
@@ -1324,13 +1409,32 @@ impl KrkrEngine {
 
     fn hit_tested_layers_at_position(&mut self, position: Point) -> Result<Vec<LayerId>> {
         let candidates = self.tjs_runtime.host().layer_tree().hit_test_all(position);
+        let modal_window = self.active_modal_window();
         let mut hits = Vec::new();
         for layer_id in candidates {
+            if let Some(window) = modal_window
+                && !self.layer_belongs_to_window(layer_id, window)
+            {
+                continue;
+            }
             if self.layer_accepts_script_hit_test(layer_id, position)? {
                 hits.push(layer_id);
             }
         }
         Ok(hits)
+    }
+
+    fn layer_belongs_to_window(&self, layer_id: LayerId, window: ObjectHandle) -> bool {
+        let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
+            return false;
+        };
+        let Variant::Object(layer_window) = self.tjs_runtime.object_member(object, "window") else {
+            return false;
+        };
+        self.tjs_runtime
+            .bound_this(layer_window)
+            .unwrap_or(layer_window)
+            == window
     }
 
     fn layer_has_script_handler(&self, layer_id: LayerId, method: &str) -> bool {
@@ -1457,7 +1561,7 @@ impl KrkrEngine {
             let image_top = object_i64(&self.tjs_runtime, handle, "imageTop")?;
             let image_width = object_i64(&self.tjs_runtime, handle, "imageWidth")?;
             let image_height = object_i64(&self.tjs_runtime, handle, "imageHeight")?;
-            let visible = object_i64(&self.tjs_runtime, handle, "visible")? != 0;
+            let visible = self.layer_effective_visible(handle)?;
             let opacity = object_i64(&self.tjs_runtime, handle, "opacity")?.clamp(0, 255) as u8;
             let enabled = object_i64(&self.tjs_runtime, handle, "enabled")? != 0;
             let node_enabled = object_i64(&self.tjs_runtime, handle, "nodeEnabled")? != 0;
@@ -1553,6 +1657,22 @@ impl KrkrEngine {
             }
         }
         Ok(())
+    }
+
+    fn layer_effective_visible(&self, handle: ObjectHandle) -> Result<bool> {
+        if object_i64(&self.tjs_runtime, handle, "visible")? == 0 {
+            return Ok(false);
+        }
+
+        let Variant::Object(window) = self.tjs_runtime.object_member(handle, "window") else {
+            return Ok(true);
+        };
+        let window = self.tjs_runtime.bound_this(window).unwrap_or(window);
+        Ok(self.tjs_runtime.object_valid(window)
+            && !self
+                .tjs_runtime
+                .object_member(window, "__nativeClosed")
+                .is_truthy())
     }
 
     fn collect_kag_layer_targets(&self) -> BTreeMap<ObjectHandle, (String, String)> {
@@ -3258,6 +3378,334 @@ mod tests {
         assert_eq!(
             engine.tjs_runtime().global_member("trace"),
             Variant::String("before:after".to_string())
+        );
+    }
+
+    #[test]
+    fn native_window_close_hides_owned_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.main = new Window();
+                global.dialog = new Window();
+                global.dialogLayer = new Layer(dialog, null);
+                dialog.add(dialogLayer);
+                dialogLayer.setSize(40, 20);
+                dialogLayer.setImageSize(40, 20);
+                dialogLayer.visible = true;
+                dialog.visible = true;
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("visible frame");
+
+        let Variant::Object(layer) = engine.tjs_runtime().global_member("dialogLayer") else {
+            panic!("dialog layer missing");
+        };
+        let layer_id = engine.host().native_layer(layer).expect("native layer");
+        assert!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .expect("layer node")
+                .visible
+        );
+
+        let Variant::Object(dialog) = engine.tjs_runtime().global_member("dialog") else {
+            panic!("dialog missing");
+        };
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(dialog, "close", Vec::new())
+            .expect("close dialog");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("hidden frame");
+
+        assert!(
+            !engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .expect("layer node")
+                .visible
+        );
+    }
+
+    #[test]
+    fn suspended_modal_pauses_tjs_timer_events_until_resume() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.trace = "";
+                global.main = new Window();
+                global.modal = new Window();
+                global.timerProbe = new Timer(function() {
+                    global.trace += "T";
+                    global.timerProbe.enabled = false;
+                }, "");
+                timerProbe.interval = 1000;
+                timerProbe.enabled = true;
+                modal.showModal();
+                global.trace += "R";
+                "#,
+            )
+            .expect("script");
+        assert!(engine.tjs_runtime().is_suspended());
+        let Variant::Object(timer_probe) = engine.tjs_runtime().global_member("timerProbe") else {
+            panic!("timerProbe missing");
+        };
+        force_timer_due(&mut engine, timer_probe);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("modal frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String(String::new())
+        );
+
+        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
+            panic!("modal window missing");
+        };
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(modal, "close", Vec::new())
+            .expect("close modal");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("resume frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("R".to_string())
+        );
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("timer frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("RT".to_string())
+        );
+    }
+
+    #[test]
+    fn event_pump_stops_when_tjs_event_opens_modal() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.trace = "";
+                global.modal = new Window();
+                global.firstTimer = new Timer(function() {
+                    global.trace += "A";
+                    global.firstTimer.enabled = false;
+                    modal.showModal();
+                    global.trace += "B";
+                }, "");
+                firstTimer.interval = 1000;
+                firstTimer.enabled = true;
+                global.secondTimer = new Timer(function() {
+                    global.trace += "X";
+                    global.secondTimer.enabled = false;
+                }, "");
+                secondTimer.interval = 1000;
+                secondTimer.enabled = true;
+                "#,
+            )
+            .expect("script");
+        let Variant::Object(first_timer) = engine.tjs_runtime().global_member("firstTimer") else {
+            panic!("firstTimer missing");
+        };
+        let Variant::Object(second_timer) = engine.tjs_runtime().global_member("secondTimer")
+        else {
+            panic!("secondTimer missing");
+        };
+        force_timer_due(&mut engine, first_timer);
+        force_timer_due(&mut engine, second_timer);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("modal frame");
+        assert!(engine.tjs_runtime().is_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("A".to_string())
+        );
+
+        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
+            panic!("modal window missing");
+        };
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(modal, "close", Vec::new())
+            .expect("close modal");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("resume frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("AB".to_string())
+        );
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("second timer frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("ABX".to_string())
+        );
+    }
+
+    #[test]
+    fn native_window_set_pos_offsets_primary_layer() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.root = new Layer(window, null);
+                window.add(root);
+                root.setSize(80, 60);
+                root.setImageSize(80, 60);
+                root.visible = true;
+                window.setInnerSize(80, 60);
+                window.setPos(20, 30);
+                "#,
+            )
+            .expect("script");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window missing");
+        };
+        assert_eq!(
+            engine.tjs_runtime().object_member(window, "left"),
+            Variant::Integer(20)
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(window, "top"),
+            Variant::Integer(30)
+        );
+        let Variant::Object(root) = engine.tjs_runtime().global_member("root") else {
+            panic!("root layer missing");
+        };
+        let layer_id = engine.host().native_layer(root).expect("native layer");
+        let position = engine
+            .host()
+            .layer_tree()
+            .absolute_position(layer_id)
+            .expect("absolute position");
+        assert_eq!(position, Point::new(20.0, 30.0));
+    }
+
+    #[test]
+    fn modal_pointer_events_do_not_click_through_to_underlying_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.trace = "";
+                global.main = new Window();
+                global.under = new Layer(main, null);
+                under.setSize(120, 80);
+                under.setImageSize(120, 80);
+                under.fillRect(0, 0, 120, 80, 0xffffffff);
+                under.visible = true;
+                under.order = 100;
+                under.onClick = function(x, y) { global.trace += "U"; };
+
+                global.modal = new Window();
+                global.modalRoot = new Layer(modal, null);
+                modalRoot.setSize(80, 60);
+                modalRoot.setImageSize(80, 60);
+                modalRoot.fillRect(0, 0, 80, 60, 0xffffffff);
+                modalRoot.visible = true;
+
+                global.modalButton = new Layer(modal, modalRoot);
+                modalButton.setPos(10, 10);
+                modalButton.setSize(30, 20);
+                modalButton.setImageSize(30, 20);
+                modalButton.fillRect(0, 0, 30, 20, 0xffffffff);
+                modalButton.visible = true;
+                modalButton.onClick = function(x, y) {
+                    global.trace += "M";
+                    modal.close();
+                };
+
+                modal.showModal();
+                global.trace += "R";
+                "#,
+            )
+            .expect("script");
+        assert!(engine.tjs_runtime().is_suspended());
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(20.0, 20.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click modal");
+
+        assert!(!engine.tjs_runtime().is_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("MR".to_string())
         );
     }
 
@@ -8208,12 +8656,16 @@ mod tests {
                     timerProbe.enabled = false;
                 }, "");
                 global.timerProbe = timerProbe;
-                timerProbe.interval = 0;
+                timerProbe.interval = 1000;
                 timerProbe.enabled = true;
                 "#,
             )
             .expect("script");
         assert_eq!(engine.host().timer_handles().len(), 1);
+        let Variant::Object(timer) = engine.tjs_runtime().global_member("timerProbe") else {
+            panic!("timerProbe should be an object");
+        };
+        force_timer_due(&mut engine, timer);
 
         engine
             .update(
@@ -8226,12 +8678,74 @@ mod tests {
             engine.tjs_runtime().global_member("timerProbeCount"),
             Variant::Integer(1)
         );
-        let Variant::Object(timer) = engine.tjs_runtime().global_member("timerProbe") else {
-            panic!("timerProbe should be an object");
-        };
         assert_eq!(
             engine.tjs_runtime().object_member(timer, "enabled"),
             Variant::Integer(0)
+        );
+    }
+
+    #[test]
+    fn native_timer_interval_zero_does_not_fire() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer_zero.tjs",
+                r#"
+                global.timerProbeCount = 0;
+                global.timerProbe = new Timer(function() {
+                    global.timerProbeCount++;
+                }, "");
+                timerProbe.interval = 0;
+                timerProbe.enabled = true;
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("timerProbeCount"),
+            Variant::Integer(0)
+        );
+    }
+
+    #[test]
+    fn idle_async_trigger_is_not_preempted_by_zero_interval_timer() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer_zero_async.tjs",
+                r#"
+                global.trace = "";
+                global.timerProbe = new Timer(function() {
+                    global.trace += "T";
+                }, "");
+                global.asyncProbe = new AsyncTrigger(function() {
+                    global.trace += "A";
+                }, "");
+                timerProbe.interval = 0;
+                timerProbe.enabled = true;
+                asyncProbe.mode = 2;
+                asyncProbe.trigger();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("A".to_string())
         );
     }
 
@@ -8251,12 +8765,16 @@ mod tests {
                 var asyncProbe = new AsyncTrigger(stopTimer, "");
                 global.timerProbe = timerProbe;
                 global.asyncProbe = asyncProbe;
-                timerProbe.interval = 0;
+                timerProbe.interval = 1000;
                 timerProbe.enabled = true;
                 asyncProbe.trigger();
                 "#,
             )
             .expect("script");
+        let Variant::Object(timer_probe) = engine.tjs_runtime().global_member("timerProbe") else {
+            panic!("timerProbe missing");
+        };
+        force_timer_due(&mut engine, timer_probe);
 
         engine
             .update(
@@ -8645,6 +9163,13 @@ mod tests {
             krkr_kag::SourceSpan::empty(0),
             krkr_kag::SourceLocation::default(),
         )
+    }
+
+    fn force_timer_due(engine: &mut KrkrEngine, timer: ObjectHandle) {
+        engine
+            .tjs_runtime
+            .host_mut()
+            .set_timer_next_fire_millis(timer, Some(0));
     }
 
     fn temp_root() -> PathBuf {

@@ -1201,6 +1201,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         match name {
             "toString" => Ok(Variant::String(value)),
             "escape" => Ok(Variant::String(escape_tjs_string_fragment(&value))),
+            "sprintf" => Ok(Variant::String(sprintf_tjs_string(&value, &args)?)),
             "substr" | "substring" => {
                 let start = args
                     .first()
@@ -1445,6 +1446,388 @@ fn string_last_index_of(value: &str, needle: &str, end_utf16: Option<usize>) -> 
         .rfind(needle)
         .map(|offset| utf16_len(&value[..offset]) as i64)
         .unwrap_or(-1)
+}
+
+fn sprintf_tjs_string(format: &str, args: &[Variant]) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = format.chars().peekable();
+    let mut arg_index = 0usize;
+
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+            continue;
+        }
+
+        let spec = PrintfSpec::parse(&mut chars, args, &mut arg_index)?;
+        let formatted = format_printf_arg(&spec, args.get(arg_index))?;
+        arg_index = arg_index.saturating_add(1);
+        out.push_str(&formatted);
+    }
+
+    Ok(out)
+}
+
+#[derive(Debug, Default)]
+struct PrintfSpec {
+    left_adjust: bool,
+    force_sign: bool,
+    space_sign: bool,
+    alternate: bool,
+    zero_pad: bool,
+    width: Option<usize>,
+    precision: Option<usize>,
+    conv: char,
+}
+
+impl PrintfSpec {
+    fn parse<I>(
+        chars: &mut std::iter::Peekable<I>,
+        args: &[Variant],
+        arg_index: &mut usize,
+    ) -> Result<Self>
+    where
+        I: Iterator<Item = char>,
+    {
+        let mut spec = Self::default();
+        loop {
+            match chars.peek().copied() {
+                Some('-') => spec.left_adjust = true,
+                Some('+') => spec.force_sign = true,
+                Some(' ') => spec.space_sign = true,
+                Some('#') => spec.alternate = true,
+                Some('0') => spec.zero_pad = true,
+                _ => break,
+            }
+            chars.next();
+        }
+
+        spec.width = parse_printf_width(chars, args, arg_index)?;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            spec.precision = Some(parse_printf_precision(chars, args, arg_index)?);
+        }
+
+        while matches!(chars.peek(), Some('h' | 'l' | 'L' | 'I' | 'z' | 't' | 'j')) {
+            let modifier = chars.next();
+            if modifier == Some('l') && chars.peek() == Some(&'l') {
+                chars.next();
+            }
+            if modifier == Some('h') && chars.peek() == Some(&'h') {
+                chars.next();
+            }
+            if modifier == Some('I') {
+                while matches!(chars.peek(), Some('3' | '6' | '2' | '4' | '8')) {
+                    chars.next();
+                }
+            }
+        }
+
+        spec.conv = chars
+            .next()
+            .ok_or_else(|| TjsError::runtime("incomplete sprintf format"))?;
+        Ok(spec)
+    }
+}
+
+fn parse_printf_width<I>(
+    chars: &mut std::iter::Peekable<I>,
+    args: &[Variant],
+    arg_index: &mut usize,
+) -> Result<Option<usize>>
+where
+    I: Iterator<Item = char>,
+{
+    if chars.peek() == Some(&'*') {
+        chars.next();
+        let width = args
+            .get(*arg_index)
+            .map(Variant::to_integer)
+            .transpose()?
+            .unwrap_or(0);
+        *arg_index = (*arg_index).saturating_add(1);
+        return Ok((width > 0).then_some(width as usize));
+    }
+
+    let mut width = 0usize;
+    let mut has_width = false;
+    while let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(10)) {
+        chars.next();
+        has_width = true;
+        width = width.saturating_mul(10).saturating_add(digit as usize);
+    }
+    Ok(has_width.then_some(width))
+}
+
+fn parse_printf_precision<I>(
+    chars: &mut std::iter::Peekable<I>,
+    args: &[Variant],
+    arg_index: &mut usize,
+) -> Result<usize>
+where
+    I: Iterator<Item = char>,
+{
+    if chars.peek() == Some(&'*') {
+        chars.next();
+        let precision = args
+            .get(*arg_index)
+            .map(Variant::to_integer)
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as usize;
+        *arg_index = (*arg_index).saturating_add(1);
+        return Ok(precision);
+    }
+
+    let mut precision = 0usize;
+    while let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(10)) {
+        chars.next();
+        precision = precision.saturating_mul(10).saturating_add(digit as usize);
+    }
+    Ok(precision)
+}
+
+fn format_printf_arg(spec: &PrintfSpec, arg: Option<&Variant>) -> Result<String> {
+    let value = arg.cloned().unwrap_or_default();
+    match spec.conv {
+        'd' | 'i' => Ok(format_printf_signed(spec, value.to_integer()?)),
+        'u' => Ok(format_printf_unsigned(
+            spec,
+            value.to_integer()? as u64,
+            10,
+            false,
+        )),
+        'o' => Ok(format_printf_unsigned(
+            spec,
+            value.to_integer()? as u64,
+            8,
+            false,
+        )),
+        'x' => Ok(format_printf_unsigned(
+            spec,
+            value.to_integer()? as u64,
+            16,
+            false,
+        )),
+        'X' => Ok(format_printf_unsigned(
+            spec,
+            value.to_integer()? as u64,
+            16,
+            true,
+        )),
+        'f' | 'F' | 'e' | 'E' | 'g' | 'G' => Ok(format_printf_real(spec, value.to_real()?)),
+        's' => {
+            let text = value.to_tjs_string()?;
+            Ok(pad_printf_text(
+                limit_chars(&text, spec.precision),
+                spec.width,
+                spec.left_adjust,
+            ))
+        }
+        'c' => format_printf_char(spec, &value),
+        '%' => Ok("%".to_string()),
+        conv => Err(TjsError::runtime(format!(
+            "unsupported sprintf conversion `%{conv}`"
+        ))),
+    }
+}
+
+fn format_printf_signed(spec: &PrintfSpec, value: i64) -> String {
+    let sign = if value < 0 {
+        "-"
+    } else if spec.force_sign {
+        "+"
+    } else if spec.space_sign {
+        " "
+    } else {
+        ""
+    };
+    let magnitude = value.unsigned_abs();
+    let digits = printf_digits(magnitude, 10, false);
+    finish_printf_number(spec, sign, "", digits, magnitude == 0)
+}
+
+fn format_printf_unsigned(spec: &PrintfSpec, value: u64, radix: u32, uppercase: bool) -> String {
+    let prefix = if spec.alternate && value != 0 {
+        match radix {
+            8 => "0",
+            16 if uppercase => "0X",
+            16 => "0x",
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    let digits = printf_digits(value, radix, uppercase);
+    finish_printf_number(spec, "", prefix, digits, value == 0)
+}
+
+fn printf_digits(value: u64, radix: u32, uppercase: bool) -> String {
+    match (radix, uppercase) {
+        (8, _) => format!("{value:o}"),
+        (10, _) => value.to_string(),
+        (16, false) => format!("{value:x}"),
+        (16, true) => format!("{value:X}"),
+        _ => unreachable!("supported printf radix"),
+    }
+}
+
+fn finish_printf_number(
+    spec: &PrintfSpec,
+    sign: &str,
+    prefix: &str,
+    mut digits: String,
+    is_zero: bool,
+) -> String {
+    if spec.precision == Some(0) && is_zero {
+        digits.clear();
+    }
+    if let Some(precision) = spec.precision
+        && digits.len() < precision
+    {
+        digits = "0".repeat(precision - digits.len()) + &digits;
+    }
+
+    let head = format!("{sign}{prefix}");
+    let len = head.chars().count() + digits.chars().count();
+    let width = spec.width.unwrap_or(0);
+    if len >= width {
+        return head + &digits;
+    }
+
+    let pad_len = width - len;
+    if spec.left_adjust {
+        return head + &digits + &" ".repeat(pad_len);
+    }
+    if spec.zero_pad && spec.precision.is_none() {
+        return head + &"0".repeat(pad_len) + &digits;
+    }
+    " ".repeat(pad_len) + &head + &digits
+}
+
+fn format_printf_real(spec: &PrintfSpec, value: f64) -> String {
+    let precision = spec.precision.unwrap_or(6);
+    let sign = if value.is_sign_negative() {
+        "-"
+    } else if spec.force_sign {
+        "+"
+    } else if spec.space_sign {
+        " "
+    } else {
+        ""
+    };
+    let value = value.abs();
+    let mut digits = match spec.conv {
+        'f' | 'F' => format!("{value:.precision$}"),
+        'e' => format!("{value:.precision$e}"),
+        'E' => format!("{value:.precision$E}"),
+        'g' => printf_general(value, precision, false, spec.alternate),
+        'G' => printf_general(value, precision, true, spec.alternate),
+        _ => unreachable!("real conversion"),
+    };
+    if spec.alternate && !digits.contains('.') && !digits.contains('e') && !digits.contains('E') {
+        digits.push('.');
+    }
+    finish_printf_real(spec, sign, &digits)
+}
+
+fn printf_general(value: f64, precision: usize, uppercase: bool, alternate: bool) -> String {
+    let significant = precision.max(1);
+    let abs = value.abs();
+    let use_exp = abs != 0.0
+        && (abs < 0.0001 || abs >= 10_f64.powi(i32::try_from(significant).unwrap_or(i32::MAX)));
+    let mut text = if use_exp {
+        let precision = significant.saturating_sub(1);
+        if uppercase {
+            format!("{value:.precision$E}")
+        } else {
+            format!("{value:.precision$e}")
+        }
+    } else {
+        let integer_digits = if abs >= 1.0 {
+            abs.log10().floor() as usize + 1
+        } else {
+            1
+        };
+        let precision = significant.saturating_sub(integer_digits);
+        format!("{value:.precision$}")
+    };
+    if !alternate {
+        strip_printf_float_zeros(&mut text);
+    }
+    text
+}
+
+fn strip_printf_float_zeros(text: &mut String) {
+    let exponent = text
+        .find('e')
+        .or_else(|| text.find('E'))
+        .map(|index| text.split_off(index));
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    if let Some(exponent) = exponent {
+        text.push_str(&exponent);
+    }
+}
+
+fn finish_printf_real(spec: &PrintfSpec, sign: &str, digits: &str) -> String {
+    let len = sign.chars().count() + digits.chars().count();
+    let width = spec.width.unwrap_or(0);
+    if len >= width {
+        return format!("{sign}{digits}");
+    }
+
+    let pad_len = width - len;
+    if spec.left_adjust {
+        return format!("{sign}{digits}{}", " ".repeat(pad_len));
+    }
+    if spec.zero_pad {
+        return format!("{sign}{}{}", "0".repeat(pad_len), digits);
+    }
+    format!("{}{}{}", " ".repeat(pad_len), sign, digits)
+}
+
+fn format_printf_char(spec: &PrintfSpec, value: &Variant) -> Result<String> {
+    let text = match value {
+        Variant::String(value) => value.chars().next().unwrap_or('\0').to_string(),
+        _ => {
+            let code = value.to_integer()? as u32;
+            char::from_u32(code).unwrap_or('\0').to_string()
+        }
+    };
+    Ok(pad_printf_text(text, spec.width, spec.left_adjust))
+}
+
+fn limit_chars(text: &str, limit: Option<usize>) -> String {
+    match limit {
+        Some(limit) => text.chars().take(limit).collect(),
+        None => text.to_string(),
+    }
+}
+
+fn pad_printf_text(text: String, width: Option<usize>, left_adjust: bool) -> String {
+    let width = width.unwrap_or(0);
+    let len = text.chars().count();
+    if len >= width {
+        return text;
+    }
+    let pad = " ".repeat(width - len);
+    if left_adjust {
+        text + &pad
+    } else {
+        pad + &text
+    }
 }
 
 fn byte_index_for_utf16(value: &str, target: usize) -> usize {
