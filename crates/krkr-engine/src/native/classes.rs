@@ -5,7 +5,7 @@ use std::{
 };
 
 use krkr_core::{AudioBus, AudioCommand, AudioLoadPolicy, LayerNode};
-use krkr_font::{FontSpec, FontSystem, TextStyle};
+use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{Closure, ObjectHandle, Runtime, TjsHost, Variant},
@@ -2635,7 +2635,8 @@ fn layer_draw_text(
         shadow: None,
     };
     let effect = text_draw_effect(&args, opacity)?;
-    let metrics = runtime.host().font_system().text_metrics(&font, &text);
+    let layout = runtime.host().font_system().layout_text(&font, &text);
+    let metrics = layout.metrics();
     let min_width =
         (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
     let min_height =
@@ -2650,15 +2651,15 @@ fn layer_draw_text(
             effect.draw(
                 font_system,
                 &font,
+                &layout,
                 pixels,
                 width,
                 height,
                 x as i32,
                 y as i32,
-                &text,
             );
-            font_system.draw_text_to_rgba(
-                &font, style, pixels, width, height, x as i32, y as i32, &text,
+            font_system.draw_text_layout_to_rgba(
+                &font, style, pixels, width, height, x as i32, y as i32, &layout,
             );
         },
     )?;
@@ -2703,7 +2704,8 @@ fn layer_draw_glyph(
         shadow: None,
     };
     let effect = text_draw_effect(&args, opacity)?;
-    let metrics = runtime.host().font_system().text_metrics(&font, &text);
+    let layout = runtime.host().font_system().layout_text(&font, &text);
+    let metrics = layout.metrics();
     let min_width =
         (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
     let min_height =
@@ -2718,15 +2720,15 @@ fn layer_draw_glyph(
             effect.draw(
                 font_system,
                 &font,
+                &layout,
                 pixels,
                 width,
                 height,
                 x as i32,
                 y as i32,
-                &text,
             );
-            font_system.draw_text_to_rgba(
-                &font, style, pixels, width, height, x as i32, y as i32, &text,
+            font_system.draw_text_layout_to_rgba(
+                &font, style, pixels, width, height, x as i32, y as i32, &layout,
             );
         },
     )?;
@@ -2777,12 +2779,12 @@ impl TextDrawEffect {
         self,
         font_system: &FontSystem,
         font: &FontSpec,
+        layout: &TextLayout,
         pixels: &mut [u8],
         width: u32,
         height: u32,
         x: i32,
         y: i32,
-        text: &str,
     ) {
         if !self.is_visible() {
             return;
@@ -2798,7 +2800,7 @@ impl TextDrawEffect {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
-                    font_system.draw_text_to_rgba(
+                    font_system.draw_text_layout_to_rgba(
                         font,
                         style,
                         pixels,
@@ -2806,7 +2808,7 @@ impl TextDrawEffect {
                         height,
                         x + dx,
                         y + dy,
-                        text,
+                        layout,
                     );
                 }
             }
@@ -2815,7 +2817,7 @@ impl TextDrawEffect {
         let spread = self.width.max(0);
         for dy in -spread..=spread {
             for dx in -spread..=spread {
-                font_system.draw_text_to_rgba(
+                font_system.draw_text_layout_to_rgba(
                     font,
                     style,
                     pixels,
@@ -2823,7 +2825,7 @@ impl TextDrawEffect {
                     height,
                     x + self.offset_x + dx,
                     y + self.offset_y + dy,
-                    text,
+                    layout,
                 );
             }
         }
