@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     error::{KagError, Result},
@@ -171,7 +171,7 @@ pub struct ParserSnapshot {
 pub struct KagParser {
     options: ParserOptions,
     debug_level: DebugLevel,
-    scenarios: BTreeMap<String, Scenario>,
+    scenarios: Arc<BTreeMap<String, Scenario>>,
     current_storage: Option<String>,
     cursor: Cursor,
     current_label: Option<String>,
@@ -198,7 +198,7 @@ impl KagParser {
         Self {
             options,
             debug_level: DebugLevel::Simple,
-            scenarios: BTreeMap::new(),
+            scenarios: Arc::new(BTreeMap::new()),
             current_storage: None,
             cursor: Cursor::default(),
             current_label: None,
@@ -244,7 +244,7 @@ impl KagParser {
     }
 
     pub fn clear(&mut self) {
-        self.scenarios.clear();
+        self.scenarios = Arc::new(BTreeMap::new());
         self.current_storage = None;
         self.cursor = Cursor::default();
         self.current_label = None;
@@ -536,7 +536,7 @@ impl KagParser {
 
     fn install_scenario(&mut self, storage: String, source: String) -> Result<()> {
         let scenario = Scenario::new(storage.clone(), source)?;
-        self.scenarios.insert(storage.clone(), scenario);
+        Arc::make_mut(&mut self.scenarios).insert(storage.clone(), scenario);
         self.current_storage = Some(storage);
         self.cursor = Cursor::default();
         self.current_label = None;
@@ -2131,6 +2131,21 @@ mod tests {
     }
 
     #[test]
+    fn cloned_parsers_share_loaded_scenarios_until_mutated() {
+        let mut parser = KagParser::new();
+        parser.load_scenario_text("first.ks", "*start\nA").unwrap();
+
+        let cloned = parser.clone();
+        assert!(Arc::ptr_eq(&parser.scenarios, &cloned.scenarios));
+
+        parser.load_scenario_text("second.ks", "*start\nB").unwrap();
+
+        assert!(!Arc::ptr_eq(&parser.scenarios, &cloned.scenarios));
+        assert!(parser.scenarios.contains_key("second.ks"));
+        assert!(!cloned.scenarios.contains_key("second.ks"));
+    }
+
+    #[test]
     fn parses_text_tags_command_lines_comments_and_labels() {
         let mut parser = KagParser::new();
         parser.set_ignore_cr(true);
@@ -2626,7 +2641,7 @@ mod tests {
         parser.load_scenario_with("first.ks", &mut host).unwrap();
         assert_eq!(lit(&next_with(&mut parser, &mut host), "text"), Some("X"));
 
-        parser.scenarios.insert(
+        Arc::make_mut(&mut parser.scenarios).insert(
             "first.ks".into(),
             Scenario::new(
                 "first.ks".into(),
