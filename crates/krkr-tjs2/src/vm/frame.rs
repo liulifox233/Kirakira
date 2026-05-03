@@ -16,6 +16,17 @@ pub(super) struct CallFrame {
     pub(super) continuation: Continuation,
 }
 
+pub(crate) struct SuspendedCallStack {
+    pub(super) stack: Vec<CallFrame>,
+    pub(super) base_depth: usize,
+}
+
+impl SuspendedCallStack {
+    pub(crate) fn resume_file_id(&self) -> Option<usize> {
+        self.stack.last().map(|frame| frame.file_id)
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum Continuation {
     Root,
