@@ -64,11 +64,7 @@ impl Xp3ResourceProvider {
             if let Some(entry) = archive.get_entry(&normalized) {
                 return Some(entry);
             }
-            if let Some(entry) = archive
-                .entries()
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(&normalized))
-            {
+            if let Some(entry) = archive.get_entry_ascii_case_insensitive(&normalized) {
                 return Some(entry);
             }
         }
@@ -89,11 +85,7 @@ impl ResourceProvider for Xp3ResourceProvider {
         for archive in self.archives.iter().rev() {
             let entry_name = if archive.get_entry(&normalized).is_some() {
                 normalized.clone()
-            } else if let Some(entry) = archive
-                .entries()
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(&normalized))
-            {
+            } else if let Some(entry) = archive.get_entry_ascii_case_insensitive(&normalized) {
                 entry.name.clone()
             } else {
                 continue;

@@ -20,6 +20,7 @@ pub struct Xp3Archive<R> {
     reader: ArchiveSourceHandle<R>,
     entries: Vec<Xp3Entry>,
     by_name: HashMap<String, usize>,
+    by_ascii_lowercase_name: HashMap<String, usize>,
     base_offset: u64,
     file_len: u64,
     extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
@@ -54,14 +55,19 @@ where
         entries.sort_by(|left, right| left.name.cmp(&right.name));
 
         let mut by_name = HashMap::with_capacity(entries.len());
+        let mut by_ascii_lowercase_name = HashMap::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             by_name.entry(entry.name.clone()).or_insert(index);
+            by_ascii_lowercase_name
+                .entry(entry.name.to_ascii_lowercase())
+                .or_insert(index);
         }
 
         Ok(Self {
             reader: make_source(reader),
             entries,
             by_name,
+            by_ascii_lowercase_name,
             base_offset,
             file_len,
             extraction_filter: options.extraction_filter,
@@ -78,6 +84,13 @@ where
         let name = normalize_entry_name(name).ok()?;
         self.by_name
             .get(&name)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    pub fn get_entry_ascii_case_insensitive(&self, name: &str) -> Option<&Xp3Entry> {
+        let name = normalize_entry_name(name).ok()?;
+        self.by_ascii_lowercase_name
+            .get(&name.to_ascii_lowercase())
             .and_then(|index| self.entries.get(*index))
     }
 
@@ -143,6 +156,7 @@ impl<R> Clone for Xp3Archive<R> {
             reader: self.reader.clone(),
             entries: self.entries.clone(),
             by_name: self.by_name.clone(),
+            by_ascii_lowercase_name: self.by_ascii_lowercase_name.clone(),
             base_offset: self.base_offset,
             file_len: self.file_len,
             extraction_filter: self.extraction_filter.clone(),
