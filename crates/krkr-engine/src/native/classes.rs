@@ -3901,10 +3901,28 @@ fn fill_pixels(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
+    let row_width = image_width as usize * 4;
+    let x0 = x0 as usize;
+    let x1 = x1 as usize;
+    let pixel = u32::from_ne_bytes(rgba);
     for py in y0..y1 {
-        for px in x0..x1 {
-            let index = ((py * image_width + px) * 4) as usize;
-            pixels[index..index + 4].copy_from_slice(&rgba);
+        let row_start = py as usize * row_width;
+        let mut offset = row_start + x0 * 4;
+        let row_end = row_start + x1 * 4;
+        if row_end > pixels.len() {
+            return;
+        }
+        while offset < row_end {
+            // The write is within the bounds checked above, but the byte buffer
+            // is not guaranteed to have u32 alignment.
+            unsafe {
+                pixels
+                    .as_mut_ptr()
+                    .add(offset)
+                    .cast::<u32>()
+                    .write_unaligned(pixel);
+            }
+            offset += 4;
         }
     }
 }
@@ -3925,35 +3943,98 @@ fn copy_pixels(
     height: i64,
     alpha_blend: bool,
 ) {
+    let Some((dx, dy, sx, sy, width, height)) = clipped_copy_rect(
+        dx,
+        dy,
+        sx,
+        sy,
+        width,
+        height,
+        dest_width as i64,
+        dest_height as i64,
+        source_width as i64,
+        source_height as i64,
+    ) else {
+        return;
+    };
+
+    let dest_stride = dest_width as usize * 4;
+    let source_stride = source_width as usize * 4;
+    let bytes = width as usize * 4;
+    let dx = dx as usize;
+    let dy = dy as usize;
+    let sx = sx as usize;
+    let sy = sy as usize;
+    let height = height as usize;
+
     for row in 0..height {
-        let src_y = sy + row;
-        let dest_y = dy + row;
-        if src_y < 0 || dest_y < 0 || src_y >= source_height as i64 || dest_y >= dest_height as i64
-        {
-            continue;
+        let src_start = (sy + row) * source_stride + sx * 4;
+        let dest_start = (dy + row) * dest_stride + dx * 4;
+        let src_end = src_start + bytes;
+        let dest_end = dest_start + bytes;
+        if src_end > source.len() || dest_end > dest.len() {
+            return;
         }
-        for col in 0..width {
-            let src_x = sx + col;
-            let dest_x = dx + col;
-            if src_x < 0
-                || dest_x < 0
-                || src_x >= source_width as i64
-                || dest_x >= dest_width as i64
+        let src_row = &source[src_start..src_end];
+        let dest_row = &mut dest[dest_start..dest_end];
+        if alpha_blend {
+            for (dest_pixel, src_pixel) in dest_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4))
             {
-                continue;
+                blend_pixel(dest_pixel, src_pixel);
             }
-            let src_index = ((src_y as u32 * source_width + src_x as u32) * 4) as usize;
-            let dest_index = ((dest_y as u32 * dest_width + dest_x as u32) * 4) as usize;
-            if alpha_blend {
-                blend_pixel(
-                    &mut dest[dest_index..dest_index + 4],
-                    &source[src_index..src_index + 4],
-                );
-            } else {
-                dest[dest_index..dest_index + 4].copy_from_slice(&source[src_index..src_index + 4]);
-            }
+        } else {
+            dest_row.copy_from_slice(src_row);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clipped_copy_rect(
+    mut dx: i64,
+    mut dy: i64,
+    mut sx: i64,
+    mut sy: i64,
+    mut width: i64,
+    mut height: i64,
+    dest_width: i64,
+    dest_height: i64,
+    source_width: i64,
+    source_height: i64,
+) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    if sx < 0 {
+        let delta = -sx;
+        sx = 0;
+        dx += delta;
+        width -= delta;
+    }
+    if sy < 0 {
+        let delta = -sy;
+        sy = 0;
+        dy += delta;
+        height -= delta;
+    }
+    if dx < 0 {
+        let delta = -dx;
+        dx = 0;
+        sx += delta;
+        width -= delta;
+    }
+    if dy < 0 {
+        let delta = -dy;
+        dy = 0;
+        sy += delta;
+        height -= delta;
+    }
+    width = width
+        .min(source_width.saturating_sub(sx))
+        .min(dest_width.saturating_sub(dx));
+    height = height
+        .min(source_height.saturating_sub(sy))
+        .min(dest_height.saturating_sub(dy));
+    (width > 0 && height > 0).then_some((dx, dy, sx, sy, width, height))
 }
 
 fn blend_pixel(dest: &mut [u8], src: &[u8]) {
