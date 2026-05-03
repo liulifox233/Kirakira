@@ -119,6 +119,9 @@ pub struct FontSystem {
     db: Database,
     named_file_faces: BTreeMap<String, Vec<fontdb::ID>>,
     prerendered_fonts: BTreeMap<String, Arc<[u8]>>,
+    primary_faces: RefCell<BTreeMap<FaceSelectionKey, Option<fontdb::ID>>>,
+    char_faces: RefCell<BTreeMap<CharFaceSelectionKey, Option<fontdb::ID>>>,
+    recent_fallback_faces: RefCell<BTreeMap<FaceSelectionKey, fontdb::ID>>,
     glyph_ids: RefCell<BTreeMap<(FontFaceKey, char), Option<u16>>>,
     face_metrics: RefCell<BTreeMap<FaceMetricsKey, swash::Metrics>>,
     glyph_images: RefCell<BTreeMap<RenderedGlyphKey, Arc<GlyphImage>>>,
@@ -136,6 +139,9 @@ impl Clone for FontSystem {
             db: self.db.clone(),
             named_file_faces: self.named_file_faces.clone(),
             prerendered_fonts: self.prerendered_fonts.clone(),
+            primary_faces: RefCell::new(BTreeMap::new()),
+            char_faces: RefCell::new(BTreeMap::new()),
+            recent_fallback_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
@@ -151,6 +157,9 @@ impl FontSystem {
             db,
             named_file_faces: BTreeMap::new(),
             prerendered_fonts: BTreeMap::new(),
+            primary_faces: RefCell::new(BTreeMap::new()),
+            char_faces: RefCell::new(BTreeMap::new()),
+            recent_fallback_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
@@ -222,7 +231,7 @@ impl FontSystem {
 
     pub fn text_metrics(&self, spec: &FontSpec, text: &str) -> TextMetrics {
         let layout = self.layout_text(spec, text);
-        layout.metrics
+        layout.metrics()
     }
 
     pub fn esc_width(&self, spec: &FontSpec, text: &str) -> (f32, f32) {
@@ -234,7 +243,13 @@ impl FontSystem {
     }
 
     pub fn glyph_draw_rect(&self, spec: &FontSpec, ch: char) -> Option<GlyphDrawRect> {
-        let face = self.select_face(spec, Some(ch))?;
+        let primary_face = self.select_primary_face(spec)?;
+        let face = if self.face_supports(primary_face, ch) {
+            primary_face
+        } else {
+            self.select_face_for_char(spec, ch, primary_face)
+                .unwrap_or(primary_face)
+        };
         let glyph_id = self
             .glyph_id(face, ch)
             .or_else(|| self.tofu_glyph_id(face))?;
@@ -249,27 +264,16 @@ impl FontSystem {
 
     pub fn rasterize_text(&self, spec: &FontSpec, style: TextStyle, text: &str) -> RgbaTextImage {
         let layout = self.layout_text(spec, text);
-        let width = layout.metrics.width.ceil().max(1.0) as u32;
-        let height = layout.metrics.height.ceil().max(1.0) as u32;
+        let metrics = layout.metrics();
+        let width = metrics.width.ceil().max(1.0) as u32;
+        let height = metrics.height.ceil().max(1.0) as u32;
         let mut rgba = vec![0; width as usize * height as usize * 4];
-        if let Some(shadow) = style.shadow {
-            self.draw_layout(
-                spec,
-                &layout,
-                &mut rgba,
-                width,
-                height,
-                shadow.offset_x,
-                shadow.offset_y,
-                shadow.color,
-            );
-        }
-        self.draw_layout(spec, &layout, &mut rgba, width, height, 0, 0, style.color);
+        self.draw_text_layout_to_rgba(spec, style, &mut rgba, width, height, 0, 0, &layout);
         RgbaTextImage {
             width,
             height,
             rgba,
-            metrics: layout.metrics,
+            metrics,
         }
     }
 
@@ -286,10 +290,25 @@ impl FontSystem {
         text: &str,
     ) {
         let layout = self.layout_text(spec, text);
+        self.draw_text_layout_to_rgba(spec, style, dest, dest_width, dest_height, x, y, &layout);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_layout_to_rgba(
+        &self,
+        spec: &FontSpec,
+        style: TextStyle,
+        dest: &mut [u8],
+        dest_width: u32,
+        dest_height: u32,
+        x: i32,
+        y: i32,
+        layout: &TextLayout,
+    ) {
         if let Some(shadow) = style.shadow {
             self.draw_layout(
                 spec,
-                &layout,
+                layout,
                 dest,
                 dest_width,
                 dest_height,
@@ -300,7 +319,7 @@ impl FontSystem {
         }
         self.draw_layout(
             spec,
-            &layout,
+            layout,
             dest,
             dest_width,
             dest_height,
@@ -310,8 +329,8 @@ impl FontSystem {
         );
     }
 
-    fn layout_text(&self, spec: &FontSpec, text: &str) -> TextLayout {
-        let face = self.select_face(spec, None);
+    pub fn layout_text(&self, spec: &FontSpec, text: &str) -> TextLayout {
+        let face = self.select_primary_face(spec);
         let Some(primary_face) = face else {
             return fallback_layout(spec, text);
         };
@@ -354,7 +373,14 @@ impl FontSystem {
                 lines = lines.saturating_add(1);
                 continue;
             }
-            let ch_face = self.select_face(spec, Some(ch)).unwrap_or(primary_face);
+            let ch_face = if self.face_supports(run_face, ch) {
+                run_face
+            } else if run_face != primary_face && self.face_supports(primary_face, ch) {
+                primary_face
+            } else {
+                self.select_face_for_char(spec, ch, primary_face)
+                    .unwrap_or(primary_face)
+            };
             if !run.is_empty() && ch_face != run_face {
                 flush_run(&mut run, run_face, &mut pen_x, pen_y, &mut glyphs);
             }
@@ -569,18 +595,80 @@ impl FontSystem {
         metrics
     }
 
-    fn select_face(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
-        if spec.face_is_file_name
-            && let Some(ids) = self.named_file_faces.get(&spec.face)
-            && let Some(id) = ids
-                .iter()
+    fn select_primary_face(&self, spec: &FontSpec) -> Option<fontdb::ID> {
+        if spec.face_is_file_name {
+            return self.select_named_file_face(spec, None);
+        }
+
+        let key = FaceSelectionKey::new(spec);
+        if let Some(cached) = self.primary_faces.borrow().get(&key).copied() {
+            return cached;
+        }
+
+        let selected = self
+            .query_requested_faces(spec, None)
+            .or_else(|| self.query_fallback_faces(spec, None))
+            .or_else(|| self.db.faces().next().map(|face| face.id));
+        self.primary_faces.borrow_mut().insert(key, selected);
+        selected
+    }
+
+    fn select_face_for_char(
+        &self,
+        spec: &FontSpec,
+        ch: char,
+        primary_face: fontdb::ID,
+    ) -> Option<fontdb::ID> {
+        if spec.face_is_file_name {
+            return self.select_named_file_face(spec, Some(ch));
+        }
+
+        let key = FaceSelectionKey::new(spec);
+        let char_key = CharFaceSelectionKey {
+            key: key.clone(),
+            ch,
+        };
+        if let Some(cached) = self.char_faces.borrow().get(&char_key).copied() {
+            return cached;
+        }
+
+        let selected = self
+            .query_requested_faces(spec, Some(ch))
+            .or_else(|| {
+                self.recent_fallback_faces
+                    .borrow()
+                    .get(&key)
+                    .copied()
+                    .filter(|id| self.face_supports(*id, ch))
+            })
+            .or_else(|| self.query_fallback_faces(spec, Some(ch)))
+            .or_else(|| {
+                self.db
+                    .faces()
+                    .map(|face| face.id)
+                    .find(|id| self.face_supports(*id, ch))
+            });
+        if let Some(id) = selected
+            && id != primary_face
+        {
+            self.recent_fallback_faces
+                .borrow_mut()
+                .insert(key.clone(), id);
+        }
+        self.char_faces.borrow_mut().insert(char_key, selected);
+        selected
+    }
+
+    fn select_named_file_face(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
+        self.named_file_faces.get(&spec.face).and_then(|ids| {
+            ids.iter()
                 .copied()
                 .find(|id| ch.is_none_or(|ch| self.face_supports(*id, ch)))
                 .or_else(|| ids.first().copied())
-        {
-            return Some(id);
-        }
+        })
+    }
 
+    fn query_requested_faces(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
         let weight = if spec.bold {
             Weight::BOLD
         } else {
@@ -612,6 +700,21 @@ impl FontSystem {
             }
         }
 
+        None
+    }
+
+    fn query_fallback_faces(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
+        let weight = if spec.bold {
+            Weight::BOLD
+        } else {
+            Weight::NORMAL
+        };
+        let style = if spec.italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        };
+
         let fallback_families = [Family::SansSerif, Family::Serif, Family::Monospace];
         for family in fallback_families {
             let families = [family];
@@ -628,15 +731,7 @@ impl FontSystem {
             }
         }
 
-        if let Some(ch) = ch {
-            return self
-                .db
-                .faces()
-                .map(|face| face.id)
-                .find(|id| self.face_supports(*id, ch));
-        }
-
-        self.db.faces().next().map(|face| face.id)
+        None
     }
 
     fn face_supports(&self, face: fontdb::ID, ch: char) -> bool {
@@ -677,10 +772,38 @@ impl FontSystem {
     }
 
     fn clear_caches(&self) {
+        self.primary_faces.borrow_mut().clear();
+        self.char_faces.borrow_mut().clear();
+        self.recent_fallback_faces.borrow_mut().clear();
         self.glyph_ids.borrow_mut().clear();
         self.face_metrics.borrow_mut().clear();
         self.glyph_images.borrow_mut().clear();
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FaceSelectionKey {
+    face: String,
+    bold: bool,
+    italic: bool,
+    face_is_file_name: bool,
+}
+
+impl FaceSelectionKey {
+    fn new(spec: &FontSpec) -> Self {
+        Self {
+            face: spec.face.clone(),
+            bold: spec.bold,
+            italic: spec.italic,
+            face_is_file_name: spec.face_is_file_name,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CharFaceSelectionKey {
+    key: FaceSelectionKey,
+    ch: char,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -709,9 +832,15 @@ pub struct RgbaTextImage {
 }
 
 #[derive(Clone, Debug)]
-struct TextLayout {
+pub struct TextLayout {
     glyphs: Vec<PositionedGlyph>,
     metrics: TextMetrics,
+}
+
+impl TextLayout {
+    pub fn metrics(&self) -> TextMetrics {
+        self.metrics
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
