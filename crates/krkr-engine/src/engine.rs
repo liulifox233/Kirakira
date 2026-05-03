@@ -81,6 +81,7 @@ pub enum KagTaskState {
     WaitingTransition,
     WaitingAudio,
     WaitingResource,
+    WaitingModal,
     Finished,
     Error { message: String },
 }
@@ -503,6 +504,7 @@ impl KrkrEngine {
         self.input_result = EngineInputResult::default();
         self.pending_input_events.extend(input.events);
         self.pump_tjs_events()?;
+        self.resume_modal_call_if_ready()?;
         let tick = self.advance(delta)?;
         self.pump_layer_paints()?;
         self.sync_native_layers_from_tjs()?;
@@ -527,6 +529,31 @@ impl KrkrEngine {
             message_layer: self.message_layer.clone(),
             location: self.kag_location(),
         })
+    }
+
+    fn resume_modal_call_if_ready(&mut self) -> Result<()> {
+        while let Some(window) = self.tjs_runtime.host().current_modal_window() {
+            let closed = !self.tjs_runtime.object_valid(window)
+                || !self
+                    .tjs_runtime
+                    .object_member(window, "visible")
+                    .is_truthy()
+                || self
+                    .tjs_runtime
+                    .object_member(window, "__nativeClosed")
+                    .is_truthy();
+            if !closed {
+                break;
+            }
+
+            self.tjs_runtime.host_mut().pop_modal_window(window);
+            self.tjs_runtime.resume_suspended()?;
+            if self.kag_task.state == KagTaskState::WaitingModal && !self.tjs_runtime.is_suspended()
+            {
+                self.kag_task.state = KagTaskState::Running;
+            }
+        }
+        Ok(())
     }
 
     fn pump_layer_paints(&mut self) -> Result<()> {
@@ -1756,6 +1783,16 @@ impl KagRuntimeTask {
         }
 
         loop {
+            if runtime.is_suspended() {
+                self.state = KagTaskState::WaitingModal;
+                return Ok(EngineTickResult {
+                    state: self.state.clone(),
+                    reason: KagYieldReason::Waiting(self.state.clone()),
+                    tags_processed,
+                    elapsed: started.elapsed(),
+                });
+            }
+
             if tags_processed >= budget.max_tags_per_tick
                 || (tags_processed > 0 && started.elapsed() >= budget.max_wall_time)
             {
@@ -3155,6 +3192,120 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("1:1".to_string()));
+    }
+
+    #[test]
+    fn native_window_finalize_is_visible_to_script_subclasses() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.trace = "";
+                class DialogWindow extends Window {
+                    function DialogWindow() { super.Window(); }
+                    function finalize() {
+                        global.trace += "D";
+                        super.finalize(...);
+                        global.trace += "F";
+                    }
+                }
+                var win = new DialogWindow();
+                invalidate win;
+                return global.trace + ":" + (isvalid win);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("DF:0".to_string()));
+    }
+
+    #[test]
+    fn native_window_show_modal_suspends_and_resumes_script() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.trace = "before";
+                global.modal = new Window();
+                modal.showModal();
+                global.trace += ":after";
+                "#,
+            )
+            .expect("script");
+
+        assert!(engine.tjs_runtime().is_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("before".to_string())
+        );
+
+        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
+            panic!("modal window missing");
+        };
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(modal, "close", Vec::new())
+            .expect("close modal");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("resume frame");
+
+        assert!(!engine.tjs_runtime().is_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("before:after".to_string())
+        );
+    }
+
+    #[test]
+    fn kag_eval_modal_suspends_scenario_until_window_closes() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            r#"[eval exp="(function(){ global.trace = 'A'; global.modal = new Window(); modal.showModal(); global.trace += 'B'; })()"]C[s]"#,
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("modal frame");
+        assert_eq!(frame.tick.state, KagTaskState::WaitingModal);
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("A".to_string())
+        );
+        assert!(engine.message_layer().lines.is_empty());
+
+        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
+            panic!("modal window missing");
+        };
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(modal, "close", Vec::new())
+            .expect("close modal");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("resume frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("AB".to_string())
+        );
+        assert_eq!(frame.message_layer.lines, vec!["C".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -5656,6 +5807,69 @@ mod tests {
                 .execute_expression("inline.tjs", "events")
                 .expect("events"),
             Variant::String("down:5:6;up:5:6;click:5:6".to_string())
+        );
+    }
+
+    #[test]
+    fn native_layer_super_on_click_bubbles_to_window_action() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.action = "";
+                var win = new Window();
+                var root = new Layer(win, null);
+                root.setSize(100, 100);
+                root.setImageSize(100, 100);
+                root.fillRect(0, 0, 100, 100, 0xffffffff);
+                root.visible = true;
+                class ActionButton extends Layer {
+                    function ActionButton(win, parent) {
+                        super.Layer(win, parent);
+                    }
+                    function onClick(x, y) {
+                        super.onClick(...);
+                    }
+                }
+                var button = new ActionButton(win, root);
+                button.setPos(10, 10);
+                button.setSize(30, 20);
+                button.setImageSize(30, 20);
+                button.fillRect(0, 0, 30, 20, 0xffffffff);
+                button.visible = true;
+                win.action = function(ev) {
+                    global.action = ev.type + ":" + (ev.target === button);
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(15.0, 15.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click frame");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("action"),
+            Variant::String("onClick:1".to_string())
         );
     }
 

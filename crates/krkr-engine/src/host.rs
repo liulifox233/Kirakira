@@ -68,6 +68,7 @@ pub struct KrkrHost {
     text_encoding: String,
     pressed_keys: BTreeSet<i64>,
     termination_requested: bool,
+    modal_windows: Vec<ObjectHandle>,
 }
 
 impl Default for KrkrHost {
@@ -113,6 +114,7 @@ impl Default for KrkrHost {
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             termination_requested: false,
+            modal_windows: Vec::new(),
         }
     }
 }
@@ -166,7 +168,24 @@ impl KrkrHost {
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             termination_requested: false,
+            modal_windows: Vec::new(),
         })
+    }
+
+    pub(crate) fn push_modal_window(&mut self, window: ObjectHandle) {
+        self.modal_windows.push(window);
+    }
+
+    pub(crate) fn current_modal_window(&self) -> Option<ObjectHandle> {
+        self.modal_windows.last().copied()
+    }
+
+    pub(crate) fn pop_modal_window(&mut self, window: ObjectHandle) {
+        if self.modal_windows.last() == Some(&window) {
+            self.modal_windows.pop();
+        } else {
+            self.modal_windows.retain(|entry| *entry != window);
+        }
     }
 
     pub fn project_root(&self) -> Option<&Path> {

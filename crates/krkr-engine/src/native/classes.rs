@@ -528,7 +528,9 @@ fn menu_item_noop(
 }
 
 fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_native_method_preserving_script(runtime, handle, "finalize", window_finalize);
     register_native_method_preserving_script(runtime, handle, "close", window_close);
+    register_native_method_preserving_script(runtime, handle, "showModal", window_show_modal);
     register_native_method_preserving_script(
         runtime,
         handle,
@@ -539,6 +541,28 @@ fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     runtime.register_object_native(handle, "remove", window_remove);
     runtime.register_object_native(handle, "setSize", window_set_size);
     runtime.register_object_native(handle, "setInnerSize", window_set_inner_size);
+}
+
+fn window_finalize(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Void)
+}
+
+fn window_show_modal(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = require_window_this(runtime, this_obj, "Window.showModal")?;
+    runtime.set_object_member(this, "visible", Variant::Integer(1));
+    runtime.set_object_member(this, "__nativeClosed", Variant::Integer(0));
+    runtime.set_object_member(this, "__nativeModal", Variant::Integer(1));
+    runtime.host_mut().push_modal_window(this);
+    runtime.request_suspend();
+    Ok(Variant::Void)
 }
 
 fn window_close(
@@ -731,6 +755,7 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "setMode", layer_void);
     register_native_method_preserving_script(runtime, handle, "removeMode", layer_void);
     register_native_method_preserving_script(runtime, handle, "releaseCapture", layer_void);
+    register_native_method_preserving_script(runtime, handle, "onClick", layer_on_click);
     register_native_method_preserving_script(runtime, handle, "onHitTest", layer_on_hit_test);
     register_native_method_preserving_script(runtime, handle, "onKeyDown", layer_on_key_down);
     register_native_method_preserving_script(runtime, handle, "onKeyUp", layer_on_key_up);
@@ -3300,6 +3325,32 @@ fn layer_void(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Void)
+}
+
+fn layer_on_click(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Void);
+    };
+    let Some(window) = variant_object(&layer_property_value(runtime, this, "window"))
+        .map(|window| runtime.bound_this(window).unwrap_or(window))
+    else {
+        return Ok(Variant::Void);
+    };
+    if matches!(runtime.object_member(window, "action"), Variant::Void) {
+        return Ok(Variant::Void);
+    }
+
+    let event = runtime.alloc_ordinary_object();
+    runtime.add_object_class_info(event, "Dictionary");
+    runtime.set_object_member(event, "target", Variant::Object(this));
+    runtime.set_object_member(event, "type", Variant::String("onClick".to_string()));
+    runtime
+        .call_object_method(window, "action", vec![Variant::Object(event)])
+        .map(|_| Variant::Void)
 }
 
 fn layer_on_hit_test(

@@ -10,6 +10,7 @@ mod dispatch;
 mod frame;
 mod opcode;
 
+pub(crate) use frame::SuspendedCallStack;
 use frame::{CallFrame, Continuation, ExceptionEntry, Frame};
 use opcode::{branch_index, next_instruction_index};
 
@@ -109,6 +110,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         this_obj: Option<ObjectHandle>,
     ) -> Result<Variant> {
         self.execute_file_object_with_this(self.file_id, object_index, args, this_obj)
+    }
+
+    pub(crate) fn resume_call_stack(&mut self, call_stack: SuspendedCallStack) -> Result<Variant> {
+        self.run_call_stack(call_stack.stack, call_stack.base_depth)
     }
 
     fn create_call_frame(
@@ -227,6 +232,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     call_frame.pc = resume_pc;
                     stack.push(call_frame);
                     stack.push(*frame);
+                }
+                Ok(Step::Suspend { resume_pc }) => {
+                    call_frame.pc = resume_pc;
+                    stack.push(call_frame);
+                    self.runtime.suspended_call = Some(SuspendedCallStack { stack, base_depth });
+                    break Ok(Variant::Void);
                 }
                 Err(error) => {
                     break Err(self.with_active_stack(
@@ -501,6 +512,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         if let Some(dest) = dest {
                             frame.set(dest, value)?;
                         }
+                        if self.runtime.suspend_requested {
+                            self.runtime.suspend_requested = false;
+                            return Ok(Step::Suspend { resume_pc: next_pc });
+                        }
                     }
                     CallOutcome::Immediate(_, continuation) => {
                         return Err(TjsError::runtime(format!(
@@ -533,6 +548,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         if let Some(dest) = dest {
                             frame.set(dest, value)?;
                         }
+                        if self.runtime.suspend_requested {
+                            self.runtime.suspend_requested = false;
+                            return Ok(Step::Suspend { resume_pc: next_pc });
+                        }
                     }
                     CallOutcome::Immediate(_, continuation) => {
                         return Err(TjsError::runtime(format!(
@@ -564,6 +583,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     CallOutcome::Immediate(value, Continuation::CallerRegister { dest }) => {
                         if let Some(dest) = dest {
                             frame.set(dest, value)?;
+                        }
+                        if self.runtime.suspend_requested {
+                            self.runtime.suspend_requested = false;
+                            return Ok(Step::Suspend { resume_pc: next_pc });
                         }
                     }
                     CallOutcome::Immediate(_, continuation) => {
@@ -973,6 +996,9 @@ enum Step {
     Return(Variant),
     Call {
         frame: Box<CallFrame>,
+        resume_pc: usize,
+    },
+    Suspend {
         resume_pc: usize,
     },
 }

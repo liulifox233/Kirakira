@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError};
-use crate::vm::Vm;
+use crate::vm::{SuspendedCallStack, Vm};
 
 mod builtins;
 pub mod object;
@@ -149,6 +149,8 @@ pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) native_properties: Vec<Arc<dyn NativeProperty<H>>>,
     pub(crate) call_depth: usize,
     pub(crate) max_call_depth: usize,
+    pub(crate) suspend_requested: bool,
+    pub(crate) suspended_call: Option<SuspendedCallStack>,
     host: H,
 }
 
@@ -189,6 +191,8 @@ impl<H: TjsHost + 'static> Runtime<H> {
             native_properties: Vec::new(),
             call_depth: 0,
             max_call_depth: 1024,
+            suspend_requested: false,
+            suspended_call: None,
             host,
         };
         builtins::install(&mut runtime);
@@ -419,6 +423,28 @@ impl<H: TjsHost + 'static> Runtime<H> {
         let file_id = self.install_script_file(Arc::new(file.clone()));
         let mut vm = Vm::new(file_id, self)?;
         vm.execute_top_level()
+    }
+
+    pub fn request_suspend(&mut self) {
+        self.suspend_requested = true;
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended_call.is_some()
+    }
+
+    pub fn resume_suspended(&mut self) -> Result<Option<Variant>> {
+        let Some(call_stack) = self.suspended_call.take() else {
+            return Ok(None);
+        };
+        let file_id = call_stack.resume_file_id().unwrap_or(0);
+        let mut vm = Vm::new(file_id, self)?;
+        let value = vm.resume_call_stack(call_stack)?;
+        if self.is_suspended() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
     }
 
     pub fn call_object_method(
