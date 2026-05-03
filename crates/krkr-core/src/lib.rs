@@ -1,6 +1,7 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    io::{self, Read, Seek},
+    io::{self, Cursor, Read, Seek},
     sync::Arc,
 };
 
@@ -10,10 +11,99 @@ pub trait ResourceStream: Read + Seek + Send {}
 
 impl<T> ResourceStream for T where T: Read + Seek + Send {}
 
+pub trait ResourceDataSource: Send + Sync {
+    fn byte_len(&self) -> u64;
+
+    fn as_bytes(&self) -> io::Result<Cow<'_, [u8]>>;
+
+    fn to_arc_bytes(&self) -> io::Result<Arc<[u8]>> {
+        match self.as_bytes()? {
+            Cow::Borrowed(bytes) => Ok(Arc::from(bytes)),
+            Cow::Owned(bytes) => Ok(Arc::from(bytes)),
+        }
+    }
+
+    fn open_stream(&self) -> io::Result<Box<dyn ResourceStream>>;
+}
+
+#[derive(Clone)]
+pub struct ResourceData {
+    source: Arc<dyn ResourceDataSource>,
+}
+
+impl ResourceData {
+    pub fn new(source: Arc<dyn ResourceDataSource>) -> Self {
+        Self { source }
+    }
+
+    pub fn from_bytes(bytes: Arc<[u8]>) -> Self {
+        Self::new(Arc::new(SharedBytesResourceData { bytes }))
+    }
+
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self::from_bytes(Arc::from(bytes))
+    }
+
+    pub fn byte_len(&self) -> u64 {
+        self.source.byte_len()
+    }
+
+    pub fn as_bytes(&self) -> io::Result<Cow<'_, [u8]>> {
+        self.source.as_bytes()
+    }
+
+    pub fn to_arc_bytes(&self) -> io::Result<Arc<[u8]>> {
+        self.source.to_arc_bytes()
+    }
+
+    pub fn open_stream(&self) -> io::Result<Box<dyn ResourceStream>> {
+        self.source.open_stream()
+    }
+}
+
+struct SharedBytesResourceData {
+    bytes: Arc<[u8]>,
+}
+
+impl ResourceDataSource for SharedBytesResourceData {
+    fn byte_len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn as_bytes(&self) -> io::Result<Cow<'_, [u8]>> {
+        Ok(Cow::Borrowed(self.bytes.as_ref()))
+    }
+
+    fn to_arc_bytes(&self) -> io::Result<Arc<[u8]>> {
+        Ok(Arc::clone(&self.bytes))
+    }
+
+    fn open_stream(&self) -> io::Result<Box<dyn ResourceStream>> {
+        Ok(Box::new(Cursor::new(Arc::clone(&self.bytes))))
+    }
+}
+
 pub trait ResourceProvider: Send + Sync {
     fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>>;
 
     fn exists(&self, path: &str) -> bool;
+
+    fn data(&self, path: &str) -> io::Result<ResourceData> {
+        let mut stream = self.open(path)?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes)?;
+        Ok(ResourceData::from_vec(bytes))
+    }
+
+    fn byte_len(&self, path: &str) -> io::Result<Option<u64>> {
+        let mut stream = self.open(path)?;
+        let current = stream.stream_position().ok();
+        let len = stream.seek(io::SeekFrom::End(0)).ok();
+        if let Some(position) = current {
+            let _ = stream.seek(io::SeekFrom::Start(position));
+        }
+        Ok(len)
+    }
 
     fn revision(&self) -> u64 {
         0

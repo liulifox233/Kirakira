@@ -796,29 +796,25 @@ fn should_stream_auto_source(request: &LoadRequest) -> Result<bool, AudioLoadFai
         return Ok(true);
     }
     let storage = request.source.storage().to_string();
-    let stream = request
+    Ok(request
         .provider
-        .open(request.source.storage())
+        .byte_len(request.source.storage())
         .map_err(|error| AudioLoadFailure {
             storage: storage.clone(),
             message: error.to_string(),
-        })?;
-    Ok(ResourceMediaSource::new(stream)
-        .byte_len()
+        })?
         .is_some_and(|len| len > PRELOAD_MAX_SOURCE_BYTES))
 }
 
 fn should_preload_static(request: &LoadRequest) -> Result<bool, AudioLoadFailure> {
     let storage = request.source.storage().to_string();
-    let stream = request
+    Ok(request
         .provider
-        .open(request.source.storage())
+        .byte_len(request.source.storage())
         .map_err(|error| AudioLoadFailure {
             storage: storage.clone(),
             message: error.to_string(),
-        })?;
-    Ok(ResourceMediaSource::new(stream)
-        .byte_len()
+        })?
         .is_none_or(|len| len <= PRELOAD_MAX_SOURCE_BYTES))
 }
 
@@ -1086,10 +1082,6 @@ impl ResourceMediaSource {
             stream: Mutex::new(stream),
             byte_len,
         }
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        self.byte_len
     }
 }
 

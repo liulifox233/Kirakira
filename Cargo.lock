@@ -982,6 +982,7 @@ dependencies = [
  "krkr-kag",
  "krkr-tjs2",
  "krkr-xp3",
+ "memmap2",
 ]
 
 [[package]]

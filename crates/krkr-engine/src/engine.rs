@@ -17,9 +17,12 @@ use krkr_tjs2::{
 
 use crate::{
     globals::install_tvp_globals,
-    host::KrkrHost,
+    host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost},
     kag::EngineKagHost,
-    native::classes::finish_completed_native_transitions,
+    native::classes::{
+        apply_completed_image_load, apply_completed_resource_loads,
+        finish_completed_native_transitions,
+    },
     plugin::KrkrPlugin,
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
@@ -555,10 +558,13 @@ impl KrkrEngine {
     }
 
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
+        apply_completed_resource_loads(&mut self.tjs_runtime)?;
         self.tjs_runtime.host_mut().advance_transition(delta);
         finish_completed_native_transitions(&mut self.tjs_runtime)?;
         let transition_active = self.tjs_runtime.host().has_active_transition();
-        self.kag_task.update_wait(delta, transition_active);
+        let resource_pending = self.tjs_runtime.host().has_pending_resource_loads();
+        self.kag_task
+            .update_wait(delta, transition_active, resource_pending);
         self.kag_task.run_until_yield(
             &mut self.kag_parser,
             &mut self.tjs_runtime,
@@ -1686,7 +1692,7 @@ impl KagRuntimeTask {
         }
     }
 
-    fn update_wait(&mut self, delta: Duration, transition_active: bool) {
+    fn update_wait(&mut self, delta: Duration, transition_active: bool, resource_pending: bool) {
         if let KagTaskState::WaitingTimer { remaining } = self.state.clone() {
             self.state = if delta >= remaining {
                 KagTaskState::Running
@@ -1696,6 +1702,8 @@ impl KagRuntimeTask {
                 }
             };
         } else if self.state == KagTaskState::WaitingTransition && !transition_active {
+            self.state = KagTaskState::Running;
+        } else if self.state == KagTaskState::WaitingResource && !resource_pending {
             self.state = KagTaskState::Running;
         }
     }
@@ -1907,8 +1915,11 @@ impl KagRuntimeTask {
                 Ok(TagAction::Continue)
             }
             "image" => {
-                apply_image_tag(runtime, tag)?;
-                Ok(TagAction::Continue)
+                if apply_image_tag(runtime, tag)? {
+                    Ok(self.wait(KagTaskState::WaitingResource))
+                } else {
+                    Ok(TagAction::Continue)
+                }
             }
             "layopt" | "position" => {
                 apply_layer_options_tag(runtime, tag)?;
@@ -2448,28 +2459,40 @@ fn has_window_state_member(runtime: &Runtime<KrkrHost>, object: ObjectHandle) ->
         .any(|name| !matches!(runtime.object_member(object, name), Variant::Void))
 }
 
-fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
+fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<bool> {
     let storage = tag
         .literal_attr("storage")
         .ok_or_else(|| TjsError::runtime("KAG image tag requires storage"))?;
     let (page, layer_name) = kag_target(runtime, tag);
-    let image = runtime.host_mut().load_image_storage(storage)?;
-    let image_size = image.size();
     let has_explicit_width = tag.literal_attr("width").is_some();
     let has_explicit_height = tag.literal_attr("height").is_some();
-    runtime
-        .host_mut()
-        .mutate_kag_layer(&page, &layer_name, |layer| {
-            layer.set_image(image);
-            if !has_explicit_width {
-                layer.width = image_size.width;
+    let request = ImageLoadRequest {
+        owner: None,
+        target: ImageLoadTarget::Kag {
+            page,
+            layer: layer_name,
+        },
+        storage: storage.to_string(),
+        visible: kag_bool_attr(tag, "visible").unwrap_or(true),
+        left: tag_i64(tag, "left")?,
+        top: tag_i64(tag, "top")?,
+        width: tag_i64(tag, "width")?,
+        height: tag_i64(tag, "height")?,
+        opacity: tag_i64(tag, "opacity")?,
+    };
+    match runtime.host_mut().request_image_load(request.clone())? {
+        ImageLoadState::Ready(mut completion) => {
+            if has_explicit_width {
+                completion.request.width = request.width;
             }
-            if !has_explicit_height {
-                layer.height = image_size.height;
+            if has_explicit_height {
+                completion.request.height = request.height;
             }
-            layer.visible = kag_bool_attr(tag, "visible").unwrap_or(true);
-            apply_tag_geometry(layer, tag)
-        })
+            apply_completed_image_load(runtime, completion)?;
+            Ok(false)
+        }
+        ImageLoadState::Pending => Ok(true),
+    }
 }
 
 fn apply_layer_options_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
@@ -8001,6 +8024,37 @@ mod tests {
             engine.tjs_runtime().object_member(system, "screenHeight"),
             Variant::Integer(1440)
         );
+    }
+
+    #[test]
+    fn system_touch_images_uses_graphic_cache_entry_points() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[255, 0, 0, 255]);
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        let value = engine
+            .execute_expression(
+                "touch_images.tjs",
+                r#"
+                (function() {
+                    System.touchImages(["sprite.png"], 0, 1000);
+                    System.clearGraphicCache();
+                    return "ok";
+                })()
+                "#,
+            )
+            .expect("touch images");
+
+        assert_eq!(value, Variant::String("ok".to_string()));
+        assert!(
+            engine
+                .host()
+                .logs()
+                .iter()
+                .any(|message| message.contains("touched 1 image(s)"))
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

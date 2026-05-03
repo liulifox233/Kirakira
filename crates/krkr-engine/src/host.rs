@@ -1,21 +1,14 @@
 use std::{
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
-    fs,
-    io::{self, Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque, btree_map::Entry},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, DrawCommand,
-    FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceProvider,
+    FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceData,
+    ResourceProvider,
 };
 use krkr_font::FontSystem;
 use krkr_kag::{KagParser, ParserSnapshot};
@@ -23,15 +16,23 @@ use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, TjsHost, Variant},
 };
-use krkr_xp3::Xp3ResourceProvider;
+
+use crate::{
+    resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId},
+    storage::{
+        ProjectStorage, decode_text_storage, io_error as storage_io_error,
+        normalize_storage_separators as storage_normalize_separators, storage_mode_offset,
+    },
+};
+
+const IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
+const IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct KrkrHost {
     project_root: Option<PathBuf>,
-    fs_layers: Vec<ProjectLayer>,
-    fs_lookup_cache: RefCell<BTreeMap<String, Option<LocatedStorage>>>,
-    xp3_provider: Option<Xp3ResourceProvider>,
-    project_resources: Option<ProjectResourceProvider>,
+    project_storage: Option<ProjectStorage>,
+    resource_manager: Option<ResourceManager>,
     auto_paths: Vec<String>,
     logs: Vec<String>,
     linked_plugins: BTreeSet<String>,
@@ -50,7 +51,13 @@ pub struct KrkrHost {
     completed_native_transitions: Vec<NativeTransitionCompletion>,
     current_kag_page: String,
     current_kag_layer: String,
-    image_cache: BTreeMap<String, LayerImage>,
+    image_cache: LayerImageCache,
+    image_cache_revision: u64,
+    pending_image_loads: BTreeMap<ResourceTaskId, PendingImageLoad>,
+    completed_image_loads: Vec<CompletedImageLoad>,
+    image_target_generations: BTreeMap<ImageLoadTarget, u64>,
+    #[cfg_attr(test, allow(dead_code))]
+    next_resource_generation: u64,
     font_system: FontSystem,
     next_texture_id: u64,
     next_audio_instance_id: u64,
@@ -67,10 +74,8 @@ impl Default for KrkrHost {
     fn default() -> Self {
         Self {
             project_root: None,
-            fs_layers: Vec::new(),
-            fs_lookup_cache: RefCell::new(BTreeMap::new()),
-            xp3_provider: None,
-            project_resources: None,
+            project_storage: Some(ProjectStorage::new(None, Vec::new(), None, Vec::new())),
+            resource_manager: None,
             auto_paths: Vec::new(),
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
@@ -89,7 +94,15 @@ impl Default for KrkrHost {
             completed_native_transitions: Vec::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
-            image_cache: BTreeMap::new(),
+            image_cache: LayerImageCache::new(
+                IMAGE_CACHE_CAPACITY_BYTES,
+                IMAGE_CACHE_MAX_ENTRY_BYTES,
+            ),
+            image_cache_revision: 0,
+            pending_image_loads: BTreeMap::new(),
+            completed_image_loads: Vec::new(),
+            image_target_generations: BTreeMap::new(),
+            next_resource_generation: 1,
             font_system: FontSystem::new(),
             next_texture_id: 1,
             next_audio_instance_id: 1,
@@ -107,16 +120,15 @@ impl Default for KrkrHost {
 impl KrkrHost {
     pub fn for_project(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        let fs_layers = project_layers(&root);
-        let xp3_provider = open_project_archives(&root)?;
-        let project_resources =
-            ProjectResourceProvider::new(fs_layers.clone(), xp3_provider.clone(), Vec::new());
+        let project_storage = ProjectStorage::for_root(&root)?;
+        let resource_manager = ResourceManager::new(project_storage.clone()).map_err(|error| {
+            TjsError::runtime(format!("failed to start resource worker: {error}"))
+        })?;
+        let image_cache_revision = project_storage.revision();
         Ok(Self {
             project_root: Some(root),
-            fs_layers,
-            fs_lookup_cache: RefCell::new(BTreeMap::new()),
-            xp3_provider,
-            project_resources: Some(project_resources),
+            project_storage: Some(project_storage),
+            resource_manager: Some(resource_manager),
             auto_paths: Vec::new(),
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
@@ -135,7 +147,15 @@ impl KrkrHost {
             completed_native_transitions: Vec::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
-            image_cache: BTreeMap::new(),
+            image_cache: LayerImageCache::new(
+                IMAGE_CACHE_CAPACITY_BYTES,
+                IMAGE_CACHE_MAX_ENTRY_BYTES,
+            ),
+            image_cache_revision,
+            pending_image_loads: BTreeMap::new(),
+            completed_image_loads: Vec::new(),
+            image_target_generations: BTreeMap::new(),
+            next_resource_generation: 1,
             font_system: FontSystem::new(),
             next_texture_id: 1,
             next_audio_instance_id: 1,
@@ -157,10 +177,16 @@ impl KrkrHost {
         self.project_root.as_ref().map(|root| root.join("savedata"))
     }
 
-    pub fn resource_provider(&self) -> Option<Arc<dyn ResourceProvider>> {
-        self.project_resources
+    pub fn project_storage(&self) -> Result<&ProjectStorage> {
+        self.project_storage
             .as_ref()
-            .map(|provider| Arc::new(provider.clone()) as Arc<dyn ResourceProvider>)
+            .ok_or_else(|| TjsError::runtime("project storage is not configured"))
+    }
+
+    pub fn resource_provider(&self) -> Option<Arc<dyn ResourceProvider>> {
+        self.project_storage
+            .as_ref()
+            .map(|storage| Arc::new(storage.clone()) as Arc<dyn ResourceProvider>)
     }
 
     pub fn logs(&self) -> &[String] {
@@ -200,13 +226,13 @@ impl KrkrHost {
     }
 
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
-        let path = normalize_storage_separators(&path.into());
+        let path = storage_normalize_separators(&path.into());
         if !self.auto_paths.iter().any(|item| item == &path) {
             self.auto_paths.push(path);
-            if let Some(provider) = &self.project_resources {
-                provider.add_auto_path(self.auto_paths.last().expect("auto path was pushed"));
+            if let Some(storage) = &self.project_storage {
+                storage.add_auto_path(self.auto_paths.last().expect("auto path was pushed"));
             }
-            self.clear_fs_lookup_cache();
+            self.invalidate_resource_state();
         }
     }
 
@@ -215,184 +241,79 @@ impl KrkrHost {
         self.auto_paths.retain(|item| item != path);
         let removed = before != self.auto_paths.len();
         if removed {
-            if let Some(provider) = &self.project_resources {
-                provider.remove_auto_path(path);
+            if let Some(storage) = &self.project_storage {
+                storage.remove_auto_path(path);
             }
-            self.clear_fs_lookup_cache();
+            self.invalidate_resource_state();
         }
         removed
     }
 
     pub fn clear_archive_cache(&self) -> Result<()> {
+        if let Some(storage) = &self.project_storage {
+            storage.clear_archive_cache()?;
+        }
         Ok(())
     }
 
     pub fn storage_exists(&self, name: &str) -> bool {
-        self.storage_bytes(name).is_ok()
+        self.project_storage
+            .as_ref()
+            .is_some_and(|storage| storage.storage_exists(name))
     }
 
     pub fn placed_path(&self, name: &str) -> Option<PathBuf> {
-        self.find_fs_path(name).ok().flatten()
+        self.project_storage
+            .as_ref()
+            .and_then(|storage| storage.placed_path(name))
     }
 
     pub(crate) fn read_text_storage(&self, name: &str) -> Result<String> {
-        if let Some(storage) = self.find_fs_storage(name)? {
-            let bytes = fs::read(&storage.path).map_err(io_error)?;
-            return decode_text_storage(name, &bytes, storage.encoding_hint, &self.text_encoding);
+        if let Some(manager) = self.resource_manager.as_ref() {
+            return manager
+                .load_text_blocking(name.to_string(), self.text_encoding.clone())
+                .map_err(|error| {
+                    TjsError::runtime(format!("failed to read text storage `{name}`: {error}"))
+                });
         }
-
-        let bytes = self.storage_bytes(name)?;
-        decode_text_storage(name, &bytes, None, &self.text_encoding)
+        self.project_storage()?
+            .read_text_storage(name, &self.text_encoding)
     }
 
     pub(crate) fn read_binary_storage(&self, name: &str) -> Result<Vec<u8>> {
-        self.storage_bytes(name)
+        let data = self.read_resource_storage(name)?;
+        data.as_bytes()
+            .map(|bytes| bytes.into_owned())
+            .map_err(storage_io_error)
     }
 
-    fn write_text_storage(&self, name: &str, mode: &str, text: &str) -> Result<()> {
-        let bytes = encode_tjs_text_stream(text, mode)?;
-        self.write_binary_storage(name, mode, &bytes)
-    }
-
-    fn write_binary_storage(&self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
-        let root = self
-            .project_root
-            .as_ref()
-            .ok_or_else(|| TjsError::runtime("project root is not set"))?;
-        let path = storage_write_path(root, name)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
+    pub(crate) fn read_resource_storage(&self, name: &str) -> Result<ResourceData> {
+        if let Some(manager) = self.resource_manager.as_ref() {
+            return manager
+                .load_bytes_blocking(name.to_string())
+                .map_err(|error| {
+                    TjsError::runtime(format!("failed to read binary storage `{name}`: {error}"))
+                });
         }
-        let result = if let Some(offset) = storage_mode_offset(mode) {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(io_error)?;
-            file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-            file.write_all(bytes).map_err(io_error)
-        } else {
-            fs::write(&path, bytes).map_err(io_error)
-        };
+        self.project_storage()?.read_binary_storage(name)
+    }
+
+    fn write_text_storage(&mut self, name: &str, mode: &str, text: &str) -> Result<()> {
+        let result = self.project_storage()?.write_text_storage(name, mode, text);
         if result.is_ok() {
-            self.clear_fs_lookup_cache();
+            self.invalidate_resource_state();
         }
         result
     }
 
-    fn storage_bytes(&self, name: &str) -> Result<Vec<u8>> {
-        if let Some(storage) = self.find_fs_storage(name)? {
-            return fs::read(&storage.path).map_err(io_error);
+    fn write_binary_storage(&mut self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
+        let result = self
+            .project_storage()?
+            .write_binary_storage(name, mode, bytes);
+        if result.is_ok() {
+            self.invalidate_resource_state();
         }
-
-        if let Some(provider) = &self.xp3_provider {
-            for candidate in self.storage_candidates(name)? {
-                if provider.exists(&candidate) {
-                    let mut stream = provider.open(&candidate).map_err(io_error)?;
-                    let mut bytes = Vec::new();
-                    stream.read_to_end(&mut bytes).map_err(io_error)?;
-                    return Ok(bytes);
-                }
-            }
-        }
-
-        Err(TjsError::runtime(format!("storage `{name}` not found")))
-    }
-
-    fn find_fs_path(&self, name: &str) -> Result<Option<PathBuf>> {
-        Ok(self.find_fs_storage(name)?.map(|storage| storage.path))
-    }
-
-    fn find_fs_storage(&self, name: &str) -> Result<Option<LocatedStorage>> {
-        if let Some(storage) = self.find_absolute_storage(name) {
-            return Ok(Some(storage));
-        }
-
-        if self.project_root.is_none() {
-            return Ok(None);
-        };
-        if let Some(storage) = self.fs_lookup_cache.borrow().get(name).cloned() {
-            return Ok(storage);
-        }
-        for candidate in self.fs_candidates(name)? {
-            for layer in self.fs_layers.iter().rev() {
-                let path = layer.root.join(&candidate);
-                if path.is_file() {
-                    let storage = Some(LocatedStorage {
-                        path,
-                        encoding_hint: layer.encoding_hint,
-                    });
-                    self.fs_lookup_cache
-                        .borrow_mut()
-                        .insert(name.to_string(), storage.clone());
-                    return Ok(storage);
-                }
-                if let Some(path) =
-                    resolve_case_insensitive_path(&layer.root, &candidate).map_err(io_error)?
-                    && path.is_file()
-                {
-                    let storage = Some(LocatedStorage {
-                        path,
-                        encoding_hint: layer.encoding_hint,
-                    });
-                    self.fs_lookup_cache
-                        .borrow_mut()
-                        .insert(name.to_string(), storage.clone());
-                    return Ok(storage);
-                }
-            }
-        }
-        self.fs_lookup_cache
-            .borrow_mut()
-            .insert(name.to_string(), None);
-        Ok(None)
-    }
-
-    fn clear_fs_lookup_cache(&self) {
-        self.fs_lookup_cache.borrow_mut().clear();
-    }
-
-    fn find_absolute_storage(&self, name: &str) -> Option<LocatedStorage> {
-        let path = Path::new(name);
-        if !path.is_absolute() || !is_safe_absolute_storage_path(path) {
-            return None;
-        }
-        let path = path.to_path_buf();
-        if !path.is_file() {
-            return None;
-        }
-        Some(LocatedStorage {
-            encoding_hint: self
-                .fs_layers
-                .iter()
-                .find(|layer| path.starts_with(&layer.root))
-                .and_then(|layer| layer.encoding_hint)
-                .or_else(|| infer_encoding_from_path(&path)),
-            path,
-        })
-    }
-
-    fn fs_candidates(&self, name: &str) -> Result<Vec<PathBuf>> {
-        self.storage_candidates(name)?
-            .into_iter()
-            .map(|candidate| clean_relative_path(&candidate))
-            .collect()
-    }
-
-    fn storage_candidates(&self, name: &str) -> Result<Vec<String>> {
-        let names = storage_lookup_names(name)?;
-        let mut candidates = Vec::with_capacity(names.len() * (self.auto_paths.len() + 1));
-        for name in names {
-            let clean = clean_relative_path(&name)?;
-            push_unique_storage_candidate(&mut candidates, &clean);
-            for auto_path in self.auto_paths.iter().rev() {
-                for candidate in auto_path_candidates(auto_path, &clean) {
-                    push_unique_storage_candidate(&mut candidates, &candidate);
-                }
-            }
-        }
-        Ok(candidates)
+        result
     }
 
     pub(crate) fn register_plugin(&mut self, name: &str) {
@@ -501,6 +422,8 @@ impl KrkrHost {
         self.pending_async_triggers.remove(&handle);
         self.pending_layer_paints.remove(&handle);
         self.pending_audio_fade_completions.remove(&handle);
+        self.pending_image_loads
+            .retain(|_, load| load.request.owner != Some(handle));
         self.kag_parsers.remove(&handle);
         if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
             self.pending_audio_commands.push(AudioCommand::Stop {
@@ -532,6 +455,8 @@ impl KrkrHost {
             self.pending_async_triggers.remove(&handle);
             self.pending_layer_paints.remove(&handle);
             self.pending_audio_fade_completions.remove(&handle);
+            self.pending_image_loads
+                .retain(|_, load| load.request.owner != Some(handle));
             self.kag_parsers.remove(&handle);
             if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
                 self.pending_audio_commands.push(AudioCommand::Stop {
@@ -689,11 +614,13 @@ impl KrkrHost {
     }
 
     pub(crate) fn load_image_storage(&mut self, name: &str) -> Result<LayerImage> {
+        self.sync_image_cache_revision();
         if let Some(image) = self.image_cache.get(name) {
             return Ok(image.clone());
         }
 
-        let bytes = self.read_binary_storage(name)?;
+        let data = self.project_storage()?.read_binary_storage(name)?;
+        let bytes = data.as_bytes().map_err(storage_io_error)?;
         let decoded = image::load_from_memory(&bytes)
             .map_err(|error| {
                 TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
@@ -707,6 +634,270 @@ impl KrkrHost {
         let image = LayerImage::new(texture_id, width, height, rgba);
         self.image_cache.insert(name.to_string(), image.clone());
         Ok(image)
+    }
+
+    pub(crate) fn load_image_storage_for_script(&mut self, name: &str) -> Result<LayerImage> {
+        self.sync_image_cache_revision();
+        if let Some(image) = self.image_cache.get(name) {
+            return Ok(image.clone());
+        }
+
+        #[cfg(test)]
+        {
+            return self.load_image_storage(name);
+        }
+
+        #[cfg(not(test))]
+        {
+            let Some(manager) = self.resource_manager.as_ref() else {
+                return self.load_image_storage(name);
+            };
+            let revision = self.storage_revision();
+            let decoded = manager
+                .decode_image_blocking(name.to_string(), revision)
+                .map_err(|error| {
+                    TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
+                })?;
+            if revision != self.storage_revision() {
+                return Err(TjsError::runtime(format!(
+                    "discarded stale image `{name}` after storage revision changed"
+                )));
+            }
+            let image = self.layer_image_from_decoded(decoded);
+            self.image_cache.insert(name.to_string(), image.clone());
+            Ok(image)
+        }
+    }
+
+    pub(crate) fn request_image_load(
+        &mut self,
+        request: ImageLoadRequest,
+    ) -> Result<ImageLoadState> {
+        self.sync_image_cache_revision();
+        if let Some(image) = self.image_cache.get(&request.storage) {
+            return Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }));
+        }
+
+        #[cfg(test)]
+        {
+            let image = self.load_image_storage(&request.storage)?;
+            return Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }));
+        }
+
+        #[cfg(not(test))]
+        {
+            let Some(manager) = self.resource_manager.as_ref() else {
+                let image = self.load_image_storage(&request.storage)?;
+                return Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }));
+            };
+            let revision = self.storage_revision();
+            let generation = self.next_resource_generation;
+            self.next_resource_generation = self.next_resource_generation.saturating_add(1);
+            self.pending_image_loads
+                .retain(|_, load| load.request.target != request.target);
+            self.image_target_generations
+                .insert(request.target.clone(), generation);
+            let id = manager.request_image_decode(request.storage.clone(), revision);
+            self.pending_image_loads.insert(
+                id,
+                PendingImageLoad {
+                    request,
+                    generation,
+                    revision,
+                },
+            );
+            Ok(ImageLoadState::Pending)
+        }
+    }
+
+    pub(crate) fn clear_graphic_cache(&mut self) {
+        self.image_cache.clear();
+        if let Some(manager) = self.resource_manager.as_ref()
+            && let Err(error) = manager.clear_decoded_image_cache_blocking()
+        {
+            self.logs
+                .push(format!("failed to clear decoded image cache: {error}"));
+        }
+    }
+
+    pub(crate) fn touch_images(&mut self, storages: &[String], limit: i64, timeout_ms: u64) {
+        self.sync_image_cache_revision();
+        if storages.is_empty() {
+            return;
+        }
+
+        let start = Instant::now();
+        let timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
+        let limit_bytes = graphic_cache_limit_bytes(limit);
+        let mut touched = 0usize;
+        let mut bytes = 0usize;
+        let mut timed_out = false;
+        let mut limit_exceeded = false;
+
+        for storage in storages {
+            if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
+                timed_out = true;
+                break;
+            }
+            if bytes >= limit_bytes {
+                limit_exceeded = true;
+                break;
+            }
+            if storage.is_empty() {
+                continue;
+            }
+
+            match self.touch_image_for_cache(storage) {
+                Ok(image_bytes) => {
+                    touched = touched.saturating_add(1);
+                    bytes = bytes.saturating_add(image_bytes);
+                }
+                Err(error) => {
+                    self.logs
+                        .push(format!("failed to touch image `{storage}`: {error}"));
+                }
+            }
+        }
+
+        let reason = if timed_out {
+            " timed out"
+        } else if limit_exceeded {
+            " limit exceeded"
+        } else {
+            ""
+        };
+        self.logs.push(format!(
+            "touched {touched} image(s), {} bytes in {}ms{reason}",
+            bytes,
+            start.elapsed().as_millis()
+        ));
+    }
+
+    fn touch_image_for_cache(&mut self, name: &str) -> Result<usize> {
+        if let Some(image) = self.image_cache.get(name) {
+            return Ok(image.upload.rgba.len());
+        }
+
+        #[cfg(test)]
+        {
+            let image = self.load_image_storage(name)?;
+            return Ok(image.upload.rgba.len());
+        }
+
+        #[cfg(not(test))]
+        {
+            if let Some(manager) = self.resource_manager.as_ref() {
+                let revision = self.storage_revision();
+                let decoded = manager
+                    .decode_image_blocking(name.to_string(), revision)
+                    .map_err(|error| {
+                        TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
+                    })?;
+                if revision != self.storage_revision() {
+                    return Err(TjsError::runtime(format!(
+                        "discarded stale image `{name}` after storage revision changed"
+                    )));
+                }
+                return Ok(decoded.rgba.len());
+            }
+
+            let image = self.load_image_storage(name)?;
+            Ok(image.upload.rgba.len())
+        }
+    }
+
+    pub(crate) fn take_completed_image_loads(&mut self) -> Vec<CompletedImageLoad> {
+        self.poll_resource_completions();
+        std::mem::take(&mut self.completed_image_loads)
+    }
+
+    pub(crate) fn has_pending_resource_loads(&self) -> bool {
+        !self.pending_image_loads.is_empty()
+    }
+
+    fn poll_resource_completions(&mut self) {
+        let Some(manager) = self.resource_manager.as_ref() else {
+            return;
+        };
+        let completions = manager.drain_completions();
+        for completion in completions {
+            self.complete_image_load(
+                completion.id,
+                completion.revision,
+                &completion.storage,
+                completion.result,
+            );
+        }
+    }
+
+    fn complete_image_load(
+        &mut self,
+        id: ResourceTaskId,
+        revision: u64,
+        storage: &str,
+        result: std::result::Result<DecodedImageData, String>,
+    ) {
+        let Some(pending) = self.pending_image_loads.remove(&id) else {
+            return;
+        };
+        if pending.revision != revision
+            || revision != self.storage_revision()
+            || self
+                .image_target_generations
+                .get(&pending.request.target)
+                .copied()
+                != Some(pending.generation)
+        {
+            return;
+        }
+        self.image_target_generations
+            .remove(&pending.request.target);
+        match result {
+            Ok(decoded) => {
+                let image = self.layer_image_from_decoded(decoded);
+                self.image_cache.insert(storage.to_string(), image.clone());
+                self.completed_image_loads.push(CompletedImageLoad {
+                    request: pending.request,
+                    image,
+                });
+            }
+            Err(error) => {
+                self.logs
+                    .push(format!("failed to decode image `{storage}`: {error}"));
+            }
+        }
+    }
+
+    fn layer_image_from_decoded(&mut self, decoded: DecodedImageData) -> LayerImage {
+        let texture_id = self.next_texture_id;
+        self.next_texture_id = self.next_texture_id.saturating_add(1);
+        LayerImage::new(texture_id, decoded.width, decoded.height, decoded.rgba)
+    }
+
+    fn storage_revision(&self) -> u64 {
+        self.project_storage
+            .as_ref()
+            .map(ProjectStorage::revision)
+            .unwrap_or(0)
+    }
+
+    fn sync_image_cache_revision(&mut self) {
+        let revision = self.storage_revision();
+        if self.image_cache_revision != revision {
+            self.image_cache.clear();
+            self.completed_image_loads.clear();
+            self.pending_image_loads.clear();
+            self.image_target_generations.clear();
+            self.image_cache_revision = revision;
+        }
+    }
+
+    fn invalidate_resource_state(&mut self) {
+        self.image_cache_revision = self.storage_revision();
+        self.image_cache.clear();
+        self.pending_image_loads.clear();
+        self.completed_image_loads.clear();
+        self.image_target_generations.clear();
     }
 
     pub(crate) fn register_native_audio_buffer(&mut self, handle: ObjectHandle) -> AudioInstanceId {
@@ -1197,10 +1388,18 @@ fn kag_layer_z_order(layer: &str) -> i32 {
     layer.parse::<i32>().map_or(1_000, |index| 1_000 + index)
 }
 
-#[derive(Clone)]
-struct ProjectLayer {
-    root: PathBuf,
-    encoding_hint: Option<&'static Encoding>,
+fn graphic_cache_limit_bytes(limit: i64) -> usize {
+    if limit >= 0 {
+        let limit = limit as usize;
+        if limit == 0 || limit > IMAGE_CACHE_CAPACITY_BYTES {
+            IMAGE_CACHE_CAPACITY_BYTES
+        } else {
+            limit
+        }
+    } else {
+        let remaining = limit.unsigned_abs().min(usize::MAX as u64) as usize;
+        IMAGE_CACHE_CAPACITY_BYTES.saturating_sub(remaining)
+    }
 }
 
 #[derive(Clone)]
@@ -1237,6 +1436,113 @@ impl NativeAudioBuffer {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ImageLoadTarget {
+    Kag { page: String, layer: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImageLoadRequest {
+    pub owner: Option<ObjectHandle>,
+    pub target: ImageLoadTarget,
+    pub storage: String,
+    pub visible: bool,
+    pub left: Option<i64>,
+    pub top: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub opacity: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingImageLoad {
+    request: ImageLoadRequest,
+    generation: u64,
+    revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedImageLoad {
+    pub request: ImageLoadRequest,
+    pub image: LayerImage,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum ImageLoadState {
+    Ready(CompletedImageLoad),
+    Pending,
+}
+
+#[derive(Clone)]
+struct LayerImageCacheEntry {
+    image: LayerImage,
+    bytes: usize,
+}
+
+#[derive(Clone)]
+struct LayerImageCache {
+    entries: HashMap<String, LayerImageCacheEntry>,
+    lru: VecDeque<String>,
+    bytes: usize,
+    capacity_bytes: usize,
+    max_entry_bytes: usize,
+}
+
+impl LayerImageCache {
+    fn new(capacity_bytes: usize, max_entry_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            bytes: 0,
+            capacity_bytes,
+            max_entry_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<LayerImage> {
+        let image = self.entries.get(key)?.image.clone();
+        self.touch(key.to_string());
+        Some(image)
+    }
+
+    fn insert(&mut self, key: String, image: LayerImage) {
+        let bytes = image.upload.rgba.len();
+        if bytes > self.max_entry_bytes || bytes > self.capacity_bytes {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries
+            .insert(key.clone(), LayerImageCacheEntry { image, bytes });
+        self.touch(key);
+        self.evict_to_capacity();
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+        self.bytes = 0;
+    }
+
+    fn touch(&mut self, key: String) {
+        self.lru.retain(|item| item != &key);
+        self.lru.push_back(key);
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.bytes > self.capacity_bytes {
+            let Some(key) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+}
+
 fn clamp_krkr_volume(volume: i64) -> i64 {
     volume.clamp(0, 100000)
 }
@@ -1265,584 +1571,6 @@ pub(crate) struct NativeTransitionCompletion {
     pub dest: ObjectHandle,
     pub source: Option<ObjectHandle>,
     pub paired_comp: bool,
-}
-
-#[derive(Clone)]
-struct LocatedStorage {
-    path: PathBuf,
-    encoding_hint: Option<&'static Encoding>,
-}
-
-#[derive(Clone)]
-pub struct ProjectResourceProvider {
-    inner: Arc<ProjectResourceProviderInner>,
-}
-
-struct ProjectResourceProviderInner {
-    fs_layers: Vec<ProjectLayer>,
-    fs_lookup_cache: Mutex<BTreeMap<String, Option<LocatedStorage>>>,
-    xp3_provider: Option<Xp3ResourceProvider>,
-    auto_paths: RwLock<Vec<String>>,
-    revision: AtomicU64,
-}
-
-impl ProjectResourceProvider {
-    fn new(
-        fs_layers: Vec<ProjectLayer>,
-        xp3_provider: Option<Xp3ResourceProvider>,
-        auto_paths: Vec<String>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(ProjectResourceProviderInner {
-                fs_layers,
-                fs_lookup_cache: Mutex::new(BTreeMap::new()),
-                xp3_provider,
-                auto_paths: RwLock::new(auto_paths),
-                revision: AtomicU64::new(0),
-            }),
-        }
-    }
-
-    fn add_auto_path(&self, path: &str) {
-        let path = normalize_storage_separators(path);
-        let Ok(mut auto_paths) = self.inner.auto_paths.write() else {
-            return;
-        };
-        if !auto_paths.iter().any(|item| item == &path) {
-            auto_paths.push(path);
-            self.clear_lookup_cache();
-            self.inner.revision.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn remove_auto_path(&self, path: &str) {
-        let Ok(mut auto_paths) = self.inner.auto_paths.write() else {
-            return;
-        };
-        let before = auto_paths.len();
-        auto_paths.retain(|item| item != path);
-        if before != auto_paths.len() {
-            self.clear_lookup_cache();
-            self.inner.revision.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn clear_lookup_cache(&self) {
-        if let Ok(mut cache) = self.inner.fs_lookup_cache.lock() {
-            cache.clear();
-        }
-    }
-
-    fn auto_paths(&self) -> Vec<String> {
-        self.inner
-            .auto_paths
-            .read()
-            .map(|paths| paths.clone())
-            .unwrap_or_default()
-    }
-
-    fn open_storage(&self, name: &str) -> io::Result<Box<dyn krkr_core::ResourceStream>> {
-        if let Some(storage) = self.find_fs_storage(name)? {
-            return fs::File::open(&storage.path)
-                .map(|file| Box::new(file) as Box<dyn krkr_core::ResourceStream>);
-        }
-
-        if let Some(provider) = &self.inner.xp3_provider {
-            for candidate in self.storage_candidates(name)? {
-                if provider.exists(&candidate) {
-                    return provider.open(&candidate);
-                }
-            }
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("storage `{name}` not found"),
-        ))
-    }
-
-    fn storage_exists(&self, name: &str) -> bool {
-        if self.find_fs_storage(name).ok().flatten().is_some() {
-            return true;
-        }
-
-        let Some(provider) = &self.inner.xp3_provider else {
-            return false;
-        };
-        self.storage_candidates(name).is_ok_and(|candidates| {
-            candidates
-                .iter()
-                .any(|candidate| provider.exists(candidate))
-        })
-    }
-
-    fn find_fs_storage(&self, name: &str) -> io::Result<Option<LocatedStorage>> {
-        if let Some(storage) = self.find_absolute_storage(name) {
-            return Ok(Some(storage));
-        }
-
-        if let Ok(cache) = self.inner.fs_lookup_cache.lock()
-            && let Some(storage) = cache.get(name).cloned()
-        {
-            return Ok(storage);
-        }
-
-        for candidate in self.fs_candidates(name)? {
-            for layer in self.inner.fs_layers.iter().rev() {
-                let path = layer.root.join(&candidate);
-                if path.is_file() {
-                    let storage = Some(LocatedStorage {
-                        path,
-                        encoding_hint: layer.encoding_hint,
-                    });
-                    self.cache_fs_lookup(name, storage.clone());
-                    return Ok(storage);
-                }
-                if let Some(path) = resolve_case_insensitive_path(&layer.root, &candidate)?
-                    && path.is_file()
-                {
-                    let storage = Some(LocatedStorage {
-                        path,
-                        encoding_hint: layer.encoding_hint,
-                    });
-                    self.cache_fs_lookup(name, storage.clone());
-                    return Ok(storage);
-                }
-            }
-        }
-
-        self.cache_fs_lookup(name, None);
-        Ok(None)
-    }
-
-    fn cache_fs_lookup(&self, name: &str, storage: Option<LocatedStorage>) {
-        if let Ok(mut cache) = self.inner.fs_lookup_cache.lock() {
-            cache.insert(name.to_string(), storage);
-        }
-    }
-
-    fn find_absolute_storage(&self, name: &str) -> Option<LocatedStorage> {
-        let path = Path::new(name);
-        if !path.is_absolute() || !is_safe_absolute_storage_path(path) {
-            return None;
-        }
-        let path = path.to_path_buf();
-        if !path.is_file() {
-            return None;
-        }
-        Some(LocatedStorage {
-            encoding_hint: self
-                .inner
-                .fs_layers
-                .iter()
-                .find(|layer| path.starts_with(&layer.root))
-                .and_then(|layer| layer.encoding_hint)
-                .or_else(|| infer_encoding_from_path(&path)),
-            path,
-        })
-    }
-
-    fn fs_candidates(&self, name: &str) -> io::Result<Vec<PathBuf>> {
-        self.storage_candidates(name)?
-            .into_iter()
-            .map(|candidate| clean_relative_path(&candidate).map_err(tjs_error_to_io))
-            .collect()
-    }
-
-    fn storage_candidates(&self, name: &str) -> io::Result<Vec<String>> {
-        let names = storage_lookup_names(name).map_err(tjs_error_to_io)?;
-        let auto_paths = self.auto_paths();
-        let mut candidates = Vec::with_capacity(names.len() * (auto_paths.len() + 1));
-        for name in names {
-            let clean = clean_relative_path(&name).map_err(tjs_error_to_io)?;
-            push_unique_storage_candidate(&mut candidates, &clean);
-            for auto_path in auto_paths.iter().rev() {
-                for candidate in auto_path_candidates(auto_path, &clean) {
-                    push_unique_storage_candidate(&mut candidates, &candidate);
-                }
-            }
-        }
-        Ok(candidates)
-    }
-}
-
-impl ResourceProvider for ProjectResourceProvider {
-    fn open(&self, path: &str) -> io::Result<Box<dyn krkr_core::ResourceStream>> {
-        self.open_storage(path)
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        self.storage_exists(path)
-    }
-
-    fn revision(&self) -> u64 {
-        self.inner.revision.load(Ordering::Relaxed)
-    }
-}
-
-fn project_layers(root: &Path) -> Vec<ProjectLayer> {
-    let mut layers = Vec::new();
-    push_project_layer(
-        &mut layers,
-        root.to_path_buf(),
-        infer_encoding_from_layer_name(root),
-    );
-    for name in ["data", "sys", "patch", "patch2", "patch3", "special"] {
-        let layer = root.join(name);
-        if layer.is_dir() {
-            push_project_layer(
-                &mut layers,
-                layer,
-                infer_encoding_from_layer_name(Path::new(name)),
-            );
-        }
-    }
-    layers
-}
-
-fn push_project_layer(
-    layers: &mut Vec<ProjectLayer>,
-    root: PathBuf,
-    encoding_hint: Option<&'static Encoding>,
-) {
-    if layers.iter().any(|layer| layer.root == root) {
-        return;
-    }
-    layers.push(ProjectLayer {
-        root,
-        encoding_hint,
-    });
-}
-
-fn infer_encoding_from_layer_name(path: &Path) -> Option<&'static Encoding> {
-    match path.file_name().and_then(|name| name.to_str()) {
-        Some("patch") | Some("patch2") | Some("patch3") | Some("special") => Some(GBK),
-        Some("data") | Some("sys") => Some(SHIFT_JIS),
-        _ => None,
-    }
-}
-
-fn infer_encoding_from_path(path: &Path) -> Option<&'static Encoding> {
-    path.components().find_map(|component| match component {
-        Component::Normal(part) => infer_encoding_from_layer_name(Path::new(part)),
-        _ => None,
-    })
-}
-
-fn auto_path_candidates(auto_path: &str, clean: &Path) -> Vec<PathBuf> {
-    let Some(auto_path) = normalize_auto_path(auto_path) else {
-        return Vec::new();
-    };
-    let Ok(auto_relative) = clean_relative_path(&auto_path) else {
-        return Vec::new();
-    };
-    vec![auto_relative.join(clean)]
-}
-
-fn push_unique_storage_candidate(candidates: &mut Vec<String>, path: &Path) {
-    let candidate = path_to_storage_name(path);
-    if !candidates.iter().any(|item| item == &candidate) {
-        candidates.push(candidate);
-    }
-}
-
-fn path_to_storage_name(path: &Path) -> String {
-    normalize_storage_separators(&path.to_string_lossy())
-}
-
-fn resolve_case_insensitive_path(root: &Path, relative: &Path) -> io::Result<Option<PathBuf>> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return Ok(None);
-        };
-        let exact = current.join(part);
-        if exact.exists() {
-            current = exact;
-            continue;
-        }
-
-        let Some(part) = part.to_str() else {
-            return Ok(None);
-        };
-        if !current.is_dir() {
-            return Ok(None);
-        }
-        let mut matched = None;
-        for entry in fs::read_dir(&current)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(part)
-            {
-                matched = Some(entry.path());
-                break;
-            }
-        }
-        let Some(path) = matched else {
-            return Ok(None);
-        };
-        current = path;
-    }
-    Ok(Some(current))
-}
-
-fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
-    let name = normalize_storage_separators(name);
-    clean_relative_path(&name)?;
-    let path = Path::new(&name);
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(is_known_storage_extension)
-    {
-        return Ok(vec![name]);
-    }
-
-    let mut names = Vec::with_capacity(12);
-    names.push(name.clone());
-    for extension in [
-        "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "tcw", "mpg", "mpeg",
-    ] {
-        names.push(format!("{name}.{extension}"));
-    }
-    Ok(names)
-}
-
-fn is_known_storage_extension(extension: &str) -> bool {
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "bmp"
-            | "webp"
-            | "ks"
-            | "tjs"
-            | "asd"
-            | "ogg"
-            | "wav"
-            | "tcw"
-            | "mpg"
-            | "mpeg"
-    )
-}
-
-fn normalize_auto_path(path: &str) -> Option<String> {
-    let path = normalize_storage_separators(path);
-    if let Some((_, inner_path)) = path.split_once('>') {
-        return Some(inner_path.trim_start_matches('/').to_string());
-    }
-    if path.is_empty() {
-        return Some(String::new());
-    }
-    let path = Path::new(&path);
-    if path.is_absolute() {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-            .filter(|name| !name.ends_with(".xp3"))
-    } else if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
-    {
-        path.file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(str::to_string)
-    } else {
-        Some(path.to_string_lossy().into_owned())
-    }
-}
-
-fn decode_text_storage(
-    _name: &str,
-    bytes: &[u8],
-    encoding_hint: Option<&'static Encoding>,
-    configured_encoding: &str,
-) -> Result<String> {
-    if let Some(text) = decode_tjs_text_stream(bytes)? {
-        return Ok(text);
-    }
-
-    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-        return Ok(text);
-    }
-
-    let mut encodings = Vec::new();
-    if let Some(encoding) = encoding_hint {
-        encodings.push(encoding);
-    }
-    if let Some(encoding) = Encoding::for_label(configured_encoding.as_bytes()) {
-        encodings.push(encoding);
-    }
-    encodings.push(SHIFT_JIS);
-    encodings.push(GBK);
-    encodings.push(UTF_8);
-
-    for encoding in encodings {
-        let (text, _, had_errors) = encoding.decode(bytes);
-        if !had_errors {
-            return Ok(text.into_owned());
-        }
-    }
-
-    let encoding = encoding_hint.unwrap_or_else(|| {
-        Encoding::for_label(configured_encoding.as_bytes()).unwrap_or(SHIFT_JIS)
-    });
-    let (text, _, _) = encoding.decode(bytes);
-    Ok(text.into_owned())
-}
-
-fn decode_tjs_text_stream(bytes: &[u8]) -> Result<Option<String>> {
-    if bytes.starts_with(&[0xff, 0xfe]) {
-        return decode_utf16le(&bytes[2..]).map(Some);
-    }
-    if !bytes.starts_with(&[0xfe, 0xfe]) || bytes.len() < 5 {
-        return Ok(None);
-    }
-    let mode = bytes[2];
-    if bytes[3] != 0xff || bytes[4] != 0xfe {
-        return Ok(None);
-    }
-    match mode {
-        0 => {
-            let mut units = utf16le_units(&bytes[5..]);
-            for unit in &mut units {
-                if *unit >= 0x20 {
-                    *unit ^= ((*unit & 0x00fe) << 8) ^ 1;
-                }
-            }
-            String::from_utf16(&units)
-                .map(Some)
-                .map_err(|error| TjsError::runtime(format!("invalid UTF-16 text stream: {error}")))
-        }
-        1 => {
-            let mut units = utf16le_units(&bytes[5..]);
-            for unit in &mut units {
-                *unit = swap_adjacent_bits(*unit);
-            }
-            String::from_utf16(&units)
-                .map(Some)
-                .map_err(|error| TjsError::runtime(format!("invalid UTF-16 text stream: {error}")))
-        }
-        2 => {
-            if bytes.len() < 21 {
-                return Err(TjsError::runtime("compressed text stream is truncated"));
-            }
-            let compressed_len = u64::from_le_bytes(
-                bytes[5..13]
-                    .try_into()
-                    .expect("slice length checked for compressed length"),
-            ) as usize;
-            let uncompressed_len = u64::from_le_bytes(
-                bytes[13..21]
-                    .try_into()
-                    .expect("slice length checked for uncompressed length"),
-            ) as usize;
-            let compressed = bytes
-                .get(21..21 + compressed_len)
-                .ok_or_else(|| TjsError::runtime("compressed text stream is truncated"))?;
-            let mut decoder = ZlibDecoder::new(compressed);
-            let mut decoded = Vec::with_capacity(uncompressed_len);
-            decoder.read_to_end(&mut decoded).map_err(io_error)?;
-            if decoded.len() != uncompressed_len {
-                return Err(TjsError::runtime("compressed text stream length mismatch"));
-            }
-            decode_utf16le(&decoded).map(Some)
-        }
-        _ => Err(TjsError::runtime(format!(
-            "unsupported text stream mode {mode}"
-        ))),
-    }
-}
-
-fn encode_tjs_text_stream(text: &str, mode: &str) -> Result<Vec<u8>> {
-    let mut payload = utf16le_bytes(text);
-    if mode.contains('z') {
-        let level = mode
-            .split('z')
-            .nth(1)
-            .and_then(|rest| rest.chars().next())
-            .and_then(|ch| ch.to_digit(10))
-            .unwrap_or(6);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-        encoder.write_all(&payload).map_err(io_error)?;
-        let compressed = encoder.finish().map_err(io_error)?;
-        let mut bytes = vec![0xfe, 0xfe, 2, 0xff, 0xfe];
-        bytes.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&compressed);
-        return Ok(bytes);
-    }
-    if mode.contains('c') {
-        for chunk in payload.chunks_exact_mut(2) {
-            let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
-            chunk.copy_from_slice(&swap_adjacent_bits(unit).to_le_bytes());
-        }
-        let mut bytes = vec![0xfe, 0xfe, 1, 0xff, 0xfe];
-        bytes.extend_from_slice(&payload);
-        return Ok(bytes);
-    }
-    let mut bytes = vec![0xff, 0xfe];
-    bytes.extend_from_slice(&payload);
-    Ok(bytes)
-}
-
-fn decode_utf16le(bytes: &[u8]) -> Result<String> {
-    String::from_utf16(&utf16le_units(bytes))
-        .map_err(|error| TjsError::runtime(format!("invalid UTF-16 text stream: {error}")))
-}
-
-fn utf16le_units(bytes: &[u8]) -> Vec<u16> {
-    bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect()
-}
-
-fn utf16le_bytes(text: &str) -> Vec<u8> {
-    text.encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>()
-}
-
-fn swap_adjacent_bits(value: u16) -> u16 {
-    ((value & 0xaaaa) >> 1) | ((value & 0x5555) << 1)
-}
-
-fn normalize_storage_separators(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-fn is_safe_absolute_storage_path(path: &Path) -> bool {
-    path.components()
-        .all(|component| !matches!(component, Component::ParentDir | Component::Prefix(_)))
-}
-
-fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
-    let path = Path::new(name);
-    if path.is_absolute() {
-        if is_safe_absolute_storage_path(path) {
-            return Ok(path.to_path_buf());
-        }
-        return Err(TjsError::runtime(format!(
-            "storage path must be safe: {}",
-            path.display()
-        )));
-    }
-    Ok(root.join(clean_relative_path(name)?))
-}
-
-fn storage_mode_offset(mode: &str) -> Option<u64> {
-    let offset = mode
-        .split('o')
-        .nth(1)?
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    (!offset.is_empty()).then(|| offset.parse().ok()).flatten()
 }
 
 impl TjsHost for KrkrHost {
@@ -1887,157 +1615,10 @@ impl TjsHost for KrkrHost {
     }
 }
 
-fn open_project_archives(root: &Path) -> Result<Option<Xp3ResourceProvider>> {
-    let archives = project_archive_paths(root);
-    if archives.is_empty() {
-        return Ok(None);
-    }
-    Xp3ResourceProvider::open_archives(archives)
-        .map(Some)
-        .map_err(|error| TjsError::runtime(format!("failed to open XP3 archives: {error}")))
-}
-
-fn project_archive_paths(root: &Path) -> Vec<PathBuf> {
-    let mut archives = xp3_files_in_directory(&root.join("sys"));
-    archives.extend(xp3_files_in_directory(root));
-    archives
-}
-
-fn xp3_files_in_directory(root: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut archives = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
-        })
-        .collect::<Vec<_>>();
-    archives.sort();
-    archives
-}
-
-fn clean_relative_path(path: &str) -> Result<PathBuf> {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        return Err(TjsError::runtime(format!(
-            "storage path must be relative: {}",
-            path.display()
-        )));
-    }
-
-    let mut clean = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => clean.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                return Err(TjsError::runtime(format!(
-                    "storage path must stay inside project root: {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(clean)
-}
-
-fn io_error(error: io::Error) -> TjsError {
-    TjsError::runtime(error.to_string())
-}
-
-fn tjs_error_to_io(error: TjsError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn storage_candidates_apply_auto_paths_to_xp3_lookups() {
-        let mut host = KrkrHost::default();
-        host.add_auto_path("bgimage/");
-        host.add_auto_path("/tmp/game/sys/bgimage.xp3>");
-
-        let candidates = host.storage_candidates("白").expect("candidates");
-
-        assert!(candidates.iter().any(|candidate| candidate == "白.jpg"));
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate == "bgimage/白.jpg")
-        );
-    }
-
-    #[test]
-    fn normalize_auto_path_uses_archive_inner_prefix() {
-        assert_eq!(
-            normalize_auto_path("/tmp/game/sys/bgimage.xp3>"),
-            Some(String::new())
-        );
-        assert_eq!(
-            normalize_auto_path("/tmp/game/sys/bgimage.xp3>patch/"),
-            Some("patch/".to_string())
-        );
-        assert_eq!(
-            normalize_auto_path("/tmp/game/bgimage/"),
-            Some("bgimage".to_string())
-        );
-    }
-
-    #[test]
-    fn project_archive_paths_include_sys_archives_before_root_archives() {
-        let root = temp_root("archives");
-        fs::create_dir_all(root.join("sys")).expect("create sys");
-        fs::write(root.join("data.xp3"), []).expect("write data archive");
-        fs::write(root.join("patch.xp3"), []).expect("write patch archive");
-        fs::write(root.join("sys/bgimage.xp3"), []).expect("write bg archive");
-        fs::write(root.join("sys/fgimage.XP3"), []).expect("write fg archive");
-        fs::write(root.join("sys/readme.txt"), []).expect("write readme");
-
-        let paths = project_archive_paths(&root)
-            .into_iter()
-            .map(|path| {
-                path.strip_prefix(&root)
-                    .expect("strip root")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            paths,
-            vec![
-                "sys/bgimage.xp3",
-                "sys/fgimage.XP3",
-                "data.xp3",
-                "patch.xp3"
-            ]
-        );
-        fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn filesystem_storage_lookup_falls_back_to_case_insensitive_match() {
-        let root = temp_root("case");
-        fs::create_dir_all(root.join("patch")).expect("create patch");
-        fs::write(root.join("patch/sc_title_bt_Gallery.png"), b"gallery")
-            .expect("write mixed-case resource");
-
-        let host = KrkrHost::for_project(&root).expect("host");
-
-        assert_eq!(
-            host.read_binary_storage("sc_title_bt_GALLERY.png")
-                .expect("read mixed-case resource"),
-            b"gallery"
-        );
-        fs::remove_dir_all(root).expect("cleanup");
-    }
+    use std::fs;
 
     #[test]
     fn storage_mode_offset_reads_and_writes_struct_tail() {

@@ -1,5 +1,5 @@
 use krkr_tjs2::{
-    Result,
+    Result, TjsError,
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
@@ -10,8 +10,6 @@ use super::{first_arg_or_void, install_static_object, register_stub_method};
 pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     let system = install_static_object(runtime, "System");
     for method in [
-        "clearGraphicCache",
-        "touchImages",
         "assignMessage",
         "doCompact",
         "system",
@@ -25,6 +23,8 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     }
     runtime.register_object_native(system, "terminate", system_exit);
     runtime.register_object_native(system, "exit", system_exit);
+    runtime.register_object_native(system, "clearGraphicCache", system_clear_graphic_cache);
+    runtime.register_object_native(system, "touchImages", system_touch_images);
     runtime.register_object_native(
         system,
         "addContinuousHandler",
@@ -102,6 +102,64 @@ fn system_exit(
 ) -> Result<Variant> {
     runtime.host_mut().request_termination();
     Ok(Variant::Void)
+}
+
+fn system_clear_graphic_cache(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    runtime.host_mut().clear_graphic_cache();
+    Ok(Variant::Void)
+}
+
+fn system_touch_images(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let source = args
+        .first()
+        .ok_or_else(|| TjsError::runtime("System.touchImages requires a storage array"))?;
+    let storages = touch_image_storages(runtime, source)?;
+    let limit = args
+        .get(1)
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(0);
+    let timeout_ms = args
+        .get(2)
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(0)
+        .max(0) as u64;
+    runtime
+        .host_mut()
+        .touch_images(&storages, limit, timeout_ms);
+    Ok(Variant::Void)
+}
+
+fn touch_image_storages(runtime: &Runtime<KrkrHost>, source: &Variant) -> Result<Vec<String>> {
+    if let Variant::Object(array) = source {
+        let count = runtime
+            .object_member(*array, "count")
+            .to_integer()
+            .unwrap_or(0)
+            .max(0);
+        let mut storages = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let value = runtime.object_member(*array, &index.to_string());
+            if matches!(value, Variant::Void) {
+                break;
+            }
+            storages.push(value.to_tjs_string()?);
+        }
+        return Ok(storages);
+    }
+
+    Ok(vec![source.to_tjs_string()?])
 }
 
 fn system_add_continuous_handler(

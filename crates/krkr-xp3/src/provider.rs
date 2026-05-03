@@ -74,6 +74,13 @@ impl Xp3ResourceProvider {
         }
         None
     }
+
+    pub fn clear_segment_cache(&self) -> Result<()> {
+        for archive in self.archives.iter() {
+            archive.clear_segment_cache()?;
+        }
+        Ok(())
+    }
 }
 
 impl ResourceProvider for Xp3ResourceProvider {
@@ -103,6 +110,10 @@ impl ResourceProvider for Xp3ResourceProvider {
 
     fn exists(&self, path: &str) -> bool {
         self.get_entry(path).is_some()
+    }
+
+    fn byte_len(&self, path: &str) -> io::Result<Option<u64>> {
+        Ok(self.get_entry(path).map(|entry| entry.original_size))
     }
 }
 
