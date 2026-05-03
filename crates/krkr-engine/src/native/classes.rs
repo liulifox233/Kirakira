@@ -232,6 +232,8 @@ fn apply_constructor_defaults(
         "Window" => {
             runtime.set_object_member(handle, "visible", Variant::Integer(0));
             runtime.set_object_member(handle, "caption", Variant::String(String::new()));
+            runtime.set_object_member(handle, "left", Variant::Integer(0));
+            runtime.set_object_member(handle, "top", Variant::Integer(0));
             runtime.set_object_member(handle, "width", Variant::Integer(0));
             runtime.set_object_member(handle, "height", Variant::Integer(0));
             runtime.set_object_member(handle, "innerWidth", Variant::Integer(0));
@@ -539,6 +541,7 @@ fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     );
     runtime.register_object_native(handle, "add", window_add);
     runtime.register_object_native(handle, "remove", window_remove);
+    runtime.register_object_native(handle, "setPos", window_set_pos);
     runtime.register_object_native(handle, "setSize", window_set_size);
     runtime.register_object_native(handle, "setInnerSize", window_set_inner_size);
 }
@@ -659,6 +662,37 @@ fn window_remove(
     if runtime.object_member(this, "focusedLayer") == item {
         runtime.set_object_member(this, "focusedLayer", Variant::Void);
     }
+    Ok(Variant::Void)
+}
+
+fn window_set_pos(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = require_window_this(runtime, this_obj, "Window.setPos")?;
+    let left = optional_integer(&args, 0)?.unwrap_or(0);
+    let top = optional_integer(&args, 1)?.unwrap_or(0);
+    runtime.set_object_member(this, "left", Variant::Integer(left));
+    runtime.set_object_member(this, "top", Variant::Integer(top));
+
+    let primary_layer = match runtime.object_member(this, "primaryLayer") {
+        Variant::Object(layer) => Some(runtime.bound_this(layer).unwrap_or(layer)),
+        _ => None,
+    };
+    if let Some(layer) = primary_layer
+        && runtime.host().native_layer(layer).is_some()
+    {
+        set_layer_property_storage(runtime, layer, "left", Variant::Integer(left));
+        set_layer_property_storage(runtime, layer, "top", Variant::Integer(top));
+        if let Some(layer_id) = runtime.host().native_layer(layer)
+            && let Some(node) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id)
+        {
+            node.left = left as f32;
+            node.top = top as f32;
+        }
+    }
+
     Ok(Variant::Void)
 }
 
