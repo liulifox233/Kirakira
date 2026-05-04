@@ -5,8 +5,8 @@ mod tag;
 
 pub use error::{KagError, Result};
 pub use parser::{
-    CallFrame, DebugLevel, KagHost, KagParser, Label, LabelEvent, ParserOptions, ParserSnapshot,
-    ScenarioLoadEvent, ScriptEvent,
+    CallFrame, DebugLevel, KagHost, KagParser, Krkr2CallFrame, Krkr2ConditionState, Label,
+    LabelEvent, ParserOptions, ParserSnapshot, ScenarioLoadEvent, ScriptEvent,
 };
 pub use source::{SourceLocation, SourceSpan};
 pub use tag::{Attribute, AttributeValue, Tag, TagOrigin};
