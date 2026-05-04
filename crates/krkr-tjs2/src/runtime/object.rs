@@ -62,14 +62,20 @@ impl Object {
     pub fn set(&mut self, name: impl Into<String>, value: Variant) {
         let name = name.into();
         let mut sync_array = false;
-        if let ObjectKind::Array { elements } = &mut self.kind
-            && let Ok(index) = name.parse::<usize>()
-        {
-            if index >= elements.len() {
-                elements.resize(index + 1, Variant::Void);
+        if let ObjectKind::Array { elements } = &mut self.kind {
+            if name == "count" || name == "length" {
+                let len = value.to_integer().unwrap_or(0).max(0) as usize;
+                elements.resize(len, Variant::Void);
+                self.sync_array_members();
+                return;
             }
-            elements[index] = value.clone();
-            sync_array = true;
+            if let Ok(index) = name.parse::<usize>() {
+                if index >= elements.len() {
+                    elements.resize(index + 1, Variant::Void);
+                }
+                elements[index] = value.clone();
+                sync_array = true;
+            }
         }
         self.members.insert(name, value);
         if sync_array {

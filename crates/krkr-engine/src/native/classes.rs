@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use krkr_core::{AudioBus, AudioCommand, AudioLoadPolicy, LayerImage, LayerNode};
+use krkr_core::{AudioBus, AudioCommand, AudioLoadPolicy, LayerImage, LayerNode, Size};
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
@@ -1698,6 +1698,53 @@ fn mutate_render_layer<R>(
     }
 }
 
+#[derive(Clone, Copy)]
+struct LayerLoadImageOptions {
+    visible: Option<bool>,
+    left: Option<i64>,
+    top: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    opacity: Option<i64>,
+    replace_size_when_unspecified: bool,
+}
+
+fn apply_loaded_image_to_layer(
+    layer: &mut LayerNode,
+    image: LayerImage,
+    image_size: Size,
+    options: LayerLoadImageOptions,
+) {
+    layer.set_image(image);
+    if let Some(visible) = options.visible {
+        layer.visible = visible;
+    }
+    if let Some(left) = options.left {
+        layer.left = left as f32;
+    }
+    if let Some(top) = options.top {
+        layer.top = top as f32;
+    }
+    if options.replace_size_when_unspecified {
+        layer.width = options
+            .width
+            .map_or(image_size.width, |width| width.max(0) as f32);
+        layer.height = options
+            .height
+            .map_or(image_size.height, |height| height.max(0) as f32);
+    } else {
+        if let Some(width) = options.width {
+            layer.width = width.max(0) as f32;
+        }
+        if let Some(height) = options.height {
+            layer.height = height.max(0) as f32;
+        }
+    }
+    if let Some(opacity) = options.opacity {
+        layer.opacity = opacity.clamp(0, 255) as u8;
+    }
+}
+
 fn layer_load_images(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1713,13 +1760,6 @@ fn layer_load_images(
         .filter(|storage| !storage.is_empty())
         .ok_or_else(|| TjsError::runtime("Layer.loadImages requires storage"))?;
     let options = source_object(source);
-    let visible = match options {
-        Some(options) => object_optional_integer(runtime, options, "visible")
-            .transpose()?
-            .map(|value| value != 0)
-            .unwrap_or(true),
-        None => true,
-    };
     let left = match options {
         Some(options) => object_optional_integer(runtime, options, "left").transpose()?,
         None => None,
@@ -1748,82 +1788,64 @@ fn layer_load_images(
         Some(options) => object_optional_string(runtime, options, "layer")?,
         None => None,
     };
+    let has_explicit_target = explicit_page.is_some() || explicit_layer.is_some();
+    let load_options = LayerLoadImageOptions {
+        visible: match options {
+            Some(options) => object_optional_integer(runtime, options, "visible")
+                .transpose()?
+                .map(|value| value != 0)
+                .or_else(|| has_explicit_target.then_some(true)),
+            None => None,
+        },
+        left,
+        top,
+        width,
+        height,
+        opacity,
+        replace_size_when_unspecified: has_explicit_target,
+    };
 
     let image = runtime.host_mut().load_image_storage_for_script(&storage)?;
     let size = image.size();
 
-    if explicit_page.is_some() || explicit_layer.is_some() {
+    if has_explicit_target {
         let page = explicit_page.unwrap_or_else(|| "back".to_string());
         let layer_name = explicit_layer.unwrap_or_else(|| "base".to_string());
         runtime
             .host_mut()
             .mutate_kag_layer(&page, &layer_name, |layer| {
-                layer.set_image(image);
-                layer.visible = visible;
-                if let Some(left) = left {
-                    layer.left = left as f32;
-                }
-                if let Some(top) = top {
-                    layer.top = top as f32;
-                }
-                layer.width = width.map_or(size.width, |width| width.max(0) as f32);
-                layer.height = height.map_or(size.height, |height| height.max(0) as f32);
-                if let Some(opacity) = opacity {
-                    layer.opacity = opacity.clamp(0, 255) as u8;
-                }
+                apply_loaded_image_to_layer(layer, image, size, load_options);
             });
     } else {
         match render_layer_target(runtime, this)? {
             Some(target) => {
                 mutate_render_layer(runtime, &target, |layer| {
-                    layer.set_image(image);
-                    layer.visible = visible;
-                    if let Some(left) = left {
-                        layer.left = left as f32;
-                    }
-                    if let Some(top) = top {
-                        layer.top = top as f32;
-                    }
-                    if let Some(width) = width {
-                        layer.width = width.max(0) as f32;
-                    }
-                    if let Some(height) = height {
-                        layer.height = height.max(0) as f32;
-                    }
-                    if let Some(opacity) = opacity {
-                        layer.opacity = opacity.clamp(0, 255) as u8;
-                    }
+                    apply_loaded_image_to_layer(layer, image, size, load_options);
                 });
             }
             None => {
+                let load_options = LayerLoadImageOptions {
+                    replace_size_when_unspecified: true,
+                    ..load_options
+                };
                 runtime
                     .host_mut()
                     .mutate_kag_layer("back", "base", |layer| {
-                        layer.set_image(image);
-                        layer.visible = visible;
-                        if let Some(left) = left {
-                            layer.left = left as f32;
-                        }
-                        if let Some(top) = top {
-                            layer.top = top as f32;
-                        }
-                        layer.width = width.map_or(size.width, |width| width.max(0) as f32);
-                        layer.height = height.map_or(size.height, |height| height.max(0) as f32);
-                        if let Some(opacity) = opacity {
-                            layer.opacity = opacity.clamp(0, 255) as u8;
-                        }
+                        apply_loaded_image_to_layer(layer, image, size, load_options);
                     });
             }
         }
     }
     sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
     mark_image_modified(runtime, this);
-    set_layer_property_storage(
-        runtime,
-        this,
-        "visible",
-        Variant::Integer(i64::from(visible)),
-    );
+    if let Some(visible) = load_options.visible {
+        set_layer_property_storage(
+            runtime,
+            this,
+            "visible",
+            Variant::Integer(i64::from(visible)),
+        );
+    }
     if let Some(left) = left {
         set_layer_property_storage(runtime, this, "left", Variant::Integer(left));
     }

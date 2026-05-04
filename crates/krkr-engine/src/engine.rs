@@ -5307,6 +5307,7 @@ mod tests {
                 r#"
                 global.layer = new Layer();
                 layer.loadImages("sprite.png");
+                layer.visible = true;
                 layer.left = 11;
                 layer.top = 13;
                 layer.opacity = 128;
@@ -5330,6 +5331,44 @@ mod tests {
                     if image.rect.x == 11.0
                         && image.rect.y == 13.0
                         && (image.opacity - (128.0 / 255.0)).abs() < 0.001
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_load_images_preserves_hidden_temporary_layer() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("thumb.png"), 2, 2, &[255; 16]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var win = new Window();
+                var primary = new Layer(win, null);
+                var temp = new Layer(win, primary);
+                temp.loadImages("thumb.png");
+                return temp.visible + ":" + temp.imageWidth + ":" + temp.imageHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("0:2:2".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(!frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 0.0 && image.rect.y == 0.0 && image.rect.width == 2.0
             )
         }));
 
@@ -6641,6 +6680,7 @@ mod tests {
                 r#"
                 var source = new Layer();
                 source.loadImages("sprite.png");
+                source.visible = true;
                 var dest = new Layer();
                 dest.visible = true;
                 dest.assignImages(source);
@@ -9494,6 +9534,61 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("B".to_string()));
+    }
+
+    #[test]
+    fn tjs_array_count_truncation_removes_invalidated_animation_conductors() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class BaseConductor extends KAGParser {
+                    function BaseConductor() { super.KAGParser(); }
+                    function assign(src) { super.assign(src); }
+                }
+                class AnimationConductor extends BaseConductor {
+                    function AnimationConductor(owner) { super.BaseConductor(); }
+                    function assign(src) { super.assign(src); }
+                }
+                class AnimationLayer {
+                    var Anim_segments = [];
+                    function AnimationLayer() {
+                        Anim_segments[0] = new AnimationConductor(this);
+                    }
+                    function assign(src) {
+                        for(var i = Anim_segments.count - 1; i >= 0; i--) {
+                            var seg = Anim_segments[i];
+                            invalidate Anim_segments[i] if seg !== void;
+                        }
+                        var srcanimseg = src.Anim_segments;
+                        var animseg = Anim_segments;
+                        for(var i = srcanimseg.count - 1; i >= 0; i--) {
+                            var seg = srcanimseg[i];
+                            animseg[i] = void;
+                            if(seg !== void) {
+                                animseg[i] = new AnimationConductor(this);
+                                animseg[i].assign(seg);
+                            }
+                        }
+                        animseg.count = srcanimseg.count;
+                    }
+                }
+                var source = new AnimationLayer();
+                source.Anim_segments[0].onScenarioLoad = function(storage) { return "A\nB"; };
+                source.Anim_segments[0].loadScenario("virtual.ks");
+                source.Anim_segments[0].getNextTag();
+                source.Anim_segments[0].getNextTag();
+                var target = new AnimationLayer();
+                target.Anim_segments[1] = new AnimationConductor(target);
+                target.assign(source);
+                var second = new AnimationLayer();
+                second.assign(target);
+                return second.Anim_segments.count + ":" + second.Anim_segments[0].getNextTag().text;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("1:B".to_string()));
     }
 
     #[test]
