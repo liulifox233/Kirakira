@@ -10,7 +10,7 @@ use krkr_core::{
     EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput, FrameOutput, LayerId,
     MessageLayerModel, Point, PointerButton, Size,
 };
-use krkr_kag::{Attribute, AttributeValue, KagParser, ParserSnapshot, Tag};
+use krkr_kag::{KagError, KagParser, ParserSnapshot, Tag};
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, Runtime, Variant},
@@ -19,11 +19,12 @@ use krkr_tjs2::{
 use crate::{
     globals::install_tvp_globals,
     host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost},
-    kag::EngineKagHost,
+    kag::{EngineKagHost, tag_to_dictionary},
     native::classes::{
         apply_completed_image_load, apply_completed_resource_loads,
         finish_completed_native_transitions,
     },
+    native::{create_kag_parser_object, refresh_kag_parser_object},
     plugin::KrkrPlugin,
     scheduler::{
         ASYNC_TRIGGER_EVENT_NAME, AUDIO_FADE_COMPLETED_EVENT_NAME, AsyncTriggerMode, IdleEvent,
@@ -143,10 +144,8 @@ pub struct EngineFrame {
 
 pub struct KrkrEngine {
     tjs_runtime: Runtime<KrkrHost>,
-    kag_parser: KagParser,
-    kag_task: KagRuntimeTask,
+    kag_session: KagSession,
     core_engine: CoreEngine,
-    message_layer: MessageLayerModel,
     kag_budget: KagRunBudget,
     plugins: Vec<Box<dyn KrkrPlugin>>,
     cursor_position: Option<Point>,
@@ -167,10 +166,8 @@ impl KrkrEngine {
         install_system_metrics(&mut tjs_runtime, config.system_metrics);
         Ok(Self {
             tjs_runtime,
-            kag_parser: KagParser::new(),
-            kag_task: KagRuntimeTask::new(),
+            kag_session: KagSession::new(),
             core_engine: CoreEngine::new(CoreEngineConfig::default()),
-            message_layer: MessageLayerModel::default(),
             kag_budget: config.kag_budget,
             plugins: Vec::new(),
             cursor_position: None,
@@ -422,12 +419,19 @@ impl KrkrEngine {
             .is_truthy()
     }
 
-    pub fn kag_parser(&self) -> &KagParser {
-        &self.kag_parser
+    pub fn active_kag_parser_handle(&self) -> Option<ObjectHandle> {
+        self.kag_session.active_parser()
     }
 
-    pub fn kag_parser_mut(&mut self) -> &mut KagParser {
-        &mut self.kag_parser
+    pub fn kag_parser(&self) -> &KagParser {
+        let handle = self
+            .kag_session
+            .active_parser()
+            .expect("active KAG parser is not initialized");
+        self.tjs_runtime
+            .host()
+            .kag_parser(handle)
+            .expect("active KAG parser state is not registered")
     }
 
     pub fn execute_script(&mut self, source_name: &str, source: &str) -> Result<Variant> {
@@ -453,49 +457,40 @@ impl KrkrEngine {
     }
 
     pub fn load_kag_scenario(&mut self, storage: &str) -> krkr_kag::Result<()> {
-        let mut host = EngineKagHost::new(&mut self.tjs_runtime);
-        self.kag_parser.load_scenario_with(storage, &mut host)?;
-        self.message_layer.clear();
-        self.kag_task.start();
-        Ok(())
+        self.kag_session
+            .load_scenario(storage, &mut self.tjs_runtime)
     }
 
     pub fn next_kag_tag(&mut self) -> krkr_kag::Result<Option<Tag>> {
-        let mut host = EngineKagHost::new(&mut self.tjs_runtime);
-        self.kag_parser.next_tag_with(&mut host)
+        self.kag_session.next_tag(&mut self.tjs_runtime)
     }
 
     pub fn kag_state(&self) -> &KagTaskState {
-        self.kag_task.state()
+        self.kag_session.state()
     }
 
     pub fn has_kag_scenario(&self) -> bool {
-        self.kag_task.loaded()
+        self.kag_session.loaded()
     }
 
     pub fn message_layer(&self) -> &MessageLayerModel {
-        &self.message_layer
+        self.kag_session.message_layer()
     }
 
     pub fn kag_location(&self) -> KagLocation {
-        KagLocation {
-            storage: self.kag_parser.cur_storage().map(str::to_string),
-            label: self.kag_parser.cur_label().map(str::to_string),
-            line: self.kag_parser.cur_line(),
-            page: self.message_layer.page,
-        }
+        self.kag_session.location(&self.tjs_runtime)
     }
 
     pub fn set_kag_handler(&mut self, handler: ObjectHandle) {
-        self.kag_task.set_handler(handler);
+        self.kag_session.set_handler(handler);
     }
 
     pub fn clear_kag_handler(&mut self) {
-        self.kag_task.clear_handler();
+        self.kag_session.clear_handler();
     }
 
     pub fn signal_kag_click(&mut self) {
-        self.kag_task.signal_click(&mut self.message_layer);
+        self.kag_session.signal_click();
     }
 
     pub fn tick(&mut self) -> Result<EngineTickResult> {
@@ -526,7 +521,7 @@ impl KrkrEngine {
             .tick_running_with_layers_suppressing_images_and_transition(
                 input.frame,
                 self.tjs_runtime.host().layer_tree(),
-                &self.message_layer,
+                self.kag_session.message_layer(),
                 &suppressed_images,
                 transition,
             );
@@ -534,7 +529,7 @@ impl KrkrEngine {
             output,
             tick,
             input: self.input_result,
-            message_layer: self.message_layer.clone(),
+            message_layer: self.kag_session.message_layer().clone(),
             location: self.kag_location(),
         })
     }
@@ -547,9 +542,10 @@ impl KrkrEngine {
 
             self.tjs_runtime.host_mut().pop_modal_window(window);
             self.tjs_runtime.resume_suspended()?;
-            if self.kag_task.state == KagTaskState::WaitingModal && !self.tjs_runtime.is_suspended()
+            if self.kag_session.state == KagTaskState::WaitingModal
+                && !self.tjs_runtime.is_suspended()
             {
-                self.kag_task.state = KagTaskState::Running;
+                self.kag_session.state = KagTaskState::Running;
             }
         }
         Ok(())
@@ -573,14 +569,10 @@ impl KrkrEngine {
         finish_completed_native_transitions(&mut self.tjs_runtime)?;
         let transition_active = self.tjs_runtime.host().has_active_transition();
         let resource_pending = self.tjs_runtime.host().has_pending_resource_loads();
-        self.kag_task
+        self.kag_session
             .update_wait(delta, transition_active, resource_pending);
-        self.kag_task.run_until_yield(
-            &mut self.kag_parser,
-            &mut self.tjs_runtime,
-            &mut self.message_layer,
-            self.kag_budget,
-        )
+        self.kag_session
+            .run_until_yield(&mut self.tjs_runtime, self.kag_budget)
     }
 
     fn runtime_window_object(&self) -> Option<ObjectHandle> {
@@ -642,18 +634,14 @@ impl KrkrEngine {
             let mut delivered_script_or_input = false;
             if matches!(mode, RuntimeSchedulerPump::Full) {
                 delivered_script_or_input = self.deliver_script_and_input_turn()?;
-                if delivered_script_or_input {
-                    if self.tjs_runtime.is_suspended() {
-                        return Ok(());
-                    }
+                if delivered_script_or_input && self.tjs_runtime.is_suspended() {
+                    return Ok(());
                 }
             }
 
             let delivered_window_update = self.deliver_window_update_events()?;
-            if delivered_window_update {
-                if self.tjs_runtime.is_suspended() {
-                    return Ok(());
-                }
+            if delivered_window_update && self.tjs_runtime.is_suspended() {
+                return Ok(());
             }
 
             if delivered_script_or_input || delivered_window_update {
@@ -1393,11 +1381,7 @@ impl KrkrEngine {
                 .map(|_| ());
         }
 
-        self.kag_task.fire_right_click(
-            &mut self.kag_parser,
-            &mut self.tjs_runtime,
-            &mut self.message_layer,
-        )
+        self.kag_session.fire_right_click(&mut self.tjs_runtime)
     }
 
     fn dispatch_layer_cursor_move(&mut self, position: Point) -> Result<()> {
@@ -1884,7 +1868,9 @@ enum RuntimeSchedulerPump {
 }
 
 #[derive(Clone, Debug)]
-struct KagRuntimeTask {
+struct KagSession {
+    parser: Option<ObjectHandle>,
+    parser_revision: u64,
     state: KagTaskState,
     handler: Option<ObjectHandle>,
     pending_tags: VecDeque<Tag>,
@@ -1892,12 +1878,17 @@ struct KagRuntimeTask {
     right_click: RightClickAction,
     loaded: bool,
     clear_page_on_click: bool,
+    message_layer: MessageLayerModel,
 }
 
 #[derive(Clone, Debug)]
 struct KagTempSnapshot {
     parser: ParserSnapshot,
     message_layer: MessageLayerModel,
+    state: KagTaskState,
+    pending_tags: VecDeque<Tag>,
+    right_click: RightClickAction,
+    clear_page_on_click: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1909,9 +1900,11 @@ struct RightClickAction {
     target: Option<String>,
 }
 
-impl KagRuntimeTask {
+impl KagSession {
     fn new() -> Self {
         Self {
+            parser: None,
+            parser_revision: 0,
             state: KagTaskState::Finished,
             handler: None,
             pending_tags: VecDeque::new(),
@@ -1919,7 +1912,12 @@ impl KagRuntimeTask {
             right_click: RightClickAction::default(),
             loaded: false,
             clear_page_on_click: false,
+            message_layer: MessageLayerModel::default(),
         }
+    }
+
+    fn active_parser(&self) -> Option<ObjectHandle> {
+        self.parser
     }
 
     fn state(&self) -> &KagTaskState {
@@ -1928,6 +1926,151 @@ impl KagRuntimeTask {
 
     fn loaded(&self) -> bool {
         self.loaded
+    }
+
+    fn message_layer(&self) -> &MessageLayerModel {
+        &self.message_layer
+    }
+
+    fn location(&self, runtime: &Runtime<KrkrHost>) -> KagLocation {
+        let parser = self
+            .parser
+            .and_then(|handle| runtime.host().kag_parser(handle));
+        KagLocation {
+            storage: parser.and_then(KagParser::cur_storage).map(str::to_string),
+            label: parser.and_then(KagParser::cur_label).map(str::to_string),
+            line: parser.and_then(KagParser::cur_line),
+            page: self.message_layer.page,
+        }
+    }
+
+    fn ensure_active_parser(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+    ) -> krkr_kag::Result<ObjectHandle> {
+        if let Some(handle) = self.parser
+            && runtime.object_valid(handle)
+            && runtime.host().kag_parser(handle).is_some()
+        {
+            return Ok(handle);
+        }
+
+        let handle = create_kag_parser_object(runtime).map_err(tjs_to_kag)?;
+        self.parser = Some(handle);
+        self.parser_revision = runtime.host().kag_parser_revision(handle);
+        Ok(handle)
+    }
+
+    fn active_parser_or_error(&self) -> krkr_kag::Result<ObjectHandle> {
+        self.parser.ok_or(KagError::NoScenario)
+    }
+
+    fn observe_external_parser_changes(&mut self, runtime: &Runtime<KrkrHost>) {
+        let Some(handle) = self.parser else {
+            return;
+        };
+        let revision = runtime.host().kag_parser_revision(handle);
+        if revision == self.parser_revision {
+            return;
+        }
+        self.parser_revision = revision;
+        self.loaded = runtime
+            .host()
+            .kag_parser(handle)
+            .is_some_and(|parser| parser.cur_storage().is_some());
+        if self.loaded {
+            self.pending_tags.clear();
+            self.clear_page_on_click = false;
+            self.message_layer.waiting_for_click = false;
+            self.state = KagTaskState::Running;
+        }
+    }
+
+    fn load_scenario(
+        &mut self,
+        storage: &str,
+        runtime: &mut Runtime<KrkrHost>,
+    ) -> krkr_kag::Result<()> {
+        let handle = self.ensure_active_parser(runtime)?;
+        self.with_parser_for_kag(runtime, |parser, session, runtime, owner| {
+            let mut host = EngineKagHost::for_owner(runtime, owner);
+            parser.load_scenario_with(storage, &mut host)?;
+            session.message_layer.clear();
+            session.start();
+            Ok(())
+        })?;
+        self.parser_revision = runtime.host().kag_parser_revision(handle);
+        Ok(())
+    }
+
+    fn next_tag(&mut self, runtime: &mut Runtime<KrkrHost>) -> krkr_kag::Result<Option<Tag>> {
+        self.observe_external_parser_changes(runtime);
+        self.active_parser_or_error()?;
+        self.with_parser_for_kag(runtime, |parser, _, runtime, owner| {
+            let mut host = EngineKagHost::for_owner(runtime, owner);
+            parser.next_tag_with(&mut host)
+        })
+    }
+
+    fn with_parser_for_kag<R, F>(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        f: F,
+    ) -> krkr_kag::Result<R>
+    where
+        F: FnOnce(
+            &mut KagParser,
+            &mut KagSession,
+            &mut Runtime<KrkrHost>,
+            ObjectHandle,
+        ) -> krkr_kag::Result<R>,
+    {
+        let handle = self.active_parser_or_error()?;
+        let mut parser = runtime
+            .host_mut()
+            .take_kag_parser(handle)
+            .ok_or(KagError::NoScenario)?;
+
+        let result = (|| {
+            runtime.host_mut().insert_kag_parser(handle, parser.clone());
+            let result = f(&mut parser, self, runtime, handle);
+            refresh_kag_parser_object(runtime, handle, &parser).map_err(tjs_to_kag)?;
+            result
+        })();
+
+        runtime.host_mut().insert_kag_parser(handle, parser);
+        self.parser_revision = runtime.host().kag_parser_revision(handle);
+        result
+    }
+
+    fn with_parser_for_tjs<R, F>(&mut self, runtime: &mut Runtime<KrkrHost>, f: F) -> Result<R>
+    where
+        F: FnOnce(
+            &mut KagParser,
+            &mut KagSession,
+            &mut Runtime<KrkrHost>,
+            ObjectHandle,
+        ) -> Result<R>,
+    {
+        self.observe_external_parser_changes(runtime);
+        let handle = self
+            .active_parser_or_error()
+            .map_err(|error| TjsError::runtime(error.to_string()))?;
+        let mut parser = runtime
+            .host_mut()
+            .take_kag_parser(handle)
+            .ok_or_else(|| TjsError::runtime("active KAG parser is not registered"))?;
+
+        let result = (|| {
+            runtime.host_mut().insert_kag_parser(handle, parser.clone());
+            let result = f(&mut parser, self, runtime, handle);
+            refresh_kag_parser_object(runtime, handle, &parser)?;
+            result
+        })();
+
+        runtime.host_mut().insert_kag_parser(handle, parser);
+        self.parser_revision = runtime.host().kag_parser_revision(handle);
+        result
     }
 
     fn start(&mut self) {
@@ -1947,13 +2090,13 @@ impl KagRuntimeTask {
         self.handler = None;
     }
 
-    fn signal_click(&mut self, message_layer: &mut MessageLayerModel) {
+    fn signal_click(&mut self) {
         if self.state == KagTaskState::WaitingClick {
             if self.clear_page_on_click {
-                message_layer.clear_text();
+                self.message_layer.clear_text();
                 self.clear_page_on_click = false;
             }
-            message_layer.waiting_for_click = false;
+            self.message_layer.waiting_for_click = false;
             self.state = KagTaskState::Running;
         }
     }
@@ -1967,18 +2110,38 @@ impl KagRuntimeTask {
                     remaining: remaining - delta,
                 }
             };
-        } else if self.state == KagTaskState::WaitingTransition && !transition_active {
-            self.state = KagTaskState::Running;
-        } else if self.state == KagTaskState::WaitingResource && !resource_pending {
+        } else if (self.state == KagTaskState::WaitingTransition && !transition_active)
+            || (self.state == KagTaskState::WaitingResource && !resource_pending)
+        {
             self.state = KagTaskState::Running;
         }
     }
 
     fn run_until_yield(
         &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        budget: KagRunBudget,
+    ) -> Result<EngineTickResult> {
+        self.observe_external_parser_changes(runtime);
+        if self.parser.is_none() {
+            let started = Instant::now();
+            return Ok(EngineTickResult {
+                state: self.state.clone(),
+                reason: KagYieldReason::Finished,
+                tags_processed: 0,
+                elapsed: started.elapsed(),
+            });
+        }
+        self.with_parser_for_tjs(runtime, |parser, session, runtime, owner| {
+            session.run_until_yield_with_parser(parser, runtime, owner, budget)
+        })
+    }
+
+    fn run_until_yield_with_parser(
+        &mut self,
         parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
-        message_layer: &mut MessageLayerModel,
+        owner: ObjectHandle,
         budget: KagRunBudget,
     ) -> Result<EngineTickResult> {
         let started = Instant::now();
@@ -2022,7 +2185,7 @@ impl KagRuntimeTask {
             let tag = match self.pending_tags.pop_front() {
                 Some(tag) => Some(tag),
                 None => {
-                    let mut host = EngineKagHost::new(runtime);
+                    let mut host = EngineKagHost::for_owner(runtime, owner);
                     match parser.next_tag_with(&mut host) {
                         Ok(tag) => tag,
                         Err(error) => {
@@ -2047,7 +2210,7 @@ impl KagRuntimeTask {
             };
 
             tags_processed += 1;
-            let action = self.process_tag(parser, runtime, message_layer, tag)?;
+            let action = self.process_tag(parser, runtime, tag)?;
             match action {
                 TagAction::Continue => {}
                 TagAction::Yield(reason) => {
@@ -2066,18 +2229,18 @@ impl KagRuntimeTask {
         &mut self,
         parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
-        message_layer: &mut MessageLayerModel,
         tag: Tag,
     ) -> Result<TagAction> {
         if let Some(handler) = self.handler
             && !matches!(runtime.object_member(handler, "onTag"), Variant::Void)
         {
-            let tag_object = tag_variant(runtime, &tag)?;
-            let value = self.call_handler(runtime, handler, "onTag", vec![tag_object])?;
+            let tag_object = tag_to_dictionary(runtime, &tag)?;
+            let value =
+                self.call_handler(runtime, handler, "onTag", vec![Variant::Object(tag_object)])?;
             return self.apply_handler_step(tag, value);
         }
 
-        let default_action = self.process_builtin_tag(parser, runtime, message_layer, &tag)?;
+        let default_action = self.process_builtin_tag(parser, runtime, &tag)?;
         if matches!(default_action, TagAction::Continue)
             && let Some(handler) = self.handler
             && !is_builtin_tag(&tag.tagname)
@@ -2086,12 +2249,15 @@ impl KagRuntimeTask {
                 Variant::Void
             )
         {
-            let tag_object = tag_variant(runtime, &tag)?;
+            let tag_object = tag_to_dictionary(runtime, &tag)?;
             let value = call_tag_handler(
                 runtime,
                 handler,
                 "onUnknownTag",
-                vec![Variant::String(tag.tagname.clone()), tag_object],
+                vec![
+                    Variant::String(tag.tagname.clone()),
+                    Variant::Object(tag_object),
+                ],
             )
             .inspect_err(|error| {
                 self.state = KagTaskState::Error {
@@ -2121,62 +2287,61 @@ impl KagRuntimeTask {
         &mut self,
         parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
-        message_layer: &mut MessageLayerModel,
         tag: &Tag,
     ) -> Result<TagAction> {
         match tag.tagname.as_str() {
             "ch" => {
                 if let Some(text) = tag.literal_attr("text") {
-                    message_layer.append_text(text);
+                    self.message_layer.append_text(text);
                 }
                 Ok(TagAction::Continue)
             }
             "r" => {
-                message_layer.newline();
+                self.message_layer.newline();
                 Ok(TagAction::Continue)
             }
             "l" => {
-                message_layer.newline();
-                Ok(self.wait_click(message_layer, false))
+                self.message_layer.newline();
+                Ok(self.wait_click(false))
             }
             "p" => {
-                message_layer.page_break();
-                Ok(self.wait_click(message_layer, true))
+                self.message_layer.page_break();
+                Ok(self.wait_click(true))
             }
             "font" | "deffont" => {
-                apply_message_font_tag(message_layer, tag)?;
+                apply_message_font_tag(&mut self.message_layer, tag)?;
                 Ok(TagAction::Continue)
             }
             "resetfont" => {
-                message_layer.font = krkr_core::FontSpec::default();
-                message_layer.style = krkr_core::TextStyle::default();
+                self.message_layer.font = krkr_core::FontSpec::default();
+                self.message_layer.style = krkr_core::TextStyle::default();
                 Ok(TagAction::Continue)
             }
             "style" => {
-                apply_message_style_tag(message_layer, tag);
+                apply_message_style_tag(&mut self.message_layer, tag);
                 Ok(TagAction::Continue)
             }
             "locate" => {
                 if let Some(x) = tag_i64(tag, "x")? {
-                    message_layer.cursor_x = x as i32;
+                    self.message_layer.cursor_x = x as i32;
                 }
                 if let Some(y) = tag_i64(tag, "y")? {
-                    message_layer.cursor_y = y as i32;
+                    self.message_layer.cursor_y = y as i32;
                 }
                 Ok(TagAction::Continue)
             }
             "ptext" => {
                 if let Some(text) = tag.literal_attr("text") {
-                    message_layer.append_text(text);
+                    self.message_layer.append_text(text);
                 }
                 Ok(TagAction::Continue)
             }
-            "waitclick" => Ok(self.wait_click(message_layer, false)),
+            "waitclick" => Ok(self.wait_click(false)),
             "wait" => Ok(match tag_millis(tag, "time") {
                 Some(duration) => self.wait(KagTaskState::WaitingTimer {
                     remaining: duration,
                 }),
-                None => self.wait_click(message_layer, false),
+                None => self.wait_click(false),
             }),
             "eval" => {
                 execute_eval_tag(runtime, tag)?;
@@ -2187,7 +2352,7 @@ impl KagRuntimeTask {
                 Ok(TagAction::Continue)
             }
             "cm" | "ct" | "er" => {
-                message_layer.clear_text();
+                self.message_layer.clear_text();
                 Ok(TagAction::Continue)
             }
             "image" => {
@@ -2220,7 +2385,11 @@ impl KagRuntimeTask {
                     place,
                     KagTempSnapshot {
                         parser: parser.store(),
-                        message_layer: message_layer.clone(),
+                        message_layer: self.message_layer.clone(),
+                        state: self.state.clone(),
+                        pending_tags: self.pending_tags.clone(),
+                        right_click: self.right_click.clone(),
+                        clear_page_on_click: self.clear_page_on_click,
                     },
                 );
                 Ok(TagAction::Continue)
@@ -2231,9 +2400,11 @@ impl KagRuntimeTask {
                     parser
                         .restore(snapshot.parser)
                         .map_err(|error| TjsError::runtime(error.to_string()))?;
-                    *message_layer = snapshot.message_layer;
-                    self.pending_tags.clear();
-                    self.state = KagTaskState::Running;
+                    self.message_layer = snapshot.message_layer;
+                    self.pending_tags = snapshot.pending_tags;
+                    self.right_click = snapshot.right_click;
+                    self.clear_page_on_click = snapshot.clear_page_on_click;
+                    self.state = snapshot.state;
                 }
                 Ok(TagAction::Continue)
             }
@@ -2243,7 +2414,7 @@ impl KagRuntimeTask {
                     parser
                         .set_cur_storage(storage)
                         .map_err(|error| TjsError::runtime(error.to_string()))?;
-                    message_layer.clear();
+                    self.message_layer.clear();
                     self.pending_tags.clear();
                     self.state = KagTaskState::Running;
                 }
@@ -2357,11 +2528,20 @@ impl KagRuntimeTask {
         }
     }
 
-    fn fire_right_click(
+    fn fire_right_click(&mut self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+        if self.parser.is_none() || !self.right_click.enabled {
+            return Ok(());
+        }
+        self.with_parser_for_tjs(runtime, |parser, session, runtime, owner| {
+            session.fire_right_click_with_parser(parser, runtime, owner)
+        })
+    }
+
+    fn fire_right_click_with_parser(
         &mut self,
         parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
-        message_layer: &mut MessageLayerModel,
+        owner: ObjectHandle,
     ) -> Result<()> {
         if !self.right_click.enabled {
             return Ok(());
@@ -2372,7 +2552,7 @@ impl KagRuntimeTask {
             return Ok(());
         }
 
-        let mut host = EngineKagHost::new(runtime);
+        let mut host = EngineKagHost::for_owner(runtime, owner);
         if self.right_click.call {
             parser
                 .call_with(storage.as_deref(), target.as_deref(), &mut host)
@@ -2388,7 +2568,7 @@ impl KagRuntimeTask {
         self.pending_tags.clear();
         self.state = KagTaskState::Running;
         self.clear_page_on_click = false;
-        message_layer.waiting_for_click = false;
+        self.message_layer.waiting_for_click = false;
         Ok(())
     }
 
@@ -2435,12 +2615,8 @@ impl KagRuntimeTask {
         TagAction::Yield(KagYieldReason::Waiting(self.state.clone()))
     }
 
-    fn wait_click(
-        &mut self,
-        message_layer: &mut MessageLayerModel,
-        clear_page_on_click: bool,
-    ) -> TagAction {
-        message_layer.waiting_for_click = true;
+    fn wait_click(&mut self, clear_page_on_click: bool) -> TagAction {
+        self.message_layer.waiting_for_click = true;
         self.clear_page_on_click = clear_page_on_click;
         self.wait(KagTaskState::WaitingClick)
     }
@@ -2461,30 +2637,8 @@ fn call_tag_handler(
     runtime.call_object_method(handler, name, args)
 }
 
-fn tag_variant(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<Variant> {
-    let object = runtime.alloc_ordinary_object();
-    runtime.add_object_class_info(object, "Dictionary");
-    runtime.set_object_member(object, "tagname", Variant::String(tag.tagname.clone()));
-    for attribute in &tag.attributes {
-        if let Attribute::Named { name, value } = attribute {
-            runtime.set_object_member(object, name, attribute_value_to_variant(value));
-        }
-    }
-    Ok(Variant::Object(object))
-}
-
-fn attribute_value_to_variant(value: &AttributeValue) -> Variant {
-    raw_attribute_value_to_variant(value.raw())
-}
-
-fn raw_attribute_value_to_variant(value: &str) -> Variant {
-    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
-        Variant::Integer(1)
-    } else if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") {
-        Variant::Integer(0)
-    } else {
-        Variant::String(value.to_string())
-    }
+fn tjs_to_kag(error: TjsError) -> KagError {
+    KagError::host(error.to_string())
 }
 
 fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
@@ -2981,6 +3135,7 @@ mod tests {
     };
 
     use krkr_core::Size;
+    use krkr_kag::{Attribute, AttributeValue};
     use krkr_tjs2::{
         Result,
         runtime::{Runtime, Variant},
@@ -3916,6 +4071,309 @@ mod tests {
     }
 
     #[test]
+    fn engine_loads_active_kag_parser_object_from_session() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "*start\nA[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        let location = engine.kag_location();
+
+        assert_eq!(
+            engine.tjs_runtime().object_member(parser, "curStorage"),
+            Variant::String(location.storage.clone().unwrap_or_default())
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(parser, "curLine"),
+            Variant::Integer(location.line.unwrap_or_default() as i64)
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(parser, "curLabel"),
+            Variant::String(location.label.clone().unwrap_or_default())
+        );
+
+        engine.next_kag_tag().expect("tag").expect("first tag");
+        let location = engine.kag_location();
+        assert_eq!(location.label.as_deref(), Some("*start"));
+        assert_eq!(
+            engine.tjs_runtime().object_member(parser, "curLabel"),
+            Variant::String("*start".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tjs_active_parser_control_methods_drive_engine_tick() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "*start\nA[s]\n*middle\nB[s]\n*sub\nC[return]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        let snapshot = engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "store", Vec::new())
+            .expect("store");
+
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(
+                parser,
+                "goToLabel",
+                vec![Variant::String("*middle".to_string())],
+            )
+            .expect("goToLabel");
+        assert_eq!(
+            engine.tick().expect("middle tick").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(engine.message_layer().lines, vec!["B".to_string()]);
+
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "restore", vec![snapshot.clone()])
+            .expect("restore");
+        assert_eq!(
+            engine.tick().expect("restore tick").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(engine.message_layer().lines, vec!["BA".to_string()]);
+
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "restore", vec![snapshot])
+            .expect("restore for call");
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(
+                parser,
+                "callLabel",
+                vec![Variant::String("*sub".to_string())],
+            )
+            .expect("callLabel");
+        assert_eq!(
+            engine.tick().expect("call tick").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(engine.message_layer().lines, vec!["BACA".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn engine_active_parser_callbacks_use_parser_owner_context() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[s]").expect("write first scenario");
+        fs::write(
+            root.join("second.ks"),
+            "*start|Page\n[iscript]\nglobal.scriptRan = 1;\n[endscript]\n[call target=*sub]A[s]\n*sub\n[return]",
+        )
+        .expect("write second scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("activeParser", Variant::Object(parser));
+        engine
+            .execute_script(
+                "callbacks.tjs",
+                r#"
+                activeParser.seen = "";
+                activeParser.onScenarioLoad = function(storage) {
+                    this.seen += "load:" + storage + ";";
+                    return true;
+                };
+                activeParser.onScenarioLoaded = function(storage) {
+                    this.seen += "loaded:" + storage + ";";
+                };
+                activeParser.onLabel = function(label, page) {
+                    this.seen += "label:" + label + ":" + (page === void ? "" : page) + ";";
+                };
+                activeParser.onScript = function(script, storage, start) {
+                    this.seen += "script:" + storage + ";";
+                    Scripts.exec(script);
+                };
+                activeParser.onCall = function(elm) {
+                    this.seen += "call:" + elm.target + ";";
+                    return true;
+                };
+                activeParser.onReturn = function(elm) {
+                    this.seen += "return:" + this.callStackDepth + ";";
+                    return true;
+                };
+                activeParser.onAfterReturn = function() {
+                    this.seen += "after;";
+                };
+                "#,
+            )
+            .expect("install callbacks");
+
+        engine
+            .load_kag_scenario("second.ks")
+            .expect("reload scenario");
+        assert_eq!(engine.tick().expect("tick").state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["A".to_string()]);
+        assert_eq!(
+            engine.tjs_runtime().global_member("scriptRan"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(parser, "seen"),
+            Variant::String(
+                "load:second.ks;loaded:second.ks;label:*start:Page;script:second.ks;call:*sub;label:*sub:;return:1;after;"
+                    .to_string()
+            )
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn active_parser_store_restore_does_not_fork_engine_parser_state() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "AB[s]\n*later\nZ[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        let first = engine
+            .next_kag_tag()
+            .expect("first tag")
+            .expect("character");
+        assert_eq!(first.literal_attr("text"), Some("A"));
+
+        let snapshot = engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "store", Vec::new())
+            .expect("store");
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(
+                parser,
+                "goToLabel",
+                vec![Variant::String("*later".to_string())],
+            )
+            .expect("goToLabel");
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "restore", vec![snapshot])
+            .expect("restore");
+
+        let next = engine
+            .next_kag_tag()
+            .expect("next tag")
+            .expect("restored character");
+        assert_eq!(next.literal_attr("text"), Some("B"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn active_session_preserves_macro_call_return_and_interrupt() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[macro name=m]M[endmacro][m][call target=*sub]A[s]\n*sub\nB[return]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "interrupt", Vec::new())
+            .expect("interrupt");
+
+        let interrupt = engine
+            .next_kag_tag()
+            .expect("interrupt tag")
+            .expect("interrupt");
+        assert_eq!(interrupt.tagname, "interrupt");
+
+        assert_eq!(engine.tick().expect("tick").state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["MBA".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tempload_restores_session_message_wait_and_pending_state() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine.kag_session.message_layer.append_text("S");
+        engine.kag_session.state = KagTaskState::WaitingClick;
+        engine.kag_session.clear_page_on_click = true;
+        engine
+            .kag_session
+            .pending_tags
+            .push_back(test_tag("ch", &[("text", "P")]));
+
+        let tempsave = test_tag("tempsave", &[("place", "9")]);
+        engine
+            .kag_session
+            .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
+                session.process_builtin_tag(parser, runtime, &tempsave)
+            })
+            .expect("tempsave");
+
+        engine.kag_session.message_layer.clear();
+        engine.kag_session.state = KagTaskState::Running;
+        engine.kag_session.clear_page_on_click = false;
+        engine.kag_session.pending_tags.clear();
+
+        let tempload = test_tag("tempload", &[("place", "9")]);
+        engine
+            .kag_session
+            .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
+                session.process_builtin_tag(parser, runtime, &tempload)
+            })
+            .expect("tempload");
+
+        assert_eq!(engine.kag_session.state, KagTaskState::WaitingClick);
+        assert_eq!(engine.message_layer().lines, vec!["S".to_string()]);
+        assert!(engine.kag_session.clear_page_on_click);
+        assert_eq!(engine.kag_session.pending_tags.len(), 1);
+        assert_eq!(
+            engine
+                .kag_session
+                .pending_tags
+                .front()
+                .and_then(|tag| tag.literal_attr("text")),
+            Some("P")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn kag_tick_processes_multiple_tags_until_click_wait() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -4008,26 +4466,23 @@ mod tests {
             engine.tick().expect("first tick").state,
             KagTaskState::Finished
         );
-        assert_eq!(engine.message_layer.lines, vec!["ABC".to_string()]);
+        assert_eq!(engine.message_layer().lines, vec!["ABC".to_string()]);
 
         let tag = test_tag("tempload", &[("place", "1")]);
         let action = engine
-            .kag_task
-            .process_builtin_tag(
-                &mut engine.kag_parser,
-                &mut engine.tjs_runtime,
-                &mut engine.message_layer,
-                &tag,
-            )
+            .kag_session
+            .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
+                session.process_builtin_tag(parser, runtime, &tag)
+            })
             .expect("tempload");
         assert_eq!(action, TagAction::Continue);
-        assert_eq!(engine.message_layer.lines, vec!["AB".to_string()]);
+        assert_eq!(engine.message_layer().lines, vec!["AB".to_string()]);
 
         assert_eq!(
             engine.tick().expect("restored tick").state,
             KagTaskState::Finished
         );
-        assert_eq!(engine.message_layer.lines, vec!["ABC".to_string()]);
+        assert_eq!(engine.message_layer().lines, vec!["ABC".to_string()]);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -4048,7 +4503,7 @@ mod tests {
             engine.tick().expect("first tick").state,
             KagTaskState::Finished
         );
-        assert_eq!(engine.message_layer.lines, vec!["A".to_string()]);
+        assert_eq!(engine.message_layer().lines, vec!["A".to_string()]);
 
         let frame = engine
             .update(
@@ -4064,7 +4519,7 @@ mod tests {
             .expect("right click update");
 
         assert_eq!(frame.tick.state, KagTaskState::Finished);
-        assert_eq!(engine.message_layer.lines, vec!["AC".to_string()]);
+        assert_eq!(engine.message_layer().lines, vec!["AC".to_string()]);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
