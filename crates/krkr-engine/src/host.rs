@@ -11,7 +11,7 @@ use krkr_core::{
     ResourceProvider,
 };
 use krkr_font::FontSystem;
-use krkr_kag::{KagParser, ParserSnapshot};
+use krkr_kag::KagParser;
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, TjsHost, Variant},
@@ -166,8 +166,6 @@ pub struct KrkrHost {
     linked_plugins: BTreeSet<String>,
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
     kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
-    kag_snapshots: BTreeMap<i64, ParserSnapshot>,
-    next_kag_snapshot_id: i64,
     layer_tree: LayerTree,
     native_layers: BTreeMap<ObjectHandle, LayerInstance>,
     native_windows: BTreeMap<ObjectHandle, WindowInstance>,
@@ -209,8 +207,6 @@ impl Default for KrkrHost {
             linked_plugins: BTreeSet::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
-            kag_snapshots: BTreeMap::new(),
-            next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
             native_windows: BTreeMap::new(),
@@ -262,8 +258,6 @@ impl KrkrHost {
             linked_plugins: BTreeSet::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
-            kag_snapshots: BTreeMap::new(),
-            next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
             native_windows: BTreeMap::new(),
@@ -484,17 +478,6 @@ impl KrkrHost {
 
     pub(crate) fn kag_parser_revision(&self, handle: ObjectHandle) -> u64 {
         self.kag_parser_revisions.get(&handle).copied().unwrap_or(0)
-    }
-
-    pub(crate) fn store_kag_snapshot(&mut self, snapshot: ParserSnapshot) -> i64 {
-        let id = self.next_kag_snapshot_id;
-        self.next_kag_snapshot_id += 1;
-        self.kag_snapshots.insert(id, snapshot);
-        id
-    }
-
-    pub(crate) fn kag_snapshot(&self, id: i64) -> Option<&ParserSnapshot> {
-        self.kag_snapshots.get(&id)
     }
 
     pub(crate) fn link_plugin(&mut self, name: &str) {

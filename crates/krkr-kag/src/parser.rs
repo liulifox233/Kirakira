@@ -171,6 +171,493 @@ pub struct ParserSnapshot {
     interrupted: bool,
 }
 
+impl ParserSnapshot {
+    const PERSISTENT_PREFIX: &'static str = "kag-snapshot-v1:";
+    const PERSISTENT_MAGIC: &'static [u8; 8] = b"KGSNAP\0\0";
+    const PERSISTENT_VERSION: u32 = 1;
+
+    pub fn storage_names(&self) -> Vec<&str> {
+        let mut storages = Vec::new();
+        if let Some(storage) = self.current_storage.as_deref() {
+            storages.push(storage);
+        }
+        for frame in &self.call_stack {
+            if !storages.contains(&frame.storage.as_str()) {
+                storages.push(&frame.storage);
+            }
+        }
+        storages
+    }
+
+    pub fn to_persistent_string(&self) -> String {
+        let mut writer = SnapshotWriter::new();
+        writer.bytes(Self::PERSISTENT_MAGIC);
+        writer.u32(Self::PERSISTENT_VERSION);
+        writer.opt_string(self.current_storage.as_deref());
+        writer.usize(self.cursor.offset);
+        writer.opt_string(self.current_label.as_deref());
+        writer.call_frames(&self.call_stack);
+        writer.macros(&self.macros);
+        writer.expansion_frames(&self.macro_stack);
+        writer.attributes(&self.macro_params);
+        writer.condition_frames(&self.condition_stack);
+        writer.bool(self.interrupted);
+        format!(
+            "{}{}",
+            Self::PERSISTENT_PREFIX,
+            hex_encode(&writer.into_bytes())
+        )
+    }
+
+    pub fn from_persistent_string(value: &str) -> Result<Self> {
+        let encoded = value
+            .strip_prefix(Self::PERSISTENT_PREFIX)
+            .ok_or_else(|| KagError::host("invalid KAGParser snapshot encoding"))?;
+        let bytes = hex_decode(encoded)?;
+        let mut reader = SnapshotReader::new(&bytes);
+        if reader.bytes(Self::PERSISTENT_MAGIC.len())? != Self::PERSISTENT_MAGIC {
+            return Err(KagError::host("invalid KAGParser snapshot header"));
+        }
+        let version = reader.u32()?;
+        if version != Self::PERSISTENT_VERSION {
+            return Err(KagError::host(format!(
+                "unsupported KAGParser snapshot version {version}"
+            )));
+        }
+        let snapshot = Self {
+            current_storage: reader.opt_string()?,
+            cursor: Cursor {
+                offset: reader.usize()?,
+            },
+            current_label: reader.opt_string()?,
+            call_stack: reader.call_frames()?,
+            macros: reader.macros()?,
+            macro_stack: reader.expansion_frames()?,
+            macro_params: reader.attributes()?,
+            condition_stack: reader.condition_frames()?,
+            interrupted: reader.bool()?,
+        };
+        reader.finish()?;
+        Ok(snapshot)
+    }
+
+    pub fn set_macro_definitions<I, N, S>(&mut self, definitions: I)
+    where
+        I: IntoIterator<Item = (N, S)>,
+        N: Into<String>,
+        S: Into<String>,
+    {
+        self.macros = definitions
+            .into_iter()
+            .map(|(name, source)| {
+                (
+                    name.into(),
+                    MacroDefinition {
+                        source: source.into(),
+                    },
+                )
+            })
+            .collect();
+    }
+}
+
+struct SnapshotWriter {
+    bytes: Vec<u8>,
+}
+
+impl SnapshotWriter {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.u64(value as u64);
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn string(&mut self, value: &str) {
+        self.u64(value.len() as u64);
+        self.bytes(value.as_bytes());
+    }
+
+    fn opt_string(&mut self, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.bool(true);
+                self.string(value);
+            }
+            None => self.bool(false),
+        }
+    }
+
+    fn usize_vec(&mut self, values: &[usize]) {
+        self.u64(values.len() as u64);
+        for value in values {
+            self.usize(*value);
+        }
+    }
+
+    fn call_frames(&mut self, values: &[CallFrame]) {
+        self.u64(values.len() as u64);
+        for value in values {
+            self.string(&value.storage);
+            self.usize(value.offset);
+            self.string(&value.line_text);
+            self.opt_string(value.current_label.as_deref());
+            self.resume_state(&value.resume);
+        }
+    }
+
+    fn resume_state(&mut self, value: &ResumeState) {
+        self.expansion_frames(&value.macro_stack);
+        self.attributes(&value.macro_params);
+        self.condition_frames(&value.condition_stack);
+    }
+
+    fn macros(&mut self, values: &BTreeMap<String, MacroDefinition>) {
+        self.u64(values.len() as u64);
+        for (name, value) in values {
+            self.string(name);
+            self.string(&value.source);
+        }
+    }
+
+    fn expansion_frames(&mut self, values: &[ExpansionFrame]) {
+        self.u64(values.len() as u64);
+        for value in values {
+            self.string(&value.name);
+            self.string(&value.source);
+            self.usize_vec(&value.line_starts);
+            self.usize(value.offset);
+            self.tag_origin(&value.origin);
+            match &value.previous_params {
+                Some(params) => {
+                    self.bool(true);
+                    self.attributes(params);
+                }
+                None => self.bool(false),
+            }
+        }
+    }
+
+    fn condition_frames(&mut self, values: &[ConditionFrame]) {
+        self.u64(values.len() as u64);
+        for value in values {
+            self.bool(value.parent_active);
+            self.bool(value.branch_taken);
+            self.bool(value.current_active);
+        }
+    }
+
+    fn attributes(&mut self, values: &[Attribute]) {
+        self.u64(values.len() as u64);
+        for value in values {
+            match value {
+                Attribute::Named { name, value } => {
+                    self.u8(0);
+                    self.string(name);
+                    self.attribute_value(value);
+                }
+                Attribute::Spread => self.u8(1),
+            }
+        }
+    }
+
+    fn attribute_value(&mut self, value: &AttributeValue) {
+        match value {
+            AttributeValue::Literal(value) => {
+                self.u8(0);
+                self.string(value);
+            }
+            AttributeValue::Expression(value) => {
+                self.u8(1);
+                self.string(value);
+            }
+            AttributeValue::MacroArgument(value) => {
+                self.u8(2);
+                self.string(value);
+            }
+        }
+    }
+
+    fn tag_origin(&mut self, value: &TagOrigin) {
+        match value {
+            TagOrigin::Bracket => self.u8(0),
+            TagOrigin::CommandLine => self.u8(1),
+            TagOrigin::Character => self.u8(2),
+            TagOrigin::Newline => self.u8(3),
+            TagOrigin::Interrupt => self.u8(4),
+            TagOrigin::MacroExpansion { name } => {
+                self.u8(5);
+                self.string(name);
+            }
+        }
+    }
+}
+
+struct SnapshotReader<'a> {
+    bytes: &'a [u8],
+    index: usize,
+}
+
+impl<'a> SnapshotReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, index: 0 }
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.index == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(KagError::host("trailing data in KAGParser snapshot"))
+        }
+    }
+
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .index
+            .checked_add(len)
+            .ok_or_else(|| KagError::host("invalid KAGParser snapshot length"))?;
+        let value = self
+            .bytes
+            .get(self.index..end)
+            .ok_or_else(|| KagError::host("truncated KAGParser snapshot"))?;
+        self.index = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(*self
+            .bytes(1)?
+            .first()
+            .ok_or_else(|| KagError::host("truncated KAGParser snapshot"))?)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let mut bytes = [0; 4];
+        bytes.copy_from_slice(self.bytes(4)?);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(self.bytes(8)?);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn usize(&mut self) -> Result<usize> {
+        self.u64()?
+            .try_into()
+            .map_err(|_| KagError::host("KAGParser snapshot value is too large"))
+    }
+
+    fn bool(&mut self) -> Result<bool> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(KagError::host("invalid KAGParser snapshot bool")),
+        }
+    }
+
+    fn string(&mut self) -> Result<String> {
+        let len = self.usize()?;
+        let bytes = self.bytes(len)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| KagError::host("invalid UTF-8 in KAGParser snapshot"))
+    }
+
+    fn opt_string(&mut self) -> Result<Option<String>> {
+        if self.bool()? {
+            self.string().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn usize_vec(&mut self) -> Result<Vec<usize>> {
+        let len = self.usize()?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(self.usize()?);
+        }
+        Ok(values)
+    }
+
+    fn call_frames(&mut self) -> Result<Vec<CallFrame>> {
+        let len = self.usize()?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(CallFrame {
+                storage: self.string()?,
+                offset: self.usize()?,
+                line_text: self.string()?,
+                current_label: self.opt_string()?,
+                resume: self.resume_state()?,
+            });
+        }
+        Ok(values)
+    }
+
+    fn resume_state(&mut self) -> Result<ResumeState> {
+        Ok(ResumeState {
+            macro_stack: self.expansion_frames()?,
+            macro_params: self.attributes()?,
+            condition_stack: self.condition_frames()?,
+        })
+    }
+
+    fn macros(&mut self) -> Result<BTreeMap<String, MacroDefinition>> {
+        let len = self.usize()?;
+        let mut values = BTreeMap::new();
+        for _ in 0..len {
+            values.insert(
+                self.string()?,
+                MacroDefinition {
+                    source: self.string()?,
+                },
+            );
+        }
+        Ok(values)
+    }
+
+    fn expansion_frames(&mut self) -> Result<Vec<ExpansionFrame>> {
+        let len = self.usize()?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            let name = self.string()?;
+            let source = self.string()?;
+            let line_starts = self.usize_vec()?;
+            let offset = self.usize()?;
+            let origin = self.tag_origin()?;
+            let previous_params = if self.bool()? {
+                Some(self.attributes()?)
+            } else {
+                None
+            };
+            values.push(ExpansionFrame {
+                name,
+                source,
+                line_starts,
+                offset,
+                origin,
+                previous_params,
+            });
+        }
+        Ok(values)
+    }
+
+    fn condition_frames(&mut self) -> Result<Vec<ConditionFrame>> {
+        let len = self.usize()?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(ConditionFrame {
+                parent_active: self.bool()?,
+                branch_taken: self.bool()?,
+                current_active: self.bool()?,
+            });
+        }
+        Ok(values)
+    }
+
+    fn attributes(&mut self) -> Result<Vec<Attribute>> {
+        let len = self.usize()?;
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(match self.u8()? {
+                0 => Attribute::Named {
+                    name: self.string()?,
+                    value: self.attribute_value()?,
+                },
+                1 => Attribute::Spread,
+                _ => return Err(KagError::host("invalid KAGParser snapshot attribute")),
+            });
+        }
+        Ok(values)
+    }
+
+    fn attribute_value(&mut self) -> Result<AttributeValue> {
+        let value = match self.u8()? {
+            0 => AttributeValue::Literal(self.string()?),
+            1 => AttributeValue::Expression(self.string()?),
+            2 => AttributeValue::MacroArgument(self.string()?),
+            _ => return Err(KagError::host("invalid KAGParser snapshot attribute value")),
+        };
+        Ok(value)
+    }
+
+    fn tag_origin(&mut self) -> Result<TagOrigin> {
+        let origin = match self.u8()? {
+            0 => TagOrigin::Bracket,
+            1 => TagOrigin::CommandLine,
+            2 => TagOrigin::Character,
+            3 => TagOrigin::Newline,
+            4 => TagOrigin::Interrupt,
+            5 => TagOrigin::MacroExpansion {
+                name: self.string()?,
+            },
+            _ => return Err(KagError::host("invalid KAGParser snapshot origin")),
+        };
+        Ok(origin)
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return Err(KagError::host("invalid KAGParser snapshot hex length"));
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let raw = value.as_bytes();
+    for index in (0..raw.len()).step_by(2) {
+        let high = hex_value(raw[index])?;
+        let low = hex_value(raw[index + 1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_value(value: u8) -> Result<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(KagError::host("invalid KAGParser snapshot hex digit")),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct KagParser {
     options: ParserOptions,
@@ -2717,6 +3204,25 @@ mod tests {
 
         parser.restore(snapshot).unwrap();
         assert_eq!(lit(&next(&mut parser), "text"), Some("B"));
+    }
+
+    #[test]
+    fn persistent_snapshot_roundtrips_parser_state() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text("first.ks", "[macro name=x]BC[endmacro][x]D")
+            .unwrap();
+
+        assert_eq!(lit(&next(&mut parser), "text"), Some("B"));
+        let snapshot = parser.store();
+        let encoded = snapshot.to_persistent_string();
+        let decoded = ParserSnapshot::from_persistent_string(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+
+        assert_eq!(lit(&next(&mut parser), "text"), Some("C"));
+        parser.restore(decoded).unwrap();
+        assert_eq!(lit(&next(&mut parser), "text"), Some("C"));
+        assert_eq!(lit(&next(&mut parser), "text"), Some("D"));
     }
 
     #[test]

@@ -849,7 +849,8 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "colorRect", layer_color_rect);
     register_native_method_preserving_script(runtime, handle, "copyRect", layer_copy_rect);
     register_native_method_preserving_script(runtime, handle, "operateRect", layer_operate_rect);
-    register_native_method_preserving_script(runtime, handle, "piledCopy", layer_copy_rect);
+    register_native_method_preserving_script(runtime, handle, "piledCopy", layer_piled_copy);
+    register_native_method_preserving_script(runtime, handle, "stretchCopy", layer_stretch_copy);
     register_native_method_preserving_script(runtime, handle, "drawText", layer_draw_text);
     register_native_method_preserving_script(runtime, handle, "drawGlyph", layer_draw_glyph);
     register_native_method_preserving_script(runtime, handle, "getProvincePixel", layer_zero);
@@ -1577,12 +1578,7 @@ fn render_layer_target(
 ) -> Result<Option<LayerRenderTarget>> {
     register_kag_layer_slots_from_tjs(runtime);
     let handle = runtime.bound_this(handle).unwrap_or(handle);
-    Ok(runtime.host().layer_render_target(handle).or_else(|| {
-        runtime
-            .host()
-            .native_layer(handle)
-            .map(LayerRenderTarget::Native)
-    }))
+    Ok(runtime.host().layer_render_target(handle))
 }
 
 pub(crate) fn register_kag_layer_slots_from_tjs(runtime: &mut Runtime<KrkrHost>) {
@@ -1677,6 +1673,14 @@ fn render_layer_snapshot(
         }
         LayerRenderTarget::Kag(slot) => runtime.host().kag_layer(&slot.page, &slot.layer).cloned(),
     }
+}
+
+fn registered_render_layer_target(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Option<LayerRenderTarget> {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    runtime.host().layer_render_target(handle)
 }
 
 fn mutate_render_layer<R>(
@@ -2863,6 +2867,141 @@ fn layer_operate_rect(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     copy_rect_impl(runtime, this_obj, args, true)
+}
+
+fn layer_piled_copy(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let dx = optional_integer(&args, 0)?.unwrap_or(0);
+    let dy = optional_integer(&args, 1)?.unwrap_or(0);
+    let Some(source_object) = args.get(2).and_then(variant_object) else {
+        return Ok(Variant::Void);
+    };
+    let sx = optional_integer(&args, 3)?.unwrap_or(0);
+    let sy = optional_integer(&args, 4)?.unwrap_or(0);
+    let width = optional_integer(&args, 5)?.unwrap_or(0);
+    let height = optional_integer(&args, 6)?.unwrap_or(0);
+    if width <= 0 || height <= 0 {
+        return Ok(Variant::Void);
+    }
+    let Some(dest_target) = dest_target else {
+        return Ok(Variant::Void);
+    };
+
+    register_kag_layer_slots_from_tjs(runtime);
+    let mut layers = Vec::new();
+    let mut visited = BTreeSet::new();
+    collect_piled_render_layers(
+        runtime,
+        source_object,
+        0.0,
+        0.0,
+        None,
+        1.0,
+        false,
+        &mut visited,
+        &mut layers,
+    );
+    if layers.is_empty() {
+        return Ok(Variant::Void);
+    }
+
+    mutate_layer_pixels_min(
+        runtime,
+        &dest_target,
+        dest_min_extent(dx, width),
+        dest_min_extent(dy, height),
+        |pixels, image_width, image_height| {
+            for layer in &layers {
+                composite_piled_layer(
+                    pixels,
+                    image_width,
+                    image_height,
+                    layer,
+                    dx,
+                    dy,
+                    sx,
+                    sy,
+                    width,
+                    height,
+                );
+            }
+        },
+    )?;
+    mark_image_modified(runtime, this);
+    Ok(Variant::Void)
+}
+
+fn layer_stretch_copy(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let dx = optional_integer(&args, 0)?.unwrap_or(0);
+    let dy = optional_integer(&args, 1)?.unwrap_or(0);
+    let dest_width = optional_integer(&args, 2)?.unwrap_or(0);
+    let dest_height = optional_integer(&args, 3)?.unwrap_or(0);
+    let Some(source_object) = args.get(4).and_then(variant_object) else {
+        return Ok(Variant::Void);
+    };
+    let sx = optional_integer(&args, 5)?.unwrap_or(0);
+    let sy = optional_integer(&args, 6)?.unwrap_or(0);
+    let source_width = optional_integer(&args, 7)?.unwrap_or(0);
+    let source_height = optional_integer(&args, 8)?.unwrap_or(0);
+    if dest_width <= 0 || dest_height <= 0 || source_width <= 0 || source_height <= 0 {
+        return Ok(Variant::Void);
+    }
+    let Some(dest_target) = dest_target else {
+        return Ok(Variant::Void);
+    };
+    let Some(source_target) = render_layer_target(runtime, source_object)? else {
+        return Ok(Variant::Void);
+    };
+    let Some(source_image) =
+        render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
+    else {
+        return Ok(Variant::Void);
+    };
+    let source_pixels = source_image.upload.rgba.as_ref().to_vec();
+    let source_texture_width = source_image.upload.width;
+    let source_texture_height = source_image.upload.height;
+
+    mutate_layer_pixels_min(
+        runtime,
+        &dest_target,
+        dest_min_extent(dx, dest_width),
+        dest_min_extent(dy, dest_height),
+        |pixels, image_width, image_height| {
+            stretch_copy_pixels(
+                pixels,
+                image_width,
+                image_height,
+                &source_pixels,
+                source_texture_width,
+                source_texture_height,
+                dx,
+                dy,
+                dest_width,
+                dest_height,
+                sx,
+                sy,
+                source_width,
+                source_height,
+            );
+        },
+    )?;
+    mark_image_modified(runtime, this);
+    Ok(Variant::Void)
 }
 
 fn copy_rect_impl(
@@ -4429,6 +4568,307 @@ fn copy_pixels(
             dest_row.copy_from_slice(src_row);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PiledClip {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl PiledClip {
+    fn new(x: f32, y: f32, width: f32, height: f32) -> Option<Self> {
+        (width > 0.0 && height > 0.0).then_some(Self {
+            x0: x,
+            y0: y,
+            x1: x + width,
+            y1: y + height,
+        })
+    }
+
+    fn intersect(self, other: Self) -> Option<Self> {
+        let x0 = self.x0.max(other.x0);
+        let y0 = self.y0.max(other.y0);
+        let x1 = self.x1.min(other.x1);
+        let y1 = self.y1.min(other.y1);
+        (x1 > x0 && y1 > y0).then_some(Self { x0, y0, x1, y1 })
+    }
+}
+
+#[derive(Clone)]
+struct PiledRenderLayer {
+    layer: LayerNode,
+    origin_x: f32,
+    origin_y: f32,
+    clip: PiledClip,
+    opacity: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_piled_render_layers(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    parent_origin_x: f32,
+    parent_origin_y: f32,
+    parent_clip: Option<PiledClip>,
+    parent_opacity: f32,
+    include_position: bool,
+    visited: &mut BTreeSet<ObjectHandle>,
+    output: &mut Vec<PiledRenderLayer>,
+) {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    if !visited.insert(handle) {
+        return;
+    }
+    let Some(target) = registered_render_layer_target(runtime, handle) else {
+        return;
+    };
+    let Some(layer) = render_layer_snapshot(runtime, &target) else {
+        return;
+    };
+    if !layer.renderable || !layer.visible || layer.opacity == 0 {
+        return;
+    }
+
+    let origin_x = if include_position {
+        parent_origin_x + layer.left
+    } else {
+        parent_origin_x
+    };
+    let origin_y = if include_position {
+        parent_origin_y + layer.top
+    } else {
+        parent_origin_y
+    };
+    let Some(layer_clip) = PiledClip::new(
+        origin_x,
+        origin_y,
+        layer_effective_width(&layer),
+        layer_effective_height(&layer),
+    ) else {
+        return;
+    };
+    let clip = match parent_clip {
+        Some(parent_clip) => match parent_clip.intersect(layer_clip) {
+            Some(clip) => clip,
+            None => return,
+        },
+        None => layer_clip,
+    };
+    let opacity = parent_opacity * layer.opacity as f32 / 255.0;
+    if opacity <= 0.0 {
+        return;
+    }
+    output.push(PiledRenderLayer {
+        layer,
+        origin_x,
+        origin_y,
+        clip,
+        opacity,
+    });
+
+    let mut children = layer_children(runtime, handle)
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    children.sort_by_key(|(index, child)| {
+        let key = registered_render_layer_target(runtime, *child)
+            .and_then(|target| render_layer_snapshot(runtime, &target))
+            .map(|layer| (layer.z_order, layer.id))
+            .unwrap_or((0, 0));
+        (key.0, key.1, *index)
+    });
+    for (_, child) in children {
+        collect_piled_render_layers(
+            runtime,
+            child,
+            origin_x,
+            origin_y,
+            Some(clip),
+            opacity,
+            true,
+            visited,
+            output,
+        );
+    }
+}
+
+fn layer_effective_width(layer: &LayerNode) -> f32 {
+    let image_width = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.width as f32)
+        .unwrap_or(0.0);
+    layer.width.max(layer.image_width).max(image_width)
+}
+
+fn layer_effective_height(layer: &LayerNode) -> f32 {
+    let image_height = layer
+        .image
+        .as_ref()
+        .map(|image| image.upload.height as f32)
+        .unwrap_or(0.0);
+    layer.height.max(layer.image_height).max(image_height)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_piled_layer(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    layer: &PiledRenderLayer,
+    dx: i64,
+    dy: i64,
+    sx: i64,
+    sy: i64,
+    width: i64,
+    height: i64,
+) {
+    let Some(source_image) = layer.layer.image.as_ref() else {
+        return;
+    };
+    let source = source_image.upload.rgba.as_ref();
+    let source_width = source_image.upload.width;
+    let source_height = source_image.upload.height;
+    let image_x0 = layer.origin_x + layer.layer.image_left;
+    let image_y0 = layer.origin_y + layer.layer.image_top;
+    let image_x1 = image_x0 + source_width as f32;
+    let image_y1 = image_y0 + source_height as f32;
+    let source_rect_x1 = sx.saturating_add(width) as f32;
+    let source_rect_y1 = sy.saturating_add(height) as f32;
+
+    let copy_x0 = image_x0.max(layer.clip.x0).max(sx as f32).ceil() as i64;
+    let copy_y0 = image_y0.max(layer.clip.y0).max(sy as f32).ceil() as i64;
+    let copy_x1 = image_x1.min(layer.clip.x1).min(source_rect_x1).floor() as i64;
+    let copy_y1 = image_y1.min(layer.clip.y1).min(source_rect_y1).floor() as i64;
+    if copy_x1 <= copy_x0 || copy_y1 <= copy_y0 {
+        return;
+    }
+
+    let dest_stride = dest_width as usize * 4;
+    let source_stride = source_width as usize * 4;
+    for root_y in copy_y0..copy_y1 {
+        let dest_y = dy + root_y - sy;
+        if dest_y < 0 || dest_y >= dest_height as i64 {
+            continue;
+        }
+        let source_y = (root_y as f32 - image_y0).floor() as i64;
+        if source_y < 0 || source_y >= source_height as i64 {
+            continue;
+        }
+        for root_x in copy_x0..copy_x1 {
+            let dest_x = dx + root_x - sx;
+            if dest_x < 0 || dest_x >= dest_width as i64 {
+                continue;
+            }
+            let source_x = (root_x as f32 - image_x0).floor() as i64;
+            if source_x < 0 || source_x >= source_width as i64 {
+                continue;
+            }
+            let source_index = source_y as usize * source_stride + source_x as usize * 4;
+            let dest_index = dest_y as usize * dest_stride + dest_x as usize * 4;
+            if source_index + 4 > source.len() || dest_index + 4 > dest.len() {
+                continue;
+            }
+            let source_pixel = &source[source_index..source_index + 4];
+            if source_pixel[3] == 0 {
+                continue;
+            }
+            let dest_pixel = &mut dest[dest_index..dest_index + 4];
+            if layer.opacity >= 0.999 {
+                blend_pixel(dest_pixel, source_pixel);
+            } else {
+                let pixel = [
+                    source_pixel[0],
+                    source_pixel[1],
+                    source_pixel[2],
+                    ((source_pixel[3] as f32 * layer.opacity).round()).clamp(0.0, 255.0) as u8,
+                ];
+                blend_pixel(dest_pixel, &pixel);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stretch_copy_pixels(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    source: &[u8],
+    source_texture_width: u32,
+    source_texture_height: u32,
+    dx: i64,
+    dy: i64,
+    dest_rect_width: i64,
+    dest_rect_height: i64,
+    sx: i64,
+    sy: i64,
+    source_rect_width: i64,
+    source_rect_height: i64,
+) {
+    if dest_rect_width <= 0
+        || dest_rect_height <= 0
+        || source_rect_width <= 0
+        || source_rect_height <= 0
+    {
+        return;
+    }
+    let dest_x0 = dx.max(0);
+    let dest_y0 = dy.max(0);
+    let dest_x1 = dx
+        .saturating_add(dest_rect_width)
+        .clamp(0, dest_width as i64);
+    let dest_y1 = dy
+        .saturating_add(dest_rect_height)
+        .clamp(0, dest_height as i64);
+    if dest_x1 <= dest_x0 || dest_y1 <= dest_y0 {
+        return;
+    }
+
+    let dest_stride = dest_width as usize * 4;
+    let source_stride = source_texture_width as usize * 4;
+    for dest_y in dest_y0..dest_y1 {
+        let rel_y = dest_y - dy;
+        let source_y = sx_scaled_coordinate(sy, rel_y, source_rect_height, dest_rect_height);
+        if source_y < 0 || source_y >= source_texture_height as i64 {
+            continue;
+        }
+        for dest_x in dest_x0..dest_x1 {
+            let rel_x = dest_x - dx;
+            let source_x = sx_scaled_coordinate(sx, rel_x, source_rect_width, dest_rect_width);
+            if source_x < 0 || source_x >= source_texture_width as i64 {
+                continue;
+            }
+            let source_index = source_y as usize * source_stride + source_x as usize * 4;
+            let dest_index = dest_y as usize * dest_stride + dest_x as usize * 4;
+            if source_index + 4 > source.len() || dest_index + 4 > dest.len() {
+                continue;
+            }
+            dest[dest_index..dest_index + 4]
+                .copy_from_slice(&source[source_index..source_index + 4]);
+        }
+    }
+}
+
+fn sx_scaled_coordinate(
+    source_origin: i64,
+    dest_offset: i64,
+    source_len: i64,
+    dest_len: i64,
+) -> i64 {
+    let scaled = (dest_offset as i128 * source_len as i128) / dest_len as i128;
+    source_origin.saturating_add(scaled as i64)
+}
+
+fn dest_min_extent(offset: i64, length: i64) -> u32 {
+    offset
+        .saturating_add(length)
+        .clamp(1, u32::MAX as i64)
+        .try_into()
+        .unwrap_or(u32::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
