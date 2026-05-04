@@ -608,10 +608,10 @@ impl KrkrHost {
                     .insert("primaryLayer".to_string(), Variant::Object(child));
             }
             if window_instance.focused_layer.is_none() {
-                window_instance.focused_layer = Some(child);
                 window_instance
                     .properties
-                    .insert("focusedLayer".to_string(), Variant::Object(child));
+                    .entry("focusedLayer".to_string())
+                    .or_insert(Variant::Null);
             }
             self.set_native_layer_window(child, Some(window), Variant::Object(window));
         }
@@ -632,7 +632,7 @@ impl KrkrHost {
             window_instance.focused_layer = None;
             window_instance
                 .properties
-                .insert("focusedLayer".to_string(), Variant::Void);
+                .insert("focusedLayer".to_string(), Variant::Null);
         }
     }
 
@@ -930,7 +930,7 @@ impl KrkrHost {
                     window.focused_layer = None;
                     window
                         .properties
-                        .insert("focusedLayer".to_string(), Variant::Void);
+                        .insert("focusedLayer".to_string(), Variant::Null);
                 }
             }
             self.cleanup_invalidated_handle(handle);
