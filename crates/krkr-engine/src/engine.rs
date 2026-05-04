@@ -3305,14 +3305,14 @@ mod tests {
                 window.add(layer);
                 var before = window.children.count + ":" +
                     (window.primaryLayer === layer) + ":" +
-                    (window.focusedLayer === layer) + ":" +
+                    (window.focusedLayer === null) + ":" +
                     (Window.mainWindow === window);
                 window.add(layer);
                 var deduped = window.children.count;
                 window.remove(layer);
                 return before + ":" + deduped + ":" + window.children.count + ":" +
                     (window.primaryLayer === void) + ":" +
-                    (window.focusedLayer === void);
+                    (window.focusedLayer === null);
                 "#,
             )
             .expect("script");
@@ -3321,7 +3321,7 @@ mod tests {
     }
 
     #[test]
-    fn window_add_remove_updates_backing_primary_and_focused_layers() {
+    fn window_add_remove_updates_backing_primary_layer_and_keeps_focus_empty() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -3343,10 +3343,7 @@ mod tests {
             engine.host().native_window_primary_layer(window),
             Some(layer)
         );
-        assert_eq!(
-            engine.host().native_window_focused_layer(window),
-            Some(layer)
-        );
+        assert_eq!(engine.host().native_window_focused_layer(window), None);
         assert_eq!(engine.host().native_layer_window(layer), Some(window));
 
         engine
@@ -8017,6 +8014,7 @@ mod tests {
                 child.events = "";
                 root.onBlur = function() { events += "blur"; };
                 child.onFocus = function() { events += "focus"; };
+                root.focus();
                 child.focus();
                 return (window.focusedLayer === child) + ":" + root.focused + ":" +
                     child.focused + ":" + root.events + ":" + child.events;
@@ -8698,6 +8696,49 @@ mod tests {
                 .execute_expression("inline.tjs", "kag.clicks")
                 .expect("clicks"),
             Variant::Integer(10)
+        );
+    }
+
+    #[test]
+    fn primary_layer_does_not_block_window_keyboard_shortcuts() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.events = "";
+                global.kag = new Window();
+                kag.innerWidth = 320;
+                var root = new Layer(kag, null);
+                kag.add(root);
+                kag.onKeyDown = function(key, shift) {
+                    if(focusedLayer === null && key == VK_CONTROL) {
+                        global.events += "ctrl:" + System.getKeyState(VK_CONTROL);
+                    }
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::KeyboardInput {
+                        key: EngineKey::Control,
+                        state: ButtonState::Pressed,
+                        repeat: false,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("key frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "events")
+                .expect("events"),
+            Variant::String("ctrl:1".to_string())
         );
     }
 
@@ -10862,6 +10903,39 @@ mod tests {
             engine.tjs_runtime().global_member("trace"),
             Variant::String("ENIC".to_string())
         );
+    }
+
+    #[test]
+    fn at_idle_async_trigger_self_reschedule_waits_for_next_frame() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "idle_self_reschedule.tjs",
+                r#"
+                global.idleCount = 0;
+                global.idleProbe = new AsyncTrigger(function() {
+                    global.idleCount++;
+                    if(global.idleCount < 3) global.idleProbe.trigger();
+                }, "");
+                idleProbe.mode = atmAtIdle;
+                idleProbe.cached = true;
+                idleProbe.trigger();
+                "#,
+            )
+            .expect("script");
+
+        for expected in 1..=3 {
+            engine
+                .update(
+                    EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                    Duration::ZERO,
+                )
+                .expect("update");
+            assert_eq!(
+                engine.tjs_runtime().global_member("idleCount"),
+                Variant::Integer(expected)
+            );
+        }
     }
 
     #[test]

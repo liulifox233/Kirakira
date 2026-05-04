@@ -282,6 +282,7 @@ fn apply_constructor_defaults(
             set_window_property_storage(runtime, handle, "height", Variant::Integer(0));
             set_window_property_storage(runtime, handle, "innerWidth", Variant::Integer(0));
             set_window_property_storage(runtime, handle, "innerHeight", Variant::Integer(0));
+            set_window_property_storage(runtime, handle, "focusedLayer", Variant::Null);
             runtime.set_object_member(handle, "fullScreen", Variant::Integer(0));
             let children = runtime.alloc_array_object(Vec::new());
             runtime
@@ -387,7 +388,7 @@ fn apply_constructor_defaults(
             );
             runtime.set_object_member(handle, "focusable", Variant::Integer(0));
             runtime.set_object_member(handle, "joinFocusChain", Variant::Integer(1));
-            runtime.set_object_member(handle, "focused", Variant::Integer(i64::from(is_primary)));
+            runtime.set_object_member(handle, "focused", Variant::Integer(0));
             set_layer_property_storage(runtime, handle, "cursor", Variant::Integer(0));
             set_layer_property_storage(runtime, handle, "hint", Variant::String(String::new()));
             set_layer_property_storage(runtime, handle, "showParentHint", Variant::Integer(1));
@@ -398,12 +399,6 @@ fn apply_constructor_defaults(
                     runtime,
                     window,
                     "primaryLayer",
-                    Variant::Object(handle),
-                );
-                set_window_property_storage(
-                    runtime,
-                    window,
-                    "focusedLayer",
                     Variant::Object(handle),
                 );
             }
@@ -734,7 +729,7 @@ fn window_remove(
         set_window_property_storage(runtime, this, "primaryLayer", Variant::Void);
     }
     if runtime.object_member(this, "focusedLayer") == item {
-        set_window_property_storage(runtime, this, "focusedLayer", Variant::Void);
+        set_window_property_storage(runtime, this, "focusedLayer", Variant::Null);
     }
     Ok(Variant::Void)
 }

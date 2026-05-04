@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use krkr_core::EngineEvent;
 use krkr_tjs2::runtime::{ObjectHandle, Variant};
@@ -20,6 +20,7 @@ pub(crate) struct TvpScheduler {
     sequence_to_process: u64,
     event_disabled: bool,
     frame_continuous_delivered: bool,
+    frame_idle_async_delivered: BTreeSet<ObjectHandle>,
     window_updates_delivering: bool,
     active_window_update: Option<ObjectHandle>,
     delivered_window_update_counts: BTreeMap<ObjectHandle, usize>,
@@ -28,6 +29,7 @@ pub(crate) struct TvpScheduler {
 impl TvpScheduler {
     pub(crate) fn begin_frame(&mut self) {
         self.frame_continuous_delivered = false;
+        self.frame_idle_async_delivered.clear();
     }
 
     pub(crate) fn set_event_disabled(&mut self, disabled: bool) {
@@ -98,9 +100,9 @@ impl TvpScheduler {
             AsyncTriggerMode::AtIdle => {
                 let entry = self.idle_async_triggers.entry(handle).or_insert(0);
                 if cached {
-                    *entry = entry.saturating_add(1);
-                } else {
                     *entry = 1;
+                } else {
+                    *entry = entry.saturating_add(1);
                 }
             }
         }
@@ -301,7 +303,13 @@ impl TvpScheduler {
     }
 
     pub(crate) fn pop_idle_event(&mut self) -> Option<IdleEvent> {
-        if let Some(handle) = self.idle_async_triggers.keys().next().copied() {
+        if let Some(handle) = self
+            .idle_async_triggers
+            .keys()
+            .copied()
+            .find(|handle| !self.frame_idle_async_delivered.contains(handle))
+        {
+            self.frame_idle_async_delivered.insert(handle);
             let remove = {
                 let count = self
                     .idle_async_triggers
