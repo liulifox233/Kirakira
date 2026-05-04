@@ -19,6 +19,7 @@ use krkr_tjs2::{
 
 use crate::{
     resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId},
+    scheduler::{AsyncTriggerMode, TvpScheduler},
     storage::{
         ProjectStorage, decode_text_storage, io_error as storage_io_error,
         normalize_storage_separators as storage_normalize_separators, storage_mode_offset,
@@ -41,10 +42,7 @@ pub struct KrkrHost {
     next_kag_snapshot_id: i64,
     layer_tree: LayerTree,
     native_layers: BTreeMap<ObjectHandle, LayerId>,
-    timers: BTreeMap<ObjectHandle, TimerState>,
-    pending_async_triggers: BTreeSet<ObjectHandle>,
-    pending_layer_paints: BTreeSet<ObjectHandle>,
-    continuous_handlers: Vec<Variant>,
+    scheduler: TvpScheduler,
     kag_layers: BTreeMap<String, LayerId>,
     pending_kag_layers: BTreeMap<String, LayerNode>,
     active_transition: Option<ActiveTransition>,
@@ -63,7 +61,6 @@ pub struct KrkrHost {
     next_audio_instance_id: u64,
     native_audio_buffers: BTreeMap<ObjectHandle, NativeAudioBuffer>,
     native_audio_global_volume: i64,
-    pending_audio_fade_completions: BTreeMap<ObjectHandle, i64>,
     pending_audio_commands: Vec<AudioCommand>,
     text_encoding: String,
     pressed_keys: BTreeSet<i64>,
@@ -85,10 +82,7 @@ impl Default for KrkrHost {
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
-            timers: BTreeMap::new(),
-            pending_async_triggers: BTreeSet::new(),
-            pending_layer_paints: BTreeSet::new(),
-            continuous_handlers: Vec::new(),
+            scheduler: TvpScheduler::default(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
             active_transition: None,
@@ -109,7 +103,6 @@ impl Default for KrkrHost {
             next_audio_instance_id: 1,
             native_audio_buffers: BTreeMap::new(),
             native_audio_global_volume: 100000,
-            pending_audio_fade_completions: BTreeMap::new(),
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
@@ -139,10 +132,7 @@ impl KrkrHost {
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
-            timers: BTreeMap::new(),
-            pending_async_triggers: BTreeSet::new(),
-            pending_layer_paints: BTreeSet::new(),
-            continuous_handlers: Vec::new(),
+            scheduler: TvpScheduler::default(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
             active_transition: None,
@@ -163,7 +153,6 @@ impl KrkrHost {
             next_audio_instance_id: 1,
             native_audio_buffers: BTreeMap::new(),
             native_audio_global_volume: 100000,
-            pending_audio_fade_completions: BTreeMap::new(),
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
@@ -437,10 +426,7 @@ impl KrkrHost {
     }
 
     pub(crate) fn invalidate_native_object(&mut self, handle: ObjectHandle) {
-        self.timers.remove(&handle);
-        self.pending_async_triggers.remove(&handle);
-        self.pending_layer_paints.remove(&handle);
-        self.pending_audio_fade_completions.remove(&handle);
+        self.scheduler.invalidate_object(handle);
         self.pending_image_loads
             .retain(|_, load| load.request.owner != Some(handle));
         self.kag_parsers.remove(&handle);
@@ -470,10 +456,7 @@ impl KrkrHost {
             .collect::<Vec<_>>();
         for handle in removed_handles {
             self.native_layers.remove(&handle);
-            self.timers.remove(&handle);
-            self.pending_async_triggers.remove(&handle);
-            self.pending_layer_paints.remove(&handle);
-            self.pending_audio_fade_completions.remove(&handle);
+            self.scheduler.invalidate_object(handle);
             self.pending_image_loads
                 .retain(|_, load| load.request.owner != Some(handle));
             self.kag_parsers.remove(&handle);
@@ -487,100 +470,53 @@ impl KrkrHost {
     }
 
     pub(crate) fn register_timer(&mut self, handle: ObjectHandle) {
-        self.timers.entry(handle).or_insert(TimerState {
-            next_fire_millis: None,
-        });
-    }
-
-    pub(crate) fn timer_handles(&self) -> Vec<ObjectHandle> {
-        self.timers.keys().copied().collect()
-    }
-
-    pub(crate) fn timer_next_fire_millis(&self, handle: ObjectHandle) -> Option<i64> {
-        self.timers
-            .get(&handle)
-            .and_then(|timer| timer.next_fire_millis)
-    }
-
-    pub(crate) fn set_timer_next_fire_millis(
-        &mut self,
-        handle: ObjectHandle,
-        next_fire_millis: Option<i64>,
-    ) {
-        self.timers
-            .entry(handle)
-            .or_insert(TimerState {
-                next_fire_millis: None,
-            })
-            .next_fire_millis = next_fire_millis;
+        self.scheduler.register_timer(handle);
     }
 
     pub(crate) fn register_async_trigger(&mut self, handle: ObjectHandle) {
-        self.pending_async_triggers.remove(&handle);
+        self.scheduler.cancel_async(handle);
     }
 
-    pub(crate) fn trigger_async(&mut self, handle: ObjectHandle) {
-        self.pending_async_triggers.insert(handle);
+    pub(crate) fn trigger_async_with_mode(
+        &mut self,
+        handle: ObjectHandle,
+        mode: AsyncTriggerMode,
+        cached: bool,
+    ) {
+        self.scheduler.trigger_async(handle, mode, cached);
     }
 
     pub(crate) fn cancel_async(&mut self, handle: ObjectHandle) {
-        self.pending_async_triggers.remove(&handle);
-    }
-
-    pub(crate) fn take_pending_async_triggers(&mut self) -> Vec<ObjectHandle> {
-        std::mem::take(&mut self.pending_async_triggers)
-            .into_iter()
-            .collect()
+        self.scheduler.cancel_async(handle);
     }
 
     pub(crate) fn schedule_audio_fade_completion(&mut self, handle: ObjectHandle, millis: i64) {
         let due = self.now_millis().saturating_add(millis.max(0));
-        self.pending_audio_fade_completions.insert(handle, due);
+        self.scheduler.schedule_audio_fade_completion(handle, due);
     }
 
     pub(crate) fn cancel_audio_fade_completion(&mut self, handle: ObjectHandle) {
-        self.pending_audio_fade_completions.remove(&handle);
-    }
-
-    pub(crate) fn take_due_audio_fade_completions(&mut self) -> Vec<ObjectHandle> {
-        let now = self.now_millis();
-        let due = self
-            .pending_audio_fade_completions
-            .iter()
-            .filter_map(|(handle, due)| (*due <= now).then_some(*handle))
-            .collect::<Vec<_>>();
-        for handle in &due {
-            self.pending_audio_fade_completions.remove(handle);
-        }
-        due
+        self.scheduler.cancel_audio_fade_completion(handle);
     }
 
     pub(crate) fn request_layer_paint(&mut self, handle: ObjectHandle) {
-        self.pending_layer_paints.insert(handle);
-    }
-
-    pub(crate) fn take_pending_layer_paints(&mut self) -> Vec<ObjectHandle> {
-        std::mem::take(&mut self.pending_layer_paints)
-            .into_iter()
-            .collect()
+        self.scheduler.post_window_update(handle);
     }
 
     pub(crate) fn add_continuous_handler(&mut self, handler: Variant) {
-        if !matches!(handler, Variant::Void)
-            && !self.continuous_handlers.iter().any(|item| item == &handler)
-        {
-            self.continuous_handlers.push(handler);
-        }
+        self.scheduler.add_continuous_handler(handler);
     }
 
     pub(crate) fn remove_continuous_handler(&mut self, handler: &Variant) -> bool {
-        let before = self.continuous_handlers.len();
-        self.continuous_handlers.retain(|item| item != handler);
-        before != self.continuous_handlers.len()
+        self.scheduler.remove_continuous_handler(handler)
     }
 
-    pub(crate) fn continuous_handlers(&self) -> Vec<Variant> {
-        self.continuous_handlers.clone()
+    pub(crate) fn scheduler(&self) -> &TvpScheduler {
+        &self.scheduler
+    }
+
+    pub(crate) fn scheduler_mut(&mut self) -> &mut TvpScheduler {
+        &mut self.scheduler
     }
 
     pub(crate) fn ensure_kag_layer(&mut self, page: &str, layer: &str) -> LayerId {
@@ -1419,11 +1355,6 @@ fn graphic_cache_limit_bytes(limit: i64) -> usize {
         let remaining = limit.unsigned_abs().min(usize::MAX as u64) as usize;
         IMAGE_CACHE_CAPACITY_BYTES.saturating_sub(remaining)
     }
-}
-
-#[derive(Clone)]
-struct TimerState {
-    next_fire_millis: Option<i64>,
 }
 
 #[derive(Clone)]

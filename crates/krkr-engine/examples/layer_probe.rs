@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use krkr_core::{
-    ButtonState, DrawCommand, EngineEvent, FrameInput, ImageCommand, ImageUpload, Point,
+    ButtonState, DrawCommand, EngineEvent, EngineKey, FrameInput, ImageCommand, ImageUpload, Point,
     PointerButton, Size,
 };
 use krkr_engine::{EngineInput, KrkrEngine};
@@ -93,13 +93,10 @@ fn main() {
                 .expect("script start click");
             println!("script_start_click={value}");
         }
-        let events = if !probe_events.is_empty() {
-            probe_events_for_frame(&probe_events, frame_index)
-        } else if click_through {
-            probe_click_events(frame_index)
-        } else {
-            Vec::new()
-        };
+        let mut events = probe_events_for_frame(&probe_events, frame_index);
+        if click_through {
+            events.extend(probe_click_events(frame_index));
+        }
         let frame = engine
             .update(
                 EngineInput::new(
@@ -267,6 +264,36 @@ fn parse_probe_events(value: &str) -> Vec<(usize, EngineEvent)> {
                     EngineEvent::PointerInput {
                         button: PointerButton::Primary,
                         state: ButtonState::Released,
+                    },
+                )),
+                "rightdown" => Some((
+                    frame,
+                    EngineEvent::PointerInput {
+                        button: PointerButton::Secondary,
+                        state: ButtonState::Pressed,
+                    },
+                )),
+                "rightup" => Some((
+                    frame,
+                    EngineEvent::PointerInput {
+                        button: PointerButton::Secondary,
+                        state: ButtonState::Released,
+                    },
+                )),
+                "enterdown" => Some((
+                    frame,
+                    EngineEvent::KeyboardInput {
+                        key: EngineKey::Enter,
+                        state: ButtonState::Pressed,
+                        repeat: false,
+                    },
+                )),
+                "enterup" => Some((
+                    frame,
+                    EngineEvent::KeyboardInput {
+                        key: EngineKey::Enter,
+                        state: ButtonState::Released,
+                        repeat: false,
                     },
                 )),
                 _ => None,

@@ -14,6 +14,7 @@ use krkr_tjs2::{
 use crate::host::{
     CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KrkrHost, NativeTransitionCompletion,
 };
+use crate::scheduler::AsyncTriggerMode;
 
 use super::register_stub_method;
 
@@ -222,7 +223,7 @@ fn apply_constructor_defaults(
             runtime.host_mut().register_timer(handle);
         }
         "AsyncTrigger" => {
-            runtime.set_object_member(handle, "cached", Variant::Integer(0));
+            runtime.set_object_member(handle, "cached", Variant::Integer(1));
             runtime.set_object_member(handle, "mode", Variant::Integer(0));
             if let Some(callback) = args.first().filter(|value| !matches!(value, Variant::Void)) {
                 runtime.set_object_member(handle, "__callback", callback.clone());
@@ -1360,7 +1361,15 @@ fn async_trigger_trigger(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("AsyncTrigger.trigger requires this"))?;
-    runtime.host_mut().trigger_async(this);
+    let mode = match runtime.object_member(this, "mode").to_integer()? {
+        1 => AsyncTriggerMode::Exclusive,
+        2 => AsyncTriggerMode::AtIdle,
+        _ => AsyncTriggerMode::Normal,
+    };
+    let cached = runtime.object_member(this, "cached").is_truthy();
+    runtime
+        .host_mut()
+        .trigger_async_with_mode(this, mode, cached);
     Ok(Variant::Void)
 }
 
