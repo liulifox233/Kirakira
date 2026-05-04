@@ -2030,7 +2030,7 @@ impl KagSession {
             };
 
             tags_processed += 1;
-            let action = self.process_tag(parser, runtime, tag)?;
+            let action = self.process_tag(parser, runtime, owner, tag)?;
             match action {
                 TagAction::Continue => {}
                 TagAction::Yield(reason) => {
@@ -2049,47 +2049,85 @@ impl KagSession {
         &mut self,
         parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
+        owner: ObjectHandle,
         tag: Tag,
     ) -> Result<TagAction> {
-        if let Some(handler) = self.handler
-            && !matches!(runtime.object_member(handler, "onTag"), Variant::Void)
-        {
-            let tag_object = tag_to_dictionary(runtime, &tag)?;
-            let value =
-                self.call_handler(runtime, handler, "onTag", vec![Variant::Object(tag_object)])?;
-            return self.apply_handler_step(tag, value);
+        if let Some(action) = self.try_tjs_tag_handler(runtime, owner, &tag)? {
+            return match action {
+                TjsTagAction::Handled(action) => Ok(action),
+                TjsTagAction::NativeFallback => {
+                    self.process_native_fallback_tag(parser, runtime, &tag)
+                }
+            };
         }
 
-        let default_action = self.process_builtin_tag(parser, runtime, &tag)?;
-        if matches!(default_action, TagAction::Continue)
-            && let Some(handler) = self.handler
-            && !is_builtin_tag(&tag.tagname)
-            && !matches!(
-                runtime.object_member(handler, "onUnknownTag"),
-                Variant::Void
-            )
-        {
-            let tag_object = tag_to_dictionary(runtime, &tag)?;
-            let value = call_tag_handler(
-                runtime,
-                handler,
-                "onUnknownTag",
-                vec![
-                    Variant::String(tag.tagname.clone()),
-                    Variant::Object(tag_object),
-                ],
-            )
-            .inspect_err(|error| {
-                self.state = KagTaskState::Error {
-                    message: error.to_string(),
-                };
-            })?;
-            return self.apply_handler_step(tag, value);
-        }
-        Ok(default_action)
+        self.process_native_fallback_tag(parser, runtime, &tag)
     }
 
-    fn call_handler(
+    fn try_tjs_tag_handler(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        owner: ObjectHandle,
+        tag: &Tag,
+    ) -> Result<Option<TjsTagAction>> {
+        for handler in self.tjs_tag_handler_candidates(runtime, owner) {
+            if !matches!(runtime.object_member(handler, "onTag"), Variant::Void) {
+                let tag_object = tag_to_dictionary(runtime, tag)?;
+                let value = self.call_tag_handler(
+                    runtime,
+                    handler,
+                    "onTag",
+                    vec![Variant::Object(tag_object)],
+                )?;
+                return self.apply_tjs_handler_step(tag.clone(), value).map(Some);
+            }
+
+            if NativeFallbackTag::from_name(&tag.tagname).is_none()
+                && !matches!(
+                    runtime.object_member(handler, "onUnknownTag"),
+                    Variant::Void
+                )
+            {
+                let tag_object = tag_to_dictionary(runtime, tag)?;
+                let value = self.call_tag_handler(
+                    runtime,
+                    handler,
+                    "onUnknownTag",
+                    vec![
+                        Variant::String(tag.tagname.clone()),
+                        Variant::Object(tag_object),
+                    ],
+                )?;
+                return self.apply_tjs_handler_step(tag.clone(), value).map(Some);
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn tjs_tag_handler_candidates(
+        &self,
+        runtime: &Runtime<KrkrHost>,
+        owner: ObjectHandle,
+    ) -> Vec<ObjectHandle> {
+        let mut candidates = Vec::new();
+        push_unique_handler(&mut candidates, self.handler);
+        push_unique_handler(&mut candidates, Some(owner));
+
+        if let Variant::Object(kag) = runtime.global_member("kag") {
+            if let Variant::Object(conductor) = runtime.object_member(kag, "conductor") {
+                push_unique_handler(&mut candidates, Some(conductor));
+            }
+            if let Variant::Object(conductor) = runtime.object_member(kag, "mainConductor") {
+                push_unique_handler(&mut candidates, Some(conductor));
+            }
+            push_unique_handler(&mut candidates, Some(kag));
+        }
+
+        candidates
+    }
+
+    fn call_tag_handler(
         &mut self,
         runtime: &mut Runtime<KrkrHost>,
         handler: ObjectHandle,
@@ -2103,45 +2141,48 @@ impl KagSession {
         })
     }
 
-    fn process_builtin_tag(
+    fn process_native_fallback_tag(
         &mut self,
         parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
         tag: &Tag,
     ) -> Result<TagAction> {
-        match tag.tagname.as_str() {
-            "ch" => {
+        let Some(native_tag) = NativeFallbackTag::from_name(&tag.tagname) else {
+            return Ok(TagAction::Continue);
+        };
+        match native_tag {
+            NativeFallbackTag::Ch => {
                 if let Some(text) = tag.literal_attr("text") {
                     self.message_layer.append_text(text);
                 }
                 Ok(TagAction::Continue)
             }
-            "r" => {
+            NativeFallbackTag::R => {
                 self.message_layer.newline();
                 Ok(TagAction::Continue)
             }
-            "l" => {
+            NativeFallbackTag::L => {
                 self.message_layer.newline();
                 Ok(self.wait_click(false))
             }
-            "p" => {
+            NativeFallbackTag::P => {
                 self.message_layer.page_break();
                 Ok(self.wait_click(true))
             }
-            "font" | "deffont" => {
+            NativeFallbackTag::Font => {
                 apply_message_font_tag(&mut self.message_layer, tag)?;
                 Ok(TagAction::Continue)
             }
-            "resetfont" => {
+            NativeFallbackTag::ResetFont => {
                 self.message_layer.font = krkr_core::FontSpec::default();
                 self.message_layer.style = krkr_core::TextStyle::default();
                 Ok(TagAction::Continue)
             }
-            "style" => {
+            NativeFallbackTag::Style => {
                 apply_message_style_tag(&mut self.message_layer, tag);
                 Ok(TagAction::Continue)
             }
-            "locate" => {
+            NativeFallbackTag::Locate => {
                 if let Some(x) = tag_i64(tag, "x")? {
                     self.message_layer.cursor_x = x as i32;
                 }
@@ -2150,56 +2191,56 @@ impl KagSession {
                 }
                 Ok(TagAction::Continue)
             }
-            "ptext" => {
+            NativeFallbackTag::PText => {
                 if let Some(text) = tag.literal_attr("text") {
                     self.message_layer.append_text(text);
                 }
                 Ok(TagAction::Continue)
             }
-            "waitclick" => Ok(self.wait_click(false)),
-            "wait" => Ok(match tag_millis(tag, "time") {
+            NativeFallbackTag::WaitClick => Ok(self.wait_click(false)),
+            NativeFallbackTag::Wait => Ok(match tag_millis(tag, "time") {
                 Some(duration) => self.wait(KagTaskState::WaitingTimer {
                     remaining: duration,
                 }),
                 None => self.wait_click(false),
             }),
-            "eval" => {
+            NativeFallbackTag::Eval => {
                 execute_eval_tag(runtime, tag)?;
                 Ok(TagAction::Continue)
             }
-            "trace" => {
+            NativeFallbackTag::Trace => {
                 execute_trace_tag(runtime, tag)?;
                 Ok(TagAction::Continue)
             }
-            "cm" | "ct" | "er" => {
+            NativeFallbackTag::ClearText => {
                 self.message_layer.clear_text();
                 Ok(TagAction::Continue)
             }
-            "image" => {
+            NativeFallbackTag::Image => {
                 if apply_image_tag(runtime, tag)? {
                     Ok(self.wait(KagTaskState::WaitingResource))
                 } else {
                     Ok(TagAction::Continue)
                 }
             }
-            "layopt" | "position" => {
+            NativeFallbackTag::LayerOptions => {
                 apply_layer_options_tag(runtime, tag)?;
                 Ok(TagAction::Continue)
             }
-            "freeimage" => {
+            NativeFallbackTag::FreeImage => {
                 apply_freeimage_tag(runtime, tag);
                 Ok(TagAction::Continue)
             }
-            "backlay" => {
+            NativeFallbackTag::Backlay => {
                 let layer = tag.literal_attr("layer");
                 runtime.host_mut().backlay_kag_layers(layer);
                 Ok(TagAction::Continue)
             }
-            "rclick" => {
+            NativeFallbackTag::Rclick => {
                 self.apply_right_click_tag(tag);
                 Ok(TagAction::Continue)
             }
-            "tempsave" => {
+            NativeFallbackTag::TempSave => {
                 let place = tag_i64(tag, "place")?.unwrap_or(0);
                 self.temp_snapshots.insert(
                     place,
@@ -2214,7 +2255,7 @@ impl KagSession {
                 );
                 Ok(TagAction::Continue)
             }
-            "tempload" => {
+            NativeFallbackTag::TempLoad => {
                 let place = tag_i64(tag, "place")?.unwrap_or(0);
                 if let Some(snapshot) = self.temp_snapshots.get(&place).cloned() {
                     parser
@@ -2228,8 +2269,8 @@ impl KagSession {
                 }
                 Ok(TagAction::Continue)
             }
-            "commit" | "history" => Ok(TagAction::Continue),
-            "gotostart" => {
+            NativeFallbackTag::Noop => Ok(TagAction::Continue),
+            NativeFallbackTag::GotoStart => {
                 if let Some(storage) = parser.cur_storage().map(str::to_string) {
                     parser
                         .set_cur_storage(storage)
@@ -2240,28 +2281,28 @@ impl KagSession {
                 }
                 Ok(TagAction::Continue)
             }
-            "laycount" => {
+            NativeFallbackTag::LayCount => {
                 apply_laycount_tag(runtime, tag)?;
                 Ok(TagAction::Continue)
             }
-            "current" => {
+            NativeFallbackTag::Current => {
                 apply_current_tag(runtime, tag);
                 Ok(TagAction::Continue)
             }
-            "trans" => {
+            NativeFallbackTag::Trans => {
                 let method = tag.literal_attr("method").unwrap_or("crossfade");
                 let duration = tag_millis(tag, "time").unwrap_or(Duration::ZERO);
                 runtime.host_mut().begin_kag_transition(method, duration);
                 Ok(TagAction::Continue)
             }
-            "wt" => {
+            NativeFallbackTag::Wt => {
                 if runtime.host().has_active_transition() {
                     Ok(self.wait(KagTaskState::WaitingTransition))
                 } else {
                     Ok(TagAction::Continue)
                 }
             }
-            "playbgm" => {
+            NativeFallbackTag::PlayBgm => {
                 play_kag_audio_tag(
                     runtime,
                     tag,
@@ -2271,7 +2312,7 @@ impl KagSession {
                 )?;
                 Ok(TagAction::Continue)
             }
-            "playse" => {
+            NativeFallbackTag::PlaySe => {
                 play_kag_audio_tag(
                     runtime,
                     tag,
@@ -2281,7 +2322,7 @@ impl KagSession {
                 )?;
                 Ok(TagAction::Continue)
             }
-            "playvoice" => {
+            NativeFallbackTag::PlayVoice => {
                 play_kag_audio_tag(
                     runtime,
                     tag,
@@ -2291,7 +2332,7 @@ impl KagSession {
                 )?;
                 Ok(TagAction::Continue)
             }
-            "stopbgm" => {
+            NativeFallbackTag::StopBgm => {
                 runtime
                     .host_mut()
                     .queue_audio_command(AudioCommand::StopBus {
@@ -2302,7 +2343,7 @@ impl KagSession {
                     });
                 Ok(TagAction::Continue)
             }
-            "stopse" | "stopvoice" => {
+            NativeFallbackTag::StopSe | NativeFallbackTag::StopVoice => {
                 runtime
                     .host_mut()
                     .queue_audio_command(AudioCommand::StopBus {
@@ -2313,14 +2354,12 @@ impl KagSession {
                     });
                 Ok(TagAction::Continue)
             }
-            "wq" | "wf" | "wb" | "wm" => Ok(self.wait(KagTaskState::WaitingAudio)),
-            "waitload" | "waittrig" => Ok(self.wait(KagTaskState::WaitingResource)),
-            "s" => {
+            NativeFallbackTag::WaitAudio => Ok(self.wait(KagTaskState::WaitingAudio)),
+            NativeFallbackTag::WaitResource => Ok(self.wait(KagTaskState::WaitingResource)),
+            NativeFallbackTag::Stop => {
                 self.state = KagTaskState::Finished;
                 Ok(TagAction::Yield(KagYieldReason::Finished))
             }
-            "defstyle" | "resetstyle" | "ruby" => Ok(TagAction::Continue),
-            _ => Ok(TagAction::Continue),
         }
     }
 
@@ -2392,7 +2431,7 @@ impl KagSession {
         Ok(())
     }
 
-    fn apply_handler_step(&mut self, tag: Tag, value: Variant) -> Result<TagAction> {
+    fn apply_tjs_handler_step(&mut self, tag: Tag, value: Variant) -> Result<TjsTagAction> {
         if matches!(value, Variant::Void) {
             self.state = KagTaskState::Error {
                 message: format!("KAG handler returned void for tag `{}`", tag.tagname),
@@ -2404,29 +2443,34 @@ impl KagSession {
         }
 
         let step = value.to_integer()?;
+        if step == TJS_NATIVE_FALLBACK_STEP {
+            return Ok(TjsTagAction::NativeFallback);
+        }
         Ok(match step {
-            0 => TagAction::Continue,
+            0 => TjsTagAction::Handled(TagAction::Continue),
             -5 => {
                 self.pending_tags.push_front(tag);
-                TagAction::Yield(KagYieldReason::HandlerYield)
+                TjsTagAction::Handled(TagAction::Yield(KagYieldReason::HandlerYield))
             }
-            -4 => TagAction::Yield(KagYieldReason::HandlerYield),
+            -4 => TjsTagAction::Handled(TagAction::Yield(KagYieldReason::HandlerYield)),
             -3 => {
                 self.pending_tags.push_front(tag);
-                TagAction::Yield(KagYieldReason::HandlerYield)
+                TjsTagAction::Handled(TagAction::Yield(KagYieldReason::HandlerYield))
             }
-            -2 => TagAction::Yield(KagYieldReason::HandlerYield),
+            -2 => TjsTagAction::Handled(TagAction::Yield(KagYieldReason::HandlerYield)),
             -1 => {
                 self.state = KagTaskState::Finished;
-                TagAction::Yield(KagYieldReason::Finished)
+                TjsTagAction::Handled(TagAction::Yield(KagYieldReason::Finished))
             }
             n if n > 0 => {
                 self.state = KagTaskState::WaitingTimer {
                     remaining: Duration::from_millis(n as u64),
                 };
-                TagAction::Yield(KagYieldReason::Waiting(self.state.clone()))
+                TjsTagAction::Handled(TagAction::Yield(KagYieldReason::Waiting(
+                    self.state.clone(),
+                )))
             }
-            _ => TagAction::Yield(KagYieldReason::HandlerYield),
+            _ => TjsTagAction::Handled(TagAction::Yield(KagYieldReason::HandlerYield)),
         })
     }
 
@@ -2446,6 +2490,107 @@ impl KagSession {
 enum TagAction {
     Continue,
     Yield(KagYieldReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TjsTagAction {
+    Handled(TagAction),
+    NativeFallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFallbackTag {
+    Ch,
+    R,
+    L,
+    P,
+    Font,
+    ResetFont,
+    Style,
+    Locate,
+    PText,
+    WaitClick,
+    Wait,
+    Eval,
+    Trace,
+    ClearText,
+    Image,
+    LayerOptions,
+    FreeImage,
+    Backlay,
+    Rclick,
+    TempSave,
+    TempLoad,
+    Noop,
+    GotoStart,
+    LayCount,
+    Current,
+    Trans,
+    Wt,
+    PlayBgm,
+    PlaySe,
+    PlayVoice,
+    StopBgm,
+    StopSe,
+    StopVoice,
+    WaitAudio,
+    WaitResource,
+    Stop,
+}
+
+impl NativeFallbackTag {
+    fn from_name(tagname: &str) -> Option<Self> {
+        Some(match tagname {
+            "ch" => Self::Ch,
+            "r" => Self::R,
+            "l" => Self::L,
+            "p" => Self::P,
+            "font" | "deffont" => Self::Font,
+            "resetfont" => Self::ResetFont,
+            "style" => Self::Style,
+            "locate" => Self::Locate,
+            "ptext" => Self::PText,
+            "waitclick" => Self::WaitClick,
+            "wait" => Self::Wait,
+            "eval" => Self::Eval,
+            "trace" => Self::Trace,
+            "cm" | "ct" | "er" => Self::ClearText,
+            "image" => Self::Image,
+            "layopt" | "position" => Self::LayerOptions,
+            "freeimage" => Self::FreeImage,
+            "backlay" => Self::Backlay,
+            "rclick" => Self::Rclick,
+            "tempsave" => Self::TempSave,
+            "tempload" => Self::TempLoad,
+            "commit" | "history" | "defstyle" | "resetstyle" | "ruby" => Self::Noop,
+            "gotostart" => Self::GotoStart,
+            "laycount" => Self::LayCount,
+            "current" => Self::Current,
+            "trans" => Self::Trans,
+            "wt" => Self::Wt,
+            "playbgm" => Self::PlayBgm,
+            "playse" => Self::PlaySe,
+            "playvoice" => Self::PlayVoice,
+            "stopbgm" => Self::StopBgm,
+            "stopse" => Self::StopSe,
+            "stopvoice" => Self::StopVoice,
+            "wq" | "wf" | "wb" | "wm" => Self::WaitAudio,
+            "waitload" | "waittrig" => Self::WaitResource,
+            "s" => Self::Stop,
+            _ => return None,
+        })
+    }
+}
+
+const TJS_NATIVE_FALLBACK_STEP: i64 = -1_000_000;
+
+fn push_unique_handler(candidates: &mut Vec<ObjectHandle>, handler: Option<ObjectHandle>) {
+    let Some(handler) = handler else {
+        return;
+    };
+    if !candidates.contains(&handler) {
+        candidates.push(handler);
+    }
 }
 
 fn call_tag_handler(
@@ -2836,53 +2981,6 @@ fn apply_laycount_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> 
         }
     }
     Ok(())
-}
-
-fn is_builtin_tag(tagname: &str) -> bool {
-    matches!(
-        tagname,
-        "ch" | "r"
-            | "p"
-            | "l"
-            | "font"
-            | "deffont"
-            | "resetfont"
-            | "style"
-            | "locate"
-            | "ptext"
-            | "wait"
-            | "waitclick"
-            | "eval"
-            | "trace"
-            | "cm"
-            | "ct"
-            | "er"
-            | "image"
-            | "layopt"
-            | "position"
-            | "freeimage"
-            | "backlay"
-            | "rclick"
-            | "tempsave"
-            | "tempload"
-            | "commit"
-            | "history"
-            | "gotostart"
-            | "laycount"
-            | "current"
-            | "trans"
-            | "wt"
-            | "wq"
-            | "wf"
-            | "wb"
-            | "wm"
-            | "waitload"
-            | "waittrig"
-            | "defstyle"
-            | "resetstyle"
-            | "ruby"
-            | "s"
-    )
 }
 
 #[cfg(test)]
@@ -4195,7 +4293,7 @@ mod tests {
         engine
             .kag_session
             .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
-                session.process_builtin_tag(parser, runtime, &tempsave)
+                session.process_native_fallback_tag(parser, runtime, &tempsave)
             })
             .expect("tempsave");
 
@@ -4208,7 +4306,7 @@ mod tests {
         engine
             .kag_session
             .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
-                session.process_builtin_tag(parser, runtime, &tempload)
+                session.process_native_fallback_tag(parser, runtime, &tempload)
             })
             .expect("tempload");
 
@@ -4327,7 +4425,7 @@ mod tests {
         let action = engine
             .kag_session
             .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
-                session.process_builtin_tag(parser, runtime, &tag)
+                session.process_native_fallback_tag(parser, runtime, &tag)
             })
             .expect("tempload");
         assert_eq!(action, TagAction::Continue);
@@ -4549,6 +4647,283 @@ mod tests {
                 .expect("f value"),
             Variant::Integer(7)
         );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_on_tag_handler_prevents_native_fallback_for_builtin_tags() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("bg.png"), 1, 1, &[255, 0, 0, 255]);
+        fs::write(
+            root.join("first.ks"),
+            "[ch text=A][image storage=bg.png layer=base page=fore][trans time=1000][s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var handler = new Dictionary();
+                handler.seen = "";
+                handler.onTag = function(elm) {
+                    this.seen += elm.tagname + ";";
+                    return 0;
+                };
+                return handler;
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(frame.tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, Vec::<String>::new());
+        assert!(frame.output.image_uploads.is_empty());
+        assert!(frame.output.transition.is_none());
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "seen"),
+            Variant::String("ch;image;trans;s;".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_handler_can_request_native_fallback_for_builtin_tag() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[ch text=A][s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                &format!(
+                    r#"
+                    var handler = new Dictionary();
+                    handler.onTag = function(elm) {{
+                        if(elm.tagname == "ch") return {};
+                        return 0;
+                    }};
+                    return handler;
+                    "#,
+                    TJS_NATIVE_FALLBACK_STEP
+                ),
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["A".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_without_tjs_handler_uses_native_fallback_message_path() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[r]B[p]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::WaitingClick);
+        assert_eq!(
+            engine.message_layer().lines,
+            vec!["A".to_string(), "B".to_string()]
+        );
+        assert!(engine.message_layer().waiting_for_click);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_native_audio_fallback_does_not_route_to_unknown_handler() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("music.ogg"), b"bgm bytes").expect("write bgm");
+        fs::write(root.join("first.ks"), "[playbgm storage=\"music.ogg\"][s]")
+            .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var handler = new Dictionary();
+                handler.seen = "";
+                handler.onUnknownTag = function(name, elm) {
+                    this.seen += name + ";";
+                    return 0;
+                };
+                return handler;
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "seen"),
+            Variant::String(String::new())
+        );
+        let commands = engine.host_mut().take_audio_commands();
+        assert!(matches!(
+            &commands[..],
+            [AudioCommand::Play {
+                bus: AudioBus::Bgm,
+                source,
+                ..
+            }] if source.storage() == "music.ogg"
+        ));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_global_conductor_handles_unknown_tag_without_explicit_session_handler() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[custom value=12][s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.conductor = new Dictionary();
+                kag.conductor.seen = "";
+                kag.conductor.onUnknownTag = function(name, elm) {
+                    this.seen = name + ":" + elm.value;
+                    return 0;
+                };
+                "#,
+            )
+            .expect("setup kag conductor");
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.conductor.seen")
+                .expect("seen"),
+            Variant::String("custom:12".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tjs_handler_positive_step_waits_and_resumes() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[waitclick][ch text=A]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var handler = new Dictionary();
+                handler.onTag = function(elm) {
+                    if(elm.tagname == "waitclick") return 5;
+                    return 0;
+                };
+                return handler;
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let first = engine.tick().expect("first tick");
+        assert!(matches!(first.state, KagTaskState::WaitingTimer { .. }));
+        assert_eq!(engine.message_layer().lines, Vec::<String>::new());
+
+        let second = engine
+            .advance(Duration::from_millis(5))
+            .expect("resume after handler wait");
+        assert_eq!(second.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, Vec::<String>::new());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_tjs_handler_error_sets_task_state_error() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[ch text=A]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var handler = new Dictionary();
+                handler.onTag = function(elm) {
+                    throw new Exception("tag boom");
+                };
+                return handler;
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let error = engine.tick().expect_err("handler error");
+
+        assert!(
+            error.to_string().contains("uncaught exception"),
+            "unexpected error: {error}"
+        );
+        assert!(matches!(
+            engine.kag_state(),
+            KagTaskState::Error { message } if message.contains("uncaught exception")
+        ));
+        assert_eq!(engine.message_layer().lines, Vec::<String>::new());
 
         fs::remove_dir_all(root).expect("cleanup");
     }
