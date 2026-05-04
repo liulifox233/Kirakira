@@ -286,6 +286,7 @@ impl<'a> Lexer<'a> {
         let mut chars = source.char_indices();
         let lookahead = chars.next();
         let mut pp_values = BTreeMap::new();
+        pp_values.insert("kirikiriz".to_string(), 1);
         pp_values.insert("version".to_string(), 0x02040009);
         Self {
             source,

@@ -135,14 +135,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let global = self.runtime.global;
             let this_obj = this_obj.or(Some(global));
             let this_proxy = self.runtime.alloc_proxy_bound(this_obj, global, None);
-            let super_class =
-                self.super_class_for_parts(file.as_ref(), &code_handles, &decoded.object)?;
-            let super_proxy = self.runtime.alloc_proxy_bound(
-                super_class.or(this_obj),
-                global,
-                super_class.and(this_obj),
-            );
-            let mut frame = Frame::new(&decoded.object, args, this_obj, this_proxy, super_proxy)?;
+            let mut frame = Frame::new(&decoded.object, args, this_obj, this_proxy)?;
             if let Some(collapse_base) = decoded.object.func_decl_collapse_base {
                 let base = collapse_base as usize;
                 let rest = if caller_args.len() > base {
@@ -151,7 +144,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     Vec::new()
                 };
                 let array = self.runtime.alloc_array_object(rest);
-                frame.set(-4 - collapse_base as i16, Variant::Object(array))?;
+                frame.set(-3 - collapse_base as i16, Variant::Object(array))?;
             }
             let pc = decoded
                 .offset_to_index
@@ -161,6 +154,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             Ok(CallFrame {
                 file_id,
                 file,
+                object_handle: code_handles
+                    .get(object_index)
+                    .copied()
+                    .ok_or_else(|| TjsError::runtime(format!("object {object_index} missing")))?,
                 code_handles,
                 object: decoded.object,
                 instructions: decoded.instructions,
@@ -211,6 +208,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
 
             match self.execute_instruction(
                 &call_frame.object,
+                call_frame.object_handle,
                 &mut call_frame.frame,
                 &inst,
                 next_pc,
@@ -351,6 +349,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     fn execute_instruction(
         &mut self,
         object: &CodeObject,
+        object_handle: ObjectHandle,
         frame: &mut Frame,
         inst: &Instruction,
         next_pc: usize,
@@ -439,11 +438,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let value = self.typeof_indirect(frame, inst, DispatchFlags::must_exist())?;
                 frame.set(inst.operands[0], value)?;
             }
-            86 | 87 => {
-                return Err(TjsError::runtime(
-                    "eval/eexp bytecode execution is not wired to a host script context yet",
-                ));
-            }
+            86 | 87 => self.eval_operator(frame, inst.operands[0], inst.opcode == 86)?,
             88 => {
                 let class_name = frame.get(inst.operands[1])?.to_tjs_string()?;
                 let value = self.instance_of(&frame.get(inst.operands[0])?, &class_name)?;
@@ -695,7 +690,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             123 => {
                 let mut value = frame.get(inst.operands[0])?;
-                let this = self.resolve_object(frame.get(inst.operands[1])?)?;
+                let this = self.optional_object(frame.get(inst.operands[1])?)?;
                 self.change_this(&mut value, this)?;
                 frame.set(inst.operands[0], value)?;
             }
@@ -753,7 +748,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         "regmember has no destination this object",
                     ));
                 };
-                self.register_object_members(object, dest)?;
+                self.register_object_members(object_handle, dest);
             }
             _ => {
                 return Err(TjsError::runtime(format!(
@@ -796,31 +791,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 .unwrap_or(Variant::CodeObject(index)),
             value => value,
         }
-    }
-
-    fn super_class_for_parts(
-        &mut self,
-        file: &BytecodeFile,
-        code_handles: &[ObjectHandle],
-        object: &CodeObject,
-    ) -> Result<Option<ObjectHandle>> {
-        if object.context_type == BytecodeContextType::SuperClassGetter {
-            return Ok(None);
-        }
-        let mut current = object.parent;
-        while let Some(object_index) = current {
-            let Some(parent) = file.objects.get(object_index) else {
-                return Ok(None);
-            };
-            if parent.context_type == BytecodeContextType::Class {
-                let Some(class_handle) = code_handles.get(object_index).copied() else {
-                    return Ok(None);
-                };
-                return self.super_class_handle(class_handle);
-            }
-            current = parent.parent;
-        }
-        Ok(None)
     }
 
     pub(super) fn value_debug_type(&self, value: &Variant) -> String {
