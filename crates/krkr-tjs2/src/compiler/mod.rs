@@ -175,6 +175,18 @@ mod tests {
     }
 
     #[test]
+    fn execute_source_array_count_assignment_resizes_elements() {
+        assert_eq!(
+            execute_source(
+                "array_count_set.tjs",
+                "var a = [1, 2, 3]; a.count = 1; a[1] = 9; a.length = 4; return a.count + ':' + a.join(',');"
+            )
+            .expect("execute"),
+            Variant::String("4:1,9,,".to_string())
+        );
+    }
+
+    #[test]
     fn execute_source_runs_direct_and_indirect_method_calls() {
         assert_eq!(
             execute_source("inline.tjs", r#"return "abcd".substr(1, 2);"#).expect("execute"),
