@@ -333,10 +333,136 @@ pub enum DrawCommand {
     Image(ImageCommand),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TransitionMethod {
+    Crossfade = 0,
+    Universal = 1,
+    Scroll = 2,
+    Wave = 3,
+    Mosaic = 4,
+    Turn = 5,
+    RotateZoom = 6,
+    RotateVanish = 7,
+    RotateSwap = 8,
+    Ripple = 9,
+}
+
+impl TransitionMethod {
+    pub fn from_name(name: &str) -> Self {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "universal" => Self::Universal,
+            "scroll" => Self::Scroll,
+            "wave" => Self::Wave,
+            "mosaic" => Self::Mosaic,
+            "turn" => Self::Turn,
+            "rotatezoom" => Self::RotateZoom,
+            "rotatevanish" => Self::RotateVanish,
+            "rotateswap" => Self::RotateSwap,
+            "ripple" => Self::Ripple,
+            "crossfade" | "" => Self::Crossfade,
+            _ => Self::Crossfade,
+        }
+    }
+
+    pub const fn as_code(self) -> f32 {
+        self as u8 as f32
+    }
+
+    pub const fn as_name(self) -> &'static str {
+        match self {
+            Self::Crossfade => "crossfade",
+            Self::Universal => "universal",
+            Self::Scroll => "scroll",
+            Self::Wave => "wave",
+            Self::Mosaic => "mosaic",
+            Self::Turn => "turn",
+            Self::RotateZoom => "rotatezoom",
+            Self::RotateVanish => "rotatevanish",
+            Self::RotateSwap => "rotateswap",
+            Self::Ripple => "ripple",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TransitionScrollFrom {
+    Left = 0,
+    Top = 1,
+    Right = 2,
+    Bottom = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TransitionScrollStay {
+    NoStay = 0,
+    StayDest = 1,
+    StaySrc = 2,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransitionParams {
+    pub method: TransitionMethod,
+    pub vague: f32,
+    pub scroll_from: TransitionScrollFrom,
+    pub scroll_stay: TransitionScrollStay,
+    pub wave_type: f32,
+    pub max_h: f32,
+    pub max_omega: f32,
+    pub bg_color1: Color,
+    pub bg_color2: Color,
+    pub max_size: f32,
+    pub bg_color: Color,
+    pub factor: f32,
+    pub accel: f32,
+    pub twist: f32,
+    pub twist_accel: f32,
+    pub center_x: f32,
+    pub center_y: f32,
+    pub ripple_width: f32,
+    pub roundness: f32,
+    pub speed: f32,
+    pub max_drift: f32,
+}
+
+impl Default for TransitionParams {
+    fn default() -> Self {
+        Self {
+            method: TransitionMethod::Crossfade,
+            vague: 64.0,
+            scroll_from: TransitionScrollFrom::Left,
+            scroll_stay: TransitionScrollStay::NoStay,
+            wave_type: 0.0,
+            max_h: 50.0,
+            max_omega: 0.2,
+            bg_color1: Color::new(0.0, 0.0, 0.0, 1.0),
+            bg_color2: Color::new(0.0, 0.0, 0.0, 1.0),
+            max_size: 30.0,
+            bg_color: Color::new(0.0, 0.0, 0.0, 1.0),
+            factor: 1.0,
+            accel: 0.0,
+            twist: 2.0,
+            twist_accel: -2.0,
+            center_x: -1.0,
+            center_y: -1.0,
+            ripple_width: 128.0,
+            roundness: 1.0,
+            speed: 6.0,
+            max_drift: 24.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameTransition {
     pub method: String,
     pub progress: f32,
+    pub params: TransitionParams,
+    pub rule_texture_id: Option<TextureId>,
+    pub rule_image_upload: Option<ImageUpload>,
     pub frozen_draw_commands: Vec<DrawCommand>,
     pub frozen_image_uploads: Vec<ImageUpload>,
 }
@@ -350,6 +476,9 @@ impl FrameTransition {
         Self {
             method: "crossfade".to_string(),
             progress: progress.clamp(0.0, 1.0),
+            params: TransitionParams::default(),
+            rule_texture_id: None,
+            rule_image_upload: None,
             frozen_draw_commands,
             frozen_image_uploads,
         }
@@ -1243,11 +1372,18 @@ impl Engine {
         if let Some(transition) = &mut output.transition {
             transition.frozen_image_uploads =
                 self.filter_new_image_uploads(std::mem::take(&mut transition.frozen_image_uploads));
+            if let Some(upload) = transition.rule_image_upload.take() {
+                let mut uploads = self.filter_new_image_uploads(vec![upload]);
+                transition.rule_image_upload = uploads.pop();
+            }
         }
         let mut referenced_textures = BTreeSet::new();
         collect_image_texture_ids(&output.draw_commands, &mut referenced_textures);
         if let Some(transition) = &output.transition {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced_textures);
+            if let Some(texture_id) = transition.rule_texture_id {
+                referenced_textures.insert(texture_id);
+            }
         }
         self.uploaded_images
             .retain(|texture_id, _| referenced_textures.contains(texture_id));

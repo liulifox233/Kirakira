@@ -5,9 +5,10 @@ use std::{
 };
 
 use krkr_core::{
-    AudioBus, AudioCommand, AudioLoadPolicy, ButtonState, Engine as CoreEngine,
-    EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput, FrameOutput, LayerId,
-    MessageLayerModel, Point, PointerButton, Size,
+    AudioBus, AudioCommand, AudioLoadPolicy, ButtonState, Color, Engine as CoreEngine,
+    EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput, FrameOutput, ImageUpload,
+    LayerId, MessageLayerModel, Point, PointerButton, Size, TransitionMethod, TransitionParams,
+    TransitionScrollFrom, TransitionScrollStay,
 };
 use krkr_kag::{KagError, KagParser, ParserSnapshot, Tag};
 use krkr_tjs2::{
@@ -2290,9 +2291,11 @@ impl KagSession {
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::Trans => {
-                let method = tag.literal_attr("method").unwrap_or("crossfade");
                 let duration = tag_millis(tag, "time").unwrap_or(Duration::ZERO);
-                runtime.host_mut().begin_kag_transition(method, duration);
+                let (params, rule_image_upload) = kag_transition_spec(runtime, tag)?;
+                runtime
+                    .host_mut()
+                    .begin_kag_transition(duration, params, rule_image_upload);
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::Wt => {
@@ -2610,6 +2613,168 @@ fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
     tag.attr(name)
         .and_then(|value| value.raw().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn kag_transition_spec(
+    runtime: &mut Runtime<KrkrHost>,
+    tag: &Tag,
+) -> Result<(TransitionParams, Option<ImageUpload>)> {
+    let method = tag
+        .literal_attr("method")
+        .or_else(|| tag.literal_attr("rule").map(|_| "universal"))
+        .unwrap_or("crossfade")
+        .to_ascii_lowercase();
+    let mut params = TransitionParams {
+        method: TransitionMethod::from_name(&method),
+        ..TransitionParams::default()
+    };
+    match params.method {
+        TransitionMethod::RotateVanish => {
+            params.accel = 2.0;
+            params.twist_accel = 2.0;
+        }
+        TransitionMethod::RotateSwap => {
+            params.twist = 1.0;
+        }
+        _ => {}
+    }
+
+    if let Some(value) = kag_f32_attr(tag, "vague")? {
+        params.vague = value.max(0.0);
+    }
+    if let Some(value) = kag_scroll_from_attr(tag, "from")? {
+        params.scroll_from = value;
+    }
+    if let Some(value) = kag_scroll_stay_attr(tag, "stay")? {
+        params.scroll_stay = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "wavetype")? {
+        params.wave_type = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "maxh")? {
+        params.max_h = value.max(0.0);
+    }
+    if let Some(value) = kag_f32_attr(tag, "maxomega")? {
+        params.max_omega = value.max(0.0);
+    }
+    if let Some(value) = kag_transition_color_attr(tag, "bgcolor1")? {
+        params.bg_color1 = value;
+    }
+    if let Some(value) = kag_transition_color_attr(tag, "bgcolor2")? {
+        params.bg_color2 = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "maxsize")? {
+        params.max_size = value.max(1.0);
+    }
+    if let Some(value) = kag_transition_color_attr(tag, "bgcolor")? {
+        params.bg_color = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "factor")? {
+        params.factor = value.max(0.0);
+    }
+    if let Some(value) = kag_f32_attr(tag, "accel")? {
+        params.accel = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "twist")? {
+        params.twist = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "twistaccel")? {
+        params.twist_accel = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "centerx")? {
+        params.center_x = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "centery")? {
+        params.center_y = value;
+    }
+    if let Some(value) = kag_f32_attr(tag, "rwidth")? {
+        params.ripple_width = value.max(1.0);
+    }
+    if let Some(value) = kag_f32_attr(tag, "roundness")? {
+        params.roundness = value.max(0.01);
+    }
+    if let Some(value) = kag_f32_attr(tag, "speed")? {
+        params.speed = value.max(0.01);
+    }
+    if let Some(value) = kag_f32_attr(tag, "maxdrift")? {
+        params.max_drift = value.max(0.0);
+    }
+
+    let rule_image_upload = if params.method == TransitionMethod::Universal {
+        match tag.literal_attr("rule") {
+            Some(rule) => Some(runtime.host_mut().load_image_storage(rule)?.upload),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    Ok((params, rule_image_upload))
+}
+
+fn kag_f32_attr(tag: &Tag, name: &str) -> Result<Option<f32>> {
+    tag.literal_attr(name)
+        .map(|value| {
+            parse_kag_number(value)
+                .map(|value| value as f32)
+                .map_err(|error| {
+                    TjsError::runtime(format!("invalid KAG {name} value `{value}`: {error}"))
+                })
+        })
+        .transpose()
+}
+
+fn parse_kag_number(value: &str) -> std::result::Result<f64, String> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return i64::from_str_radix(hex, 16)
+            .map(|value| value as f64)
+            .map_err(|error| error.to_string());
+    }
+    trimmed.parse::<f64>().map_err(|error| error.to_string())
+}
+
+fn kag_transition_color_attr(tag: &Tag, name: &str) -> Result<Option<Color>> {
+    let Some([r, g, b, _]) = parse_color_attr(tag, name)? else {
+        return Ok(None);
+    };
+    Ok(Some(Color::rgb_u8(r, g, b)))
+}
+
+fn kag_scroll_from_attr(tag: &Tag, name: &str) -> Result<Option<TransitionScrollFrom>> {
+    let Some(value) = tag.literal_attr(name) else {
+        return Ok(None);
+    };
+    Ok(Some(match value {
+        "left" | "0" => TransitionScrollFrom::Left,
+        "top" | "1" => TransitionScrollFrom::Top,
+        "right" | "2" => TransitionScrollFrom::Right,
+        "bottom" | "3" => TransitionScrollFrom::Bottom,
+        _ => {
+            return Err(TjsError::runtime(format!(
+                "invalid KAG {name} value `{value}`"
+            )));
+        }
+    }))
+}
+
+fn kag_scroll_stay_attr(tag: &Tag, name: &str) -> Result<Option<TransitionScrollStay>> {
+    let Some(value) = tag.literal_attr(name) else {
+        return Ok(None);
+    };
+    Ok(Some(match value {
+        "nostay" | "0" => TransitionScrollStay::NoStay,
+        "stayfore" | "1" => TransitionScrollStay::StayDest,
+        "stayback" | "2" => TransitionScrollStay::StaySrc,
+        _ => {
+            return Err(TjsError::runtime(format!(
+                "invalid KAG {name} value `{value}`"
+            )));
+        }
+    }))
 }
 
 fn play_kag_audio_tag(
@@ -5486,6 +5651,132 @@ mod tests {
         assert!(frame.output.transition.is_none());
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_universal_transition_carries_rule_image_and_options() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("fore.png"), 1, 1, &[255, 255, 255, 255]);
+        write_png(root.join("back.png"), 1, 1, &[0, 0, 0, 255]);
+        write_png(
+            root.join("rule.png"),
+            2,
+            1,
+            &[0, 0, 0, 255, 255, 255, 255, 255],
+        );
+        fs::write(
+            root.join("first.ks"),
+            concat!(
+                "[image storage=fore.png layer=base page=fore]",
+                "[image storage=back.png layer=base page=back]",
+                "[trans method=universal rule=rule vague=32 time=1000][wt][s]"
+            ),
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("start transition");
+
+        let transition = frame.output.transition.as_ref().expect("transition");
+        assert_eq!(transition.method, "universal");
+        assert_eq!(
+            transition.params.method,
+            krkr_core::TransitionMethod::Universal
+        );
+        assert_eq!(transition.params.vague, 32.0);
+        assert!(transition.rule_texture_id.is_some());
+        assert!(transition.rule_image_upload.is_some());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_extrans_transition_methods_carry_effect_options() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("fore.png"), 1, 1, &[255, 255, 255, 255]);
+        write_png(root.join("back.png"), 1, 1, &[0, 0, 0, 255]);
+        fs::write(
+            root.join("first.ks"),
+            concat!(
+                "[image storage=fore.png layer=base page=fore]",
+                "[image storage=back.png layer=base page=back]",
+                "[trans method=wave wavetype=2 maxh=20 maxomega=0.1 bgcolor1=0xff0000 bgcolor2=0x0000ff time=1000][wt][s]"
+            ),
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("start transition");
+
+        let transition = frame.output.transition.as_ref().expect("transition");
+        assert_eq!(transition.method, "wave");
+        assert_eq!(transition.params.method, krkr_core::TransitionMethod::Wave);
+        assert_eq!(transition.params.wave_type, 2.0);
+        assert_eq!(transition.params.max_h, 20.0);
+        assert!((transition.params.max_omega - 0.1).abs() < 0.001);
+        assert_eq!(transition.params.bg_color1, Color::rgb_u8(255, 0, 0));
+        assert_eq!(transition.params.bg_color2, Color::rgb_u8(0, 0, 255));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_transition_methods_include_krkr2_and_extrans_names() {
+        for (method, expected) in [
+            ("crossfade", krkr_core::TransitionMethod::Crossfade),
+            ("universal", krkr_core::TransitionMethod::Universal),
+            ("scroll", krkr_core::TransitionMethod::Scroll),
+            ("wave", krkr_core::TransitionMethod::Wave),
+            ("mosaic", krkr_core::TransitionMethod::Mosaic),
+            ("turn", krkr_core::TransitionMethod::Turn),
+            ("rotatezoom", krkr_core::TransitionMethod::RotateZoom),
+            ("rotatevanish", krkr_core::TransitionMethod::RotateVanish),
+            ("rotateswap", krkr_core::TransitionMethod::RotateSwap),
+            ("ripple", krkr_core::TransitionMethod::Ripple),
+        ] {
+            let root = temp_root();
+            fs::create_dir_all(&root).expect("create temp root");
+            write_png(root.join("fore.png"), 1, 1, &[255, 255, 255, 255]);
+            write_png(root.join("back.png"), 1, 1, &[0, 0, 0, 255]);
+            write_png(root.join("rule.png"), 1, 1, &[0, 0, 0, 255]);
+            fs::write(
+                root.join("first.ks"),
+                format!(
+                    "[image storage=fore.png layer=base page=fore]\
+                     [image storage=back.png layer=base page=back]\
+                     [trans method={method} rule=rule.png time=1000][wt][s]"
+                ),
+            )
+            .expect("write scenario");
+
+            let mut engine = KrkrEngine::for_project(&root).expect("engine");
+            engine.load_kag_scenario("first.ks").expect("load scenario");
+            let frame = engine
+                .update(
+                    EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                    Duration::ZERO,
+                )
+                .expect("start transition");
+            let transition = frame.output.transition.as_ref().expect("transition");
+            assert_eq!(transition.method, method);
+            assert_eq!(transition.params.method, expected);
+
+            fs::remove_dir_all(root).expect("cleanup");
+        }
     }
 
     #[test]

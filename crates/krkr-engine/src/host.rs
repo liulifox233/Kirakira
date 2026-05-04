@@ -8,7 +8,7 @@ use std::{
 use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, DrawCommand,
     FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceData,
-    ResourceProvider,
+    ResourceProvider, TextureId, TransitionParams,
 };
 use krkr_font::FontSystem;
 use krkr_kag::KagParser;
@@ -1588,7 +1588,12 @@ impl KrkrHost {
         self.active_transition = None;
     }
 
-    pub(crate) fn begin_kag_transition(&mut self, method: &str, duration: Duration) {
+    pub(crate) fn begin_kag_transition(
+        &mut self,
+        duration: Duration,
+        params: TransitionParams,
+        rule_image_upload: Option<ImageUpload>,
+    ) {
         self.complete_active_transition();
         if self.pending_kag_layers.is_empty() {
             self.active_transition = None;
@@ -1603,7 +1608,9 @@ impl KrkrHost {
         let (frozen_draw_commands, frozen_image_uploads) = self.layer_tree.draw_model();
         self.apply_pending_kag_layers();
         self.active_transition = Some(ActiveTransition {
-            method: normalize_transition_method(method).to_string(),
+            params,
+            rule_texture_id: rule_image_upload.as_ref().map(|upload| upload.texture_id),
+            rule_image_upload,
             elapsed: Duration::ZERO,
             duration,
             frozen_draw_commands,
@@ -1616,8 +1623,9 @@ impl KrkrHost {
 
     pub(crate) fn begin_native_transition(
         &mut self,
-        method: &str,
         duration: Duration,
+        params: TransitionParams,
+        rule_image_upload: Option<ImageUpload>,
         frozen_model: (Vec<DrawCommand>, Vec<ImageUpload>),
         suppressed_live_images: BTreeSet<LayerId>,
         live_layer_overrides: BTreeMap<LayerId, LayerNode>,
@@ -1631,7 +1639,9 @@ impl KrkrHost {
         }
 
         self.active_transition = Some(ActiveTransition {
-            method: normalize_transition_method(method).to_string(),
+            params,
+            rule_texture_id: rule_image_upload.as_ref().map(|upload| upload.texture_id),
+            rule_image_upload,
             elapsed: Duration::ZERO,
             duration,
             frozen_draw_commands: frozen_model.0,
@@ -1687,8 +1697,11 @@ impl KrkrHost {
             transition.elapsed.as_secs_f32() / transition.duration.as_secs_f32()
         };
         Some(FrameTransition {
-            method: transition.method.clone(),
+            method: transition.params.method.as_name().to_string(),
             progress: progress.clamp(0.0, 1.0),
+            params: transition.params.clone(),
+            rule_texture_id: transition.rule_texture_id,
+            rule_image_upload: transition.rule_image_upload.clone(),
             frozen_draw_commands: transition.frozen_draw_commands.clone(),
             frozen_image_uploads: transition.frozen_image_uploads.clone(),
         })
@@ -1875,13 +1888,6 @@ fn copy_layer_node_render_content(dest: &mut LayerNode, source: &LayerNode) {
     dest.image = source.image.clone();
 }
 
-fn normalize_transition_method(method: &str) -> &str {
-    match method {
-        "crossfade" | "" => "crossfade",
-        _ => "crossfade",
-    }
-}
-
 fn kag_layer_z_order(layer: &str) -> i32 {
     if layer == "base" || layer == "background" {
         return 0;
@@ -2058,7 +2064,9 @@ fn krkr_volume_product_to_linear(volume: i64, volume2: i64, global_volume: i64) 
 
 #[derive(Clone)]
 struct ActiveTransition {
-    method: String,
+    params: TransitionParams,
+    rule_texture_id: Option<TextureId>,
+    rule_image_upload: Option<ImageUpload>,
     elapsed: Duration,
     duration: Duration,
     frozen_draw_commands: Vec<DrawCommand>,
