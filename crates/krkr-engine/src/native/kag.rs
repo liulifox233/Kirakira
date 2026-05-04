@@ -1,6 +1,6 @@
 use krkr_kag::{
-    Attribute, AttributeValue, CallFrame, DebugLevel, KagError, KagHost, KagParser, LabelEvent,
-    ParserSnapshot, ScenarioLoadEvent, ScriptEvent, Tag,
+    CallFrame, DebugLevel, KagError, KagHost, KagParser, LabelEvent, ParserSnapshot,
+    ScenarioLoadEvent, ScriptEvent, Tag,
 };
 use krkr_tjs2::{
     Result, TjsError,
@@ -10,6 +10,7 @@ use krkr_tjs2::{
 
 use crate::{
     host::KrkrHost,
+    kag::{attributes_to_dictionary, tag_to_dictionary},
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
 
@@ -21,6 +22,20 @@ pub(crate) fn install_kag_parser(runtime: &mut Runtime<KrkrHost>) {
     install_kag_parser_methods(runtime, handle);
 }
 
+pub(crate) fn create_kag_parser_object(runtime: &mut Runtime<KrkrHost>) -> Result<ObjectHandle> {
+    let handle = runtime.alloc_ordinary_object();
+    initialize_kag_parser_object(runtime, handle, KagParser::new())?;
+    Ok(handle)
+}
+
+pub(crate) fn refresh_kag_parser_object(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    parser: &KagParser,
+) -> Result<()> {
+    refresh_kag_parser_members_from_parser(runtime, handle, parser)
+}
+
 fn kag_parser_constructor(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -29,13 +44,20 @@ fn kag_parser_constructor(
     let handle = this_obj
         .filter(|handle| *handle != runtime.global_handle())
         .unwrap_or_else(|| runtime.alloc_ordinary_object());
+    initialize_kag_parser_object(runtime, handle, KagParser::new())?;
+    Ok(Variant::Object(handle))
+}
+
+fn initialize_kag_parser_object(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    parser: KagParser,
+) -> Result<()> {
     runtime.add_object_class_info(handle, "KAGParser");
     install_kag_parser_methods(runtime, handle);
-    runtime
-        .host_mut()
-        .insert_kag_parser(handle, KagParser::new());
+    runtime.host_mut().insert_kag_parser(handle, parser);
     refresh_kag_parser_members(runtime, handle)?;
-    Ok(Variant::Object(handle))
+    Ok(())
 }
 
 fn install_kag_parser_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -125,6 +147,7 @@ fn kag_load_scenario(
         vm,
         this_obj,
         "KAGParser.loadScenario",
+        true,
         |parser, vm, owner| {
             let mut host = TjsKagHost::new(vm, owner);
             parser
@@ -141,7 +164,7 @@ fn kag_go_to_label(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let label = required_arg_string(&args, 0, "KAGParser.goToLabel")?;
-    with_parser(vm, this_obj, "KAGParser.goToLabel", |parser, _, _| {
+    with_parser(vm, this_obj, "KAGParser.goToLabel", true, |parser, _, _| {
         parser.go_to_label(&label).map_err(kag_to_tjs)?;
         Ok(Variant::Void)
     })
@@ -153,7 +176,7 @@ fn kag_call_label(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let label = required_arg_string(&args, 0, "KAGParser.callLabel")?;
-    with_parser(vm, this_obj, "KAGParser.callLabel", |parser, _, _| {
+    with_parser(vm, this_obj, "KAGParser.callLabel", true, |parser, _, _| {
         parser.call_label(&label).map_err(kag_to_tjs)?;
         Ok(Variant::Void)
     })
@@ -164,16 +187,22 @@ fn kag_get_next_tag(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    with_parser(vm, this_obj, "KAGParser.getNextTag", |parser, vm, owner| {
-        let mut host = TjsKagHost::new(vm, owner);
-        let Some(tag) = parser.next_tag_with(&mut host).map_err(kag_to_tjs)? else {
-            return Ok(Variant::Void);
-        };
-        Ok(Variant::Object(tag_to_dictionary(
-            host.vm.runtime_mut(),
-            &tag,
-        )?))
-    })
+    with_parser(
+        vm,
+        this_obj,
+        "KAGParser.getNextTag",
+        true,
+        |parser, vm, owner| {
+            let mut host = TjsKagHost::new(vm, owner);
+            let Some(tag) = parser.next_tag_with(&mut host).map_err(kag_to_tjs)? else {
+                return Ok(Variant::Void);
+            };
+            Ok(Variant::Object(tag_to_dictionary(
+                host.vm.runtime_mut(),
+                &tag,
+            )?))
+        },
+    )
 }
 
 fn kag_assign(
@@ -193,7 +222,7 @@ fn kag_assign(
         .kag_parser(source_handle)
         .cloned()
         .ok_or_else(|| TjsError::runtime("KAGParser.assign requires a KAGParser"))?;
-    with_parser(vm, this_obj, "KAGParser.assign", |parser, _, _| {
+    with_parser(vm, this_obj, "KAGParser.assign", true, |parser, _, _| {
         parser.assign(&source);
         Ok(Variant::Void)
     })
@@ -204,7 +233,7 @@ fn kag_clear(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    with_parser(vm, this_obj, "KAGParser.clear", |parser, _, _| {
+    with_parser(vm, this_obj, "KAGParser.clear", true, |parser, _, _| {
         parser.clear();
         Ok(Variant::Void)
     })
@@ -215,7 +244,7 @@ fn kag_store(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    with_parser(vm, this_obj, "KAGParser.store", |parser, vm, _| {
+    with_parser(vm, this_obj, "KAGParser.store", false, |parser, vm, _| {
         let runtime = vm.runtime_mut();
         let snapshot = parser.store();
         let id = runtime.host_mut().store_kag_snapshot(snapshot);
@@ -257,7 +286,7 @@ fn kag_restore(
         ));
     };
     let snapshot = snapshot_from_object(vm.runtime(), snapshot_object)?;
-    with_parser(vm, this_obj, "KAGParser.restore", |parser, _, _| {
+    with_parser(vm, this_obj, "KAGParser.restore", true, |parser, _, _| {
         parser.restore(snapshot).map_err(kag_to_tjs)?;
         Ok(Variant::Void)
     })
@@ -268,10 +297,16 @@ fn kag_clear_call_stack(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    with_parser(vm, this_obj, "KAGParser.clearCallStack", |parser, _, _| {
-        parser.clear_call_stack();
-        Ok(Variant::Void)
-    })
+    with_parser(
+        vm,
+        this_obj,
+        "KAGParser.clearCallStack",
+        true,
+        |parser, _, _| {
+            parser.clear_call_stack();
+            Ok(Variant::Void)
+        },
+    )
 }
 
 fn kag_interrupt(
@@ -279,7 +314,7 @@ fn kag_interrupt(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    with_parser(vm, this_obj, "KAGParser.interrupt", |parser, _, _| {
+    with_parser(vm, this_obj, "KAGParser.interrupt", true, |parser, _, _| {
         parser.interrupt();
         Ok(Variant::Void)
     })
@@ -290,10 +325,16 @@ fn kag_reset_interrupt(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    with_parser(vm, this_obj, "KAGParser.resetInterrupt", |parser, _, _| {
-        parser.reset_interrupt();
-        Ok(Variant::Void)
-    })
+    with_parser(
+        vm,
+        this_obj,
+        "KAGParser.resetInterrupt",
+        true,
+        |parser, _, _| {
+            parser.reset_interrupt();
+            Ok(Variant::Void)
+        },
+    )
 }
 
 fn kag_pop_macro_args(
@@ -301,16 +342,23 @@ fn kag_pop_macro_args(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    with_parser(vm, this_obj, "KAGParser.popMacroArgs", |parser, _, _| {
-        parser.pop_macro_args().map_err(kag_to_tjs)?;
-        Ok(Variant::Void)
-    })
+    with_parser(
+        vm,
+        this_obj,
+        "KAGParser.popMacroArgs",
+        true,
+        |parser, _, _| {
+            parser.pop_macro_args().map_err(kag_to_tjs)?;
+            Ok(Variant::Void)
+        },
+    )
 }
 
 fn with_parser<F>(
     vm: &mut Vm<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     method: &str,
+    mutation: bool,
     f: F,
 ) -> Result<Variant>
 where
@@ -331,6 +379,9 @@ where
             .insert_kag_parser(handle, parser.clone());
         let result = f(&mut parser, vm, handle);
         refresh_kag_parser_members_from_parser(vm.runtime_mut(), handle, &parser)?;
+        if mutation && result.is_ok() {
+            vm.runtime_mut().host_mut().mark_kag_parser_changed(handle);
+        }
         result
     })();
 
@@ -612,46 +663,6 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
     fn on_after_return(&mut self, _frame: &CallFrame) -> krkr_kag::Result<()> {
         self.call_event("onAfterReturn", Vec::new())?;
         Ok(())
-    }
-}
-
-fn tag_to_dictionary(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<ObjectHandle> {
-    let object = runtime.alloc_ordinary_object();
-    runtime.add_object_class_info(object, "Dictionary");
-    runtime.set_object_member(object, "tagname", Variant::String(tag.tagname.clone()));
-    for attribute in &tag.attributes {
-        if let Attribute::Named { name, value } = attribute {
-            runtime.set_object_member(object, name, attribute_value_to_variant(value)?);
-        }
-    }
-    Ok(object)
-}
-
-fn attributes_to_dictionary(
-    runtime: &mut Runtime<KrkrHost>,
-    attributes: &[Attribute],
-) -> Result<ObjectHandle> {
-    let object = runtime.alloc_ordinary_object();
-    runtime.add_object_class_info(object, "Dictionary");
-    for attribute in attributes {
-        if let Attribute::Named { name, value } = attribute {
-            runtime.set_object_member(object, name, attribute_value_to_variant(value)?);
-        }
-    }
-    Ok(object)
-}
-
-fn attribute_value_to_variant(value: &AttributeValue) -> Result<Variant> {
-    Ok(raw_attribute_value_to_variant(value.raw()))
-}
-
-fn raw_attribute_value_to_variant(value: &str) -> Variant {
-    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
-        Variant::Integer(1)
-    } else if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") {
-        Variant::Integer(0)
-    } else {
-        Variant::String(value.to_string())
     }
 }
 

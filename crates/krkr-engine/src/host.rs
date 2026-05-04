@@ -38,6 +38,7 @@ pub struct KrkrHost {
     logs: Vec<String>,
     linked_plugins: BTreeSet<String>,
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
+    kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
     kag_snapshots: BTreeMap<i64, ParserSnapshot>,
     next_kag_snapshot_id: i64,
     layer_tree: LayerTree,
@@ -78,6 +79,7 @@ impl Default for KrkrHost {
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
             kag_parsers: BTreeMap::new(),
+            kag_parser_revisions: BTreeMap::new(),
             kag_snapshots: BTreeMap::new(),
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
@@ -128,6 +130,7 @@ impl KrkrHost {
             logs: Vec::new(),
             linked_plugins: BTreeSet::new(),
             kag_parsers: BTreeMap::new(),
+            kag_parser_revisions: BTreeMap::new(),
             kag_snapshots: BTreeMap::new(),
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
@@ -329,6 +332,7 @@ impl KrkrHost {
     }
 
     pub(crate) fn insert_kag_parser(&mut self, handle: ObjectHandle, parser: KagParser) {
+        self.kag_parser_revisions.entry(handle).or_insert(0);
         self.kag_parsers.insert(handle, parser);
     }
 
@@ -338,6 +342,15 @@ impl KrkrHost {
 
     pub(crate) fn take_kag_parser(&mut self, handle: ObjectHandle) -> Option<KagParser> {
         self.kag_parsers.remove(&handle)
+    }
+
+    pub(crate) fn mark_kag_parser_changed(&mut self, handle: ObjectHandle) {
+        let revision = self.kag_parser_revisions.entry(handle).or_insert(0);
+        *revision = revision.saturating_add(1);
+    }
+
+    pub(crate) fn kag_parser_revision(&self, handle: ObjectHandle) -> u64 {
+        self.kag_parser_revisions.get(&handle).copied().unwrap_or(0)
     }
 
     pub(crate) fn store_kag_snapshot(&mut self, snapshot: ParserSnapshot) -> i64 {
@@ -430,6 +443,7 @@ impl KrkrHost {
         self.pending_image_loads
             .retain(|_, load| load.request.owner != Some(handle));
         self.kag_parsers.remove(&handle);
+        self.kag_parser_revisions.remove(&handle);
         if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
             self.pending_audio_commands.push(AudioCommand::Stop {
                 id: buffer.id,
@@ -460,6 +474,7 @@ impl KrkrHost {
             self.pending_image_loads
                 .retain(|_, load| load.request.owner != Some(handle));
             self.kag_parsers.remove(&handle);
+            self.kag_parser_revisions.remove(&handle);
             if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
                 self.pending_audio_commands.push(AudioCommand::Stop {
                     id: buffer.id,
@@ -599,7 +614,7 @@ impl KrkrHost {
 
         #[cfg(test)]
         {
-            return self.load_image_storage(name);
+            self.load_image_storage(name)
         }
 
         #[cfg(not(test))]
@@ -636,7 +651,7 @@ impl KrkrHost {
         #[cfg(test)]
         {
             let image = self.load_image_storage(&request.storage)?;
-            return Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }));
+            Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }))
         }
 
         #[cfg(not(test))]
@@ -736,7 +751,7 @@ impl KrkrHost {
         #[cfg(test)]
         {
             let image = self.load_image_storage(name)?;
-            return Ok(image.upload.rgba.len());
+            Ok(image.upload.rgba.len())
         }
 
         #[cfg(not(test))]

@@ -15,7 +15,7 @@ pub(crate) use classes::{
 };
 pub(crate) use clipboard::install_clipboard;
 pub(crate) use debug::install_debug;
-pub(crate) use kag::install_kag_parser;
+pub(crate) use kag::{create_kag_parser_object, install_kag_parser, refresh_kag_parser_object};
 pub(crate) use plugins::install_plugins;
 pub(crate) use scripts::install_scripts;
 pub(crate) use storages::install_storages;
