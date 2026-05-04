@@ -25,6 +25,10 @@ use crate::{
         finish_completed_native_transitions,
     },
     plugin::KrkrPlugin,
+    scheduler::{
+        ASYNC_TRIGGER_EVENT_NAME, AUDIO_FADE_COMPLETED_EVENT_NAME, AsyncTriggerMode, IdleEvent,
+        ScriptEvent, ScriptEventKind, ScriptEventSelection, TIMER_EVENT_NAME,
+    },
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
 
@@ -149,7 +153,6 @@ pub struct KrkrEngine {
     hovered_layer: Option<LayerId>,
     pressed_layer: Option<LayerId>,
     captured_layer: Option<LayerId>,
-    pending_input_events: VecDeque<EngineEvent>,
     input_result: EngineInputResult,
 }
 
@@ -174,7 +177,6 @@ impl KrkrEngine {
             hovered_layer: None,
             pressed_layer: None,
             captured_layer: None,
-            pending_input_events: VecDeque::new(),
             input_result: EngineInputResult::default(),
         })
     }
@@ -502,11 +504,17 @@ impl KrkrEngine {
 
     pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
         self.input_result = EngineInputResult::default();
-        self.pending_input_events.extend(input.events);
-        self.pump_tjs_events()?;
+        {
+            let scheduler = self.tjs_runtime.host_mut().scheduler_mut();
+            scheduler.begin_frame();
+            for event in input.events {
+                scheduler.post_input_event(event);
+            }
+        }
+        self.pump_runtime_scheduler(RuntimeSchedulerPump::Full)?;
         self.resume_modal_call_if_ready()?;
         let tick = self.advance(delta)?;
-        self.pump_layer_paints()?;
+        self.pump_runtime_scheduler(RuntimeSchedulerPump::WindowUpdatesOnly)?;
         self.sync_native_layers_from_tjs()?;
         self.tjs_runtime
             .host_mut()
@@ -559,35 +567,6 @@ impl KrkrEngine {
                 .is_truthy()
     }
 
-    fn pump_layer_paints(&mut self) -> Result<()> {
-        const MAX_LAYER_PAINT_PASSES: usize = 1024;
-
-        for _ in 0..MAX_LAYER_PAINT_PASSES {
-            let layers = self.tjs_runtime.host_mut().take_pending_layer_paints();
-            if layers.is_empty() {
-                return Ok(());
-            }
-            for layer in layers {
-                if !self.tjs_runtime.object_valid(layer) {
-                    continue;
-                }
-                if matches!(
-                    self.tjs_runtime.object_member(layer, "onPaint"),
-                    Variant::Void
-                ) {
-                    continue;
-                }
-                self.tjs_runtime
-                    .call_object_method(layer, "onPaint", Vec::new())?;
-            }
-        }
-
-        self.tjs_runtime
-            .host_mut()
-            .log("layer paint pump reached its per-frame pass budget; remaining paints deferred");
-        Ok(())
-    }
-
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
         apply_completed_resource_loads(&mut self.tjs_runtime)?;
         self.tjs_runtime.host_mut().advance_transition(delta);
@@ -630,53 +609,58 @@ impl KrkrEngine {
         (!self.modal_window_is_closed(window)).then_some(window)
     }
 
-    fn pump_tjs_events(&mut self) -> Result<()> {
+    fn pump_runtime_scheduler(&mut self, mode: RuntimeSchedulerPump) -> Result<()> {
         const MAX_NATIVE_EVENT_PASSES: usize = 1024;
 
-        if self.tjs_runtime.is_suspended() {
-            while let Some(event) = self.pending_input_events.pop_front() {
-                self.handle_input_event(event)?;
-                if self
-                    .tjs_runtime
-                    .host()
-                    .current_modal_window()
-                    .is_some_and(|window| self.modal_window_is_closed(window))
-                {
-                    break;
-                }
-            }
-            return Ok(());
+        if matches!(mode, RuntimeSchedulerPump::Full) {
+            self.sync_scheduler_event_disabled();
         }
 
-        self.fire_continuous_handlers()?;
         if self.tjs_runtime.is_suspended() {
+            if matches!(mode, RuntimeSchedulerPump::Full) {
+                while let Some(event) = self
+                    .tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
+                    .pop_input_event()
+                {
+                    self.handle_input_event(event)?;
+                    if self
+                        .tjs_runtime
+                        .host()
+                        .current_modal_window()
+                        .is_some_and(|window| self.modal_window_is_closed(window))
+                    {
+                        break;
+                    }
+                }
+            }
             return Ok(());
         }
 
         for _ in 0..MAX_NATIVE_EVENT_PASSES {
-            if self.fire_due_tjs_events(TjsEventPriority::Exclusive)? {
+            let mut delivered_script_or_input = false;
+            if matches!(mode, RuntimeSchedulerPump::Full) {
+                delivered_script_or_input = self.deliver_script_and_input_turn()?;
+                if delivered_script_or_input {
+                    if self.tjs_runtime.is_suspended() {
+                        return Ok(());
+                    }
+                }
+            }
+
+            let delivered_window_update = self.deliver_window_update_events()?;
+            if delivered_window_update {
                 if self.tjs_runtime.is_suspended() {
                     return Ok(());
                 }
+            }
+
+            if delivered_script_or_input || delivered_window_update {
                 continue;
             }
 
-            if let Some(event) = self.pending_input_events.pop_front() {
-                self.handle_input_event(event)?;
-                if self.tjs_runtime.is_suspended() {
-                    return Ok(());
-                }
-                continue;
-            }
-
-            if self.fire_due_tjs_events(TjsEventPriority::Normal)? {
-                if self.tjs_runtime.is_suspended() {
-                    return Ok(());
-                }
-                continue;
-            }
-
-            if self.fire_due_tjs_events(TjsEventPriority::Idle)? {
+            if matches!(mode, RuntimeSchedulerPump::Full) && self.deliver_idle_scheduler_event()? {
                 if self.tjs_runtime.is_suspended() {
                     return Ok(());
                 }
@@ -688,93 +672,107 @@ impl KrkrEngine {
 
         self.tjs_runtime
             .host_mut()
-            .log("native event pump reached its per-frame pass budget; remaining events deferred");
+            .log("runtime scheduler reached its per-frame pass budget; remaining events deferred");
         Ok(())
     }
 
-    fn fire_continuous_handlers(&mut self) -> Result<()> {
-        for handler in self.tjs_runtime.host().continuous_handlers() {
-            if matches!(handler, Variant::Void) {
-                continue;
-            }
-            self.tjs_runtime.call_function(handler, Vec::new())?;
+    fn deliver_script_and_input_turn(&mut self) -> Result<bool> {
+        self.post_due_scheduler_events()?;
+        self.tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .begin_script_delivery_turn();
+
+        let mut delivered = false;
+        let mut delivered_exclusive = false;
+        while let Some(event) = self
+            .tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .pop_script_event(ScriptEventSelection::Exclusive)
+        {
+            delivered = true;
+            delivered_exclusive = true;
+            self.fire_script_event(event)?;
             if self.tjs_runtime.is_suspended() {
-                break;
+                return Ok(true);
             }
         }
-        Ok(())
+
+        if delivered_exclusive
+            || self
+                .tjs_runtime
+                .host()
+                .scheduler()
+                .has_exclusive_script_event()
+        {
+            return Ok(delivered);
+        }
+
+        while let Some(event) = self
+            .tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .pop_input_event()
+        {
+            delivered = true;
+            self.handle_input_event(event)?;
+            if self.tjs_runtime.is_suspended()
+                || self
+                    .tjs_runtime
+                    .host()
+                    .scheduler()
+                    .has_exclusive_script_event()
+            {
+                return Ok(true);
+            }
+        }
+
+        while let Some(event) = self
+            .tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .pop_script_event(ScriptEventSelection::Any)
+        {
+            delivered = true;
+            self.fire_script_event(event)?;
+            if self.tjs_runtime.is_suspended()
+                || self
+                    .tjs_runtime
+                    .host()
+                    .scheduler()
+                    .has_exclusive_script_event()
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(delivered)
     }
 
-    fn fire_due_tjs_events(&mut self, priority: TjsEventPriority) -> Result<bool> {
-        let events = self.collect_due_tjs_events(priority)?;
-        if events.is_empty() {
-            return Ok(false);
-        }
-        let mut events = events.into_iter();
-        while let Some(event) = events.next() {
-            self.fire_tjs_event(event)?;
-            if self.tjs_runtime.is_suspended() {
-                for event in events {
-                    self.defer_tjs_event(event);
-                }
-                break;
-            }
-        }
-        Ok(true)
+    fn sync_scheduler_event_disabled(&mut self) {
+        let disabled = match self.tjs_runtime.global_member("System") {
+            Variant::Object(system) => self
+                .tjs_runtime
+                .object_member(system, "eventDisabled")
+                .is_truthy(),
+            _ => false,
+        };
+        self.tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .set_event_disabled(disabled);
     }
 
-    fn defer_tjs_event(&mut self, event: TjsEvent) {
-        match event.kind {
-            TjsEventKind::Timer => {
-                self.tjs_runtime
-                    .host_mut()
-                    .set_timer_next_fire_millis(event.handle, Some(0));
-            }
-            TjsEventKind::AsyncTrigger => {
-                self.tjs_runtime.host_mut().trigger_async(event.handle);
-            }
-            TjsEventKind::AudioFadeCompleted => {
-                self.tjs_runtime
-                    .host_mut()
-                    .schedule_audio_fade_completion(event.handle, 0);
-            }
-        }
-    }
-
-    fn collect_due_tjs_events(&mut self, priority: TjsEventPriority) -> Result<Vec<TjsEvent>> {
+    fn post_due_scheduler_events(&mut self) -> Result<()> {
         let now = self.tjs_runtime.host_mut().now_millis();
-        let pending_async_triggers = self.tjs_runtime.host_mut().take_pending_async_triggers();
-        let mut events = Vec::new();
-        let mut deferred_async_triggers = Vec::new();
-        for handle in pending_async_triggers {
-            if self.async_trigger_priority(handle)? == priority {
-                events.push(TjsEvent {
-                    handle,
-                    kind: TjsEventKind::AsyncTrigger,
-                });
-            } else {
-                deferred_async_triggers.push(handle);
-            }
-        }
-        for handle in deferred_async_triggers {
-            self.tjs_runtime.host_mut().trigger_async(handle);
-        }
-        if priority != TjsEventPriority::Normal {
-            return Ok(events);
-        }
+        self.tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .post_due_audio_fade_completions(now);
 
-        events.extend(
-            self.tjs_runtime
-                .host_mut()
-                .take_due_audio_fade_completions()
-                .into_iter()
-                .map(|handle| TjsEvent {
-                    handle,
-                    kind: TjsEventKind::AudioFadeCompleted,
-                }),
-        );
-
-        for handle in self.tjs_runtime.host().timer_handles() {
+        let timer_handles = self.tjs_runtime.host().scheduler().timer_handles();
+        for handle in timer_handles {
             let enabled = self
                 .tjs_runtime
                 .object_member(handle, "enabled")
@@ -782,6 +780,7 @@ impl KrkrEngine {
             if !enabled {
                 self.tjs_runtime
                     .host_mut()
+                    .scheduler_mut()
                     .set_timer_next_fire_millis(handle, None);
                 continue;
             }
@@ -794,79 +793,189 @@ impl KrkrEngine {
             if interval == 0 {
                 self.tjs_runtime
                     .host_mut()
+                    .scheduler_mut()
                     .set_timer_next_fire_millis(handle, None);
                 continue;
             }
-            let next_fire = match self.tjs_runtime.host().timer_next_fire_millis(handle) {
+
+            let next_fire = match self
+                .tjs_runtime
+                .host()
+                .scheduler()
+                .timer_next_fire_millis(handle)
+            {
                 Some(next_fire) => next_fire,
                 None => {
                     let next_fire = now.saturating_add(interval);
                     self.tjs_runtime
                         .host_mut()
+                        .scheduler_mut()
                         .set_timer_next_fire_millis(handle, Some(next_fire));
                     next_fire
                 }
             };
 
-            if now >= next_fire {
+            if now < next_fire {
+                continue;
+            }
+
+            let capacity = self
+                .tjs_runtime
+                .object_member(handle, "capacity")
+                .to_integer()
+                .unwrap_or(1);
+            let capacity = if capacity == 0 {
+                usize::MAX
+            } else {
+                capacity.max(1) as usize
+            };
+            let queued = self.tjs_runtime.host().scheduler().count_script_events(
+                handle,
+                handle,
+                TIMER_EVENT_NAME,
+                0,
+            );
+            if queued < capacity {
+                let scheduler = self.tjs_runtime.host_mut().scheduler_mut();
+                let tag = scheduler.next_timer_tag(handle);
+                scheduler.post_timer_event(handle, tag);
+            }
+            self.tjs_runtime
+                .host_mut()
+                .scheduler_mut()
+                .set_timer_next_fire_millis(handle, None);
+        }
+
+        Ok(())
+    }
+
+    fn deliver_window_update_events(&mut self) -> Result<bool> {
+        let started = self
+            .tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .begin_window_update_delivery();
+        if !started {
+            return Ok(false);
+        }
+
+        while let Some(layer) = self
+            .tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .pop_window_update_event()
+        {
+            self.fire_layer_paint_event(layer)?;
+            self.tjs_runtime
+                .host_mut()
+                .scheduler_mut()
+                .finish_window_update_event(layer);
+            if self.tjs_runtime.is_suspended() {
                 self.tjs_runtime
                     .host_mut()
-                    .set_timer_next_fire_millis(handle, None);
-                events.push(TjsEvent {
-                    handle,
-                    kind: TjsEventKind::Timer,
-                });
+                    .scheduler_mut()
+                    .finish_window_update_delivery();
+                return Ok(true);
             }
         }
 
-        Ok(events)
+        self.tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .finish_window_update_delivery();
+        Ok(true)
     }
 
-    fn async_trigger_priority(&self, handle: ObjectHandle) -> Result<TjsEventPriority> {
-        Ok(
-            match self
-                .tjs_runtime
-                .object_member(handle, "mode")
-                .to_integer()?
-            {
-                1 => TjsEventPriority::Exclusive,
-                2 => TjsEventPriority::Idle,
-                _ => TjsEventPriority::Normal,
-            },
-        )
-    }
-
-    fn fire_tjs_event(&mut self, event: TjsEvent) -> Result<()> {
-        if event.kind == TjsEventKind::Timer
-            && !self
-                .tjs_runtime
-                .object_member(event.handle, "enabled")
-                .is_truthy()
-        {
+    fn fire_layer_paint_event(&mut self, layer: ObjectHandle) -> Result<()> {
+        if !self.tjs_runtime.object_valid(layer) {
             return Ok(());
         }
-
-        let callback = self.tjs_runtime.object_member(event.handle, "__callback");
-        if !matches!(callback, Variant::Void) {
-            return self
-                .tjs_runtime
-                .call_function(callback, Vec::new())
-                .map(|_| ());
-        }
-
-        let method = match event.kind {
-            TjsEventKind::Timer => "onTimer",
-            TjsEventKind::AsyncTrigger => "onFire",
-            TjsEventKind::AudioFadeCompleted => "onFadeCompleted",
-        };
         if matches!(
-            self.tjs_runtime.object_member(event.handle, method),
+            self.tjs_runtime.object_member(layer, "onPaint"),
             Variant::Void
         ) {
             return Ok(());
         }
         self.tjs_runtime
-            .call_object_method(event.handle, method, Vec::new())
+            .call_object_method(layer, "onPaint", Vec::new())
+            .map(|_| ())
+    }
+
+    fn deliver_idle_scheduler_event(&mut self) -> Result<bool> {
+        let Some(event) = self.tjs_runtime.host_mut().scheduler_mut().pop_idle_event() else {
+            return Ok(false);
+        };
+
+        match event {
+            IdleEvent::AsyncTrigger(handle) => {
+                self.tjs_runtime.host_mut().scheduler_mut().trigger_async(
+                    handle,
+                    AsyncTriggerMode::Normal,
+                    false,
+                );
+            }
+            IdleEvent::ContinuousHandlers(handlers) => {
+                for handler in handlers {
+                    if matches!(handler, Variant::Void) {
+                        continue;
+                    }
+                    self.tjs_runtime.call_function(handler, Vec::new())?;
+                    if self.tjs_runtime.is_suspended()
+                        || self
+                            .tjs_runtime
+                            .host()
+                            .scheduler()
+                            .has_exclusive_script_event()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn fire_script_event(&mut self, event: ScriptEvent) -> Result<()> {
+        if !self.tjs_runtime.object_valid(event.target) {
+            return Ok(());
+        }
+
+        if event.kind == ScriptEventKind::Timer
+            && !self
+                .tjs_runtime
+                .object_member(event.target, "enabled")
+                .is_truthy()
+        {
+            return Ok(());
+        }
+
+        if matches!(
+            event.kind,
+            ScriptEventKind::Timer | ScriptEventKind::AsyncTrigger
+        ) {
+            let callback = self.tjs_runtime.object_member(event.target, "__callback");
+            if !matches!(callback, Variant::Void) {
+                return self
+                    .tjs_runtime
+                    .call_function(callback, event.args)
+                    .map(|_| ());
+            }
+        }
+
+        let method = match event.kind {
+            ScriptEventKind::Timer => TIMER_EVENT_NAME,
+            ScriptEventKind::AsyncTrigger => ASYNC_TRIGGER_EVENT_NAME,
+            ScriptEventKind::AudioFadeCompleted => AUDIO_FADE_COMPLETED_EVENT_NAME,
+            ScriptEventKind::Custom => event.name.as_str(),
+        };
+        if matches!(
+            self.tjs_runtime.object_member(event.target, method),
+            Variant::Void
+        ) {
+            return Ok(());
+        }
+        self.tjs_runtime
+            .call_object_method(event.target, method, event.args)
             .map(|_| ())
     }
 
@@ -1769,23 +1878,9 @@ struct LayerEventTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TjsEvent {
-    handle: ObjectHandle,
-    kind: TjsEventKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TjsEventKind {
-    Timer,
-    AsyncTrigger,
-    AudioFadeCompleted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TjsEventPriority {
-    Exclusive,
-    Normal,
-    Idle,
+enum RuntimeSchedulerPump {
+    Full,
+    WindowUpdatesOnly,
 }
 
 #[derive(Clone, Debug)]
@@ -8661,7 +8756,15 @@ mod tests {
                 "#,
             )
             .expect("script");
-        assert_eq!(engine.host().timer_handles().len(), 1);
+        assert_eq!(
+            engine
+                .tjs_runtime()
+                .host()
+                .scheduler()
+                .timer_handles()
+                .len(),
+            1
+        );
         let Variant::Object(timer) = engine.tjs_runtime().global_member("timerProbe") else {
             panic!("timerProbe should be an object");
         };
@@ -9084,12 +9187,6 @@ mod tests {
                 "#,
             )
             .expect("script");
-        assert_eq!(engine.host_mut().take_pending_async_triggers().len(), 1);
-        let async_probe = match engine.tjs_runtime().global_member("asyncProbe") {
-            Variant::Object(handle) => handle,
-            _ => panic!("asyncProbe should be an object"),
-        };
-        engine.host_mut().trigger_async(async_probe);
 
         engine
             .update(
@@ -9150,6 +9247,262 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scheduler_runs_exclusive_input_then_normal_script_events() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "scheduler_order.tjs",
+                r#"
+                global.trace = "";
+                global.kag = new Dictionary();
+                kag.innerWidth = 320;
+                kag.onPrimaryClick = function() {
+                    global.trace += "I";
+                };
+                var normalProbe = new AsyncTrigger(function() {
+                    global.trace += "N";
+                }, "");
+                var exclusiveProbe = new AsyncTrigger(function() {
+                    global.trace += "E";
+                }, "");
+                exclusiveProbe.mode = atmExclusive;
+                normalProbe.trigger();
+                exclusiveProbe.trigger();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::PointerInput {
+                        button: PointerButton::Primary,
+                        state: ButtonState::Pressed,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("EIN".to_string())
+        );
+    }
+
+    #[test]
+    fn scheduler_keeps_async_trigger_exclusive_normal_idle_order_stable() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "async_order.tjs",
+                r#"
+                global.trace = "";
+                var exclusiveProbe = new AsyncTrigger(function() {
+                    global.trace += "E";
+                }, "");
+                var normalProbe = new AsyncTrigger(function() {
+                    global.trace += "N";
+                }, "");
+                var idleProbe = new AsyncTrigger(function() {
+                    global.trace += "I";
+                }, "");
+                function continuousProbe() {
+                    global.trace += "C";
+                    System.removeContinuousHandler(continuousProbe);
+                }
+                exclusiveProbe.mode = atmExclusive;
+                idleProbe.mode = atmAtIdle;
+                System.addContinuousHandler(continuousProbe);
+                normalProbe.trigger();
+                idleProbe.trigger();
+                exclusiveProbe.trigger();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("ENIC".to_string())
+        );
+    }
+
+    #[test]
+    fn scheduler_limits_layer_update_reposts_during_on_paint() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "paint_repost.tjs",
+                r#"
+                global.paintCount = 0;
+                global.trace = "";
+                class RepaintLayer extends Layer {
+                    function RepaintLayer() {
+                        super.Layer(...);
+                        setSize(10, 10);
+                        setImageSize(10, 10);
+                        visible = true;
+                    }
+                    function onPaint() {
+                        global.paintCount++;
+                        global.trace += "P";
+                        update();
+                    }
+                }
+                global.probeLayer = new RepaintLayer();
+                probeLayer.update();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("paint frame");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("paintCount"),
+            Variant::Integer(2)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("PP".to_string())
+        );
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("second frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("paintCount"),
+            Variant::Integer(2)
+        );
+    }
+
+    #[test]
+    fn scheduler_defers_events_posted_by_handler_until_after_window_update() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "sequence_window_update.tjs",
+                r#"
+                global.trace = "";
+                class PaintLayer extends Layer {
+                    function PaintLayer() {
+                        super.Layer(...);
+                        setSize(10, 10);
+                        setImageSize(10, 10);
+                        visible = true;
+                    }
+                    function onPaint() {
+                        global.trace += "P";
+                    }
+                }
+                global.probeLayer = new PaintLayer();
+                var secondProbe = new AsyncTrigger(function() {
+                    global.trace += "B";
+                }, "");
+                var firstProbe = new AsyncTrigger(function() {
+                    global.trace += "A";
+                    secondProbe.trigger();
+                    probeLayer.update();
+                }, "");
+                firstProbe.trigger();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("APB".to_string())
+        );
+    }
+
+    #[test]
+    fn scheduler_preserves_script_event_order_across_modal_resume() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "modal_order.tjs",
+                r#"
+                global.trace = "";
+                global.modal = new Window();
+                var firstProbe = new AsyncTrigger(function() {
+                    global.trace += "A";
+                    modal.showModal();
+                    global.trace += "R";
+                }, "");
+                var secondProbe = new AsyncTrigger(function() {
+                    global.trace += "B";
+                }, "");
+                firstProbe.trigger();
+                secondProbe.trigger();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("modal frame");
+        assert!(engine.tjs_runtime().is_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("A".to_string())
+        );
+
+        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
+            panic!("modal window missing");
+        };
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(modal, "close", Vec::new())
+            .expect("close modal");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("resume frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("AR".to_string())
+        );
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("queued event frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("ARB".to_string())
+        );
+    }
+
     fn test_tag(name: &str, attrs: &[(&str, &str)]) -> Tag {
         Tag::new(
             name,
@@ -9169,6 +9522,7 @@ mod tests {
         engine
             .tjs_runtime
             .host_mut()
+            .scheduler_mut()
             .set_timer_next_fire_millis(timer, Some(0));
     }
 

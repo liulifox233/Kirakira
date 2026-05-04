@@ -7,6 +7,7 @@ mod globals;
 mod kag;
 mod native;
 pub mod resource_manager;
+mod scheduler;
 mod script;
 
 pub use engine::{
