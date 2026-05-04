@@ -29,6 +29,133 @@ use crate::{
 const IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KagLayerSlot {
+    pub page: String,
+    pub layer: String,
+}
+
+impl KagLayerSlot {
+    pub(crate) fn new(page: &str, layer: &str) -> Self {
+        Self {
+            page: normalize_kag_page(page).to_string(),
+            layer: layer.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LayerRenderTarget {
+    Native(LayerId),
+    Kag(KagLayerSlot),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LayerInstance {
+    pub layer_id: LayerId,
+    pub window: Option<ObjectHandle>,
+    pub parent: Option<ObjectHandle>,
+    pub children: Vec<ObjectHandle>,
+    pub children_array: Option<ObjectHandle>,
+    pub render_target: LayerRenderTarget,
+    properties: BTreeMap<String, Variant>,
+}
+
+impl LayerInstance {
+    fn new(
+        layer_id: LayerId,
+        window: Option<ObjectHandle>,
+        parent: Option<ObjectHandle>,
+        children_array: Option<ObjectHandle>,
+    ) -> Self {
+        Self {
+            layer_id,
+            window,
+            parent,
+            children: Vec::new(),
+            children_array,
+            render_target: LayerRenderTarget::Native(layer_id),
+            properties: BTreeMap::new(),
+        }
+    }
+
+    fn property(&self, name: &str) -> Option<Variant> {
+        match name {
+            "window" => self
+                .properties
+                .get(name)
+                .cloned()
+                .or_else(|| self.window.map(Variant::Object)),
+            "parent" => self
+                .properties
+                .get(name)
+                .cloned()
+                .or_else(|| self.parent.map(Variant::Object)),
+            "children" => self
+                .children_array
+                .map(Variant::Object)
+                .or_else(|| self.properties.get(name).cloned()),
+            _ => self.properties.get(name).cloned(),
+        }
+    }
+
+    fn set_property(&mut self, name: impl Into<String>, value: Variant) {
+        self.properties.insert(name.into(), value);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WindowInstance {
+    pub children: Vec<ObjectHandle>,
+    pub children_array: Option<ObjectHandle>,
+    pub primary_layer: Option<ObjectHandle>,
+    pub focused_layer: Option<ObjectHandle>,
+    pub visible: bool,
+    pub closed: bool,
+    pub modal: bool,
+    properties: BTreeMap<String, Variant>,
+}
+
+impl WindowInstance {
+    fn new(children_array: Option<ObjectHandle>) -> Self {
+        Self {
+            children: Vec::new(),
+            children_array,
+            primary_layer: None,
+            focused_layer: None,
+            visible: false,
+            closed: false,
+            modal: false,
+            properties: BTreeMap::new(),
+        }
+    }
+
+    fn property(&self, name: &str) -> Option<Variant> {
+        match name {
+            "children" => self
+                .children_array
+                .map(Variant::Object)
+                .or_else(|| self.properties.get(name).cloned()),
+            "primaryLayer" => self
+                .primary_layer
+                .map(Variant::Object)
+                .or_else(|| self.properties.get(name).cloned()),
+            "focusedLayer" => self
+                .focused_layer
+                .map(Variant::Object)
+                .or_else(|| self.properties.get(name).cloned()),
+            "visible" => Some(Variant::Integer(i64::from(self.visible))),
+            "__nativeClosed" => Some(Variant::Integer(i64::from(self.closed))),
+            "__nativeModal" => Some(Variant::Integer(i64::from(self.modal))),
+            _ => self.properties.get(name).cloned(),
+        }
+    }
+
+    fn set_property(&mut self, name: impl Into<String>, value: Variant) {
+        self.properties.insert(name.into(), value);
+    }
+}
+
 #[derive(Clone)]
 pub struct KrkrHost {
     project_root: Option<PathBuf>,
@@ -42,7 +169,9 @@ pub struct KrkrHost {
     kag_snapshots: BTreeMap<i64, ParserSnapshot>,
     next_kag_snapshot_id: i64,
     layer_tree: LayerTree,
-    native_layers: BTreeMap<ObjectHandle, LayerId>,
+    native_layers: BTreeMap<ObjectHandle, LayerInstance>,
+    native_windows: BTreeMap<ObjectHandle, WindowInstance>,
+    kag_layer_slots: BTreeMap<ObjectHandle, KagLayerSlot>,
     scheduler: TvpScheduler,
     kag_layers: BTreeMap<String, LayerId>,
     pending_kag_layers: BTreeMap<String, LayerNode>,
@@ -84,6 +213,8 @@ impl Default for KrkrHost {
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
+            native_windows: BTreeMap::new(),
+            kag_layer_slots: BTreeMap::new(),
             scheduler: TvpScheduler::default(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
@@ -135,6 +266,8 @@ impl KrkrHost {
             next_kag_snapshot_id: 1,
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
+            native_windows: BTreeMap::new(),
+            kag_layer_slots: BTreeMap::new(),
             scheduler: TvpScheduler::default(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
@@ -393,23 +526,153 @@ impl KrkrHost {
         &mut self.layer_tree
     }
 
+    pub(crate) fn register_native_window(
+        &mut self,
+        handle: ObjectHandle,
+        children_array: Option<ObjectHandle>,
+    ) {
+        self.native_windows
+            .entry(handle)
+            .or_insert_with(|| WindowInstance::new(children_array));
+    }
+
+    pub(crate) fn native_window_property(
+        &self,
+        handle: ObjectHandle,
+        name: &str,
+    ) -> Option<Variant> {
+        self.native_windows
+            .get(&handle)
+            .and_then(|window| window.property(name))
+    }
+
+    pub(crate) fn set_native_window_property(
+        &mut self,
+        handle: ObjectHandle,
+        name: impl Into<String>,
+        value: Variant,
+    ) {
+        let name = name.into();
+        let window = self
+            .native_windows
+            .entry(handle)
+            .or_insert_with(|| WindowInstance::new(None));
+        match name.as_str() {
+            "visible" => {
+                window.visible = value.is_truthy();
+            }
+            "__nativeClosed" => {
+                window.closed = value.is_truthy();
+            }
+            "__nativeModal" => {
+                window.modal = value.is_truthy();
+            }
+            "primaryLayer" => {
+                window.primary_layer = match &value {
+                    Variant::Object(handle) => Some(*handle),
+                    _ => None,
+                };
+            }
+            "focusedLayer" => {
+                window.focused_layer = match &value {
+                    Variant::Object(handle) => Some(*handle),
+                    _ => None,
+                };
+            }
+            "children" => {
+                window.children_array = match &value {
+                    Variant::Object(handle) => Some(*handle),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+        window.set_property(name, value);
+        self.apply_window_visibility_to_layers(handle);
+    }
+
+    pub(crate) fn native_window_closed(&self, handle: ObjectHandle) -> bool {
+        self.native_windows
+            .get(&handle)
+            .map(|window| window.closed)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn native_window_primary_layer(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.native_windows
+            .get(&handle)
+            .and_then(|window| window.primary_layer)
+    }
+
+    pub(crate) fn native_window_focused_layer(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.native_windows
+            .get(&handle)
+            .and_then(|window| window.focused_layer)
+    }
+
+    pub(crate) fn add_native_window_child(&mut self, window: ObjectHandle, child: ObjectHandle) {
+        let window_instance = self
+            .native_windows
+            .entry(window)
+            .or_insert_with(|| WindowInstance::new(None));
+        window_instance.children.retain(|entry| *entry != child);
+        window_instance.children.push(child);
+        if self.native_layers.contains_key(&child) {
+            if window_instance.primary_layer.is_none() {
+                window_instance.primary_layer = Some(child);
+                window_instance
+                    .properties
+                    .insert("primaryLayer".to_string(), Variant::Object(child));
+            }
+            if window_instance.focused_layer.is_none() {
+                window_instance.focused_layer = Some(child);
+                window_instance
+                    .properties
+                    .insert("focusedLayer".to_string(), Variant::Object(child));
+            }
+            self.set_native_layer_window(child, Some(window), Variant::Object(window));
+        }
+    }
+
+    pub(crate) fn remove_native_window_child(&mut self, window: ObjectHandle, child: ObjectHandle) {
+        let Some(window_instance) = self.native_windows.get_mut(&window) else {
+            return;
+        };
+        window_instance.children.retain(|entry| *entry != child);
+        if window_instance.primary_layer == Some(child) {
+            window_instance.primary_layer = None;
+            window_instance
+                .properties
+                .insert("primaryLayer".to_string(), Variant::Void);
+        }
+        if window_instance.focused_layer == Some(child) {
+            window_instance.focused_layer = None;
+            window_instance
+                .properties
+                .insert("focusedLayer".to_string(), Variant::Void);
+        }
+    }
+
     pub(crate) fn register_native_layer(
         &mut self,
         handle: ObjectHandle,
         name: impl Into<String>,
-        parent: Option<LayerId>,
+        window: Option<ObjectHandle>,
+        parent: Option<ObjectHandle>,
+        children_array: Option<ObjectHandle>,
         primary: bool,
     ) -> LayerId {
-        if let Some(id) = self.native_layers.get(&handle) {
-            return *id;
+        if let Some(instance) = self.native_layers.get(&handle) {
+            return instance.layer_id;
         }
 
+        let parent_layer = parent.and_then(|parent| self.native_layer(parent));
         let z_order = if primary {
             0
         } else {
-            self.next_sibling_z_order(parent)
+            self.next_sibling_z_order(parent_layer)
         };
-        let id = self.layer_tree.create_layer(name, parent, z_order);
+        let id = self.layer_tree.create_layer(name, parent_layer, z_order);
         if let Some(layer) = self.layer_tree.layer_mut(id)
             && primary
         {
@@ -417,41 +680,229 @@ impl KrkrHost {
             layer.opacity = 255;
             layer.layer_type = 1;
         }
-        self.native_layers.insert(handle, id);
+        let mut instance = LayerInstance::new(id, window, parent, children_array);
+        instance.set_property("isPrimary", Variant::Integer(i64::from(primary)));
+        self.native_layers.insert(handle, instance);
+        if let Some(parent) = parent {
+            self.add_native_layer_child(parent, handle);
+        }
         id
     }
 
     pub(crate) fn native_layer(&self, handle: ObjectHandle) -> Option<LayerId> {
-        self.native_layers.get(&handle).copied()
-    }
-
-    pub(crate) fn native_layer_entries(&self) -> Vec<(ObjectHandle, LayerId)> {
         self.native_layers
-            .iter()
-            .map(|(handle, layer_id)| (*handle, *layer_id))
-            .collect()
+            .get(&handle)
+            .map(|instance| instance.layer_id)
     }
 
     pub(crate) fn native_object_for_layer(&self, layer_id: LayerId) -> Option<ObjectHandle> {
         self.native_layers
             .iter()
-            .find_map(|(handle, id)| (*id == layer_id).then_some(*handle))
+            .find_map(|(handle, instance)| (instance.layer_id == layer_id).then_some(*handle))
+    }
+
+    pub(crate) fn native_layer_property(
+        &self,
+        handle: ObjectHandle,
+        name: &str,
+    ) -> Option<Variant> {
+        self.native_layers
+            .get(&handle)
+            .and_then(|instance| instance.property(name))
+    }
+
+    pub(crate) fn set_native_layer_property(
+        &mut self,
+        handle: ObjectHandle,
+        name: impl Into<String>,
+        value: Variant,
+    ) {
+        let Some(instance) = self.native_layers.get_mut(&handle) else {
+            return;
+        };
+        instance.set_property(name, value);
+    }
+
+    pub(crate) fn native_layer_parent(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.native_layers
+            .get(&handle)
+            .and_then(|instance| instance.parent)
+    }
+
+    pub(crate) fn native_layer_window(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.native_layers
+            .get(&handle)
+            .and_then(|instance| instance.window)
+    }
+
+    pub(crate) fn native_layer_children(&self, handle: ObjectHandle) -> Vec<ObjectHandle> {
+        self.native_layers
+            .get(&handle)
+            .map(|instance| instance.children.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_native_layer_parent(
+        &mut self,
+        handle: ObjectHandle,
+        parent: Option<ObjectHandle>,
+        stored_value: Variant,
+    ) -> bool {
+        let Some(layer_id) = self.native_layer(handle) else {
+            return false;
+        };
+        let parent_layer = parent.and_then(|parent| self.native_layer(parent));
+        let render_parent = if self
+            .kag_layer_slots
+            .get(&handle)
+            .is_some_and(|slot| slot.page == "fore" && slot.layer == "base")
+        {
+            None
+        } else {
+            parent_layer
+        };
+        if !self.layer_tree.set_parent(layer_id, render_parent) {
+            return false;
+        }
+
+        let old_parent = self.native_layer_parent(handle);
+        if old_parent == parent {
+            if let Some(instance) = self.native_layers.get_mut(&handle) {
+                instance.set_property("parent", stored_value);
+            }
+            return true;
+        }
+
+        if let Some(old_parent) = old_parent {
+            self.remove_native_layer_child(old_parent, handle);
+        }
+        if let Some(new_parent) = parent {
+            self.add_native_layer_child(new_parent, handle);
+            let z_order = self.next_sibling_z_order(parent_layer);
+            if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
+                layer.z_order = z_order;
+            }
+        }
+        if let Some(instance) = self.native_layers.get_mut(&handle) {
+            instance.parent = parent;
+            instance.set_property("parent", stored_value);
+        }
+        self.apply_layer_instance_to_render(handle);
+        true
+    }
+
+    pub(crate) fn set_native_layer_window(
+        &mut self,
+        handle: ObjectHandle,
+        window: Option<ObjectHandle>,
+        stored_value: Variant,
+    ) {
+        let Some(instance) = self.native_layers.get_mut(&handle) else {
+            return;
+        };
+        instance.window = window;
+        instance.set_property("window", stored_value);
+        self.apply_layer_instance_to_render(handle);
+    }
+
+    fn add_native_layer_child(&mut self, parent: ObjectHandle, child: ObjectHandle) {
+        if let Some(parent) = self.native_layers.get_mut(&parent)
+            && !parent.children.contains(&child)
+        {
+            parent.children.push(child);
+        }
+    }
+
+    fn remove_native_layer_child(&mut self, parent: ObjectHandle, child: ObjectHandle) {
+        if let Some(parent) = self.native_layers.get_mut(&parent) {
+            parent.children.retain(|entry| *entry != child);
+        }
+    }
+
+    pub(crate) fn kag_layer_slot(&self, handle: ObjectHandle) -> Option<&KagLayerSlot> {
+        self.kag_layer_slots.get(&handle)
+    }
+
+    pub(crate) fn layer_render_target(&self, handle: ObjectHandle) -> Option<LayerRenderTarget> {
+        self.native_layers
+            .get(&handle)
+            .map(|instance| instance.render_target.clone())
+    }
+
+    pub(crate) fn replace_kag_layer_slots(&mut self, slots: BTreeMap<ObjectHandle, KagLayerSlot>) {
+        if self.kag_layer_slots == slots {
+            return;
+        }
+        self.kag_layer_slots = slots;
+        let handles = self.native_layers.keys().copied().collect::<Vec<_>>();
+        for handle in handles {
+            let Some(layer_id) = self.native_layer(handle) else {
+                continue;
+            };
+            let target = match self.kag_layer_slots.get(&handle).cloned() {
+                Some(slot) if slot.page == "back" => LayerRenderTarget::Kag(slot),
+                _ => LayerRenderTarget::Native(layer_id),
+            };
+            if let Some(instance) = self.native_layers.get_mut(&handle) {
+                instance.render_target = target;
+            }
+            self.apply_layer_instance_to_render(handle);
+        }
+    }
+
+    pub(crate) fn apply_layer_instance_to_render(&mut self, handle: ObjectHandle) {
+        let Some(instance) = self.native_layers.get(&handle).cloned() else {
+            return;
+        };
+        let window_closed = instance
+            .window
+            .is_some_and(|window| self.native_window_closed(window));
+        match instance.render_target.clone() {
+            LayerRenderTarget::Native(layer_id) => {
+                let render_parent = match self.kag_layer_slots.get(&handle) {
+                    Some(slot) if slot.page == "fore" && slot.layer == "base" => None,
+                    _ => instance.parent.and_then(|parent| self.native_layer(parent)),
+                };
+                self.layer_tree.set_parent(layer_id, render_parent);
+                if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
+                    apply_layer_properties_to_node(layer, &instance.properties, window_closed);
+                    layer.renderable = true;
+                }
+            }
+            LayerRenderTarget::Kag(slot) => {
+                if let Some(layer) = self.layer_tree.layer_mut(instance.layer_id) {
+                    layer.renderable = false;
+                }
+                self.mutate_kag_layer(&slot.page, &slot.layer, |layer| {
+                    apply_layer_properties_to_node(layer, &instance.properties, window_closed);
+                });
+            }
+        }
+    }
+
+    fn apply_window_visibility_to_layers(&mut self, window: ObjectHandle) {
+        let handles = self
+            .native_layers
+            .iter()
+            .filter_map(|(handle, instance)| (instance.window == Some(window)).then_some(*handle))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            self.apply_layer_instance_to_render(handle);
+        }
     }
 
     pub(crate) fn invalidate_native_object(&mut self, handle: ObjectHandle) {
-        self.scheduler.invalidate_object(handle);
-        self.pending_image_loads
-            .retain(|_, load| load.request.owner != Some(handle));
-        self.kag_parsers.remove(&handle);
-        self.kag_parser_revisions.remove(&handle);
-        if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
-            self.pending_audio_commands.push(AudioCommand::Stop {
-                id: buffer.id,
-                fade_seconds: 0.0,
-            });
+        self.cleanup_invalidated_handle(handle);
+        self.modal_windows.retain(|window| *window != handle);
+
+        if let Some(window) = self.native_windows.remove(&handle) {
+            for child in window.children {
+                self.invalidate_native_object(child);
+            }
+            return;
         }
 
-        let Some(layer_id) = self.native_layers.get(&handle).copied() else {
+        let Some(layer_id) = self.native_layer(handle) else {
             return;
         };
 
@@ -464,23 +915,56 @@ impl KrkrHost {
         let removed_handles = self
             .native_layers
             .iter()
-            .filter_map(|(handle, layer_id)| {
-                removed_layer_ids.contains(layer_id).then_some(*handle)
+            .filter_map(|(handle, instance)| {
+                removed_layer_ids
+                    .contains(&instance.layer_id)
+                    .then_some(*handle)
             })
             .collect::<Vec<_>>();
         for handle in removed_handles {
-            self.native_layers.remove(&handle);
-            self.scheduler.invalidate_object(handle);
-            self.pending_image_loads
-                .retain(|_, load| load.request.owner != Some(handle));
-            self.kag_parsers.remove(&handle);
-            self.kag_parser_revisions.remove(&handle);
-            if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
-                self.pending_audio_commands.push(AudioCommand::Stop {
-                    id: buffer.id,
-                    fade_seconds: 0.0,
-                });
+            if let Some(instance) = self.native_layers.remove(&handle) {
+                if let Some(parent) = instance.parent {
+                    self.remove_native_layer_child(parent, handle);
+                }
+                if let Some(window) = instance.window {
+                    self.remove_native_window_child(window, handle);
+                }
             }
+            if let Some(slot) = self.kag_layer_slots.remove(&handle)
+                && slot.page == "back"
+            {
+                self.pending_kag_layers.remove(&slot.layer);
+            }
+            for window in self.native_windows.values_mut() {
+                window.children.retain(|child| *child != handle);
+                if window.primary_layer == Some(handle) {
+                    window.primary_layer = None;
+                    window
+                        .properties
+                        .insert("primaryLayer".to_string(), Variant::Void);
+                }
+                if window.focused_layer == Some(handle) {
+                    window.focused_layer = None;
+                    window
+                        .properties
+                        .insert("focusedLayer".to_string(), Variant::Void);
+                }
+            }
+            self.cleanup_invalidated_handle(handle);
+        }
+    }
+
+    fn cleanup_invalidated_handle(&mut self, handle: ObjectHandle) {
+        self.scheduler.invalidate_object(handle);
+        self.pending_image_loads
+            .retain(|_, load| load.request.owner != Some(handle));
+        self.kag_parsers.remove(&handle);
+        self.kag_parser_revisions.remove(&handle);
+        if let Some(buffer) = self.native_audio_buffers.remove(&handle) {
+            self.pending_audio_commands.push(AudioCommand::Stop {
+                id: buffer.id,
+                fade_seconds: 0.0,
+            });
         }
     }
 
@@ -528,6 +1012,18 @@ impl KrkrHost {
 
     pub(crate) fn scheduler(&self) -> &TvpScheduler {
         &self.scheduler
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_window_update(&self, handle: ObjectHandle) -> bool {
+        self.scheduler.has_window_update(handle)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_image_load_for_owner(&self, handle: ObjectHandle) -> bool {
+        self.pending_image_loads
+            .values()
+            .any(|load| load.request.owner == Some(handle))
     }
 
     pub(crate) fn scheduler_mut(&mut self) -> &mut TvpScheduler {
@@ -645,20 +1141,29 @@ impl KrkrHost {
     ) -> Result<ImageLoadState> {
         self.sync_image_cache_revision();
         if let Some(image) = self.image_cache.get(&request.storage) {
-            return Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }));
+            return Ok(ImageLoadState::Ready(Box::new(CompletedImageLoad {
+                request,
+                image,
+            })));
         }
 
         #[cfg(test)]
         {
             let image = self.load_image_storage(&request.storage)?;
-            Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }))
+            Ok(ImageLoadState::Ready(Box::new(CompletedImageLoad {
+                request,
+                image,
+            })))
         }
 
         #[cfg(not(test))]
         {
             let Some(manager) = self.resource_manager.as_ref() else {
                 let image = self.load_image_storage(&request.storage)?;
-                return Ok(ImageLoadState::Ready(CompletedImageLoad { request, image }));
+                return Ok(ImageLoadState::Ready(Box::new(CompletedImageLoad {
+                    request,
+                    image,
+                })));
             };
             let revision = self.storage_revision();
             let generation = self.next_resource_generation;
@@ -1320,6 +1825,55 @@ fn normalize_kag_page(page: &str) -> &str {
     }
 }
 
+fn apply_layer_properties_to_node(
+    layer: &mut LayerNode,
+    properties: &BTreeMap<String, Variant>,
+    window_closed: bool,
+) {
+    layer.left = layer_property_i64(properties, "left", layer.left.round() as i64) as f32;
+    layer.top = layer_property_i64(properties, "top", layer.top.round() as i64) as f32;
+    layer.width = layer_property_i64(properties, "width", layer.width.round() as i64).max(0) as f32;
+    layer.height =
+        layer_property_i64(properties, "height", layer.height.round() as i64).max(0) as f32;
+    layer.image_left =
+        layer_property_i64(properties, "imageLeft", layer.image_left.round() as i64) as f32;
+    layer.image_top =
+        layer_property_i64(properties, "imageTop", layer.image_top.round() as i64) as f32;
+    layer.image_width =
+        layer_property_i64(properties, "imageWidth", layer.image_width.round() as i64).max(0)
+            as f32;
+    layer.image_height =
+        layer_property_i64(properties, "imageHeight", layer.image_height.round() as i64).max(0)
+            as f32;
+    layer.visible =
+        layer_property_i64(properties, "visible", i64::from(layer.visible)) != 0 && !window_closed;
+    layer.enabled = layer_property_i64(properties, "enabled", i64::from(layer.enabled)) != 0;
+    layer.node_enabled =
+        layer_property_i64(properties, "nodeEnabled", i64::from(layer.node_enabled)) != 0;
+    layer.opacity =
+        layer_property_i64(properties, "opacity", i64::from(layer.opacity)).clamp(0, 255) as u8;
+    layer.layer_type = layer_property_i64(properties, "type", i64::from(layer.layer_type)) as i32;
+    layer.face = layer_property_i64(properties, "face", i64::from(layer.face)) as i32;
+    layer.hit_type = layer_property_i64(properties, "hitType", i64::from(layer.hit_type)) as i32;
+    layer.hit_threshold =
+        layer_property_i64(properties, "hitThreshold", i64::from(layer.hit_threshold))
+            .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    if let Some(z_order) = properties
+        .get("absolute")
+        .or_else(|| properties.get("order"))
+        .and_then(|value| value.to_integer().ok())
+    {
+        layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+}
+
+fn layer_property_i64(properties: &BTreeMap<String, Variant>, name: &str, fallback: i64) -> i64 {
+    properties
+        .get(name)
+        .and_then(|value| value.to_integer().ok())
+        .unwrap_or(fallback)
+}
+
 fn copy_layer_node_render_content(dest: &mut LayerNode, source: &LayerNode) {
     dest.left = source.left;
     dest.top = source.top;
@@ -1434,7 +1988,7 @@ pub(crate) struct CompletedImageLoad {
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) enum ImageLoadState {
-    Ready(CompletedImageLoad),
+    Ready(Box<CompletedImageLoad>),
     Pending,
 }
 

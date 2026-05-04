@@ -335,6 +335,15 @@ impl TvpScheduler {
             .retain(|event| event.source != handle && event.target != handle);
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_window_update(&self, handle: ObjectHandle) -> bool {
+        self.active_window_update == Some(handle)
+            || self
+                .window_update_events
+                .iter()
+                .any(|event| *event == handle)
+    }
+
     fn script_event_from_request(&self, request: ScriptEventRequest) -> ScriptEvent {
         ScriptEvent {
             source: request.source,

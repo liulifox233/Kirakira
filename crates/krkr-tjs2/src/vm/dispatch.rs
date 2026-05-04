@@ -162,7 +162,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         } = kind
         {
             if let Some(primary) = primary {
-                let primary_value = self.runtime.heap[primary.0].get_raw(name);
+                let primary_value = self.member_in_super_chain(primary, name)?;
                 let primary_has_member = primary_value.is_some();
                 if primary_has_member || (bind_this.is_none() && flags.ensure) {
                     if let Some(this_obj) = bind_this {
@@ -216,7 +216,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             while let Some(class_handle) = current {
                 if let Some(existing) = self.runtime.heap[class_handle.0].get_raw(name)
                     && self
-                        .property_setter(existing, value.clone(), Some(handle))?
+                        .property_setter(existing, value.clone(), caller_this.or(Some(handle)))?
                         .is_some()
                 {
                     return Ok(());
@@ -232,6 +232,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
         self.runtime.heap[handle.0].set(name, value);
         Ok(())
+    }
+
+    fn member_in_super_chain(
+        &mut self,
+        handle: ObjectHandle,
+        name: &str,
+    ) -> Result<Option<Variant>> {
+        let mut current = Some(handle);
+        while let Some(class_handle) = current {
+            if let Some(value) = self.runtime.heap[class_handle.0].get_raw(name) {
+                return Ok(Some(value));
+            }
+            current = self.super_class_handle(class_handle)?;
+        }
+        Ok(None)
     }
 
     fn set_bound_member(&mut self, handle: ObjectHandle, name: &str, value: Variant) {

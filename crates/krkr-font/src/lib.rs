@@ -1025,8 +1025,9 @@ fn blit_glyph(
                 let dest_y = (y + row as i32) as u32;
                 let dest_x = (x + col_start as i32) as u32;
                 let mut dest_index = ((dest_y * dest_width + dest_x) * 4) as usize;
-                let mut src_index = (row * image.width + col_start) as usize;
-                for _ in col_start..col_end {
+                let src_start = (row * image.width + col_start) as usize;
+                let src_end = (row * image.width + col_end) as usize;
+                for src_index in src_start..src_end {
                     let src_a = multiply_u8(image.data[src_index], color[3]);
                     if src_a != 0 {
                         blend_pixel_channels(
@@ -1037,7 +1038,6 @@ fn blit_glyph(
                             src_a,
                         );
                     }
-                    src_index += 1;
                     dest_index += 4;
                 }
             }
@@ -1050,8 +1050,9 @@ fn blit_glyph(
                 let dest_y = (y + row as i32) as u32;
                 let dest_x = (x + col_start as i32) as u32;
                 let mut dest_index = ((dest_y * dest_width + dest_x) * 4) as usize;
-                let mut src_index = ((row * image.width + col_start) * 4) as usize;
-                for _ in col_start..col_end {
+                let src_start = ((row * image.width + col_start) * 4) as usize;
+                let src_end = ((row * image.width + col_end) * 4) as usize;
+                for src_index in (src_start..src_end).step_by(4) {
                     let r = image.data[src_index];
                     let g = image.data[src_index + 1];
                     let b = image.data[src_index + 2];
@@ -1066,7 +1067,6 @@ fn blit_glyph(
                             src_a,
                         );
                     }
-                    src_index += 4;
                     dest_index += 4;
                 }
             }
@@ -1079,8 +1079,9 @@ fn blit_glyph(
                 let dest_y = (y + row as i32) as u32;
                 let dest_x = (x + col_start as i32) as u32;
                 let mut dest_index = ((dest_y * dest_width + dest_x) * 4) as usize;
-                let mut src_index = ((row * image.width + col_start) * 4) as usize;
-                for _ in col_start..col_end {
+                let src_start = ((row * image.width + col_start) * 4) as usize;
+                let src_end = ((row * image.width + col_end) * 4) as usize;
+                for src_index in (src_start..src_end).step_by(4) {
                     let src_a = multiply_u8(image.data[src_index + 3], color[3]);
                     if src_a != 0 {
                         blend_pixel_channels(
@@ -1091,7 +1092,6 @@ fn blit_glyph(
                             src_a,
                         );
                     }
-                    src_index += 4;
                     dest_index += 4;
                 }
             }

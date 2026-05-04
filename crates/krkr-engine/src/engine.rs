@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     time::{Duration, Instant},
@@ -22,7 +21,7 @@ use crate::{
     kag::{EngineKagHost, tag_to_dictionary},
     native::classes::{
         apply_completed_image_load, apply_completed_resource_loads,
-        finish_completed_native_transitions,
+        finish_completed_native_transitions, register_kag_layer_slots_from_tjs,
     },
     native::{create_kag_parser_object, refresh_kag_parser_object},
     plugin::KrkrPlugin,
@@ -435,21 +434,32 @@ impl KrkrEngine {
     }
 
     pub fn execute_script(&mut self, source_name: &str, source: &str) -> Result<Variant> {
-        execute_script_on_runtime(&mut self.tjs_runtime, source_name, source)
+        let result = execute_script_on_runtime(&mut self.tjs_runtime, source_name, source);
+        self.sync_kag_slots_after_ok(result)
     }
 
     pub fn execute_expression(&mut self, source_name: &str, source: &str) -> Result<Variant> {
-        execute_expression_on_runtime(&mut self.tjs_runtime, source_name, source)
+        let result = execute_expression_on_runtime(&mut self.tjs_runtime, source_name, source);
+        self.sync_kag_slots_after_ok(result)
     }
 
     pub fn execute_storage(&mut self, name: &str) -> Result<Variant> {
         let source = self.tjs_runtime.host().read_text_storage(name)?;
-        execute_script_on_runtime(&mut self.tjs_runtime, name, &source)
+        let result = execute_script_on_runtime(&mut self.tjs_runtime, name, &source);
+        self.sync_kag_slots_after_ok(result)
     }
 
     pub fn eval_storage(&mut self, name: &str) -> Result<Variant> {
         let source = self.tjs_runtime.host().read_text_storage(name)?;
-        execute_expression_on_runtime(&mut self.tjs_runtime, name, &source)
+        let result = execute_expression_on_runtime(&mut self.tjs_runtime, name, &source);
+        self.sync_kag_slots_after_ok(result)
+    }
+
+    fn sync_kag_slots_after_ok<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_ok() {
+            register_kag_layer_slots_from_tjs(&mut self.tjs_runtime);
+        }
+        result
     }
 
     pub fn execute_startup(&mut self) -> Result<Variant> {
@@ -510,7 +520,6 @@ impl KrkrEngine {
         self.resume_modal_call_if_ready()?;
         let tick = self.advance(delta)?;
         self.pump_runtime_scheduler(RuntimeSchedulerPump::WindowUpdatesOnly)?;
-        self.sync_native_layers_from_tjs()?;
         self.tjs_runtime
             .host_mut()
             .reapply_transition_live_layer_overrides();
@@ -553,13 +562,12 @@ impl KrkrEngine {
 
     fn modal_window_is_closed(&self, window: ObjectHandle) -> bool {
         !self.tjs_runtime.object_valid(window)
+            || self.tjs_runtime.host().native_window_closed(window)
             || !self
                 .tjs_runtime
-                .object_member(window, "visible")
-                .is_truthy()
-            || self
-                .tjs_runtime
-                .object_member(window, "__nativeClosed")
+                .host()
+                .native_window_property(window, "visible")
+                .unwrap_or_else(|| self.tjs_runtime.object_member(window, "visible"))
                 .is_truthy()
     }
 
@@ -943,10 +951,11 @@ impl KrkrEngine {
         ) {
             let callback = self.tjs_runtime.object_member(event.target, "__callback");
             if !matches!(callback, Variant::Void) {
-                return self
+                let result = self
                     .tjs_runtime
                     .call_function(callback, event.args)
                     .map(|_| ());
+                return self.sync_kag_slots_after_ok(result);
             }
         }
 
@@ -962,9 +971,11 @@ impl KrkrEngine {
         ) {
             return Ok(());
         }
-        self.tjs_runtime
+        let result = self
+            .tjs_runtime
             .call_object_method(event.target, method, event.args)
-            .map(|_| ())
+            .map(|_| ());
+        self.sync_kag_slots_after_ok(result)
     }
 
     fn handle_input_event(&mut self, event: EngineEvent) -> Result<()> {
@@ -1153,14 +1164,19 @@ impl KrkrEngine {
         let Some(window) = self.runtime_window_object() else {
             return Ok(false);
         };
-        let Variant::Object(focused_layer) = self.tjs_runtime.object_member(window, "focusedLayer")
-        else {
-            return Ok(false);
+        let focused_layer = match self.tjs_runtime.host().native_window_focused_layer(window) {
+            Some(layer) => layer,
+            None => {
+                let Variant::Object(focused_layer) =
+                    self.tjs_runtime.object_member(window, "focusedLayer")
+                else {
+                    return Ok(false);
+                };
+                self.tjs_runtime
+                    .bound_this(focused_layer)
+                    .unwrap_or(focused_layer)
+            }
         };
-        let focused_layer = self
-            .tjs_runtime
-            .bound_this(focused_layer)
-            .unwrap_or(focused_layer);
         if !self.tjs_runtime.object_valid(focused_layer) {
             return Ok(false);
         }
@@ -1438,14 +1454,19 @@ impl KrkrEngine {
         let Some(window) = self.runtime_window_object() else {
             return Ok(());
         };
-        let Variant::Object(focused_layer) = self.tjs_runtime.object_member(window, "focusedLayer")
-        else {
-            return Ok(());
+        let focused_layer = match self.tjs_runtime.host().native_window_focused_layer(window) {
+            Some(layer) => layer,
+            None => {
+                let Variant::Object(focused_layer) =
+                    self.tjs_runtime.object_member(window, "focusedLayer")
+                else {
+                    return Ok(());
+                };
+                self.tjs_runtime
+                    .bound_this(focused_layer)
+                    .unwrap_or(focused_layer)
+            }
         };
-        let focused_layer = self
-            .tjs_runtime
-            .bound_this(focused_layer)
-            .unwrap_or(focused_layer);
         if !self.tjs_runtime.object_valid(focused_layer)
             || matches!(
                 self.tjs_runtime
@@ -1521,13 +1542,18 @@ impl KrkrEngine {
         let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
             return false;
         };
-        let Variant::Object(layer_window) = self.tjs_runtime.object_member(object, "window") else {
-            return false;
-        };
         self.tjs_runtime
-            .bound_this(layer_window)
-            .unwrap_or(layer_window)
-            == window
+            .host()
+            .native_layer_window(object)
+            .or_else(|| match self.tjs_runtime.object_member(object, "window") {
+                Variant::Object(layer_window) => Some(
+                    self.tjs_runtime
+                        .bound_this(layer_window)
+                        .unwrap_or(layer_window),
+                ),
+                _ => None,
+            })
+            == Some(window)
     }
 
     fn layer_has_script_handler(&self, layer_id: LayerId, method: &str) -> bool {
@@ -1615,9 +1641,11 @@ impl KrkrEngine {
         ) {
             return Ok(());
         }
-        self.tjs_runtime
+        let result = self
+            .tjs_runtime
             .call_object_method(object, method, args)
-            .map(|_| ())
+            .map(|_| ());
+        self.sync_kag_slots_after_ok(result)
     }
 
     fn layer_local_point(&self, layer_id: LayerId, position: Point) -> Option<(i64, i64)> {
@@ -1630,214 +1658,6 @@ impl KrkrEngine {
             (position.x - origin.x).round() as i64,
             (position.y - origin.y).round() as i64,
         ))
-    }
-
-    fn sync_native_layers_from_tjs(&mut self) -> Result<()> {
-        let entries = self.tjs_runtime.host().native_layer_entries();
-        let kag_targets = self.collect_kag_layer_targets();
-        for (handle, layer_id) in entries {
-            if !self.tjs_runtime.object_valid(handle) {
-                continue;
-            }
-            let parent = match self.tjs_runtime.object_member(handle, "parent") {
-                Variant::Object(parent) => {
-                    let parent = self.tjs_runtime.bound_this(parent).unwrap_or(parent);
-                    self.tjs_runtime.host().native_layer(parent)
-                }
-                _ => None,
-            };
-            let left = object_i64(&self.tjs_runtime, handle, "left")?;
-            let top = object_i64(&self.tjs_runtime, handle, "top")?;
-            let width = object_i64(&self.tjs_runtime, handle, "width")?;
-            let height = object_i64(&self.tjs_runtime, handle, "height")?;
-            let image_left = object_i64(&self.tjs_runtime, handle, "imageLeft")?;
-            let image_top = object_i64(&self.tjs_runtime, handle, "imageTop")?;
-            let image_width = object_i64(&self.tjs_runtime, handle, "imageWidth")?;
-            let image_height = object_i64(&self.tjs_runtime, handle, "imageHeight")?;
-            let visible = self.layer_effective_visible(handle)?;
-            let opacity = object_i64(&self.tjs_runtime, handle, "opacity")?.clamp(0, 255) as u8;
-            let enabled = object_i64(&self.tjs_runtime, handle, "enabled")? != 0;
-            let node_enabled = object_i64(&self.tjs_runtime, handle, "nodeEnabled")? != 0;
-            let layer_type = object_i64(&self.tjs_runtime, handle, "type")? as i32;
-            let face = object_i64(&self.tjs_runtime, handle, "face")? as i32;
-            let hit_type = object_i64(&self.tjs_runtime, handle, "hitType")? as i32;
-            let hit_threshold = object_i64(&self.tjs_runtime, handle, "hitThreshold")?
-                .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            let absolute = object_optional_i64(&self.tjs_runtime, handle, "absolute")?;
-            let order = object_optional_i64(&self.tjs_runtime, handle, "order")?;
-
-            let target_handle = self.tjs_runtime.bound_this(handle).unwrap_or(handle);
-            let kag_target = kag_targets.get(&target_handle).cloned();
-            if let Some((page, layer_name)) = kag_target.as_ref().filter(|(page, _)| page == "back")
-            {
-                let source = self
-                    .tjs_runtime
-                    .host()
-                    .layer_tree()
-                    .layer(layer_id)
-                    .cloned();
-                if let Some(layer) = self
-                    .tjs_runtime
-                    .host_mut()
-                    .layer_tree_mut()
-                    .layer_mut(layer_id)
-                {
-                    layer.renderable = false;
-                }
-                self.tjs_runtime
-                    .host_mut()
-                    .mutate_kag_layer(page, layer_name, |layer| {
-                        if layer.image.is_none()
-                            && let Some(source) = &source
-                            && source.image.is_some()
-                        {
-                            layer.image = source.image.clone();
-                        }
-                        layer.left = left as f32;
-                        layer.top = top as f32;
-                        layer.width = width.max(0) as f32;
-                        layer.height = height.max(0) as f32;
-                        layer.image_left = image_left as f32;
-                        layer.image_top = image_top as f32;
-                        layer.image_width = image_width.max(0) as f32;
-                        layer.image_height = image_height.max(0) as f32;
-                        layer.visible = visible;
-                        layer.opacity = opacity;
-                        layer.enabled = enabled;
-                        layer.node_enabled = node_enabled;
-                        layer.layer_type = layer_type;
-                        layer.face = face;
-                        layer.hit_type = hit_type;
-                        layer.hit_threshold = hit_threshold;
-                        if let Some(z_order) = absolute.or(order) {
-                            layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                        }
-                    });
-                continue;
-            }
-
-            let layer_tree = self.tjs_runtime.host_mut().layer_tree_mut();
-            let render_parent = if matches!(kag_target.as_ref(), Some((page, layer_name)) if page == "fore" && layer_name == "base")
-            {
-                None
-            } else {
-                parent
-            };
-            layer_tree.set_parent(layer_id, render_parent);
-            if let Some(layer) = layer_tree.layer_mut(layer_id) {
-                layer.left = left as f32;
-                layer.top = top as f32;
-                layer.width = width.max(0) as f32;
-                layer.height = height.max(0) as f32;
-                layer.image_left = image_left as f32;
-                layer.image_top = image_top as f32;
-                layer.image_width = image_width.max(0) as f32;
-                layer.image_height = image_height.max(0) as f32;
-                layer.visible = visible;
-                if matches!(kag_target.as_ref(), Some((page, _)) if page == "fore") {
-                    layer.renderable = true;
-                }
-                layer.opacity = opacity;
-                layer.enabled = enabled;
-                layer.node_enabled = node_enabled;
-                layer.layer_type = layer_type;
-                layer.face = face;
-                layer.hit_type = hit_type;
-                layer.hit_threshold = hit_threshold;
-                if let Some(z_order) = absolute.or(order) {
-                    layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn layer_effective_visible(&self, handle: ObjectHandle) -> Result<bool> {
-        if object_i64(&self.tjs_runtime, handle, "visible")? == 0 {
-            return Ok(false);
-        }
-
-        let Variant::Object(window) = self.tjs_runtime.object_member(handle, "window") else {
-            return Ok(true);
-        };
-        let window = self.tjs_runtime.bound_this(window).unwrap_or(window);
-        Ok(self.tjs_runtime.object_valid(window)
-            && !self
-                .tjs_runtime
-                .object_member(window, "__nativeClosed")
-                .is_truthy())
-    }
-
-    fn collect_kag_layer_targets(&self) -> BTreeMap<ObjectHandle, (String, String)> {
-        let mut targets = BTreeMap::new();
-        let Variant::Object(kag) = self.tjs_runtime.global_member("kag") else {
-            return targets;
-        };
-
-        for page in ["fore", "back"] {
-            let Variant::Object(page_object) = self.tjs_runtime.object_member(kag, page) else {
-                continue;
-            };
-            if let Variant::Object(base) = self.tjs_runtime.object_member(page_object, "base") {
-                targets.insert(
-                    self.tjs_runtime.bound_this(base).unwrap_or(base),
-                    (page.to_string(), "base".to_string()),
-                );
-            }
-            self.collect_kag_layer_array_targets(&mut targets, page, page_object, "layers", false);
-            self.collect_kag_layer_array_targets(&mut targets, page, page_object, "messages", true);
-        }
-
-        targets
-    }
-
-    fn collect_kag_layer_array_targets(
-        &self,
-        targets: &mut BTreeMap<ObjectHandle, (String, String)>,
-        page: &str,
-        page_object: ObjectHandle,
-        member: &str,
-        message_layers: bool,
-    ) {
-        let Variant::Object(array) = self.tjs_runtime.object_member(page_object, member) else {
-            return;
-        };
-        if let Some(elements) = self.tjs_runtime.array_elements(array) {
-            for (index, value) in elements.iter().enumerate() {
-                self.insert_kag_layer_target(targets, page, index, message_layers, value);
-            }
-            return;
-        }
-        let Ok(count) = self.tjs_runtime.object_member(array, "count").to_integer() else {
-            return;
-        };
-        for index in 0..count.max(0) {
-            let value = self.tjs_runtime.object_member(array, &index.to_string());
-            self.insert_kag_layer_target(targets, page, index as usize, message_layers, &value);
-        }
-    }
-
-    fn insert_kag_layer_target(
-        &self,
-        targets: &mut BTreeMap<ObjectHandle, (String, String)>,
-        page: &str,
-        index: usize,
-        message_layer: bool,
-        value: &Variant,
-    ) {
-        let Variant::Object(candidate) = value else {
-            return;
-        };
-        let handle = self
-            .tjs_runtime
-            .bound_this(*candidate)
-            .unwrap_or(*candidate);
-        let layer = if message_layer {
-            format!("message{index}")
-        } else {
-            index.to_string()
-        };
-        targets.insert(handle, (page.to_string(), layer));
     }
 
     pub fn register_plugin<P>(&mut self, plugin: P) -> Result<()>
@@ -2746,7 +2566,11 @@ fn execute_eval_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
     let expression = tag
         .literal_attr("exp")
         .ok_or_else(|| TjsError::runtime("KAG eval tag requires exp"))?;
-    execute_expression_on_runtime(runtime, "kag eval", expression).map(|_| ())
+    let result = execute_expression_on_runtime(runtime, "kag eval", expression);
+    if result.is_ok() {
+        register_kag_layer_slots_from_tjs(runtime);
+    }
+    result.map(|_| ())
 }
 
 fn execute_trace_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
@@ -2797,70 +2621,6 @@ fn pointer_event_methods(method: &str) -> &'static [&'static str] {
         "onMouseUp" => &["onMouseUp"],
         "onMouseMove" => &["onMouseMove", "onMouseEnter", "onMouseLeave"],
         _ => &[],
-    }
-}
-
-fn object_i64(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Result<i64> {
-    layer_object_member(runtime, object, name).to_integer()
-}
-
-fn object_optional_i64(
-    runtime: &Runtime<KrkrHost>,
-    object: ObjectHandle,
-    name: &str,
-) -> Result<Option<i64>> {
-    match layer_object_member(runtime, object, name) {
-        Variant::Void => Ok(None),
-        value => value.to_integer().map(Some),
-    }
-}
-
-fn layer_object_member(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Variant {
-    let direct = runtime.object_member(object, name);
-    if !runtime.variant_is_property(&direct) && !matches!(direct, Variant::Void) {
-        return direct;
-    }
-    let stored = runtime.object_member(object, &layer_property_backing_key(name));
-    if !matches!(stored, Variant::Void) {
-        return stored;
-    }
-    if runtime.variant_is_property(&direct) {
-        Variant::Void
-    } else {
-        direct
-    }
-}
-
-fn layer_property_backing_key(name: &str) -> Cow<'static, str> {
-    match name {
-        "window" => Cow::Borrowed("__nativeLayerProperty$window"),
-        "parent" => Cow::Borrowed("__nativeLayerProperty$parent"),
-        "children" => Cow::Borrowed("__nativeLayerProperty$children"),
-        "order" => Cow::Borrowed("__nativeLayerProperty$order"),
-        "absoluteOrderMode" => Cow::Borrowed("__nativeLayerProperty$absoluteOrderMode"),
-        "visible" => Cow::Borrowed("__nativeLayerProperty$visible"),
-        "nodeVisible" => Cow::Borrowed("__nativeLayerProperty$nodeVisible"),
-        "opacity" => Cow::Borrowed("__nativeLayerProperty$opacity"),
-        "isPrimary" => Cow::Borrowed("__nativeLayerProperty$isPrimary"),
-        "left" => Cow::Borrowed("__nativeLayerProperty$left"),
-        "top" => Cow::Borrowed("__nativeLayerProperty$top"),
-        "width" => Cow::Borrowed("__nativeLayerProperty$width"),
-        "height" => Cow::Borrowed("__nativeLayerProperty$height"),
-        "imageLeft" => Cow::Borrowed("__nativeLayerProperty$imageLeft"),
-        "imageTop" => Cow::Borrowed("__nativeLayerProperty$imageTop"),
-        "imageWidth" => Cow::Borrowed("__nativeLayerProperty$imageWidth"),
-        "imageHeight" => Cow::Borrowed("__nativeLayerProperty$imageHeight"),
-        "type" => Cow::Borrowed("__nativeLayerProperty$type"),
-        "face" => Cow::Borrowed("__nativeLayerProperty$face"),
-        "hitType" => Cow::Borrowed("__nativeLayerProperty$hitType"),
-        "hitThreshold" => Cow::Borrowed("__nativeLayerProperty$hitThreshold"),
-        "cursor" => Cow::Borrowed("__nativeLayerProperty$cursor"),
-        "hint" => Cow::Borrowed("__nativeLayerProperty$hint"),
-        "showParentHint" => Cow::Borrowed("__nativeLayerProperty$showParentHint"),
-        "enabled" => Cow::Borrowed("__nativeLayerProperty$enabled"),
-        "nodeEnabled" => Cow::Borrowed("__nativeLayerProperty$nodeEnabled"),
-        "font" => Cow::Borrowed("__nativeLayerProperty$font"),
-        _ => Cow::Owned(format!("__nativeLayerProperty${name}")),
     }
 }
 
@@ -2947,7 +2707,7 @@ fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<bool> {
             if has_explicit_height {
                 completion.request.height = request.height;
             }
-            apply_completed_image_load(runtime, completion)?;
+            apply_completed_image_load(runtime, *completion)?;
             Ok(false)
         }
         ImageLoadState::Pending => Ok(true),
@@ -3374,6 +3134,42 @@ mod tests {
             .expect("script");
 
         assert_eq!(value, Variant::String("1:1:1:1:1:0:1:1".to_string()));
+    }
+
+    #[test]
+    fn window_add_remove_updates_backing_primary_and_focused_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.layer = new Layer(window, null);
+                window.add(layer);
+                "#,
+            )
+            .expect("script");
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window missing");
+        };
+        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
+            panic!("layer missing");
+        };
+        assert_eq!(
+            engine.host().native_window_primary_layer(window),
+            Some(layer)
+        );
+        assert_eq!(
+            engine.host().native_window_focused_layer(window),
+            Some(layer)
+        );
+        assert_eq!(engine.host().native_layer_window(layer), Some(window));
+
+        engine
+            .execute_script("inline.tjs", "window.remove(layer);")
+            .expect("remove");
+        assert_eq!(engine.host().native_window_primary_layer(window), None);
+        assert_eq!(engine.host().native_window_focused_layer(window), None);
     }
 
     #[test]
@@ -3886,6 +3682,65 @@ mod tests {
             .absolute_position(layer_id)
             .expect("absolute position");
         assert_eq!(position, Point::new(20.0, 30.0));
+    }
+
+    #[test]
+    fn inherited_super_layer_property_assignment_updates_render_node() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(
+            root.join("button.png"),
+            6,
+            1,
+            &[
+                255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0,
+                0, 255, 255,
+            ],
+        );
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class MiddleLayer extends Layer {
+                    function MiddleLayer(window, parent) { super.Layer(window, parent); }
+                }
+                class ThreeStateLayer extends MiddleLayer {
+                    function ThreeStateLayer(window, parent) {
+                        super.MiddleLayer(window, parent);
+                    }
+                    function load(storage) {
+                        super.loadImages(storage);
+                        super.width = imageWidth \ 3;
+                        super.height = imageHeight;
+                    }
+                }
+                global.button = new ThreeStateLayer(null, null);
+                button.load("button.png");
+                button.visible = true;
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.width == 2.0
+                        && image.rect.height == 1.0
+                        && image.source_rect.width == 2.0
+                        && image.texture_size.width == 6.0
+            )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -5600,6 +5455,131 @@ mod tests {
     }
 
     #[test]
+    fn native_kag_slot_mapping_tracks_fore_back_base_layers_and_messages() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(null, kag.fore.base), layers: [], messages: []];
+                kag.fore.layers[0] = new Layer(null, kag.fore.base);
+                kag.back.layers[0] = new Layer(null, kag.back.base);
+                kag.fore.messages[0] = new Layer(null, kag.fore.base);
+                kag.back.messages[0] = new Layer(null, kag.back.base);
+                kag.back.layers[0].left = 42;
+                kag.back.messages[0].visible = true;
+                "#,
+            )
+            .expect("script");
+
+        let Variant::Object(kag) = engine.tjs_runtime().global_member("kag") else {
+            panic!("kag missing");
+        };
+        let Variant::Object(fore) = engine.tjs_runtime().object_member(kag, "fore") else {
+            panic!("fore missing");
+        };
+        let Variant::Object(back) = engine.tjs_runtime().object_member(kag, "back") else {
+            panic!("back missing");
+        };
+        let Variant::Object(fore_base) = engine.tjs_runtime().object_member(fore, "base") else {
+            panic!("fore base missing");
+        };
+        let Variant::Object(back_layers) = engine.tjs_runtime().object_member(back, "layers")
+        else {
+            panic!("back layers missing");
+        };
+        let Variant::Object(back_layer0) = engine.tjs_runtime().object_member(back_layers, "0")
+        else {
+            panic!("back layer missing");
+        };
+        let Variant::Object(back_messages) = engine.tjs_runtime().object_member(back, "messages")
+        else {
+            panic!("back messages missing");
+        };
+        let Variant::Object(back_message0) = engine.tjs_runtime().object_member(back_messages, "0")
+        else {
+            panic!("back message missing");
+        };
+
+        let fore_base_slot = engine.host().kag_layer_slot(fore_base).expect("fore slot");
+        assert_eq!(fore_base_slot.page, "fore");
+        assert_eq!(fore_base_slot.layer, "base");
+        let back_layer_slot = engine
+            .host()
+            .kag_layer_slot(back_layer0)
+            .expect("back layer slot");
+        assert_eq!(back_layer_slot.page, "back");
+        assert_eq!(back_layer_slot.layer, "0");
+        let back_message_slot = engine
+            .host()
+            .kag_layer_slot(back_message0)
+            .expect("back message slot");
+        assert_eq!(back_message_slot.page, "back");
+        assert_eq!(back_message_slot.layer, "message0");
+        assert_eq!(
+            engine.host().kag_layer("back", "0").map(|layer| layer.left),
+            Some(42.0)
+        );
+        let native_back_layer = engine
+            .host()
+            .native_layer(back_layer0)
+            .expect("native layer");
+        assert!(
+            !engine
+                .host()
+                .layer_tree()
+                .layer(native_back_layer)
+                .expect("native layer node")
+                .renderable
+        );
+    }
+
+    #[test]
+    fn native_kag_backlay_stages_back_state_without_polluting_fore_object_properties() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(null, kag.fore.base), layers: [], messages: []];
+                kag.fore.layers[0] = new Layer(null, kag.fore.base);
+                kag.back.layers[0] = new Layer(null, kag.back.base);
+                kag.fore.layers[0].left = 5;
+                kag.fore.layers[0].top = 7;
+                kag.fore.layers[0].visible = true;
+                "#,
+            )
+            .expect("setup");
+        engine.host_mut().backlay_kag_layers(Some("0"));
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                kag.back.layers[0].left = 40;
+                kag.back.layers[0].top = 50;
+                "#,
+            )
+            .expect("stage back");
+
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "kag.fore.layers[0].left + ':' + kag.fore.layers[0].top",
+                )
+                .expect("fore props"),
+            Variant::String("5:7".to_string())
+        );
+        let back = engine.host().kag_layer("back", "0").expect("back layer");
+        assert_eq!(back.left, 40.0);
+        assert_eq!(back.top, 50.0);
+    }
+
+    #[test]
     fn native_kag_fore_base_keeps_native_tree_for_hit_testing() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -5957,6 +5937,75 @@ mod tests {
             )
         }));
         assert_eq!(image_command_count(&frame), 0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_kag_base_transition_keeps_live_base_visible_when_back_base_hidden() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 4, 4, &[255; 64]);
+        write_png(root.join("new.png"), 4, 4, &[0, 255, 0, 255].repeat(16));
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.fore.base.loadImages("old.png");
+                kag.fore.base.setSizeToImageSize();
+                kag.fore.base.visible = true;
+                kag.back.base.loadImages("new.png");
+                kag.back.base.setSizeToImageSize();
+                kag.back.base.visible = false;
+                "#,
+            )
+            .expect("setup");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync fore");
+        assert_eq!(image_command_count(&frame), 1);
+
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                kag.fore.base.beginTransition(
+                    "crossfade",
+                    true,
+                    kag.back.base,
+                    %[time: 1000]
+                );
+                "#,
+            )
+            .expect("begin transition");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("transition frame");
+        let transition = frame.output.transition.as_ref().expect("transition");
+        assert!(transition.frozen_draw_commands.iter().any(|command| {
+            matches!(
+                command,
+                krkr_core::DrawCommand::Image(image)
+                    if image.rect.x == 0.0
+                        && image.rect.y == 0.0
+                        && image.rect.width == 4.0
+                        && image.rect.height == 4.0
+            )
+        }));
+        assert_eq!(image_command_count(&frame), 1);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -6595,6 +6644,93 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_property_setters_update_render_tree_without_frame_sync() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.left = 12;
+                layer.top = 34;
+                layer.width = 56;
+                layer.height = 78;
+                layer.visible = true;
+                layer.opacity = 123;
+                return layer.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+
+        let layer = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .expect("native layer");
+        assert_eq!(layer.left, 12.0);
+        assert_eq!(layer.top, 34.0);
+        assert_eq!(layer.width, 56.0);
+        assert_eq!(layer.height, 78.0);
+        assert!(layer.visible);
+        assert_eq!(layer.opacity, 123);
+    }
+
+    #[test]
+    fn native_layer_parent_setter_updates_render_tree_and_hit_testing_immediately() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.root1 = new Layer();
+                root1.setPos(10, 10);
+                root1.setSize(100, 100);
+                root1.visible = true;
+
+                global.root2 = new Layer();
+                root2.setPos(200, 10);
+                root2.setSize(100, 100);
+                root2.visible = true;
+
+                global.child = new Layer(null, root1);
+                child.setPos(5, 5);
+                child.setSize(10, 10);
+                child.setImageSize(10, 10);
+                child.fillRect(0, 0, 10, 10, 0xffffffff);
+                child.visible = true;
+                "#,
+            )
+            .expect("script");
+        let Variant::Object(child) = engine.tjs_runtime().global_member("child") else {
+            panic!("child missing");
+        };
+        let child_layer = engine.host().native_layer(child).expect("child layer");
+
+        assert_eq!(
+            engine.host().layer_tree().hit_test(Point::new(16.0, 16.0)),
+            Some(child_layer)
+        );
+
+        engine
+            .execute_script("inline.tjs", "child.parent = root2;")
+            .expect("reparent");
+        assert_eq!(
+            engine.host().layer_tree().absolute_position(child_layer),
+            Some(Point::new(205.0, 15.0))
+        );
+        assert_eq!(
+            engine.host().layer_tree().hit_test(Point::new(206.0, 16.0)),
+            Some(child_layer)
+        );
+        assert_eq!(
+            engine.host().layer_tree().hit_test(Point::new(16.0, 16.0)),
+            None
+        );
+    }
+
+    #[test]
     fn native_layer_invalidate_removes_child_from_render_tree_and_hit_testing() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -6656,6 +6792,38 @@ mod tests {
                 .expect("buttonClicks"),
             Variant::Integer(0)
         );
+    }
+
+    #[test]
+    fn native_layer_invalidate_removes_subtree_backing_and_pending_window_updates() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.root = new Layer();
+                global.child = new Layer(null, root);
+                child.update();
+                "#,
+            )
+            .expect("script");
+        let Variant::Object(root) = engine.tjs_runtime().global_member("root") else {
+            panic!("root missing");
+        };
+        let Variant::Object(child) = engine.tjs_runtime().global_member("child") else {
+            panic!("child missing");
+        };
+        assert!(engine.host().native_layer(root).is_some());
+        assert!(engine.host().native_layer(child).is_some());
+        assert!(engine.host().has_pending_window_update(child));
+
+        engine
+            .execute_script("cleanup.tjs", "invalidate root;")
+            .expect("invalidate");
+        assert!(engine.host().native_layer(root).is_none());
+        assert!(engine.host().native_layer(child).is_none());
+        assert!(!engine.host().has_pending_window_update(child));
+        assert!(!engine.host().has_pending_image_load_for_owner(child));
     }
 
     #[test]

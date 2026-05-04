@@ -1641,6 +1641,26 @@ enum ExprTask<'a> {
     },
 }
 
+struct ExprLoweringState<'a> {
+    tasks: Vec<ExprTask<'a>>,
+    values: Vec<Value>,
+    places: Vec<Place>,
+    call_targets: Vec<CallTarget>,
+    arg_lists: Vec<ArgList>,
+}
+
+impl<'a> ExprLoweringState<'a> {
+    fn new(expr: &'a syntax::Expr) -> Self {
+        Self {
+            tasks: vec![ExprTask::Expr(expr)],
+            values: Vec::new(),
+            places: Vec::new(),
+            call_targets: Vec::new(),
+            arg_lists: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DictionaryKeyPlan {
     Direct(StringId),
@@ -2486,35 +2506,27 @@ impl ObjectBuilder {
     }
 
     fn lower_expr(&mut self, lowerer: &mut Lowerer, expr: &syntax::Expr) -> Result<Value> {
-        let mut tasks = vec![ExprTask::Expr(expr)];
-        let mut values = Vec::new();
-        let mut places = Vec::new();
-        let mut call_targets = Vec::new();
-        let mut arg_lists = Vec::new();
-        while let Some(task) = tasks.pop() {
-            self.run_expr_task(
-                lowerer,
-                task,
-                &mut tasks,
-                &mut values,
-                &mut places,
-                &mut call_targets,
-                &mut arg_lists,
-            )?;
+        let mut state = ExprLoweringState::new(expr);
+        while let Some(task) = state.tasks.pop() {
+            self.run_expr_task(lowerer, task, &mut state)?;
         }
-        pop_value(&mut values)
+        pop_value(&mut state.values)
     }
 
     fn run_expr_task<'a>(
         &mut self,
         lowerer: &mut Lowerer,
         task: ExprTask<'a>,
-        tasks: &mut Vec<ExprTask<'a>>,
-        values: &mut Vec<Value>,
-        places: &mut Vec<Place>,
-        call_targets: &mut Vec<CallTarget>,
-        arg_lists: &mut Vec<ArgList>,
+        state: &mut ExprLoweringState<'a>,
     ) -> Result<()> {
+        let ExprLoweringState {
+            tasks,
+            values,
+            places,
+            call_targets,
+            arg_lists,
+        } = state;
+
         match task {
             ExprTask::Expr(expr) => self.push_expr_task(lowerer, expr, tasks, values, places)?,
             ExprTask::PushValue(value) => values.push(value),

@@ -488,6 +488,35 @@ mod tests {
     }
 
     #[test]
+    fn super_native_property_assignment_walks_inherited_super_chain() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "super_inherited_native_property_set.tjs",
+            r#"
+            class Middle extends NativeBase {
+                function Middle() { super.NativeBase(); }
+            }
+            class Child extends Middle {
+                function Child() { super.Middle(); }
+                function setNativeProp(value) { super.nativeProp = value; }
+                function getNativeProp() { return super.nativeProp; }
+            }
+            var c = new Child();
+            c.setNativeProp(41);
+            return c.getNativeProp() + ":" + c.nativePropValue + ":" +
+                typeof global.nativeProp;
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("41:41:undefined".to_string())
+        );
+    }
+
+    #[test]
     fn super_finalize_uses_declaring_class_super_chain() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);
@@ -608,6 +637,8 @@ mod tests {
         runtime.add_object_class_info(constructor, "NativeBase");
         runtime.register_object_native(constructor, "nativeValue", native_base_value);
         runtime.register_object_native(constructor, "finalize", native_base_finalize);
+        let native_prop = runtime.alloc_native_property(native_base_prop_get, native_base_prop_set);
+        runtime.set_object_member(constructor, "nativeProp", Variant::Object(native_prop));
         runtime.set_global_member("NativeBase", Variant::Object(constructor));
     }
 
@@ -632,6 +663,26 @@ mod tests {
         let trace = runtime.global_member("trace").to_tjs_string()?;
         runtime.set_global_member("trace", Variant::String(format!("{trace}N")));
         Ok(Variant::Void)
+    }
+
+    fn native_base_prop_get(
+        runtime: &mut Runtime,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<Variant> {
+        let handle =
+            this_obj.ok_or_else(|| TjsError::runtime("NativeBase.nativeProp requires this"))?;
+        Ok(runtime.object_member(handle, "nativePropValue"))
+    }
+
+    fn native_base_prop_set(
+        runtime: &mut Runtime,
+        this_obj: Option<ObjectHandle>,
+        value: Variant,
+    ) -> Result<()> {
+        let handle =
+            this_obj.ok_or_else(|| TjsError::runtime("NativeBase.nativeProp requires this"))?;
+        runtime.set_object_member(handle, "nativePropValue", value);
+        Ok(())
     }
 
     #[test]
