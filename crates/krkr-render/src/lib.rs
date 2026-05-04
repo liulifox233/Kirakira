@@ -8,7 +8,7 @@ use std::{
 use bytemuck::{Pod, Zeroable};
 use krkr_core::{
     Color, DrawCommand, FrameOutput, FrameTransition, ImageCommand, ImageUpload, Rect, Size,
-    TextureId,
+    TextureId, TransitionMethod,
 };
 use krkr_font::FontSystem;
 use wgpu::util::DeviceExt;
@@ -256,13 +256,13 @@ impl Renderer {
                 frame.clip,
                 &prepared.draw_commands,
             );
-            self.render_crossfade_to_view(
+            self.render_transition_to_view(
                 &mut encoder,
                 &view,
                 frame.clear_color,
                 &old_target.view,
                 &new_target.view,
-                transition.progress,
+                transition,
             );
         } else {
             self.render_commands_to_view(
@@ -294,6 +294,9 @@ impl Renderer {
             FrameTransition {
                 method: transition.method.clone(),
                 progress: transition.progress,
+                params: transition.params.clone(),
+                rule_texture_id: transition.rule_texture_id,
+                rule_image_upload: transition.rule_image_upload.clone(),
                 frozen_draw_commands,
                 frozen_image_uploads,
             }
@@ -355,6 +358,9 @@ impl Renderer {
         self.upload_images(&frame.image_uploads);
         if let Some(transition) = &frame.transition {
             self.upload_images(&transition.frozen_image_uploads);
+            if let Some(upload) = &transition.rule_image_upload {
+                self.upload_images(std::slice::from_ref(upload));
+            }
         }
     }
 
@@ -433,6 +439,9 @@ impl Renderer {
         collect_image_texture_ids(&frame.draw_commands, &mut referenced);
         if let Some(transition) = &frame.transition {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced);
+            if let Some(texture_id) = transition.rule_texture_id {
+                referenced.insert(texture_id);
+            }
         }
         self.textures
             .retain(|texture_id, _| referenced.contains(texture_id));
@@ -473,26 +482,32 @@ impl Renderer {
         }
     }
 
-    fn render_crossfade_to_view(
+    fn render_transition_to_view(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         clear_color: Color,
         old_view: &wgpu::TextureView,
         new_view: &wgpu::TextureView,
-        progress: f32,
+        transition: &FrameTransition,
     ) {
-        let progress = progress.clamp(0.0, 1.0);
+        let uniforms = transition_uniforms(
+            transition,
+            self.config.width.max(1) as f32,
+            self.config.height.max(1) as f32,
+        );
         let uniform_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Kirakira transition uniforms"),
-                contents: bytemuck::cast_slice(&[TransitionUniforms {
-                    progress,
-                    _padding: [0.0; 3],
-                }]),
+                contents: bytemuck::cast_slice(&[uniforms]),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
+        let rule_view = transition
+            .rule_texture_id
+            .and_then(|texture_id| self.textures.get(&texture_id))
+            .map(|texture| &texture._view)
+            .unwrap_or(old_view);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Kirakira transition bind group"),
             layout: &self.transition_pipeline.bind_group_layout,
@@ -516,6 +531,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(rule_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.texture_pipeline.sampler),
                 },
             ],
         });
@@ -931,6 +954,8 @@ impl TransitionPipelineResources {
                     },
                     count: None,
                 },
+                texture_bind_group_layout_entry(5),
+                sampler_bind_group_layout_entry(6),
             ],
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("transition.wgsl"));
@@ -1067,8 +1092,73 @@ struct TexturedVertex {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct TransitionUniforms {
-    progress: f32,
-    _padding: [f32; 3],
+    data: [[f32; 4]; 8],
+}
+
+fn transition_uniforms(
+    transition: &FrameTransition,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> TransitionUniforms {
+    let params = &transition.params;
+    let primary_bg_color = if matches!(
+        params.method,
+        TransitionMethod::Turn | TransitionMethod::RotateSwap
+    ) {
+        params.bg_color
+    } else {
+        params.bg_color1
+    };
+    TransitionUniforms {
+        data: [
+            [
+                transition.progress.clamp(0.0, 1.0),
+                params.method.as_code(),
+                if transition.rule_texture_id.is_some() {
+                    1.0
+                } else {
+                    0.0
+                },
+                0.0,
+            ],
+            [
+                viewport_width,
+                viewport_height,
+                params.vague.max(0.0),
+                params.scroll_from as u8 as f32,
+            ],
+            [
+                params.scroll_stay as u8 as f32,
+                params.wave_type,
+                params.max_h.max(0.0),
+                params.max_omega.max(0.0),
+            ],
+            color_uniform(primary_bg_color),
+            color_uniform(params.bg_color2),
+            [
+                params.max_size.max(1.0),
+                params.factor.max(0.0),
+                params.accel,
+                params.twist,
+            ],
+            [
+                params.twist_accel,
+                params.center_x,
+                params.center_y,
+                params.ripple_width.max(1.0),
+            ],
+            [
+                params.roundness.max(0.01),
+                params.speed.max(0.01),
+                params.max_drift.max(0.0),
+                0.0,
+            ],
+        ],
+    }
+}
+
+fn color_uniform(color: Color) -> [f32; 4] {
+    [color.r, color.g, color.b, color.a]
 }
 
 impl TexturedVertex {

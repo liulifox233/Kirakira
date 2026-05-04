@@ -4,7 +4,10 @@ use std::{
     time::Duration,
 };
 
-use krkr_core::{AudioBus, AudioCommand, AudioLoadPolicy, LayerImage, LayerNode, Size};
+use krkr_core::{
+    AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerImage, LayerNode, Size,
+    TransitionMethod, TransitionParams, TransitionScrollFrom, TransitionScrollStay,
+};
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
     Result, TjsError,
@@ -2148,6 +2151,17 @@ fn object_optional_integer(
     }
 }
 
+fn object_optional_real(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Option<Result<f64>> {
+    match runtime.object_member(object, name) {
+        Variant::Void => None,
+        value => Some(value.to_real()),
+    }
+}
+
 fn object_optional_string(
     runtime: &Runtime<KrkrHost>,
     object: ObjectHandle,
@@ -2157,6 +2171,182 @@ fn object_optional_string(
         Variant::Void => Ok(None),
         value => value.to_tjs_string().map(Some),
     }
+}
+
+fn transition_params_from_options(
+    runtime: &mut Runtime<KrkrHost>,
+    method: &str,
+    options: Option<ObjectHandle>,
+) -> Result<(TransitionParams, Option<ImageUpload>)> {
+    let method = method.to_ascii_lowercase();
+    let mut params = TransitionParams {
+        method: TransitionMethod::from_name(&method),
+        ..TransitionParams::default()
+    };
+    match params.method {
+        TransitionMethod::RotateVanish => {
+            params.accel = 2.0;
+            params.twist_accel = 2.0;
+        }
+        TransitionMethod::RotateSwap => {
+            params.twist = 1.0;
+        }
+        _ => {}
+    }
+
+    let Some(options) = options else {
+        return Ok((params, None));
+    };
+
+    if let Some(value) = object_optional_real(runtime, options, "vague").transpose()? {
+        params.vague = (value as f32).max(0.0);
+    }
+    if let Some(value) = object_optional_scroll_from(runtime, options, "from")? {
+        params.scroll_from = value;
+    }
+    if let Some(value) = object_optional_scroll_stay(runtime, options, "stay")? {
+        params.scroll_stay = value;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "wavetype").transpose()? {
+        params.wave_type = value as f32;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "maxh").transpose()? {
+        params.max_h = (value as f32).max(0.0);
+    }
+    if let Some(value) = object_optional_real(runtime, options, "maxomega").transpose()? {
+        params.max_omega = (value as f32).max(0.0);
+    }
+    if let Some(value) = object_optional_color(runtime, options, "bgcolor1")? {
+        params.bg_color1 = value;
+    }
+    if let Some(value) = object_optional_color(runtime, options, "bgcolor2")? {
+        params.bg_color2 = value;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "maxsize").transpose()? {
+        params.max_size = (value as f32).max(1.0);
+    }
+    if let Some(value) = object_optional_color(runtime, options, "bgcolor")? {
+        params.bg_color = value;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "factor").transpose()? {
+        params.factor = (value as f32).max(0.0);
+    }
+    if let Some(value) = object_optional_real(runtime, options, "accel").transpose()? {
+        params.accel = value as f32;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "twist").transpose()? {
+        params.twist = value as f32;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "twistaccel").transpose()? {
+        params.twist_accel = value as f32;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "centerx").transpose()? {
+        params.center_x = value as f32;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "centery").transpose()? {
+        params.center_y = value as f32;
+    }
+    if let Some(value) = object_optional_real(runtime, options, "rwidth").transpose()? {
+        params.ripple_width = (value as f32).max(1.0);
+    }
+    if let Some(value) = object_optional_real(runtime, options, "roundness").transpose()? {
+        params.roundness = (value as f32).max(0.01);
+    }
+    if let Some(value) = object_optional_real(runtime, options, "speed").transpose()? {
+        params.speed = (value as f32).max(0.01);
+    }
+    if let Some(value) = object_optional_real(runtime, options, "maxdrift").transpose()? {
+        params.max_drift = (value as f32).max(0.0);
+    }
+
+    let rule_image_upload = if params.method == TransitionMethod::Universal {
+        match object_optional_string(runtime, options, "rule")? {
+            Some(rule) if !rule.is_empty() => {
+                Some(runtime.host_mut().load_image_storage(&rule)?.upload)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Ok((params, rule_image_upload))
+}
+
+fn object_optional_scroll_from(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Result<Option<TransitionScrollFrom>> {
+    match runtime.object_member(object, name) {
+        Variant::Void => Ok(None),
+        Variant::String(value) => Ok(Some(match value.as_str() {
+            "left" => TransitionScrollFrom::Left,
+            "top" => TransitionScrollFrom::Top,
+            "right" => TransitionScrollFrom::Right,
+            "bottom" => TransitionScrollFrom::Bottom,
+            _ => TransitionScrollFrom::Left,
+        })),
+        value => Ok(Some(match value.to_integer()? {
+            1 => TransitionScrollFrom::Top,
+            2 => TransitionScrollFrom::Right,
+            3 => TransitionScrollFrom::Bottom,
+            _ => TransitionScrollFrom::Left,
+        })),
+    }
+}
+
+fn object_optional_scroll_stay(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Result<Option<TransitionScrollStay>> {
+    match runtime.object_member(object, name) {
+        Variant::Void => Ok(None),
+        Variant::String(value) => Ok(Some(match value.as_str() {
+            "stayfore" => TransitionScrollStay::StayDest,
+            "stayback" => TransitionScrollStay::StaySrc,
+            _ => TransitionScrollStay::NoStay,
+        })),
+        value => Ok(Some(match value.to_integer()? {
+            1 => TransitionScrollStay::StayDest,
+            2 => TransitionScrollStay::StaySrc,
+            _ => TransitionScrollStay::NoStay,
+        })),
+    }
+}
+
+fn object_optional_color(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Result<Option<Color>> {
+    let value = runtime.object_member(object, name);
+    if matches!(value, Variant::Void) {
+        return Ok(None);
+    }
+    let color = match value {
+        Variant::String(text) => match text.as_str() {
+            "black" => 0x000000,
+            "white" => 0xffffff,
+            "red" => 0xff0000,
+            "green" => 0x00ff00,
+            "blue" => 0x0000ff,
+            _ => {
+                let text = text
+                    .strip_prefix("0x")
+                    .or_else(|| text.strip_prefix("0X"))
+                    .or_else(|| text.strip_prefix('#'))
+                    .unwrap_or(&text);
+                i64::from_str_radix(text, 16).unwrap_or(0)
+            }
+        },
+        value => value.to_integer()?,
+    };
+    Ok(Some(Color::rgb_u8(
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+    )))
 }
 
 fn source_object(value: &Variant) -> Option<ObjectHandle> {
@@ -2479,13 +2669,16 @@ fn layer_begin_transition(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_else(|| "crossfade".to_string());
-    let duration = match args.get(3).and_then(variant_object) {
+    let options = args.get(3).and_then(variant_object);
+    let duration = match options {
         Some(options) => object_optional_integer(runtime, options, "time")
             .transpose()?
             .unwrap_or(0),
         None => 0,
     }
     .max(0) as u64;
+    let (transition_params, rule_image_upload) =
+        transition_params_from_options(runtime, &method, options)?;
     let source_layer_id = source
         .map(|source| native_layer_id(runtime, source))
         .transpose()?
@@ -2529,8 +2722,9 @@ fn layer_begin_transition(
         finish_immediate_transition(runtime, this);
     } else {
         runtime.host_mut().begin_native_transition(
-            &method,
             Duration::from_millis(duration),
+            transition_params,
+            rule_image_upload,
             frozen,
             suppressed_images,
             live_layer_overrides,
