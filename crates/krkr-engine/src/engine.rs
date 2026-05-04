@@ -3139,6 +3139,52 @@ mod tests {
     }
 
     #[test]
+    fn layer_thumbnail_pipeline_writes_scaled_piled_bmp24() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var base = new Layer();
+                base.visible = true;
+                base.setSize(4, 2);
+                base.setImageSize(4, 2);
+                base.fillRect(0, 0, 4, 2, 0x0000ff);
+
+                var child = new Layer(null, base);
+                child.visible = true;
+                child.setPos(2, 0);
+                child.setSize(2, 2);
+                child.setImageSize(2, 2);
+                child.fillRect(0, 0, 2, 2, 0xff0000);
+
+                var snapshot = new Layer();
+                snapshot.setImageSize(4, 2);
+                snapshot.face = dfAlpha;
+                snapshot.piledCopy(0, 0, base, 0, 0, 4, 2);
+
+                var thumb = new Layer();
+                thumb.setImageSize(2, 1);
+                thumb.face = dfAlpha;
+                thumb.stretchCopy(
+                    0, 0, 2, 1, snapshot,
+                    0, 0, snapshot.imageWidth, snapshot.imageHeight, stLinear);
+                thumb.saveLayerImage(System.dataPath + "thumb-pipeline.bmp", "bmp24");
+                "#,
+            )
+            .expect("save thumbnail");
+
+        let bytes = fs::read(root.join("savedata/thumb-pipeline.bmp")).expect("bmp");
+        assert_eq!(&bytes[0..2], b"BM");
+        assert_eq!(bytes.len(), 54 + 8);
+        assert_eq!(&bytes[54..62], &[255, 0, 0, 0, 0, 255, 0, 0]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn window_inner_size_updates_preferred_viewport_size() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
 
@@ -4237,6 +4283,102 @@ mod tests {
             .expect("next tag")
             .expect("restored character");
         assert_eq!(next.literal_attr("text"), Some("B"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn active_parser_store_survives_struct_save_load() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "AB[s]\n*later\nZ[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        let first = engine
+            .next_kag_tag()
+            .expect("first tag")
+            .expect("character");
+        assert_eq!(first.literal_attr("text"), Some("A"));
+        let snapshot = engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "store", Vec::new())
+            .expect("store");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("activeParser", Variant::Object(parser));
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("savedSnapshot", snapshot);
+        engine
+            .execute_script(
+                "persist.tjs",
+                r#"
+                var data = %[mainConductor: savedSnapshot];
+                (Dictionary.saveStruct incontextof data)("savedata/bookmark.ksd", "");
+                var loaded = Scripts.evalStorage("savedata/bookmark.ksd");
+                activeParser.goToLabel("*later");
+                activeParser.restore(loaded.mainConductor);
+                "#,
+            )
+            .expect("persist restore");
+
+        let next = engine
+            .next_kag_tag()
+            .expect("next tag")
+            .expect("restored character");
+        assert_eq!(next.literal_attr("text"), Some("B"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_parser_snapshot_loads_call_stack_storages() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[call storage=\"second.ks\"]A[s]")
+            .expect("write first scenario");
+        fs::write(root.join("second.ks"), "B[return]C[s]").expect("write second scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        let first = engine
+            .next_kag_tag()
+            .expect("first tag")
+            .expect("character");
+        assert_eq!(first.literal_attr("text"), Some("B"));
+        let snapshot = engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "store", Vec::new())
+            .expect("store");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("savedSnapshot", snapshot);
+        engine
+            .execute_script(
+                "persist-call-stack.tjs",
+                r#"
+                var data = %[mainConductor: savedSnapshot];
+                (Dictionary.saveStruct incontextof data)("savedata/bookmark.ksd", "");
+                var loaded = Scripts.evalStorage("savedata/bookmark.ksd");
+                var fresh = new KAGParser();
+                fresh.restore(loaded.mainConductor);
+                var tag = fresh.getNextTag();
+                global.restoredText = tag.text;
+                "#,
+            )
+            .expect("persist call stack restore");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("restoredText"),
+            Variant::String("A".to_string())
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -7280,6 +7422,105 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_stretch_copy_scales_source_pixels() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 2);
+                source.fillRect(0, 0, 1, 1, 0xff0000);
+                source.fillRect(1, 0, 1, 1, 0x00ff00);
+                source.fillRect(0, 1, 1, 1, 0x0000ff);
+                source.fillRect(1, 1, 1, 1, 0xffffff);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.stretchCopy(0, 0, 4, 4, source, 0, 0, 2, 2, 0);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image");
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let white = [255, 255, 255, 255];
+        let mut expected = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                expected.extend_from_slice(match (x >= 2, y >= 2) {
+                    (false, false) => &red,
+                    (true, false) => &green,
+                    (false, true) => &blue,
+                    (true, true) => &white,
+                });
+            }
+        }
+        assert_eq!(image.upload.rgba.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn native_layer_piled_copy_composites_child_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var base = new Layer();
+                base.visible = true;
+                base.setSize(4, 4);
+                base.setImageSize(4, 4);
+                base.fillRect(0, 0, 4, 4, 0x202020);
+
+                var child = new Layer(null, base);
+                child.visible = true;
+                child.setPos(1, 1);
+                child.setSize(2, 2);
+                child.setImageSize(2, 2);
+                child.fillRect(0, 0, 2, 2, 0xff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.piledCopy(0, 0, base, 0, 0, 4, 4);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image");
+        let base = [0x20, 0x20, 0x20, 255];
+        let red = [255, 0, 0, 255];
+        let mut expected = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                if (1..3).contains(&x) && (1..3).contains(&y) {
+                    expected.extend_from_slice(&red);
+                } else {
+                    expected.extend_from_slice(&base);
+                }
+            }
+        }
+        assert_eq!(image.upload.rgba.as_ref(), expected.as_slice());
+    }
+
+    #[test]
     fn update_dispatches_primary_pointer_release_to_top_native_layer() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -9475,11 +9716,11 @@ mod tests {
                 };
                 parser.loadScenario("first.ks");
                 parser.getNextTag();
-                return parser.snapshot.curStorage;
+                return parser.snapshot.snapshot != "";
                 "#,
             )
             .expect("script");
-        assert_eq!(value, Variant::String("first.ks".to_string()));
+        assert_eq!(value, Variant::Integer(1));
 
         fs::remove_dir_all(root).expect("cleanup");
     }

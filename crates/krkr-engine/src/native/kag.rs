@@ -246,31 +246,19 @@ fn kag_store(
 ) -> Result<Variant> {
     with_parser(vm, this_obj, "KAGParser.store", false, |parser, vm, _| {
         let runtime = vm.runtime_mut();
-        let snapshot = parser.store();
-        let id = runtime.host_mut().store_kag_snapshot(snapshot);
         let object = runtime.alloc_ordinary_object();
         runtime.add_object_class_info(object, "Dictionary");
-        runtime.set_object_member(object, "__kagSnapshotId", Variant::Integer(id));
         runtime.set_object_member(
             object,
-            "curStorage",
-            Variant::String(parser.cur_storage().unwrap_or_default().to_string()),
+            "snapshot",
+            Variant::String(parser.store().to_persistent_string()),
         );
-        runtime.set_object_member(
-            object,
-            "curLabel",
-            Variant::String(parser.cur_label().unwrap_or_default().to_string()),
-        );
-        runtime.set_object_member(
-            object,
-            "curLine",
-            Variant::Integer(parser.cur_line().unwrap_or(0) as i64),
-        );
-        runtime.set_object_member(
-            object,
-            "curPos",
-            Variant::Integer(parser.cur_pos().unwrap_or(0) as i64),
-        );
+        let macros = runtime.alloc_ordinary_object();
+        runtime.add_object_class_info(macros, "Dictionary");
+        for (name, source) in parser.macro_definitions() {
+            runtime.set_object_member(macros, name, Variant::String(source.to_string()));
+        }
+        runtime.set_object_member(object, "macros", Variant::Object(macros));
         Ok(Variant::Object(object))
     })
 }
@@ -285,11 +273,17 @@ fn kag_restore(
             "KAGParser.restore requires a snapshot object",
         ));
     };
-    let snapshot = snapshot_from_object(vm.runtime(), snapshot_object)?;
-    with_parser(vm, this_obj, "KAGParser.restore", true, |parser, _, _| {
-        parser.restore(snapshot).map_err(kag_to_tjs)?;
-        Ok(Variant::Void)
-    })
+    with_parser(
+        vm,
+        this_obj,
+        "KAGParser.restore",
+        true,
+        |parser, vm, handle| {
+            let snapshot = snapshot_from_object(vm, handle, parser, snapshot_object)?;
+            parser.restore(snapshot).map_err(kag_to_tjs)?;
+            Ok(Variant::Void)
+        },
+    )
 }
 
 fn kag_clear_call_stack(
@@ -667,17 +661,91 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
 }
 
 fn snapshot_from_object(
-    runtime: &Runtime<KrkrHost>,
+    vm: &mut Vm<KrkrHost>,
+    owner: ObjectHandle,
+    parser: &mut KagParser,
     snapshot_object: ObjectHandle,
 ) -> Result<ParserSnapshot> {
-    let id = runtime
-        .object_member(snapshot_object, "__kagSnapshotId")
-        .to_integer()?;
-    runtime
-        .host()
-        .kag_snapshot(id)
-        .cloned()
-        .ok_or_else(|| TjsError::runtime("KAGParser snapshot is not available"))
+    let Variant::String(encoded) = vm.runtime().object_member(snapshot_object, "snapshot") else {
+        return Err(TjsError::runtime(
+            "KAGParser.restore requires a persistent snapshot",
+        ));
+    };
+    if encoded.is_empty() {
+        return Err(TjsError::runtime(
+            "KAGParser.restore requires a persistent snapshot",
+        ));
+    }
+
+    let mut snapshot = ParserSnapshot::from_persistent_string(&encoded).map_err(kag_to_tjs)?;
+    apply_snapshot_macros_from_object(vm.runtime(), parser, snapshot_object, &mut snapshot);
+    ensure_snapshot_storages_loaded(vm, owner, parser, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn apply_snapshot_macros_from_object(
+    runtime: &Runtime<KrkrHost>,
+    parser: &KagParser,
+    snapshot_object: ObjectHandle,
+    snapshot: &mut ParserSnapshot,
+) {
+    if !runtime.has_object_member(snapshot_object, "macros") {
+        return;
+    }
+
+    match runtime.object_member(snapshot_object, "macros") {
+        Variant::Object(macros) => {
+            let definitions = runtime.object_members(macros).into_iter().filter_map(
+                |(name, value)| match value {
+                    Variant::String(source) => Some((name, source)),
+                    _ => None,
+                },
+            );
+            snapshot.set_macro_definitions(definitions);
+        }
+        Variant::Void => snapshot.set_macro_definitions(
+            parser
+                .macro_definitions()
+                .map(|(name, source)| (name.to_string(), source.to_string())),
+        ),
+        _ => {}
+    }
+}
+
+fn ensure_snapshot_storages_loaded(
+    vm: &mut Vm<KrkrHost>,
+    owner: ObjectHandle,
+    parser: &mut KagParser,
+    snapshot: &ParserSnapshot,
+) -> Result<()> {
+    for storage in snapshot.storage_names() {
+        ensure_snapshot_storage_loaded(vm, owner, parser, storage)?;
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_storage_loaded(
+    vm: &mut Vm<KrkrHost>,
+    owner: ObjectHandle,
+    parser: &mut KagParser,
+    storage: &str,
+) -> Result<()> {
+    if storage.is_empty() {
+        return Ok(());
+    }
+    if parser.cur_storage() == Some(storage) {
+        return Ok(());
+    }
+    match parser.set_cur_storage(storage.to_string()) {
+        Ok(()) => Ok(()),
+        Err(KagError::ScenarioNotLoaded { .. }) => {
+            let mut host = TjsKagHost::new(vm, owner);
+            parser
+                .load_scenario_with(storage.to_string(), &mut host)
+                .map_err(kag_to_tjs)
+        }
+        Err(error) => Err(kag_to_tjs(error)),
+    }
 }
 
 fn debug_level_from_variant(value: &Variant) -> Result<DebugLevel> {
