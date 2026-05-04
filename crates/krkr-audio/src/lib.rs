@@ -113,7 +113,7 @@ enum PreparedSound {
 enum ControlMessage {
     Command(AudioCommand),
     SetResourceProvider(Option<Arc<dyn ResourceProvider>>),
-    Prepared(PreparedAudio),
+    Prepared(Box<PreparedAudio>),
     Shutdown,
 }
 
@@ -149,7 +149,7 @@ enum PreparedAudioKind {
     Play {
         id: AudioInstanceId,
         generation: u64,
-        result: Result<PreparedSound, AudioLoadFailure>,
+        result: Box<Result<PreparedSound, AudioLoadFailure>>,
     },
     Preload {
         result: Result<(), AudioLoadFailure>,
@@ -363,7 +363,7 @@ fn audio_control_worker(
                 if prepared.provider_epoch != provider_epoch {
                     continue;
                 }
-                handle_prepared_audio(prepared, &mut backend, &mut slots, &event_tx);
+                handle_prepared_audio(*prepared, &mut backend, &mut slots, &event_tx);
             }
             ControlMessage::Shutdown => {
                 backend.stop_all(Tween::default());
@@ -566,7 +566,7 @@ fn handle_prepared_audio(
             if slot.generation != generation {
                 return;
             }
-            match result {
+            match *result {
                 Ok(sound) => {
                     let request = PlayRequest {
                         id,
@@ -673,23 +673,23 @@ fn send_static_load_result(
     match request.kind {
         LoadRequestKind::Play { id, generation, .. } => {
             let result = load_static_or_auto_sound(request, cache);
-            control_tx.send(ControlMessage::Prepared(PreparedAudio {
+            control_tx.send(ControlMessage::Prepared(Box::new(PreparedAudio {
                 source,
                 provider_epoch,
                 kind: PreparedAudioKind::Play {
                     id,
                     generation,
-                    result,
+                    result: Box::new(result),
                 },
-            }))
+            })))
         }
         LoadRequestKind::Preload => {
             let result = preload_static_sound(request, cache);
-            control_tx.send(ControlMessage::Prepared(PreparedAudio {
+            control_tx.send(ControlMessage::Prepared(Box::new(PreparedAudio {
                 source,
                 provider_epoch,
                 kind: PreparedAudioKind::Preload { result },
-            }))
+            })))
         }
     }
 }
@@ -704,15 +704,15 @@ fn send_streaming_load_result(
         return Ok(());
     };
     let result = load_streaming_sound(request).map(PreparedSound::Streaming);
-    control_tx.send(ControlMessage::Prepared(PreparedAudio {
+    control_tx.send(ControlMessage::Prepared(Box::new(PreparedAudio {
         source,
         provider_epoch,
         kind: PreparedAudioKind::Play {
             id,
             generation,
-            result,
+            result: Box::new(result),
         },
-    }))
+    })))
 }
 
 fn load_static_sound(

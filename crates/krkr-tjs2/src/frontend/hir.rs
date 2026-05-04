@@ -405,15 +405,11 @@ impl Analyzer {
                     self.declare_ident(name, BindingKind::Function, decl.span);
                 }
             }
-            syntax::StmtKind::ClassDecl(decl) => {
-                if decl.name.binding.is_none() {
-                    self.declare_ident(&mut decl.name, BindingKind::Class, decl.span);
-                }
+            syntax::StmtKind::ClassDecl(decl) if decl.name.binding.is_none() => {
+                self.declare_ident(&mut decl.name, BindingKind::Class, decl.span);
             }
-            syntax::StmtKind::PropertyDecl(decl) => {
-                if decl.name.binding.is_none() {
-                    self.declare_ident(&mut decl.name, BindingKind::Property, decl.span);
-                }
+            syntax::StmtKind::PropertyDecl(decl) if decl.name.binding.is_none() => {
+                self.declare_ident(&mut decl.name, BindingKind::Property, decl.span);
             }
             _ => {}
         }
