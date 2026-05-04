@@ -1,6 +1,6 @@
 use krkr_kag::{
-    Attribute, AttributeValue, CallFrame, KagError, KagHost, LabelEvent, ScenarioLoadEvent,
-    ScriptEvent, Tag,
+    Attribute, AttributeValue, CallFrame, KagError, KagHost, KagParser, LabelEvent,
+    ScenarioLoadEvent, ScriptEvent, Tag,
 };
 use krkr_tjs2::{
     Result,
@@ -9,6 +9,7 @@ use krkr_tjs2::{
 
 use crate::{
     host::KrkrHost,
+    native::refresh_kag_parser_object,
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
 
@@ -42,6 +43,13 @@ impl<'a> EngineKagHost<'a> {
 }
 
 impl KagHost for EngineKagHost<'_> {
+    fn sync_parser_state(&mut self, parser: &KagParser) -> krkr_kag::Result<()> {
+        self.runtime
+            .host_mut()
+            .insert_kag_parser(self.owner, parser.clone());
+        refresh_kag_parser_object(self.runtime, self.owner, parser).map_err(kag_host_error)
+    }
+
     fn load_scenario(&mut self, storage: &str) -> krkr_kag::Result<String> {
         self.runtime
             .host()

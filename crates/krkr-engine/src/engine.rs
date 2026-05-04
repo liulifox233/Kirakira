@@ -3114,6 +3114,46 @@ mod tests {
     }
 
     #[test]
+    fn structured_persistence_writes_krkr2_struct_details() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var textPath = System.dataPath + "vars_text.ksd";
+                var binPath = System.dataPath + "vars_bin.ksd";
+                var saved = %["negative" => -1, "real" => 1.5];
+                saved.list = [1, 2];
+                (Dictionary.saveStruct incontextof saved)(textPath, "");
+                (Dictionary.saveStruct incontextof %["negative" => -1])(binPath, "b");
+                "#,
+            )
+            .expect("save structs");
+
+        let bytes = fs::read(root.join("savedata/vars_text.ksd")).expect("text struct");
+        assert_eq!(&bytes[0..2], &[0xff, 0xfe]);
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        let text = String::from_utf16(&units).expect("utf16 struct");
+        assert!(text.contains("\"real\" => 0x1.8000000000000p0 /* 1.5 */"));
+        assert!(!text.contains(",\n]"));
+
+        let bytes = fs::read(root.join("savedata/vars_bin.ksd")).expect("binary struct");
+        assert!(bytes.starts_with(b"KBAD100\0"));
+        assert!(
+            bytes.ends_with(&[0xd0, 0xff]),
+            "negative integers must use KRKR2-compatible int8 encoding"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn layer_save_layer_image_writes_krkr_bmp24_thumbnail() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create project root");
@@ -4282,7 +4322,160 @@ mod tests {
             .next_kag_tag()
             .expect("next tag")
             .expect("restored character");
-        assert_eq!(next.literal_attr("text"), Some("B"));
+        assert_eq!(next.literal_attr("text"), Some("A"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn active_parser_store_uses_krkr2_dictionary_fields() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "AB[s]\n*later\nZ[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        engine
+            .next_kag_tag()
+            .expect("first tag")
+            .expect("character");
+        let snapshot = engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "store", Vec::new())
+            .expect("store");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("savedSnapshot", snapshot);
+
+        let result = engine
+            .execute_script(
+                "store-shape.tjs",
+                r#"
+                return (savedSnapshot.snapshot === void) &&
+                    savedSnapshot.storageName == "first.ks" &&
+                    savedSnapshot.storageShortName == "first.ks" &&
+                    savedSnapshot.curLine == 0 &&
+                    savedSnapshot.curPos == 1 &&
+                    savedSnapshot.callStack.count == 0 &&
+                    savedSnapshot.macros !== void &&
+                    savedSnapshot.ExcludeLevel == -1;
+                "#,
+            )
+            .expect("inspect store shape");
+
+        assert_eq!(result, Variant::Integer(1));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn active_parser_store_from_label_callback_uses_current_parser_state() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "*start|Page\nA[s]\n*later|Next\nB[s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("activeParser", Variant::Object(parser));
+        engine
+            .execute_script(
+                "label-store-callback.tjs",
+                r#"
+                activeParser.onLabel = function(label, page) {
+                    global.callbackLabel = label;
+                    global.callbackParserLabel = this.curLabel;
+                    global.callbackStored = this.store();
+                };
+                "#,
+            )
+            .expect("install callback");
+
+        let first = engine.next_kag_tag().expect("next tag").expect("character");
+        assert_eq!(first.literal_attr("text"), Some("A"));
+
+        let Variant::Object(stored) = engine.tjs_runtime().global_member("callbackStored") else {
+            panic!("stored snapshot should be an object");
+        };
+        assert_eq!(
+            engine.tjs_runtime().global_member("callbackLabel"),
+            Variant::String("*start".to_string())
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("callbackParserLabel"),
+            Variant::String("*start".to_string())
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(stored, "curLabel"),
+            Variant::String("*start".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn krkr2_restore_uses_cur_label_not_cur_line_pos() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "AB[s]\n*later\nZ[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        let snapshot = {
+            let runtime = engine.tjs_runtime_mut();
+            let object = runtime.alloc_ordinary_object();
+            runtime.add_object_class_info(object, "Dictionary");
+            let call_stack = runtime.alloc_array_object(Vec::new());
+            let macros = runtime.alloc_ordinary_object();
+            runtime.add_object_class_info(macros, "Dictionary");
+            runtime.set_object_member(
+                object,
+                "storageName",
+                Variant::String("first.ks".to_string()),
+            );
+            runtime.set_object_member(
+                object,
+                "storageShortName",
+                Variant::String("first.ks".to_string()),
+            );
+            runtime.set_object_member(object, "curLine", Variant::Integer(0));
+            runtime.set_object_member(object, "curPos", Variant::Integer(1));
+            runtime.set_object_member(object, "curLabel", Variant::String("*later".to_string()));
+            runtime.set_object_member(object, "callStack", Variant::Object(call_stack));
+            runtime.set_object_member(object, "macros", Variant::Object(macros));
+            runtime.set_object_member(object, "ExcludeLevel", Variant::Integer(-1));
+            runtime.set_object_member(object, "IfLevel", Variant::Integer(0));
+            runtime.set_object_member(object, "ExcludeLevelStack", Variant::String(String::new()));
+            runtime.set_object_member(
+                object,
+                "IfLevelExecutedStack",
+                Variant::String(String::new()),
+            );
+            Variant::Object(object)
+        };
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(parser, "restore", vec![snapshot])
+            .expect("restore");
+
+        let next = engine
+            .next_kag_tag()
+            .expect("next tag")
+            .expect("restored character");
+        assert_eq!(next.literal_attr("text"), Some("Z"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -4330,7 +4523,7 @@ mod tests {
             .next_kag_tag()
             .expect("next tag")
             .expect("restored character");
-        assert_eq!(next.literal_attr("text"), Some("B"));
+        assert_eq!(next.literal_attr("text"), Some("A"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -4377,7 +4570,7 @@ mod tests {
 
         assert_eq!(
             engine.tjs_runtime().global_member("restoredText"),
-            Variant::String("A".to_string())
+            Variant::String("B".to_string())
         );
 
         fs::remove_dir_all(root).expect("cleanup");
@@ -9716,7 +9909,8 @@ mod tests {
                 };
                 parser.loadScenario("first.ks");
                 parser.getNextTag();
-                return parser.snapshot.snapshot != "";
+                return parser.snapshot.snapshot === void &&
+                    parser.snapshot.storageName == "first.ks";
                 "#,
             )
             .expect("script");

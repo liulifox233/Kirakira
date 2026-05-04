@@ -1,6 +1,6 @@
 use krkr_kag::{
-    CallFrame, DebugLevel, KagError, KagHost, KagParser, LabelEvent, ParserSnapshot,
-    ScenarioLoadEvent, ScriptEvent, Tag,
+    CallFrame, DebugLevel, KagError, KagHost, KagParser, Krkr2CallFrame, Krkr2ConditionState,
+    LabelEvent, ParserSnapshot, ScenarioLoadEvent, ScriptEvent, Tag,
 };
 use krkr_tjs2::{
     Result, TjsError,
@@ -245,20 +245,7 @@ fn kag_store(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     with_parser(vm, this_obj, "KAGParser.store", false, |parser, vm, _| {
-        let runtime = vm.runtime_mut();
-        let object = runtime.alloc_ordinary_object();
-        runtime.add_object_class_info(object, "Dictionary");
-        runtime.set_object_member(
-            object,
-            "snapshot",
-            Variant::String(parser.store().to_persistent_string()),
-        );
-        let macros = runtime.alloc_ordinary_object();
-        runtime.add_object_class_info(macros, "Dictionary");
-        for (name, source) in parser.macro_definitions() {
-            runtime.set_object_member(macros, name, Variant::String(source.to_string()));
-        }
-        runtime.set_object_member(object, "macros", Variant::Object(macros));
+        let object = krkr2_parser_snapshot_to_object(vm.runtime_mut(), parser)?;
         Ok(Variant::Object(object))
     })
 }
@@ -346,6 +333,166 @@ fn kag_pop_macro_args(
             Ok(Variant::Void)
         },
     )
+}
+
+fn krkr2_parser_snapshot_to_object(
+    runtime: &mut Runtime<KrkrHost>,
+    parser: &KagParser,
+) -> Result<ObjectHandle> {
+    let snapshot = parser.store();
+    let object = alloc_dictionary(runtime);
+
+    let macros = alloc_dictionary(runtime);
+    for (name, source) in parser.macro_definitions() {
+        runtime.set_object_member(macros, name, Variant::String(source.to_string()));
+    }
+    runtime.set_object_member(object, "macros", Variant::Object(macros));
+
+    let macro_args = runtime.alloc_array_object(Vec::new());
+    runtime.set_object_member(object, "macroArgs", Variant::Object(macro_args));
+
+    let mut frames = Vec::new();
+    for frame in parser.call_stack() {
+        frames.push(Variant::Object(krkr2_call_frame_to_object(
+            runtime, parser, frame,
+        )?));
+    }
+    let call_stack = runtime.alloc_array_object(frames);
+    runtime.set_object_member(object, "callStack", Variant::Object(call_stack));
+
+    let storage = parser.cur_storage().unwrap_or_default();
+    runtime.set_object_member(object, "storageName", Variant::String(storage.to_string()));
+    runtime.set_object_member(
+        object,
+        "storageShortName",
+        Variant::String(storage_short_name(storage)),
+    );
+    runtime.set_object_member(
+        object,
+        "curLine",
+        Variant::Integer(parser.cur_line().unwrap_or(1).saturating_sub(1) as i64),
+    );
+    runtime.set_object_member(
+        object,
+        "curPos",
+        Variant::Integer(parser.cur_pos().unwrap_or(0) as i64),
+    );
+    runtime.set_object_member(object, "lineBuffer", Variant::String(String::new()));
+    runtime.set_object_member(object, "lineBufferUsing", Variant::Integer(0));
+    runtime.set_object_member(
+        object,
+        "curLabel",
+        Variant::String(parser.cur_label().unwrap_or_default().to_string()),
+    );
+    set_krkr2_condition_members(runtime, object, &snapshot.krkr2_condition_state());
+    runtime.set_object_member(object, "macroArgStackBase", Variant::Integer(0));
+    runtime.set_object_member(object, "macroArgStackDepth", Variant::Integer(0));
+
+    Ok(object)
+}
+
+fn krkr2_call_frame_to_object(
+    runtime: &mut Runtime<KrkrHost>,
+    parser: &KagParser,
+    frame: &CallFrame,
+) -> Result<ObjectHandle> {
+    let object = alloc_dictionary(runtime);
+    let storage = frame.storage();
+    let label = frame.current_label().unwrap_or_default();
+    let (line, pos) = parser
+        .line_pos_for_offset(storage, frame.offset())
+        .unwrap_or((0, 0));
+    let label_line = if label.is_empty() {
+        0
+    } else {
+        parser.label_line(storage, label).unwrap_or(0)
+    };
+
+    runtime.set_object_member(object, "storage", Variant::String(storage.to_string()));
+    runtime.set_object_member(object, "label", Variant::String(label.to_string()));
+    runtime.set_object_member(
+        object,
+        "offset",
+        Variant::Integer(line.saturating_sub(label_line) as i64),
+    );
+    runtime.set_object_member(
+        object,
+        "orgLineStr",
+        Variant::String(frame.line_text().to_string()),
+    );
+    runtime.set_object_member(object, "lineBuffer", Variant::String(String::new()));
+    runtime.set_object_member(object, "pos", Variant::Integer(pos as i64));
+    runtime.set_object_member(object, "lineBufferUsing", Variant::Integer(0));
+    runtime.set_object_member(object, "macroArgStackBase", Variant::Integer(0));
+    runtime.set_object_member(object, "macroArgStackDepth", Variant::Integer(0));
+    set_krkr2_condition_members(runtime, object, &frame.krkr2_condition_state());
+    Ok(object)
+}
+
+fn set_krkr2_condition_members(
+    runtime: &mut Runtime<KrkrHost>,
+    object: ObjectHandle,
+    state: &Krkr2ConditionState,
+) {
+    runtime.set_object_member(
+        object,
+        "ExcludeLevel",
+        Variant::Integer(state.exclude_level),
+    );
+    runtime.set_object_member(object, "IfLevel", Variant::Integer(state.if_level));
+    runtime.set_object_member(
+        object,
+        "ExcludeLevelStack",
+        Variant::String(krkr2_int_stack_string(&state.exclude_level_stack)),
+    );
+    runtime.set_object_member(
+        object,
+        "IfLevelExecutedStack",
+        Variant::String(krkr2_bool_stack_string(&state.if_level_executed_stack)),
+    );
+}
+
+fn alloc_dictionary(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
+    let object = runtime.alloc_ordinary_object();
+    runtime.add_object_class_info(object, "Dictionary");
+    object
+}
+
+fn storage_short_name(storage: &str) -> String {
+    storage
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(storage)
+        .to_string()
+}
+
+fn krkr2_int_stack_string(values: &[i64]) -> String {
+    let mut out = String::new();
+    for value in values {
+        out.push_str(&format!("{:08x}", *value as i32 as u32));
+    }
+    out
+}
+
+fn parse_krkr2_int_stack(value: &str) -> Vec<i64> {
+    value
+        .as_bytes()
+        .chunks_exact(8)
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .filter_map(|chunk| u32::from_str_radix(chunk, 16).ok())
+        .map(|value| value as i32 as i64)
+        .collect()
+}
+
+fn krkr2_bool_stack_string(values: &[bool]) -> String {
+    values
+        .iter()
+        .map(|value| if *value { '1' } else { '0' })
+        .collect()
+}
+
+fn parse_krkr2_bool_stack(value: &str) -> Vec<bool> {
+    value.chars().map(|ch| ch == '1').collect()
 }
 
 fn with_parser<F>(
@@ -544,6 +691,14 @@ impl<'a, 'bc, 'rt> TjsKagHost<'a, 'bc, 'rt> {
 }
 
 impl KagHost for TjsKagHost<'_, '_, '_> {
+    fn sync_parser_state(&mut self, parser: &KagParser) -> krkr_kag::Result<()> {
+        let runtime = self.vm.runtime_mut();
+        runtime
+            .host_mut()
+            .insert_kag_parser(self.owner, parser.clone());
+        refresh_kag_parser_members_from_parser(runtime, self.owner, parser).map_err(kag_host_error)
+    }
+
     fn load_scenario(&mut self, storage: &str) -> krkr_kag::Result<String> {
         self.vm
             .runtime()
@@ -666,21 +821,201 @@ fn snapshot_from_object(
     parser: &mut KagParser,
     snapshot_object: ObjectHandle,
 ) -> Result<ParserSnapshot> {
-    let Variant::String(encoded) = vm.runtime().object_member(snapshot_object, "snapshot") else {
-        return Err(TjsError::runtime(
-            "KAGParser.restore requires a persistent snapshot",
-        ));
-    };
-    if encoded.is_empty() {
-        return Err(TjsError::runtime(
-            "KAGParser.restore requires a persistent snapshot",
-        ));
+    if let Variant::String(encoded) = vm.runtime().object_member(snapshot_object, "snapshot")
+        && !encoded.is_empty()
+    {
+        let mut snapshot = ParserSnapshot::from_persistent_string(&encoded).map_err(kag_to_tjs)?;
+        apply_snapshot_macros_from_object(vm.runtime(), parser, snapshot_object, &mut snapshot);
+        ensure_snapshot_storages_loaded(vm, owner, parser, &snapshot)?;
+        return Ok(snapshot);
     }
 
-    let mut snapshot = ParserSnapshot::from_persistent_string(&encoded).map_err(kag_to_tjs)?;
-    apply_snapshot_macros_from_object(vm.runtime(), parser, snapshot_object, &mut snapshot);
-    ensure_snapshot_storages_loaded(vm, owner, parser, &snapshot)?;
-    Ok(snapshot)
+    snapshot_from_krkr2_object(vm, owner, parser, snapshot_object)
+}
+
+fn snapshot_from_krkr2_object(
+    vm: &mut Vm<KrkrHost>,
+    owner: ObjectHandle,
+    parser: &mut KagParser,
+    snapshot_object: ObjectHandle,
+) -> Result<ParserSnapshot> {
+    let storage = object_string(vm.runtime(), snapshot_object, "storageName")?;
+    let current_storage = (!storage.is_empty()).then_some(storage);
+    if let Some(storage) = current_storage.as_deref() {
+        ensure_snapshot_storage_loaded(vm, owner, parser, storage)?;
+    }
+
+    let frame_objects = object_array_objects(vm.runtime(), snapshot_object, "callStack");
+    for frame_object in &frame_objects {
+        let storage = object_string(vm.runtime(), *frame_object, "storage")?;
+        if !storage.is_empty() {
+            ensure_snapshot_storage_loaded(vm, owner, parser, &storage)?;
+        }
+    }
+
+    let current_label = object_string(vm.runtime(), snapshot_object, "curLabel")?;
+    let current_label = (!current_label.is_empty()).then_some(current_label);
+    let cursor_offset =
+        krkr2_restore_cursor_offset(parser, current_storage.as_deref(), current_label.as_deref())?;
+    let call_frames = frame_objects
+        .into_iter()
+        .map(|frame| krkr2_call_frame_from_object(vm.runtime(), parser, frame))
+        .collect::<Result<Vec<_>>>()?;
+    let macros = macros_from_snapshot_object(vm.runtime(), parser, snapshot_object);
+    let condition = condition_state_from_object(vm.runtime(), snapshot_object)?;
+
+    Ok(ParserSnapshot::from_krkr2_compatible(
+        current_storage,
+        cursor_offset,
+        current_label,
+        call_frames,
+        macros,
+        condition,
+    ))
+}
+
+fn krkr2_restore_cursor_offset(
+    parser: &KagParser,
+    storage: Option<&str>,
+    label: Option<&str>,
+) -> Result<usize> {
+    let Some(storage) = storage else {
+        return Ok(0);
+    };
+    let Some(label) = label else {
+        return Ok(0);
+    };
+    let line = parser.label_line(storage, label).ok_or_else(|| {
+        kag_to_tjs(KagError::LabelNotFound {
+            storage: storage.to_string(),
+            label: label.to_string(),
+        })
+    })?;
+    parser
+        .offset_for_line_pos(storage, line, 0)
+        .map_err(kag_to_tjs)
+}
+
+fn krkr2_call_frame_from_object(
+    runtime: &Runtime<KrkrHost>,
+    parser: &KagParser,
+    frame: ObjectHandle,
+) -> Result<Krkr2CallFrame> {
+    let storage = object_string(runtime, frame, "storage")?;
+    let label = object_string(runtime, frame, "label")?;
+    let line_offset = object_usize(runtime, frame, "offset", 0)?;
+    let pos = object_usize(runtime, frame, "pos", 0)?;
+    let label_line = if label.is_empty() {
+        0
+    } else {
+        parser.label_line(&storage, &label).unwrap_or(0)
+    };
+    let offset = parser
+        .offset_for_line_pos(&storage, label_line.saturating_add(line_offset), pos)
+        .map_err(kag_to_tjs)?;
+    let mut line_text = object_string(runtime, frame, "orgLineStr")?;
+    if line_text.is_empty() {
+        line_text = parser
+            .line_text_for_offset(&storage, offset)
+            .unwrap_or_default()
+            .to_string();
+    }
+    let label = (!label.is_empty()).then_some(label);
+    let condition = condition_state_from_object(runtime, frame)?;
+    Ok((storage, offset, line_text, label, condition))
+}
+
+fn macros_from_snapshot_object(
+    runtime: &Runtime<KrkrHost>,
+    parser: &KagParser,
+    snapshot_object: ObjectHandle,
+) -> Vec<(String, String)> {
+    match runtime.object_member(snapshot_object, "macros") {
+        Variant::Object(macros) => runtime
+            .object_members(macros)
+            .into_iter()
+            .filter_map(|(name, value)| match value {
+                Variant::String(source) => Some((name, source)),
+                _ => None,
+            })
+            .collect(),
+        Variant::Void => parser
+            .macro_definitions()
+            .map(|(name, source)| (name.to_string(), source.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn condition_state_from_object(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+) -> Result<Krkr2ConditionState> {
+    let exclude_level = object_integer(runtime, object, "ExcludeLevel", -1)?;
+    let exclude_level_stack =
+        parse_krkr2_int_stack(&object_string(runtime, object, "ExcludeLevelStack")?);
+    let if_level_executed_stack =
+        parse_krkr2_bool_stack(&object_string(runtime, object, "IfLevelExecutedStack")?);
+    let if_level = object_integer(
+        runtime,
+        object,
+        "IfLevel",
+        if_level_executed_stack.len() as i64,
+    )?;
+    Ok(Krkr2ConditionState {
+        exclude_level,
+        if_level,
+        exclude_level_stack,
+        if_level_executed_stack,
+    })
+}
+
+fn object_string(runtime: &Runtime<KrkrHost>, object: ObjectHandle, name: &str) -> Result<String> {
+    match runtime.object_member(object, name) {
+        Variant::Void => Ok(String::new()),
+        value => value.to_tjs_string(),
+    }
+}
+
+fn object_integer(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+    default: i64,
+) -> Result<i64> {
+    match runtime.object_member(object, name) {
+        Variant::Void => Ok(default),
+        value => value.to_integer(),
+    }
+}
+
+fn object_usize(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+    default: usize,
+) -> Result<usize> {
+    let value = object_integer(runtime, object, name, default as i64)?;
+    Ok(value.max(0) as usize)
+}
+
+fn object_array_objects(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Vec<ObjectHandle> {
+    let Variant::Object(array) = runtime.object_member(object, name) else {
+        return Vec::new();
+    };
+    runtime
+        .array_elements(array)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| match value {
+            Variant::Object(object) => Some(*object),
+            _ => None,
+        })
+        .collect()
 }
 
 fn apply_snapshot_macros_from_object(

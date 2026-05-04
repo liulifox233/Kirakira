@@ -36,6 +36,10 @@ impl Default for ParserOptions {
 }
 
 pub trait KagHost {
+    fn sync_parser_state(&mut self, _parser: &KagParser) -> Result<()> {
+        Ok(())
+    }
+
     fn load_scenario(&mut self, storage: &str) -> Result<String> {
         Err(KagError::ScenarioLoadUnsupported {
             storage: storage.to_owned(),
@@ -153,10 +157,78 @@ impl CallFrame {
         self.offset
     }
 
+    pub fn line_text(&self) -> &str {
+        &self.line_text
+    }
+
     pub fn current_label(&self) -> Option<&str> {
         self.current_label.as_deref()
     }
+
+    pub fn krkr2_condition_state(&self) -> Krkr2ConditionState {
+        Krkr2ConditionState::from_frames(&self.resume.condition_stack)
+    }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Krkr2ConditionState {
+    pub exclude_level: i64,
+    pub if_level: i64,
+    pub exclude_level_stack: Vec<i64>,
+    pub if_level_executed_stack: Vec<bool>,
+}
+
+impl Krkr2ConditionState {
+    fn from_frames(frames: &[ConditionFrame]) -> Self {
+        let mut exclude_level = -1;
+        let mut exclude_level_stack = Vec::with_capacity(frames.len());
+        let mut if_level_executed_stack = Vec::with_capacity(frames.len());
+        for (index, frame) in frames.iter().enumerate() {
+            exclude_level_stack.push(exclude_level);
+            if_level_executed_stack.push(frame.branch_taken);
+            if exclude_level == -1 && !frame.current_active {
+                exclude_level = index as i64 + 1;
+            }
+        }
+
+        Self {
+            exclude_level,
+            if_level: frames.len() as i64,
+            exclude_level_stack,
+            if_level_executed_stack,
+        }
+    }
+
+    fn to_frames(&self) -> Vec<ConditionFrame> {
+        let count = self
+            .if_level
+            .max(0)
+            .try_into()
+            .unwrap_or(0)
+            .max(self.exclude_level_stack.len())
+            .max(self.if_level_executed_stack.len());
+        (0..count)
+            .map(|index| {
+                let level = index as i64 + 1;
+                let parent_exclude = self.exclude_level_stack.get(index).copied().unwrap_or(-1);
+                let parent_active = parent_exclude == -1;
+                let current_active =
+                    parent_active && (self.exclude_level == -1 || self.exclude_level > level);
+                ConditionFrame {
+                    parent_active,
+                    branch_taken: self
+                        .if_level_executed_stack
+                        .get(index)
+                        .copied()
+                        .unwrap_or(current_active),
+                    current_active,
+                }
+            })
+            .collect()
+    }
+}
+
+pub type Krkr2CallFrame = (String, usize, String, Option<String>, Krkr2ConditionState);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParserSnapshot {
@@ -258,6 +330,63 @@ impl ParserSnapshot {
                 )
             })
             .collect();
+    }
+
+    pub fn from_krkr2_compatible<I, N, S>(
+        current_storage: Option<String>,
+        cursor_offset: usize,
+        current_label: Option<String>,
+        call_frames: Vec<Krkr2CallFrame>,
+        macros: I,
+        condition_state: Krkr2ConditionState,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (N, S)>,
+        N: Into<String>,
+        S: Into<String>,
+    {
+        Self {
+            current_storage,
+            cursor: Cursor {
+                offset: cursor_offset,
+            },
+            current_label,
+            call_stack: call_frames
+                .into_iter()
+                .map(
+                    |(storage, offset, line_text, current_label, condition_state)| CallFrame {
+                        storage,
+                        offset,
+                        line_text,
+                        current_label,
+                        resume: ResumeState {
+                            macro_stack: Vec::new(),
+                            macro_params: Vec::new(),
+                            condition_stack: condition_state.to_frames(),
+                        },
+                    },
+                )
+                .collect(),
+            macros: macros
+                .into_iter()
+                .map(|(name, source)| {
+                    (
+                        name.into(),
+                        MacroDefinition {
+                            source: source.into(),
+                        },
+                    )
+                })
+                .collect(),
+            macro_stack: Vec::new(),
+            macro_params: Vec::new(),
+            condition_stack: condition_state.to_frames(),
+            interrupted: false,
+        }
+    }
+
+    pub fn krkr2_condition_state(&self) -> Krkr2ConditionState {
+        Krkr2ConditionState::from_frames(&self.condition_stack)
     }
 }
 
@@ -636,7 +765,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(KagError::host("invalid KAGParser snapshot hex length"));
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
@@ -819,6 +948,51 @@ impl KagParser {
         Some(line_text_at_in(source, line_starts, self.active_offset()))
     }
 
+    pub fn offset_for_line_pos(&self, storage: &str, line: usize, pos: usize) -> Result<usize> {
+        let scenario = self
+            .scenarios
+            .get(storage)
+            .ok_or_else(|| KagError::ScenarioNotLoaded {
+                storage: storage.to_string(),
+            })?;
+        let mut offset = scenario
+            .line_starts
+            .get(line)
+            .copied()
+            .ok_or_else(|| KagError::host("KAGParser save data line is out of range"))?;
+        let end = scenario.line_end(offset);
+        for _ in 0..pos {
+            if offset >= end {
+                return Ok(end);
+            }
+            let Some(ch) = scenario.char_at(offset) else {
+                return Ok(end);
+            };
+            offset += ch.len_utf8();
+        }
+        Ok(offset)
+    }
+
+    pub fn line_pos_for_offset(&self, storage: &str, offset: usize) -> Option<(usize, usize)> {
+        let scenario = self.scenarios.get(storage)?;
+        let location = scenario.location(offset);
+        Some((
+            location.line.saturating_sub(1),
+            location.column.saturating_sub(1),
+        ))
+    }
+
+    pub fn line_text_for_offset(&self, storage: &str, offset: usize) -> Option<&str> {
+        let scenario = self.scenarios.get(storage)?;
+        Some(scenario.line_text_at(offset))
+    }
+
+    pub fn label_line(&self, storage: &str, label: &str) -> Option<usize> {
+        let scenario = self.scenarios.get(storage)?;
+        let label = scenario.labels.get(label)?;
+        Some(label.location.line.saturating_sub(1))
+    }
+
     pub fn call_stack_depth(&self) -> usize {
         self.call_stack.len()
     }
@@ -990,6 +1164,7 @@ impl KagParser {
                     let storage = self.current_storage_name()?.to_owned();
                     let (script, span) = self.collect_script_block_from(script_start, span)?;
                     if self.is_executing() {
+                        host.sync_parser_state(self)?;
                         host.on_script(ScriptEvent {
                             storage: &storage,
                             script: &script,
@@ -1001,6 +1176,7 @@ impl KagParser {
                 RawItem::Label(label) => {
                     let storage = self.current_storage_name()?.to_owned();
                     self.current_label = Some(label.name.clone());
+                    host.sync_parser_state(self)?;
                     host.on_label(LabelEvent {
                         storage: &storage,
                         label: &label,
@@ -1066,6 +1242,7 @@ impl KagParser {
             None => host.load_scenario(storage)?,
         };
         self.install_scenario(storage.to_owned(), source)?;
+        host.sync_parser_state(self)?;
         host.on_scenario_loaded(ScenarioLoadEvent { storage })?;
         Ok(())
     }
@@ -1672,6 +1849,7 @@ impl KagParser {
     {
         let storage = self.optional_attr_string(&tag, "storage", host)?;
         let target = self.optional_attr_string(&tag, "target", host)?;
+        host.sync_parser_state(self)?;
         if host.on_jump(&tag, storage.as_deref(), target.as_deref())? {
             self.move_to(storage.as_deref(), target.as_deref(), Some(host))?;
         }
@@ -1684,6 +1862,7 @@ impl KagParser {
     {
         let storage = self.optional_attr_string(&tag, "storage", host)?;
         let target = self.optional_attr_string(&tag, "target", host)?;
+        host.sync_parser_state(self)?;
         if host.on_call(&tag, storage.as_deref(), target.as_deref())? {
             let preserved_params = self.macro_params.clone();
             self.push_call_frame()?;
@@ -1700,6 +1879,7 @@ impl KagParser {
         let storage = self.optional_attr_string(&tag, "storage", host)?;
         let target = self.optional_attr_string(&tag, "target", host)?;
         host.on_call_stack_depth(self.call_stack.len())?;
+        host.sync_parser_state(self)?;
         if !host.on_return(&tag, storage.as_deref(), target.as_deref())? {
             self.interrupt();
             return Ok(());
@@ -1715,11 +1895,13 @@ impl KagParser {
             let preserved_params = frame.resume.macro_params.clone();
             self.move_to(storage.as_deref(), target.as_deref(), Some(host))?;
             self.macro_params = preserved_params;
+            host.sync_parser_state(self)?;
             host.on_after_return(&frame)?;
             return Ok(());
         }
 
         self.restore_call_frame(&frame)?;
+        host.sync_parser_state(self)?;
         host.on_after_return(&frame)?;
         Ok(())
     }

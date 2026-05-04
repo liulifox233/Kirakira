@@ -859,10 +859,14 @@ impl<'a, H: TjsHost + 'static> StructTextSerializer<'a, H> {
         let indent = " ".repeat(depth);
         let child_indent = " ".repeat(depth + 1);
         let mut out = String::from("(const) [\n");
-        for value in elements {
+        for (index, value) in elements.iter().enumerate() {
             out.push_str(&child_indent);
             out.push_str(&self.value(value, depth + 1));
-            out.push_str(",\n");
+            if index + 1 == elements.len() {
+                out.push('\n');
+            } else {
+                out.push_str(",\n");
+            }
         }
         out.push_str(&indent);
         out.push(']');
@@ -873,12 +877,17 @@ impl<'a, H: TjsHost + 'static> StructTextSerializer<'a, H> {
         let indent = " ".repeat(depth);
         let child_indent = " ".repeat(depth + 1);
         let mut out = String::from("(const) %[\n");
-        for (key, value) in dictionary_struct_entries(self.runtime, handle) {
+        let entries = dictionary_struct_entries(self.runtime, handle);
+        for (index, (key, value)) in entries.iter().enumerate() {
             out.push_str(&child_indent);
-            out.push_str(&tjs_quote(&key));
+            out.push_str(&tjs_quote(key));
             out.push_str(" => ");
-            out.push_str(&self.value(&value, depth + 1));
-            out.push_str(",\n");
+            out.push_str(&self.value(value, depth + 1));
+            if index + 1 == entries.len() {
+                out.push('\n');
+            } else {
+                out.push_str(",\n");
+            }
         }
         out.push_str(&indent);
         out.push(']');
@@ -947,21 +956,54 @@ fn tjs_quote(value: &str) -> String {
 }
 
 fn real_literal(value: f64) -> String {
+    let literal = real_hex_literal(value);
+    format!("{literal} /* {} */", real_comment_literal(value))
+}
+
+fn real_hex_literal(value: f64) -> String {
     if value.is_nan() {
-        "0.0/0.0".to_string()
+        return "NaN".to_string();
     } else if value.is_infinite() {
         if value.is_sign_negative() {
-            "-1.0/0.0".to_string()
+            return "-Infinity".to_string();
         } else {
-            "1.0/0.0".to_string()
+            return "+Infinity".to_string();
+        }
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "+0.0".to_string()
+        };
+    }
+
+    let bits = value.to_bits();
+    let prefix = if bits & (1 << 63) != 0 {
+        "-0x1."
+    } else {
+        "0x1."
+    };
+    let exponent = (((bits & 0x7ff0_0000_0000_0000) >> 52) as i32) - 1023;
+    let fraction = bits & 0x000f_ffff_ffff_ffff;
+    format!("{prefix}{fraction:013X}p{exponent}")
+}
+
+fn real_comment_literal(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value == f64::INFINITY {
+        "+Infinity".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else if value == 0.0 {
+        if value.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "+0.0".to_string()
         }
     } else {
-        let text = value.to_string();
-        if text.contains(['.', 'e', 'E']) {
-            text
-        } else {
-            format!("{text}.0")
-        }
+        value.to_string()
     }
 }
 
@@ -1037,9 +1079,7 @@ impl<'a, H: TjsHost + 'static> BinaryStructSerializer<'a, H> {
 
 fn put_binary_integer(out: &mut Vec<u8>, value: i64) {
     if value < 0 {
-        if value >= -32 {
-            out.push(value as i8 as u8);
-        } else if value >= i8::MIN as i64 {
+        if value >= i8::MIN as i64 {
             out.push(0xd0);
             out.push(value as i8 as u8);
         } else if value >= i16::MIN as i64 {
