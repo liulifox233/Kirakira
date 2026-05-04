@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use super::instruction::{BinaryForm, CallArgs, Instruction, binary_form};
-use super::{BytecodeFile, CodeObject, DataSlot, DataSlotType, require_index};
+use super::{
+    BytecodeFile, CodeObject, DataSlot, DataSlotType, max_positive_register, require_index,
+};
 use crate::error::{Result, TjsError};
 
 pub(super) fn verify_bytecode(file: &BytecodeFile) -> Result<()> {
@@ -78,8 +80,19 @@ fn verify_source_positions(object: &CodeObject) -> Result<()> {
 
 fn verify_instructions(object_index: usize, object: &CodeObject) -> Result<()> {
     let instructions = object.decode_instructions()?;
+    let max_frame_count = max_positive_register(instructions.iter(), object.max_frame_count);
     for inst in instructions {
-        verify_instruction_operands(object_index, object, &inst)?;
+        verify_instruction_operands(object_index, object, max_frame_count, &inst).map_err(
+            |error| {
+                TjsError::verify(format!(
+                    "object {object_index} offset {} opcode {} ({}): {}",
+                    inst.offset,
+                    inst.opcode,
+                    inst.mnemonic(),
+                    error.message
+                ))
+            },
+        )?;
     }
     Ok(())
 }
@@ -87,72 +100,73 @@ fn verify_instructions(object_index: usize, object: &CodeObject) -> Result<()> {
 fn verify_instruction_operands(
     object_index: usize,
     object: &CodeObject,
+    max_frame_count: u32,
     inst: &Instruction,
 ) -> Result<()> {
     let code_len = object.code_words.len();
     match inst.opcode {
         1 => {
-            require_reg(object, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
             require_data(object, inst.operands[1])?;
         }
         2 | 7..=10 | 88 | 123 | 125 => {
             for operand in &inst.operands {
-                require_reg(object, *operand)?;
+                require_reg(object, max_frame_count, *operand)?;
             }
         }
         3 | 5 | 6 | 11..=13 | 18 | 22 | 82 | 83 | 86 | 87 | 89..=98 | 118 | 122 | 124 => {
-            require_reg(object, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
         }
         4 => {
-            require_reg(object, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
             if inst.operands[1] < 0 {
                 return Err(TjsError::verify("ccl count is negative"));
             }
         }
         15..=17 => require_branch(code_len, inst.offset, inst.operands[0])?,
         19 | 23 | 84 | 103 | 110 | 116 => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
             require_data(object, inst.operands[2])?;
         }
         20 | 24 | 85 | 107 | 112 | 117 => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
-            require_reg(object, inst.operands[2])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[2])?;
         }
         21 | 25 | 114 | 115 => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
         }
-        26..=81 => verify_binary_operands(object, inst)?,
+        26..=81 => verify_binary_operands(object, max_frame_count, inst)?,
         99 | 102 => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
-            verify_call_args(object, inst.call_args.as_ref())?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
+            verify_call_args(object, max_frame_count, inst.call_args.as_ref())?;
         }
         100 | 101 => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
             if inst.opcode == 100 {
                 require_data(object, inst.operands[2])?;
             } else {
-                require_reg(object, inst.operands[2])?;
+                require_reg(object, max_frame_count, inst.operands[2])?;
             }
-            verify_call_args(object, inst.call_args.as_ref())?;
+            verify_call_args(object, max_frame_count, inst.call_args.as_ref())?;
         }
         104..=106 | 111 => {
-            require_reg(object, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
             require_data(object, inst.operands[1])?;
-            require_reg(object, inst.operands[2])?;
+            require_reg(object, max_frame_count, inst.operands[2])?;
         }
         108 | 109 | 113 => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
-            require_reg(object, inst.operands[2])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[2])?;
         }
         120 => {
             require_branch(code_len, inst.offset, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
         }
         0 | 14 | 119 | 121 | 126 | 127 => {}
         _ => {
@@ -165,40 +179,48 @@ fn verify_instruction_operands(
     Ok(())
 }
 
-fn verify_binary_operands(object: &CodeObject, inst: &Instruction) -> Result<()> {
+fn verify_binary_operands(
+    object: &CodeObject,
+    max_frame_count: u32,
+    inst: &Instruction,
+) -> Result<()> {
     match binary_form(inst.opcode) {
         BinaryForm::Slot => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
         }
         BinaryForm::DirectProperty => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
             require_data(object, inst.operands[2])?;
-            require_reg(object, inst.operands[3])?;
+            require_reg(object, max_frame_count, inst.operands[3])?;
         }
         BinaryForm::IndirectProperty => {
             for operand in &inst.operands {
-                require_reg(object, *operand)?;
+                require_reg(object, max_frame_count, *operand)?;
             }
         }
         BinaryForm::DefaultProperty => {
-            require_reg(object, inst.operands[0])?;
-            require_reg(object, inst.operands[1])?;
-            require_reg(object, inst.operands[2])?;
+            require_reg(object, max_frame_count, inst.operands[0])?;
+            require_reg(object, max_frame_count, inst.operands[1])?;
+            require_reg(object, max_frame_count, inst.operands[2])?;
         }
     }
     Ok(())
 }
 
-fn verify_call_args(object: &CodeObject, args: Option<&CallArgs>) -> Result<()> {
+fn verify_call_args(
+    object: &CodeObject,
+    max_frame_count: u32,
+    args: Option<&CallArgs>,
+) -> Result<()> {
     let Some(args) = args else {
         return Err(TjsError::verify("call opcode has no argspec"));
     };
     match args {
         CallArgs::Normal(args) => {
             for arg in args {
-                require_reg(object, *arg)?;
+                require_reg(object, max_frame_count, *arg)?;
             }
         }
         CallArgs::OmittedCallerArgs => {}
@@ -207,18 +229,16 @@ fn verify_call_args(object: &CodeObject, args: Option<&CallArgs>) -> Result<()> 
                 if !matches!(arg.arg_type, 0..=2) {
                     return Err(TjsError::verify("invalid expanded call argument type"));
                 }
-                require_reg(object, arg.reg)?;
+                require_reg(object, max_frame_count, arg.reg)?;
             }
         }
     }
     Ok(())
 }
 
-fn require_reg(object: &CodeObject, reg: i16) -> Result<()> {
-    let min = -i64::from(
-        object.max_variable_count + object.variable_reserve_count + object.func_decl_arg_count + 4,
-    );
-    let max = i64::from(object.max_frame_count);
+fn require_reg(object: &CodeObject, max_frame_count: u32, reg: i16) -> Result<()> {
+    let min = -i64::from((object.max_variable_count + object.variable_reserve_count).max(2));
+    let max = i64::from(max_frame_count);
     let reg = i64::from(reg);
     if reg < min || reg > max {
         return Err(TjsError::verify(format!(

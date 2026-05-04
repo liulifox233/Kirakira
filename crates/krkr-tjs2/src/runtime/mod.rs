@@ -11,6 +11,30 @@ pub mod value;
 pub use self::object::{Object, ObjectKind};
 pub use self::value::{Closure, ObjectHandle, Variant};
 
+pub(crate) fn split_delimited_string(
+    string: &str,
+    delimiters: &str,
+    purge_empty: bool,
+) -> Vec<Variant> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for ch in string.chars() {
+        if delimiters.contains(ch) {
+            if !purge_empty || !current.is_empty() {
+                parts.push(Variant::String(std::mem::take(&mut current)));
+            } else {
+                current.clear();
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !purge_empty || !current.is_empty() {
+        parts.push(Variant::String(current));
+    }
+    parts
+}
+
 pub trait TjsHost {
     fn read_text(&mut self, name: &str, _mode: &str) -> Result<String> {
         Err(TjsError::runtime(format!(

@@ -10,7 +10,7 @@ pub use self::instruction::{CallArgs, ExpandedArg, Instruction};
 
 use self::disasm::disassemble_instruction;
 use self::instruction::decode_instructions;
-use self::parse::parse_bytecode;
+use self::parse::{parse_bytecode, parse_bytecode_unverified};
 use self::verify::verify_bytecode;
 
 pub const BYTECODE_SIGNATURE: [u8; 8] = *b"TJS2100\0";
@@ -26,6 +26,10 @@ pub struct BytecodeFile {
 impl BytecodeFile {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         parse_bytecode(bytes)
+    }
+
+    pub fn parse_unverified(bytes: &[u8]) -> Result<Self> {
+        parse_bytecode_unverified(bytes)
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -97,9 +101,32 @@ impl CodeObject {
         decode_instructions(&self.code_words)
     }
 
+    pub(crate) fn effective_max_frame_count(&self) -> Result<u32> {
+        let instructions = self.decode_instructions()?;
+        Ok(max_positive_register(
+            instructions.iter(),
+            self.max_frame_count,
+        ))
+    }
+
     pub fn name<'a>(&self, file: &'a BytecodeFile) -> Option<&'a str> {
         file.data.strings.get(self.name).map(String::as_str)
     }
+}
+
+pub(crate) fn max_positive_register<'a>(
+    instructions: impl IntoIterator<Item = &'a Instruction>,
+    declared_max_frame_count: u32,
+) -> u32 {
+    let mut max_frame_count = declared_max_frame_count;
+    for inst in instructions {
+        for reg in inst.register_operands() {
+            if reg >= 0 {
+                max_frame_count = max_frame_count.max(reg as u32);
+            }
+        }
+    }
+    max_frame_count
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,6 +344,19 @@ mod tests {
         let bytes = bytecode_file_with_max_frame(vec![8, 0], vec![1, 0, 0, 118, 0, 119], 0);
         let file = BytecodeFile::parse(&bytes).expect("parse");
         assert_eq!(file.objects[0].max_frame_count, 0);
+    }
+
+    #[test]
+    fn accepts_krkr2_bytecode_with_underdeclared_max_frame_count() {
+        let bytes =
+            bytecode_file_with_max_frame(vec![3, 0], vec![124, 1, 103, 2, 1, 0, 118, 2, 119], 1);
+        let file = BytecodeFile::parse(&bytes).expect("parse");
+
+        assert_eq!(file.objects[0].max_frame_count, 1);
+        assert_eq!(
+            file.objects[0].effective_max_frame_count().expect("scan"),
+            2
+        );
     }
 
     fn integer_return_bytecode() -> Vec<u8> {

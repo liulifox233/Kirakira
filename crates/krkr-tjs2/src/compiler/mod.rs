@@ -118,6 +118,24 @@ mod tests {
     }
 
     #[test]
+    fn compiler_uses_krkr2_argument_register_layout() {
+        let file =
+            compile_source_to_bytecode("registers.tjs", "function f(a, b) { return a + b; }")
+                .expect("bytecode");
+        let function_index = file
+            .objects
+            .iter()
+            .position(|object| object.name(&file) == Some("f"))
+            .expect("function object");
+        let disasm = file
+            .disassemble_object(function_index)
+            .expect("function disassembly");
+
+        assert!(disasm.iter().any(|line| line.contains("%-3")), "{disasm:?}");
+        assert!(disasm.iter().any(|line| line.contains("%-4")), "{disasm:?}");
+    }
+
+    #[test]
     fn execute_source_runs_deep_recursive_return_values_on_vm_stack() {
         assert_eq!(
             execute_source(
@@ -183,6 +201,54 @@ mod tests {
             )
             .expect("execute"),
             Variant::String("4:1,9,,".to_string())
+        );
+    }
+
+    #[test]
+    fn string_and_array_split_use_krkr2_delimiter_semantics() {
+        assert_eq!(
+            execute_source(
+                "split.tjs",
+                r#"return "a/b//c".split("/", void, false).join("|");"#
+            )
+            .expect("execute"),
+            Variant::String("a|b||c".to_string())
+        );
+        assert_eq!(
+            execute_source(
+                "split.tjs",
+                r#"return "a/b//c".split("/", void, true).join("|");"#
+            )
+            .expect("execute"),
+            Variant::String("a|b|c".to_string())
+        );
+        assert_eq!(
+            execute_source(
+                "split.tjs",
+                r#"var a = [].split("(), ", "x(12, y)", void, true); return a.join("|");"#
+            )
+            .expect("execute"),
+            Variant::String("x|12|y".to_string())
+        );
+    }
+
+    #[test]
+    fn string_methods_cover_krkr2_char_trim_reverse_repeat() {
+        assert_eq!(
+            execute_source(
+                "string_methods.tjs",
+                r#"return "abcd".charAt(2) + ":" + "abcd".charAt(9);"#
+            )
+            .expect("execute"),
+            Variant::String("c:".to_string())
+        );
+        assert_eq!(
+            execute_source(
+                "string_methods.tjs",
+                r#"return " \tname\r\n".trim() + ":" + "abc".reverse() + ":" + "ab".repeat(3);"#
+            )
+            .expect("execute"),
+            Variant::String("name:cba:ababab".to_string())
         );
     }
 
@@ -529,6 +595,37 @@ mod tests {
     }
 
     #[test]
+    fn super_property_get_skips_overriding_instance_property_before_superclass() {
+        let mut runtime = Runtime::new();
+        install_native_base(&mut runtime);
+        let file = compile_source_to_bytecode(
+            "super_overridden_property_get.tjs",
+            r#"
+            class Middle extends NativeBase {
+                function Middle() { super.NativeBase(); }
+            }
+            class Child extends Middle {
+                function Child() { super.Middle(); }
+                property nativeProp {
+                    getter { return super.nativeProp; }
+                    setter(value) { super.nativeProp = value; }
+                }
+                function scaled(value) { return -value * nativeProp; }
+            }
+            var c = new Child();
+            c.nativeProp = 7;
+            return c.scaled(2);
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::Integer(-14)
+        );
+    }
+
+    #[test]
     fn super_finalize_uses_declaring_class_super_chain() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);
@@ -741,6 +838,82 @@ mod tests {
             )
             .expect("execute"),
             Variant::String("21:21".to_string())
+        );
+    }
+
+    #[test]
+    fn class_regmember_copies_child_methods_to_instance() {
+        assert_eq!(
+            execute_source(
+                "class_regmember_methods.tjs",
+                r#"
+                    class U {
+                        function delayLoadFunction(x) { return makeDelay(x); }
+                        function makeDelay(x) { return x + "!"; }
+                    }
+                    var u = new U();
+                    return u.delayLoadFunction("ok");
+                "#
+            )
+            .expect("execute"),
+            Variant::String("ok!".to_string())
+        );
+    }
+
+    #[test]
+    fn eval_operator_executes_expression_source() {
+        assert_eq!(
+            execute_source(
+                "eval_expression.tjs",
+                r#"global.value = 40; return "value + 2"!;"#
+            )
+            .expect("execute"),
+            Variant::Integer(42)
+        );
+    }
+
+    #[test]
+    fn eexp_operator_executes_statement_source_in_current_this() {
+        let mut file = compile_source_to_bytecode(
+            "eexp_statement.tjs",
+            r#"
+                function evalit(source) { source!; }
+                var d = new Dictionary();
+                (evalit incontextof d)("property answer { getter { return 42; } }");
+                return d.answer;
+            "#,
+        )
+        .expect("compile");
+        let mut patched = false;
+        for object in &mut file.objects {
+            let instructions = object.decode_instructions().expect("decode");
+            for inst in instructions {
+                if inst.opcode == 86 {
+                    object.code_words[inst.offset] = 87;
+                    patched = true;
+                }
+            }
+        }
+        assert!(patched, "expected compiled eval opcode to patch to eexp");
+        assert_eq!(
+            Runtime::new().execute_file(&file).expect("execute"),
+            Variant::Integer(42)
+        );
+    }
+
+    #[test]
+    fn chgthis_accepts_null_objthis_like_krkr2() {
+        assert_eq!(
+            execute_source(
+                "chgthis_null.tjs",
+                r#"
+                    function f() { return 1; }
+                    var c = f incontextof null;
+                    return c();
+                "#
+            )
+            .expect("execute"),
+            Variant::Integer(1)
         );
     }
 

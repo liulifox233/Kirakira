@@ -430,6 +430,18 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "volume", Variant::Integer(100000));
             runtime.set_object_member(handle, "pan", Variant::Integer(0));
             runtime.set_object_member(handle, "looping", Variant::Integer(0));
+            set_wave_property_storage(
+                runtime,
+                handle,
+                "sampleCount",
+                Variant::Integer(wave_default_sample_property(runtime, "sampleCount")),
+            );
+            set_wave_property_storage(
+                runtime,
+                handle,
+                "sampleAhead",
+                Variant::Integer(wave_default_sample_property(runtime, "sampleAhead")),
+            );
             let id = runtime.host_mut().register_native_audio_buffer(handle);
             runtime.set_object_member(handle, "__nativeAudioId", Variant::Integer(id.0 as i64));
         }
@@ -1237,6 +1249,9 @@ const WAVE_NATIVE_PROPERTIES: &[&str] = &[
     "volume",
     "volume2",
     "pan",
+    "sampleValue",
+    "sampleCount",
+    "sampleAhead",
     "globalVolume",
     "globalFocusMode",
     "useVisBuffer",
@@ -1258,9 +1273,19 @@ fn wave_native_property_get(
             &wave_static_property_backing_key(name),
         ));
     }
+    if name == "sampleValue" {
+        return Ok(Variant::Real(0.0));
+    }
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
+    if matches!(name, "sampleCount" | "sampleAhead") {
+        let value = runtime.object_member(this, &wave_property_backing_key(name));
+        return Ok(match value {
+            Variant::Void => Variant::Integer(wave_default_sample_property(runtime, name)),
+            value => value,
+        });
+    }
     let value = runtime
         .host()
         .native_audio_buffer(this)
@@ -1303,6 +1328,11 @@ fn wave_native_property_set(
         return Ok(());
     };
     match name {
+        "sampleValue" => {}
+        "sampleCount" | "sampleAhead" => {
+            let value = value.to_integer()?.max(0);
+            set_wave_property_storage(runtime, this, name, Variant::Integer(value));
+        }
         "looping" => {
             let looping = value.is_truthy();
             runtime.host_mut().set_native_audio_looping(this, looping);
@@ -1346,6 +1376,18 @@ fn wave_static_property_backing_key(name: &str) -> String {
     format!("__nativeWaveStaticProperty${name}")
 }
 
+fn wave_default_sample_property(runtime: &Runtime<KrkrHost>, name: &str) -> i64 {
+    match runtime.object_member(
+        runtime.global_handle(),
+        &wave_static_property_backing_key(name),
+    ) {
+        Variant::Integer(value) => value,
+        Variant::Real(value) => value as i64,
+        _ if name == "sampleCount" => 100,
+        _ => 0,
+    }
+}
+
 fn register_native_method_preserving_script(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
@@ -1370,6 +1412,16 @@ fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: Ob
     runtime.register_object_native(handle, "fade", wave_sound_buffer_fade);
     runtime.register_object_native(handle, "stopFade", wave_sound_buffer_stop_fade);
     runtime.register_object_native(handle, "setPos", wave_sound_buffer_set_pos);
+    runtime.register_object_native(
+        handle,
+        "setDefaultCounts",
+        wave_sound_buffer_set_default_counts,
+    );
+    runtime.register_object_native(
+        handle,
+        "setDefaultAheads",
+        wave_sound_buffer_set_default_aheads,
+    );
     runtime.register_object_native(handle, "freeDirectSound", native_wave_noop);
     runtime.register_object_native(handle, "getVisBuffer", native_wave_noop);
 }
@@ -1494,6 +1546,34 @@ fn wave_sound_buffer_set_pos(
     let position = optional_integer(&args, 0)?.unwrap_or(0).max(0);
     runtime.set_object_member(this, "position", Variant::Integer(position));
     runtime.set_object_member(this, "samplePosition", Variant::Integer(position));
+    Ok(Variant::Void)
+}
+
+fn wave_sound_buffer_set_default_counts(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let count = optional_integer(&args, 0)?.unwrap_or(100).max(0);
+    runtime.set_object_member(
+        runtime.global_handle(),
+        wave_static_property_backing_key("sampleCount"),
+        Variant::Integer(count),
+    );
+    Ok(Variant::Void)
+}
+
+fn wave_sound_buffer_set_default_aheads(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let ahead = optional_integer(&args, 0)?.unwrap_or(0).max(0);
+    runtime.set_object_member(
+        runtime.global_handle(),
+        wave_static_property_backing_key("sampleAhead"),
+        Variant::Integer(ahead),
+    );
     Ok(Variant::Void)
 }
 
@@ -5608,6 +5688,8 @@ const WAVE_SOUND_BUFFER_METHODS: &[&str] = &[
     "onLabel",
     "freeDirectSound",
     "getVisBuffer",
+    "setDefaultCounts",
+    "setDefaultAheads",
 ];
 
 pub(crate) static WAVE_SOUND_BUFFER_CLASS: NativeClassSpec = NativeClassSpec {
@@ -5622,6 +5704,9 @@ pub(crate) static WAVE_SOUND_BUFFER_CLASS: NativeClassSpec = NativeClassSpec {
         "volume",
         "volume2",
         "pan",
+        "sampleValue",
+        "sampleCount",
+        "sampleAhead",
         "posX",
         "posY",
         "posZ",

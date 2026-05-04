@@ -30,7 +30,10 @@ use crate::{
         ASYNC_TRIGGER_EVENT_NAME, AUDIO_FADE_COMPLETED_EVENT_NAME, AsyncTriggerMode, IdleEvent,
         ScriptEvent, ScriptEventKind, ScriptEventSelection, TIMER_EVENT_NAME,
     },
-    script::{execute_expression_on_runtime, execute_script_on_runtime},
+    script::{
+        execute_bytecode_if_present_on_runtime, execute_expression_on_runtime,
+        execute_script_on_runtime,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -445,12 +448,24 @@ impl KrkrEngine {
     }
 
     pub fn execute_storage(&mut self, name: &str) -> Result<Variant> {
+        let bytes = self.tjs_runtime.host().read_binary_storage(name)?;
+        if let Some(result) =
+            execute_bytecode_if_present_on_runtime(&mut self.tjs_runtime, name, &bytes)?
+        {
+            return self.sync_kag_slots_after_ok(Ok(result));
+        }
         let source = self.tjs_runtime.host().read_text_storage(name)?;
         let result = execute_script_on_runtime(&mut self.tjs_runtime, name, &source);
         self.sync_kag_slots_after_ok(result)
     }
 
     pub fn eval_storage(&mut self, name: &str) -> Result<Variant> {
+        let bytes = self.tjs_runtime.host().read_binary_storage(name)?;
+        if let Some(result) =
+            execute_bytecode_if_present_on_runtime(&mut self.tjs_runtime, name, &bytes)?
+        {
+            return self.sync_kag_slots_after_ok(Ok(result));
+        }
         let source = self.tjs_runtime.host().read_text_storage(name)?;
         let result = execute_expression_on_runtime(&mut self.tjs_runtime, name, &source);
         self.sync_kag_slots_after_ok(result)
@@ -3531,6 +3546,131 @@ mod tests {
             Variant::Integer(42)
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn storage_executes_bytecode_startup_from_project_root() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("startup.tjs"), integer_return_bytecode(42)).expect("write startup");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        assert_eq!(
+            engine.execute_startup().expect("startup"),
+            Variant::Integer(42)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn scripts_eval_empty_string_returns_void() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        assert_eq!(
+            engine
+                .execute_script("inline.tjs", r#"return Scripts.eval("");"#)
+                .expect("eval"),
+            Variant::Void
+        );
+    }
+
+    #[test]
+    fn scripts_eval_supports_kirikiriz_conditional_compile_probe() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    r#"return Scripts.eval("@if(kirikiriz)1@endif");"#,
+                )
+                .expect("eval"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn string_case_methods_match_krkr2_ascii_behavior() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    r#"return "AbC123".toLowerCase() + ":" + "aBc123".toUpperCase();"#,
+                )
+                .expect("script"),
+            Variant::String("abc123:ABC123".to_string())
+        );
+    }
+
+    #[test]
+    fn array_shift_and_unshift_match_krkr2_behavior() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    r#"
+                    var a = [2, 3];
+                    var len = a.unshift(0, 1);
+                    var first = a.shift();
+                    var second = a.shift();
+                    var last = (new Array()).shift();
+                    return len + ":" + first + ":" + second + ":" + a[0] + ":" + last;
+                    "#,
+                )
+                .expect("script"),
+            Variant::String("4:0:1:2:1".to_string())
+        );
+    }
+
+    #[test]
+    fn scripts_exec_storage_accepts_string_argument_from_script_function() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("child.tjs"), "global.__child_loaded = 1;").expect("write child");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                function KAGLoadScript(name) {
+                    Scripts.execStorage(name);
+                }
+                KAGLoadScript("child.tjs");
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("__child_loaded"),
+            Variant::Integer(1)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn script_function_argument_preserves_string_type() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    r#"
+                    function id(name) {
+                        return typeof name + ":" + name;
+                    }
+                    return id("child.tjs");
+                    "#,
+                )
+                .expect("script"),
+            Variant::String("String:child.tjs".to_string())
+        );
     }
 
     #[test]
@@ -9551,6 +9691,24 @@ mod tests {
     }
 
     #[test]
+    fn wave_sound_buffer_get_sample_plugin_compat_members_exist() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                WaveSoundBuffer.setDefaultCounts(256);
+                WaveSoundBuffer.setDefaultAheads(512);
+                var buffer = new WaveSoundBuffer();
+                buffer.sampleCount = 128;
+                return buffer.sampleValue + ":" + buffer.sampleCount + ":" + buffer.sampleAhead;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result, Variant::String("0:128:512".to_string()));
+    }
+
+    #[test]
     fn wave_sound_buffer_queues_audio_commands() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -11430,6 +11588,94 @@ mod tests {
             "Kirakira-engine-{}-{nanos}-{id}",
             std::process::id()
         ))
+    }
+
+    fn integer_return_bytecode(value: i32) -> Vec<u8> {
+        let data_payload = data_pool(value);
+        let object_payload = code_object(vec![8, 0], vec![1, 0, 0, 118, 0, 119], 1);
+        let mut objects_payload = Vec::new();
+        push_i32(&mut objects_payload, 0);
+        push_i32(&mut objects_payload, 1);
+        objects_payload.extend_from_slice(b"TJS2");
+        push_i32(&mut objects_payload, object_payload.len() as i32);
+        objects_payload.extend_from_slice(&object_payload);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TJS2100\0");
+        push_i32(&mut bytes, 0);
+        bytes.extend_from_slice(b"DATA");
+        push_i32(&mut bytes, (data_payload.len() + 8) as i32);
+        bytes.extend_from_slice(&data_payload);
+        bytes.extend_from_slice(b"OBJS");
+        push_i32(&mut bytes, (objects_payload.len() + 8) as i32);
+        bytes.extend_from_slice(&objects_payload);
+        let size = bytes.len() as i32;
+        bytes[8..12].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    fn data_pool(value: i32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 1);
+        push_i32(&mut bytes, value);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 1);
+        push_utf16_string(&mut bytes, "global");
+        push_i32(&mut bytes, 0);
+        bytes
+    }
+
+    fn code_object(data_slots: Vec<i16>, code_words: Vec<i16>, max_frame_count: i32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_i32(&mut bytes, -1);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 2);
+        push_i32(&mut bytes, max_frame_count);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, -1);
+        push_i32(&mut bytes, -1);
+        push_i32(&mut bytes, -1);
+        push_i32(&mut bytes, -1);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, code_words.len() as i32);
+        for word in &code_words {
+            push_i16(&mut bytes, *word);
+        }
+        if code_words.len() % 2 == 1 {
+            push_i16(&mut bytes, 0);
+        }
+        push_i32(&mut bytes, (data_slots.len() / 2) as i32);
+        for word in data_slots {
+            push_i16(&mut bytes, word);
+        }
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        bytes
+    }
+
+    fn push_utf16_string(bytes: &mut Vec<u8>, text: &str) {
+        let units = text.encode_utf16().collect::<Vec<_>>();
+        push_i32(bytes, units.len() as i32);
+        for unit in &units {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        if units.len() % 2 == 1 {
+            push_i16(bytes, 0);
+        }
+    }
+
+    fn push_i32(bytes: &mut Vec<u8>, value: i32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_i16(bytes: &mut Vec<u8>, value: i16) {
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn write_png(path: PathBuf, width: u32, height: u32, rgba: &[u8]) {

@@ -5,7 +5,10 @@ use krkr_tjs2::{
 
 use crate::{
     host::KrkrHost,
-    script::{execute_expression_on_runtime, execute_script_on_runtime},
+    script::{
+        execute_bytecode_if_present_on_runtime, execute_expression_on_runtime,
+        execute_script_on_runtime,
+    },
 };
 
 use super::{arg_string, install_static_object, native_void, required_arg_string};
@@ -39,6 +42,10 @@ fn scripts_exec_storage(
     if let Some(value) = read_binary_struct_storage(runtime, &name, &mode)? {
         return Ok(value);
     }
+    let bytes = runtime.host_mut().read_binary(&name, &mode)?;
+    if let Some(value) = execute_bytecode_if_present_on_runtime(runtime, &name, &bytes)? {
+        return Ok(value);
+    }
     let source = runtime.host_mut().read_text(&name, &mode)?;
     execute_script_on_runtime(runtime, &name, &source)
 }
@@ -51,6 +58,11 @@ fn scripts_eval_storage(
     let name = required_arg_string(&args, 0, "Scripts.evalStorage")?;
     let mode = arg_string(&args, 1)?.unwrap_or_default();
     if let Some(value) = read_binary_struct_storage(runtime, &name, &mode)? {
+        return Ok(value);
+    }
+    let bytes = runtime.host_mut().read_binary(&name, &mode)?;
+    if let Some(value) = execute_bytecode_if_present_on_runtime(runtime, &name, &bytes)? {
+        normalize_kag_system_variable_struct(runtime, &name, &value);
         return Ok(value);
     }
     let source = runtime.host_mut().read_text(&name, &mode)?;
@@ -133,7 +145,12 @@ fn scripts_eval(
 ) -> Result<Variant> {
     let source = required_arg_string(&args, 0, "Scripts.eval")?;
     let name = arg_string(&args, 1)?.unwrap_or_else(|| "inline.tjs".to_string());
-    execute_expression_on_runtime(runtime, &name, &source)
+    execute_expression_on_runtime(runtime, &name, &source).map_err(|error| {
+        TjsError::runtime(format!(
+            "Scripts.eval failed for source `{}`: {error}",
+            preview_source(&source)
+        ))
+    })
 }
 
 fn scripts_get_trace_string(
@@ -159,4 +176,20 @@ fn scripts_get_class_names(
         .map(Variant::String)
         .collect();
     Ok(Variant::Object(runtime.alloc_array_object(values)))
+}
+
+fn preview_source(source: &str) -> String {
+    let mut preview = String::new();
+    for ch in source.chars().take(80) {
+        match ch {
+            '\n' => preview.push_str("\\n"),
+            '\r' => preview.push_str("\\r"),
+            '\t' => preview.push_str("\\t"),
+            _ => preview.push(ch),
+        }
+    }
+    if source.chars().count() > 80 {
+        preview.push_str("...");
+    }
+    preview
 }

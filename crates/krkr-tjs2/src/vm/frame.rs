@@ -8,6 +8,7 @@ pub(super) struct CallFrame {
     pub(super) file_id: usize,
     pub(super) file: Arc<BytecodeFile>,
     pub(super) code_handles: Vec<ObjectHandle>,
+    pub(super) object_handle: ObjectHandle,
     pub(super) object: CodeObject,
     pub(super) instructions: Arc<[Instruction]>,
     pub(super) offset_to_index: Arc<BTreeMap<usize, usize>>,
@@ -56,7 +57,6 @@ pub(super) struct Frame {
     pub(super) entries: Vec<ExceptionEntry>,
     pub(super) this_obj: Option<ObjectHandle>,
     pub(super) this_proxy: ObjectHandle,
-    pub(super) super_proxy: ObjectHandle,
 }
 
 impl Frame {
@@ -65,17 +65,14 @@ impl Frame {
         args: Vec<Variant>,
         this_obj: Option<ObjectHandle>,
         this_proxy: ObjectHandle,
-        super_proxy: ObjectHandle,
     ) -> Result<Self> {
-        let frame_len = object.max_frame_count.saturating_add(1).max(1) as usize;
+        let frame_len = object.effective_max_frame_count()?.saturating_add(1).max(1) as usize;
         let mut regs = vec![Variant::Void; frame_len];
         regs[0] = Variant::Void;
 
-        let negative_len = (object.max_variable_count
-            + object.variable_reserve_count
-            + object.func_decl_arg_count
-            + 8) as usize
-            + args.len();
+        let variable_slots =
+            (object.max_variable_count + object.variable_reserve_count).saturating_sub(2) as usize;
+        let negative_len = variable_slots.max(object.func_decl_arg_count as usize);
         let mut negative = vec![Variant::Void; negative_len.max(1)];
         for (index, slot) in negative
             .iter_mut()
@@ -93,7 +90,6 @@ impl Frame {
             entries: Vec::new(),
             this_obj,
             this_proxy,
-            super_proxy,
         })
     }
 
@@ -108,9 +104,8 @@ impl Frame {
         match reg {
             -1 => Ok(self.this_obj.map(Variant::Object).unwrap_or(Variant::Null)),
             -2 => Ok(Variant::Object(self.this_proxy)),
-            -3 => Ok(Variant::Object(self.super_proxy)),
             value => {
-                let index = usize::try_from((-4 - value) as i32).expect("nonnegative");
+                let index = usize::try_from((-3 - value) as i32).expect("nonnegative");
                 Ok(self.negative.get(index).cloned().unwrap_or_default())
             }
         }
@@ -126,11 +121,11 @@ impl Frame {
             return Ok(());
         }
         match reg {
-            -3..=-1 => Err(TjsError::runtime(format!(
+            -1 | -2 => Err(TjsError::runtime(format!(
                 "writing reserved register {reg} is not supported"
             ))),
             reg_value => {
-                let index = usize::try_from((-4 - reg_value) as i32).expect("nonnegative");
+                let index = usize::try_from((-3 - reg_value) as i32).expect("nonnegative");
                 if index >= self.negative.len() {
                     self.negative.resize(index + 1, Variant::Void);
                 }
@@ -145,4 +140,72 @@ impl Frame {
 pub(super) struct ExceptionEntry {
     pub(super) catch_pc: usize,
     pub(super) exception_reg: i16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::{BytecodeContextType, CodeObject};
+
+    #[test]
+    fn minus_three_is_first_negative_variable_register() {
+        let object = CodeObject {
+            parent: None,
+            name: 0,
+            context_type: BytecodeContextType::TopLevel,
+            max_variable_count: 0,
+            variable_reserve_count: 0,
+            max_frame_count: 0,
+            func_decl_arg_count: 0,
+            func_decl_unnamed_arg_array_base: 0,
+            func_decl_collapse_base: None,
+            prop_setter: None,
+            prop_getter: None,
+            super_class_getter: None,
+            source_positions: Vec::new(),
+            code_words: Vec::new(),
+            data_slots: Vec::new(),
+            super_class_getter_pointers: Vec::new(),
+            properties: Vec::new(),
+        };
+        let mut frame = Frame::new(&object, Vec::new(), None, ObjectHandle(1)).expect("frame");
+
+        assert_eq!(frame.get(-3).expect("default"), Variant::Void);
+
+        frame
+            .set(-3, Variant::Integer(7))
+            .expect("write first negative variable register");
+
+        assert_eq!(frame.get(-3).expect("overridden"), Variant::Integer(7));
+    }
+
+    #[test]
+    fn frame_allocates_underdeclared_positive_registers_used_by_krkr2_bytecode() {
+        let object = CodeObject {
+            parent: None,
+            name: 0,
+            context_type: BytecodeContextType::TopLevel,
+            max_variable_count: 0,
+            variable_reserve_count: 2,
+            max_frame_count: 1,
+            func_decl_arg_count: 0,
+            func_decl_unnamed_arg_array_base: 0,
+            func_decl_collapse_base: None,
+            prop_setter: None,
+            prop_getter: None,
+            super_class_getter: None,
+            source_positions: Vec::new(),
+            code_words: vec![124, 1, 103, 2, 1, 0, 118, 2, 119],
+            data_slots: Vec::new(),
+            super_class_getter_pointers: Vec::new(),
+            properties: Vec::new(),
+        };
+        let mut frame = Frame::new(&object, Vec::new(), None, ObjectHandle(1)).expect("frame");
+
+        frame
+            .set(2, Variant::Integer(9))
+            .expect("write scanned positive register");
+
+        assert_eq!(frame.get(2).expect("read"), Variant::Integer(9));
+    }
 }

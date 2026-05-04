@@ -1157,12 +1157,11 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
             SlotId::Temp(id) => checked_i16(id.0 as usize + 1, "temp register")?,
             SlotId::Local(id) => {
                 let offset = self.object.args.declared.len() + id.0 as usize;
-                -4 - checked_i16(offset, "local register")?
+                -3 - checked_i16(offset, "local register")?
             }
-            SlotId::Arg(index) => -4 - checked_i16(index as usize, "arg register")?,
+            SlotId::Arg(index) => -3 - checked_i16(index as usize, "arg register")?,
             SlotId::This => -1,
             SlotId::ThisProxy => -2,
-            SlotId::SuperProxy => -3,
         })
     }
 

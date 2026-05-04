@@ -7,7 +7,7 @@ use crate::compile_source_to_bytecode;
 use crate::error::{Result, TjsError};
 use crate::runtime::object::Object;
 use crate::runtime::value::{ObjectHandle, Variant};
-use crate::runtime::{Runtime, TjsHost};
+use crate::runtime::{Runtime, TjsHost, split_delimited_string};
 
 pub(crate) fn install<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
     let array = runtime.register_global_native("Array", native_array::<H>);
@@ -301,6 +301,8 @@ pub(crate) fn install_array_methods<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "insert", array_insert::<H>);
     runtime.register_object_native(handle, "erase", array_erase::<H>);
     runtime.register_object_native(handle, "pop", array_pop::<H>);
+    runtime.register_object_native(handle, "shift", array_shift::<H>);
+    runtime.register_object_native(handle, "unshift", array_unshift::<H>);
     runtime.register_object_native(handle, "clear", array_clear::<H>);
     runtime.register_object_native(handle, "assign", array_assign::<H>);
     runtime.register_object_native(handle, "assignStruct", array_assign_struct::<H>);
@@ -308,6 +310,7 @@ pub(crate) fn install_array_methods<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "save", array_save::<H>);
     runtime.register_object_native(handle, "saveStruct", array_save_struct::<H>);
     runtime.register_object_native(handle, "loadStruct", array_load_struct::<H>);
+    runtime.register_object_native(handle, "split", array_split::<H>);
     runtime.register_object_native(handle, "join", array_join::<H>);
     runtime.register_object_native(handle, "reverse", array_reverse::<H>);
 }
@@ -408,6 +411,45 @@ fn array_pop<H: TjsHost + 'static>(
     runtime.heap[handle.0]
         .array_pop()
         .ok_or_else(|| TjsError::runtime("Array.pop called on a non-array object"))
+}
+
+fn array_shift<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.shift")?;
+    let len = runtime.heap[handle.0]
+        .array_elements()
+        .map(|items| items.len())
+        .ok_or_else(|| TjsError::runtime("Array.shift called on a non-array object"))?;
+    if len == 0 {
+        return Ok(Variant::Void);
+    }
+    runtime.heap[handle.0]
+        .array_erase(0)
+        .ok_or_else(|| TjsError::runtime("Array.shift called on a non-array object"))
+}
+
+fn array_unshift<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.unshift")?;
+    for (index, value) in args.into_iter().enumerate() {
+        if !runtime.heap[handle.0].array_insert(index, value) {
+            return Err(TjsError::runtime(
+                "Array.unshift called on a non-array object",
+            ));
+        }
+    }
+    Ok(Variant::Integer(
+        runtime.heap[handle.0]
+            .array_elements()
+            .map(|items| items.len() as i64)
+            .unwrap_or(0),
+    ))
 }
 
 fn array_clear<H: TjsHost + 'static>(
@@ -587,6 +629,29 @@ fn array_join<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .collect::<Result<Vec<_>>>()?;
     Ok(Variant::String(parts.join(&separator)))
+}
+
+fn array_split<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.split")?;
+    if args.len() < 2 {
+        return Err(TjsError::runtime(
+            "Array.split requires delimiter and string arguments",
+        ));
+    }
+    let delimiters = args[0].to_tjs_string()?;
+    let string = args[1].to_tjs_string()?;
+    let purge_empty = args
+        .get(3)
+        .filter(|value| !matches!(value, Variant::Void))
+        .is_some_and(Variant::is_truthy);
+    runtime.heap[handle.0] =
+        Object::array(split_delimited_string(&string, &delimiters, purge_empty));
+    install_array_methods(runtime, handle);
+    Ok(Variant::Object(handle))
 }
 
 fn array_reverse<H: TjsHost + 'static>(
@@ -908,6 +973,7 @@ fn is_native_member_name(key: &str) -> bool {
                 | "save"
                 | "add"
                 | "push"
+                | "split"
                 | "insert"
                 | "erase"
                 | "pop"

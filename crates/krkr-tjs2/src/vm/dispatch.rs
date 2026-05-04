@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use crate::bytecode::{BytecodeContextType, CallArgs, CodeObject, Instruction};
+use crate::compiler::compile_source_to_bytecode;
 use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
-use crate::runtime::{Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant};
+use crate::runtime::{
+    Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant, split_delimited_string,
+};
 
 use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form};
 use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
@@ -52,7 +55,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 callee_type: None,
             })
         })?;
-        self.prop_get_handle(handle, name, flags, closure_this.or(caller_this))
+        let effective_this = self.effective_member_this(closure_this, caller_this)?;
+        self.prop_get_handle(handle, name, flags, effective_this)
             .map_err(|error| {
                 error.with_member_access(TjsMemberAccess {
                     operation: TjsMemberOperation::Getting,
@@ -90,6 +94,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             if let Some(this_obj) = bind_this
                 && !flags.no_bound_instance_fallback
                 && let Some(value) = self.runtime.heap[this_obj.0].get_raw(name)
+                && !self.runtime.variant_is_property(&value)
             {
                 return Ok(value);
             }
@@ -97,12 +102,25 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
 
         let Some(value) = self.runtime.heap[handle.0].get_raw(name) else {
+            let bind_this = self.bound_super_this(handle, caller_this)?;
+            if let Some(this_obj) = bind_this
+                && self.handle_class_name_matches(handle, name)
+            {
+                return Ok(Variant::Closure(Closure::new(handle, Some(this_obj))));
+            }
             if let Some(class_handle) = self.super_class_handle(handle)? {
                 let receiver = caller_this.or(Some(handle));
                 let value = self.prop_get_handle(class_handle, name, flags, receiver)?;
                 if !matches!(value, Variant::Void) {
                     return Ok(self.bind_proxy_value(value, receiver));
                 }
+            }
+            if let Some(this_obj) = bind_this
+                && !flags.no_bound_instance_fallback
+                && let Some(value) = self.runtime.heap[this_obj.0].get_raw(name)
+                && !self.runtime.variant_is_property(&value)
+            {
+                return Ok(value);
             }
             if flags.must_exist {
                 return Err(TjsError::runtime(format!("member `{name}` not found")));
@@ -115,7 +133,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         {
             return Ok(getter);
         }
-        Ok(value)
+        let bind_this = self.bound_super_this(handle, caller_this)?;
+        Ok(self.bind_proxy_value(value, bind_this))
     }
 
     pub(super) fn prop_set(
@@ -135,7 +154,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 callee_type: None,
             })
         })?;
-        self.prop_set_handle(handle, name, value, flags, closure_this.or(caller_this))
+        let effective_this = self.effective_member_this(closure_this, caller_this)?;
+        self.prop_set_handle(handle, name, value, flags, effective_this)
             .map_err(|error| {
                 error.with_member_access(TjsMemberAccess {
                     operation: TjsMemberOperation::Setting,
@@ -224,6 +244,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 current = self.super_class_handle(class_handle)?;
             }
         }
+        if let Some(this_obj) = self.bound_super_this(handle, caller_this)? {
+            self.set_bound_member(this_obj, name, value);
+            return Ok(());
+        }
         let mut value = self.materialize_code_object(value);
         if let Variant::Closure(closure) = &mut value
             && closure.this_obj.is_none()
@@ -275,11 +299,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let file = self.runtime.script_file(file_id)?;
             let getter = file.objects[object_index].prop_getter;
             if let Some(getter) = getter {
+                let effective_this = self.effective_member_this(closure_this, caller_this)?;
                 return self.execute_file_object_with_this(
                     file_id,
                     getter,
                     Vec::new(),
-                    closure_this.or(caller_this),
+                    effective_this,
                 );
             }
             return Err(TjsError::runtime("property has no getter"));
@@ -291,14 +316,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 .get(id)
                 .cloned()
                 .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
-            return property.get(self.runtime, closure_this.or(caller_this));
+            let effective_this = self.effective_member_this(closure_this, caller_this)?;
+            return property.get(self.runtime, effective_this);
         }
-        self.prop_get_handle(
-            handle,
-            "value",
-            DispatchFlags::default(),
-            closure_this.or(caller_this),
-        )
+        let effective_this = self.effective_member_this(closure_this, caller_this)?;
+        self.prop_get_handle(handle, "value", DispatchFlags::default(), effective_this)
     }
 
     pub(super) fn default_prop_set(
@@ -318,12 +340,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let file = self.runtime.script_file(file_id)?;
             let setter = file.objects[object_index].prop_setter;
             if let Some(setter) = setter {
-                self.execute_file_object_with_this(
-                    file_id,
-                    setter,
-                    vec![value],
-                    closure_this.or(caller_this),
-                )?;
+                let effective_this = self.effective_member_this(closure_this, caller_this)?;
+                self.execute_file_object_with_this(file_id, setter, vec![value], effective_this)?;
                 return Ok(());
             }
             return Err(TjsError::runtime("property has no setter"));
@@ -335,15 +353,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 .get(id)
                 .cloned()
                 .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
-            property.set(self.runtime, closure_this.or(caller_this), value)?;
+            let effective_this = self.effective_member_this(closure_this, caller_this)?;
+            property.set(self.runtime, effective_this, value)?;
             return Ok(());
         }
+        let effective_this = self.effective_member_this(closure_this, caller_this)?;
         self.prop_set_handle(
             handle,
             "value",
             value,
             DispatchFlags::default(),
-            closure_this.or(caller_this),
+            effective_this,
         )
     }
 
@@ -365,11 +385,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let Some(getter) = file.objects[object_index].prop_getter else {
                     return Ok(None);
                 };
+                let effective_this = self.effective_member_this(closure_this, caller_this)?;
                 Ok(Some(self.execute_file_object_with_this(
                     file_id,
                     getter,
                     Vec::new(),
-                    closure_this.or(caller_this),
+                    effective_this,
                 )?))
             }
             ObjectKind::NativeProperty { id } => {
@@ -379,9 +400,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
-                Ok(Some(
-                    property.get(self.runtime, closure_this.or(caller_this))?,
-                ))
+                let effective_this = self.effective_member_this(closure_this, caller_this)?;
+                Ok(Some(property.get(self.runtime, effective_this)?))
             }
             _ => Ok(None),
         }
@@ -406,12 +426,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let Some(setter) = file.objects[object_index].prop_setter else {
                     return Ok(None);
                 };
-                self.execute_file_object_with_this(
-                    file_id,
-                    setter,
-                    vec![value],
-                    closure_this.or(caller_this),
-                )?;
+                let effective_this = self.effective_member_this(closure_this, caller_this)?;
+                self.execute_file_object_with_this(file_id, setter, vec![value], effective_this)?;
                 Ok(Some(()))
             }
             ObjectKind::NativeProperty { id } => {
@@ -421,7 +437,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| TjsError::runtime(format!("native property {id} missing")))?;
-                property.set(self.runtime, closure_this.or(caller_this), value)?;
+                let effective_this = self.effective_member_this(closure_this, caller_this)?;
+                property.set(self.runtime, effective_this, value)?;
                 Ok(Some(()))
             }
             _ => Ok(None),
@@ -748,8 +765,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 callee_type: None,
             })
         })?;
-        let member = self
-            .prop_get_handle(
+        let member = if let Some(this_obj) = self.bound_super_this(handle, caller_this)?
+            && self.handle_class_name_matches(handle, name)
+        {
+            self.runtime.heap[this_obj.0]
+                .get_raw(name)
+                .unwrap_or_else(|| Variant::Closure(Closure::new(handle, Some(this_obj))))
+        } else {
+            self.prop_get_handle(
                 handle,
                 name,
                 DispatchFlags::no_bound_instance_fallback(),
@@ -762,7 +785,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     member_name: name.to_string(),
                     callee_type: None,
                 })
-            })?;
+            })?
+        };
+        let bind_this = self.bound_super_this(handle, caller_this)?;
+        let member = self.bind_proxy_value(member, bind_this);
         let callee_type = self.value_debug_type(&member);
         let receiver = self.receiver_this(handle);
         let receiver_this = if let Some(this_obj) = caller_this
@@ -1212,11 +1238,31 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         result
     }
 
-    fn call_string_method(&self, value: String, name: &str, args: Vec<Variant>) -> Result<Variant> {
+    fn call_string_method(
+        &mut self,
+        value: String,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
         match name {
             "toString" => Ok(Variant::String(value)),
             "escape" => Ok(Variant::String(escape_tjs_string_fragment(&value))),
             "sprintf" => Ok(Variant::String(sprintf_tjs_string(&value, &args)?)),
+            "toLowerCase" => Ok(Variant::String(string_to_ascii_lowercase(&value))),
+            "toUpperCase" => Ok(Variant::String(string_to_ascii_uppercase(&value))),
+            "charAt" => {
+                if args.len() != 1 {
+                    return Err(TjsError::runtime("String.charAt requires one argument"));
+                }
+                let index = args[0].to_integer()?;
+                let Some(ch) = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| value.chars().nth(index))
+                else {
+                    return Ok(Variant::String(String::new()));
+                };
+                Ok(Variant::String(ch.to_string()))
+            }
             "substr" | "substring" => {
                 let start = args
                     .first()
@@ -1271,6 +1317,48 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     .transpose()?
                     .map(|value| value.max(0) as usize);
                 Ok(Variant::Integer(string_last_index_of(&value, &needle, end)))
+            }
+            "split" => {
+                let Some(pattern) = args.first() else {
+                    return Err(TjsError::runtime(
+                        "String.split requires a delimiter argument",
+                    ));
+                };
+                let delimiters = pattern.to_tjs_string()?;
+                let purge_empty = args
+                    .get(2)
+                    .filter(|value| !matches!(value, Variant::Void))
+                    .is_some_and(Variant::is_truthy);
+                let array = self.runtime.alloc_array_object(split_delimited_string(
+                    &value,
+                    &delimiters,
+                    purge_empty,
+                ));
+                Ok(Variant::Object(array))
+            }
+            "trim" => {
+                if !args.is_empty() {
+                    return Err(TjsError::runtime("String.trim does not accept arguments"));
+                }
+                Ok(Variant::String(trim_tjs_ascii_space(&value).to_string()))
+            }
+            "reverse" => {
+                if !args.is_empty() {
+                    return Err(TjsError::runtime(
+                        "String.reverse does not accept arguments",
+                    ));
+                }
+                Ok(Variant::String(value.chars().rev().collect()))
+            }
+            "repeat" => {
+                if args.len() != 1 {
+                    return Err(TjsError::runtime("String.repeat requires one argument"));
+                }
+                let count = args[0].to_integer()?;
+                if count <= 0 || value.is_empty() {
+                    return Ok(Variant::String(String::new()));
+                }
+                Ok(Variant::String(value.repeat(count as usize)))
             }
             _ => Err(TjsError::runtime(format!(
                 "string method `{name}` not found"
@@ -1327,6 +1415,45 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
+    fn bound_super_this(
+        &mut self,
+        class_handle: ObjectHandle,
+        caller_this: Option<ObjectHandle>,
+    ) -> Result<Option<ObjectHandle>> {
+        let Some(this_obj) = caller_this else {
+            return Ok(None);
+        };
+        if this_obj == self.runtime.global {
+            return Ok(None);
+        }
+        if self.is_class_in_instance_chain(this_obj, class_handle)? {
+            return Ok(Some(this_obj));
+        }
+        Ok(None)
+    }
+
+    fn effective_member_this(
+        &mut self,
+        closure_this: Option<ObjectHandle>,
+        caller_this: Option<ObjectHandle>,
+    ) -> Result<Option<ObjectHandle>> {
+        let Some(caller_this) = caller_this else {
+            return Ok(closure_this);
+        };
+        if caller_this == self.runtime.global {
+            return Ok(closure_this.or(Some(caller_this)));
+        }
+        if let Some(closure_this) = closure_this {
+            if closure_this == self.runtime.global
+                || self.is_class_in_instance_chain(caller_this, closure_this)?
+            {
+                return Ok(Some(caller_this));
+            }
+            return Ok(Some(closure_this));
+        }
+        Ok(Some(caller_this))
+    }
+
     fn bind_proxy_value(&self, value: Variant, bind_this: Option<ObjectHandle>) -> Variant {
         let Some(this_obj) = bind_this else {
             return value;
@@ -1375,19 +1502,66 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
-    pub(super) fn change_this(&self, value: &mut Variant, this_obj: ObjectHandle) -> Result<()> {
+    pub(super) fn optional_object(&self, value: Variant) -> Result<Option<ObjectHandle>> {
+        match self.materialize_code_object(value) {
+            Variant::Object(handle) => Ok(Some(handle)),
+            Variant::Closure(closure) => Ok(Some(closure.object)),
+            Variant::Null => Ok(None),
+            other => Err(TjsError::runtime(format!("{other} is not an object"))),
+        }
+    }
+
+    pub(super) fn change_this(
+        &self,
+        value: &mut Variant,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<()> {
         match self.materialize_code_object(value.clone()) {
             Variant::Closure(mut closure) => {
-                closure.this_obj = Some(this_obj);
+                closure.this_obj = this_obj;
                 *value = Variant::Closure(closure);
                 Ok(())
             }
             Variant::Object(object) => {
-                *value = Variant::Closure(Closure::new(object, Some(this_obj)));
+                *value = this_obj
+                    .map(|this_obj| Variant::Closure(Closure::new(object, Some(this_obj))))
+                    .unwrap_or(Variant::Object(object));
                 Ok(())
             }
             other => Err(TjsError::runtime(format!("{other} is not a closure"))),
         }
+    }
+
+    pub(super) fn eval_operator(
+        &mut self,
+        frame: &mut Frame,
+        reg: i16,
+        result_needed: bool,
+    ) -> Result<()> {
+        let source = frame.get(reg)?.to_tjs_string()?;
+        if source.is_empty() {
+            if result_needed {
+                frame.set(reg, Variant::Void)?;
+            }
+            return Ok(());
+        }
+
+        let source = if result_needed {
+            format!("return {source};")
+        } else {
+            format!("{source};")
+        };
+        let file = compile_source_to_bytecode("<eval>", &source)?;
+        let top_level = file
+            .top_level
+            .ok_or_else(|| TjsError::runtime("eval bytecode has no top-level object"))?;
+        let file_id = self.runtime.install_script_file(Arc::new(file));
+        let value =
+            self.execute_file_object_with_this(file_id, top_level, Vec::new(), frame.this_obj)?;
+        if result_needed {
+            frame.set(reg, value)?;
+        }
+        Ok(())
     }
 
     pub(super) fn instance_of(&mut self, value: &Variant, class_name: &str) -> Result<bool> {
@@ -1425,23 +1599,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.runtime.heap[handle.0].class_infos.push(info);
     }
 
-    pub(super) fn register_object_members(
-        &mut self,
-        object: &CodeObject,
-        dest: ObjectHandle,
-    ) -> Result<()> {
-        for property in &object.properties {
-            let name = self
-                .file
-                .data
-                .strings
-                .get(property.name)
-                .cloned()
-                .ok_or_else(|| TjsError::runtime("property name missing"))?;
-            let handle = self.code_handles[property.object];
-            self.runtime.heap[dest.0].set(name, Variant::Closure(Closure::new(handle, Some(dest))));
+    pub(super) fn register_object_members(&mut self, source: ObjectHandle, dest: ObjectHandle) {
+        let members = self.runtime.heap[source.0].members.clone();
+        for (name, value) in members {
+            let mut value = self.materialize_code_object(value);
+            match &mut value {
+                Variant::Closure(closure) => closure.this_obj = Some(dest),
+                Variant::Object(handle) => {
+                    value = Variant::Closure(Closure::new(*handle, Some(dest)));
+                }
+                _ => {}
+            }
+            self.runtime.heap[dest.0].set(name, value);
         }
-        Ok(())
     }
 }
 
@@ -1461,6 +1631,36 @@ fn string_last_index_of(value: &str, needle: &str, end_utf16: Option<usize>) -> 
         .rfind(needle)
         .map(|offset| utf16_len(&value[..offset]) as i64)
         .unwrap_or(-1)
+}
+
+fn string_to_ascii_lowercase(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_uppercase() {
+                ch.to_ascii_lowercase()
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn string_to_ascii_uppercase(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() {
+                ch.to_ascii_uppercase()
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn trim_tjs_ascii_space(value: &str) -> &str {
+    value.trim_matches(|ch: char| ch > '\0' && ch <= ' ')
 }
 
 fn sprintf_tjs_string(format: &str, args: &[Variant]) -> Result<String> {

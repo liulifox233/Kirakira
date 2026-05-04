@@ -625,7 +625,7 @@ impl MirObject {
                     Err(TjsError::mir(format!("invalid arg id {index}")))
                 }
             }
-            SlotId::This | SlotId::ThisProxy | SlotId::SuperProxy => Ok(()),
+            SlotId::This | SlotId::ThisProxy => Ok(()),
         }
     }
 }
@@ -714,7 +714,6 @@ pub enum SlotId {
     Arg(u32),
     This,
     ThisProxy,
-    SuperProxy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1133,6 +1132,7 @@ pub fn lower_hir_program(
 ) -> Result<MirModule> {
     let mut lowerer = Lowerer::new(program, source_name, source_text);
     let global_name = lowerer.intern_string("global");
+    lowerer.record_object(ObjectId(0), ContextType::TopLevel, None);
     let mut top = ObjectBuilder::new(
         ObjectId(0),
         global_name,
@@ -1183,6 +1183,9 @@ struct Lowerer {
     source_spans: SourceSpanMapper,
     next_object_id: u32,
     bindings: BTreeMap<syntax::BindingId, BindingInfo>,
+    object_parents: BTreeMap<ObjectId, Option<ObjectId>>,
+    object_contexts: BTreeMap<ObjectId, ContextType>,
+    class_primary_extenders: BTreeMap<ObjectId, syntax::Expr>,
     object_jobs: VecDeque<ObjectJob>,
 }
 
@@ -1224,6 +1227,9 @@ impl Lowerer {
             source_spans: SourceSpanMapper::new(source_text),
             next_object_id: 1,
             bindings,
+            object_parents: BTreeMap::new(),
+            object_contexts: BTreeMap::new(),
+            class_primary_extenders: BTreeMap::new(),
             object_jobs: VecDeque::new(),
         }
     }
@@ -1290,6 +1296,28 @@ impl Lowerer {
         id
     }
 
+    fn record_object(&mut self, id: ObjectId, context: ContextType, parent: Option<ObjectId>) {
+        self.object_contexts.insert(id, context);
+        self.object_parents.insert(id, parent);
+    }
+
+    fn enclosing_super_expr(&self, object: &MirObject) -> Option<syntax::Expr> {
+        if object.context == ContextType::Class
+            && let Some(expr) = self.class_primary_extenders.get(&object.id)
+        {
+            return Some(expr.clone());
+        }
+
+        let mut current = object.parent;
+        while let Some(id) = current {
+            if self.object_contexts.get(&id) == Some(&ContextType::Class) {
+                return self.class_primary_extenders.get(&id).cloned();
+            }
+            current = self.object_parents.get(&id).copied().flatten();
+        }
+        None
+    }
+
     fn lower_function_object(
         &mut self,
         decl: &syntax::FunctionDecl,
@@ -1337,6 +1365,7 @@ impl Lowerer {
                             .map(|name| name.name.as_str())
                             .unwrap_or("(anonymous)"),
                     );
+                    self.record_object(id, context, parent);
                     let mut object =
                         ObjectBuilder::new(id, name, context, parent, self.add_span(decl.span));
                     object.bind_params(self, &decl)?;
@@ -1349,6 +1378,10 @@ impl Lowerer {
                     decl,
                     parent,
                 } => {
+                    self.record_object(id, ContextType::Class, Some(parent));
+                    if let Some(extender) = decl.extends.first() {
+                        self.class_primary_extenders.insert(id, extender.clone());
+                    }
                     let mut class_object = ObjectBuilder::new(
                         id,
                         name,
@@ -1386,6 +1419,7 @@ impl Lowerer {
                             syntax::StmtKind::PropertyDecl(property) => {
                                 let property_id = self.next_object_id();
                                 let property_name = self.intern_string(&property.name.name);
+                                self.record_object(property_id, ContextType::Property, Some(id));
                                 let mut property_object = ObjectBuilder::new(
                                     property_id,
                                     property_name,
@@ -1416,6 +1450,7 @@ impl Lowerer {
                     parent,
                     expr,
                 } => {
+                    self.record_object(id, ContextType::SuperClassGetter, Some(parent));
                     let mut object = ObjectBuilder::new(
                         id,
                         name,
@@ -1489,6 +1524,7 @@ struct ObjectBuilder {
     object: MirObject,
     current: BlockId,
     binding_slots: BTreeMap<syntax::BindingId, SlotId>,
+    force_global_context: bool,
     with_stack: Vec<Value>,
     control_stack: Vec<ControlFrame>,
     active_regions: Vec<ExceptionRegionId>,
@@ -1701,6 +1737,7 @@ impl ObjectBuilder {
             },
             current: BlockId(0),
             binding_slots: BTreeMap::new(),
+            force_global_context: false,
             with_stack: Vec::new(),
             control_stack: Vec::new(),
             active_regions: Vec::new(),
@@ -1850,6 +1887,12 @@ impl ObjectBuilder {
         let id = TempId(self.object.frame.temps.len() as u32);
         self.object.frame.temps.push(TempDecl { id, span: None });
         SlotId::Temp(id)
+    }
+
+    fn global_value(&mut self) -> Value {
+        let dst = self.temp();
+        self.emit(MirInst::LoadGlobal { dst });
+        Value::Slot(dst)
     }
 
     fn local(
@@ -2339,6 +2382,7 @@ impl ObjectBuilder {
     ) -> Result<()> {
         let property_id = lowerer.next_object_id();
         let property_name = lowerer.intern_string(&decl.name.name);
+        lowerer.record_object(property_id, ContextType::Property, Some(self.object.id));
         let mut property_object = ObjectBuilder::new(
             property_id,
             property_name,
@@ -2511,6 +2555,27 @@ impl ObjectBuilder {
             self.run_expr_task(lowerer, task, &mut state)?;
         }
         pop_value(&mut state.values)
+    }
+
+    fn lower_expr_in_global_context(
+        &mut self,
+        lowerer: &mut Lowerer,
+        expr: &syntax::Expr,
+    ) -> Result<Value> {
+        let previous = self.force_global_context;
+        self.force_global_context = true;
+        let result = self.lower_expr(lowerer, expr);
+        self.force_global_context = previous;
+        result
+    }
+
+    fn lower_super_expr(&mut self, lowerer: &mut Lowerer) -> Result<Value> {
+        let Some(expr) = lowerer.enclosing_super_expr(&self.object) else {
+            return Err(TjsError::mir(
+                "cannot get super outside a class with extends",
+            ));
+        };
+        self.lower_expr_in_global_context(lowerer, &expr)
     }
 
     fn run_expr_task<'a>(
@@ -2960,11 +3025,9 @@ impl ObjectBuilder {
                 values.push(self.read_ident(lowerer, ident, expr.span)?);
             }
             syntax::ExprKind::This => values.push(Value::Slot(SlotId::This)),
-            syntax::ExprKind::Super => values.push(Value::Slot(SlotId::SuperProxy)),
+            syntax::ExprKind::Super => values.push(self.lower_super_expr(lowerer)?),
             syntax::ExprKind::Global => {
-                let dst = self.temp();
-                self.emit(MirInst::LoadGlobal { dst });
-                values.push(Value::Slot(dst));
+                values.push(self.global_value());
             }
             syntax::ExprKind::Nan => {
                 values.push(Value::Const(lowerer.add_const(MirConst::Real(f64::NAN))));
@@ -3463,8 +3526,13 @@ impl ObjectBuilder {
             return Ok(Value::Slot(slot));
         }
 
+        let object = if self.force_global_context {
+            self.global_value()
+        } else {
+            Value::Slot(SlotId::ThisProxy)
+        };
         let place = Place::Member {
-            object: Value::Slot(SlotId::ThisProxy),
+            object,
             key: MemberKey::Direct(lowerer.intern_string(&ident.name)),
             flags: FLAGS_DEFAULT_GET,
         };
@@ -3481,8 +3549,13 @@ impl ObjectBuilder {
             return Ok(Place::Slot(slot));
         }
 
+        let object = if self.force_global_context {
+            self.global_value()
+        } else {
+            Value::Slot(SlotId::ThisProxy)
+        };
         Ok(Place::Member {
-            object: Value::Slot(SlotId::ThisProxy),
+            object,
             key: MemberKey::Direct(lowerer.intern_string(&ident.name)),
             flags: if lowerer.ident_is_property(ident) {
                 FLAGS_DEFAULT_SET

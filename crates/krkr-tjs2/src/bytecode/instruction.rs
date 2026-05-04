@@ -13,6 +13,56 @@ impl Instruction {
     pub fn mnemonic(&self) -> &'static str {
         opcode_mnemonic(self.opcode)
     }
+
+    pub(crate) fn register_operands(&self) -> Vec<i16> {
+        let mut regs = Vec::new();
+        match self.opcode {
+            1 => regs.push(self.operands[0]),
+            2 | 7..=10 | 88 | 123 | 125 => regs.extend_from_slice(&self.operands),
+            3 | 5 | 6 | 11..=13 | 18 | 22 | 82 | 83 | 86 | 87 | 89..=98 | 118 | 122 | 124 => {
+                regs.push(self.operands[0])
+            }
+            4 => regs.push(self.operands[0]),
+            19 | 23 | 84 | 103 | 110 | 116 => {
+                regs.push(self.operands[0]);
+                regs.push(self.operands[1]);
+            }
+            20 | 24 | 85 | 107 | 112 | 117 => regs.extend_from_slice(&self.operands),
+            21 | 25 | 114 | 115 => regs.extend_from_slice(&self.operands),
+            26..=81 => match binary_form(self.opcode) {
+                BinaryForm::Slot => regs.extend_from_slice(&self.operands[0..2]),
+                BinaryForm::DirectProperty => {
+                    regs.push(self.operands[0]);
+                    regs.push(self.operands[1]);
+                    regs.push(self.operands[3]);
+                }
+                BinaryForm::IndirectProperty => regs.extend_from_slice(&self.operands),
+                BinaryForm::DefaultProperty => regs.extend_from_slice(&self.operands),
+            },
+            99 | 102 => {
+                regs.push(self.operands[0]);
+                regs.push(self.operands[1]);
+                append_call_arg_registers(&mut regs, self.call_args.as_ref());
+            }
+            100 | 101 => {
+                regs.push(self.operands[0]);
+                regs.push(self.operands[1]);
+                if self.opcode == 101 {
+                    regs.push(self.operands[2]);
+                }
+                append_call_arg_registers(&mut regs, self.call_args.as_ref());
+            }
+            104..=106 | 111 => {
+                regs.push(self.operands[0]);
+                regs.push(self.operands[2]);
+            }
+            108 | 109 | 113 => regs.extend_from_slice(&self.operands),
+            120 => regs.push(self.operands[1]),
+            0 | 14 | 15..=17 | 119 | 121 | 126 | 127 => {}
+            _ => {}
+        }
+        regs
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +77,21 @@ pub struct ExpandedArg {
     pub arg_type: i16,
     pub reg: i16,
 }
+
+fn append_call_arg_registers(regs: &mut Vec<i16>, args: Option<&CallArgs>) {
+    match args {
+        Some(CallArgs::Normal(args)) => regs.extend(args.iter().copied()),
+        Some(CallArgs::Expanded(args)) => {
+            for arg in args {
+                if matches!(arg.arg_type, 0 | 1) {
+                    regs.push(arg.reg);
+                }
+            }
+        }
+        Some(CallArgs::OmittedCallerArgs) | None => {}
+    }
+}
+
 pub(super) fn decode_instructions(code_words: &[i16]) -> Result<Vec<Instruction>> {
     let mut instructions = Vec::new();
     let mut offset = 0;

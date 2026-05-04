@@ -5,6 +5,14 @@ use super::{
 use crate::error::{Result, TjsError};
 
 pub(super) fn parse_bytecode(bytes: &[u8]) -> Result<BytecodeFile> {
+    parse_bytecode_inner(bytes, true)
+}
+
+pub(super) fn parse_bytecode_unverified(bytes: &[u8]) -> Result<BytecodeFile> {
+    parse_bytecode_inner(bytes, false)
+}
+
+fn parse_bytecode_inner(bytes: &[u8], verify: bool) -> Result<BytecodeFile> {
     let mut reader = Reader::new(bytes);
     let signature = reader.read_bytes(8)?;
     if signature != BYTECODE_SIGNATURE {
@@ -47,7 +55,9 @@ pub(super) fn parse_bytecode(bytes: &[u8]) -> Result<BytecodeFile> {
         top_level,
         debug_info: Default::default(),
     };
-    file.verify()?;
+    if verify {
+        file.verify()?;
+    }
     Ok(file)
 }
 
