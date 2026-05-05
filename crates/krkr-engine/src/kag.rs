@@ -102,6 +102,13 @@ impl KagHost for EngineKagHost<'_> {
             .map_err(kag_host_error)
     }
 
+    fn eval_attribute(&mut self, expression: &str) -> krkr_kag::Result<Option<String>> {
+        match eval_expression(self.runtime, expression)? {
+            Variant::Void => Ok(None),
+            value => value.to_tjs_string().map(Some).map_err(kag_host_error),
+        }
+    }
+
     fn on_label(&mut self, event: LabelEvent<'_>) -> krkr_kag::Result<()> {
         let page = event
             .label
@@ -228,7 +235,10 @@ fn fill_attributes_dictionary(
 }
 
 fn attribute_value_to_variant(value: &AttributeValue) -> Variant {
-    raw_attribute_value_to_variant(value.raw())
+    match value {
+        AttributeValue::Void => Variant::Void,
+        value => raw_attribute_value_to_variant(value.raw()),
+    }
 }
 
 fn raw_attribute_value_to_variant(value: &str) -> Variant {

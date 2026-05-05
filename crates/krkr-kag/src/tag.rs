@@ -121,6 +121,7 @@ pub enum AttributeValue {
     Literal(String),
     Expression(String),
     MacroArgument(String),
+    Void,
 }
 
 impl AttributeValue {
@@ -131,13 +132,14 @@ impl AttributeValue {
     pub fn raw(&self) -> &str {
         match self {
             Self::Literal(value) | Self::Expression(value) | Self::MacroArgument(value) => value,
+            Self::Void => "",
         }
     }
 
     pub fn as_literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) => Some(value),
-            Self::Expression(_) | Self::MacroArgument(_) => None,
+            Self::Expression(_) | Self::MacroArgument(_) | Self::Void => None,
         }
     }
 }
