@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError};
@@ -375,6 +378,16 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.heap[object.0].set(name, value);
     }
 
+    pub fn set_object_call_missing(
+        &mut self,
+        object: ObjectHandle,
+        missing_name: impl Into<String>,
+    ) {
+        let object = &mut self.heap[object.0];
+        object.missing_name = missing_name.into();
+        object.call_missing = !object.missing_name.is_empty();
+    }
+
     pub fn object_member_is_property(&self, object: ObjectHandle, name: &str) -> bool {
         self.heap[object.0]
             .get_raw(name)
@@ -711,5 +724,25 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.native_properties
             .push(Arc::new(NativePropertyAccessors { getter, setter }));
         self.alloc_object(Object::new(ObjectKind::NativeProperty { id }))
+    }
+
+    pub(crate) fn alloc_value_property(&mut self, initial: Variant) -> ObjectHandle {
+        let value = Arc::new(Mutex::new(initial));
+        let getter_value = Arc::clone(&value);
+        let setter_value = Arc::clone(&value);
+        self.alloc_native_property(
+            move |_runtime, _this_obj| {
+                getter_value
+                    .lock()
+                    .map(|value| value.clone())
+                    .map_err(|_| TjsError::runtime("native value property lock poisoned"))
+            },
+            move |_runtime, _this_obj, value| {
+                *setter_value
+                    .lock()
+                    .map_err(|_| TjsError::runtime("native value property lock poisoned"))? = value;
+                Ok(())
+            },
+        )
     }
 }

@@ -43,6 +43,7 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(system, "toActualColor", first_arg_or_void);
     runtime.register_object_native(system, "createUUID", system_create_uuid);
     runtime.register_object_native(system, "getArgument", system_get_argument);
+    runtime.register_object_native(system, "addFont", system_add_font);
 
     for (name, value) in [
         ("versionString", Variant::String("Kirakira".to_string())),
@@ -160,6 +161,32 @@ fn touch_image_storages(runtime: &Runtime<KrkrHost>, source: &Variant) -> Result
     }
 
     Ok(vec![source.to_tjs_string()?])
+}
+
+fn system_add_font(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(storage) = args.first() else {
+        return Err(TjsError::runtime("System.addFont requires a storage name"));
+    };
+    let storage = storage.to_tjs_string()?;
+    let Ok(data) = runtime.host().read_resource_storage(&storage) else {
+        return Ok(Variant::Void);
+    };
+    let bytes = data.to_arc_bytes().map_err(crate::storage::io_error)?;
+    let loaded = runtime
+        .host_mut()
+        .font_system_mut()
+        .load_font_data(storage.clone(), bytes.as_ref().to_vec())
+        .is_ok();
+    if loaded {
+        runtime
+            .host_mut()
+            .log(&format!("System.addFont loaded: {storage}"));
+    }
+    Ok(Variant::Integer(i64::from(loaded)))
 }
 
 fn system_add_continuous_handler(

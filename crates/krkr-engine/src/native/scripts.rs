@@ -23,13 +23,30 @@ pub(crate) fn install_scripts(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(scripts, "dump", native_void);
     runtime.register_object_native(scripts, "getTraceString", scripts_get_trace_string);
     runtime.register_object_native(scripts, "dumpStringHeap", native_void);
-    runtime.register_object_native(scripts, "setCallMissing", native_void);
+    runtime.register_object_native(scripts, "setCallMissing", scripts_set_call_missing);
     runtime.register_object_native(scripts, "getClassNames", scripts_get_class_names);
+    runtime.register_object_native(scripts, "getObjectKeys", scripts_get_object_keys);
+    runtime.register_object_native(scripts, "getObjectCount", scripts_get_object_count);
+    runtime.set_object_member(scripts, "pfMemberEnsure", Variant::Integer(0x0000_0200));
+    runtime.set_object_member(scripts, "pfMemberMustExist", Variant::Integer(0x0000_0400));
+    runtime.set_object_member(scripts, "pfIgnoreProp", Variant::Integer(0x0000_0800));
+    runtime.set_object_member(scripts, "pfHiddenMember", Variant::Integer(0x0000_1000));
+    runtime.set_object_member(scripts, "pfStaticMember", Variant::Integer(0x0001_0000));
     runtime.set_object_member(
         scripts,
         "textEncoding",
         Variant::String(runtime.host().text_encoding().to_string()),
     );
+}
+
+fn scripts_set_call_missing(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = required_arg_object(&args, 0, "Scripts.setCallMissing")?;
+    runtime.set_object_call_missing(handle, "missing");
+    Ok(Variant::Void)
 }
 
 fn scripts_exec_storage(
@@ -176,6 +193,80 @@ fn scripts_get_class_names(
         .map(Variant::String)
         .collect();
     Ok(Variant::Object(runtime.alloc_array_object(values)))
+}
+
+fn scripts_get_object_keys(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = required_arg_object(&args, 0, "Scripts.getObjectKeys")?;
+    let mut keys = runtime
+        .object_members(handle)
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| !is_hidden_member_name(key))
+        .collect::<Vec<_>>();
+    keys.sort();
+    let values = keys.into_iter().map(Variant::String).collect();
+    Ok(Variant::Object(runtime.alloc_array_object(values)))
+}
+
+fn scripts_get_object_count(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = required_arg_object(&args, 0, "Scripts.getObjectCount")?;
+    let count = runtime
+        .object_members(handle)
+        .into_iter()
+        .filter(|(key, _)| !is_hidden_member_name(key))
+        .count();
+    Ok(Variant::Integer(count as i64))
+}
+
+fn required_arg_object(args: &[Variant], index: usize, method: &str) -> Result<ObjectHandle> {
+    match args.get(index) {
+        Some(Variant::Object(handle)) => Ok(*handle),
+        Some(Variant::Closure(closure)) => Ok(closure.object),
+        Some(Variant::Null) => Err(TjsError::runtime(format!("{method} got null object"))),
+        Some(other) => Err(TjsError::runtime(format!(
+            "{method} requires object argument {index}, got {}",
+            other.type_name()
+        ))),
+        None => Err(TjsError::runtime(format!(
+            "{method} requires argument {index}"
+        ))),
+    }
+}
+
+fn is_hidden_member_name(key: &str) -> bool {
+    key.starts_with("__")
+        || matches!(
+            key,
+            "clear"
+                | "assign"
+                | "assignStruct"
+                | "saveStruct"
+                | "loadStruct"
+                | "load"
+                | "save"
+                | "add"
+                | "push"
+                | "split"
+                | "insert"
+                | "erase"
+                | "remove"
+                | "pop"
+                | "shift"
+                | "unshift"
+                | "join"
+                | "sort"
+                | "reverse"
+                | "count"
+                | "length"
+        )
 }
 
 fn preview_source(source: &str) -> String {

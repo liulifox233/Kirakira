@@ -3,6 +3,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use regex::RegexBuilder;
+
 use crate::compile_source_to_bytecode;
 use crate::error::{Result, TjsError};
 use crate::runtime::object::Object;
@@ -300,6 +302,7 @@ pub(crate) fn install_array_methods<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "push", array_push::<H>);
     runtime.register_object_native(handle, "insert", array_insert::<H>);
     runtime.register_object_native(handle, "erase", array_erase::<H>);
+    runtime.register_object_native(handle, "remove", array_remove::<H>);
     runtime.register_object_native(handle, "pop", array_pop::<H>);
     runtime.register_object_native(handle, "shift", array_shift::<H>);
     runtime.register_object_native(handle, "unshift", array_unshift::<H>);
@@ -312,6 +315,7 @@ pub(crate) fn install_array_methods<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "loadStruct", array_load_struct::<H>);
     runtime.register_object_native(handle, "split", array_split::<H>);
     runtime.register_object_native(handle, "join", array_join::<H>);
+    runtime.register_object_native(handle, "sort", array_sort::<H>);
     runtime.register_object_native(handle, "reverse", array_reverse::<H>);
 }
 
@@ -400,6 +404,22 @@ fn array_erase<H: TjsHost + 'static>(
         .array_erase(index as usize)
         .ok_or_else(|| TjsError::runtime("Array.erase called on a non-array object"))?;
     Ok(Variant::Void)
+}
+
+fn array_remove<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.remove")?;
+    let Some(value) = args.first() else {
+        return Err(TjsError::runtime("Array.remove requires a value"));
+    };
+    let remove_all = args.get(1).map(Variant::is_truthy).unwrap_or(true);
+    let removed = runtime.heap[handle.0]
+        .array_remove_values(value, remove_all)
+        .ok_or_else(|| TjsError::runtime("Array.remove called on a non-array object"))?;
+    Ok(Variant::Integer(removed as i64))
 }
 
 fn array_pop<H: TjsHost + 'static>(
@@ -652,6 +672,37 @@ fn array_split<H: TjsHost + 'static>(
         Object::array(split_delimited_string(&string, &delimiters, purge_empty));
     install_array_methods(runtime, handle);
     Ok(Variant::Object(handle))
+}
+
+fn array_sort<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.sort")?;
+    let mode = args
+        .first()
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .and_then(|value| value.chars().next())
+        .filter(|mode| matches!(mode, '+' | '-' | '0' | '9' | 'a' | 'z'))
+        .unwrap_or('+');
+    if !runtime.heap[handle.0].array_sort_by(|lhs, rhs| array_sort_less(lhs, rhs, mode))? {
+        return Err(TjsError::runtime("Array.sort called on a non-array object"));
+    }
+    Ok(Variant::Void)
+}
+
+fn array_sort_less(lhs: &Variant, rhs: &Variant, mode: char) -> Result<bool> {
+    match mode {
+        '-' => rhs.less_than(lhs),
+        '0' => Ok(lhs.to_real()? < rhs.to_real()?),
+        '9' => Ok(lhs.to_real()? > rhs.to_real()?),
+        'a' => Ok(lhs.to_tjs_string()? < rhs.to_tjs_string()?),
+        'z' => Ok(lhs.to_tjs_string()? > rhs.to_tjs_string()?),
+        _ => lhs.less_than(rhs),
+    }
 }
 
 fn array_reverse<H: TjsHost + 'static>(
@@ -1471,11 +1522,8 @@ fn regexp_test<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    let pattern = runtime.heap[handle.0]
-        .get("pattern")
-        .to_tjs_string()
-        .unwrap_or_default();
-    Ok(Variant::Integer(i64::from(target.contains(&pattern))))
+    let regex = regexp_regex(runtime, handle)?;
+    Ok(Variant::Integer(i64::from(regex.is_match(&target))))
 }
 
 fn regexp_match<H: TjsHost + 'static>(
@@ -1483,8 +1531,40 @@ fn regexp_match<H: TjsHost + 'static>(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let matched = regexp_test(runtime, this_obj, args)?.is_truthy();
-    Ok(Variant::Integer(i64::from(matched)))
+    let handle = require_this(this_obj, "RegExp.match")?;
+    let target = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    let regex = regexp_regex(runtime, handle)?;
+    let values = regex
+        .captures(&target)
+        .map(|captures| {
+            captures
+                .iter()
+                .map(|capture| Variant::String(capture.map(|m| m.as_str()).unwrap_or("").into()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Variant::Object(runtime.alloc_array_object(values)))
+}
+
+fn regexp_regex<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) -> Result<regex::Regex> {
+    let pattern = runtime.heap[handle.0]
+        .get("pattern")
+        .to_tjs_string()
+        .unwrap_or_default();
+    let flags = runtime.heap[handle.0]
+        .get("flags")
+        .to_tjs_string()
+        .unwrap_or_default();
+    RegexBuilder::new(&pattern)
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'))
+        .dot_matches_new_line(flags.contains('s'))
+        .build()
+        .map_err(|error| TjsError::runtime(format!("RegExp compile failed: {error}")))
 }
 
 fn date_get_time<H: TjsHost + 'static>(

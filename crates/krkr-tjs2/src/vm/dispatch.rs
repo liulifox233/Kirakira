@@ -122,6 +122,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             {
                 return Ok(value);
             }
+            if let Some(value) = self.call_get_missing(handle, name)? {
+                return Ok(value);
+            }
             if flags.must_exist {
                 return Err(TjsError::runtime(format!("member `{name}` not found")));
             }
@@ -223,6 +226,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return self.prop_set_handle(fallback, name, value, flags, caller_this);
         }
 
+        let member_exists = self.runtime.heap[handle.0].get_raw(name).is_some();
         if let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
             && (!flags.ignore_prop || self.runtime.variant_is_native_property(&existing))
             && self
@@ -244,6 +248,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 current = self.super_class_handle(class_handle)?;
             }
         }
+        if !member_exists && self.call_set_missing(handle, name, value.clone())? {
+            return Ok(());
+        }
         if let Some(this_obj) = self.bound_super_this(handle, caller_this)? {
             self.set_bound_member(this_obj, name, value);
             return Ok(());
@@ -256,6 +263,89 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
         self.runtime.heap[handle.0].set(name, value);
         Ok(())
+    }
+
+    fn call_get_missing(&mut self, handle: ObjectHandle, name: &str) -> Result<Option<Variant>> {
+        let Some(value_property) = self.call_missing_method(handle, false, name, Variant::Void)?
+        else {
+            return Ok(None);
+        };
+        let (result, property) = value_property;
+        if result.is_truthy() {
+            return self
+                .default_prop_get(Variant::Object(property), Some(handle))
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    fn call_set_missing(
+        &mut self,
+        handle: ObjectHandle,
+        name: &str,
+        value: Variant,
+    ) -> Result<bool> {
+        let Some((result, _property)) = self.call_missing_method(handle, true, name, value)? else {
+            return Ok(false);
+        };
+        Ok(result.is_truthy())
+    }
+
+    fn call_missing_method(
+        &mut self,
+        handle: ObjectHandle,
+        is_set: bool,
+        name: &str,
+        initial_value: Variant,
+    ) -> Result<Option<(Variant, ObjectHandle)>> {
+        let object = &self.runtime.heap[handle.0];
+        if !object.call_missing || object.processing_missing {
+            return Ok(None);
+        }
+        let missing_name = object.missing_name.clone();
+        if missing_name.is_empty() {
+            return Ok(None);
+        }
+
+        let value_property = self.runtime.alloc_value_property(initial_value);
+        let args = vec![
+            Variant::Integer(i64::from(is_set)),
+            Variant::String(name.to_string()),
+            Variant::Object(value_property),
+        ];
+
+        self.runtime.heap[handle.0].processing_missing = true;
+        let result = (|| {
+            let missing = self.prop_get_handle(
+                handle,
+                &missing_name,
+                DispatchFlags::no_bound_instance_fallback(),
+                Some(handle),
+            )?;
+            if matches!(missing, Variant::Void) {
+                return Ok(Variant::Integer(0));
+            }
+            self.call_value_sync(missing, Some(handle), args)
+        })();
+        self.runtime.heap[handle.0].processing_missing = false;
+
+        result.map(|result| Some((result, value_property)))
+    }
+
+    fn call_value_sync(
+        &mut self,
+        callee: Variant,
+        this_obj: Option<ObjectHandle>,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        let base_depth = self.runtime.call_depth;
+        match self.call_value(callee, this_obj, args, false, Continuation::Root)? {
+            CallOutcome::Immediate(value, Continuation::Root) => Ok(value),
+            CallOutcome::Immediate(_, continuation) => Err(TjsError::runtime(format!(
+                "unexpected missing continuation {continuation:?}"
+            ))),
+            CallOutcome::Frame(frame) => self.run_call_stack(vec![*frame], base_depth),
+        }
     }
 
     fn member_in_super_chain(
@@ -1568,6 +1658,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let Ok(handle) = self.resolve_object(value.clone()) else {
             return Ok(false);
         };
+        if class_name == "Function" && self.handle_is_function(handle) {
+            return Ok(true);
+        }
         let mut seen = Vec::new();
         let mut current = Some(handle);
         while let Some(handle) = current {
@@ -1585,6 +1678,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             current = self.super_class_handle(handle)?;
         }
         Ok(false)
+    }
+
+    fn handle_is_function(&self, handle: ObjectHandle) -> bool {
+        matches!(
+            self.runtime.heap[handle.0].kind,
+            ObjectKind::NativeFunction { .. }
+                | ObjectKind::VmNativeFunction { .. }
+                | ObjectKind::InterCode {
+                    context: BytecodeContextType::Function | BytecodeContextType::ExprFunction,
+                    ..
+                }
+        )
     }
 
     pub(super) fn add_class_info(&mut self, handle: ObjectHandle, info: String) {

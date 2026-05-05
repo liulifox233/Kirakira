@@ -44,4 +44,14 @@ pub(crate) fn install_tvp_globals(runtime: &mut Runtime<KrkrHost>) {
     let window = install_native_class(runtime, &WINDOW_CLASS, true);
     let draw_device = install_native_class(runtime, &BASIC_DRAW_DEVICE_CLASS, false);
     runtime.set_object_member(window, "BasicDrawDevice", Variant::Object(draw_device));
+    runtime.set_object_member(
+        window,
+        "PassThroughDrawDevice",
+        Variant::Object(draw_device),
+    );
+    runtime.set_object_member(draw_device, "dtNone", Variant::Integer(0));
+    runtime.set_object_member(draw_device, "dtDrawDib", Variant::Integer(1));
+    runtime.set_object_member(draw_device, "dtDBGDI", Variant::Integer(2));
+    runtime.set_object_member(draw_device, "dtDBDD", Variant::Integer(3));
+    runtime.set_object_member(draw_device, "dtDBD3D", Variant::Integer(4));
 }

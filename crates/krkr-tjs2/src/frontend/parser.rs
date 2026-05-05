@@ -1146,6 +1146,10 @@ impl Parser {
                     Self::push_string_segment(exprs, text, span);
                 }
                 InterpolatedPart::Expr(source) => {
+                    if source.trim().is_empty() {
+                        Self::push_string_segment(exprs, String::new(), span);
+                        continue;
+                    }
                     let mut parser = Parser::new(lex(&source)?);
                     let expr = parser.parse_expression()?;
                     parser.expect(&TokenKind::Eof)?;
@@ -2280,6 +2284,18 @@ mod tests {
     fn concatenates_string_literals_after_interpolated_string() {
         let program = parse(r#"var s = @"a" "b";"#).expect("parse");
         assert_eq!(program.statements.len(), 1);
+        let StmtKind::Var { declarations, .. } = &program.statements[0].kind else {
+            panic!("expected var statement");
+        };
+        assert!(matches!(
+            declarations[0].initializer.as_ref().map(|expr| &expr.kind),
+            Some(ExprKind::String(text)) if text == "ab"
+        ));
+    }
+
+    #[test]
+    fn empty_interpolated_string_expression_is_empty_text() {
+        let program = parse(r#"var s = @"a${}b";"#).expect("parse");
         let StmtKind::Var { declarations, .. } = &program.statements[0].kind else {
             panic!("expected var statement");
         };

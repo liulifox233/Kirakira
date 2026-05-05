@@ -294,6 +294,9 @@ fn apply_constructor_defaults(
             set_window_property_storage(runtime, handle, "children", Variant::Object(children));
             let menu = alloc_menu_item_object(runtime, Some(handle), String::new());
             runtime.set_object_member(handle, "menu", Variant::Object(menu));
+            let draw_device =
+                construct_native_instance(runtime, &BASIC_DRAW_DEVICE_CLASS, None, Vec::new())?;
+            runtime.set_object_member(handle, "drawDevice", draw_device);
             if let Variant::Object(window_class) = runtime.global_member("Window")
                 && matches!(
                     runtime.object_member(window_class, "mainWindow"),
@@ -424,6 +427,11 @@ fn apply_constructor_defaults(
         "Bitmap" | "BitmapLayerTreeOwner" => {
             runtime.set_object_member(handle, "width", Variant::Integer(0));
             runtime.set_object_member(handle, "height", Variant::Integer(0));
+        }
+        "BasicDrawDevice" => {
+            runtime.set_object_member(handle, "interface", Variant::Void);
+            runtime.set_object_member(handle, "enableD3D", Variant::Integer(0));
+            runtime.set_object_member(handle, "preferredDrawer", Variant::Integer(0));
         }
         "WaveSoundBuffer" => {
             runtime.set_object_member(handle, "status", Variant::String("unload".to_string()));
@@ -5815,7 +5823,7 @@ pub(crate) static VIDEO_OVERLAY_CLASS: NativeClassSpec = NativeClassSpec {
 pub(crate) static BASIC_DRAW_DEVICE_CLASS: NativeClassSpec = NativeClassSpec {
     name: "BasicDrawDevice",
     methods: &["recreate"],
-    properties: &["interface"],
+    properties: &["interface", "enableD3D", "preferredDrawer"],
     static_methods: &[],
-    static_properties: &[],
+    static_properties: &["dtNone", "dtDrawDib", "dtDBGDI", "dtDBDD", "dtDBD3D"],
 };

@@ -3229,6 +3229,26 @@ mod tests {
     }
 
     #[test]
+    fn scripts_object_keys_match_scriptsex_enumeration_shape() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var d = new Dictionary();
+                d.b = 2;
+                d.a = 1;
+                var keys = Scripts.getObjectKeys(d);
+                return keys.join(",") + ":" + Scripts.getObjectCount(d);
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("a,b:2".to_string()));
+    }
+
+    #[test]
     fn dictionary_save_struct_persists_to_system_data_path() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create project root");
@@ -3623,7 +3643,7 @@ mod tests {
                     "#,
                 )
                 .expect("script"),
-            Variant::String("4:0:1:2:1".to_string())
+            Variant::String("4:0:1:2:".to_string())
         );
     }
 
@@ -3736,6 +3756,48 @@ mod tests {
 
         assert_eq!(value, Variant::String("gbk".to_string()));
         assert_eq!(engine.host().text_encoding(), "gbk");
+    }
+
+    #[test]
+    fn storages_path_helpers_match_krkr2_storage_syntax() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var ext = Storages.extractStorageExt;
+                return ext("arc.xp3>dir/file.tjs") + ":" +
+                    Storages.extractStorageName("arc.xp3>dir/file.tjs") + ":" +
+                    Storages.extractStoragePath("arc.xp3>dir/file.tjs") + ":" +
+                    Storages.chopStorageExt("arc.xp3>dir/file.tjs") + ":" +
+                    Storages.extractStorageExt("noext") + ":" +
+                    Storages.chopStorageExt("noext");
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String(".tjs:file.tjs:arc.xp3>dir/:arc.xp3>dir/file::noext".to_string())
+        );
+    }
+
+    #[test]
+    fn native_methods_match_function_instance_class() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                return (Storages.extractStorageExt instanceof "Function") + ":" +
+                    (Layer.releaseCapture instanceof "Function");
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1:1".to_string()));
     }
 
     #[test]
