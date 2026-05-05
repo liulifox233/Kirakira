@@ -9014,6 +9014,35 @@ mod tests {
     }
 
     #[test]
+    fn layer_absolute_property_updates_render_order() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.absolute = 2000000;
+                "#,
+            )
+            .expect("script");
+
+        let layer_id = engine
+            .execute_expression("inline.tjs", "layer.__nativeLayerId")
+            .expect("layer id")
+            .to_integer()
+            .expect("layer id integer") as u64;
+        let z_order = engine
+            .tjs_runtime
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .expect("layer node")
+            .z_order;
+
+        assert_eq!(z_order, 2_000_000);
+    }
+
+    #[test]
     fn message_layer_overlay_passes_pointer_to_lower_control_layer() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
