@@ -9,14 +9,39 @@
 
 `Kirakira` is a lightweight, high-performance, modern KRKR game emulator.
 
-## Run
+## Usage
 
 ```sh
 cargo run -p krkr-desktop
 ```
 
-You can also pass a game directory directly:
+By default, the desktop app tries to launch the current directory when it
+looks like a KRKR project. Otherwise it falls back to the directory containing
+the executable.
+
+You can pass a game/project directory explicitly:
 
 ```sh
 cargo run -p krkr-desktop -- /path/to/game
 ```
+
+A project directory is detected when it contains one of the following:
+
+- `startup.tjs`
+- `startup.ks`
+- one or more `.xp3` archives in the project root
+- one or more `.xp3` archives in `sys/`
+
+For a release build:
+
+```sh
+cargo build -p krkr-desktop --release
+./target/release/krkr-desktop /path/to/game
+```
+
+## Compatibility Notice
+
+Kirakira is still under active development. Most KRKR plugin features are not
+implemented yet. `Plugins.link` currently records linked plugin names and some
+limited compatibility shims exist, but games that depend on native KRKR plugins
+may fail or behave differently.
