@@ -66,6 +66,10 @@ pub trait KagHost {
         })
     }
 
+    fn eval_attribute(&mut self, expression: &str) -> Result<Option<String>> {
+        self.eval_string(expression).map(Some)
+    }
+
     fn on_label(&mut self, _event: LabelEvent<'_>) -> Result<()> {
         Ok(())
     }
@@ -529,6 +533,7 @@ impl SnapshotWriter {
                 self.u8(2);
                 self.string(value);
             }
+            AttributeValue::Void => self.u8(3),
         }
     }
 
@@ -733,6 +738,7 @@ impl<'a> SnapshotReader<'a> {
             0 => AttributeValue::Literal(self.string()?),
             1 => AttributeValue::Expression(self.string()?),
             2 => AttributeValue::MacroArgument(self.string()?),
+            3 => AttributeValue::Void,
             _ => return Err(KagError::host("invalid KAGParser snapshot attribute value")),
         };
         Ok(value)
@@ -2124,6 +2130,7 @@ impl KagParser {
                     self.resolve_macro_argument_value(AttributeValue::MacroArgument(value.clone()));
                 self.attr_value_to_string(&resolved, host)
             }
+            AttributeValue::Void => Ok(String::new()),
         }
     }
 
@@ -2136,7 +2143,10 @@ impl KagParser {
                 continue;
             };
             if let AttributeValue::Expression(expression) = value {
-                *value = AttributeValue::Literal(host.eval_string(expression)?);
+                *value = host
+                    .eval_attribute(expression)?
+                    .map(AttributeValue::Literal)
+                    .unwrap_or(AttributeValue::Void);
             } else if let AttributeValue::MacroArgument(argument) = value {
                 *value = self
                     .resolve_macro_argument_value(AttributeValue::MacroArgument(argument.clone()));
@@ -2801,6 +2811,13 @@ mod tests {
                 })
         }
 
+        fn eval_attribute(&mut self, expression: &str) -> Result<Option<String>> {
+            if expression == "void" {
+                return Ok(None);
+            }
+            self.eval_string(expression).map(Some)
+        }
+
         fn on_label(&mut self, event: LabelEvent<'_>) -> Result<()> {
             self.labels.push(event.label.name.clone());
             Ok(())
@@ -3142,6 +3159,18 @@ mod tests {
         assert_eq!(parser.cur_line(), Some(1));
         assert_eq!(parser.cur_pos(), Some(1));
         assert_eq!(parser.cur_line_str(), Some("AB"));
+    }
+
+    #[test]
+    fn expression_attribute_void_stays_void() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text("first.ks", r#"[bgmopt gvolume="&void"]"#)
+            .unwrap();
+        let mut host = TestHost::default();
+
+        let tag = next_with(&mut parser, &mut host);
+        assert!(matches!(tag.attr("gvolume"), Some(AttributeValue::Void)));
     }
 
     #[test]

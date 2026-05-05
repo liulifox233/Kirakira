@@ -11660,6 +11660,25 @@ mod tests {
         )
     }
 
+    #[test]
+    fn kag_tag_dictionary_preserves_void_attributes() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let tag = Tag::new(
+            "bgmopt",
+            vec![Attribute::named("gvolume", AttributeValue::Void)],
+            krkr_kag::TagOrigin::Bracket,
+            krkr_kag::SourceSpan::empty(0),
+            krkr_kag::SourceLocation::default(),
+        );
+
+        let tag_object = tag_to_dictionary(engine.tjs_runtime_mut(), &tag).expect("tag object");
+
+        assert_eq!(
+            engine.tjs_runtime().object_member(tag_object, "gvolume"),
+            Variant::Void
+        );
+    }
+
     fn force_timer_due(engine: &mut KrkrEngine, timer: ObjectHandle) {
         engine
             .tjs_runtime

@@ -740,6 +740,13 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
             .map_err(kag_host_error)
     }
 
+    fn eval_attribute(&mut self, expression: &str) -> krkr_kag::Result<Option<String>> {
+        match eval_expression(self.vm.runtime_mut(), expression)? {
+            Variant::Void => Ok(None),
+            value => value.to_tjs_string().map(Some).map_err(kag_host_error),
+        }
+    }
+
     fn on_label(&mut self, event: LabelEvent<'_>) -> krkr_kag::Result<()> {
         let page = event
             .label
