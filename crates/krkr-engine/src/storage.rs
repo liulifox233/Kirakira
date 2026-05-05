@@ -973,7 +973,7 @@ pub(crate) fn normalize_storage_separators(path: &str) -> String {
 
 fn is_safe_absolute_storage_path(path: &Path) -> bool {
     path.components()
-        .all(|component| !matches!(component, Component::ParentDir | Component::Prefix(_)))
+        .all(|component| !matches!(component, Component::ParentDir))
 }
 
 pub(crate) fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
