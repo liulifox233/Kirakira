@@ -1440,6 +1440,20 @@ impl KrkrHost {
         }
     }
 
+    pub(crate) fn mark_native_audio_instance_stopped(
+        &mut self,
+        id: AudioInstanceId,
+    ) -> Option<ObjectHandle> {
+        self.native_audio_buffers
+            .iter_mut()
+            .find_map(|(handle, buffer)| {
+                (buffer.id == id).then(|| {
+                    buffer.playing = false;
+                    *handle
+                })
+            })
+    }
+
     pub(crate) fn open_native_audio_storage(
         &mut self,
         handle: ObjectHandle,

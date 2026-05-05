@@ -1477,6 +1477,7 @@ fn wave_sound_buffer_play(
         .queue_native_audio_play(this, bus, AudioLoadPolicy::Auto)?;
     runtime.set_object_member(this, "status", Variant::String("play".to_string()));
     runtime.set_object_member(this, "paused", Variant::Integer(0));
+    call_wave_status_changed(runtime, this)?;
     Ok(Variant::Void)
 }
 
@@ -1500,7 +1501,20 @@ fn wave_sound_buffer_stop(
     runtime.host_mut().mark_native_audio_stopped(this);
     runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
     runtime.set_object_member(this, "paused", Variant::Integer(0));
+    call_wave_status_changed(runtime, this)?;
     Ok(Variant::Void)
+}
+
+fn call_wave_status_changed(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) -> Result<()> {
+    if matches!(
+        runtime.object_member(this, "onStatusChanged"),
+        Variant::Void
+    ) {
+        return Ok(());
+    }
+    runtime
+        .call_object_method(this, "onStatusChanged", Vec::new())
+        .map(|_| ())
 }
 
 fn wave_sound_buffer_stop_fade(

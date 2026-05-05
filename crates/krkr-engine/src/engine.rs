@@ -5,10 +5,10 @@ use std::{
 };
 
 use krkr_core::{
-    AudioBus, AudioCommand, AudioLoadPolicy, ButtonState, Color, Engine as CoreEngine,
-    EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput, FrameOutput, ImageUpload,
-    LayerId, MessageLayerModel, Point, PointerButton, Size, TransitionMethod, TransitionParams,
-    TransitionScrollFrom, TransitionScrollStay,
+    AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, ButtonState, Color,
+    Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput,
+    FrameOutput, ImageUpload, LayerId, MessageLayerModel, Point, PointerButton, Size,
+    TransitionMethod, TransitionParams, TransitionScrollFrom, TransitionScrollStay,
 };
 use krkr_kag::{KagError, KagParser, ParserSnapshot, Tag};
 use krkr_tjs2::{
@@ -517,6 +517,38 @@ impl KrkrEngine {
 
     pub fn signal_kag_click(&mut self) {
         self.kag_session.signal_click();
+    }
+
+    pub fn notify_audio_stopped(&mut self, id: AudioInstanceId) -> Result<()> {
+        let handle = self
+            .tjs_runtime
+            .host_mut()
+            .mark_native_audio_instance_stopped(id);
+        self.kag_session.signal_audio_finished();
+
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        if !self.tjs_runtime.object_valid(handle) {
+            return Ok(());
+        }
+
+        self.tjs_runtime
+            .set_object_member(handle, "status", Variant::String("stop".to_string()));
+        self.tjs_runtime
+            .set_object_member(handle, "paused", Variant::Integer(0));
+        if matches!(
+            self.tjs_runtime.object_member(handle, "onStatusChanged"),
+            Variant::Void
+        ) {
+            return Ok(());
+        }
+
+        let result = self
+            .tjs_runtime
+            .call_object_method(handle, "onStatusChanged", Vec::new())
+            .map(|_| ());
+        self.sync_kag_slots_after_ok(result)
     }
 
     pub fn tick(&mut self) -> Result<EngineTickResult> {
@@ -1714,6 +1746,7 @@ struct KagSession {
     right_click: RightClickAction,
     loaded: bool,
     clear_page_on_click: bool,
+    clear_page_on_timer: bool,
     message_layer: MessageLayerModel,
 }
 
@@ -1725,6 +1758,7 @@ struct KagTempSnapshot {
     pending_tags: VecDeque<Tag>,
     right_click: RightClickAction,
     clear_page_on_click: bool,
+    clear_page_on_timer: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1748,6 +1782,7 @@ impl KagSession {
             right_click: RightClickAction::default(),
             loaded: false,
             clear_page_on_click: false,
+            clear_page_on_timer: false,
             message_layer: MessageLayerModel::default(),
         }
     }
@@ -1817,6 +1852,7 @@ impl KagSession {
         if self.loaded {
             self.pending_tags.clear();
             self.clear_page_on_click = false;
+            self.clear_page_on_timer = false;
             self.message_layer.waiting_for_click = false;
             self.state = KagTaskState::Running;
         }
@@ -1916,6 +1952,7 @@ impl KagSession {
         self.right_click = RightClickAction::default();
         self.loaded = true;
         self.clear_page_on_click = false;
+        self.clear_page_on_timer = false;
     }
 
     fn set_handler(&mut self, handler: ObjectHandle) {
@@ -1932,7 +1969,14 @@ impl KagSession {
                 self.message_layer.clear_text();
                 self.clear_page_on_click = false;
             }
+            self.clear_page_on_timer = false;
             self.message_layer.waiting_for_click = false;
+            self.state = KagTaskState::Running;
+        }
+    }
+
+    fn signal_audio_finished(&mut self) {
+        if self.state == KagTaskState::WaitingAudio {
             self.state = KagTaskState::Running;
         }
     }
@@ -1940,6 +1984,10 @@ impl KagSession {
     fn update_wait(&mut self, delta: Duration, transition_active: bool, resource_pending: bool) {
         if let KagTaskState::WaitingTimer { remaining } = self.state.clone() {
             self.state = if delta >= remaining {
+                if self.clear_page_on_timer {
+                    self.message_layer.clear_text();
+                    self.clear_page_on_timer = false;
+                }
                 KagTaskState::Running
             } else {
                 KagTaskState::WaitingTimer {
@@ -2179,10 +2227,18 @@ impl KagSession {
             }
             NativeFallbackTag::L => {
                 self.message_layer.newline();
+                if kag_auto_mode(runtime) {
+                    return Ok(self.wait_auto_timer(kag_auto_line_wait(runtime), false));
+                }
                 Ok(self.wait_click(false))
             }
             NativeFallbackTag::P => {
                 self.message_layer.page_break();
+                if kag_auto_mode(runtime) {
+                    self.message_layer.waiting_for_click = false;
+                    self.clear_page_on_click = false;
+                    return Ok(self.wait_auto_timer(kag_auto_page_wait(runtime), true));
+                }
                 Ok(self.wait_click(true))
             }
             NativeFallbackTag::Font => {
@@ -2267,6 +2323,7 @@ impl KagSession {
                         pending_tags: self.pending_tags.clone(),
                         right_click: self.right_click.clone(),
                         clear_page_on_click: self.clear_page_on_click,
+                        clear_page_on_timer: self.clear_page_on_timer,
                     },
                 );
                 Ok(TagAction::Continue)
@@ -2281,6 +2338,7 @@ impl KagSession {
                     self.pending_tags = snapshot.pending_tags;
                     self.right_click = snapshot.right_click;
                     self.clear_page_on_click = snapshot.clear_page_on_click;
+                    self.clear_page_on_timer = snapshot.clear_page_on_timer;
                     self.state = snapshot.state;
                 }
                 Ok(TagAction::Continue)
@@ -2374,6 +2432,10 @@ impl KagSession {
             }
             NativeFallbackTag::WaitAudio => Ok(self.wait(KagTaskState::WaitingAudio)),
             NativeFallbackTag::WaitResource => Ok(self.wait(KagTaskState::WaitingResource)),
+            NativeFallbackTag::CancelAutoMode => {
+                cancel_kag_auto_mode(runtime);
+                Ok(TagAction::Continue)
+            }
             NativeFallbackTag::Stop => {
                 self.state = KagTaskState::Finished;
                 Ok(TagAction::Yield(KagYieldReason::Finished))
@@ -2493,8 +2555,25 @@ impl KagSession {
     }
 
     fn wait(&mut self, state: KagTaskState) -> TagAction {
+        if !matches!(state, KagTaskState::WaitingTimer { .. }) {
+            self.clear_page_on_timer = false;
+        }
         self.state = state;
         TagAction::Yield(KagYieldReason::Waiting(self.state.clone()))
+    }
+
+    fn wait_auto_timer(&mut self, duration: Duration, clear_page_on_timer: bool) -> TagAction {
+        if duration.is_zero() {
+            self.clear_page_on_timer = false;
+            if clear_page_on_timer {
+                self.message_layer.clear_text();
+            }
+            return TagAction::Continue;
+        }
+        self.clear_page_on_timer = clear_page_on_timer;
+        self.wait(KagTaskState::WaitingTimer {
+            remaining: duration,
+        })
     }
 
     fn wait_click(&mut self, clear_page_on_click: bool) -> TagAction {
@@ -2553,6 +2632,7 @@ enum NativeFallbackTag {
     StopVoice,
     WaitAudio,
     WaitResource,
+    CancelAutoMode,
     Stop,
 }
 
@@ -2592,8 +2672,9 @@ impl NativeFallbackTag {
             "stopbgm" => Self::StopBgm,
             "stopse" => Self::StopSe,
             "stopvoice" => Self::StopVoice,
-            "wq" | "wf" | "wb" | "wm" => Self::WaitAudio,
+            "wq" | "wf" | "wb" | "wm" | "ws" => Self::WaitAudio,
             "waitload" | "waittrig" => Self::WaitResource,
+            "cancelautomode" => Self::CancelAutoMode,
             "s" => Self::Stop,
             _ => return None,
         })
@@ -2628,6 +2709,40 @@ fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
     tag.attr(name)
         .and_then(|value| value.raw().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn kag_auto_mode(runtime: &Runtime<KrkrHost>) -> bool {
+    let Variant::Object(kag) = runtime.global_member("kag") else {
+        return false;
+    };
+    runtime.object_member(kag, "autoMode").is_truthy()
+}
+
+fn kag_auto_line_wait(runtime: &Runtime<KrkrHost>) -> Duration {
+    kag_auto_wait(runtime, "autoModeLineWait", 300)
+}
+
+fn kag_auto_page_wait(runtime: &Runtime<KrkrHost>) -> Duration {
+    kag_auto_wait(runtime, "autoModePageWait", 1000)
+}
+
+fn kag_auto_wait(runtime: &Runtime<KrkrHost>, name: &str, default_millis: u64) -> Duration {
+    let Variant::Object(kag) = runtime.global_member("kag") else {
+        return Duration::from_millis(default_millis);
+    };
+    let millis = runtime
+        .object_member(kag, name)
+        .to_integer()
+        .unwrap_or(default_millis as i64)
+        .max(0) as u64;
+    Duration::from_millis(millis)
+}
+
+fn cancel_kag_auto_mode(runtime: &mut Runtime<KrkrHost>) {
+    let Variant::Object(kag) = runtime.global_member("kag") else {
+        return;
+    };
+    runtime.set_object_member(kag, "autoMode", Variant::Integer(0));
 }
 
 fn kag_transition_spec(
@@ -5456,6 +5571,87 @@ mod tests {
             vec!["A".to_string(), "B".to_string()]
         );
         assert!(engine.message_layer().waiting_for_click);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_native_fallback_auto_mode_uses_line_and_page_timers() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[l]B[p]C[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine
+            .execute_script(
+                "auto_mode.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.autoMode = true;
+                kag.autoModeLineWait = 7;
+                kag.autoModePageWait = 9;
+                "#,
+            )
+            .expect("auto setup");
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let first = engine.tick().expect("first tick");
+        assert_eq!(
+            first.state,
+            KagTaskState::WaitingTimer {
+                remaining: Duration::from_millis(7)
+            }
+        );
+        assert_eq!(
+            engine.message_layer().lines,
+            vec!["A".to_string(), String::new()]
+        );
+        assert!(!engine.message_layer().waiting_for_click);
+
+        let second = engine.advance(Duration::from_millis(7)).expect("line wait");
+        assert_eq!(
+            second.state,
+            KagTaskState::WaitingTimer {
+                remaining: Duration::from_millis(9)
+            }
+        );
+        assert!(!engine.message_layer().waiting_for_click);
+
+        let third = engine.advance(Duration::from_millis(9)).expect("page wait");
+        assert_eq!(third.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["C".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_native_cancel_auto_mode_tag_restores_click_wait() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[cancelautomode]A[p]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine
+            .execute_script(
+                "auto_mode.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.autoMode = true;
+                kag.autoModePageWait = 1;
+                "#,
+            )
+            .expect("auto setup");
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+        assert_eq!(tick.state, KagTaskState::WaitingClick);
+        assert!(engine.message_layer().waiting_for_click);
+        assert_eq!(
+            engine
+                .execute_expression("auto_mode_check.tjs", "kag.autoMode")
+                .expect("auto mode"),
+            Variant::Integer(0)
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -9858,6 +10054,133 @@ mod tests {
             }
         ));
         assert!(matches!(commands[3], AudioCommand::Stop { .. }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_completion_restarts_script_conductor_wait() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("voice.ogg"), b"voice bytes").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.waitHandlerRan = 0;
+                global.conductorResumed = 0;
+                global.asyncProbe = new AsyncTrigger(function() {
+                    global.conductorResumed++;
+                }, "");
+
+                global.owner = new Dictionary();
+                owner.conductor = new Dictionary();
+                owner.conductor.status = 2;
+                owner.conductor.waitUntil = new Dictionary();
+                owner.conductor.run = function() {
+                    this.status = 1;
+                    global.asyncProbe.trigger();
+                };
+                owner.conductor.trigger = function(name) {
+                    if(this.status != 2) return false;
+                    var func = this.waitUntil[name];
+                    if(func === void) return false;
+                    func();
+                    this.waitUntil = new Dictionary();
+                    this.run();
+                    return true;
+                };
+                owner.onSESoundBufferStop = function(id) {
+                    this.conductor.trigger("sestop" + id);
+                };
+
+                class SESoundBuffer extends WaveSoundBuffer
+                {
+                    var prevstatus = "unload";
+                    var id = 7;
+                    var owner;
+
+                    function SESoundBuffer(owner)
+                    {
+                        super.WaveSoundBuffer();
+                        this.owner = owner;
+                    }
+
+                    function onStatusChanged()
+                    {
+                        var ps = prevstatus;
+                        var cs = status;
+                        prevstatus = cs;
+                        if(ps == "play" && cs == "stop")
+                            owner.onSESoundBufferStop(id);
+                    }
+                }
+
+                owner.conductor.waitUntil.sestop7 = function() {
+                    global.waitHandlerRan++;
+                };
+                global.buffer = new SESoundBuffer(owner);
+                buffer.open("voice.ogg");
+                buffer.play();
+                "#,
+            )
+            .expect("script");
+
+        let commands = engine.host_mut().take_audio_commands();
+        let play_id = match &commands[..] {
+            [AudioCommand::Preload { .. }, AudioCommand::Play { id, .. }] => *id,
+            commands => panic!("expected preload and play, got {commands:?}"),
+        };
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "buffer.prevstatus")
+                .expect("prevstatus"),
+            Variant::String("play".to_string())
+        );
+
+        engine
+            .notify_audio_stopped(play_id)
+            .expect("audio completion");
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "buffer.status + ':' + buffer.prevstatus + ':' + waitHandlerRan",
+                )
+                .expect("wait handler"),
+            Variant::String("stop:stop:1".to_string())
+        );
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "conductorResumed")
+                .expect("resumed"),
+            Variant::Integer(1)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn audio_completion_resumes_native_wait_audio_fallback() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let mut engine = image_test_engine(&root);
+        engine.kag_session.state = KagTaskState::WaitingAudio;
+        engine
+            .notify_audio_stopped(AudioInstanceId(999))
+            .expect("audio");
+
+        assert_eq!(engine.kag_session.state, KagTaskState::Running);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
