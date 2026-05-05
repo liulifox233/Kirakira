@@ -418,7 +418,7 @@ impl KrkrHost {
             .read_text_storage(name, &self.text_encoding)
     }
 
-    pub(crate) fn read_binary_storage(&self, name: &str) -> Result<Vec<u8>> {
+    pub fn read_binary_storage(&self, name: &str) -> Result<Vec<u8>> {
         let data = self.read_resource_storage(name)?;
         data.as_bytes()
             .map(|bytes| bytes.into_owned())
@@ -497,7 +497,7 @@ impl KrkrHost {
             .unwrap_or(0)
     }
 
-    pub(crate) fn log(&mut self, message: &str) {
+    pub fn log(&mut self, message: &str) {
         self.logs.push(message.to_string());
     }
 
@@ -1573,7 +1573,7 @@ impl KrkrHost {
         &self.font_system
     }
 
-    pub(crate) fn font_system_mut(&mut self) -> &mut FontSystem {
+    pub fn font_system_mut(&mut self) -> &mut FontSystem {
         &mut self.font_system
     }
 

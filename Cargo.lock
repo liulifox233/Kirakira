@@ -974,6 +974,7 @@ dependencies = [
  "krkr-core",
  "krkr-engine",
  "krkr-platform",
+ "krkr-plugins",
  "krkr-render",
  "pollster",
  "winit",
@@ -1012,6 +1013,14 @@ version = "0.1.0"
 dependencies = [
  "krkr-core",
  "rfd",
+]
+
+[[package]]
+name = "krkr-plugins"
+version = "0.1.0"
+dependencies = [
+ "krkr-engine",
+ "krkr-tjs2",
 ]
 
 [[package]]

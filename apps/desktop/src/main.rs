@@ -9,6 +9,7 @@ use krkr_engine::{
     EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, SystemMetrics,
 };
 use krkr_platform::show_error;
+use krkr_plugins::register_reference_plugins;
 use krkr_render::{RenderError, Renderer};
 use winit::{
     application::ApplicationHandler,
@@ -318,6 +319,13 @@ impl DesktopApp {
                 return false;
             }
         };
+        if let Err(error) = register_reference_plugins(&mut krkr_engine) {
+            let message = format!("reference plugin registration failed: {error}");
+            self.set_status(StatusLevel::Error, message.clone(), Some(window));
+            show_error("Plugin initialization failed", &message);
+            self.state = DesktopState::FatalError;
+            return false;
+        }
         let has_startup_tjs = krkr_engine.host().storage_exists("startup.tjs");
         let has_startup_ks = krkr_engine.host().storage_exists("startup.ks");
         if has_startup_tjs || !has_startup_ks {
