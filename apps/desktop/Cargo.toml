@@ -8,6 +8,7 @@ license.workspace = true
 krkr-audio.workspace = true
 krkr-core.workspace = true
 krkr-platform.workspace = true
+krkr-plugins.workspace = true
 krkr-render.workspace = true
 krkr-engine.workspace = true
 pollster.workspace = true
