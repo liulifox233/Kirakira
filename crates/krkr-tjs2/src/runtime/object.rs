@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::bytecode::BytecodeContextType;
+use crate::error::Result;
 use crate::runtime::value::{ObjectHandle, Variant};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -9,6 +10,9 @@ pub struct Object {
     pub members: BTreeMap<String, Variant>,
     pub class_infos: Vec<String>,
     pub super_class: Option<ObjectHandle>,
+    pub call_missing: bool,
+    pub processing_missing: bool,
+    pub missing_name: String,
     pub valid: bool,
     pub invalidating: bool,
 }
@@ -20,6 +24,9 @@ impl Default for Object {
             members: BTreeMap::new(),
             class_infos: Vec::new(),
             super_class: None,
+            call_missing: false,
+            processing_missing: false,
+            missing_name: "missing".to_string(),
             valid: true,
             invalidating: false,
         }
@@ -135,15 +142,49 @@ impl Object {
     }
 
     pub fn array_remove_value(&mut self, value: &Variant) -> bool {
+        self.array_remove_values(value, false)
+            .is_some_and(|count| count > 0)
+    }
+
+    pub fn array_remove_values(&mut self, value: &Variant, remove_all: bool) -> Option<usize> {
         let ObjectKind::Array { elements } = &mut self.kind else {
-            return false;
+            return None;
         };
-        let Some(index) = elements.iter().position(|item| item == value) else {
-            return false;
+        let mut count = 0;
+        let mut index = 0;
+        while index < elements.len() {
+            if value.discern_eq(&elements[index]) {
+                elements.remove(index);
+                count += 1;
+                if !remove_all {
+                    break;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        if count > 0 {
+            self.sync_array_members();
+        }
+        Some(count)
+    }
+
+    pub fn array_sort_by<F>(&mut self, mut less: F) -> Result<bool>
+    where
+        F: FnMut(&Variant, &Variant) -> Result<bool>,
+    {
+        let ObjectKind::Array { elements } = &mut self.kind else {
+            return Ok(false);
         };
-        elements.remove(index);
+        for index in 1..elements.len() {
+            let mut current = index;
+            while current > 0 && less(&elements[current], &elements[current - 1])? {
+                elements.swap(current, current - 1);
+                current -= 1;
+            }
+        }
         self.sync_array_members();
-        true
+        Ok(true)
     }
 
     pub fn array_pop(&mut self) -> Option<Variant> {

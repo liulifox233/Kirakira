@@ -539,7 +539,7 @@ fn require_kag_this(this_obj: Option<ObjectHandle>, method: &str) -> Result<Obje
 fn kag_parser_object_handle(runtime: &Runtime<KrkrHost>, value: &Variant) -> Option<ObjectHandle> {
     let handle = match value {
         Variant::Object(handle) => *handle,
-        Variant::Closure(closure) => closure.object,
+        Variant::Closure(closure) => closure.this_obj.unwrap_or(closure.object),
         _ => return None,
     };
     Some(runtime.bound_this(handle).unwrap_or(handle))

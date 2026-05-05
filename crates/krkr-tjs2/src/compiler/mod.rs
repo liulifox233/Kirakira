@@ -118,6 +118,15 @@ mod tests {
     }
 
     #[test]
+    fn global_functions_are_registered_before_source_order() {
+        assert_eq!(
+            execute_source("inline.tjs", "return f(4); function f(x) { return x + 3; }")
+                .expect("execute"),
+            Variant::Integer(7)
+        );
+    }
+
+    #[test]
     fn compiler_uses_krkr2_argument_register_layout() {
         let file =
             compile_source_to_bytecode("registers.tjs", "function f(a, b) { return a + b; }")
@@ -172,6 +181,39 @@ mod tests {
             )
             .expect("execute"),
             Variant::String("1,4".to_string())
+        );
+    }
+
+    #[test]
+    fn array_remove_matches_krkr2_discern_compare_and_count() {
+        assert_eq!(
+            execute_source(
+                "array_remove.tjs",
+                r#"
+                var a = [1, "1", 1, 2];
+                var first = a.remove(1, false);
+                var rest = a.remove(1);
+                return first + ":" + rest + ":" + a.join(",");
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("1:1:1,2".to_string())
+        );
+    }
+
+    #[test]
+    fn array_sort_covers_krkr2_builtin_orders() {
+        assert_eq!(
+            execute_source(
+                "array_sort.tjs",
+                r#"
+                var text = ["b", "a", "c"]; text.sort("a");
+                var nums = [3, 10, 2]; nums.sort("9");
+                return text.join("") + ":" + nums.join(",");
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("abc:10,3,2".to_string())
         );
     }
 
@@ -335,6 +377,38 @@ mod tests {
         )
         .expect("execute");
         assert_eq!(result, Variant::String("child".to_string()));
+    }
+
+    #[test]
+    fn function_values_match_function_instance_class() {
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                r#"
+                function f() { return 1; }
+                var g = function() { return 2; };
+                return (f instanceof "Function") + ":" + (g instanceof "Function");
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("1:1".to_string())
+        );
+    }
+
+    #[test]
+    fn regexp_match_returns_krkr2_result_array_shape() {
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                r#"
+                var matched = RegExp("^Windows [^\\s]+ (\\d+\\.\\d+)", "i").match("Windows NT 10.0");
+                var missed = RegExp("^Windows").match("Darwin");
+                return matched.count + ":" + matched[0] + ":" + matched[1] + ":" + missed.count;
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("2:Windows NT 10.0:10.0:0".to_string())
+        );
     }
 
     #[test]
@@ -562,6 +636,28 @@ mod tests {
         assert_eq!(
             runtime.execute_file(&file).expect("execute"),
             Variant::String("23:23:undefined".to_string())
+        );
+    }
+
+    #[test]
+    fn returned_super_expression_keeps_current_objthis() {
+        assert_eq!(
+            execute_source(
+                "super_objthis.tjs",
+                r#"
+                class Base {
+                    function value() { return answer; }
+                }
+                class Child extends Base {
+                    function Child() { answer = 42; }
+                    function baseProxy() { return super; }
+                }
+                var child = new Child();
+                return child.baseProxy().value();
+                "#,
+            )
+            .expect("execute"),
+            Variant::Integer(42)
         );
     }
 
@@ -914,6 +1010,60 @@ mod tests {
             )
             .expect("execute"),
             Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn set_call_missing_routes_absent_gets_and_sets_through_missing() {
+        let mut runtime = Runtime::new();
+        runtime.register_global_native(
+            "setCallMissing",
+            |runtime: &mut Runtime, _this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
+                let handle = match args.first() {
+                    Some(Variant::Object(handle)) => *handle,
+                    Some(Variant::Closure(closure)) => closure.object,
+                    Some(other) => {
+                        return Err(TjsError::runtime(format!(
+                            "setCallMissing requires object, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    None => return Err(TjsError::runtime("setCallMissing requires object")),
+                };
+                runtime.set_object_call_missing(handle, "missing");
+                Ok(Variant::Void)
+            },
+        );
+        let file = compile_source_to_bytecode(
+            "missing_proxy.tjs",
+            r#"
+                class StaticSetterProxy {
+                    var target;
+                    function StaticSetterProxy(target) {
+                        this.target = target;
+                        setCallMissing(this);
+                    }
+                    function missing(set, name, value) {
+                        if (set) {
+                            target[name] = *value;
+                        } else {
+                            *value = target[name];
+                        }
+                        return true;
+                    }
+                }
+                var target = %["existing" => 2];
+                var proxy = new StaticSetterProxy(target);
+                proxy.answer = 40 + 2;
+                target.answer += 1;
+                return target.answer + ":" + proxy.answer + ":" + proxy.existing;
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("43:43:2".to_string())
         );
     }
 

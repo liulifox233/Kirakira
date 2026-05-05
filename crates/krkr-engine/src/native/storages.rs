@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use krkr_tjs2::{
     Result,
     runtime::{ObjectHandle, Runtime, Variant},
@@ -103,14 +101,11 @@ fn storages_extract_ext(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let ext = arg_string(&args, 0)?
-        .and_then(|value| {
-            Path::new(&value)
-                .extension()
-                .map(|ext| ext.to_string_lossy().into())
-        })
-        .unwrap_or_default();
-    Ok(Variant::String(ext))
+    Ok(Variant::String(
+        arg_string(&args, 0)?
+            .map(|value| extract_storage_ext(&value))
+            .unwrap_or_default(),
+    ))
 }
 
 fn storages_extract_name(
@@ -118,14 +113,11 @@ fn storages_extract_name(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let name = arg_string(&args, 0)?
-        .and_then(|value| {
-            Path::new(&value)
-                .file_name()
-                .map(|name| name.to_string_lossy().into())
-        })
-        .unwrap_or_default();
-    Ok(Variant::String(name))
+    Ok(Variant::String(
+        arg_string(&args, 0)?
+            .map(|value| extract_storage_name(&value))
+            .unwrap_or_default(),
+    ))
 }
 
 fn storages_extract_path(
@@ -133,14 +125,11 @@ fn storages_extract_path(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let path = arg_string(&args, 0)?
-        .and_then(|value| {
-            Path::new(&value)
-                .parent()
-                .map(|path| path.to_string_lossy().into())
-        })
-        .unwrap_or_default();
-    Ok(Variant::String(path))
+    Ok(Variant::String(
+        arg_string(&args, 0)?
+            .map(|value| extract_storage_path(&value))
+            .unwrap_or_default(),
+    ))
 }
 
 fn storages_chop_ext(
@@ -148,19 +137,11 @@ fn storages_chop_ext(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let value = arg_string(&args, 0)?.unwrap_or_default();
-    let path = Path::new(&value);
-    let chopped = path
-        .file_stem()
-        .map(|stem| {
-            path.parent()
-                .map(|parent| parent.join(stem))
-                .unwrap_or_else(|| PathBuf::from(stem))
-                .to_string_lossy()
-                .into_owned()
-        })
-        .unwrap_or(value);
-    Ok(Variant::String(chopped))
+    Ok(Variant::String(
+        arg_string(&args, 0)?
+            .map(|value| chop_storage_ext(&value))
+            .unwrap_or_default(),
+    ))
 }
 
 fn storages_clear_archive_cache(
@@ -170,4 +151,41 @@ fn storages_clear_archive_cache(
 ) -> Result<Variant> {
     runtime.host().clear_archive_cache()?;
     Ok(Variant::Void)
+}
+
+fn storage_delimiter_index(name: &str) -> Option<usize> {
+    name.rfind(['/', '\\', '>'])
+}
+
+fn storage_file_start(name: &str) -> usize {
+    storage_delimiter_index(name)
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn storage_extension_index(name: &str) -> Option<usize> {
+    let start = storage_file_start(name);
+    name[start..].rfind('.').map(|index| start + index)
+}
+
+fn extract_storage_ext(name: &str) -> String {
+    storage_extension_index(name)
+        .map(|index| name[index..].to_string())
+        .unwrap_or_default()
+}
+
+fn extract_storage_name(name: &str) -> String {
+    name[storage_file_start(name)..].to_string()
+}
+
+fn extract_storage_path(name: &str) -> String {
+    storage_delimiter_index(name)
+        .map(|index| name[..=index].to_string())
+        .unwrap_or_default()
+}
+
+fn chop_storage_ext(name: &str) -> String {
+    storage_extension_index(name)
+        .map(|index| name[..index].to_string())
+        .unwrap_or_else(|| name.to_string())
 }

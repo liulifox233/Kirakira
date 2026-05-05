@@ -683,6 +683,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             122 => {
                 let thrown = frame.get(inst.operands[0])?;
                 let Some(entry) = frame.entries.pop() else {
+                    let thrown = self.format_uncaught_exception(&thrown);
                     return Err(TjsError::runtime(format!("uncaught exception {thrown}")));
                 };
                 frame.set(entry.exception_reg, thrown)?;
@@ -842,6 +843,39 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             label.push('>');
         }
         format!("{label}#{}", handle.0)
+    }
+
+    fn format_uncaught_exception(&self, value: &Variant) -> String {
+        let mut text = value.to_string();
+        let handle = match value {
+            Variant::Object(handle) => Some(*handle),
+            Variant::Closure(closure) => Some(closure.object),
+            _ => None,
+        };
+        let Some(handle) = handle else {
+            return text;
+        };
+        let Some(object) = self.runtime.heap.get(handle.0) else {
+            return text;
+        };
+        let details = ["name", "message", "trace"]
+            .into_iter()
+            .filter_map(|name| {
+                let value = object.get_raw(name)?;
+                let value = value.to_tjs_string().ok()?;
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(format!("{name}={value:?}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        if !details.is_empty() {
+            text.push_str(" (");
+            text.push_str(&details.join(", "));
+            text.push(')');
+        }
+        text
     }
 
     fn stack_frame_for(

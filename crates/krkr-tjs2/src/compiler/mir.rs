@@ -1140,6 +1140,7 @@ pub fn lower_hir_program(
         None,
         lowerer.add_span(program.span),
     );
+    top.predeclare_global_functions(&mut lowerer, &program.statements)?;
     top.lower_statements(&mut lowerer, &program.statements)?;
     lowerer.lower_pending_objects()?;
     lowerer.module.objects.push(top.finish());
@@ -1183,6 +1184,7 @@ struct Lowerer {
     source_spans: SourceSpanMapper,
     next_object_id: u32,
     bindings: BTreeMap<syntax::BindingId, BindingInfo>,
+    declared_objects: BTreeMap<syntax::BindingId, ObjectId>,
     object_parents: BTreeMap<ObjectId, Option<ObjectId>>,
     object_contexts: BTreeMap<ObjectId, ContextType>,
     class_primary_extenders: BTreeMap<ObjectId, syntax::Expr>,
@@ -1227,6 +1229,7 @@ impl Lowerer {
             source_spans: SourceSpanMapper::new(source_text),
             next_object_id: 1,
             bindings,
+            declared_objects: BTreeMap::new(),
             object_parents: BTreeMap::new(),
             object_contexts: BTreeMap::new(),
             class_primary_extenders: BTreeMap::new(),
@@ -1324,6 +1327,12 @@ impl Lowerer {
         context: ContextType,
         parent: Option<ObjectId>,
     ) -> Result<ObjectId> {
+        let binding = decl.name.as_ref().and_then(|name| name.binding);
+        if let Some(binding) = binding
+            && let Some(id) = self.declared_objects.get(&binding)
+        {
+            return Ok(*id);
+        }
         let id = self.next_object_id();
         self.object_jobs.push_back(ObjectJob::Function {
             id,
@@ -1331,7 +1340,30 @@ impl Lowerer {
             context,
             parent,
         });
+        if let Some(binding) = binding {
+            self.declared_objects.insert(binding, id);
+        }
         Ok(id)
+    }
+
+    fn lower_class_object(&mut self, decl: &syntax::ClassDecl, parent: ObjectId) -> ObjectId {
+        if let Some(binding) = decl.name.binding
+            && let Some(id) = self.declared_objects.get(&binding)
+        {
+            return *id;
+        }
+        let id = self.next_object_id();
+        let name = self.intern_string(&decl.name.name);
+        self.object_jobs.push_back(ObjectJob::Class {
+            id,
+            name,
+            decl: Box::new(decl.clone()),
+            parent,
+        });
+        if let Some(binding) = decl.name.binding {
+            self.declared_objects.insert(binding, id);
+        }
+        id
     }
 
     fn lower_super_class_getter(
@@ -1703,6 +1735,69 @@ enum DictionaryKeyPlan {
     Computed,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum HoistedGlobalDeclaration<'a> {
+    Function(&'a syntax::FunctionDecl),
+    Class(&'a syntax::ClassDecl),
+}
+
+fn collect_hoisted_global_declarations<'a>(
+    statements: &'a [syntax::Stmt],
+    out: &mut Vec<HoistedGlobalDeclaration<'a>>,
+) {
+    for statement in statements {
+        collect_hoisted_global_declaration(statement, out);
+    }
+}
+
+fn collect_hoisted_global_declaration<'a>(
+    statement: &'a syntax::Stmt,
+    out: &mut Vec<HoistedGlobalDeclaration<'a>>,
+) {
+    match &statement.kind {
+        syntax::StmtKind::FunctionDecl(decl) => out.push(HoistedGlobalDeclaration::Function(decl)),
+        syntax::StmtKind::ClassDecl(decl) => out.push(HoistedGlobalDeclaration::Class(decl)),
+        syntax::StmtKind::Block(statements) => collect_hoisted_global_declarations(statements, out),
+        syntax::StmtKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_hoisted_global_declaration(then_branch, out);
+            if let Some(else_branch) = else_branch {
+                collect_hoisted_global_declaration(else_branch, out);
+            }
+        }
+        syntax::StmtKind::While { body, .. }
+        | syntax::StmtKind::DoWhile { body, .. }
+        | syntax::StmtKind::For { body, .. }
+        | syntax::StmtKind::With { body, .. } => {
+            collect_hoisted_global_declaration(body, out);
+        }
+        syntax::StmtKind::Try { body, catch } => {
+            collect_hoisted_global_declaration(body, out);
+            if let Some(catch) = catch {
+                collect_hoisted_global_declaration(&catch.body, out);
+            }
+        }
+        syntax::StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                collect_hoisted_global_declarations(&case.body, out);
+            }
+        }
+        syntax::StmtKind::Empty
+        | syntax::StmtKind::Expr(_)
+        | syntax::StmtKind::Var { .. }
+        | syntax::StmtKind::PropertyDecl(_)
+        | syntax::StmtKind::Return(_)
+        | syntax::StmtKind::Throw(_)
+        | syntax::StmtKind::Break
+        | syntax::StmtKind::Continue
+        | syntax::StmtKind::Case { .. }
+        | syntax::StmtKind::Debugger => {}
+    }
+}
+
 impl ObjectBuilder {
     fn new(
         id: ObjectId,
@@ -1742,6 +1837,53 @@ impl ObjectBuilder {
             control_stack: Vec::new(),
             active_regions: Vec::new(),
         }
+    }
+
+    fn predeclare_global_functions(
+        &mut self,
+        lowerer: &mut Lowerer,
+        statements: &[syntax::Stmt],
+    ) -> Result<()> {
+        if self.object.context != ContextType::TopLevel {
+            return Ok(());
+        }
+
+        let mut declarations = Vec::new();
+        collect_hoisted_global_declarations(statements, &mut declarations);
+        for declaration in declarations {
+            match declaration {
+                HoistedGlobalDeclaration::Function(decl) => {
+                    let Some(name) = &decl.name else {
+                        continue;
+                    };
+                    let id = lowerer.lower_function_object(
+                        decl,
+                        ContextType::Function,
+                        Some(self.object.id),
+                    )?;
+                    let name_id = lowerer.intern_string(&name.name);
+                    let value = Value::Const(lowerer.add_const(MirConst::CodeObject(id)));
+                    self.emit(MirInst::RegisterDeclaration {
+                        name: name_id,
+                        object: id,
+                        value: Some(value),
+                        change_this: true,
+                    });
+                }
+                HoistedGlobalDeclaration::Class(decl) => {
+                    let id = lowerer.lower_class_object(decl, self.object.id);
+                    let name_id = lowerer.intern_string(&decl.name.name);
+                    let value = Value::Const(lowerer.add_const(MirConst::CodeObject(id)));
+                    self.emit(MirInst::RegisterDeclaration {
+                        name: name_id,
+                        object: id,
+                        value: Some(value),
+                        change_this: false,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn finish(mut self) -> MirObject {
@@ -2344,14 +2486,8 @@ impl ObjectBuilder {
     }
 
     fn lower_class_decl(&mut self, lowerer: &mut Lowerer, decl: &syntax::ClassDecl) -> Result<()> {
-        let class_id = lowerer.next_object_id();
+        let class_id = lowerer.lower_class_object(decl, self.object.id);
         let class_name = lowerer.intern_string(&decl.name.name);
-        lowerer.object_jobs.push_back(ObjectJob::Class {
-            id: class_id,
-            name: class_name,
-            decl: Box::new(decl.clone()),
-            parent: self.object.id,
-        });
 
         let value = Value::Const(lowerer.add_const(MirConst::CodeObject(class_id)));
         let place = self.ident_declaration_place(lowerer, &decl.name, decl.span);
@@ -2575,7 +2711,14 @@ impl ObjectBuilder {
                 "cannot get super outside a class with extends",
             ));
         };
-        self.lower_expr_in_global_context(lowerer, &expr)
+        let super_value = self.lower_expr_in_global_context(lowerer, &expr)?;
+        let dst = self.temp();
+        self.emit(MirInst::ChangeThis {
+            dst,
+            closure: super_value,
+            this_obj: Value::Slot(SlotId::This),
+        });
+        Ok(Value::Slot(dst))
     }
 
     fn run_expr_task<'a>(
@@ -3603,15 +3746,7 @@ impl ObjectBuilder {
         if lowerer.ident_is_class_scoped(ident) {
             return Ok(None);
         }
-        self.binding_slots.get(&binding).copied().map_or_else(
-            || {
-                Err(TjsError::mir(format!(
-                    "captured binding `{}` is not supported by MIR yet",
-                    ident.name
-                )))
-            },
-            |slot| Ok(Some(slot)),
-        )
+        Ok(self.binding_slots.get(&binding).copied())
     }
 
     fn with_member_object(&mut self) -> Value {
@@ -3934,7 +4069,6 @@ fn terminator_successors(term: &Terminator) -> Vec<BlockId> {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::TjsErrorKind;
     use crate::{FrontendOptions, analyze_script};
 
     use super::*;
@@ -3989,11 +4123,34 @@ mod tests {
     }
 
     #[test]
-    fn nested_function_captures_are_rejected_until_modeled() {
-        let err = lower_result("function f() { var x = 1; function g() { return x; } }")
-            .expect_err("capture should be rejected");
-        assert_eq!(err.kind, TjsErrorKind::Mir);
-        assert!(err.message.contains("captured binding `x`"));
+    fn nonlocal_function_locals_lower_to_this_proxy_members() {
+        let module = lower("function f() { var x = 1; function g() { return x; } }");
+        let x_name = module
+            .strings
+            .iter()
+            .position(|name| name == "x")
+            .map(|index| StringId(index as u32))
+            .expect("x string");
+        let g = module
+            .objects
+            .iter()
+            .find(|object| module.strings[object.name.0 as usize] == "g")
+            .expect("nested function");
+        assert!(g.blocks.iter().any(|block| {
+            block.insts.iter().any(|inst| {
+                matches!(
+                    inst,
+                    MirInst::ReadPlace {
+                        place: Place::Member {
+                            object: Value::Slot(SlotId::ThisProxy),
+                            key: MemberKey::Direct(key),
+                            ..
+                        },
+                        ..
+                    } if *key == x_name
+                )
+            })
+        }));
     }
 
     #[test]
