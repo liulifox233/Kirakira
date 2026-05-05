@@ -964,6 +964,7 @@ const LAYER_NATIVE_PROPERTIES: &[&str] = &[
     "parent",
     "children",
     "order",
+    "absolute",
     "absoluteOrderMode",
     "visible",
     "nodeVisible",
