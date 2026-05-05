@@ -226,6 +226,9 @@ impl ProjectStorage {
             .as_ref()
             .ok_or_else(|| TjsError::runtime("project root is not set"))?;
         let path = storage_write_path(root, name)?;
+        // Release cached raw file views before writing so Windows does not reject
+        // overwriting a file that is still held by a read-only mmap in `raw_cache`.
+        self.clear_raw_cache();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
