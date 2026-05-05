@@ -2,13 +2,13 @@ use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
 
 use krkr_audio::{AudioStatusLevel, AudioSystem};
 use krkr_core::{
-    ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Panel, Point,
-    PointerButton, Size, StatusLevel, UiAction,
+    ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Point, PointerButton,
+    Size, StatusLevel,
 };
 use krkr_engine::{
     EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, SystemMetrics,
 };
-use krkr_platform::{pick_folder, show_error};
+use krkr_platform::show_error;
 use krkr_render::{RenderError, Renderer};
 use winit::{
     application::ApplicationHandler,
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let initial_project_root = std::env::args_os().nth(1).map(PathBuf::from);
+    let initial_project_root = initial_project_root();
     let mut app = DesktopApp::new(initial_project_root);
 
     match event_loop.run_app(&mut app) {
@@ -43,10 +43,48 @@ fn main() -> ExitCode {
     }
 }
 
+fn initial_project_root() -> Option<PathBuf> {
+    if let Some(arg) = std::env::args_os().nth(1) {
+        return Some(PathBuf::from(arg));
+    }
+
+    let current_dir = std::env::current_dir().ok();
+    if current_dir
+        .as_ref()
+        .is_some_and(|path| looks_like_project_root(path))
+    {
+        return current_dir;
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .or(current_dir)
+}
+
+fn looks_like_project_root(path: &std::path::Path) -> bool {
+    path.join("startup.tjs").is_file()
+        || path.join("startup.ks").is_file()
+        || directory_has_xp3(path)
+        || directory_has_xp3(&path.join("sys"))
+}
+
+fn directory_has_xp3(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        entry.path().is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("xp3"))
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DesktopState {
-    Launcher,
-    Settings,
     Running,
     FatalError,
 }
@@ -79,7 +117,6 @@ struct DesktopApp {
     initial_project_root: Option<PathBuf>,
     status: Option<DesktopStatus>,
     last_frame: Instant,
-    exit_after_runtime_close: bool,
 }
 
 impl DesktopApp {
@@ -92,12 +129,11 @@ impl DesktopApp {
             krkr_engine: None,
             runtime_viewport_size: None,
             pending_runtime_events: Vec::new(),
-            state: DesktopState::Launcher,
+            state: DesktopState::Running,
             project_root: None,
             initial_project_root,
             status: None,
             last_frame: Instant::now(),
-            exit_after_runtime_close: false,
         }
     }
 
@@ -149,8 +185,16 @@ impl DesktopApp {
         self.renderer = Some(renderer);
         self.update_window_title(&window);
 
-        if let Some(root) = self.initial_project_root.take() {
-            self.launch_project(root, &window);
+        let root = self.initial_project_root.take().unwrap_or_else(|| {
+            let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            log_warn(&format!(
+                "failed to resolve startup project root; falling back to {}",
+                fallback.display()
+            ));
+            fallback
+        });
+        if !self.launch_project(root, &window) {
+            event_loop.exit();
         }
     }
 
@@ -167,22 +211,10 @@ impl DesktopApp {
         self.last_frame = now;
 
         let window_logical_size = renderer.logical_size();
-        let content_size = if self.state == DesktopState::Running {
-            self.runtime_viewport_size.unwrap_or(window_logical_size)
-        } else {
-            window_logical_size
-        };
+        let content_size = self.runtime_viewport_size.unwrap_or(window_logical_size);
         let frame_input = FrameInput::new(content_size, delta_seconds);
-        let mut return_to_launcher_after_render = false;
+        let mut exit_after_render = false;
         let frame = match self.state {
-            DesktopState::Launcher => {
-                self.engine.set_panel(Panel::Launcher);
-                self.engine.tick(frame_input)
-            }
-            DesktopState::Settings => {
-                self.engine.set_panel(Panel::Settings);
-                self.engine.tick(frame_input)
-            }
             DesktopState::Running => {
                 if let Some(krkr_engine) = &mut self.krkr_engine {
                     let events = std::mem::take(&mut self.pending_runtime_events);
@@ -194,7 +226,6 @@ impl DesktopApp {
                             if frame.input.unhandled_escape_pressed
                                 && !krkr_engine.host().termination_requested()
                             {
-                                self.exit_after_runtime_close = false;
                                 if let Err(error) = krkr_engine.request_runtime_close() {
                                     log_warn(&format!(
                                         "failed to request runtime close from Escape fallback: {error}"
@@ -204,11 +235,10 @@ impl DesktopApp {
                                             "failed to persist runtime state before Escape fallback close: {error}"
                                         ));
                                     }
-                                    return_to_launcher_after_render = true;
+                                    exit_after_render = true;
                                 }
                             }
-                            return_to_launcher_after_render |=
-                                krkr_engine.host().termination_requested();
+                            exit_after_render |= krkr_engine.host().termination_requested();
                             let audio_commands = krkr_engine.host_mut().take_audio_commands();
                             if let Err(error) = self.audio.submit_commands(audio_commands) {
                                 let message = format!("audio command failed: {error}");
@@ -236,12 +266,11 @@ impl DesktopApp {
             }
             DesktopState::FatalError => {
                 self.engine.set_status_level(Some(StatusLevel::Error));
-                self.engine.tick(frame_input)
+                self.engine.tick_running(frame_input)
             }
         };
 
-        let render_content_size = (self.state == DesktopState::Running).then_some(content_size);
-        renderer.set_content_size(render_content_size);
+        renderer.set_content_size(Some(content_size));
         if let Err(error) = renderer.render(&frame) {
             match error {
                 RenderError::OutOfMemory => {
@@ -253,14 +282,9 @@ impl DesktopApp {
             }
         }
 
-        if return_to_launcher_after_render {
-            if self.exit_after_runtime_close {
-                self.persist_running_project();
-                self.exit_after_runtime_close = false;
-                event_loop.exit();
-            } else if let Some(window) = self.window.as_ref().cloned() {
-                self.return_to_launcher(&window);
-            }
+        if exit_after_render {
+            self.persist_running_project();
+            event_loop.exit();
         }
     }
 
@@ -271,63 +295,13 @@ impl DesktopApp {
         }
     }
 
-    fn handle_core_event(&mut self, event: EngineEvent, window: &Window) {
-        self.engine.handle_event(event);
-        if let Some(action) = self.engine.take_last_action() {
-            self.apply_action(action, window);
-        }
-    }
-
-    fn apply_action(&mut self, action: UiAction, window: &Window) {
-        match action {
-            UiAction::LaunchRequested => self.launch_selected_project(window),
-            UiAction::OpenProjectRequested => self.pick_and_launch_project(window),
-            UiAction::SettingsOpened => {
-                self.state = DesktopState::Settings;
-                self.engine.set_panel(Panel::Settings);
-                self.update_window_title(window);
-                log_info("entered settings");
-            }
-            UiAction::SettingsClosed => {
-                self.state = DesktopState::Launcher;
-                self.engine.set_panel(Panel::Launcher);
-                self.update_window_title(window);
-                log_info("returned to launcher");
-            }
-        }
-    }
-
-    fn launch_selected_project(&mut self, window: &Window) {
-        let Some(root) = self.project_root.clone() else {
-            let message = "project resource root missing; use Open Project first";
-            self.set_status(StatusLevel::Error, message, Some(window));
-            show_error("Project resource root missing", message);
-            return;
-        };
-
-        self.launch_project(root, window);
-    }
-
-    fn pick_and_launch_project(&mut self, window: &Window) {
-        match pick_folder() {
-            Some(root) => self.launch_project(root, window),
-            None => {
-                let message = "project selection canceled";
-                self.set_status(StatusLevel::Warning, message, Some(window));
-                log_warn(message);
-            }
-        }
-    }
-
-    fn launch_project(&mut self, root: PathBuf, window: &Window) {
+    fn launch_project(&mut self, root: PathBuf, window: &Window) -> bool {
         if !root.is_dir() {
-            let message = format!(
-                "selected project path is not a directory: {}",
-                root.display()
-            );
+            let message = format!("project path is not a directory: {}", root.display());
             self.set_status(StatusLevel::Error, message.clone(), Some(window));
             show_error("Invalid project directory", &message);
-            return;
+            self.state = DesktopState::FatalError;
+            return false;
         }
 
         let mut krkr_engine = match KrkrEngine::new(KrkrEngineConfig {
@@ -340,7 +314,8 @@ impl DesktopApp {
                 let message = format!("engine initialization failed: {error}");
                 self.set_status(StatusLevel::Error, message.clone(), Some(window));
                 show_error("Engine initialization failed", &message);
-                return;
+                self.state = DesktopState::FatalError;
+                return false;
             }
         };
         let has_startup_tjs = krkr_engine.host().storage_exists("startup.tjs");
@@ -356,7 +331,8 @@ impl DesktopApp {
                     let message = format!("startup.tjs failed: {error}");
                     self.set_status(StatusLevel::Error, message.clone(), Some(window));
                     show_error("Project startup failed", &message);
-                    return;
+                    self.state = DesktopState::FatalError;
+                    return false;
                 }
             }
         }
@@ -366,7 +342,8 @@ impl DesktopApp {
                 let message = format!("startup.ks failed: {error}");
                 self.set_status(StatusLevel::Error, message.clone(), Some(window));
                 show_error("Project KAG startup failed", &message);
-                return;
+                self.state = DesktopState::FatalError;
+                return false;
             }
             log_info(&format!("loaded startup.ks for {}", root.display()));
         }
@@ -392,29 +369,7 @@ impl DesktopApp {
         self.state = DesktopState::Running;
         self.clear_status(Some(window));
         log_info(&format!("entered engine: {}", root.display()));
-    }
-
-    fn return_to_launcher(&mut self, window: &Window) {
-        self.persist_running_project();
-        self.exit_after_runtime_close = false;
-        self.state = DesktopState::Launcher;
-        self.krkr_engine = None;
-        if let Err(error) = self.audio.clear_resource_provider() {
-            log_warn(&format!("failed to clear audio resource provider: {error}"));
-        }
-        self.runtime_viewport_size = None;
-        self.pending_runtime_events.clear();
-        if let Some(renderer) = &mut self.renderer {
-            renderer.set_content_size(None);
-        }
-        apply_window_fullscreen(window, false);
-        self.engine.set_panel(Panel::Launcher);
-        self.set_status(
-            StatusLevel::Info,
-            "returned to launcher from engine shell",
-            Some(window),
-        );
-        log_info("returned to launcher from engine shell");
+        true
     }
 
     fn persist_running_project(&mut self) {
@@ -428,11 +383,10 @@ impl DesktopApp {
         }
     }
 
-    fn request_running_project_close(&mut self, exit_after_close: bool) -> bool {
+    fn request_running_project_close(&mut self) -> bool {
         let Some(krkr_engine) = &mut self.krkr_engine else {
             return false;
         };
-        self.exit_after_runtime_close = exit_after_close;
         if let Err(error) = krkr_engine.request_runtime_close() {
             log_warn(&format!("failed to request runtime close: {error}"));
             self.persist_running_project();
@@ -516,8 +470,6 @@ impl DesktopApp {
 
     fn window_title(&self) -> String {
         let state = match self.state {
-            DesktopState::Launcher => "Launcher".to_string(),
-            DesktopState::Settings => "Settings".to_string(),
             DesktopState::Running => match &self.project_root {
                 Some(root) => format!("Running - {}", root.display()),
                 None => "Running".to_string(),
@@ -571,7 +523,7 @@ impl ApplicationHandler for DesktopApp {
         match event {
             WindowEvent::CloseRequested => {
                 if self.state == DesktopState::Running {
-                    if self.request_running_project_close(true) {
+                    if self.request_running_project_close() {
                         window.request_redraw();
                     } else {
                         event_loop.exit();
@@ -585,16 +537,7 @@ impl ApplicationHandler for DesktopApp {
                 self.resize_renderer(window.inner_size());
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if matches!(self.state, DesktopState::Launcher | DesktopState::Settings) {
-                    let position = position.to_logical::<f64>(window.scale_factor());
-                    self.handle_core_event(
-                        EngineEvent::CursorMoved {
-                            position: Point::new(position.x as f32, position.y as f32),
-                        },
-                        &window,
-                    );
-                    window.request_redraw();
-                } else if self.state == DesktopState::Running {
+                if self.state == DesktopState::Running {
                     let position = position.to_logical::<f64>(window.scale_factor());
                     let position = self
                         .runtime_pointer_position(Point::new(position.x as f32, position.y as f32));
@@ -604,16 +547,7 @@ impl ApplicationHandler for DesktopApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if matches!(self.state, DesktopState::Launcher | DesktopState::Settings) {
-                    self.handle_core_event(
-                        EngineEvent::PointerInput {
-                            button: map_mouse_button(button),
-                            state: map_button_state(state),
-                        },
-                        &window,
-                    );
-                    window.request_redraw();
-                } else if self.state == DesktopState::Running {
+                if self.state == DesktopState::Running {
                     self.pending_runtime_events.push(EngineEvent::PointerInput {
                         button: map_mouse_button(button),
                         state: map_button_state(state),
@@ -633,19 +567,7 @@ impl ApplicationHandler for DesktopApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if matches!(self.state, DesktopState::Launcher | DesktopState::Settings)
-                    && let Some(key) = map_key(&event.logical_key)
-                {
-                    self.handle_core_event(
-                        EngineEvent::KeyboardInput {
-                            key,
-                            state: map_button_state(event.state),
-                            repeat: event.repeat,
-                        },
-                        &window,
-                    );
-                    window.request_redraw();
-                } else if self.state == DesktopState::Running
+                if self.state == DesktopState::Running
                     && let Some(key) = map_key(&event.logical_key)
                 {
                     self.pending_runtime_events
@@ -824,6 +746,10 @@ fn log_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn maps_fullscreen_window_points_to_runtime_content_space() {
@@ -859,5 +785,39 @@ mod tests {
             map_window_point_to_content(point, Size::new(1920.0, 1080.0), Size::new(800.0, 0.0)),
             point
         );
+    }
+
+    #[test]
+    fn detects_project_root_with_startup_script() {
+        let root = make_temp_dir("startup-script");
+        fs::write(root.join("startup.tjs"), b"").expect("write startup");
+
+        assert!(looks_like_project_root(&root));
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    #[test]
+    fn detects_project_root_with_xp3_archive() {
+        let root = make_temp_dir("xp3-root");
+        fs::create_dir(root.join("sys")).expect("create sys");
+        fs::write(root.join("sys/data.xp3"), b"").expect("write xp3");
+
+        assert!(looks_like_project_root(&root));
+
+        fs::remove_dir_all(root).expect("remove temp project");
+    }
+
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "kirakira-desktop-{name}-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create temp dir");
+        path
     }
 }
