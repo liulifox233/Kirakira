@@ -11,7 +11,7 @@ use std::{
 use kira::{
     AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Tween,
     sound::{
-        FromFileError,
+        FromFileError, PlaybackState,
         static_sound::{StaticSoundData, StaticSoundHandle},
         streaming::{StreamingSoundData, StreamingSoundHandle},
     },
@@ -45,6 +45,12 @@ pub struct AudioStatusEvent {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioEvent {
+    Status(AudioStatusEvent),
+    PlaybackStopped { id: AudioInstanceId },
+}
+
 #[derive(Debug)]
 pub enum AudioError {
     BackendUnavailable(String),
@@ -75,7 +81,7 @@ impl Error for AudioError {}
 pub struct AudioSystem {
     state: AudioState,
     control_tx: Option<mpsc::Sender<ControlMessage>>,
-    event_rx: Option<mpsc::Receiver<AudioStatusEvent>>,
+    event_rx: Option<mpsc::Receiver<AudioEvent>>,
 }
 
 struct KiraBackend {
@@ -270,7 +276,7 @@ impl AudioSystem {
         Ok(())
     }
 
-    pub fn drain_events(&mut self) -> Vec<AudioStatusEvent> {
+    pub fn drain_events(&mut self) -> Vec<AudioEvent> {
         let Some(rx) = &self.event_rx else {
             return Vec::new();
         };
@@ -300,7 +306,7 @@ impl AudioSystem {
 fn audio_control_worker(
     rx: mpsc::Receiver<ControlMessage>,
     control_tx: mpsc::Sender<ControlMessage>,
-    event_tx: mpsc::Sender<AudioStatusEvent>,
+    event_tx: mpsc::Sender<AudioEvent>,
 ) {
     let mut backend = match KiraBackend::new() {
         Ok(backend) => backend,
@@ -338,9 +344,9 @@ fn audio_control_worker(
     let mut next_generation = 1u64;
     let mut slots = BTreeMap::new();
 
-    while let Ok(message) = rx.recv() {
-        match message {
-            ControlMessage::Command(command) => handle_audio_command(
+    loop {
+        match rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(ControlMessage::Command(command)) => handle_audio_command(
                 command,
                 ControlContext {
                     backend: &mut backend,
@@ -353,25 +359,27 @@ fn audio_control_worker(
                     event_tx: &event_tx,
                 },
             ),
-            ControlMessage::SetResourceProvider(next_provider) => {
+            Ok(ControlMessage::SetResourceProvider(next_provider)) => {
                 backend.stop_all(Tween::default());
                 slots.clear();
                 provider = next_provider;
                 provider_epoch = provider_epoch.saturating_add(1);
             }
-            ControlMessage::Prepared(prepared) => {
-                if prepared.provider_epoch != provider_epoch {
-                    continue;
+            Ok(ControlMessage::Prepared(prepared)) => {
+                if prepared.provider_epoch == provider_epoch {
+                    handle_prepared_audio(*prepared, &mut backend, &mut slots, &event_tx);
                 }
-                handle_prepared_audio(*prepared, &mut backend, &mut slots, &event_tx);
             }
-            ControlMessage::Shutdown => {
+            Ok(ControlMessage::Shutdown) => {
                 backend.stop_all(Tween::default());
                 let _ = static_tx.send(LoaderMessage::Shutdown);
                 let _ = streaming_tx.send(LoaderMessage::Shutdown);
                 break;
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        report_stopped_sounds(&mut backend, &mut slots, &event_tx);
     }
 }
 
@@ -383,7 +391,7 @@ struct ControlContext<'a> {
     slots: &'a mut BTreeMap<AudioInstanceId, SoundSlot>,
     static_tx: &'a mpsc::Sender<LoaderMessage>,
     streaming_tx: &'a mpsc::Sender<LoaderMessage>,
-    event_tx: &'a mpsc::Sender<AudioStatusEvent>,
+    event_tx: &'a mpsc::Sender<AudioEvent>,
 }
 
 fn handle_audio_command(command: AudioCommand, mut context: ControlContext<'_>) {
@@ -552,7 +560,7 @@ fn handle_prepared_audio(
     prepared: PreparedAudio,
     backend: &mut KiraBackend,
     slots: &mut BTreeMap<AudioInstanceId, SoundSlot>,
-    event_tx: &mpsc::Sender<AudioStatusEvent>,
+    event_tx: &mpsc::Sender<AudioEvent>,
 ) {
     match prepared.kind {
         PreparedAudioKind::Play {
@@ -606,6 +614,17 @@ fn handle_prepared_audio(
                 );
             }
         }
+    }
+}
+
+fn report_stopped_sounds(
+    backend: &mut KiraBackend,
+    slots: &mut BTreeMap<AudioInstanceId, SoundSlot>,
+    event_tx: &mpsc::Sender<AudioEvent>,
+) {
+    for id in backend.take_stopped_non_looping_ids(slots) {
+        slots.remove(&id);
+        let _ = event_tx.send(AudioEvent::PlaybackStopped { id });
     }
 }
 
@@ -936,6 +955,24 @@ impl KiraBackend {
         }
     }
 
+    fn take_stopped_non_looping_ids(
+        &mut self,
+        slots: &BTreeMap<AudioInstanceId, SoundSlot>,
+    ) -> Vec<AudioInstanceId> {
+        let stopped = self
+            .handles
+            .iter()
+            .filter_map(|(id, handle)| {
+                let slot = slots.get(id)?;
+                (!slot.looping && handle.state() == PlaybackState::Stopped).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in &stopped {
+            self.handles.remove(id);
+        }
+        stopped
+    }
+
     fn set_volume(&mut self, id: AudioInstanceId, volume: f32, tween: Tween) {
         if let Some(handle) = self.handles.get_mut(&id) {
             handle.set_volume(linear_volume_to_decibels(volume), tween);
@@ -997,6 +1034,13 @@ impl PlayingSound {
         match self {
             Self::Static { handle, .. } => handle.stop(tween),
             Self::Streaming { handle, .. } => handle.stop(tween),
+        }
+    }
+
+    fn state(&self) -> PlaybackState {
+        match self {
+            Self::Static { handle, .. } => handle.state(),
+            Self::Streaming { handle, .. } => handle.state(),
         }
     }
 
@@ -1117,12 +1161,8 @@ fn static_sound_data_bytes(data: &StaticSoundData) -> usize {
     std::mem::size_of_val(data.frames.as_ref())
 }
 
-fn report_event(
-    event_tx: &mpsc::Sender<AudioStatusEvent>,
-    level: AudioStatusLevel,
-    message: String,
-) {
-    let _ = event_tx.send(AudioStatusEvent { level, message });
+fn report_event(event_tx: &mpsc::Sender<AudioEvent>, level: AudioStatusLevel, message: String) {
+    let _ = event_tx.send(AudioEvent::Status(AudioStatusEvent { level, message }));
 }
 
 fn tween(seconds: f32) -> Tween {

@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
 
-use krkr_audio::{AudioStatusLevel, AudioSystem};
+use krkr_audio::{AudioEvent, AudioStatusLevel, AudioSystem};
 use krkr_core::{
     ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Point, PointerButton,
     Size, StatusLevel,
@@ -422,18 +422,32 @@ impl DesktopApp {
 
     fn report_audio_events(&mut self) {
         for event in self.audio.drain_events() {
-            let level = match event.level {
-                AudioStatusLevel::Warning => StatusLevel::Warning,
-                AudioStatusLevel::Error => StatusLevel::Error,
-            };
-            let message = format!("audio: {}", event.message);
-            match level {
-                StatusLevel::Info => log_info(&message),
-                StatusLevel::Warning => log_warn(&message),
-                StatusLevel::Error => log_error(&message),
+            match event {
+                AudioEvent::Status(event) => {
+                    let level = match event.level {
+                        AudioStatusLevel::Warning => StatusLevel::Warning,
+                        AudioStatusLevel::Error => StatusLevel::Error,
+                    };
+                    let message = format!("audio: {}", event.message);
+                    match level {
+                        StatusLevel::Info => log_info(&message),
+                        StatusLevel::Warning => log_warn(&message),
+                        StatusLevel::Error => log_error(&message),
+                    }
+                    self.engine.set_status_level(Some(level));
+                    self.status = Some(DesktopStatus::new(level, message));
+                }
+                AudioEvent::PlaybackStopped { id } => {
+                    if let Some(engine) = &mut self.krkr_engine
+                        && let Err(error) = engine.notify_audio_stopped(id)
+                    {
+                        let message = format!("audio completion callback failed: {error}");
+                        log_warn(&message);
+                        self.engine.set_status_level(Some(StatusLevel::Warning));
+                        self.status = Some(DesktopStatus::new(StatusLevel::Warning, message));
+                    }
+                }
             }
-            self.engine.set_status_level(Some(level));
-            self.status = Some(DesktopStatus::new(level, message));
         }
     }
 
