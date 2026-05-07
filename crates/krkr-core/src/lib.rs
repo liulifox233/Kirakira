@@ -785,13 +785,31 @@ impl LayerTree {
     }
 
     pub fn draw_model(&self) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
-        self.draw_model_suppressing_images(&BTreeSet::new())
+        self.draw_model_filtered(|_| true)
     }
 
     pub fn draw_model_suppressing_images(
         &self,
         suppressed_images: &BTreeSet<LayerId>,
     ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        self.draw_model_filtered_suppressing_images(|_| true, suppressed_images)
+    }
+
+    pub fn draw_model_filtered<F>(&self, filter: F) -> (Vec<DrawCommand>, Vec<ImageUpload>)
+    where
+        F: FnMut(&LayerNode) -> bool,
+    {
+        self.draw_model_filtered_suppressing_images(filter, &BTreeSet::new())
+    }
+
+    pub fn draw_model_filtered_suppressing_images<F>(
+        &self,
+        mut filter: F,
+        suppressed_images: &BTreeSet<LayerId>,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>)
+    where
+        F: FnMut(&LayerNode) -> bool,
+    {
         let mut model = LayerDrawModel {
             suppressed_images,
             commands: Vec::new(),
@@ -799,22 +817,35 @@ impl LayerTree {
         };
         let clip = Rect::new(0.0, 0.0, f32::MAX / 4.0, f32::MAX / 4.0);
         for root in self.sorted_children(None) {
-            self.draw_layer(root.id, Point::new(0.0, 0.0), clip, 1.0, &mut model);
+            self.draw_layer(
+                root.id,
+                Point::new(0.0, 0.0),
+                clip,
+                1.0,
+                &mut filter,
+                &mut model,
+            );
         }
         (model.commands, model.uploads)
     }
 
-    fn draw_layer(
+    fn draw_layer<F>(
         &self,
         id: LayerId,
         parent_origin: Point,
         parent_clip: Rect,
         parent_opacity: f32,
+        filter: &mut F,
         model: &mut LayerDrawModel<'_>,
-    ) {
+    ) where
+        F: FnMut(&LayerNode) -> bool,
+    {
         let Some(layer) = self.layers.get(&id) else {
             return;
         };
+        if !filter(layer) {
+            return;
+        }
         if !layer.renderable || !layer.visible || layer.opacity == 0 {
             return;
         }
@@ -835,7 +866,7 @@ impl LayerTree {
         }
 
         for child in self.sorted_children(Some(id)) {
-            self.draw_layer(child.id, origin, clip, opacity, model);
+            self.draw_layer(child.id, origin, clip, opacity, filter, model);
         }
     }
 
@@ -2158,6 +2189,43 @@ mod tests {
         assert!(matches!(
             &commands[..],
             [DrawCommand::Image(image)] if image.texture_id == 2
+        ));
+    }
+
+    #[test]
+    fn layer_tree_draw_model_filtered_excludes_subtree() {
+        let pixels = std::sync::Arc::<[u8]>::from(vec![255, 255, 255, 255]);
+        let root_image = LayerImage::new(1, 1, 1, pixels.clone());
+        let parent_image = LayerImage::new(2, 1, 1, pixels.clone());
+        let child_image = LayerImage::new(3, 1, 1, pixels);
+        let mut layers = LayerTree::new();
+        let root = layers.create_layer("root", None, 0);
+        let parent = layers.create_layer("kag:message0", None, 10);
+        let child = layers.create_layer("child", Some(parent), 0);
+        for (id, image, left) in [
+            (root, root_image, 1.0),
+            (parent, parent_image, 2.0),
+            (child, child_image, 3.0),
+        ] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.left = left;
+            layer.width = 1.0;
+            layer.height = 1.0;
+            layer.visible = true;
+            layer.opacity = 128;
+            layer.set_image(image);
+        }
+
+        let (commands, uploads) =
+            layers.draw_model_filtered(|layer| !layer.name.starts_with("kag:message"));
+
+        assert_eq!(uploads.len(), 1);
+        assert!(matches!(
+            &commands[..],
+            [DrawCommand::Image(image)]
+                if image.texture_id == 1
+                    && image.rect == Rect::new(1.0, 0.0, 1.0, 1.0)
+                    && (image.opacity - 128.0 / 255.0).abs() < 0.001
         ));
     }
 

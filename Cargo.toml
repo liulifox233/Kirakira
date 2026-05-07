@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/desktop",
+    "apps/terminal",
     "crates/krkr-audio",
     "crates/krkr-core",
     "crates/krkr-plugins",
@@ -21,10 +22,13 @@ license-file = "LICENSE"
 
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
+base64 = "0.22.1"
 cpal = "=0.17.3"
+crossterm = "0.29.0"
 encoding_rs = "0.8.35"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 image = { version = "0.25.8", default-features = false, features = ["bmp", "jpeg", "png"] }
+icy_sixel = "0.5.0"
 fontdb = "0.23.0"
 kira = { version = "=0.12.0", default-features = false, features = ["cpal", "mp3", "ogg", "vorbis", "wav", "flac", "aac", "isomp4"] }
 memmap2 = "0.9.9"
@@ -32,6 +36,7 @@ pollster = "0.4.0"
 rfd = "=0.17.2"
 swash = "0.2.7"
 symphonia = { version = "=0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+terminal_size = "0.4.4"
 wgpu = "=29.0.1"
 winit = "=0.30.13"
 

@@ -1921,12 +1921,19 @@ fn layer_load_images(
             .mutate_kag_layer(&page, &layer_name, |layer| {
                 apply_loaded_image_to_layer(layer, image, size, load_options);
             });
+        runtime.host_mut().record_layer_image_storage(
+            &LayerRenderTarget::Kag(KagLayerSlot::new(&page, &layer_name)),
+            &storage,
+        );
     } else {
         match render_layer_target(runtime, this)? {
             Some(target) => {
                 mutate_render_layer(runtime, &target, |layer| {
                     apply_loaded_image_to_layer(layer, image, size, load_options);
                 });
+                runtime
+                    .host_mut()
+                    .record_layer_image_storage(&target, &storage);
             }
             None => {
                 let load_options = LayerLoadImageOptions {
@@ -1938,6 +1945,10 @@ fn layer_load_images(
                     .mutate_kag_layer("back", "base", |layer| {
                         apply_loaded_image_to_layer(layer, image, size, load_options);
                     });
+                runtime.host_mut().record_layer_image_storage(
+                    &LayerRenderTarget::Kag(KagLayerSlot::new("back", "base")),
+                    &storage,
+                );
             }
         }
     }
@@ -2064,6 +2075,10 @@ fn apply_image_to_target(
                 }
                 apply_layer_load_geometry(layer, request, image_size);
             });
+            runtime.host_mut().record_layer_image_storage(
+                &LayerRenderTarget::Kag(KagLayerSlot::new(page, layer)),
+                &request.storage,
+            );
         }
     }
     Ok(())
@@ -2468,6 +2483,7 @@ fn layer_free_image(
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
         layer.clear_image();
     }
+    runtime.host_mut().clear_layer_image_storage(layer_id);
     sync_layer_image_members(runtime, this, 0, 0);
     Ok(Variant::Void)
 }
@@ -3415,6 +3431,9 @@ fn layer_draw_text(
             );
         },
     )?;
+    runtime
+        .host_mut()
+        .record_native_text_draw(&target, text, x, y);
     mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
@@ -3484,6 +3503,9 @@ fn layer_draw_glyph(
             );
         },
     )?;
+    runtime
+        .host_mut()
+        .record_native_text_draw(&target, text, x, y);
     mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }

@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod hooks;
 pub mod host;
 pub mod plugin;
 pub mod storage;
@@ -14,7 +15,8 @@ pub use engine::{
     EngineConfig, EngineFrame, EngineInput, EngineTickResult, KagLocation, KagRunBudget,
     KagTaskState, KagYieldReason, KrkrEngine, SystemMetrics,
 };
-pub use host::KrkrHost;
+pub use hooks::{EngineHook, EngineHookContext, KagTagDecision};
+pub use host::{KrkrHost, NativeTextDrawEvent, TransitionPolicy};
 pub use plugin::KrkrPlugin;
 pub use resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId};
 pub use storage::ProjectStorage;
