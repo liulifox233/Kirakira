@@ -29,6 +29,21 @@ use crate::{
 const IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TransitionPolicy {
+    #[default]
+    Animated,
+    Immediate,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeTextDrawEvent {
+    pub layer_id: Option<LayerId>,
+    pub text: String,
+    pub x: i64,
+    pub y: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KagLayerSlot {
     pub page: String,
@@ -170,9 +185,12 @@ pub struct KrkrHost {
     native_layers: BTreeMap<ObjectHandle, LayerInstance>,
     native_windows: BTreeMap<ObjectHandle, WindowInstance>,
     kag_layer_slots: BTreeMap<ObjectHandle, KagLayerSlot>,
+    native_text_draw_events: Vec<NativeTextDrawEvent>,
+    layer_image_storages: BTreeMap<LayerId, String>,
     scheduler: TvpScheduler,
     kag_layers: BTreeMap<String, LayerId>,
     pending_kag_layers: BTreeMap<String, LayerNode>,
+    transition_policy: TransitionPolicy,
     active_transition: Option<ActiveTransition>,
     completed_native_transitions: Vec<NativeTransitionCompletion>,
     current_kag_page: String,
@@ -211,9 +229,12 @@ impl Default for KrkrHost {
             native_layers: BTreeMap::new(),
             native_windows: BTreeMap::new(),
             kag_layer_slots: BTreeMap::new(),
+            native_text_draw_events: Vec::new(),
+            layer_image_storages: BTreeMap::new(),
             scheduler: TvpScheduler::default(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
+            transition_policy: TransitionPolicy::Animated,
             active_transition: None,
             completed_native_transitions: Vec::new(),
             current_kag_page: "fore".to_string(),
@@ -262,9 +283,12 @@ impl KrkrHost {
             native_layers: BTreeMap::new(),
             native_windows: BTreeMap::new(),
             kag_layer_slots: BTreeMap::new(),
+            native_text_draw_events: Vec::new(),
+            layer_image_storages: BTreeMap::new(),
             scheduler: TvpScheduler::default(),
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
+            transition_policy: TransitionPolicy::Animated,
             active_transition: None,
             completed_native_transitions: Vec::new(),
             current_kag_page: "fore".to_string(),
@@ -349,6 +373,14 @@ impl KrkrHost {
 
     pub fn set_text_encoding(&mut self, encoding: impl Into<String>) {
         self.text_encoding = encoding.into();
+    }
+
+    pub fn transition_policy(&self) -> TransitionPolicy {
+        self.transition_policy
+    }
+
+    pub fn set_transition_policy(&mut self, policy: TransitionPolicy) {
+        self.transition_policy = policy;
     }
 
     pub(crate) fn set_key_state(&mut self, key: i64, pressed: bool) {
@@ -503,6 +535,90 @@ impl KrkrHost {
 
     pub fn layer_tree(&self) -> &LayerTree {
         &self.layer_tree
+    }
+
+    pub fn kag_layer_slot_for_render_layer(&self, layer_id: LayerId) -> Option<(String, String)> {
+        let mut current = Some(layer_id);
+        while let Some(id) = current {
+            if let Some((_, slot)) = self
+                .native_layers
+                .iter()
+                .find(|(_, instance)| instance.layer_id == id)
+                .and_then(|(handle, _)| self.kag_layer_slots.get(handle).map(|slot| (handle, slot)))
+            {
+                return Some((slot.page.clone(), slot.layer.clone()));
+            }
+            if let Some((layer, _)) = self
+                .kag_layers
+                .iter()
+                .find(|(_, candidate_id)| **candidate_id == id)
+            {
+                return Some(("fore".to_string(), layer.clone()));
+            }
+            current = self.layer_tree.layer(id).and_then(|layer| layer.parent);
+        }
+        None
+    }
+
+    pub fn layer_image_storage(&self, layer_id: LayerId) -> Option<&str> {
+        self.layer_image_storages.get(&layer_id).map(String::as_str)
+    }
+
+    pub fn take_native_text_draw_events(&mut self) -> Vec<NativeTextDrawEvent> {
+        std::mem::take(&mut self.native_text_draw_events)
+    }
+
+    pub(crate) fn record_native_text_draw(
+        &mut self,
+        target: &LayerRenderTarget,
+        text: String,
+        x: i64,
+        y: i64,
+    ) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let layer_id = match target {
+            LayerRenderTarget::Native(layer_id) => Some(*layer_id),
+            LayerRenderTarget::Kag(slot) => self.kag_layers.get(&slot.layer).copied(),
+        };
+        self.native_text_draw_events.push(NativeTextDrawEvent {
+            layer_id,
+            text,
+            x,
+            y,
+        });
+    }
+
+    pub(crate) fn record_layer_image_storage(&mut self, target: &LayerRenderTarget, storage: &str) {
+        let Some(layer_id) = self.render_layer_id_for_target(target) else {
+            return;
+        };
+        self.layer_image_storages
+            .insert(layer_id, storage.to_string());
+    }
+
+    pub(crate) fn clear_layer_image_storage_for_target(&mut self, target: &LayerRenderTarget) {
+        let Some(layer_id) = self.render_layer_id_for_target(target) else {
+            return;
+        };
+        self.layer_image_storages.remove(&layer_id);
+    }
+
+    pub(crate) fn clear_layer_image_storage(&mut self, layer_id: LayerId) {
+        self.layer_image_storages.remove(&layer_id);
+    }
+
+    pub(crate) fn clear_kag_layer_image_storage(&mut self, page: &str, layer: &str) {
+        let target = LayerRenderTarget::Kag(KagLayerSlot::new(page, layer));
+        self.clear_layer_image_storage_for_target(&target);
+    }
+
+    fn render_layer_id_for_target(&mut self, target: &LayerRenderTarget) -> Option<LayerId> {
+        match target {
+            LayerRenderTarget::Native(layer_id) => Some(*layer_id),
+            LayerRenderTarget::Kag(slot) => Some(self.ensure_kag_layer(&slot.page, &slot.layer)),
+        }
     }
 
     pub(crate) fn layer_tree_mut(&mut self) -> &mut LayerTree {
@@ -1614,7 +1730,7 @@ impl KrkrHost {
             return;
         }
 
-        if duration.is_zero() {
+        if duration.is_zero() || self.transition_policy == TransitionPolicy::Immediate {
             self.apply_immediate_transition();
             return;
         }
@@ -1646,7 +1762,7 @@ impl KrkrHost {
         completion: NativeTransitionCompletion,
     ) {
         self.complete_active_transition();
-        if duration.is_zero() {
+        if duration.is_zero() || self.transition_policy == TransitionPolicy::Immediate {
             self.completed_native_transitions.push(completion);
             self.active_transition = None;
             return;
