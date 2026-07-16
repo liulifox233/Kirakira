@@ -7,7 +7,7 @@ use std::{
 
 use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, DrawCommand,
-    FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, ResourceData,
+    FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, Point, ResourceData,
     ResourceProvider, TextureId, TransitionParams,
 };
 use krkr_font::FontSystem;
@@ -210,6 +210,7 @@ pub struct KrkrHost {
     pending_audio_commands: Vec<AudioCommand>,
     text_encoding: String,
     pressed_keys: BTreeSet<i64>,
+    cursor_position: Option<Point>,
     termination_requested: bool,
     modal_windows: Vec<ObjectHandle>,
 }
@@ -256,6 +257,7 @@ impl Default for KrkrHost {
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
+            cursor_position: None,
             termination_requested: false,
             modal_windows: Vec::new(),
         }
@@ -310,6 +312,7 @@ impl KrkrHost {
             pending_audio_commands: Vec::new(),
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
+            cursor_position: None,
             termination_requested: false,
             modal_windows: Vec::new(),
         })
@@ -393,6 +396,14 @@ impl KrkrHost {
 
     pub(crate) fn key_state(&self, key: i64) -> bool {
         self.pressed_keys.contains(&key)
+    }
+
+    pub(crate) fn set_cursor_position(&mut self, position: Point) {
+        self.cursor_position = Some(position);
+    }
+
+    pub(crate) fn cursor_position(&self) -> Option<Point> {
+        self.cursor_position
     }
 
     pub fn add_auto_path(&mut self, path: impl Into<String>) {

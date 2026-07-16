@@ -1037,6 +1037,7 @@ impl KrkrEngine {
             match event {
                 EngineEvent::CursorMoved { position } => {
                     self.cursor_position = Some(*position);
+                    self.tjs_runtime.host_mut().set_cursor_position(*position);
                     self.dispatch_layer_cursor_move(*position)?;
                 }
                 EngineEvent::PointerInput {
@@ -9035,6 +9036,59 @@ mod tests {
                 .execute_expression("inline.tjs", "moves")
                 .expect("moves"),
             Variant::String("40:42:up:40:42".to_string())
+        );
+    }
+
+    #[test]
+    fn layer_cursor_position_tracks_mouse_in_layer_coordinates() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parent = new Layer();
+                parent.setPos(40, 30);
+                parent.setSize(200, 200);
+                parent.visible = true;
+                var child = new Layer(void, parent);
+                child.setPos(10, 5);
+                child.setSize(50, 50);
+                child.visible = true;
+                global.parent = parent;
+                global.child = child;
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::CursorMoved {
+                        position: Point::new(57.0, 48.0),
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("cursor frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "child.cursorX + \":\" + child.cursorY")
+                .expect("child cursor"),
+            Variant::String("7:13".to_string())
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "parent.cursorX + \":\" + parent.cursorY")
+                .expect("parent cursor"),
+            Variant::String("17:18".to_string())
         );
     }
 

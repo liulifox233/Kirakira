@@ -983,6 +983,8 @@ const LAYER_NATIVE_PROPERTIES: &[&str] = &[
     "hitType",
     "hitThreshold",
     "cursor",
+    "cursorX",
+    "cursorY",
     "hint",
     "showParentHint",
     "enabled",
@@ -1063,7 +1065,35 @@ fn layer_native_property_get(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
+    if matches!(name, "cursorX" | "cursorY") {
+        return Ok(layer_cursor_position_value(runtime, this, name));
+    }
     Ok(layer_property_value(runtime, this, name))
+}
+
+// Layer.cursorX/cursorY report the current mouse cursor position in the
+// layer's local coordinate system, so they must be computed on read rather
+// than stored.
+fn layer_cursor_position_value(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &str,
+) -> Variant {
+    let (Some(layer_id), Some(cursor)) = (
+        runtime.host().native_layer(handle),
+        runtime.host().cursor_position(),
+    ) else {
+        return Variant::Void;
+    };
+    let Some(origin) = runtime.host().layer_tree().absolute_position(layer_id) else {
+        return Variant::Void;
+    };
+    let value = if name == "cursorX" {
+        cursor.x - origin.x
+    } else {
+        cursor.y - origin.y
+    };
+    Variant::Integer(value.round() as i64)
 }
 
 fn layer_native_property_set(
