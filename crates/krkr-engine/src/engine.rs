@@ -18,7 +18,6 @@ use krkr_tjs2::{
 
 use crate::{
     globals::install_tvp_globals,
-    hooks::{EngineHook, EngineHookContext, KagTagDecision},
     host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost},
     kag::{EngineKagHost, tag_to_dictionary},
     native::classes::{
@@ -152,7 +151,6 @@ pub struct KrkrEngine {
     core_engine: CoreEngine,
     kag_budget: KagRunBudget,
     plugins: Vec<Box<dyn KrkrPlugin>>,
-    hooks: Vec<Box<dyn EngineHook>>,
     cursor_position: Option<Point>,
     hovered_layer: Option<LayerId>,
     pressed_layer: Option<LayerId>,
@@ -175,7 +173,6 @@ impl KrkrEngine {
             core_engine: CoreEngine::new(CoreEngineConfig::default()),
             kag_budget: config.kag_budget,
             plugins: Vec::new(),
-            hooks: Vec::new(),
             cursor_position: None,
             hovered_layer: None,
             pressed_layer: None,
@@ -205,17 +202,6 @@ impl KrkrEngine {
 
     pub fn host_mut(&mut self) -> &mut KrkrHost {
         self.tjs_runtime.host_mut()
-    }
-
-    pub fn add_hook<H: EngineHook + 'static>(&mut self, hook: H) -> Result<()> {
-        self.hooks.push(Box::new(hook));
-        let index = self.hooks.len() - 1;
-        let mut ctx = EngineHookContext::new(&mut self.tjs_runtime);
-        let result = self.hooks[index].on_register(&mut ctx);
-        if result.is_err() {
-            self.hooks.pop();
-        }
-        result
     }
 
     pub fn preferred_viewport_size(&self) -> Option<Size> {
@@ -569,12 +555,8 @@ impl KrkrEngine {
         self.advance(Duration::ZERO)
     }
 
-    pub fn update(&mut self, mut input: EngineInput, delta: Duration) -> Result<EngineFrame> {
+    pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
         self.input_result = EngineInputResult::default();
-        for hook in &mut self.hooks {
-            let mut ctx = EngineHookContext::new(&mut self.tjs_runtime);
-            hook.before_update(&mut ctx, &mut input, delta)?;
-        }
         {
             let scheduler = self.tjs_runtime.host_mut().scheduler_mut();
             scheduler.begin_frame();
@@ -600,17 +582,13 @@ impl KrkrEngine {
                 &suppressed_images,
                 transition,
             );
-        let mut frame = EngineFrame {
+        let frame = EngineFrame {
             output,
             tick,
             input: self.input_result,
             message_layer: self.kag_session.message_layer().clone(),
             location: self.kag_location(),
         };
-        for hook in &mut self.hooks {
-            let mut ctx = EngineHookContext::new(&mut self.tjs_runtime);
-            hook.after_frame(&mut ctx, &mut frame)?;
-        }
         Ok(frame)
     }
 
@@ -651,7 +629,7 @@ impl KrkrEngine {
         self.kag_session
             .update_wait(delta, transition_active, resource_pending);
         self.kag_session
-            .run_until_yield(&mut self.tjs_runtime, self.kag_budget, &mut self.hooks)
+            .run_until_yield(&mut self.tjs_runtime, self.kag_budget)
     }
 
     fn runtime_window_object(&self) -> Option<ObjectHandle> {
@@ -2028,7 +2006,6 @@ impl KagSession {
         &mut self,
         runtime: &mut Runtime<KrkrHost>,
         budget: KagRunBudget,
-        hooks: &mut [Box<dyn EngineHook>],
     ) -> Result<EngineTickResult> {
         self.observe_external_parser_changes(runtime);
         if self.parser.is_none() {
@@ -2041,7 +2018,7 @@ impl KagSession {
             });
         }
         self.with_parser_for_tjs(runtime, |parser, session, runtime, owner| {
-            session.run_until_yield_with_parser(parser, runtime, owner, budget, hooks)
+            session.run_until_yield_with_parser(parser, runtime, owner, budget)
         })
     }
 
@@ -2051,7 +2028,6 @@ impl KagSession {
         runtime: &mut Runtime<KrkrHost>,
         owner: ObjectHandle,
         budget: KagRunBudget,
-        hooks: &mut [Box<dyn EngineHook>],
     ) -> Result<EngineTickResult> {
         let started = Instant::now();
         let mut tags_processed = 0;
@@ -2119,7 +2095,7 @@ impl KagSession {
             };
 
             tags_processed += 1;
-            let action = self.process_tag(parser, runtime, owner, tag, hooks)?;
+            let action = self.process_tag(parser, runtime, owner, tag)?;
             match action {
                 TagAction::Continue => {}
                 TagAction::Yield(reason) => {
@@ -2140,16 +2116,8 @@ impl KagSession {
         runtime: &mut Runtime<KrkrHost>,
         owner: ObjectHandle,
         tag: Tag,
-        hooks: &mut [Box<dyn EngineHook>],
     ) -> Result<TagAction> {
-        for hook in hooks.iter_mut() {
-            let mut ctx = EngineHookContext::new(runtime);
-            if hook.before_kag_tag(&mut ctx, &tag)? == KagTagDecision::Skip {
-                return Ok(TagAction::Continue);
-            }
-        }
-
-        let action = if let Some(action) = self.try_tjs_tag_handler(runtime, owner, &tag)? {
+        if let Some(action) = self.try_tjs_tag_handler(runtime, owner, &tag)? {
             match action {
                 TjsTagAction::Handled(action) => Ok(action),
                 TjsTagAction::NativeFallback => {
@@ -2158,13 +2126,7 @@ impl KagSession {
             }
         } else {
             self.process_native_fallback_tag(parser, runtime, &tag)
-        }?;
-
-        for hook in hooks.iter_mut() {
-            let mut ctx = EngineHookContext::new(runtime);
-            hook.after_kag_tag(&mut ctx, &tag)?;
         }
-        Ok(action)
     }
 
     fn try_tjs_tag_handler(
@@ -3323,10 +3285,8 @@ fn apply_laycount_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::{Cell, RefCell},
         fs,
         path::{Path, PathBuf},
-        rc::Rc,
         sync::atomic::{AtomicU64, Ordering},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -3334,12 +3294,18 @@ mod tests {
     use krkr_core::Size;
     use krkr_kag::{Attribute, AttributeValue};
     use krkr_tjs2::{
-        Result, TjsError,
+        Result,
         runtime::{Runtime, Variant},
     };
 
     use super::*;
-    use crate::{EngineHook, EngineHookContext, KagTagDecision, KrkrHost, KrkrPlugin};
+    use crate::{KrkrHost, KrkrPlugin};
+
+    #[test]
+    fn engine_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<KrkrEngine>();
+    }
 
     #[test]
     fn installs_core_tjs_and_tvp_globals() {
@@ -3367,228 +3333,6 @@ mod tests {
                 "{name} should be registered"
             );
         }
-    }
-
-    #[test]
-    fn engine_hooks_register_in_order_and_abort_on_error() {
-        struct RegisterHook {
-            name: &'static str,
-            events: Rc<RefCell<Vec<&'static str>>>,
-            fail: bool,
-        }
-
-        impl EngineHook for RegisterHook {
-            fn on_register(&mut self, _ctx: &mut EngineHookContext<'_>) -> Result<()> {
-                self.events.borrow_mut().push(self.name);
-                if self.fail {
-                    Err(TjsError::runtime("hook failed"))
-                } else {
-                    Ok(())
-                }
-            }
-        }
-
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
-        engine
-            .add_hook(RegisterHook {
-                name: "a",
-                events: events.clone(),
-                fail: false,
-            })
-            .expect("first hook");
-        engine
-            .add_hook(RegisterHook {
-                name: "b",
-                events: events.clone(),
-                fail: false,
-            })
-            .expect("second hook");
-        assert!(
-            engine
-                .add_hook(RegisterHook {
-                    name: "err",
-                    events: events.clone(),
-                    fail: true,
-                })
-                .is_err()
-        );
-
-        assert_eq!(&*events.borrow(), &["a", "b", "err"]);
-    }
-
-    #[test]
-    fn engine_hook_before_update_error_aborts_update() {
-        struct FailingUpdateHook;
-
-        impl EngineHook for FailingUpdateHook {
-            fn before_update(
-                &mut self,
-                _ctx: &mut EngineHookContext<'_>,
-                _input: &mut EngineInput,
-                _delta: Duration,
-            ) -> Result<()> {
-                Err(TjsError::runtime("before update failed"))
-            }
-        }
-
-        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
-        engine.add_hook(FailingUpdateHook).expect("hook");
-        let error = engine
-            .update(
-                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::ZERO,
-            )
-            .expect_err("update should fail");
-        assert!(error.to_string().contains("before update failed"));
-    }
-
-    #[test]
-    fn engine_hook_before_kag_tag_can_skip_tag() {
-        struct SkipFirstCharacterHook {
-            skipped: Rc<Cell<bool>>,
-        }
-
-        impl EngineHook for SkipFirstCharacterHook {
-            fn before_kag_tag(
-                &mut self,
-                _ctx: &mut EngineHookContext<'_>,
-                tag: &Tag,
-            ) -> Result<KagTagDecision> {
-                if tag.tagname == "ch" && !self.skipped.replace(true) {
-                    Ok(KagTagDecision::Skip)
-                } else {
-                    Ok(KagTagDecision::Continue)
-                }
-            }
-        }
-
-        let root = temp_root();
-        fs::create_dir_all(&root).expect("create temp root");
-        fs::write(root.join("startup.ks"), "[ch text=skip][ch text=keep]").expect("write scenario");
-        let skipped = Rc::new(Cell::new(false));
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
-        engine
-            .add_hook(SkipFirstCharacterHook {
-                skipped: skipped.clone(),
-            })
-            .expect("hook");
-        engine
-            .load_kag_scenario("startup.ks")
-            .expect("load scenario");
-
-        engine
-            .update(
-                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::ZERO,
-            )
-            .expect("update");
-
-        assert!(skipped.get());
-        assert_eq!(engine.message_layer().lines, vec!["keep".to_string()]);
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn engine_hook_skip_short_circuits_later_tag_callbacks() {
-        struct SkipHook;
-
-        impl EngineHook for SkipHook {
-            fn before_kag_tag(
-                &mut self,
-                _ctx: &mut EngineHookContext<'_>,
-                tag: &Tag,
-            ) -> Result<KagTagDecision> {
-                if tag.tagname == "ch" {
-                    Ok(KagTagDecision::Skip)
-                } else {
-                    Ok(KagTagDecision::Continue)
-                }
-            }
-        }
-
-        struct ObserveHook {
-            before_called: Rc<Cell<bool>>,
-            after_called: Rc<Cell<bool>>,
-        }
-
-        impl EngineHook for ObserveHook {
-            fn before_kag_tag(
-                &mut self,
-                _ctx: &mut EngineHookContext<'_>,
-                _tag: &Tag,
-            ) -> Result<KagTagDecision> {
-                self.before_called.set(true);
-                Ok(KagTagDecision::Continue)
-            }
-
-            fn after_kag_tag(
-                &mut self,
-                _ctx: &mut EngineHookContext<'_>,
-                _tag: &Tag,
-            ) -> Result<()> {
-                self.after_called.set(true);
-                Ok(())
-            }
-        }
-
-        let root = temp_root();
-        fs::create_dir_all(&root).expect("create temp root");
-        fs::write(root.join("startup.ks"), "[ch text=skip]").expect("write scenario");
-        let before_called = Rc::new(Cell::new(false));
-        let after_called = Rc::new(Cell::new(false));
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
-        engine.add_hook(SkipHook).expect("skip hook");
-        engine
-            .add_hook(ObserveHook {
-                before_called: before_called.clone(),
-                after_called: after_called.clone(),
-            })
-            .expect("observe hook");
-        engine
-            .load_kag_scenario("startup.ks")
-            .expect("load scenario");
-
-        engine
-            .update(
-                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::ZERO,
-            )
-            .expect("update");
-
-        assert!(!before_called.get());
-        assert!(!after_called.get());
-        assert!(engine.message_layer().lines.is_empty());
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn engine_hook_after_frame_can_mutate_output() {
-        struct RedFrameHook;
-
-        impl EngineHook for RedFrameHook {
-            fn after_frame(
-                &mut self,
-                _ctx: &mut EngineHookContext<'_>,
-                frame: &mut EngineFrame,
-            ) -> Result<()> {
-                frame.output.clear_color = Color::rgb_u8(255, 0, 0);
-                frame.output.draw_commands.clear();
-                Ok(())
-            }
-        }
-
-        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
-        engine.add_hook(RedFrameHook).expect("hook");
-        let frame = engine
-            .update(
-                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::ZERO,
-            )
-            .expect("update");
-
-        assert_eq!(frame.output.clear_color, Color::rgb_u8(255, 0, 0));
-        assert!(frame.output.draw_commands.is_empty());
     }
 
     #[test]

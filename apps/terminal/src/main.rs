@@ -22,8 +22,8 @@ use krkr_core::{
     LayerId, MessageLayerModel, Point, PointerButton, Rect, Size, TextureId,
 };
 use krkr_engine::{
-    EngineConfig, EngineFrame, EngineHook, EngineHookContext, EngineInput, KrkrEngine, KrkrHost,
-    NativeTextDrawEvent, TransitionPolicy,
+    EngineConfig, EngineFrame, EngineInput, KrkrEngine, KrkrHost, NativeTextDrawEvent,
+    TransitionPolicy,
 };
 use krkr_plugins::register_reference_plugins;
 use terminal_size::{Height, Width, terminal_size};
@@ -150,8 +150,8 @@ impl TerminalApp {
         })
         .map_err(|error| format!("engine initialization failed: {error}"))?;
         engine
-            .add_hook(TerminalPresentationHook)
-            .map_err(|error| format!("terminal hook registration failed: {error}"))?;
+            .host_mut()
+            .set_transition_policy(TransitionPolicy::Immediate);
         register_reference_plugins(&mut engine)
             .map_err(|error| format!("reference plugin registration failed: {error}"))?;
         run_project_startup(&mut engine).map_err(|error| error.to_string())?;
@@ -199,10 +199,11 @@ impl TerminalApp {
             let delta = now.duration_since(last_frame);
             last_frame = now;
             let frame_input = FrameInput::new(self.viewport_size, delta.as_secs_f32());
-            let frame = self.engine.update(
+            let mut frame = self.engine.update(
                 EngineInput::new(frame_input, std::mem::take(&mut self.pending_events)),
                 delta,
             )?;
+            prepare_terminal_frame(self.engine.host(), &mut frame);
 
             self.interaction
                 .refresh_candidates(self.engine.host().layer_tree(), self.viewport_size);
@@ -639,33 +640,17 @@ fn directory_has_xp3(path: &Path) -> bool {
     })
 }
 
-struct TerminalPresentationHook;
-
-impl EngineHook for TerminalPresentationHook {
-    fn on_register(&mut self, ctx: &mut EngineHookContext<'_>) -> krkr_tjs2::Result<()> {
-        ctx.host_mut()
-            .set_transition_policy(TransitionPolicy::Immediate);
-        Ok(())
-    }
-
-    fn after_frame(
-        &mut self,
-        ctx: &mut EngineHookContext<'_>,
-        frame: &mut EngineFrame,
-    ) -> krkr_tjs2::Result<()> {
-        let hidden_layers = terminal_hidden_layer_ids(ctx.host());
-        let (draw_commands, image_uploads) = ctx
-            .host()
-            .layer_tree()
-            .draw_model_filtered(|layer| !hidden_layers.contains(&layer.id));
-        frame.output.draw_commands = draw_commands
-            .into_iter()
-            .filter(|command| matches!(command, DrawCommand::Image(_)))
-            .collect();
-        frame.output.image_uploads = image_uploads;
-        frame.output.transition = None;
-        Ok(())
-    }
+fn prepare_terminal_frame(host: &KrkrHost, frame: &mut EngineFrame) {
+    let hidden_layers = terminal_hidden_layer_ids(host);
+    let (draw_commands, image_uploads) = host
+        .layer_tree()
+        .draw_model_filtered(|layer| !hidden_layers.contains(&layer.id));
+    frame.output.draw_commands = draw_commands
+        .into_iter()
+        .filter(|command| matches!(command, DrawCommand::Image(_)))
+        .collect();
+    frame.output.image_uploads = image_uploads;
+    frame.output.transition = None;
 }
 
 fn terminal_hidden_layer_ids(host: &KrkrHost) -> BTreeSet<LayerId> {
