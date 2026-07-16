@@ -3700,7 +3700,11 @@ impl ObjectBuilder {
         Ok(Place::Member {
             object,
             key: MemberKey::Direct(lowerer.intern_string(&ident.name)),
-            flags: if lowerer.ident_is_property(ident) {
+            flags: if lowerer.ident_is_property(ident) || ident.binding.is_none() {
+                // Properties and statically unresolved identifiers (e.g. members
+                // inherited from a super class) must go through dynamic dispatch so
+                // property setters found at runtime are honored. Only statically
+                // known data members may bypass it.
                 FLAGS_DEFAULT_SET
             } else {
                 FLAGS_IGNORE_PROP_SET

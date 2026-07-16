@@ -938,6 +938,34 @@ mod tests {
     }
 
     #[test]
+    fn inherited_property_identifier_assignment_uses_setter() {
+        assert_eq!(
+            execute_source(
+                "inherited_property_identifier_set.tjs",
+                r#"
+                    class Base {
+                        var stored = 0;
+                        property value {
+                            getter { return stored; }
+                            setter(v) { stored = v * 3; }
+                        }
+                    }
+                    class Sub extends Base {
+                        function Sub() { value = 7; }
+                        function setViaMethod(v) { value = v; }
+                    }
+                    var sub = new Sub();
+                    sub.setViaMethod(9);
+                    sub.value = 4;
+                    return sub.value + ":" + sub.stored;
+                "#
+            )
+            .expect("execute"),
+            Variant::String("12:12".to_string())
+        );
+    }
+
+    #[test]
     fn class_regmember_copies_child_methods_to_instance() {
         assert_eq!(
             execute_source(
