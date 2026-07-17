@@ -5,7 +5,9 @@ use crate::compiler::compile_source_to_bytecode;
 use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
 use crate::runtime::{
     Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant, split_delimited_string,
+    split_string_by_regex,
 };
+use crate::runtime::builtins::{regexp_object_handle, regexp_regex};
 
 use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form};
 use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
@@ -137,6 +139,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Ok(getter);
         }
         let bind_this = self.bound_super_this(handle, caller_this)?;
+        // Native methods carry no receiver of their own; bind them to the
+        // object they were read from so a fetched method called as a plain
+        // value still runs on the receiver (krkrz ObjThis semantics).
+        if bind_this.is_none()
+            && let Variant::Object(native) = &value
+            && matches!(
+                self.runtime.heap[native.0].kind,
+                ObjectKind::NativeFunction { .. } | ObjectKind::VmNativeFunction { .. }
+            )
+        {
+            return Ok(self.bind_proxy_value(value, Some(handle)));
+        }
         Ok(self.bind_proxy_value(value, bind_this))
     }
 
@@ -917,10 +931,34 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 return Ok(true);
             }
             if seen.contains(&handle.0) {
-                return Ok(false);
+                break;
             }
             seen.push(handle.0);
             current = self.super_class_handle(handle)?;
+        }
+        // TJS2 multiple inheritance initializes one instance from several
+        // class bodies, but only the first parent is reachable through the
+        // super-class link; fall back to the recorded class names so the
+        // other parents still count as part of the instance's chain. Only
+        // applies to actual class objects — two instances of the same class
+        // must not be treated as each other's class.
+        if matches!(
+            self.runtime.heap[class_handle.0].kind,
+            ObjectKind::InterCode {
+                context: BytecodeContextType::Class,
+                ..
+            }
+        ) {
+            let class_names = self.runtime.heap[class_handle.0].class_infos.clone();
+            if !class_names.is_empty() {
+                let instance_names = &self.runtime.heap[instance.0].class_infos;
+                if class_names
+                    .iter()
+                    .any(|name| instance_names.contains(name))
+                {
+                    return Ok(true);
+                }
+            }
         }
         Ok(false)
     }
@@ -1001,7 +1039,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<CallOutcome> {
         match self.materialize_code_object(callee) {
             Variant::Closure(closure) => {
-                let effective_this = closure.this_obj.or(this_obj).or(Some(closure.object));
+                // A method that was registered bound to a class prototype
+                // must still run on the caller's instance when invoked from
+                // within a construction chain (krkrz superclass-constructor
+                // semantics), otherwise state would land on the prototype.
+                let effective_this = match (closure.this_obj, this_obj) {
+                    (Some(bound), Some(caller))
+                        if bound != caller
+                            && matches!(
+                                self.runtime.heap[bound.0].kind,
+                                ObjectKind::InterCode {
+                                    context: BytecodeContextType::Class,
+                                    ..
+                                }
+                            )
+                            && self.is_class_in_instance_chain(caller, bound)? =>
+                    {
+                        Some(caller)
+                    }
+                    _ => closure.this_obj.or(this_obj).or(Some(closure.object)),
+                };
                 self.call_handle(closure.object, effective_this, args, is_new, continuation)
             }
             Variant::Object(handle) => {
@@ -1031,11 +1088,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 } else if context == BytecodeContextType::Class {
                     if let Some(instance) = this_obj.filter(|handle| *handle != self.runtime.global)
                     {
-                        self.initialize_inter_code_instance(
+                        // A plain call to a class object with an instance
+                        // `this` only runs the class body (member
+                        // initializers); krkrz performs superclass
+                        // initialization this way and never invokes the
+                        // constructor here. The constructor runs separately
+                        // through `new` or an explicit ctor call.
+                        self.initialize_inter_code_class_body(
                             file_id,
                             object_index,
                             instance,
-                            args,
                             continuation,
                         )
                     } else {
@@ -1123,7 +1185,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if context == BytecodeContextType::Class {
             self.add_class_info(instance, name.clone());
             let class_handle = code_handles[object_index];
-            self.runtime.heap[instance.0].super_class = Some(class_handle);
             let frame = self.create_call_frame(
                 file_id,
                 object_index,
@@ -1154,48 +1215,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
-    fn initialize_inter_code_instance(
-        &mut self,
-        file_id: usize,
-        object_index: usize,
-        instance: ObjectHandle,
-        args: Vec<Variant>,
-        continuation: Continuation,
-    ) -> Result<CallOutcome> {
-        self.initialize_inter_code_instance_with_constructor(
-            file_id,
-            object_index,
-            instance,
-            args,
-            true,
-            continuation,
-        )
-    }
-
     fn initialize_inter_code_class_body(
         &mut self,
         file_id: usize,
         object_index: usize,
         instance: ObjectHandle,
-        continuation: Continuation,
-    ) -> Result<CallOutcome> {
-        self.initialize_inter_code_instance_with_constructor(
-            file_id,
-            object_index,
-            instance,
-            Vec::new(),
-            false,
-            continuation,
-        )
-    }
-
-    fn initialize_inter_code_instance_with_constructor(
-        &mut self,
-        file_id: usize,
-        object_index: usize,
-        instance: ObjectHandle,
-        args: Vec<Variant>,
-        run_constructor: bool,
         continuation: Continuation,
     ) -> Result<CallOutcome> {
         let file = self.runtime.script_file(file_id)?;
@@ -1209,9 +1233,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.add_class_info(instance, name.clone());
         }
         let class_handle = code_handles[object_index];
-        if self.runtime.heap[instance.0].super_class.is_none() {
-            self.runtime.heap[instance.0].super_class = Some(class_handle);
-        }
+        // The superclass link is only attached once the class body has run
+        // (see Continuation::ClassBody): while the body is executing, member
+        // lookups on the under-construction instance must miss so that they
+        // fall back to the global object, matching krkrz regmember semantics.
         let frame = self.create_call_frame(
             file_id,
             object_index,
@@ -1221,8 +1246,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 instance,
                 class_handle,
                 class_name: name,
-                constructor_args: args,
-                run_constructor,
+                constructor_args: Vec::new(),
+                run_constructor: false,
                 target: Box::new(continuation),
             },
         )?;
@@ -1414,11 +1439,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         "String.split requires a delimiter argument",
                     ));
                 };
-                let delimiters = pattern.to_tjs_string()?;
                 let purge_empty = args
                     .get(2)
                     .filter(|value| !matches!(value, Variant::Void))
                     .is_some_and(Variant::is_truthy);
+                if let Some(regexp) = regexp_object_handle(&self.runtime, pattern) {
+                    let regex = regexp_regex(&self.runtime, regexp)?;
+                    let array = self.runtime.alloc_array_object(split_string_by_regex(
+                        &value,
+                        &regex,
+                        purge_empty,
+                    ));
+                    return Ok(Variant::Object(array));
+                }
+                let delimiters = pattern.to_tjs_string()?;
                 let array = self.runtime.alloc_array_object(split_delimited_string(
                     &value,
                     &delimiters,
@@ -1553,7 +1587,23 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 closure.this_obj = Some(this_obj);
                 Variant::Closure(closure)
             }
-            Variant::Object(handle) => Variant::Closure(Closure::new(handle, Some(this_obj))),
+            Variant::Object(handle) => {
+                // Only callable members are rebound to the caller's `this`;
+                // data members (arrays, dictionaries, plain objects) keep
+                // their identity, matching krkrz where ObjThis is assigned
+                // when the member is written, not when it is read.
+                match self.runtime.heap[handle.0].kind {
+                    ObjectKind::InterCode { .. }
+                    | ObjectKind::NativeFunction { .. }
+                    | ObjectKind::VmNativeFunction { .. }
+                    | ObjectKind::Proxy { .. } => {
+                        Variant::Closure(Closure::new(handle, Some(this_obj)))
+                    }
+                    ObjectKind::Ordinary
+                    | ObjectKind::Array { .. }
+                    | ObjectKind::NativeProperty { .. } => Variant::Object(handle),
+                }
+            }
             value => value,
         }
     }
@@ -1661,6 +1711,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if class_name == "Function" && self.handle_is_function(handle) {
             return Ok(true);
         }
+        if class_name == "Property" && self.handle_is_property(handle) {
+            return Ok(true);
+        }
         let mut seen = Vec::new();
         let mut current = Some(handle);
         while let Some(handle) = current {
@@ -1687,6 +1740,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 | ObjectKind::VmNativeFunction { .. }
                 | ObjectKind::InterCode {
                     context: BytecodeContextType::Function | BytecodeContextType::ExprFunction,
+                    ..
+                }
+        )
+    }
+
+    fn handle_is_property(&self, handle: ObjectHandle) -> bool {
+        matches!(
+            self.runtime.heap[handle.0].kind,
+            ObjectKind::NativeProperty { .. }
+                | ObjectKind::InterCode {
+                    context:
+                        BytecodeContextType::Property
+                        | BytecodeContextType::PropertyGetter
+                        | BytecodeContextType::PropertySetter,
                     ..
                 }
         )

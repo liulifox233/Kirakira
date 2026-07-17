@@ -9,7 +9,7 @@ use crate::compile_source_to_bytecode;
 use crate::error::{Result, TjsError};
 use crate::runtime::object::Object;
 use crate::runtime::value::{ObjectHandle, Variant};
-use crate::runtime::{Runtime, TjsHost, split_delimited_string};
+use crate::runtime::{Runtime, TjsHost, split_delimited_string, split_string_by_regex};
 
 pub(crate) fn install<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
     let array = runtime.register_global_native("Array", native_array::<H>);
@@ -59,7 +59,7 @@ fn native_regexp<H: TjsHost + 'static>(
         runtime.heap[handle.0].set("flags", Variant::String(String::new()));
     }
     runtime.register_object_native(handle, "compile", regexp_compile::<H>);
-    runtime.register_object_native(handle, "_compile", regexp_compile::<H>);
+    runtime.register_object_native(handle, "_compile", regexp_compile_internal::<H>);
     runtime.register_object_native(handle, "test", regexp_test::<H>);
     runtime.register_object_native(handle, "match", regexp_match::<H>);
     runtime.register_object_native(handle, "exec", regexp_match::<H>);
@@ -317,6 +317,7 @@ pub(crate) fn install_array_methods<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "join", array_join::<H>);
     runtime.register_object_native(handle, "sort", array_sort::<H>);
     runtime.register_object_native(handle, "reverse", array_reverse::<H>);
+    runtime.register_object_native(handle, "find", array_find::<H>);
 }
 
 fn install_dictionary_methods<H: TjsHost + 'static>(
@@ -535,7 +536,7 @@ fn array_load<H: TjsHost + 'static>(
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.load")?;
     let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
-        return Ok(Variant::Integer(0));
+        return Err(TjsError::runtime("Array.load requires a storage name"));
     };
     let path = path.to_tjs_string()?;
     let mode = args
@@ -543,16 +544,14 @@ fn array_load<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
-        return Ok(Variant::Integer(0));
-    };
+    let text = runtime.host_mut().read_text(&path, &mode)?;
     runtime.heap[handle.0] = Object::array(
         text.lines()
             .map(|line| Variant::String(line.to_string()))
             .collect(),
     );
     install_array_methods(runtime, handle);
-    Ok(Variant::Integer(1))
+    Ok(Variant::Object(handle))
 }
 
 fn array_save<H: TjsHost + 'static>(
@@ -662,12 +661,19 @@ fn array_split<H: TjsHost + 'static>(
             "Array.split requires delimiter and string arguments",
         ));
     }
-    let delimiters = args[0].to_tjs_string()?;
     let string = args[1].to_tjs_string()?;
     let purge_empty = args
         .get(3)
         .filter(|value| !matches!(value, Variant::Void))
         .is_some_and(Variant::is_truthy);
+    if let Some(regexp) = regexp_object_handle(runtime, &args[0]) {
+        let regex = regexp_regex(runtime, regexp)?;
+        runtime.heap[handle.0] =
+            Object::array(split_string_by_regex(&string, &regex, purge_empty));
+        install_array_methods(runtime, handle);
+        return Ok(Variant::Object(handle));
+    }
+    let delimiters = args[0].to_tjs_string()?;
     runtime.heap[handle.0] =
         Object::array(split_delimited_string(&string, &delimiters, purge_empty));
     install_array_methods(runtime, handle);
@@ -703,6 +709,39 @@ fn array_sort_less(lhs: &Variant, rhs: &Variant, mode: char) -> Result<bool> {
         'z' => Ok(lhs.to_tjs_string()? > rhs.to_tjs_string()?),
         _ => lhs.less_than(rhs),
     }
+}
+
+fn array_find<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "Array.find")?;
+    let Some(needle) = args.first() else {
+        return Err(TjsError::runtime("Array.find requires a value argument"));
+    };
+    let elements = runtime.heap[handle.0]
+        .array_elements()
+        .ok_or_else(|| TjsError::runtime("Array.find called on a non-array object"))?;
+    let len = elements.len() as i64;
+    let mut start = args
+        .get(1)
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(0);
+    if start < 0 {
+        start += len;
+    }
+    let start = start.max(0);
+    if start >= len {
+        return Ok(Variant::Integer(-1));
+    }
+    for (index, element) in elements.iter().enumerate().skip(start as usize) {
+        if needle.discern_eq(element) {
+            return Ok(Variant::Integer(index as i64));
+        }
+    }
+    Ok(Variant::Integer(-1))
 }
 
 fn array_reverse<H: TjsHost + 'static>(
@@ -1511,6 +1550,45 @@ fn regexp_compile<H: TjsHost + 'static>(
     Ok(Variant::Object(handle))
 }
 
+fn regexp_compile_internal<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let handle = require_this(this_obj, "RegExp._compile")?;
+    if args.len() != 1 {
+        return Err(TjsError::runtime("RegExp._compile requires one argument"));
+    }
+    let source = args[0].to_tjs_string()?;
+    // Internal literal format used by precompiled bytecode: `//flags/expression`.
+    let body = source.strip_prefix("//").ok_or_else(|| {
+        TjsError::runtime("RegExp._compile: expression must start with `//`")
+    })?;
+    let slash = body.find('/').ok_or_else(|| {
+        TjsError::runtime("RegExp._compile: expression is missing the flag terminator")
+    })?;
+    runtime.heap[handle.0].set("flags", Variant::String(body[..slash].to_string()));
+    runtime.heap[handle.0].set("pattern", Variant::String(body[slash + 1..].to_string()));
+    Ok(Variant::Object(handle))
+}
+
+pub(crate) fn regexp_object_handle<H: TjsHost>(
+    runtime: &Runtime<H>,
+    value: &Variant,
+) -> Option<ObjectHandle> {
+    let Variant::Object(handle) = value else {
+        return None;
+    };
+    let object = &runtime.heap[handle.0];
+    if matches!(object.get("pattern"), Variant::String(_))
+        && !matches!(object.get("_compile"), Variant::Void)
+    {
+        Some(*handle)
+    } else {
+        None
+    }
+}
+
 fn regexp_test<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
@@ -1550,7 +1628,7 @@ fn regexp_match<H: TjsHost + 'static>(
     Ok(Variant::Object(runtime.alloc_array_object(values)))
 }
 
-fn regexp_regex<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) -> Result<regex::Regex> {
+pub(crate) fn regexp_regex<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) -> Result<regex::Regex> {
     let pattern = runtime.heap[handle.0]
         .get("pattern")
         .to_tjs_string()

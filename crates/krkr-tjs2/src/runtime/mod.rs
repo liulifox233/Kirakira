@@ -7,7 +7,7 @@ use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction
 use crate::error::{Result, TjsError};
 use crate::vm::{SuspendedCallStack, Vm};
 
-mod builtins;
+pub(crate) mod builtins;
 pub mod object;
 pub mod value;
 
@@ -34,6 +34,33 @@ pub(crate) fn split_delimited_string(
     }
     if !purge_empty || !current.is_empty() {
         parts.push(Variant::String(current));
+    }
+    parts
+}
+
+pub(crate) fn split_string_by_regex(
+    string: &str,
+    regex: &regex::Regex,
+    purge_empty: bool,
+) -> Vec<Variant> {
+    // Matches krkrz `split_regex` semantics (oniguruma FIND_NOT_EMPTY):
+    // empty matches are skipped, and the unmatched tail is always emitted
+    // unless purged.
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for found in regex.find_iter(string) {
+        if found.start() == found.end() {
+            continue;
+        }
+        let piece = &string[start..found.start()];
+        if !purge_empty || !piece.is_empty() {
+            parts.push(Variant::String(piece.to_string()));
+        }
+        start = found.end();
+    }
+    let tail = &string[start..];
+    if !purge_empty || !tail.is_empty() {
+        parts.push(Variant::String(tail.to_string()));
     }
     parts
 }

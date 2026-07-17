@@ -275,6 +275,109 @@ mod tests {
     }
 
     #[test]
+    fn string_and_array_split_support_regexp_patterns() {
+        assert_eq!(
+            execute_source(
+                "split_regexp.tjs",
+                r#"
+                var re = new RegExp();
+                re._compile("///[\\t ]+");
+                var direct = "TitleCaption\t\tGINKA".split(re, void, true);
+                var viaArray = [].split(re, "a  b\tc", void, true);
+                return direct.join("|") + ":" + viaArray.join("|");
+                "#
+            )
+            .expect("execute"),
+            Variant::String("TitleCaption|GINKA:a|b|c".to_string())
+        );
+        assert_eq!(
+            execute_source(
+                "split_regexp_flags.tjs",
+                r#"
+                var re = new RegExp();
+                re._compile("//i/x+");
+                return "axXbx".split(re, void, true).join("|");
+                "#
+            )
+            .expect("execute"),
+            Variant::String("a|b".to_string())
+        );
+        assert_eq!(
+            execute_source(
+                "split_regexp_keep_empty.tjs",
+                r#"
+                var re = new RegExp();
+                re._compile("///,");
+                return "a,,b".split(re).join("|");
+                "#
+            )
+            .expect("execute"),
+            Variant::String("a||b".to_string())
+        );
+    }
+
+    #[test]
+    fn regexp_internal_compile_rejects_malformed_literal() {
+        let error = execute_source(
+            "split_regexp_bad.tjs",
+            r#"var re = new RegExp(); re._compile("not-a-literal");"#,
+        )
+        .expect_err("malformed literal should fail");
+        assert!(error.message.contains("RegExp._compile"));
+    }
+
+    #[test]
+    fn class_static_array_member_keeps_identity_in_constructor_calls() {
+        assert_eq!(
+            execute_source(
+                "static_array.tjs",
+                r#"
+                class Base { function Base() {} }
+                class Derived extends Base {
+                    function Derived() { global.Derived.instances.add(this); }
+                }
+                Derived.instances = new Array();
+                var a = new Derived();
+                return Derived.instances.count + ":" + (Derived.instances[0] === a);
+                "#
+            )
+            .expect("execute"),
+            Variant::String("1:1".to_string())
+        );
+    }
+
+    #[test]
+    fn multiple_inheritance_explicit_parent_ctor_runs_on_instance() {
+        assert_eq!(
+            execute_source(
+                "mi_ctor.tjs",
+                r#"
+                class A {
+                    function A() { initialized = 1; }
+                    var initialized;
+                }
+                class B {
+                    function B() { bCount = 1; }
+                    var bCount;
+                }
+                class C extends A, B {
+                    function C() {
+                        this.PA.A();
+                        this.PB.B();
+                    }
+                    var PA = global.A;
+                    var PB = global.B;
+                }
+                var c = new C();
+                return c.initialized + ":" + c.bCount;
+                "#
+            )
+            .expect("execute"),
+            Variant::String("1:1".to_string())
+        );
+    }
+
+    #[test]
     fn string_methods_cover_krkr2_char_trim_reverse_repeat() {
         assert_eq!(
             execute_source(
@@ -408,6 +511,33 @@ mod tests {
             )
             .expect("execute"),
             Variant::String("2:Windows NT 10.0:10.0:0".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_errors_from_nested_calls_are_catchable() {
+        assert_eq!(
+            execute_source(
+                "catch_runtime.tjs",
+                r#"
+                function inner() { var v; v.remove(1); }
+                function outer() { inner(); }
+                try { outer(); return "uncaught"; } catch (e) { return "caught:" + (typeof e.message != "undefined"); }
+                "#
+            )
+            .expect("execute"),
+            Variant::String("caught:1".to_string())
+        );
+        assert_eq!(
+            execute_source(
+                "catch_native.tjs",
+                r#"
+                try { var a = new Array(); a.load("definitely/missing/file.txt"); return "uncaught"; }
+                catch (e) { return "caught"; }
+                "#
+            )
+            .expect("execute"),
+            Variant::String("caught".to_string())
         );
     }
 

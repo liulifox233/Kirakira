@@ -238,11 +238,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     break Ok(Variant::Void);
                 }
                 Err(error) => {
-                    break Err(self.with_active_stack(
-                        error,
-                        &stack,
-                        Some((&call_frame, inst.offset)),
+                    let error = error.with_stack_frame(self.stack_frame_for(
+                        &call_frame.file,
+                        &call_frame.object,
+                        inst.offset,
                     ));
+                    match self.unwind_to_catch(error, call_frame, &mut stack) {
+                        Ok(()) => {}
+                        Err(error) => break Err(error),
+                    }
                 }
             }
         };
@@ -250,6 +254,47 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.runtime.call_depth = base_depth;
         }
         result
+    }
+
+    fn unwind_to_catch(
+        &mut self,
+        mut error: TjsError,
+        mut call_frame: CallFrame,
+        stack: &mut Vec<CallFrame>,
+    ) -> Result<()> {
+        // krkrz executes try-blocks so that runtime errors raised inside
+        // them (including errors from nested calls) are converted into
+        // exception objects and execution resumes at the catch address.
+        loop {
+            if let Some(entry) = call_frame.frame.entries.pop() {
+                let exception = self.make_runtime_exception(&error);
+                call_frame.frame.set(entry.exception_reg, exception)?;
+                call_frame.pc = entry.catch_pc;
+                stack.push(call_frame);
+                return Ok(());
+            }
+            let offset = call_frame
+                .instructions
+                .get(call_frame.pc)
+                .map(|inst| inst.offset)
+                .unwrap_or(0);
+            error = error.with_stack_frame(self.stack_frame_for(
+                &call_frame.file,
+                &call_frame.object,
+                offset,
+            ));
+            self.runtime.leave_call_frame();
+            let Some(caller) = stack.pop() else {
+                return Err(error);
+            };
+            call_frame = caller;
+        }
+    }
+
+    fn make_runtime_exception(&mut self, error: &TjsError) -> Variant {
+        let handle = self.runtime.alloc_object(Default::default());
+        self.runtime.heap[handle.0].set("message", Variant::String(error.message.clone()));
+        Variant::Object(handle)
     }
 
     fn complete_call_value(
@@ -282,6 +327,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 for info in self.runtime.heap[class_handle.0].class_infos.clone() {
                     self.add_class_info(instance, info);
                 }
+                // Attach the superclass link only after the class body has
+                // run, so member lookups during construction missed and fell
+                // back to the global object (krkrz regmember semantics).
+                self.runtime.heap[instance.0].super_class = Some(class_handle);
                 let object_value = Variant::Object(instance);
                 if run_constructor
                     && !class_name.is_empty()

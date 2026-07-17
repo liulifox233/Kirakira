@@ -287,6 +287,8 @@ fn apply_constructor_defaults(
             set_window_property_storage(runtime, handle, "innerHeight", Variant::Integer(0));
             set_window_property_storage(runtime, handle, "focusedLayer", Variant::Null);
             runtime.set_object_member(handle, "fullScreen", Variant::Integer(0));
+            set_window_property_storage(runtime, handle, "zoomNumer", Variant::Integer(100));
+            set_window_property_storage(runtime, handle, "zoomDenom", Variant::Integer(100));
             let children = runtime.alloc_array_object(Vec::new());
             runtime
                 .host_mut()
@@ -513,6 +515,7 @@ fn alloc_menu_item_object(
     runtime.set_object_member(handle, "visible", Variant::Integer(1));
     runtime.set_object_member(handle, "radio", Variant::Integer(0));
     runtime.set_object_member(handle, "group", Variant::Integer(0));
+    runtime.set_object_member(handle, "parent", Variant::Void);
     let children = runtime.alloc_array_object(Vec::new());
     runtime.set_object_member(handle, "children", Variant::Object(children));
     handle
@@ -553,6 +556,7 @@ fn menu_item_add(
     let item = args.into_iter().next().unwrap_or_default();
     let children = menu_item_children(runtime, this_obj, "MenuItem.add")?;
     runtime.array_push(children, item.clone());
+    menu_item_set_parent(runtime, this_obj, &item);
     Ok(item)
 }
 
@@ -570,6 +574,7 @@ fn menu_item_insert(
         .max(0) as usize;
     let children = menu_item_children(runtime, this_obj, "MenuItem.insert")?;
     runtime.array_insert(children, index, item.clone());
+    menu_item_set_parent(runtime, this_obj, &item);
     Ok(item)
 }
 
@@ -581,6 +586,9 @@ fn menu_item_remove(
     let item = args.into_iter().next().unwrap_or_default();
     let children = menu_item_children(runtime, this_obj, "MenuItem.remove")?;
     runtime.array_remove_value(children, &item);
+    if let Variant::Object(child) = &item {
+        runtime.set_object_member(*child, "parent", Variant::Void);
+    }
     Ok(Variant::Void)
 }
 
@@ -590,8 +598,28 @@ fn menu_item_clear(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let children = menu_item_children(runtime, this_obj, "MenuItem.clear")?;
+    let items = runtime
+        .array_elements(children)
+        .map(<[Variant]>::to_vec)
+        .unwrap_or_default();
+    for item in items {
+        if let Variant::Object(child) = item {
+            runtime.set_object_member(child, "parent", Variant::Void);
+        }
+    }
     runtime.array_clear(children);
     Ok(Variant::Void)
+}
+
+fn menu_item_set_parent(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    item: &Variant,
+) {
+    let (Some(this), Variant::Object(child)) = (this_obj, item) else {
+        return;
+    };
+    runtime.set_object_member(*child, "parent", Variant::Object(this));
 }
 
 fn menu_item_noop(
@@ -823,6 +851,7 @@ fn set_window_size_members(
 
 fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     register_native_method_preserving_script(runtime, handle, "finalize", layer_void);
+    register_native_method_preserving_script(runtime, handle, "asLayer", layer_as_layer);
     register_native_method_preserving_script(runtime, handle, "loadImages", layer_load_images);
     register_native_method_preserving_script(
         runtime,
@@ -4084,6 +4113,17 @@ fn layer_void(
     Ok(Variant::Void)
 }
 
+fn layer_as_layer(
+    _runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    // krkr base scripts call `asLayer()` on layer wrappers to obtain the
+    // underlying native layer; our script layers are native layers, so the
+    // receiver itself is the answer.
+    Ok(this_obj.map(Variant::Object).unwrap_or_default())
+}
+
 fn layer_on_click(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -5571,6 +5611,7 @@ pub(crate) static WINDOW_CLASS: NativeClassSpec = NativeClassSpec {
 pub(crate) static LAYER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Layer",
     methods: &[
+        "asLayer",
         "moveBefore",
         "moveBehind",
         "bringToBack",

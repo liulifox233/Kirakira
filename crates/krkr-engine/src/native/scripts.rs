@@ -27,6 +27,7 @@ pub(crate) fn install_scripts(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(scripts, "getClassNames", scripts_get_class_names);
     runtime.register_object_native(scripts, "getObjectKeys", scripts_get_object_keys);
     runtime.register_object_native(scripts, "getObjectCount", scripts_get_object_count);
+    runtime.register_object_native(scripts, "foreach", scripts_foreach);
     runtime.set_object_member(scripts, "pfMemberEnsure", Variant::Integer(0x0000_0200));
     runtime.set_object_member(scripts, "pfMemberMustExist", Variant::Integer(0x0000_0400));
     runtime.set_object_member(scripts, "pfIgnoreProp", Variant::Integer(0x0000_0800));
@@ -195,6 +196,55 @@ fn scripts_get_class_names(
     Ok(Variant::Object(runtime.alloc_array_object(values)))
 }
 
+fn scripts_foreach(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    // Mirrors the environment helper: clones the collection like
+    // `new Array().assign(collection)` and invokes
+    // func(elements[i], elements[i + 1], collection, *extra) for each pair.
+    let Some(collection) = args.first().cloned() else {
+        return Ok(Variant::Void);
+    };
+    if matches!(collection, Variant::Void | Variant::Null) {
+        return Ok(Variant::Void);
+    }
+    let Some(func) = args.get(1).cloned() else {
+        return Ok(Variant::Void);
+    };
+    let elements = match &collection {
+        Variant::Object(handle) => {
+            if let Some(items) = runtime.array_elements(*handle) {
+                items.to_vec()
+            } else {
+                // krkrz dictionaries only carry user members on the instance;
+                // the injected helper methods are not iterated.
+                runtime
+                    .object_members(*handle)
+                    .into_iter()
+                    .filter(|(key, _)| !is_hidden_member_name(key))
+                    .flat_map(|(key, value)| [Variant::String(key), value])
+                    .collect()
+            }
+        }
+        _ => Vec::new(),
+    };
+    let count = elements.len();
+    let mut index = 0;
+    while index < count {
+        let mut call_args = vec![
+            elements[index].clone(),
+            elements.get(index + 1).cloned().unwrap_or_default(),
+            collection.clone(),
+        ];
+        call_args.extend(args.iter().skip(2).cloned());
+        runtime.call_function(func.clone(), call_args)?;
+        index += 2;
+    }
+    Ok(Variant::Void)
+}
+
 fn scripts_get_object_keys(
     runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -264,6 +314,7 @@ fn is_hidden_member_name(key: &str) -> bool {
                 | "join"
                 | "sort"
                 | "reverse"
+                | "find"
                 | "count"
                 | "length"
         )
