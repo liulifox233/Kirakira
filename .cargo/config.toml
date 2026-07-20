@@ -1,0 +1,4 @@
+# Nix clang's SDK lacks the libiconv stub (and macOS no longer ships
+# /usr/lib/libiconv.dylib), so link with Apple's toolchain instead.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/clang"
