@@ -20,7 +20,7 @@ use crate::host::{
 };
 use crate::scheduler::AsyncTriggerMode;
 
-use super::register_stub_method;
+use super::{native_void, register_stub_method};
 
 pub(crate) fn install_native_class(
     runtime: &mut Runtime<KrkrHost>,
@@ -387,12 +387,19 @@ fn apply_constructor_defaults(
             set_layer_property_storage(runtime, handle, "enabled", Variant::Integer(1));
             set_layer_property_storage(runtime, handle, "nodeEnabled", Variant::Integer(1));
             set_layer_property_storage(runtime, handle, "nodeVisible", Variant::Integer(1));
+            set_layer_property_storage(runtime, handle, "callOnPaint", Variant::Integer(0));
             set_layer_property_storage(runtime, handle, "opacity", Variant::Integer(255));
             set_layer_property_storage(
                 runtime,
                 handle,
                 "type",
                 Variant::Integer(if is_primary { 1 } else { 2 }),
+            );
+            set_layer_property_storage(
+                runtime,
+                handle,
+                "neutralColor",
+                Variant::Integer(if is_primary { 0xffff_ffff } else { 0x00ff_ffff }),
             );
             set_layer_property_storage(runtime, handle, "face", Variant::Integer(128));
             set_layer_property_storage(runtime, handle, "hitType", Variant::Integer(0));
@@ -1034,6 +1041,9 @@ const LAYER_NATIVE_PROPERTIES: &[&str] = &[
     "showParentHint",
     "enabled",
     "nodeEnabled",
+    "callOnPaint",
+    "neutralColor",
+    "hasImage",
     "font",
 ];
 
@@ -1113,6 +1123,13 @@ fn layer_native_property_get(
     if matches!(name, "cursorX" | "cursorY") {
         return Ok(layer_cursor_position_value(runtime, this, name));
     }
+    if name == "hasImage" {
+        let has_image = render_layer_target(runtime, this)?
+            .as_ref()
+            .and_then(|target| render_layer_snapshot(runtime, target))
+            .is_some_and(|layer| layer.image.is_some());
+        return Ok(Variant::Integer(i64::from(has_image)));
+    }
     Ok(layer_property_value(runtime, this, name))
 }
 
@@ -1150,8 +1167,30 @@ fn layer_native_property_set(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(());
     };
+    let previous_type = (name == "type")
+        .then(|| {
+            layer_property_value(runtime, this, "type")
+                .to_integer()
+                .ok()
+        })
+        .flatten();
     let value = normalize_layer_property_value(name, value)?;
+    if name == "hasImage" {
+        set_layer_has_image(runtime, this, value.is_truthy())?;
+        return Ok(());
+    }
     set_layer_property_storage(runtime, this, name, value.clone());
+    if name == "type" {
+        let layer_type = value.to_integer()?;
+        if previous_type != Some(layer_type) {
+            set_layer_property_storage(
+                runtime,
+                this,
+                "neutralColor",
+                Variant::Integer(neutral_color_for_layer_type(layer_type)),
+            );
+        }
+    }
     apply_layer_property_to_render(runtime, this, name, &value)
 }
 
@@ -1207,19 +1246,134 @@ fn set_layer_property_storage(
     }
 }
 
+pub(crate) fn set_layer_call_on_paint(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    value: bool,
+) {
+    set_layer_property_storage(
+        runtime,
+        handle,
+        "callOnPaint",
+        Variant::Integer(i64::from(value)),
+    );
+}
+
+pub(crate) fn complete_layer_before_draw(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Result<()> {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    if runtime.host().native_layer(handle).is_none()
+        || !layer_property_value(runtime, handle, "callOnPaint").is_truthy()
+    {
+        return Ok(());
+    }
+
+    // KRKR2 tTJSNI_BaseLayer::BeforeCompletion clears this flag before
+    // immediately dispatching onPaint, so an update issued by onPaint itself
+    // remains pending for the next completion.
+    set_layer_call_on_paint(runtime, handle, false);
+    runtime
+        .call_object_method(handle, "onPaint", Vec::new())
+        .map(|_| ())
+}
+
+fn complete_layer_subtree_before_draw(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    visited: &mut BTreeSet<ObjectHandle>,
+) -> Result<()> {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    if !visited.insert(handle) {
+        return Ok(());
+    }
+    complete_layer_before_draw(runtime, handle)?;
+    for child in runtime.host().native_layer_children(handle) {
+        complete_layer_subtree_before_draw(runtime, child, visited)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn complete_pending_layer_paints(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+    let roots = runtime.host().native_layer_roots();
+    let mut visited = BTreeSet::new();
+    for root in roots {
+        complete_layer_subtree_before_draw(runtime, root, &mut visited)?;
+    }
+    Ok(())
+}
+
 fn normalize_layer_property_value(name: &str, value: Variant) -> Result<Variant> {
     match name {
         "width" | "height" | "imageWidth" | "imageHeight" | "clipWidth" | "clipHeight" => {
             Ok(Variant::Integer(value.to_integer()?.max(0)))
         }
         "opacity" => Ok(Variant::Integer(value.to_integer()?.clamp(0, 255))),
+        "neutralColor" => Ok(Variant::Integer(value.to_integer()? & 0xffff_ffff)),
+        "hasImage" => Ok(Variant::Integer(i64::from(value.is_truthy()))),
         "left" | "top" | "imageLeft" | "imageTop" | "order" | "absolute" | "absoluteOrderMode"
         | "visible" | "nodeVisible" | "enabled" | "nodeEnabled" | "type" | "face" | "hitType"
-        | "hitThreshold" | "cursor" | "isPrimary" | "showParentHint" => {
+        | "hitThreshold" | "cursor" | "isPrimary" | "showParentHint" | "callOnPaint" => {
             Ok(Variant::Integer(value.to_integer()?))
         }
         _ => Ok(value),
     }
+}
+
+fn neutral_color_for_layer_type(layer_type: i64) -> i64 {
+    match layer_type {
+        // KRKR2 tTJSNI_BaseLayer::SetType uses transparent white for these
+        // blend modes.
+        0 | 1 | 2 | 4 | 5 | 6 | 7 | 9 | 15 | 16 | 23 | 25 => 0x00ff_ffff,
+        // Photoshop overlay/hard-light/soft-light use transparent middle gray.
+        18..=20 => 0x0080_8080,
+        // Additive/lighten/screen and the remaining Photoshop modes use
+        // transparent black.
+        _ => 0x0000_0000,
+    }
+}
+
+fn set_layer_has_image(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    has_image: bool,
+) -> Result<()> {
+    let Some(target) = render_layer_target(runtime, handle)? else {
+        return Ok(());
+    };
+    if !has_image {
+        mutate_render_layer(runtime, &target, LayerNode::clear_image);
+        runtime
+            .host_mut()
+            .clear_layer_image_storage_for_target(&target);
+        sync_layer_image_members(runtime, handle, 0, 0);
+        return Ok(());
+    }
+    if render_layer_snapshot(runtime, &target).is_some_and(|layer| layer.image.is_some()) {
+        return Ok(());
+    }
+
+    let width = layer_property_i64(runtime, handle, "imageWidth", 0)?
+        .max(layer_property_i64(runtime, handle, "width", 0)?)
+        .max(1) as u32;
+    let height = layer_property_i64(runtime, handle, "imageHeight", 0)?
+        .max(layer_property_i64(runtime, handle, "height", 0)?)
+        .max(1) as u32;
+    let neutral = layer_property_value(runtime, handle, "neutralColor")
+        .to_integer()
+        .unwrap_or(0x00ff_ffff);
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    let rgba = packed_color_to_rgba(neutral);
+    if rgba != [0, 0, 0, 0] {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&rgba);
+        }
+    }
+    let image = runtime.host_mut().create_layer_image(width, height, pixels);
+    mutate_render_layer(runtime, &target, |layer| layer.set_image(image));
+    sync_layer_image_members(runtime, handle, width as i64, height as i64);
+    Ok(())
 }
 
 fn apply_layer_property_to_render(
@@ -1485,6 +1639,7 @@ fn register_native_method_preserving_script(
 }
 
 fn install_async_trigger_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    runtime.register_object_native(handle, "finalize", native_void);
     runtime.register_object_native(handle, "trigger", async_trigger_trigger);
     runtime.register_object_native(handle, "cancel", async_trigger_cancel);
     register_native_method_preserving_script(runtime, handle, "onFire", async_trigger_on_fire);
@@ -3257,7 +3412,14 @@ fn layer_fill_rect(
         return Ok(Variant::Void);
     };
     let color = required_integer(&args, 4, "Layer.fillRect color")?;
-    let rgba = color_to_rgba(color, None);
+    let rgba = if layer_property_value(runtime, this, "neutralColor")
+        .to_integer()
+        .is_ok_and(|neutral| neutral == color)
+    {
+        packed_color_to_rgba(color)
+    } else {
+        color_to_rgba(color, None)
+    };
     if let Some(target) = target {
         fill_layer_pixels(runtime, &target, x, y, width, height, rgba)?;
         mark_image_modified(runtime, this);
@@ -3328,6 +3490,7 @@ fn layer_piled_copy(
         return Ok(Variant::Void);
     };
 
+    complete_layer_subtree_before_draw(runtime, source_object, &mut BTreeSet::new())?;
     register_kag_layer_slots_from_tjs(runtime);
     let mut layers = Vec::new();
     let mut visited = BTreeSet::new();
@@ -3398,6 +3561,7 @@ fn layer_stretch_copy(
     let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
+    complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
         return Ok(Variant::Void);
     };
@@ -3463,6 +3627,7 @@ fn copy_rect_impl(
     let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
+    complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
         return Ok(Variant::Void);
     };
@@ -3795,7 +3960,10 @@ fn layer_update(
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer.update requires this"))?;
-    runtime.host_mut().request_layer_paint(this);
+    set_layer_property_storage(runtime, this, "callOnPaint", Variant::Integer(1));
+    if !runtime.host_mut().request_layer_paint(this) {
+        set_layer_property_storage(runtime, this, "callOnPaint", Variant::Integer(0));
+    }
     Ok(Variant::Void)
 }
 
@@ -4437,6 +4605,7 @@ fn copy_layer_images(
     dest_target: &LayerRenderTarget,
     source_object: ObjectHandle,
 ) -> Result<()> {
+    complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
         return Ok(());
     };
@@ -4741,6 +4910,16 @@ fn color_to_rgba(color: i64, opacity: Option<i64>) -> [u8; 4] {
         None => ((color >> 24) & 0xff) as u8,
     };
     [r, g, b, a]
+}
+
+fn packed_color_to_rgba(color: i64) -> [u8; 4] {
+    let color = color.max(0) as u32;
+    [
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+        ((color >> 24) & 0xff) as u8,
+    ]
 }
 
 fn mutate_layer_pixels<F>(

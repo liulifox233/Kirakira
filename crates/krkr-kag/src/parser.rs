@@ -1706,7 +1706,11 @@ impl KagParser {
             "emb" => {
                 let expression = self.required_attr_string(&tag, "exp", host)?;
                 let text = host.eval_string(&expression)?;
-                self.push_emb_text(&text)?;
+                let escape = match self.optional_attr_string(&tag, "escape", host)? {
+                    Some(expression) => host.eval_bool(&expression)?,
+                    None => true,
+                };
+                self.push_emb_text(&text, escape)?;
                 Ok(true)
             }
             "jump" => {
@@ -1808,8 +1812,13 @@ impl KagParser {
         }
     }
 
-    fn push_emb_text(&mut self, text: &str) -> Result<()> {
-        self.push_expansion("<emb>", escape_embedded_text(text), None)
+    fn push_emb_text(&mut self, text: &str, escape: bool) -> Result<()> {
+        let source = if escape {
+            escape_embedded_text(text)
+        } else {
+            text.to_owned()
+        };
+        self.push_expansion("<emb>", source, None)
     }
 
     fn pop_macro_arguments(&mut self, span: SourceSpan) -> Result<()> {
@@ -2345,13 +2354,9 @@ impl Scenario {
         let pipe = line.find('|');
         let raw_name = pipe.map_or(line, |index| &line[..index]);
         let name = if raw_name == "*" {
-            previous_label.ok_or_else(|| {
-                KagError::parse_at(
-                    self.storage.clone(),
-                    SourceSpan::new(line_start, line_end),
-                    "first label cannot omit its name",
-                )
-            })?
+            // A leading bare `*` is a valid anonymous scenario entry label in
+            // krkr. Later bare labels continue to alias the preceding label.
+            previous_label.unwrap_or("*")
         } else {
             raw_name
         };
@@ -2970,6 +2975,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_anonymous_first_label() {
+        let mut parser = KagParser::new();
+        parser.set_ignore_cr(true);
+        parser
+            .load_scenario_text("custom.ks", "*\n[setup]\n*named\n[done]")
+            .unwrap();
+        let mut host = TestHost::default();
+
+        assert_eq!(next_with(&mut parser, &mut host).tagname, "setup");
+        assert_eq!(host.labels, vec!["*"]);
+        assert_eq!(next_with(&mut parser, &mut host).tagname, "done");
+        assert_eq!(host.labels, vec!["*", "*named"]);
+    }
+
+    #[test]
     fn skips_tabs_and_suppresses_newline_after_page_break() {
         let mut parser = KagParser::new();
         parser.load_scenario_text("first.ks", "A\tB[p]\nC").unwrap();
@@ -3126,6 +3146,55 @@ mod tests {
         assert_eq!(wait.tagname, "wait");
         assert!(wait.attr("cond").is_none());
         assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
+    }
+
+    #[test]
+    fn emb_escape_false_reparses_generated_kag_tags() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text("first.ks", "[emb escape=false exp=generated]")
+            .unwrap();
+        let mut host = TestHost::default();
+        host.bools.insert("false".into(), false);
+        host.strings
+            .insert("generated".into(), "[generated value=ok]".into());
+
+        let generated = next_with(&mut parser, &mut host);
+        assert_eq!(generated.tagname, "generated");
+        assert_eq!(generated.literal_attr("value"), Some("ok"));
+        assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
+    }
+
+    #[test]
+    fn emb_escape_false_generated_call_restores_expansion_after_return() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text("first.ks", "[emb escape=false exp=generated][after]")
+            .unwrap();
+        let mut host = TestHost::default();
+        host.bools.insert("false".into(), false);
+        host.strings
+            .insert("generated".into(), "[call storage='child.ks']".into());
+        host.sources
+            .insert("child.ks".into(), "[child][return]".into());
+
+        assert_eq!(next_with(&mut parser, &mut host).tagname, "child");
+        assert_eq!(next_with(&mut parser, &mut host).tagname, "after");
+        assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
+    }
+
+    #[test]
+    fn emb_escapes_generated_kag_tags_by_default() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text("first.ks", "[emb exp=generated]")
+            .unwrap();
+        let mut host = TestHost::default();
+        host.strings
+            .insert("generated".into(), "[generated]".into());
+
+        assert_eq!(lit(&next_with(&mut parser, &mut host), "text"), Some("["));
+        assert_eq!(lit(&next_with(&mut parser, &mut host), "text"), Some("g"));
     }
 
     #[test]

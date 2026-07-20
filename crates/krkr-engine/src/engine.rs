@@ -21,8 +21,9 @@ use crate::{
     host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost},
     kag::{EngineKagHost, tag_to_dictionary},
     native::classes::{
-        apply_completed_image_load, apply_completed_resource_loads,
-        finish_completed_native_transitions, register_kag_layer_slots_from_tjs,
+        apply_completed_image_load, apply_completed_resource_loads, complete_layer_before_draw,
+        complete_pending_layer_paints, finish_completed_native_transitions,
+        register_kag_layer_slots_from_tjs,
     },
     native::{create_kag_parser_object, refresh_kag_parser_object},
     plugin::KrkrPlugin,
@@ -568,6 +569,7 @@ impl KrkrEngine {
         self.resume_modal_call_if_ready()?;
         let tick = self.advance(delta)?;
         self.pump_runtime_scheduler(RuntimeSchedulerPump::WindowUpdatesOnly)?;
+        complete_pending_layer_paints(&mut self.tjs_runtime)?;
         self.tjs_runtime
             .host_mut()
             .reapply_transition_live_layer_overrides();
@@ -932,18 +934,10 @@ impl KrkrEngine {
     }
 
     fn fire_layer_paint_event(&mut self, layer: ObjectHandle) -> Result<()> {
-        if !self.tjs_runtime.object_valid(layer) {
-            return Ok(());
+        if self.tjs_runtime.object_valid(layer) {
+            complete_layer_before_draw(&mut self.tjs_runtime, layer)?;
         }
-        if matches!(
-            self.tjs_runtime.object_member(layer, "onPaint"),
-            Variant::Void
-        ) {
-            return Ok(());
-        }
-        self.tjs_runtime
-            .call_object_method(layer, "onPaint", Vec::new())
-            .map(|_| ())
+        Ok(())
     }
 
     fn deliver_idle_scheduler_event(&mut self) -> Result<bool> {
@@ -3438,6 +3432,100 @@ mod tests {
             .expect("script");
 
         assert_eq!(value, Variant::String("a,b:2".to_string()));
+    }
+
+    #[test]
+    fn scripts_foreach_visits_array_indices_and_dictionary_members() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.foreachOutput = "";
+                Scripts.foreach(["a", "b"], function(index, value, suffix) {
+                    global.foreachOutput += index + "=" + value + suffix;
+                }, ";");
+                var values = %[];
+                values.name = "kirakira";
+                Scripts.foreach(values, function(key, value) {
+                    global.foreachOutput += key + "=" + value;
+                });
+                return global.foreachOutput;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("0=a;1=b;name=kirakira".to_string()));
+    }
+
+    #[test]
+    fn scripts_foreach_stops_on_and_returns_a_non_void_callback_result() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.foreachVisited = "";
+                var result = Scripts.foreach([10, 20, 30], function(index, value) {
+                    global.foreachVisited += value + ",";
+                    if(index == 1) return "stop";
+                });
+                return global.foreachVisited + result;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("10,20,stop".to_string()));
+    }
+
+    #[test]
+    fn scripts_foreach_preserves_anonymous_function_this_context() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Collector {
+                    var output = "";
+                    function collect() {
+                        Scripts.foreach(["a", "b"], function(index, value) {
+                            this.output += index + value;
+                        });
+                        return output;
+                    }
+                }
+                return (new Collector()).collect();
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("0a1b".to_string()));
+    }
+
+    #[test]
+    fn scripts_equal_struct_compares_nested_arrays_and_dictionaries() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var shared = %[name: "kirakira"];
+                return "" +
+                    Scripts.equalStruct(1, 1) + ":" +
+                    Scripts.equalStruct(1, "1") + ":" +
+                    Scripts.equalStruct([1, %[value: [2, 3]]], [1, %[value: [2, 3]]]) + ":" +
+                    Scripts.equalStruct([1, 2], [1, 3]) + ":" +
+                    Scripts.equalStruct(%[a: 1], %[a: 1, b: 2]) + ":" +
+                    Scripts.equalStruct(shared, shared);
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1:0:1:0:0:1".to_string()));
     }
 
     #[test]
@@ -7766,6 +7854,51 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_completion_paints_before_assigning_images() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.paintCount = 0;
+                class PaintedLayer extends Layer {
+                    function PaintedLayer() {
+                        super.Layer();
+                        setImageSize(2, 1);
+                    }
+                    function onPaint() {
+                        global.paintCount++;
+                        fillRect(0, 0, 2, 1, 0xff00ff00);
+                    }
+                }
+
+                var source = new PaintedLayer();
+                var dest = new Layer();
+                dest.visible = true;
+                source.update();
+                var wasPending = source.callOnPaint;
+                dest.assignImages(source);
+                return wasPending + ":" + source.callOnPaint + ":" +
+                    paintCount + ":" + dest.imageWidth + "x" + dest.imageHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:0:1:2x1".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(frame.output.image_uploads.iter().any(|upload| {
+            upload.width == 2
+                && upload.height == 1
+                && upload.rgba.as_ref() == [0, 255, 0, 255, 0, 255, 0, 255]
+        }));
+    }
+
+    #[test]
     fn native_layer_assign_images_copies_source_image_to_destination() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -7815,6 +7948,81 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_has_image_controls_and_guards_image_assignment() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("sprite.png"), 1, 1, &[255, 0, 0, 255]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.loadImages("sprite.png");
+                var dest = new Layer();
+                dest.visible = true;
+                var loaded = source.hasImage;
+                if(source.hasImage) dest.assignImages(source);
+                source.hasImage = false;
+                return loaded + ":" + source.hasImage + ":" + dest.hasImage +
+                    ":" + dest.imageWidth + "x" + dest.imageHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:0:1:1x1".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(frame.output.image_uploads.len(), 1);
+        assert_eq!(
+            frame.output.image_uploads[0].rgba.as_ref(),
+            [255, 0, 0, 255]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_neutral_color_matches_krkr2_defaults_and_blend_types() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.normal = new Layer();
+                normal.setImageSize(1, 1);
+                var alphaNeutral = normal.neutralColor;
+                normal.fillRect(0, 0, 1, 1, normal.neutralColor);
+                var win = new Window();
+                var primary = new Layer(win);
+                var primaryNeutral = primary.neutralColor;
+                normal.type = 3;
+                return alphaNeutral + ":" + primaryNeutral + ":" + normal.neutralColor;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("16777215:4294967295:0".to_string()));
+        let layer_id = engine
+            .execute_expression("inline.tjs", "normal.__nativeLayerId")
+            .expect("layer id")
+            .to_integer()
+            .expect("integer layer id") as u64;
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image");
+        assert_eq!(image.upload.rgba.as_ref(), [255, 255, 255, 0]);
     }
 
     #[test]
@@ -8389,7 +8597,7 @@ mod tests {
                 source.fillRect(0, 0, 1, 1, 0xff0000);
                 source.fillRect(1, 0, 1, 1, 0x00ff00);
                 source.fillRect(0, 1, 1, 1, 0x0000ff);
-                source.fillRect(1, 1, 1, 1, 0xffffff);
+                source.fillRect(1, 1, 1, 1, 0xffffffff);
 
                 global.dest = new Layer();
                 dest.setImageSize(4, 4);

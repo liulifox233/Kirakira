@@ -2,6 +2,7 @@ use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, Runtime, TjsHost, Variant},
 };
+use std::collections::BTreeSet;
 
 use crate::{
     host::KrkrHost,
@@ -28,6 +29,7 @@ pub(crate) fn install_scripts(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(scripts, "getObjectKeys", scripts_get_object_keys);
     runtime.register_object_native(scripts, "getObjectCount", scripts_get_object_count);
     runtime.register_object_native(scripts, "foreach", scripts_foreach);
+    runtime.register_object_native(scripts, "equalStruct", scripts_equal_struct);
     runtime.set_object_member(scripts, "pfMemberEnsure", Variant::Integer(0x0000_0200));
     runtime.set_object_member(scripts, "pfMemberMustExist", Variant::Integer(0x0000_0400));
     runtime.set_object_member(scripts, "pfIgnoreProp", Variant::Integer(0x0000_0800));
@@ -204,9 +206,6 @@ fn scripts_foreach(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    // Mirrors the environment helper: clones the collection like
-    // `new Array().assign(collection)` and invokes
-    // func(elements[i], elements[i + 1], collection, *extra) for each pair.
     let Some(collection) = args.first().cloned() else {
         return Ok(Variant::Void);
     };
@@ -216,36 +215,128 @@ fn scripts_foreach(
     let Some(func) = args.get(1).cloned() else {
         return Ok(Variant::Void);
     };
-    let elements = match &collection {
+    let entries = match &collection {
         Variant::Object(handle) => {
             if let Some(items) = runtime.array_elements(*handle) {
-                items.to_vec()
+                items
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, value)| (Variant::Integer(index as i64), value))
+                    .collect::<Vec<_>>()
             } else {
-                // krkrz dictionaries only carry user members on the instance;
-                // the injected helper methods are not iterated.
                 runtime
                     .object_members(*handle)
                     .into_iter()
                     .filter(|(key, _)| !is_hidden_member_name(key))
-                    .flat_map(|(key, value)| [Variant::String(key), value])
+                    .map(|(key, value)| (Variant::String(key), value))
                     .collect()
             }
         }
         _ => Vec::new(),
     };
-    let count = elements.len();
-    let mut index = 0;
-    while index < count {
-        let mut call_args = vec![
-            elements[index].clone(),
-            elements.get(index + 1).cloned().unwrap_or_default(),
-            collection.clone(),
-        ];
+    for (key, value) in entries {
+        let mut call_args = vec![key, value];
         call_args.extend(args.iter().skip(2).cloned());
-        runtime.call_function(func.clone(), call_args)?;
-        index += 2;
+        let result = runtime.call_function(func.clone(), call_args)?;
+        if !matches!(result, Variant::Void) {
+            return Ok(result);
+        }
     }
     Ok(Variant::Void)
+}
+
+fn scripts_equal_struct(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let lhs = args.first().cloned().unwrap_or(Variant::Void);
+    let rhs = args.get(1).cloned().unwrap_or(Variant::Void);
+    let mut compared = BTreeSet::new();
+    Ok(Variant::Integer(i64::from(equal_struct(
+        runtime,
+        &lhs,
+        &rhs,
+        &mut compared,
+    ))))
+}
+
+fn equal_struct(
+    runtime: &Runtime<KrkrHost>,
+    lhs: &Variant,
+    rhs: &Variant,
+    compared: &mut BTreeSet<(ObjectHandle, ObjectHandle)>,
+) -> bool {
+    let (Some(lhs_handle), Some(rhs_handle)) =
+        (variant_object_handle(lhs), variant_object_handle(rhs))
+    else {
+        return lhs.discern_eq(rhs);
+    };
+    if lhs_handle == rhs_handle {
+        return true;
+    }
+
+    let lhs_array = runtime.array_elements(lhs_handle);
+    let rhs_array = runtime.array_elements(rhs_handle);
+    if let (Some(lhs_items), Some(rhs_items)) = (lhs_array, rhs_array) {
+        if lhs_items.len() != rhs_items.len() {
+            return false;
+        }
+        if !compared.insert((lhs_handle, rhs_handle)) {
+            return true;
+        }
+        let lhs_items = lhs_items.to_vec();
+        let rhs_items = rhs_items.to_vec();
+        return lhs_items
+            .iter()
+            .zip(&rhs_items)
+            .all(|(lhs, rhs)| equal_struct(runtime, lhs, rhs, compared));
+    }
+    if lhs_array.is_some() || rhs_array.is_some() {
+        return false;
+    }
+
+    let lhs_dictionary = is_dictionary(runtime, lhs_handle);
+    let rhs_dictionary = is_dictionary(runtime, rhs_handle);
+    if lhs_dictionary && rhs_dictionary {
+        if !compared.insert((lhs_handle, rhs_handle)) {
+            return true;
+        }
+        let lhs_entries = struct_members(runtime, lhs_handle);
+        let rhs_entries = struct_members(runtime, rhs_handle);
+        return lhs_entries.len() == rhs_entries.len()
+            && lhs_entries.iter().zip(&rhs_entries).all(
+                |((lhs_key, lhs_value), (rhs_key, rhs_value))| {
+                    lhs_key == rhs_key && equal_struct(runtime, lhs_value, rhs_value, compared)
+                },
+            );
+    }
+
+    false
+}
+
+fn variant_object_handle(value: &Variant) -> Option<ObjectHandle> {
+    match value {
+        Variant::Object(handle) => Some(*handle),
+        Variant::Closure(closure) => Some(closure.object),
+        _ => None,
+    }
+}
+
+fn is_dictionary(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> bool {
+    runtime
+        .object_class_infos(handle)
+        .iter()
+        .any(|name| name == "Dictionary")
+}
+
+fn struct_members(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> Vec<(String, Variant)> {
+    runtime
+        .object_members(handle)
+        .into_iter()
+        .filter(|(key, _)| !is_hidden_member_name(key))
+        .collect()
 }
 
 fn scripts_get_object_keys(
