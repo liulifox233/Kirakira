@@ -3,11 +3,11 @@ use std::sync::Arc;
 use crate::bytecode::{BytecodeContextType, CallArgs, CodeObject, Instruction};
 use crate::compiler::compile_source_to_bytecode;
 use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
+use crate::runtime::builtins::{regexp_object_handle, regexp_regex};
 use crate::runtime::{
     Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant, split_delimited_string,
     split_string_by_regex,
 };
-use crate::runtime::builtins::{regexp_object_handle, regexp_regex};
 
 use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form};
 use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
@@ -952,10 +952,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let class_names = self.runtime.heap[class_handle.0].class_infos.clone();
             if !class_names.is_empty() {
                 let instance_names = &self.runtime.heap[instance.0].class_infos;
-                if class_names
-                    .iter()
-                    .any(|name| instance_names.contains(name))
-                {
+                if class_names.iter().any(|name| instance_names.contains(name)) {
                     return Ok(true);
                 }
             }
@@ -970,6 +967,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         args: Vec<Variant>,
     ) -> Result<Variant> {
         self.call_member_direct(Variant::Object(object), name, args, 1)
+    }
+
+    pub fn call_variant_method(
+        &mut self,
+        object: Variant,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        self.call_member_direct(object, name, args, 1)
     }
 
     pub fn call_function(&mut self, callee: Variant, args: Vec<Variant>) -> Result<Variant> {
@@ -1161,7 +1167,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 }
             }
             ObjectKind::Ordinary | ObjectKind::Array { .. } | ObjectKind::NativeProperty { .. } => {
-                Err(TjsError::runtime("object is not callable"))
+                let object_type = self.object_debug_type(handle, "object");
+                Err(TjsError::runtime(format!("{object_type} is not callable")))
             }
         }
     }
@@ -1750,8 +1757,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.runtime.heap[handle.0].kind,
             ObjectKind::NativeProperty { .. }
                 | ObjectKind::InterCode {
-                    context:
-                        BytecodeContextType::Property
+                    context: BytecodeContextType::Property
                         | BytecodeContextType::PropertyGetter
                         | BytecodeContextType::PropertySetter,
                     ..

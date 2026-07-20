@@ -18,11 +18,11 @@ fn main() {
         .collect();
     names.sort();
     for xp3 in &names {
-        let archive = match krkr_xp3::Xp3Archive::open_file(std::path::Path::new(&game_dir).join(xp3))
-        {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
+        let archive =
+            match krkr_xp3::Xp3Archive::open_file(std::path::Path::new(&game_dir).join(xp3)) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
         for entry in archive.entries() {
             if !(pat.is_empty() || entry.name.to_lowercase().contains(&pat)) {
                 continue;

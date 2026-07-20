@@ -75,7 +75,7 @@ fn main() {
 
 fn dump_logs(engine: &KrkrEngine) {
     let logs = engine.host().logs();
-    let start = logs.len().saturating_sub(80);
+    let start = logs.len().saturating_sub(500);
     println!("---host logs (last {})---", logs.len() - start);
     for line in &logs[start..] {
         println!("log: {line}");

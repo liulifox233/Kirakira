@@ -18,7 +18,7 @@ use krkr_tjs2::{
 };
 
 use crate::{
-    resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId},
+    resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId, decode_image_bytes},
     scheduler::{AsyncTriggerMode, TvpScheduler},
     storage::{
         ProjectStorage, decode_text_storage, io_error as storage_io_error,
@@ -1197,17 +1197,10 @@ impl KrkrHost {
 
         let data = self.project_storage()?.read_binary_storage(name)?;
         let bytes = data.as_bytes().map_err(storage_io_error)?;
-        let decoded = image::load_from_memory(&bytes)
-            .map_err(|error| {
-                TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
-            })?
-            .to_rgba8();
-        let width = decoded.width();
-        let height = decoded.height();
-        let rgba = Arc::<[u8]>::from(decoded.into_raw());
+        let decoded = decode_image_bytes(&bytes, name).map_err(TjsError::runtime)?;
         let texture_id = self.next_texture_id;
         self.next_texture_id = self.next_texture_id.saturating_add(1);
-        let image = LayerImage::new(texture_id, width, height, rgba);
+        let image = LayerImage::new(texture_id, decoded.width, decoded.height, decoded.rgba);
         self.image_cache.insert(name.to_string(), image.clone());
         Ok(image)
     }

@@ -169,7 +169,8 @@ fn register_shadowed_zero_property(
         handle,
         name,
         move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
-            if let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle)) {
+            if let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+            {
                 let value = runtime.object_member(this, name);
                 if !runtime.variant_is_property(&value) && !matches!(value, Variant::Void) {
                     return Ok(value);
@@ -178,7 +179,8 @@ fn register_shadowed_zero_property(
             Ok(Variant::Integer(0))
         },
         move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, value: Variant| {
-            if let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle)) {
+            if let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+            {
                 runtime.set_object_member(this, name, value);
             }
             Ok(())

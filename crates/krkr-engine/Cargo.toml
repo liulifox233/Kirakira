@@ -13,4 +13,5 @@ krkr-font.workspace = true
 krkr-kag.workspace = true
 krkr-tjs2.workspace = true
 krkr-xp3.workspace = true
+libtlg-rs.workspace = true
 memmap2.workspace = true

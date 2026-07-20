@@ -960,11 +960,18 @@ impl KrkrEngine {
                 );
             }
             IdleEvent::ContinuousHandlers(handlers) => {
+                let tick = self.tjs_runtime.host_mut().now_millis();
                 for handler in handlers {
                     if matches!(handler, Variant::Void) {
                         continue;
                     }
-                    self.tjs_runtime.call_function(handler, Vec::new())?;
+                    self.tjs_runtime
+                        .call_function(handler.clone(), vec![Variant::Integer(tick)])
+                        .map_err(|error| {
+                            TjsError::runtime(format!(
+                                "continuous handler {handler:?} failed: {error}"
+                            ))
+                        })?;
                     if self.tjs_runtime.is_suspended()
                         || self
                             .tjs_runtime
@@ -994,20 +1001,6 @@ impl KrkrEngine {
             return Ok(());
         }
 
-        if matches!(
-            event.kind,
-            ScriptEventKind::Timer | ScriptEventKind::AsyncTrigger
-        ) {
-            let callback = self.tjs_runtime.object_member(event.target, "__callback");
-            if !matches!(callback, Variant::Void) {
-                let result = self
-                    .tjs_runtime
-                    .call_function(callback, event.args)
-                    .map(|_| ());
-                return self.sync_kag_slots_after_ok(result);
-            }
-        }
-
         let method = match event.kind {
             ScriptEventKind::Timer => TIMER_EVENT_NAME,
             ScriptEventKind::AsyncTrigger => ASYNC_TRIGGER_EVENT_NAME,
@@ -1023,6 +1016,12 @@ impl KrkrEngine {
         let result = self
             .tjs_runtime
             .call_object_method(event.target, method, event.args)
+            .map_err(|error| {
+                TjsError::runtime(format!(
+                    "{:?} event `{method}` on object#{} failed: {error}",
+                    event.kind, event.target.0
+                ))
+            })
             .map(|_| ());
         self.sync_kag_slots_after_ok(result)
     }
@@ -11456,6 +11455,41 @@ mod tests {
     }
 
     #[test]
+    fn async_trigger_invokes_named_owner_action_with_method_receiver() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "async_action_owner.tjs",
+                r#"
+                global.actionOwner = new Dictionary();
+                actionOwner.count = 0;
+                actionOwner.namedAction = function() { this.count += 1; };
+                actionOwner.action = function() { this.count += 10; };
+                global.namedTrigger = new AsyncTrigger(actionOwner, "namedAction");
+                global.defaultTrigger = new AsyncTrigger(actionOwner);
+                namedTrigger.trigger();
+                defaultTrigger.trigger();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        let Variant::Object(owner) = engine.tjs_runtime().global_member("actionOwner") else {
+            panic!("action owner missing");
+        };
+        assert_eq!(
+            engine.tjs_runtime().object_member(owner, "count"),
+            Variant::Integer(11)
+        );
+    }
+
+    #[test]
     fn system_continuous_handler_runs_once_per_update_until_removed() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -11496,6 +11530,51 @@ mod tests {
         assert_eq!(
             engine.tjs_runtime().global_member("continuousCount"),
             Variant::Integer(2)
+        );
+    }
+
+    #[test]
+    fn system_continuous_handler_preserves_method_receiver_and_tick_argument() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "continuous_method.tjs",
+                r#"
+                class ContinuousOwner {
+                    var count = 0;
+                    var lastTick = -1;
+                    function ContinuousOwner() {
+                        System.addContinuousHandler(callback);
+                    }
+                    function callback(tick) {
+                        count++;
+                        lastTick = tick;
+                    }
+                }
+                global.continuousOwner = new ContinuousOwner();
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(16),
+            )
+            .expect("update");
+        let Variant::Object(owner) = engine.tjs_runtime().global_member("continuousOwner") else {
+            panic!("continuous owner missing");
+        };
+        assert_eq!(
+            engine.tjs_runtime().object_member(owner, "count"),
+            Variant::Integer(1)
+        );
+        assert!(
+            engine
+                .tjs_runtime()
+                .object_member(owner, "lastTick")
+                .to_integer()
+                .is_ok_and(|tick| tick >= 0)
         );
     }
 

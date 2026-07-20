@@ -41,9 +41,7 @@ fn new_psb_value_instance(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
 
 fn psb_value_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
     let handle = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>,
-         this_obj: Option<ObjectHandle>,
-         _args: Vec<Variant>| {
+        |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, _args: Vec<Variant>| {
             let instance = this_obj
                 .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
                 .filter(|handle| *handle != runtime.global_handle())
@@ -59,9 +57,7 @@ fn psb_value_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
 
 fn psb_file_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
     let handle = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>,
-         this_obj: Option<ObjectHandle>,
-         _args: Vec<Variant>| {
+        |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, _args: Vec<Variant>| {
             let instance = this_obj
                 .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
                 .filter(|handle| *handle != runtime.global_handle())
@@ -95,8 +91,7 @@ fn psb_file_load(
     };
     match runtime.host().read_binary_storage(storage) {
         Ok(_data) => {
-            if let Some(this) =
-                this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+            if let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
             {
                 let root = new_psb_value_instance(runtime);
                 runtime.set_object_member(this, "root", Variant::Object(root));

@@ -167,9 +167,9 @@ const GDIPLUS_ENUM_CONSTANTS: &[(&str, i64)] = &[
     ("HatchStyleOutlinedDiamond", 51),
     ("HatchStyleSolidDiamond", 52),
     ("HatchStyleTotal", 53),
-    ("HatchStyleLargeGrid", 4),  // HatchStyleCross
-    ("HatchStyleMin", 0),        // HatchStyleHorizontal
-    ("HatchStyleMax", 52),       // HatchStyleSolidDiamond
+    ("HatchStyleLargeGrid", 4), // HatchStyleCross
+    ("HatchStyleMin", 0),       // HatchStyleHorizontal
+    ("HatchStyleMax", 52),      // HatchStyleSolidDiamond
     // LinearGradientMode
     ("LinearGradientModeHorizontal", 0),
     ("LinearGradientModeVertical", 1),
@@ -247,9 +247,9 @@ fn add_private_font(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = arg_string(&args, 0);
-    runtime
-        .host_mut()
-        .log(&format!("layerExDraw.dll: GdiPlus.addPrivateFont({name}) is a no-op"));
+    runtime.host_mut().log(&format!(
+        "layerExDraw.dll: GdiPlus.addPrivateFont({name}) is a no-op"
+    ));
     Ok(Variant::Void)
 }
 
@@ -332,7 +332,13 @@ fn rect_f_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
 
 /// Builds a RectF-shaped object exactly the way the RectF constructor does;
 /// used for every `GdiPlus.RectF` value returned from Layer draw methods.
-fn new_rect_f(runtime: &mut Runtime<KrkrHost>, x: f64, y: f64, width: f64, height: f64) -> ObjectHandle {
+fn new_rect_f(
+    runtime: &mut Runtime<KrkrHost>,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> ObjectHandle {
     let handle = runtime.alloc_ordinary_object();
     runtime.add_object_class_info(handle, "RectF");
     install_rect_f_members(runtime, handle);
@@ -398,7 +404,9 @@ fn install_rect_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
         "bounds",
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
             let rect = this_rect(runtime, this_obj);
-            Ok(Variant::Object(new_rect_f(runtime, rect[0], rect[1], rect[2], rect[3])))
+            Ok(Variant::Object(new_rect_f(
+                runtime, rect[0], rect[1], rect[2], rect[3],
+            )))
         },
         keep_setter,
     );
@@ -441,7 +449,9 @@ fn rect_clone(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let rect = this_rect(runtime, this_obj);
-    Ok(Variant::Object(new_rect_f(runtime, rect[0], rect[1], rect[2], rect[3])))
+    Ok(Variant::Object(new_rect_f(
+        runtime, rect[0], rect[1], rect[2], rect[3],
+    )))
 }
 
 fn rect_equals(
@@ -510,7 +520,9 @@ fn rect_is_empty_area(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let rect = this_rect(runtime, this_obj);
-    Ok(Variant::Integer(i64::from(rect[2] <= 0.0 || rect[3] <= 0.0)))
+    Ok(Variant::Integer(i64::from(
+        rect[2] <= 0.0 || rect[3] <= 0.0,
+    )))
 }
 
 fn rect_offset(
@@ -637,7 +649,11 @@ fn matrix_mul(a: [f64; 6], b: [f64; 6]) -> [f64; 6] {
 }
 
 /// GDI+ prepend semantics: `transform` is applied before the current matrix.
-fn matrix_premultiply(runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, transform: [f64; 6]) {
+fn matrix_premultiply(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    transform: [f64; 6],
+) {
     if let Some(this) = this_obj {
         let matrix = this_matrix(runtime, Some(this));
         store_matrix(runtime, this, matrix_mul(transform, matrix));
@@ -679,14 +695,18 @@ fn matrix_set_elements(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     if let Some(this) = this_obj {
-        store_matrix(runtime, this, [
-            arg_real(&args, 0),
-            arg_real(&args, 1),
-            arg_real(&args, 2),
-            arg_real(&args, 3),
-            arg_real(&args, 4),
-            arg_real(&args, 5),
-        ]);
+        store_matrix(
+            runtime,
+            this,
+            [
+                arg_real(&args, 0),
+                arg_real(&args, 1),
+                arg_real(&args, 2),
+                arg_real(&args, 3),
+                arg_real(&args, 4),
+                arg_real(&args, 5),
+            ],
+        );
     }
     Ok(Variant::Void)
 }
@@ -700,14 +720,18 @@ fn matrix_invert(
         let m = this_matrix(runtime, Some(this));
         let det = m[0] * m[3] - m[1] * m[2];
         if det != 0.0 {
-            store_matrix(runtime, this, [
-                m[3] / det,
-                -m[1] / det,
-                -m[2] / det,
-                m[0] / det,
-                (m[2] * m[5] - m[3] * m[4]) / det,
-                (m[1] * m[4] - m[0] * m[5]) / det,
-            ]);
+            store_matrix(
+                runtime,
+                this,
+                [
+                    m[3] / det,
+                    -m[1] / det,
+                    -m[2] / det,
+                    m[0] / det,
+                    (m[2] * m[5] - m[3] * m[4]) / det,
+                    (m[1] * m[4] - m[0] * m[5]) / det,
+                ],
+            );
         }
     }
     Ok(Variant::Void)
@@ -729,7 +753,9 @@ fn matrix_is_invertible(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let m = this_matrix(runtime, this_obj);
-    Ok(Variant::Integer(i64::from(m[0] * m[3] - m[1] * m[2] != 0.0)))
+    Ok(Variant::Integer(i64::from(
+        m[0] * m[3] - m[1] * m[2] != 0.0,
+    )))
 }
 
 fn matrix_multiply(
@@ -922,7 +948,11 @@ fn font_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
             let instance = fresh_instance(runtime, this_obj);
             runtime.add_object_class_info(instance, "Font");
             install_font_members(runtime, instance);
-            runtime.set_object_member(instance, "familyName", Variant::String(arg_string(&args, 0)));
+            runtime.set_object_member(
+                instance,
+                "familyName",
+                Variant::String(arg_string(&args, 0)),
+            );
             runtime.set_object_member(instance, "emSize", Variant::Real(arg_real(&args, 1)));
             runtime.set_object_member(instance, "style", Variant::Integer(arg_int(&args, 2)));
             Ok(Variant::Object(instance))
@@ -989,7 +1019,10 @@ fn appearance_add_brush(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     if let Some(Variant::Object(brush)) = args.first() {
-        let brush_type = runtime.object_member(*brush, "type").to_integer().unwrap_or(0);
+        let brush_type = runtime
+            .object_member(*brush, "type")
+            .to_integer()
+            .unwrap_or(0);
         if !(0..=4).contains(&brush_type) {
             return Err(TjsError::runtime("invalid brush type"));
         }
@@ -1083,13 +1116,48 @@ fn install_layer_ex_draw(runtime: &mut Runtime<KrkrHost>) {
     // height into the returned RectF (argument positions per the reference
     // LayerExDraw.hpp signatures; drawImage's size comes from the zero-sized
     // stub image, and drawImageRect copies unscaled so swidth/sheight apply).
-    register_unless_closure(runtime, layer, "drawArc", layer_draw_rect(Some(1), Some(2), Some(3), Some(4)));
-    register_unless_closure(runtime, layer, "drawPie", layer_draw_rect(Some(1), Some(2), Some(3), Some(4)));
-    register_unless_closure(runtime, layer, "drawEllipse", layer_draw_rect(Some(1), Some(2), Some(3), Some(4)));
-    register_unless_closure(runtime, layer, "drawRectangle", layer_draw_rect(Some(1), Some(2), Some(3), Some(4)));
-    register_unless_closure(runtime, layer, "drawImage", layer_draw_rect(Some(0), Some(1), None, None));
-    register_unless_closure(runtime, layer, "drawImageRect", layer_draw_rect(Some(0), Some(1), Some(5), Some(6)));
-    register_unless_closure(runtime, layer, "drawImageStretch", layer_draw_rect(Some(0), Some(1), Some(2), Some(3)));
+    register_unless_closure(
+        runtime,
+        layer,
+        "drawArc",
+        layer_draw_rect(Some(1), Some(2), Some(3), Some(4)),
+    );
+    register_unless_closure(
+        runtime,
+        layer,
+        "drawPie",
+        layer_draw_rect(Some(1), Some(2), Some(3), Some(4)),
+    );
+    register_unless_closure(
+        runtime,
+        layer,
+        "drawEllipse",
+        layer_draw_rect(Some(1), Some(2), Some(3), Some(4)),
+    );
+    register_unless_closure(
+        runtime,
+        layer,
+        "drawRectangle",
+        layer_draw_rect(Some(1), Some(2), Some(3), Some(4)),
+    );
+    register_unless_closure(
+        runtime,
+        layer,
+        "drawImage",
+        layer_draw_rect(Some(0), Some(1), None, None),
+    );
+    register_unless_closure(
+        runtime,
+        layer,
+        "drawImageRect",
+        layer_draw_rect(Some(0), Some(1), Some(5), Some(6)),
+    );
+    register_unless_closure(
+        runtime,
+        layer,
+        "drawImageStretch",
+        layer_draw_rect(Some(0), Some(1), Some(2), Some(3)),
+    );
     for name in [
         "drawPath",
         "drawBezier",
@@ -1107,10 +1175,20 @@ fn install_layer_ex_draw(runtime: &mut Runtime<KrkrHost>) {
         "drawString",
         "drawImageAffine",
     ] {
-        register_unless_closure(runtime, layer, name, layer_draw_rect(None, None, None, None));
+        register_unless_closure(
+            runtime,
+            layer,
+            name,
+            layer_draw_rect(None, None, None, None),
+        );
     }
     register_unless_closure(runtime, layer, "measureString", layer_measure_string);
-    register_unless_closure(runtime, layer, "measureStringInternal", layer_measure_string);
+    register_unless_closure(
+        runtime,
+        layer,
+        "measureStringInternal",
+        layer_measure_string,
+    );
 
     register_unless_closure(runtime, layer, "getRecordImage", native_void);
     register_unless_closure(runtime, layer, "redrawRecord", zero);
@@ -1238,7 +1316,10 @@ fn this_real(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, name: 
 
 fn variant_real(runtime: &Runtime<KrkrHost>, value: Option<&Variant>, name: &str) -> f64 {
     match value {
-        Some(Variant::Object(handle)) => runtime.object_member(*handle, name).to_real().unwrap_or(0.0),
+        Some(Variant::Object(handle)) => runtime
+            .object_member(*handle, name)
+            .to_real()
+            .unwrap_or(0.0),
         _ => 0.0,
     }
 }

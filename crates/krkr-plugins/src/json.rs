@@ -455,7 +455,11 @@ fn strtod(text: &str) -> f64 {
             len = exp;
         }
     }
-    chars[..len].iter().collect::<String>().parse().unwrap_or(0.0)
+    chars[..len]
+        .iter()
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +810,10 @@ mod tests {
             parse_json("-9223372036854775809").unwrap(),
             JValue::Integer(i64::MIN)
         );
-        assert_eq!(parse_json("-9223372036854775808").unwrap(), JValue::Integer(i64::MIN));
+        assert_eq!(
+            parse_json("-9223372036854775808").unwrap(),
+            JValue::Integer(i64::MIN)
+        );
     }
 
     #[test]
@@ -955,6 +962,9 @@ mod tests {
         assert!(!looks_utf16le(b"{\"a\":1}"));
         assert_eq!(decode_storage_text(b"{\"a\":1}", false), "{\"a\":1}");
         // utf8 flag forces UTF-8 decoding.
-        assert_eq!(decode_storage_text(&utf16_nobom, true), String::from_utf8_lossy(&utf16_nobom));
+        assert_eq!(
+            decode_storage_text(&utf16_nobom, true),
+            String::from_utf8_lossy(&utf16_nobom)
+        );
     }
 }

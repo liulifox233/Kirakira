@@ -668,8 +668,7 @@ fn array_split<H: TjsHost + 'static>(
         .is_some_and(Variant::is_truthy);
     if let Some(regexp) = regexp_object_handle(runtime, &args[0]) {
         let regex = regexp_regex(runtime, regexp)?;
-        runtime.heap[handle.0] =
-            Object::array(split_string_by_regex(&string, &regex, purge_empty));
+        runtime.heap[handle.0] = Object::array(split_string_by_regex(&string, &regex, purge_empty));
         install_array_methods(runtime, handle);
         return Ok(Variant::Object(handle));
     }
@@ -1561,9 +1560,9 @@ fn regexp_compile_internal<H: TjsHost + 'static>(
     }
     let source = args[0].to_tjs_string()?;
     // Internal literal format used by precompiled bytecode: `//flags/expression`.
-    let body = source.strip_prefix("//").ok_or_else(|| {
-        TjsError::runtime("RegExp._compile: expression must start with `//`")
-    })?;
+    let body = source
+        .strip_prefix("//")
+        .ok_or_else(|| TjsError::runtime("RegExp._compile: expression must start with `//`"))?;
     let slash = body.find('/').ok_or_else(|| {
         TjsError::runtime("RegExp._compile: expression is missing the flag terminator")
     })?;
@@ -1628,7 +1627,10 @@ fn regexp_match<H: TjsHost + 'static>(
     Ok(Variant::Object(runtime.alloc_array_object(values)))
 }
 
-pub(crate) fn regexp_regex<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) -> Result<regex::Regex> {
+pub(crate) fn regexp_regex<H: TjsHost>(
+    runtime: &Runtime<H>,
+    handle: ObjectHandle,
+) -> Result<regex::Regex> {
     let pattern = runtime.heap[handle.0]
         .get("pattern")
         .to_tjs_string()
