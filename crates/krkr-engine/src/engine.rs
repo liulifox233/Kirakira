@@ -8253,6 +8253,38 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_transition_notifies_secondary_tjs_base_class() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class TransitionHook {
+                    function onTransitionCompleted(dest, src) {
+                        this.window.completed++;
+                    }
+                }
+                class TransitionLayer extends Layer, TransitionHook {
+                    function TransitionLayer(window) { super.Layer(window); }
+                }
+
+                global.window = %[transCount: 1, completed: 0, inTransition: 0];
+                global.dest = new TransitionLayer(window);
+                dest.window = window;
+                dest.inTransition = true;
+                dest.beginTransition("crossfade", false, null, %[time: 0]);
+                return window.completed + ":" + dest.inTransition + ":" + window.transCount;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("1:0:0".to_string()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn native_layer_replacing_transition_completes_previous_transition() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
