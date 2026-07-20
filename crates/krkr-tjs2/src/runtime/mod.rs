@@ -527,6 +527,20 @@ impl<H: TjsHost + 'static> Runtime<H> {
         vm.call_object_method(object, name, args)
     }
 
+    /// Invoke a method declared by a secondary TJS class extender, if one
+    /// exists. TJS keeps every extender's class name on the instance even
+    /// though the ordinary superclass link can represent only one chain.
+    pub fn call_secondary_class_method(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<bool> {
+        let file_id = self.call_context_file_id();
+        let mut vm = Vm::new(file_id, self)?;
+        vm.call_secondary_class_method(object, name, args)
+    }
+
     pub fn call_variant_method(
         &mut self,
         object: Variant,

@@ -71,6 +71,15 @@ fn construct_native_instance(
         install_methods(runtime, handle, spec.name, spec.methods);
         install_special_methods(runtime, handle, spec.name);
     }
+    // `onTransitionCompleted` is a native event, not an instance method
+    // implementation.  Keeping the placeholder installed by `Layer` on the
+    // instance shadows overrides supplied by script base classes (for example
+    // BaseLayerBase in KAGWindow).  Leave the no-op declaration on the Layer
+    // class itself for `SUPER.onTransitionCompleted()`, but let normal member
+    // lookup reach the script override for an instance.
+    if spec.name == "Layer" {
+        runtime.delete_object_member(handle, "onTransitionCompleted");
+    }
     install_properties(runtime, handle, spec.properties);
     apply_constructor_defaults(runtime, handle, spec.name, &args)?;
     install_instance_native_properties(runtime, handle, spec.name);
@@ -931,12 +940,13 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
         "stopTransition",
         layer_stop_transition,
     );
-    register_native_method_preserving_script(
-        runtime,
-        handle,
-        "onTransitionCompleted",
-        layer_on_transition_completed,
-    );
+    // Keep a no-op declaration on the native Layer class so a script override
+    // may safely call `SUPER.onTransitionCompleted()`.  Constructor instances
+    // remove their own declaration below, allowing the actual script method
+    // to be found through normal inheritance.
+    if runtime.object_super_class(handle).is_none() {
+        runtime.register_object_native(handle, "onTransitionCompleted", native_void);
+    }
     register_native_method_preserving_script(runtime, handle, "fillRect", layer_fill_rect);
     register_native_method_preserving_script(runtime, handle, "colorRect", layer_color_rect);
     register_native_method_preserving_script(runtime, handle, "copyRect", layer_copy_rect);
@@ -3141,7 +3151,7 @@ fn layer_begin_transition(
         {
             source_layer.renderable = false;
         }
-        finish_immediate_transition(runtime, this);
+        finish_immediate_transition(runtime, this, source)?;
     } else {
         runtime.host_mut().begin_native_transition(
             Duration::from_millis(duration),
@@ -4407,26 +4417,6 @@ fn layer_on_click(
         .map(|_| Variant::Void)
 }
 
-fn layer_on_transition_completed(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
-) -> Result<Variant> {
-    let this = this_obj
-        .map(|this| runtime.bound_this(this).unwrap_or(this))
-        .ok_or_else(|| TjsError::runtime("Layer.onTransitionCompleted requires this"))?;
-    let owner = runtime.object_member(this, "__actionOwner");
-    if let Variant::Object(owner) = owner
-        && !matches!(
-            runtime.object_member(owner, "onTransitionCompleted"),
-            Variant::Void
-        )
-    {
-        runtime.call_object_method(owner, "onTransitionCompleted", args)?;
-    }
-    Ok(Variant::Void)
-}
-
 fn layer_on_hit_test(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -4729,21 +4719,39 @@ fn variant_object(value: &Variant) -> Option<ObjectHandle> {
     }
 }
 
-fn finish_immediate_transition(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) {
-    runtime.set_object_member(layer, "inTransition", Variant::Integer(0));
+fn finish_immediate_transition(
+    runtime: &mut Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    source: Option<ObjectHandle>,
+) -> Result<()> {
     let Some(window) = variant_object(&layer_property_value(runtime, layer, "window"))
         .map(|window| runtime.bound_this(window).unwrap_or(window))
     else {
-        return;
+        return Ok(());
     };
-    let Ok(trans_count) = runtime.object_member(window, "transCount").to_integer() else {
-        return;
-    };
-    runtime.set_object_member(
-        window,
-        "transCount",
-        Variant::Integer(trans_count.saturating_sub(1).max(0)),
-    );
+    let trans_count_before = runtime
+        .object_member(window, "transCount")
+        .to_integer()
+        .ok();
+    notify_transition_completed(runtime, layer, source)?;
+    finish_kag_window_transition_if_pending(runtime, layer)?;
+    let callback_consumed_transition = trans_count_before.is_some_and(|before| {
+        runtime
+            .object_member(window, "transCount")
+            .to_integer()
+            .is_ok_and(|after| after != before)
+    });
+    if !callback_consumed_transition {
+        runtime.set_object_member(layer, "inTransition", Variant::Integer(0));
+        if let Some(trans_count) = trans_count_before {
+            runtime.set_object_member(
+                window,
+                "transCount",
+                Variant::Integer(trans_count.saturating_sub(1).max(0)),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn finish_current_transition(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
@@ -4782,28 +4790,15 @@ pub(crate) fn finish_native_transition(
             .ok()
     });
 
-    if !matches!(
-        runtime.object_member(completion.dest, "onTransitionCompleted"),
-        Variant::Void
-    ) {
-        let source = completion
-            .source
-            .filter(|source| runtime.object_valid(*source))
-            .map(Variant::Object)
-            .unwrap_or_default();
-        runtime.call_object_method(
-            completion.dest,
-            "onTransitionCompleted",
-            vec![Variant::Object(completion.dest), source],
-        )?;
-        if completion.paired_comp
-            && let Some(source) = completion.source
-            && runtime.object_valid(source)
-        {
-            let visible = Variant::Integer(1);
-            set_layer_property_storage(runtime, source, "visible", visible.clone());
-            apply_layer_property_to_render(runtime, source, "visible", &visible)?;
-        }
+    notify_transition_completed(runtime, completion.dest, completion.source)?;
+    finish_kag_window_transition_if_pending(runtime, completion.dest)?;
+    if completion.paired_comp
+        && let Some(source) = completion.source
+        && runtime.object_valid(source)
+    {
+        let visible = Variant::Integer(1);
+        set_layer_property_storage(runtime, source, "visible", visible.clone());
+        apply_layer_property_to_render(runtime, source, "visible", &visible)?;
     }
 
     let callback_consumed_transition =
@@ -4828,6 +4823,78 @@ pub(crate) fn finish_native_transition(
         }
     }
     Ok(())
+}
+
+fn notify_transition_completed(
+    runtime: &mut Runtime<KrkrHost>,
+    dest: ObjectHandle,
+    source: Option<ObjectHandle>,
+) -> Result<()> {
+    let source = source
+        .filter(|source| runtime.object_valid(*source))
+        .map(Variant::Object)
+        .unwrap_or_default();
+    let callback_args = vec![Variant::Object(dest), source];
+    if !matches!(
+        runtime.object_member(dest, "onTransitionCompleted"),
+        Variant::Void
+    ) {
+        runtime.call_object_method(dest, "onTransitionCompleted", callback_args)?;
+    } else if !runtime.call_secondary_class_method(
+        dest,
+        "onTransitionCompleted",
+        callback_args.clone(),
+    )? {
+        // A plain Layer still exposes the native no-op through its primary
+        // class chain, preserving the event's optional nature.
+        runtime.call_object_method(dest, "onTransitionCompleted", callback_args)?;
+    }
+    Ok(())
+}
+
+fn finish_kag_window_transition_if_pending(
+    runtime: &mut Runtime<KrkrHost>,
+    layer: ObjectHandle,
+) -> Result<()> {
+    let Some(window) = variant_object(&layer_property_value(runtime, layer, "window"))
+        .map(|window| runtime.bound_this(window).unwrap_or(window))
+    else {
+        return Ok(());
+    };
+    if !runtime.object_member(window, "inTransition").is_truthy()
+        || !kag_window_transition_base(runtime, window, layer)
+        || matches!(
+            runtime.object_member(window, "onTransitionEnd"),
+            Variant::Void
+        )
+    {
+        return Ok(());
+    }
+
+    // KAG's BaseLayerBase receives Layer.onTransitionCompleted and normally
+    // relays it to KAGWindow.onTransitionEnd.  A secondary TJS class extender
+    // can make that relay unavailable to the instance lookup, so preserve the
+    // native event contract at the KAG boundary rather than leaving its
+    // conductor suspended forever.
+    runtime
+        .call_object_method(window, "onTransitionEnd", Vec::new())
+        .map(|_| ())
+}
+
+fn kag_window_transition_base(
+    runtime: &Runtime<KrkrHost>,
+    window: ObjectHandle,
+    layer: ObjectHandle,
+) -> bool {
+    ["_forebase", "_backbase"]
+        .into_iter()
+        .any(|name| variant_object(&runtime.object_member(window, name)) == Some(layer))
+        || ["fore", "back"].into_iter().any(|name| {
+            let Some(page) = variant_object(&runtime.object_member(window, name)) else {
+                return false;
+            };
+            variant_object(&runtime.object_member(page, "base")) == Some(layer)
+        })
 }
 
 fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
