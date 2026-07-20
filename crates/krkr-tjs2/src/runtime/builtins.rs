@@ -48,6 +48,7 @@ fn native_regexp<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = runtime.alloc_object(Object::default());
+    runtime.add_object_class_info(handle, "RegExp");
     if let Some(pattern) = args.first() {
         runtime.heap[handle.0].set("pattern", pattern.clone());
     } else {
@@ -685,6 +686,38 @@ fn array_sort<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.sort")?;
+    if let Some(comparator @ (Variant::Object(_) | Variant::Closure(_) | Variant::CodeObject(_))) =
+        args.first()
+    {
+        let mut elements = runtime.heap[handle.0]
+            .array_elements()
+            .ok_or_else(|| TjsError::runtime("Array.sort called on a non-array object"))?
+            .to_vec();
+
+        // TJS accepts a function as the first argument and interprets its
+        // truthy return value as `lhs < rhs`. Use insertion sort here because
+        // Rust's standard sorting callbacks cannot return script errors.
+        for index in 1..elements.len() {
+            let mut current = index;
+            while current > 0 {
+                let less = runtime
+                    .call_function(
+                        comparator.clone(),
+                        vec![elements[current].clone(), elements[current - 1].clone()],
+                    )?
+                    .is_truthy();
+                if !less {
+                    break;
+                }
+                elements.swap(current, current - 1);
+                current -= 1;
+            }
+        }
+
+        runtime.heap[handle.0] = Object::array(elements);
+        install_array_methods(runtime, handle);
+        return Ok(Variant::Void);
+    }
     let mode = args
         .first()
         .filter(|value| !matches!(value, Variant::Void))

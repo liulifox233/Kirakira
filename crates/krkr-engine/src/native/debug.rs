@@ -27,10 +27,10 @@ fn debug_message(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let message = args
-        .first()
+        .iter()
         .map(Variant::to_tjs_string)
-        .transpose()?
-        .unwrap_or_default();
+        .collect::<Result<Vec<_>>>()?
+        .join(" ");
     runtime.host_mut().log(&message);
     Ok(Variant::Void)
 }

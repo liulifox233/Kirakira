@@ -852,6 +852,13 @@ impl KrkrHost {
             .unwrap_or_default()
     }
 
+    pub(crate) fn native_layer_roots(&self) -> Vec<ObjectHandle> {
+        self.native_layers
+            .iter()
+            .filter_map(|(handle, instance)| instance.parent.is_none().then_some(*handle))
+            .collect()
+    }
+
     pub(crate) fn set_native_layer_parent(
         &mut self,
         handle: ObjectHandle,
@@ -1108,8 +1115,8 @@ impl KrkrHost {
         self.scheduler.cancel_audio_fade_completion(handle);
     }
 
-    pub(crate) fn request_layer_paint(&mut self, handle: ObjectHandle) {
-        self.scheduler.post_window_update(handle);
+    pub(crate) fn request_layer_paint(&mut self, handle: ObjectHandle) -> bool {
+        self.scheduler.post_window_update(handle)
     }
 
     pub(crate) fn add_continuous_handler(&mut self, handler: Variant) {

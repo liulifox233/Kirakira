@@ -218,6 +218,22 @@ mod tests {
     }
 
     #[test]
+    fn array_sort_accepts_a_script_comparison_function() {
+        assert_eq!(
+            execute_source(
+                "array_sort_function.tjs",
+                r#"
+                var values = [[2, "second"], [1, "first"], [2, "third"]];
+                values.sort(function(a, b) { return a[0] < b[0]; }, true);
+                return values[0][1] + ":" + values[1][1] + ":" + values[2][1];
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("first:second:third".to_string())
+        );
+    }
+
+    #[test]
     fn execute_source_assigns_sparse_array_index() {
         assert_eq!(
             execute_source("inline.tjs", "var a = []; a[30] = false; return a.count;")
@@ -511,6 +527,24 @@ mod tests {
             )
             .expect("execute"),
             Variant::String("2:Windows NT 10.0:10.0:0".to_string())
+        );
+    }
+
+    #[test]
+    fn regexp_values_report_regexp_class_identity() {
+        assert_eq!(
+            execute_source(
+                "regexp_instanceof.tjs",
+                r#"
+                var literal = /^title_/;
+                var constructed = new RegExp("^title_");
+                return (literal instanceof "RegExp") + ":" +
+                    (constructed instanceof "RegExp") + ":" +
+                    literal.match("title_image").count;
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("1:1:1".to_string())
         );
     }
 

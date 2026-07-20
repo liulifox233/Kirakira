@@ -180,7 +180,7 @@ impl TvpScheduler {
         self.input_events.pop_front()
     }
 
-    pub(crate) fn post_window_update(&mut self, handle: ObjectHandle) {
+    pub(crate) fn post_window_update(&mut self, handle: ObjectHandle) -> bool {
         let queued = self
             .window_update_events
             .iter()
@@ -190,7 +190,7 @@ impl TvpScheduler {
             if queued == 0 {
                 self.window_update_events.push_back(handle);
             }
-            return;
+            return true;
         }
 
         let active = usize::from(self.active_window_update == Some(handle));
@@ -201,6 +201,12 @@ impl TvpScheduler {
             .unwrap_or(0);
         if active + delivered + queued < 2 {
             self.window_update_events.push_back(handle);
+            true
+        } else {
+            // A queued event will still complete the pending paint. If only
+            // the active event remains, the per-delivery recursion limit has
+            // discarded this repost and no completion is pending.
+            queued != 0
         }
     }
 

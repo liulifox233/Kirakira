@@ -408,7 +408,24 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         match inst.opcode {
             0 | 127 => {}
             1 => {
-                let value = self.data_slot_value(object, inst.operands[1])?;
+                let mut value = self.data_slot_value(object, inst.operands[1])?;
+                if let Variant::Closure(closure) = &mut value
+                    && closure.this_obj.is_none()
+                    && frame.this_obj != Some(self.runtime.global)
+                    && matches!(
+                        self.runtime.heap[closure.object.0].kind,
+                        ObjectKind::InterCode {
+                            context: BytecodeContextType::ExprFunction,
+                            ..
+                        }
+                    )
+                {
+                    // Expression functions created inside an object method
+                    // retain that context. Top-level expression functions
+                    // remain unbound so assigning one to an object member can
+                    // bind ObjThis to that destination, as krkr does.
+                    closure.this_obj = frame.this_obj;
+                }
                 frame.set(inst.operands[0], value)?;
             }
             2 => {
