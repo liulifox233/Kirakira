@@ -6562,6 +6562,77 @@ mod tests {
     }
 
     #[test]
+    fn later_layer_super_constructor_reparents_the_native_layer() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("child.png"), 1, 1, &[255, 255, 255, 255]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class DeferredLayer extends Layer {
+                    function DeferredLayer(owner, parent) {
+                        super.Layer();
+                        super.Layer(owner, parent);
+                    }
+                }
+                global.ownerProbe = new Window();
+                global.rootProbe = new Layer(ownerProbe, null);
+                global.parentProbe = new Layer(ownerProbe, rootProbe);
+                global.childProbe = new DeferredLayer(ownerProbe, parentProbe);
+                ownerProbe.visible = true;
+                rootProbe.visible = true;
+                parentProbe.visible = false;
+                childProbe.loadImages("child.png");
+                childProbe.visible = true;
+                "#,
+            )
+            .expect("script");
+
+        let Variant::Object(parent) = engine.tjs_runtime().global_member("parentProbe") else {
+            panic!("parent missing");
+        };
+        let Variant::Object(child) = engine.tjs_runtime().global_member("childProbe") else {
+            panic!("child missing");
+        };
+        let parent_id = engine
+            .host()
+            .native_layer(parent)
+            .expect("parent native layer");
+        let child_id = engine
+            .host()
+            .native_layer(child)
+            .expect("child native layer");
+        assert_eq!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(child_id)
+                .expect("child node")
+                .parent,
+            Some(parent_id)
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("frame");
+        assert!(
+            !frame
+                .output
+                .draw_commands
+                .iter()
+                .any(|command| matches!(command, krkr_core::DrawCommand::Image(_)))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn native_font_methods_measure_and_layer_draw_text_updates_pixels() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let result = engine

@@ -773,7 +773,43 @@ impl KrkrHost {
         primary: bool,
     ) -> LayerId {
         if let Some(instance) = self.native_layers.get(&handle) {
-            return instance.layer_id;
+            let layer_id = instance.layer_id;
+            let old_parent = instance.parent;
+
+            // A script subclass may call an intermediate `super.Layer()`
+            // before its base class forwards the real `(owner, parent)` pair.
+            // KRKR attaches the native instance when that latter constructor
+            // runs.  Do not keep the temporary, ownerless root created by the
+            // first call: it causes child controls (notably quick-menu
+            // buttons) to escape their hidden parent layer.
+            if window.is_some() || parent.is_some() {
+                if let Some(old_parent) = old_parent
+                    && Some(old_parent) != parent
+                {
+                    self.remove_native_layer_child(old_parent, handle);
+                }
+                if let Some(new_parent) = parent
+                    && old_parent != Some(new_parent)
+                {
+                    self.add_native_layer_child(new_parent, handle);
+                }
+                if let Some(instance) = self.native_layers.get_mut(&handle) {
+                    if window.is_some() {
+                        instance.window = window;
+                    }
+                    instance.parent = parent;
+                    instance.children_array = children_array.or(instance.children_array);
+                }
+                let render_parent = parent.and_then(|parent| self.native_layer(parent));
+                self.layer_tree.set_parent(layer_id, render_parent);
+                if parent.is_some() {
+                    let z_order = self.next_sibling_z_order(render_parent);
+                    if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
+                        layer.z_order = z_order;
+                    }
+                }
+            }
+            return layer_id;
         }
 
         let parent_layer = parent.and_then(|parent| self.native_layer(parent));
