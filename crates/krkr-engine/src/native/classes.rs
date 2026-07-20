@@ -347,93 +347,109 @@ fn apply_constructor_defaults(
                 variant_object(&window).map(|window| runtime.bound_this(window).unwrap_or(window));
             let parent_object =
                 variant_object(&parent).map(|parent| runtime.bound_this(parent).unwrap_or(parent));
-            let is_primary =
-                window_object.is_some() && matches!(parent, Variant::Void | Variant::Null);
-            let stored_window = window_object
-                .map(Variant::Object)
-                .unwrap_or_else(|| window.clone());
-            let stored_parent = parent_object
-                .map(Variant::Object)
-                .unwrap_or_else(|| parent.clone());
-            let children = runtime.alloc_array_object(Vec::new());
-            let layer_id = runtime.host_mut().register_native_layer(
-                handle,
-                format!("native:{}", handle.0),
-                window_object,
-                parent_object,
-                Some(children),
-                is_primary,
-            );
-            set_layer_property_storage(runtime, handle, "window", stored_window.clone());
-            set_layer_property_storage(runtime, handle, "parent", stored_parent.clone());
-            runtime.set_object_member(handle, "__nativeLayerId", Variant::Integer(layer_id as i64));
-            set_layer_property_storage(runtime, handle, "children", Variant::Object(children));
-            set_layer_property_storage(runtime, handle, "left", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "top", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "width", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "height", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "imageWidth", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "imageHeight", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "order", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "absoluteOrderMode", Variant::Integer(0));
-            set_layer_property_storage(
-                runtime,
-                handle,
-                "visible",
-                Variant::Integer(i64::from(is_primary)),
-            );
-            set_layer_property_storage(runtime, handle, "enabled", Variant::Integer(1));
-            set_layer_property_storage(runtime, handle, "nodeEnabled", Variant::Integer(1));
-            set_layer_property_storage(runtime, handle, "nodeVisible", Variant::Integer(1));
-            set_layer_property_storage(runtime, handle, "callOnPaint", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "opacity", Variant::Integer(255));
-            set_layer_property_storage(
-                runtime,
-                handle,
-                "type",
-                Variant::Integer(if is_primary { 1 } else { 2 }),
-            );
-            set_layer_property_storage(
-                runtime,
-                handle,
-                "neutralColor",
-                Variant::Integer(if is_primary { 0xffff_ffff } else { 0x00ff_ffff }),
-            );
-            set_layer_property_storage(runtime, handle, "face", Variant::Integer(128));
-            set_layer_property_storage(runtime, handle, "hitType", Variant::Integer(0));
-            set_layer_property_storage(
-                runtime,
-                handle,
-                "hitThreshold",
-                Variant::Integer(if is_primary { 0 } else { 16 }),
-            );
-            set_layer_property_storage(
-                runtime,
-                handle,
-                "isPrimary",
-                Variant::Integer(i64::from(is_primary)),
-            );
-            runtime.set_object_member(handle, "focusable", Variant::Integer(0));
-            runtime.set_object_member(handle, "joinFocusChain", Variant::Integer(1));
-            runtime.set_object_member(handle, "focused", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "cursor", Variant::Integer(0));
-            set_layer_property_storage(runtime, handle, "hint", Variant::String(String::new()));
-            set_layer_property_storage(runtime, handle, "showParentHint", Variant::Integer(1));
-            let font = construct_native_instance(runtime, &FONT_CLASS, None, Vec::new())?;
-            set_layer_property_storage(runtime, handle, "font", font);
-            if is_primary && let Some(window) = window_object {
-                set_window_property_storage(
-                    runtime,
-                    window,
-                    "primaryLayer",
-                    Variant::Object(handle),
+            let preserve_existing_attachment = window_object.is_none()
+                && parent_object.is_none()
+                && (runtime.host().native_layer_window(handle).is_some()
+                    || runtime.host().native_layer_parent(handle).is_some());
+            if !preserve_existing_attachment {
+                let is_primary =
+                    window_object.is_some() && matches!(parent, Variant::Void | Variant::Null);
+                let stored_window = window_object
+                    .map(Variant::Object)
+                    .unwrap_or_else(|| window.clone());
+                let stored_parent = parent_object
+                    .map(Variant::Object)
+                    .unwrap_or_else(|| parent.clone());
+                runtime.set_object_member(handle, "__actionOwner", stored_window.clone());
+                let children = runtime.alloc_array_object(Vec::new());
+                let layer_id = runtime.host_mut().register_native_layer(
+                    handle,
+                    format!("native:{}", handle.0),
+                    window_object,
+                    parent_object,
+                    Some(children),
+                    is_primary,
                 );
-            }
-            if let Some(parent) = parent_object {
-                let children = ensure_child_array(runtime, parent);
-                runtime.array_push(children, Variant::Object(handle));
+                set_layer_property_storage(runtime, handle, "window", stored_window.clone());
+                set_layer_property_storage(runtime, handle, "parent", stored_parent.clone());
+                runtime.set_object_member(
+                    handle,
+                    "__nativeLayerId",
+                    Variant::Integer(layer_id as i64),
+                );
+                set_layer_property_storage(runtime, handle, "children", Variant::Object(children));
+                set_layer_property_storage(runtime, handle, "left", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "top", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "width", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "height", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "imageWidth", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "imageHeight", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "order", Variant::Integer(0));
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "absoluteOrderMode",
+                    Variant::Integer(0),
+                );
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "visible",
+                    Variant::Integer(i64::from(is_primary)),
+                );
+                set_layer_property_storage(runtime, handle, "enabled", Variant::Integer(1));
+                set_layer_property_storage(runtime, handle, "nodeEnabled", Variant::Integer(1));
+                set_layer_property_storage(runtime, handle, "nodeVisible", Variant::Integer(1));
+                set_layer_property_storage(runtime, handle, "callOnPaint", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "opacity", Variant::Integer(255));
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "type",
+                    Variant::Integer(if is_primary { 1 } else { 2 }),
+                );
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "neutralColor",
+                    Variant::Integer(if is_primary { 0xffff_ffff } else { 0x00ff_ffff }),
+                );
+                set_layer_property_storage(runtime, handle, "face", Variant::Integer(128));
+                set_layer_property_storage(runtime, handle, "hitType", Variant::Integer(0));
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "hitThreshold",
+                    Variant::Integer(if is_primary { 0 } else { 16 }),
+                );
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "isPrimary",
+                    Variant::Integer(i64::from(is_primary)),
+                );
+                runtime.set_object_member(handle, "focusable", Variant::Integer(0));
+                runtime.set_object_member(handle, "joinFocusChain", Variant::Integer(1));
+                runtime.set_object_member(handle, "focused", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "cursor", Variant::Integer(0));
+                set_layer_property_storage(runtime, handle, "hint", Variant::String(String::new()));
+                set_layer_property_storage(runtime, handle, "showParentHint", Variant::Integer(1));
+                let font = construct_native_instance(runtime, &FONT_CLASS, None, Vec::new())?;
+                set_layer_property_storage(runtime, handle, "font", font);
+                if is_primary && let Some(window) = window_object {
+                    set_window_property_storage(
+                        runtime,
+                        window,
+                        "primaryLayer",
+                        Variant::Object(handle),
+                    );
+                }
+                if let Some(parent) = parent_object {
+                    let children = ensure_child_array(runtime, parent);
+                    runtime.array_push(children, Variant::Object(handle));
+                }
             }
         }
         "Font" => {
@@ -914,6 +930,12 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
         handle,
         "stopTransition",
         layer_stop_transition,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "onTransitionCompleted",
+        layer_on_transition_completed,
     );
     register_native_method_preserving_script(runtime, handle, "fillRect", layer_fill_rect);
     register_native_method_preserving_script(runtime, handle, "colorRect", layer_color_rect);
@@ -4385,6 +4407,26 @@ fn layer_on_click(
         .map(|_| Variant::Void)
 }
 
+fn layer_on_transition_completed(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj
+        .map(|this| runtime.bound_this(this).unwrap_or(this))
+        .ok_or_else(|| TjsError::runtime("Layer.onTransitionCompleted requires this"))?;
+    let owner = runtime.object_member(this, "__actionOwner");
+    if let Variant::Object(owner) = owner
+        && !matches!(
+            runtime.object_member(owner, "onTransitionCompleted"),
+            Variant::Void
+        )
+    {
+        runtime.call_object_method(owner, "onTransitionCompleted", args)?;
+    }
+    Ok(Variant::Void)
+}
+
 fn layer_on_hit_test(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -4731,6 +4773,15 @@ pub(crate) fn finish_native_transition(
         exchange_native_layer_info(runtime, completion.dest, source)?;
     }
 
+    let window = variant_object(&layer_property_value(runtime, completion.dest, "window"))
+        .map(|window| runtime.bound_this(window).unwrap_or(window));
+    let trans_count_before = window.and_then(|window| {
+        runtime
+            .object_member(window, "transCount")
+            .to_integer()
+            .ok()
+    });
+
     if !matches!(
         runtime.object_member(completion.dest, "onTransitionCompleted"),
         Variant::Void
@@ -4753,11 +4804,20 @@ pub(crate) fn finish_native_transition(
             set_layer_property_storage(runtime, source, "visible", visible.clone());
             apply_layer_property_to_render(runtime, source, "visible", &visible)?;
         }
-    } else {
+    }
+
+    let callback_consumed_transition =
+        window
+            .zip(trans_count_before)
+            .is_some_and(|(window, before)| {
+                runtime
+                    .object_member(window, "transCount")
+                    .to_integer()
+                    .is_ok_and(|after| after != before)
+            });
+    if !callback_consumed_transition {
         runtime.set_object_member(completion.dest, "inTransition", Variant::Integer(0));
-        if let Some(window) =
-            variant_object(&layer_property_value(runtime, completion.dest, "window"))
-                .map(|window| runtime.bound_this(window).unwrap_or(window))
+        if let Some(window) = window
             && let Ok(trans_count) = runtime.object_member(window, "transCount").to_integer()
         {
             runtime.set_object_member(
