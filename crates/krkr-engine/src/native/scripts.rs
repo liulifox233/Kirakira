@@ -100,6 +100,9 @@ fn read_binary_struct_storage(
     if bytes.starts_with(b"KBAD100\0") {
         return runtime.decode_binary_struct(&bytes);
     }
+    if bytes.starts_with(b"TJS/ns0\0") || bytes.starts_with(b"TJS/4s0\0") {
+        return runtime.decode_tjs_ns0(&bytes);
+    }
     Ok(None)
 }
 
