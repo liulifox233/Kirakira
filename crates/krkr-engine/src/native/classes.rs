@@ -1772,16 +1772,25 @@ fn wave_sound_buffer_stop(
     Ok(Variant::Void)
 }
 
-fn call_wave_status_changed(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) -> Result<()> {
-    if matches!(
-        runtime.object_member(this, "onStatusChanged"),
-        Variant::Void
-    ) {
+pub(crate) fn call_wave_status_changed(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+) -> Result<()> {
+    let callback = runtime.object_member(this, "onStatusChanged");
+    if !matches!(callback, Variant::Void) && !runtime.variant_is_native_function(&callback) {
+        return runtime
+            .call_object_method(this, "onStatusChanged", Vec::new())
+            .map(|_| ());
+    }
+    if runtime.call_secondary_class_method(this, "onStatusChanged", Vec::new())? {
         return Ok(());
     }
-    runtime
-        .call_object_method(this, "onStatusChanged", Vec::new())
-        .map(|_| ())
+    if !matches!(callback, Variant::Void) {
+        runtime
+            .call_object_method(this, "onStatusChanged", Vec::new())
+            .map(|_| ())?;
+    }
+    Ok(())
 }
 
 fn wave_sound_buffer_stop_fade(

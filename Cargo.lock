@@ -1193,6 +1193,7 @@ dependencies = [
 name = "krkr-plugins"
 version = "0.1.0"
 dependencies = [
+ "krkr-audio",
  "krkr-core",
  "krkr-engine",
  "krkr-tjs2",

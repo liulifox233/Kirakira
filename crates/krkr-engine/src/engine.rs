@@ -21,9 +21,9 @@ use crate::{
     host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost},
     kag::{EngineKagHost, tag_to_dictionary},
     native::classes::{
-        apply_completed_image_load, apply_completed_resource_loads, complete_layer_before_draw,
-        complete_pending_layer_paints, finish_completed_native_transitions,
-        register_kag_layer_slots_from_tjs,
+        apply_completed_image_load, apply_completed_resource_loads, call_wave_status_changed,
+        complete_layer_before_draw, complete_pending_layer_paints,
+        finish_completed_native_transitions, register_kag_layer_slots_from_tjs,
     },
     native::{create_kag_parser_object, refresh_kag_parser_object},
     plugin::KrkrPlugin,
@@ -538,17 +538,7 @@ impl KrkrEngine {
             .set_object_member(handle, "status", Variant::String("stop".to_string()));
         self.tjs_runtime
             .set_object_member(handle, "paused", Variant::Integer(0));
-        if matches!(
-            self.tjs_runtime.object_member(handle, "onStatusChanged"),
-            Variant::Void
-        ) {
-            return Ok(());
-        }
-
-        let result = self
-            .tjs_runtime
-            .call_object_method(handle, "onStatusChanged", Vec::new())
-            .map(|_| ());
+        let result = call_wave_status_changed(&mut self.tjs_runtime, handle);
         self.sync_kag_slots_after_ok(result)
     }
 
@@ -10607,6 +10597,36 @@ mod tests {
             Variant::Integer(1)
         );
 
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wave_sound_buffer_notifies_secondary_tjs_base_status_handler() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("voice.ogg"), b"voice bytes").expect("write audio bytes");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class KAGSoundBuffer {
+                    function onStatusChanged() { this.statusChanges++; }
+                }
+                class KAGWaveSoundBuffer extends WaveSoundBuffer, KAGSoundBuffer {
+                    function KAGWaveSoundBuffer() { super.WaveSoundBuffer(); }
+                }
+                global.buffer = new KAGWaveSoundBuffer();
+                buffer.statusChanges = 0;
+                buffer.open("voice.ogg");
+                buffer.play();
+                return buffer.statusChanges;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::Integer(1));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
