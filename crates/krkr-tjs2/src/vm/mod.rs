@@ -103,6 +103,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.run_call_stack(vec![frame], base_depth)
     }
 
+    pub(super) fn execute_file_object_with_this_at(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+        code_offset: usize,
+        args: Vec<Variant>,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<Variant> {
+        let base_depth = self.runtime.call_depth;
+        let mut frame =
+            self.create_call_frame(file_id, object_index, args, this_obj, Continuation::Root)?;
+        frame.pc = frame
+            .offset_to_index
+            .get(&code_offset)
+            .copied()
+            .ok_or_else(|| {
+                TjsError::runtime(format!("invalid bytecode entry offset {code_offset}"))
+            })?;
+        self.run_call_stack(vec![frame], base_depth)
+    }
+
     pub(super) fn execute_object_with_this(
         &mut self,
         object_index: usize,
