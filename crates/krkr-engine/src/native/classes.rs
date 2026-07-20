@@ -486,6 +486,10 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "volume", Variant::Integer(100000));
             runtime.set_object_member(handle, "pan", Variant::Integer(0));
             runtime.set_object_member(handle, "looping", Variant::Integer(0));
+            // KRKR's BGM helper records the effective loop mode in flags[0].
+            // It assumes this mutable array exists on every sound buffer.
+            let flags = runtime.alloc_array_object(vec![Variant::Integer(0)]);
+            runtime.set_object_member(handle, "flags", Variant::Object(flags));
             set_wave_property_storage(
                 runtime,
                 handle,
