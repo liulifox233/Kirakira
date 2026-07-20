@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 krkr-engine.workspace = true
 krkr-tjs2.workspace = true
+
+[dev-dependencies]
+krkr-core.workspace = true

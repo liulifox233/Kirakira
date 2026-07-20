@@ -479,7 +479,7 @@ impl KrkrHost {
         self.project_storage()?.read_binary_storage(name)
     }
 
-    fn write_text_storage(&mut self, name: &str, mode: &str, text: &str) -> Result<()> {
+    pub fn write_text_storage(&mut self, name: &str, mode: &str, text: &str) -> Result<()> {
         let result = self.project_storage()?.write_text_storage(name, mode, text);
         if result.is_ok() {
             self.invalidate_resource_state();
@@ -487,7 +487,7 @@ impl KrkrHost {
         result
     }
 
-    fn write_binary_storage(&mut self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
+    pub fn write_binary_storage(&mut self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
         let result = self
             .project_storage()?
             .write_binary_storage(name, mode, bytes);

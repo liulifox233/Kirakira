@@ -209,6 +209,15 @@ pub(crate) fn tag_to_dictionary(
     runtime.add_object_class_info(object, "Dictionary");
     runtime.set_object_member(object, "tagname", Variant::String(tag.tagname.clone()));
     fill_attributes_dictionary(runtime, object, &tag.attributes);
+    // KAGParserEx compatibility: expose the insertion-ordered member name list.
+    let mut taglist = vec![Variant::String("tagname".to_string())];
+    for attribute in &tag.attributes {
+        if let Attribute::Named { name, .. } = attribute {
+            taglist.push(Variant::String(name.clone()));
+        }
+    }
+    let taglist = runtime.alloc_array_object(taglist);
+    runtime.set_object_member(object, "taglist", Variant::Object(taglist));
     Ok(object)
 }
 

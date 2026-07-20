@@ -320,7 +320,7 @@ pub(crate) fn install_array_methods<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "find", array_find::<H>);
 }
 
-fn install_dictionary_methods<H: TjsHost + 'static>(
+pub fn install_dictionary_methods<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     handle: ObjectHandle,
 ) {
