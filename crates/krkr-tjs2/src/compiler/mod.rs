@@ -394,6 +394,28 @@ mod tests {
     }
 
     #[test]
+    fn class_qualified_call_finds_secondary_extender_method() {
+        assert_eq!(
+            execute_source(
+                "mi_qualified_call.tjs",
+                r#"
+                class Pool {}
+                class Action {
+                    function stopAllActions() { return 42; }
+                }
+                class Base extends Pool, Action {}
+                class Child extends Base {
+                    function stop() { return global.Base.stopAllActions(); }
+                }
+                return (new Child()).stop();
+                "#,
+            )
+            .expect("execute"),
+            Variant::Integer(42)
+        );
+    }
+
+    #[test]
     fn string_methods_cover_krkr2_char_trim_reverse_repeat() {
         assert_eq!(
             execute_source(

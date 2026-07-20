@@ -376,7 +376,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
         Ok(None)
     }
-
     fn set_bound_member(&mut self, handle: ObjectHandle, name: &str, value: Variant) {
         let mut value = self.materialize_code_object(value);
         if let Variant::Closure(closure) = &mut value
@@ -869,7 +868,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 callee_type: None,
             })
         })?;
-        let member = if let Some(this_obj) = self.bound_super_this(handle, caller_this)?
+        let mut member = if let Some(this_obj) = self.bound_super_this(handle, caller_this)?
             && self.handle_class_name_matches(handle, name)
         {
             self.runtime.heap[this_obj.0]
@@ -891,6 +890,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 })
             })?
         };
+        // TJS2 emits one entry point per class extender in the superclass
+        // getter. A class-qualified call searches those entries in reverse
+        // declaration order and retains the caller's ObjThis. Keep this
+        // lookup confined to calls: applying it to ordinary property reads
+        // changes the meaning of class initialization.
+        if matches!(member, Variant::Void)
+            && let Some(this_obj) = caller_this
+            && let Some(secondary) = self.secondary_class_member_for_call(handle, this_obj, name)?
+        {
+            member = secondary;
+        }
         let bind_this = self.bound_super_this(handle, caller_this)?;
         let member = self.bind_proxy_value(member, bind_this);
         let callee_type = self.value_debug_type(&member);
@@ -917,6 +927,120 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 callee_type: Some(callee_type),
             })
         })
+    }
+
+    fn secondary_class_member_for_call(
+        &mut self,
+        qualifier: ObjectHandle,
+        instance: ObjectHandle,
+        name: &str,
+    ) -> Result<Option<Variant>> {
+        if !matches!(
+            self.runtime.heap[qualifier.0].kind,
+            ObjectKind::InterCode {
+                context: BytecodeContextType::Class,
+                ..
+            }
+        ) || !self.is_class_in_instance_chain(instance, qualifier)?
+        {
+            return Ok(None);
+        }
+
+        if let Some(member) = self.superclass_getter_member_for_call(qualifier, instance, name)? {
+            return Ok(Some(member));
+        }
+
+        // Source compiled by older Kirakira versions does not retain the
+        // bytecode entry offsets above. Preserve its existing equivalent
+        // fallback while parsed KRKR2/KRKRZ bytecode takes the exact path.
+        let qualifier_names = self.runtime.heap[qualifier.0].class_infos.clone();
+        let instance_names = self.runtime.heap[instance.0].class_infos.clone();
+        let Some(start) = instance_names.iter().position(|instance_name| {
+            qualifier_names
+                .iter()
+                .any(|qualifier_name| qualifier_name == instance_name)
+        }) else {
+            return Ok(None);
+        };
+
+        // `instance_names` is recorded in extender execution order. The
+        // primary superclass chain was already searched above, so only a
+        // later class body can supply the missing member here.
+        for class_name in &instance_names[start + 1..] {
+            let class_handle = match self.runtime.global_member(class_name) {
+                Variant::Object(handle) => handle,
+                Variant::Closure(closure) => closure.object,
+                _ => continue,
+            };
+            if !matches!(
+                self.runtime.heap[class_handle.0].kind,
+                ObjectKind::InterCode {
+                    context: BytecodeContextType::Class,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            if let Some(member) = self.runtime.heap[class_handle.0].get_raw(name) {
+                return Ok(Some(self.bind_proxy_value(member, Some(instance))));
+            }
+        }
+        Ok(None)
+    }
+
+    fn superclass_getter_member_for_call(
+        &mut self,
+        class_handle: ObjectHandle,
+        instance: ObjectHandle,
+        name: &str,
+    ) -> Result<Option<Variant>> {
+        let ObjectKind::InterCode {
+            file_id,
+            object_index,
+            context: BytecodeContextType::Class,
+        } = self.runtime.heap[class_handle.0].kind
+        else {
+            return Ok(None);
+        };
+        let file = self.runtime.script_file(file_id)?;
+        let Some(getter_index) = file.objects[object_index].super_class_getter else {
+            return Ok(None);
+        };
+        let pointers = file.objects[getter_index]
+            .super_class_getter_pointers
+            .clone();
+        if pointers.is_empty() {
+            return Ok(None);
+        }
+
+        for pointer in pointers.into_iter().rev() {
+            let code_offset = usize::try_from(pointer)
+                .map_err(|_| TjsError::runtime("negative superclass getter entry offset"))?;
+            let value = self.execute_file_object_with_this_preserving_active_at(
+                file_id,
+                getter_index,
+                code_offset,
+                Vec::new(),
+                Some(self.runtime.global),
+            )?;
+            let super_handle = self.resolve_object(value)?;
+            if let Some(member) = self.class_member_for_call(super_handle, instance, name)? {
+                return Ok(Some(member));
+            }
+        }
+        Ok(None)
+    }
+
+    fn class_member_for_call(
+        &mut self,
+        class_handle: ObjectHandle,
+        instance: ObjectHandle,
+        name: &str,
+    ) -> Result<Option<Variant>> {
+        if let Some(member) = self.runtime.heap[class_handle.0].get_raw(name) {
+            return Ok(Some(self.bind_proxy_value(member, Some(instance))));
+        }
+        self.superclass_getter_member_for_call(class_handle, instance, name)
     }
 
     fn is_class_in_instance_chain(
@@ -1405,6 +1529,30 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let saved_file = Arc::clone(&self.file);
         let saved_code_handles = self.code_handles.clone();
         let result = self.execute_file_object_with_this(file_id, object_index, args, this_obj);
+        self.file_id = saved_file_id;
+        self.file = saved_file;
+        self.code_handles = saved_code_handles;
+        result
+    }
+
+    fn execute_file_object_with_this_preserving_active_at(
+        &mut self,
+        file_id: usize,
+        object_index: usize,
+        code_offset: usize,
+        args: Vec<Variant>,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<Variant> {
+        let saved_file_id = self.file_id;
+        let saved_file = Arc::clone(&self.file);
+        let saved_code_handles = self.code_handles.clone();
+        let result = self.execute_file_object_with_this_at(
+            file_id,
+            object_index,
+            code_offset,
+            args,
+            this_obj,
+        );
         self.file_id = saved_file_id;
         self.file = saved_file;
         self.code_handles = saved_code_handles;
