@@ -1,5 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
+use krkr_audio::{AudioEvent, AudioStatusLevel, AudioSystem};
 use krkr_core::{DrawCommand, FrameInput, Size};
 use krkr_engine::{EngineInput, KrkrEngine, TransitionPolicy};
 
@@ -36,6 +37,15 @@ fn main() {
         engine.kag_state()
     );
 
+    let mut audio = std::env::var_os("KRKR_PROBE_AUDIO").map(|_| {
+        let mut audio = AudioSystem::new();
+        audio.prepare().expect("audio backend");
+        audio
+            .set_resource_provider(engine.host().resource_provider())
+            .expect("audio provider");
+        audio
+    });
+
     if let Ok(script) = std::env::var("KRKR_PROBE_BEFORE_SCRIPT") {
         engine
             .execute_script("ginka_probe_before.tjs", &script)
@@ -50,6 +60,23 @@ fn main() {
     let delta = Duration::from_millis(1000 / 60);
     let realtime = std::env::var_os("KRKR_PROBE_REALTIME").is_some();
     for frame_index in 0..frames {
+        if let Some(audio) = &mut audio {
+            for event in audio.drain_events() {
+                match event {
+                    AudioEvent::PlaybackStopped { id } => engine
+                        .notify_audio_stopped(id)
+                        .expect("audio completion callback"),
+                    AudioEvent::Status(event) => println!(
+                        "audio_{:?}: {}",
+                        match event.level {
+                            AudioStatusLevel::Warning => "warning",
+                            AudioStatusLevel::Error => "error",
+                        },
+                        event.message
+                    ),
+                }
+            }
+        }
         match engine.update(
             EngineInput::new(
                 FrameInput::new(Size::new(1280.0, 720.0), 1.0 / 60.0),
@@ -58,6 +85,13 @@ fn main() {
             delta,
         ) {
             Ok(frame) => {
+                if let Some(audio) = &mut audio {
+                    audio
+                        .submit_commands(engine.host_mut().take_audio_commands())
+                        .expect("audio commands");
+                } else {
+                    engine.host_mut().take_audio_commands();
+                }
                 let images = frame
                     .output
                     .draw_commands
