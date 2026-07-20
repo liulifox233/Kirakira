@@ -13,3 +13,7 @@ krkr-render.workspace = true
 krkr-engine.workspace = true
 pollster.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+krkr-tjs2.workspace = true
+krkr-xp3.workspace = true
