@@ -10,6 +10,7 @@ use crate::vm::{SuspendedCallStack, Vm};
 pub(crate) mod builtins;
 pub mod object;
 pub mod value;
+pub(crate) mod tjs_ns0;
 
 pub use self::object::{Object, ObjectKind};
 pub use self::value::{Closure, ObjectHandle, Variant};
@@ -481,6 +482,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     pub fn decode_binary_struct(&mut self, bytes: &[u8]) -> Result<Option<Variant>> {
         builtins::decode_binary_struct(self, bytes)
+    }
+
+    pub fn decode_tjs_ns0(&mut self, bytes: &[u8]) -> Result<Option<Variant>> {
+        tjs_ns0::decode_tjs_ns0(self, bytes).map(Some)
     }
 
     pub fn execute_file(&mut self, file: &BytecodeFile) -> Result<Variant> {
