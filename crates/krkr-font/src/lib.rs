@@ -114,17 +114,169 @@ pub struct GlyphImage {
     pub data: Vec<u8>,
 }
 
+const PRERENDERED_FONT_SIGNATURE: &[u8; 22] = b"TVP pre-rendered font\x1a";
+const PRERENDERED_FONT_HEADER_LEN: usize = 36;
+const PRERENDERED_FONT_ITEM_LEN: usize = 20;
+
+#[derive(Clone, Debug)]
+struct PrerenderedFont {
+    version: u8,
+    data: Arc<[u8]>,
+    glyphs: BTreeMap<u16, PrerenderedGlyph>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrerenderedGlyph {
+    offset: usize,
+    width: u16,
+    height: u16,
+    origin_x: i16,
+    origin_y: i16,
+    increment_x: i16,
+    increment_y: i16,
+}
+
+impl PrerenderedFont {
+    fn parse(data: Arc<[u8]>) -> Result<Self, String> {
+        if data.len() < PRERENDERED_FONT_HEADER_LEN
+            || data.get(..PRERENDERED_FONT_SIGNATURE.len()) != Some(PRERENDERED_FONT_SIGNATURE)
+        {
+            return Err("invalid TVP pre-rendered font signature".to_owned());
+        }
+        let version = data[22];
+        if version > 1 {
+            return Err(format!(
+                "unsupported TVP pre-rendered font version {version}"
+            ));
+        }
+        if data[23] != 2 {
+            return Err(format!(
+                "unsupported TVP pre-rendered font character width {}",
+                data[23]
+            ));
+        }
+
+        let count = read_u32_le(&data, 24)? as usize;
+        let chars_offset = read_u32_le(&data, 28)? as usize;
+        let items_offset = read_u32_le(&data, 32)? as usize;
+        let chars_len = count
+            .checked_mul(2)
+            .ok_or_else(|| "TVP pre-rendered font character index is too large".to_owned())?;
+        let items_len = count
+            .checked_mul(PRERENDERED_FONT_ITEM_LEN)
+            .ok_or_else(|| "TVP pre-rendered font glyph index is too large".to_owned())?;
+        checked_range(data.len(), chars_offset, chars_len, "character index")?;
+        checked_range(data.len(), items_offset, items_len, "glyph index")?;
+
+        let mut glyphs = BTreeMap::new();
+        for index in 0..count {
+            let ch = read_u16_le(&data, chars_offset + index * 2)?;
+            let item = items_offset + index * PRERENDERED_FONT_ITEM_LEN;
+            let offset = read_u32_le(&data, item)? as usize;
+            let width = read_u16_le(&data, item + 4)?;
+            let height = read_u16_le(&data, item + 6)?;
+            if width != 0 && height != 0 && offset >= data.len() {
+                return Err(format!(
+                    "TVP pre-rendered font glyph U+{ch:04X} has an invalid bitmap offset"
+                ));
+            }
+            glyphs.insert(
+                ch,
+                PrerenderedGlyph {
+                    offset,
+                    width,
+                    height,
+                    origin_x: read_i16_le(&data, item + 8)?,
+                    origin_y: read_i16_le(&data, item + 10)?,
+                    increment_x: read_i16_le(&data, item + 12)?,
+                    increment_y: read_i16_le(&data, item + 14)?,
+                },
+            );
+        }
+
+        Ok(Self {
+            version,
+            data,
+            glyphs,
+        })
+    }
+
+    fn decode_glyph(&self, glyph: PrerenderedGlyph) -> Option<Vec<u8>> {
+        let pixel_count = usize::from(glyph.width).checked_mul(usize::from(glyph.height))?;
+        if pixel_count == 0 {
+            return Some(Vec::new());
+        }
+        let mut source = glyph.offset;
+        let mut bitmap = Vec::with_capacity(pixel_count);
+        while bitmap.len() < pixel_count {
+            let value = *self.data.get(source)?;
+            source += 1;
+            let repeat = match self.version {
+                0 if value == 0x41 => {
+                    let count = usize::from(*self.data.get(source)?);
+                    source += 1;
+                    Some(count)
+                }
+                1 if value >= 0x41 => Some(usize::from(value - 0x40)),
+                _ => None,
+            };
+            if let Some(repeat) = repeat {
+                let previous = *bitmap.last()?;
+                if bitmap.len().checked_add(repeat)? > pixel_count {
+                    return None;
+                }
+                bitmap.resize(bitmap.len() + repeat, previous);
+            } else {
+                bitmap.push(value);
+            }
+        }
+        for alpha in &mut bitmap {
+            *alpha = ((u16::from((*alpha).min(64)) * 255 + 32) / 64) as u8;
+        }
+        Some(bitmap)
+    }
+}
+
+fn checked_range(data_len: usize, offset: usize, len: usize, context: &str) -> Result<(), String> {
+    if offset.checked_add(len).is_some_and(|end| end <= data_len) {
+        Ok(())
+    } else {
+        Err(format!(
+            "TVP pre-rendered font {context} is outside the payload"
+        ))
+    }
+}
+
+fn read_u16_le(data: &[u8], offset: usize) -> Result<u16, String> {
+    let bytes = data
+        .get(offset..offset + 2)
+        .ok_or_else(|| "truncated TVP pre-rendered font".to_owned())?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_i16_le(data: &[u8], offset: usize) -> Result<i16, String> {
+    read_u16_le(data, offset).map(|value| value as i16)
+}
+
+fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, String> {
+    let bytes = data
+        .get(offset..offset + 4)
+        .ok_or_else(|| "truncated TVP pre-rendered font".to_owned())?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 #[derive(Debug)]
 pub struct FontSystem {
     db: Database,
     named_file_faces: BTreeMap<String, Vec<fontdb::ID>>,
-    prerendered_fonts: BTreeMap<String, Arc<[u8]>>,
+    prerendered_fonts: BTreeMap<PrerenderedFontKey, PrerenderedFont>,
     primary_faces: RefCell<BTreeMap<FaceSelectionKey, Option<fontdb::ID>>>,
     char_faces: RefCell<BTreeMap<CharFaceSelectionKey, Option<fontdb::ID>>>,
     recent_fallback_faces: RefCell<BTreeMap<FaceSelectionKey, fontdb::ID>>,
     glyph_ids: RefCell<BTreeMap<(FontFaceKey, char), Option<u16>>>,
     face_metrics: RefCell<BTreeMap<FaceMetricsKey, swash::Metrics>>,
     glyph_images: RefCell<BTreeMap<RenderedGlyphKey, Arc<GlyphImage>>>,
+    prerendered_glyph_images: RefCell<BTreeMap<(PrerenderedFontKey, u16), Arc<GlyphImage>>>,
 }
 
 impl Default for FontSystem {
@@ -145,6 +297,7 @@ impl Clone for FontSystem {
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
+            prerendered_glyph_images: RefCell::new(BTreeMap::new()),
         }
     }
 }
@@ -163,6 +316,7 @@ impl FontSystem {
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
+            prerendered_glyph_images: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -205,24 +359,38 @@ impl FontSystem {
         name: impl Into<String>,
         data: Arc<[u8]>,
     ) -> Result<(), String> {
-        let name = name.into();
-        let ids = self
-            .db
-            .load_font_source(Source::Binary(Arc::new(data.as_ref().to_vec())));
-        if ids.is_empty() {
-            return Err(format!(
-                "prerendered font `{name}` is not a supported font payload"
-            ));
-        }
-        self.named_file_faces
-            .insert(name.clone(), ids.into_iter().collect());
-        self.prerendered_fonts.insert(name, data);
+        let spec = FontSpec {
+            face: name.into(),
+            ..FontSpec::default()
+        };
+        self.map_prerendered_font_for_spec_arc(&spec, data)
+    }
+
+    pub fn map_prerendered_font_for_spec_arc(
+        &mut self,
+        spec: &FontSpec,
+        data: Arc<[u8]>,
+    ) -> Result<(), String> {
+        let font = PrerenderedFont::parse(data)?;
+        self.prerendered_fonts
+            .insert(PrerenderedFontKey::new(spec), font);
         self.clear_caches();
         Ok(())
     }
 
     pub fn unmap_prerendered_font(&mut self, name: &str) -> bool {
-        let removed = self.prerendered_fonts.remove(name).is_some();
+        let spec = FontSpec {
+            face: name.to_owned(),
+            ..FontSpec::default()
+        };
+        self.unmap_prerendered_font_for_spec(&spec)
+    }
+
+    pub fn unmap_prerendered_font_for_spec(&mut self, spec: &FontSpec) -> bool {
+        let removed = self
+            .prerendered_fonts
+            .remove(&PrerenderedFontKey::new(spec))
+            .is_some();
         if removed {
             self.clear_caches();
         }
@@ -243,6 +411,14 @@ impl FontSystem {
     }
 
     pub fn glyph_draw_rect(&self, spec: &FontSpec, ch: char) -> Option<GlyphDrawRect> {
+        if let Some(glyph) = self.prerendered_glyph(spec, ch) {
+            return Some(GlyphDrawRect {
+                left: i32::from(glyph.origin_x),
+                top: i32::from(glyph.origin_y),
+                width: u32::from(glyph.width),
+                height: u32::from(glyph.height),
+            });
+        }
         let primary_face = self.select_primary_face(spec)?;
         let face = if self.face_supports(primary_face, ch) {
             primary_face
@@ -334,6 +510,12 @@ impl FontSystem {
         let Some(primary_face) = face else {
             return fallback_layout(spec, text);
         };
+        if self
+            .prerendered_fonts
+            .contains_key(&PrerenderedFontKey::new(spec))
+        {
+            return self.layout_prerendered_text(spec, text, primary_face);
+        }
         let primary_metrics = self.face_metrics(primary_face, spec.resolved_height());
         let ascent = primary_metrics.ascent.max(spec.resolved_height() * 0.8);
         let descent = (-primary_metrics.descent).max(spec.resolved_height() * 0.2);
@@ -402,6 +584,81 @@ impl FontSystem {
         }
     }
 
+    fn layout_prerendered_text(
+        &self,
+        spec: &FontSpec,
+        text: &str,
+        primary_face: fontdb::ID,
+    ) -> TextLayout {
+        let primary_metrics = self.face_metrics(primary_face, spec.resolved_height());
+        let ascent = primary_metrics.ascent.max(spec.resolved_height() * 0.8);
+        let descent = (-primary_metrics.descent).max(spec.resolved_height() * 0.2);
+        let line_gap = primary_metrics.leading.max(0.0);
+        let line_height = (ascent + descent + line_gap).max(spec.resolved_height());
+        let key = PrerenderedFontKey::new(spec);
+        let font = &self.prerendered_fonts[&key];
+
+        let mut glyphs = Vec::new();
+        let mut pen_x = 0.0_f32;
+        let mut pen_y = 0.0_f32;
+        let mut max_width = 0.0_f32;
+        let mut lines = 1_u32;
+        for ch in text.chars() {
+            if ch == '\n' {
+                max_width = max_width.max(pen_x);
+                pen_x = 0.0;
+                pen_y += line_height;
+                lines = lines.saturating_add(1);
+                continue;
+            }
+            let code = u32::from(ch);
+            if code <= u32::from(u16::MAX)
+                && let Some(item) = font.glyphs.get(&(code as u16))
+            {
+                glyphs.push(PositionedGlyph {
+                    face: primary_face,
+                    glyph_id: code as u16,
+                    prerendered_char: Some(code as u16),
+                    pen_x,
+                    line_y: pen_y,
+                    x: 0.0,
+                    y: 0.0,
+                    advance: f32::from(item.increment_x),
+                });
+                pen_x += f32::from(item.increment_x);
+                // The original renderer also advances vertically for rotated
+                // fonts. Kirakira's current text layout is horizontal, so keep
+                // the value parsed for compatibility without applying it yet.
+                let _ = item.increment_y;
+                continue;
+            }
+
+            let face = if self.face_supports(primary_face, ch) {
+                primary_face
+            } else {
+                self.select_face_for_char(spec, ch, primary_face)
+                    .unwrap_or(primary_face)
+            };
+            let start = glyphs.len();
+            self.shape_run(spec, face, &ch.to_string(), pen_x, pen_y, &mut glyphs);
+            if let Some(last) = glyphs.get(start..).and_then(|run| run.last()) {
+                pen_x = last.pen_x + last.advance;
+            }
+        }
+        max_width = max_width.max(pen_x);
+
+        TextLayout {
+            glyphs,
+            metrics: TextMetrics {
+                width: max_width.max(0.0),
+                height: (lines as f32 * line_height).max(line_height),
+                ascent,
+                descent,
+                line_gap,
+            },
+        }
+    }
+
     fn shape_run(
         &self,
         spec: &FontSpec,
@@ -423,6 +680,7 @@ impl FontSystem {
                     output.push(PositionedGlyph {
                         face,
                         glyph_id: glyph.id,
+                        prerendered_char: None,
                         pen_x,
                         line_y,
                         x: glyph.x,
@@ -444,6 +702,7 @@ impl FontSystem {
             output.push(PositionedGlyph {
                 face,
                 glyph_id: 0,
+                prerendered_char: None,
                 pen_x: start_x,
                 line_y,
                 x: 0.0,
@@ -467,13 +726,18 @@ impl FontSystem {
     ) {
         self.prepare_layout_glyphs(spec, layout);
         for glyph in &layout.glyphs {
-            let Some(image) = self.render_glyph(
-                glyph.face,
-                spec,
-                glyph.glyph_id,
-                glyph.pen_x + glyph.x,
-                glyph.line_y - glyph.y,
-            ) else {
+            let image = if let Some(ch) = glyph.prerendered_char {
+                self.render_prerendered_glyph(glyph.face, spec, ch)
+            } else {
+                self.render_glyph(
+                    glyph.face,
+                    spec,
+                    glyph.glyph_id,
+                    glyph.pen_x + glyph.x,
+                    glyph.line_y - glyph.y,
+                )
+            };
+            let Some(image) = image else {
                 continue;
             };
             let baseline_y = y as f32 + layout.metrics.ascent + glyph.line_y;
@@ -490,6 +754,9 @@ impl FontSystem {
         {
             let cache = self.glyph_images.borrow();
             for glyph in &layout.glyphs {
+                if glyph.prerendered_char.is_some() {
+                    continue;
+                }
                 let x_subpixel = subpixel_bin(glyph.pen_x + glyph.x);
                 let y_subpixel = subpixel_bin(glyph.line_y - glyph.y);
                 let key = RenderedGlyphKey {
@@ -652,6 +919,57 @@ impl FontSystem {
         } else {
             None
         }
+    }
+
+    fn prerendered_glyph(&self, spec: &FontSpec, ch: char) -> Option<&PrerenderedGlyph> {
+        let code = u32::from(ch);
+        if code > u32::from(u16::MAX) {
+            return None;
+        }
+        self.prerendered_fonts
+            .get(&PrerenderedFontKey::new(spec))?
+            .glyphs
+            .get(&(code as u16))
+    }
+
+    fn render_prerendered_glyph(
+        &self,
+        face: fontdb::ID,
+        spec: &FontSpec,
+        ch: u16,
+    ) -> Option<Arc<GlyphImage>> {
+        let font_key = PrerenderedFontKey::new(spec);
+        let cache_key = (font_key.clone(), ch);
+        if let Some(image) = self
+            .prerendered_glyph_images
+            .borrow()
+            .get(&cache_key)
+            .cloned()
+        {
+            return Some(image);
+        }
+        let font = self.prerendered_fonts.get(&font_key)?;
+        let glyph = *font.glyphs.get(&ch)?;
+        let data = font.decode_glyph(glyph)?;
+        let image = Arc::new(GlyphImage {
+            key: GlyphKey {
+                face: FontFaceKey(face),
+                glyph_id: ch,
+                size_px: spec.resolved_height().round().max(1.0) as u32,
+                bold: spec.bold,
+                italic: spec.italic,
+            },
+            left: i32::from(glyph.origin_x),
+            top: i32::from(glyph.origin_y),
+            width: u32::from(glyph.width),
+            height: u32::from(glyph.height),
+            content: GlyphContent::Alpha,
+            data,
+        });
+        self.prerendered_glyph_images
+            .borrow_mut()
+            .insert(cache_key, image.clone());
+        Some(image)
     }
 
     fn face_metrics(&self, face: fontdb::ID, size: f32) -> swash::Metrics {
@@ -875,6 +1193,34 @@ impl FontSystem {
         self.glyph_ids.borrow_mut().clear();
         self.face_metrics.borrow_mut().clear();
         self.glyph_images.borrow_mut().clear();
+        self.prerendered_glyph_images.borrow_mut().clear();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PrerenderedFontKey {
+    face: String,
+    height_bits: u32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+    angle: i32,
+    face_is_file_name: bool,
+}
+
+impl PrerenderedFontKey {
+    fn new(spec: &FontSpec) -> Self {
+        Self {
+            face: spec.face.clone(),
+            height_bits: spec.resolved_height().to_bits(),
+            bold: spec.bold,
+            italic: spec.italic,
+            underline: spec.underline,
+            strikeout: spec.strikeout,
+            angle: spec.angle,
+            face_is_file_name: spec.face_is_file_name,
+        }
     }
 }
 
@@ -952,6 +1298,7 @@ impl TextLayout {
 struct PositionedGlyph {
     face: fontdb::ID,
     glyph_id: u16,
+    prerendered_char: Option<u16>,
     pen_x: f32,
     line_y: f32,
     x: f32,
@@ -1135,6 +1482,27 @@ fn blend_channel(src: u8, src_a: u32, dest: u8, dest_a: u32, inv_src_a: u32, den
 mod tests {
     use super::*;
 
+    fn test_prerendered_font() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(PRERENDERED_FONT_SIGNATURE);
+        data.extend_from_slice(&[1, 2]);
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&39_u32.to_le_bytes());
+        data.extend_from_slice(&41_u32.to_le_bytes());
+        data.extend_from_slice(&[0, 64, 0x42]);
+        data.extend_from_slice(&(b'A' as u16).to_le_bytes());
+        data.extend_from_slice(&36_u32.to_le_bytes());
+        data.extend_from_slice(&2_u16.to_le_bytes());
+        data.extend_from_slice(&2_u16.to_le_bytes());
+        data.extend_from_slice(&1_i16.to_le_bytes());
+        data.extend_from_slice(&2_i16.to_le_bytes());
+        data.extend_from_slice(&3_i16.to_le_bytes());
+        data.extend_from_slice(&0_i16.to_le_bytes());
+        data.extend_from_slice(&3_i16.to_le_bytes());
+        data.extend_from_slice(&0_u16.to_le_bytes());
+        data
+    }
+
     #[test]
     fn measures_ascii_text_with_system_fallback() {
         let system = FontSystem::new();
@@ -1159,5 +1527,34 @@ mod tests {
         };
         let (x, y) = system.esc_width(&spec, "A");
         assert!(x.abs() < y.abs().max(1.0));
+    }
+
+    #[test]
+    fn parses_and_expands_tvp_prerendered_font() {
+        let font = PrerenderedFont::parse(Arc::from(test_prerendered_font())).unwrap();
+        let glyph = *font.glyphs.get(&(b'A' as u16)).unwrap();
+        assert_eq!(glyph.width, 2);
+        assert_eq!(glyph.height, 2);
+        assert_eq!(glyph.origin_x, 1);
+        assert_eq!(glyph.origin_y, 2);
+        assert_eq!(glyph.increment_x, 3);
+        assert_eq!(font.decode_glyph(glyph).unwrap(), [0, 255, 255, 255]);
+    }
+
+    #[test]
+    fn mapped_tvp_prerendered_font_drives_metrics_and_rasterization() {
+        let mut system = FontSystem::new();
+        let spec = FontSpec {
+            height: 10.0,
+            ..FontSpec::default()
+        };
+        system
+            .map_prerendered_font_for_spec_arc(&spec, Arc::from(test_prerendered_font()))
+            .unwrap();
+
+        let metrics = system.text_metrics(&spec, "AA");
+        assert_eq!(metrics.width, 6.0);
+        let image = system.rasterize_text(&spec, TextStyle::default(), "A");
+        assert!(image.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
     }
 }

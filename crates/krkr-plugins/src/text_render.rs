@@ -30,9 +30,7 @@ fn install_text_render_compat(runtime: &mut Runtime<KrkrHost>) {
 
 fn text_render_base_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
     let handle = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>,
-         this_obj: Option<ObjectHandle>,
-         _args: Vec<Variant>| {
+        |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, _args: Vec<Variant>| {
             // The real constructor takes render target info; tolerate any args.
             let instance = this_obj
                 .map(|handle| runtime.bound_this(handle).unwrap_or(handle))

@@ -263,17 +263,31 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "interval", Variant::Integer(1000));
             runtime.set_object_member(handle, "capacity", Variant::Integer(1));
             runtime.set_object_member(handle, "mode", Variant::Integer(0));
-            if let Some(callback) = args.first().filter(|value| !matches!(value, Variant::Void)) {
-                runtime.set_object_member(handle, "__callback", callback.clone());
-            }
+            runtime.set_object_member(
+                handle,
+                "__actionOwner",
+                args.first().cloned().unwrap_or_default(),
+            );
+            runtime.set_object_member(
+                handle,
+                "__actionName",
+                Variant::String(action_name_from_constructor_args(args)?),
+            );
             runtime.host_mut().register_timer(handle);
         }
         "AsyncTrigger" => {
             runtime.set_object_member(handle, "cached", Variant::Integer(1));
             runtime.set_object_member(handle, "mode", Variant::Integer(0));
-            if let Some(callback) = args.first().filter(|value| !matches!(value, Variant::Void)) {
-                runtime.set_object_member(handle, "__callback", callback.clone());
-            }
+            runtime.set_object_member(
+                handle,
+                "__actionOwner",
+                args.first().cloned().unwrap_or_default(),
+            );
+            runtime.set_object_member(
+                handle,
+                "__actionName",
+                Variant::String(action_name_from_constructor_args(args)?),
+            );
             runtime.host_mut().register_async_trigger(handle);
         }
         "Window" => {
@@ -476,7 +490,9 @@ fn install_special_methods(
     handle: ObjectHandle,
     class_name: &'static str,
 ) {
-    if class_name == "MenuItem" {
+    if class_name == "Timer" {
+        install_timer_methods(runtime, handle);
+    } else if class_name == "MenuItem" {
         install_menu_item_methods(runtime, handle);
     } else if class_name == "Layer" {
         install_layer_methods(runtime, handle);
@@ -1471,6 +1487,11 @@ fn register_native_method_preserving_script(
 fn install_async_trigger_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.register_object_native(handle, "trigger", async_trigger_trigger);
     runtime.register_object_native(handle, "cancel", async_trigger_cancel);
+    register_native_method_preserving_script(runtime, handle, "onFire", async_trigger_on_fire);
+}
+
+fn install_timer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_native_method_preserving_script(runtime, handle, "onTimer", timer_on_timer);
 }
 
 fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -1709,6 +1730,52 @@ fn async_trigger_cancel(
     let this = this_obj.ok_or_else(|| TjsError::runtime("AsyncTrigger.cancel requires this"))?;
     runtime.host_mut().cancel_async(this);
     Ok(Variant::Void)
+}
+
+fn timer_on_timer(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    invoke_tvp_action(runtime, this_obj, args, "Timer.onTimer")
+}
+
+fn async_trigger_on_fire(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    invoke_tvp_action(runtime, this_obj, args, "AsyncTrigger.onFire")
+}
+
+fn invoke_tvp_action(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+    context: &str,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime(format!("{context} requires this")))?;
+    let this = runtime.bound_this(this).unwrap_or(this);
+    let owner = runtime.object_member(this, "__actionOwner");
+    if matches!(owner, Variant::Void | Variant::Null) {
+        return Ok(Variant::Void);
+    }
+    let action_name = runtime
+        .object_member(this, "__actionName")
+        .to_tjs_string()?;
+    if action_name.is_empty() {
+        runtime.call_function(owner, args)
+    } else {
+        runtime.call_variant_method(owner, &action_name, args)
+    }
+}
+
+fn action_name_from_constructor_args(args: &[Variant]) -> Result<String> {
+    args.get(1)
+        .filter(|value| !matches!(value, Variant::Void))
+        .map(Variant::to_tjs_string)
+        .transpose()
+        .map(|name| name.unwrap_or_else(|| "action".to_string()))
 }
 
 fn this_layer_id(
@@ -4301,43 +4368,35 @@ fn font_get_list(
 
 fn font_map_prerendered_font(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
+    this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let name = args
+    let storage = args
         .first()
         .map(Variant::to_tjs_string)
         .transpose()?
         .ok_or_else(|| TjsError::runtime("Font.mapPrerenderedFont requires a font name"))?;
-    let storage = args
-        .get(1)
-        .map(Variant::to_tjs_string)
-        .transpose()?
-        .unwrap_or_else(|| name.clone());
+    let font = this_font_spec(runtime, this_obj)?;
     let data = runtime.host().read_resource_storage(&storage)?;
     let bytes = data.to_arc_bytes().map_err(crate::storage::io_error)?;
     runtime
         .host_mut()
         .font_system_mut()
-        .map_prerendered_font_arc(name, bytes)
+        .map_prerendered_font_for_spec_arc(&font, bytes)
         .map_err(TjsError::runtime)?;
     Ok(Variant::Void)
 }
 
 fn font_unmap_prerendered_font(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
 ) -> Result<Variant> {
-    let name = args
-        .first()
-        .map(Variant::to_tjs_string)
-        .transpose()?
-        .ok_or_else(|| TjsError::runtime("Font.unmapPrerenderedFont requires a font name"))?;
+    let font = this_font_spec(runtime, this_obj)?;
     let unmapped = runtime
         .host_mut()
         .font_system_mut()
-        .unmap_prerendered_font(&name);
+        .unmap_prerendered_font_for_spec(&font);
     Ok(Variant::Integer(i64::from(unmapped)))
 }
 
@@ -5357,7 +5416,7 @@ pub(crate) struct NativeClassSpec {
 
 pub(crate) static TIMER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Timer",
-    methods: &["onTimer"],
+    methods: &[],
     properties: &["interval", "enabled", "capacity", "mode"],
     static_methods: &[],
     static_properties: &[],
@@ -5365,7 +5424,7 @@ pub(crate) static TIMER_CLASS: NativeClassSpec = NativeClassSpec {
 
 pub(crate) static ASYNC_TRIGGER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "AsyncTrigger",
-    methods: &["trigger", "cancel", "onFire"],
+    methods: &["trigger", "cancel"],
     properties: &["cached", "mode"],
     static_methods: &[],
     static_properties: &[],

@@ -98,7 +98,8 @@ fn register_sample_property(
             Ok(Variant::Integer(default))
         },
         move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, value: Variant| {
-            if let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle)) {
+            if let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+            {
                 let value = value.to_integer()?;
                 runtime.set_object_member(this, name, Variant::Integer(value));
             }

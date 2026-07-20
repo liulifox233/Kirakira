@@ -9,8 +9,8 @@ use crate::vm::{SuspendedCallStack, Vm};
 
 pub(crate) mod builtins;
 pub mod object;
-pub mod value;
 pub(crate) mod tjs_ns0;
+pub mod value;
 
 pub use self::object::{Object, ObjectKind};
 pub use self::value::{Closure, ObjectHandle, Variant};
@@ -525,6 +525,17 @@ impl<H: TjsHost + 'static> Runtime<H> {
         let file_id = self.call_context_file_id();
         let mut vm = Vm::new(file_id, self)?;
         vm.call_object_method(object, name, args)
+    }
+
+    pub fn call_variant_method(
+        &mut self,
+        object: Variant,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        let file_id = self.call_context_file_id();
+        let mut vm = Vm::new(file_id, self)?;
+        vm.call_variant_method(object, name, args)
     }
 
     pub fn call_function(&mut self, callee: Variant, args: Vec<Variant>) -> Result<Variant> {

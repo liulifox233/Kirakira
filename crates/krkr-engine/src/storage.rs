@@ -761,7 +761,8 @@ fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
     let mut names = Vec::with_capacity(12);
     names.push(name.clone());
     for extension in [
-        "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "tcw", "mpg", "mpeg",
+        "tlg", "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "tcw", "mpg",
+        "mpeg",
     ] {
         names.push(format!("{name}.{extension}"));
     }
@@ -1094,6 +1095,7 @@ mod tests {
         let candidates = storage.storage_candidates("白").expect("candidates");
 
         assert!(candidates.iter().any(|candidate| candidate == "白.jpg"));
+        assert!(candidates.iter().any(|candidate| candidate == "白.tlg"));
         assert!(
             candidates
                 .iter()

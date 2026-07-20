@@ -78,7 +78,7 @@ pub const IMPLEMENTED_MAPPINGS: &[PluginMapping] = &[
         notes: "Functional lenient JSON parser and serializer compatible with wtnbgo/json.",
     },
     PluginMapping {
-        feature: "CSVParser, Storages.saveOctet, System.getOSVersion, Layer effects",
+        feature: "CSVParser, Scripts.loadDataPack, Storages.saveOctet, System.getOSVersion, Layer effects",
         provider: PluginOrigin::Plugin,
         plugin_name: Some("PackinOne.dll"),
         notes: "Subset of the PackinOne bundle that games actually call; the rest is no-op surface.",

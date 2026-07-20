@@ -2,8 +2,12 @@ use std::io::Read as _;
 use std::path::Path;
 
 fn main() {
-    let game_dir = std::env::args().nth(1).expect("usage: dump_scripts <game_dir> <out_dir>");
-    let out_dir = std::env::args().nth(2).expect("usage: dump_scripts <game_dir> <out_dir>");
+    let game_dir = std::env::args()
+        .nth(1)
+        .expect("usage: dump_scripts <game_dir> <out_dir>");
+    let out_dir = std::env::args()
+        .nth(2)
+        .expect("usage: dump_scripts <game_dir> <out_dir>");
     let out_root = Path::new(&out_dir);
     std::fs::create_dir_all(out_root).unwrap();
 
@@ -12,7 +16,11 @@ fn main() {
         .filter_map(|e| {
             let p = e.unwrap().path();
             let n = p.file_name()?.to_string_lossy().to_string();
-            if n.to_ascii_lowercase().ends_with(".xp3") { Some(n) } else { None }
+            if n.to_ascii_lowercase().ends_with(".xp3") {
+                Some(n)
+            } else {
+                None
+            }
         })
         .collect();
     names.sort();
@@ -33,7 +41,9 @@ fn main() {
             if !(lower.ends_with(".tjs") || lower.ends_with(".ks") || lower.ends_with(".asd")) {
                 continue;
             }
-            let Ok(Some(mut stream)) = archive.open_by_name(name) else { continue };
+            let Ok(Some(mut stream)) = archive.open_by_name(name) else {
+                continue;
+            };
             let mut buf = Vec::new();
             if stream.read_to_end(&mut buf).is_err() {
                 continue;

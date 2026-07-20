@@ -38,7 +38,7 @@ fn install_window_ex(runtime: &mut Runtime<KrkrHost>) {
 
     // HT* hit-test constants.
     for (name, value) in [
-        ("nchtError", 65534), // HTERROR & 0xFFFF
+        ("nchtError", 65534),       // HTERROR & 0xFFFF
         ("nchtTransparent", 65535), // HTTRANSPARENT & 0xFFFF
         ("nchtNoWhere", 0),
         ("nchtClient", 1),

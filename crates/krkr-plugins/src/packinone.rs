@@ -12,12 +12,16 @@
 //! - `Storages.saveOctet` / `Storages.loadOctet`: binary storage I/O.
 //! - `System.urlencode` / `System.urldecode`: UTF-8 percent codec; decoding
 //!   leaves `+` untouched (no form-style space mapping).
+//! - `Scripts.loadDataPack`: decodes the binary dictionary/array formats used
+//!   by packed UI definitions (`KBAD100` and `TJS/ns0`).
+//! - `Scripts.clone`: recursively clones arrays and dictionaries and delegates
+//!   other objects to their own `clone` method, matching scriptsEx.
 //!
 //! Everything else (System version/env shims, Layer effect methods, Process,
-//! tjsDataPack, fstat, proxyfs, ...) is a no-op stub returning benign values.
+//! fstat, proxyfs, ...) is a no-op stub returning benign values.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::BTreeMap, sync::Arc};
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
@@ -43,9 +47,9 @@ impl KrkrPlugin for PackinOnePlugin {
         install_process(runtime);
         install_misc_classes(runtime);
         runtime.host_mut().log(
-            "PackinOne.dll compat registered: CSVParser, Storages octet I/O and System URL \
-             codecs functional; fstat/savestruct/scriptsEx/systemEx/shrinkCopy/layerEx*/\
-             process/tjsDataPack are stubs",
+            "PackinOne.dll compat registered: CSVParser, Storages octet I/O, System URL \
+             codecs, Scripts.loadDataPack and Scripts.clone functional; fstat/savestruct/\
+             remaining scriptsEx/systemEx/shrinkCopy/layerEx*/process are stubs",
         );
         Ok(())
     }
@@ -124,7 +128,11 @@ fn install_csv_parser(runtime: &mut Runtime<KrkrHost>) {
             runtime.set_object_member(instance, "__csvFile", Variant::String(String::new()));
             // new CSVParser(target?, separator?, newline?): only the callback
             // target is honored; separator/newline stay accepted-but-ignored.
-            runtime.set_object_member(instance, "target", args.into_iter().next().unwrap_or_default());
+            runtime.set_object_member(
+                instance,
+                "target",
+                args.into_iter().next().unwrap_or_default(),
+            );
             Ok(Variant::Object(instance))
         },
     );
@@ -385,7 +393,10 @@ fn parse_csv_field(bytes: &[u8], mut pos: usize) -> (String, usize) {
         while pos < bytes.len() && bytes[pos] != b',' && !is_eol(bytes, pos) {
             pos += 1;
         }
-        (String::from_utf8_lossy(&bytes[start..pos]).into_owned(), pos)
+        (
+            String::from_utf8_lossy(&bytes[start..pos]).into_owned(),
+            pos,
+        )
     }
 }
 
@@ -423,7 +434,9 @@ fn storages_save_octet(
         Some(value) => value.to_tjs_string()?.into_bytes(),
         None => Vec::new(),
     };
-    runtime.host_mut().write_binary_storage(&name, "w", &bytes)?;
+    runtime
+        .host_mut()
+        .write_binary_storage(&name, "w", &bytes)?;
     Ok(Variant::Void)
 }
 
@@ -598,29 +611,39 @@ fn install_layer_effects(runtime: &mut Runtime<KrkrHost>) {
 }
 
 // ---------------------------------------------------------------------------
-// tjsDataPack global functions (stub)
+// tjsDataPack global functions
 
 fn install_data_pack(runtime: &mut Runtime<KrkrHost>) {
     // tjsDataPack attaches these to the Scripts object (games call
     // `Scripts.loadDataPack(...)`); also expose them as globals for safety.
     let scripts = ensure_global_object(runtime, "Scripts");
     let global = runtime.global_handle();
-    let logged = Arc::new(AtomicBool::new(false));
-    let load_stub = move |runtime: &mut Runtime<KrkrHost>, _this_obj, _args| {
-        if !logged.swap(true, Ordering::Relaxed) {
-            runtime
-                .host_mut()
-                .log("PackinOne.dll: loadDataPack is a no-op stub");
-        }
-        Ok(Variant::Void)
-    };
-    runtime.register_object_native(scripts, "loadDataPack", load_stub.clone());
-    runtime.register_object_native(global, "loadDataPack", load_stub);
+    runtime.register_object_native(scripts, "loadDataPack", load_data_pack);
+    runtime.register_object_native(global, "loadDataPack", load_data_pack);
     for target in [scripts, global] {
         runtime.register_object_native(target, "saveDataPack", zero);
         runtime.register_object_native(target, "makeDataPackThumb", native_void);
         runtime.register_object_native(target, "makeDataPackDigest", empty_string);
     }
+}
+
+fn load_data_pack(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
+    let Ok(bytes) = runtime.host().read_binary_storage(&name) else {
+        return Ok(Variant::Void);
+    };
+    let value = if bytes.starts_with(b"KBAD100\0") {
+        runtime.decode_binary_struct(&bytes)?
+    } else if bytes.starts_with(b"TJS/ns0\0") || bytes.starts_with(b"TJS/4s0\0") {
+        runtime.decode_tjs_ns0(&bytes)?
+    } else {
+        None
+    };
+    Ok(value.unwrap_or(Variant::Void))
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +653,7 @@ fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
     let scripts = ensure_global_object(runtime, "Scripts");
     runtime.register_object_native(scripts, "encodeTBPS", first_arg_string);
     runtime.register_object_native(scripts, "decodeTBPS", first_arg_string);
+    runtime.register_object_native(scripts, "clone", scripts_clone);
     let logged = Arc::new(AtomicBool::new(false));
     runtime.register_object_native(
         scripts,
@@ -654,6 +678,72 @@ fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
             Ok(Variant::Void)
         },
     );
+}
+
+fn scripts_clone(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let value = args.first().cloned().unwrap_or_default();
+    clone_scripts_value(runtime, &value, &mut BTreeMap::new())
+}
+
+fn clone_scripts_value(
+    runtime: &mut Runtime<KrkrHost>,
+    value: &Variant,
+    cloned: &mut BTreeMap<ObjectHandle, ObjectHandle>,
+) -> Result<Variant> {
+    let Variant::Object(source) = value else {
+        return Ok(value.clone());
+    };
+    if let Some(dest) = cloned.get(source) {
+        return Ok(Variant::Object(*dest));
+    }
+
+    if let Some(elements) = runtime.array_elements(*source).map(Vec::from) {
+        let dest = runtime.alloc_array_object(Vec::new());
+        cloned.insert(*source, dest);
+        for element in elements {
+            let element = clone_scripts_value(runtime, &element, cloned)?;
+            runtime.array_push(dest, element);
+        }
+        return Ok(Variant::Object(dest));
+    }
+
+    let is_dictionary = runtime
+        .object_class_infos(*source)
+        .iter()
+        .any(|class| class == "Dictionary");
+    if is_dictionary {
+        let constructor = runtime.global_member("Dictionary");
+        let Variant::Object(dest) = runtime.call_function(constructor, Vec::new())? else {
+            return Ok(value.clone());
+        };
+        cloned.insert(*source, dest);
+        for (name, member) in runtime.object_members(*source) {
+            if scripts_clone_builtin_member(&name) {
+                continue;
+            }
+            let member = clone_scripts_value(runtime, &member, cloned)?;
+            runtime.set_object_member(dest, name, member);
+        }
+        return Ok(Variant::Object(dest));
+    }
+
+    if !matches!(runtime.object_member(*source, "clone"), Variant::Void)
+        && let Ok(result) = runtime.call_object_method(*source, "clone", Vec::new())
+    {
+        return Ok(result);
+    }
+    Ok(value.clone())
+}
+
+fn scripts_clone_builtin_member(name: &str) -> bool {
+    matches!(
+        name,
+        "clear" | "assign" | "assignStruct" | "saveStruct" | "loadStruct"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -772,5 +862,75 @@ fn install_misc_class_members(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, time::SystemTime};
+
+    use krkr_engine::KrkrEngine;
+
+    use super::*;
+
+    #[test]
+    fn load_data_pack_decodes_binary_struct_storage() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kirakira-packinone-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create project root");
+
+        let mut bytes = b"KBAD100\0\x81\xa6".to_vec();
+        for unit in "answer".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.push(42);
+        fs::write(root.join("probe.pbd"), bytes).expect("write data pack");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression("inline.tjs", "Scripts.loadDataPack(\"probe.pbd\").answer")
+            .expect("load data pack");
+
+        assert_eq!(value, Variant::Integer(42));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn scripts_clone_deeply_copies_arrays_and_dictionaries() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kirakira-packinone-clone-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create project root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var source = %[nested: [1, %[value: 2]]];
+                    var copy = Scripts.clone(source);
+                    copy.nested[0] = 9;
+                    copy.nested[1].value = 7;
+                    return source.nested[0] + ":" + source.nested[1].value + ":" +
+                        copy.nested[0] + ":" + copy.nested[1].value;
+                })()"#,
+            )
+            .expect("clone structured value");
+
+        assert_eq!(value, Variant::String("1:2:9:7".to_owned()));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

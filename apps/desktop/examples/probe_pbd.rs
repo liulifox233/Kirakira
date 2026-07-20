@@ -4,9 +4,12 @@ use krkr_engine::{EngineConfig, KrkrEngine, SystemMetrics};
 use krkr_plugins::register_reference_plugins;
 
 fn main() {
-    let game_dir = std::env::args()
-        .nth(1)
+    let args = std::env::args().collect::<Vec<_>>();
+    let game_dir = args
+        .get(1)
+        .cloned()
         .expect("usage: cargo run --example probe_pbd -- <game_dir>");
+    let requested_names = args.iter().skip(2).cloned().collect::<Vec<_>>();
 
     eprintln!("[probe] opening project: {game_dir}");
     let mut engine = match KrkrEngine::new(EngineConfig {
@@ -35,13 +38,33 @@ fn main() {
     }
 
     // Probe 1: try to run startup.tjs and capture the exact failure.
-    eprintln!("[probe] executing startup.tjs ...");
-    match engine.execute_startup() {
-        Ok(result) => eprintln!("[probe] startup.tjs OK: {result:?}"),
-        Err(err) => {
-            eprintln!("[probe] startup.tjs FAILED: {err}");
-            // Continue probing .pbd files even after startup fails.
+    if std::env::var_os("KRKR_PROBE_SKIP_STARTUP").is_none() {
+        eprintln!("[probe] executing startup.tjs ...");
+        match engine.execute_startup() {
+            Ok(result) => eprintln!("[probe] startup.tjs OK: {result:?}"),
+            Err(err) => {
+                eprintln!("[probe] startup.tjs FAILED: {err}");
+                // Continue probing .pbd files even after startup fails.
+            }
         }
+    }
+
+    if !requested_names.is_empty() {
+        for name in requested_names {
+            inspect_storage(&mut engine, &name);
+        }
+        return;
+    }
+
+    if let Ok(expression) = std::env::var("KRKR_PROBE_EXPR") {
+        match engine.execute_expression("probe_inline.tjs", &expression) {
+            Ok(value) => eprintln!(
+                "[probe] expression OK -> {}",
+                summarize_value(&engine, &value, 6)
+            ),
+            Err(err) => eprintln!("[probe] expression FAILED -> {err}"),
+        }
+        return;
     }
 
     // Probe 2: enumerate .pbd entries in every XP3 archive and decode them
@@ -117,7 +140,22 @@ fn main() {
     eprintln!("[probe] .pbd scan complete: total={total}, failed={failed}");
 }
 
-fn summarize_value(engine: &KrkrEngine, value: &krkr_tjs2::runtime::Variant, depth: usize) -> String {
+fn inspect_storage(engine: &mut KrkrEngine, name: &str) {
+    let script = format!(r#"Scripts.evalStorage("{name}")"#);
+    match engine.execute_expression("probe_inline.tjs", &script) {
+        Ok(value) => {
+            let summary = summarize_value(engine, &value, 6);
+            eprintln!("[probe]   {name} OK -> {summary}");
+        }
+        Err(err) => eprintln!("[probe]   {name} FAILED -> {err}"),
+    }
+}
+
+fn summarize_value(
+    engine: &KrkrEngine,
+    value: &krkr_tjs2::runtime::Variant,
+    depth: usize,
+) -> String {
     use krkr_tjs2::runtime::Variant;
     match value {
         Variant::Void => "void".into(),
@@ -128,16 +166,31 @@ fn summarize_value(engine: &KrkrEngine, value: &krkr_tjs2::runtime::Variant, dep
         Variant::Octet(b) => format!("octet({})", b.len()),
         Variant::Object(_) if depth == 0 => "{...}".into(),
         Variant::Object(h) => {
-            let members: Vec<(String, Variant)> = engine.tjs_runtime().object_members(*h);
-            if members.len() > 6 {
-                format!("dict({} keys)", members.len())
-            } else {
-                let parts: Vec<String> = members
+            if let Some(elements) = engine.tjs_runtime().array_elements(*h) {
+                let parts = elements
                     .iter()
-                    .map(|(k, v)| format!("{k}: {}", summarize_value(engine, v, depth - 1)))
-                    .collect();
-                format!("{{ {p} }}", p = parts.join(", "))
+                    .take(24)
+                    .map(|value| summarize_value(engine, value, depth - 1))
+                    .collect::<Vec<_>>();
+                let suffix = if elements.len() > parts.len() {
+                    ", ..."
+                } else {
+                    ""
+                };
+                return format!("[{}{suffix}]", parts.join(", "));
             }
+            let members: Vec<(String, Variant)> = engine.tjs_runtime().object_members(*h);
+            let parts = members
+                .iter()
+                .take(40)
+                .map(|(k, v)| format!("{k}: {}", summarize_value(engine, v, depth - 1)))
+                .collect::<Vec<_>>();
+            let suffix = if members.len() > parts.len() {
+                ", ..."
+            } else {
+                ""
+            };
+            format!("{{ {}{suffix} }}", parts.join(", "))
         }
         Variant::Closure(_) => "closure".into(),
         Variant::CodeObject(_) => "codeobject".into(),

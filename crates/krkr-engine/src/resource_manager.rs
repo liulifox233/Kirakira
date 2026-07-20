@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    io::Cursor,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -277,16 +278,84 @@ fn decode_image(
         .read_binary_storage(name)
         .map_err(|error| error.to_string())?;
     let bytes = data.as_bytes().map_err(|error| error.to_string())?;
-    let decoded = image::load_from_memory(&bytes)
+    let image = decode_image_bytes(&bytes, name)?;
+    cache.insert(key, image.clone());
+    Ok(image)
+}
+
+pub(crate) fn decode_image_bytes(
+    bytes: &[u8],
+    name: &str,
+) -> std::result::Result<DecodedImageData, String> {
+    if libtlg_rs::is_valid_tlg(bytes) {
+        let tlg = libtlg_rs::load_tlg(Cursor::new(bytes))
+            .map_err(|error| format!("failed to decode TLG image `{name}`: {error}"))?;
+        return tlg_to_rgba(tlg, name);
+    }
+
+    let decoded = image::load_from_memory(bytes)
         .map_err(|error| format!("failed to decode image `{name}`: {error}"))?
         .to_rgba8();
-    let image = DecodedImageData {
+    Ok(DecodedImageData {
         width: decoded.width(),
         height: decoded.height(),
         rgba: Arc::<[u8]>::from(decoded.into_raw()),
+    })
+}
+
+fn tlg_to_rgba(tlg: libtlg_rs::Tlg, name: &str) -> std::result::Result<DecodedImageData, String> {
+    use libtlg_rs::TlgColorType;
+
+    let pixels = usize::try_from(tlg.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(tlg.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| format!("TLG image `{name}` dimensions overflow"))?;
+    let channels = match tlg.color {
+        TlgColorType::Grayscale8 => 1,
+        TlgColorType::Bgr24 => 3,
+        TlgColorType::Bgra32 => 4,
     };
-    cache.insert(key, image.clone());
-    Ok(image)
+    let expected = pixels
+        .checked_mul(channels)
+        .ok_or_else(|| format!("TLG image `{name}` buffer size overflow"))?;
+    if tlg.data.len() != expected {
+        return Err(format!(
+            "TLG image `{name}` decoded to {} bytes, expected {expected}",
+            tlg.data.len()
+        ));
+    }
+
+    let mut rgba = Vec::with_capacity(
+        pixels
+            .checked_mul(4)
+            .ok_or_else(|| format!("TLG image `{name}` RGBA size overflow"))?,
+    );
+    match tlg.color {
+        TlgColorType::Grayscale8 => {
+            for value in tlg.data {
+                rgba.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        TlgColorType::Bgr24 => {
+            for pixel in tlg.data.chunks_exact(3) {
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+            }
+        }
+        TlgColorType::Bgra32 => {
+            for pixel in tlg.data.chunks_exact(4) {
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
+        }
+    }
+    Ok(DecodedImageData {
+        width: tlg.width,
+        height: tlg.height,
+        rgba: Arc::from(rgba),
+    })
 }
 
 impl DecodedImageCache {
@@ -346,12 +415,33 @@ impl DecodedImageCache {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
+
+    #[test]
+    fn converts_tlg_bgra_pixels_to_rgba() {
+        let image = tlg_to_rgba(
+            libtlg_rs::Tlg {
+                tags: HashMap::new(),
+                version: 6,
+                width: 2,
+                height: 1,
+                color: libtlg_rs::TlgColorType::Bgra32,
+                data: vec![3, 2, 1, 4, 30, 20, 10, 40],
+            },
+            "probe.tlg",
+        )
+        .expect("convert TLG pixels");
+
+        assert_eq!(image.width, 2);
+        assert_eq!(image.height, 1);
+        assert_eq!(image.rgba.as_ref(), &[1, 2, 3, 4, 10, 20, 30, 40]);
+    }
 
     #[test]
     fn dropping_manager_clone_does_not_shutdown_worker() {
