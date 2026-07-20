@@ -23,6 +23,8 @@ license-file = "LICENSE"
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
 base64 = "0.22.1"
+audiopus = "0.3.0-rc.0"
+audiopus_sys = { version = "0.2.2", features = ["static"] }
 cpal = "=0.17.3"
 crossterm = "0.29.0"
 encoding_rs = "0.8.35"

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    convert::TryFrom,
     error::Error,
     fmt,
     io::{self, Read, Seek, SeekFrom},
@@ -8,11 +9,15 @@ use std::{
     time::Duration,
 };
 
+use audiopus::{
+    Channels as OpusChannels, MutSignals, SampleRate as OpusSampleRate,
+    coder::Decoder as OpusDecoder, packet::Packet as OpusPacket,
+};
 use kira::{
-    AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Tween,
+    AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Frame, Tween,
     sound::{
         FromFileError, PlaybackState,
-        static_sound::{StaticSoundData, StaticSoundHandle},
+        static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
         streaming::{StreamingSoundData, StreamingSoundHandle},
     },
     track::{TrackBuilder, TrackHandle},
@@ -21,7 +26,11 @@ use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, ResourceProvider,
     ResourceStream,
 };
-use symphonia::core::io::MediaSource;
+use symphonia::core::{
+    codecs::CODEC_TYPE_OPUS,
+    errors::Error as SymphoniaError,
+    io::{MediaSource, MediaSourceStream},
+};
 
 const STATIC_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const STATIC_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
@@ -722,7 +731,7 @@ fn send_streaming_load_result(
     let LoadRequestKind::Play { id, generation, .. } = request.kind else {
         return Ok(());
     };
-    let result = load_streaming_sound(request).map(PreparedSound::Streaming);
+    let result = load_streaming_or_opus_sound(request);
     control_tx.send(ControlMessage::Prepared(Box::new(PreparedAudio {
         source,
         provider_epoch,
@@ -756,13 +765,13 @@ fn load_static_sound(
             storage: storage.clone(),
             message: error.to_string(),
         })?;
-    let data =
-        StaticSoundData::from_media_source(ResourceMediaSource::new(stream)).map_err(|error| {
-            AudioLoadFailure {
-                storage: storage.clone(),
-                message: error.to_string(),
-            }
-        })?;
+    let data = match StaticSoundData::from_media_source(ResourceMediaSource::new(stream)) {
+        Ok(data) => data,
+        Err(error) => load_opus_static_sound(&request).map_err(|opus_error| AudioLoadFailure {
+            storage: storage.clone(),
+            message: format!("{error}; Opus fallback failed: {opus_error}"),
+        })?,
+    };
     if should_cache {
         cache.insert(key, data.clone());
     }
@@ -776,7 +785,7 @@ fn load_static_or_auto_sound(
     match request.load_policy {
         AudioLoadPolicy::Auto => {
             if should_stream_auto_source(&request)? {
-                load_streaming_sound(request).map(PreparedSound::Streaming)
+                load_streaming_or_opus_sound(request)
             } else {
                 request.load_policy = AudioLoadPolicy::StaticCached;
                 load_static_sound(request, cache).map(PreparedSound::Static)
@@ -785,7 +794,7 @@ fn load_static_or_auto_sound(
         AudioLoadPolicy::StaticCached | AudioLoadPolicy::StaticUncached => {
             load_static_sound(request, cache).map(PreparedSound::Static)
         }
-        AudioLoadPolicy::Streaming => load_streaming_sound(request).map(PreparedSound::Streaming),
+        AudioLoadPolicy::Streaming => load_streaming_or_opus_sound(request),
     }
 }
 
@@ -837,8 +846,17 @@ fn should_preload_static(request: &LoadRequest) -> Result<bool, AudioLoadFailure
         .is_none_or(|len| len <= PRELOAD_MAX_SOURCE_BYTES))
 }
 
+fn load_streaming_or_opus_sound(request: LoadRequest) -> Result<PreparedSound, AudioLoadFailure> {
+    match load_streaming_sound(&request) {
+        Ok(data) => Ok(PreparedSound::Streaming(data)),
+        Err(stream_error) => load_opus_static_sound(&request)
+            .map(PreparedSound::Static)
+            .map_err(|_| stream_error),
+    }
+}
+
 fn load_streaming_sound(
-    request: LoadRequest,
+    request: &LoadRequest,
 ) -> Result<StreamingSoundData<FromFileError>, AudioLoadFailure> {
     let storage = request.source.storage().to_string();
     let stream = request
@@ -853,6 +871,79 @@ fn load_streaming_sound(
             storage,
             message: error.to_string(),
         }
+    })
+}
+
+fn load_opus_static_sound(request: &LoadRequest) -> Result<StaticSoundData, String> {
+    let stream = request
+        .provider
+        .open(request.source.storage())
+        .map_err(|error| error.to_string())?;
+    let media_source = Box::new(ResourceMediaSource::new(stream));
+    let mut format = symphonia::default::get_probe()
+        .format(
+            &Default::default(),
+            MediaSourceStream::new(media_source, Default::default()),
+            &Default::default(),
+            &Default::default(),
+        )
+        .map_err(|error| error.to_string())?
+        .format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| "audio stream has no default track".to_string())?;
+    if track.codec_params.codec != CODEC_TYPE_OPUS {
+        return Err("audio stream is not Ogg Opus".to_string());
+    }
+    let track_id = track.id;
+    let channels = match track.codec_params.channels.map(|channels| channels.count()) {
+        Some(1) => OpusChannels::Mono,
+        Some(2) => OpusChannels::Stereo,
+        Some(count) => return Err(format!("unsupported Opus channel count {count}")),
+        None => return Err("Opus stream has no channel layout".to_string()),
+    };
+    let mut decoder =
+        OpusDecoder::new(OpusSampleRate::Hz48000, channels).map_err(|error| error.to_string())?;
+    let channel_count = if channels.is_mono() { 1 } else { 2 };
+    let mut frames = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if packet.track_id() != track_id || packet.data.is_empty() {
+            continue;
+        }
+        let mut samples = vec![0.0_f32; 5760 * channel_count];
+        let decoded = decoder
+            .decode_float(
+                Some(
+                    OpusPacket::try_from(packet.data.as_ref())
+                        .map_err(|error| error.to_string())?,
+                ),
+                MutSignals::try_from(&mut samples).map_err(|error| error.to_string())?,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        let start = (packet.trim_start as usize).min(decoded);
+        let end = decoded.saturating_sub(packet.trim_end as usize).max(start);
+        for frame in samples[start * channel_count..end * channel_count].chunks_exact(channel_count)
+        {
+            frames.push(if channel_count == 1 {
+                Frame::from_mono(frame[0])
+            } else {
+                Frame::new(frame[0], frame[1])
+            });
+        }
+    }
+    Ok(StaticSoundData {
+        sample_rate: 48_000,
+        frames: frames.into(),
+        settings: StaticSoundSettings::default(),
+        slice: None,
     })
 }
 
