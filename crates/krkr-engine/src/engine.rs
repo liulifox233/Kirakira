@@ -10427,6 +10427,22 @@ mod tests {
     }
 
     #[test]
+    fn wave_sound_buffer_exposes_mutable_loop_flags() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.flags[0] = buffer.looping ? 0 : 1;
+                return buffer.flags[0];
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result, Variant::Integer(1));
+    }
+
+    #[test]
     fn wave_sound_buffer_queues_audio_commands() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
