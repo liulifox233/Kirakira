@@ -79,11 +79,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     }
 
     pub fn execute_top_level(&mut self) -> Result<Variant> {
+        self.execute_top_level_with_this(Some(self.runtime.global))
+    }
+
+    pub(crate) fn execute_top_level_with_this(
+        &mut self,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<Variant> {
         let index = self
             .file
             .top_level
             .ok_or_else(|| TjsError::runtime("bytecode has no top-level object"))?;
-        self.execute_object_with_this(index, Vec::new(), Some(self.runtime.global))
+        self.execute_object_with_this(index, Vec::new(), this_obj)
     }
 
     pub fn execute_object(&mut self, object_index: usize, args: Vec<Variant>) -> Result<Variant> {

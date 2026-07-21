@@ -2,7 +2,7 @@ use krkr_tjs2::{
     Result, TjsStackFrame,
     bytecode::BYTECODE_SIGNATURE,
     compile_source_to_bytecode,
-    runtime::{Runtime, Variant},
+    runtime::{ObjectHandle, Runtime, Variant},
 };
 
 use crate::host::KrkrHost;
@@ -14,6 +14,16 @@ pub(crate) fn execute_script_on_runtime(
 ) -> Result<Variant> {
     let file = compile_source_to_bytecode(source_name, source)?;
     runtime.execute_file(&file)
+}
+
+pub(crate) fn execute_script_on_runtime_with_this(
+    runtime: &mut Runtime<KrkrHost>,
+    source_name: &str,
+    source: &str,
+    this_obj: Option<ObjectHandle>,
+) -> Result<Variant> {
+    let file = compile_source_to_bytecode(source_name, source)?;
+    runtime.execute_file_with_this(&file, this_obj)
 }
 
 pub(crate) fn execute_bytecode_if_present_on_runtime(
@@ -46,4 +56,17 @@ pub(crate) fn execute_expression_on_runtime(
     }
     let wrapped = format!("return ({source});");
     execute_script_on_runtime(runtime, source_name, &wrapped)
+}
+
+pub(crate) fn execute_expression_on_runtime_with_this(
+    runtime: &mut Runtime<KrkrHost>,
+    source_name: &str,
+    source: &str,
+    this_obj: Option<ObjectHandle>,
+) -> Result<Variant> {
+    if source.trim().is_empty() {
+        return Ok(Variant::Void);
+    }
+    let wrapped = format!("return ({source});");
+    execute_script_on_runtime_with_this(runtime, source_name, &wrapped, this_obj)
 }

@@ -827,13 +827,15 @@ impl KrkrEngine {
                 .object_member(handle, "interval")
                 .to_integer()?
                 .max(0);
-            if interval == 0 {
-                self.tjs_runtime
-                    .host_mut()
-                    .scheduler_mut()
-                    .set_timer_next_fire_millis(handle, None);
-                continue;
-            }
+            // TVP uses a zero Timer interval as an idle continuation: it
+            // must run again after the current event turn, not be disabled.
+            // In particular, KAG's conductor returns -2 after a tag that
+            // yields and sets its timer interval to zero so it can parse the
+            // next tag on the following turn.  Treat it as one logical
+            // millisecond here.  This both preserves that continuation
+            // contract and keeps a zero-interval timer from re-entering
+            // endlessly in the same scheduler pump.
+            let interval = interval.max(1);
 
             let next_fire = match self
                 .tjs_runtime
@@ -3405,6 +3407,27 @@ mod tests {
     }
 
     #[test]
+    fn scripts_eval_and_exec_honor_the_optional_context_argument() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    r#"
+                    var target = new Dictionary();
+                    target.result = 0;
+                    Scripts.eval("this.result = 42", "context.tjs", 0, target);
+                    Scripts.exec("this.result += 3;", "context.tjs", 0, target);
+                    return target.result;
+                    "#,
+                )
+                .expect("contextual script execution"),
+            Variant::Integer(45)
+        );
+    }
+
+    #[test]
     fn scripts_object_keys_match_scriptsex_enumeration_shape() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
 
@@ -3436,7 +3459,7 @@ mod tests {
                 Scripts.foreach(["a", "b"], function(index, value, suffix) {
                     global.foreachOutput += index + "=" + value + suffix;
                 }, ";");
-                var values = %[];
+                var values = new Dictionary();
                 values.name = "kirakira";
                 Scripts.foreach(values, function(key, value) {
                     global.foreachOutput += key + "=" + value;
@@ -11697,7 +11720,7 @@ mod tests {
     }
 
     #[test]
-    fn native_timer_interval_zero_does_not_fire() {
+    fn native_timer_interval_zero_runs_on_the_next_clock_turn() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -11723,6 +11746,19 @@ mod tests {
         assert_eq!(
             engine.tjs_runtime().global_member("timerProbeCount"),
             Variant::Integer(0)
+        );
+
+        engine.host_mut().advance_clock(Duration::from_millis(1));
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("next clock turn");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("timerProbeCount"),
+            Variant::Integer(1)
         );
     }
 

@@ -1917,6 +1917,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if class_name == "Function" && self.handle_is_function(handle) {
             return Ok(true);
         }
+        // TJS exposes class definitions as first-class `Class` objects. They
+        // are callable through `new`, but are not ordinary Function objects:
+        // framework code commonly dispatches a configured `start` value by
+        // testing Function first and Class second.
+        if class_name == "Class"
+            && matches!(
+                self.runtime.heap[handle.0].kind,
+                ObjectKind::InterCode {
+                    context: BytecodeContextType::Class,
+                    ..
+                }
+            )
+        {
+            return Ok(true);
+        }
         if class_name == "Property" && self.handle_is_property(handle) {
             return Ok(true);
         }

@@ -83,6 +83,20 @@ fn main() {
             .expect("KRKR_PROBE_CLICK_Y must be a number");
         (frame, Point::new(x, y))
     });
+    let click_2 = std::env::var("KRKR_PROBE_CLICK_FRAME_2").ok().map(|value| {
+        let frame = value
+            .parse::<usize>()
+            .expect("KRKR_PROBE_CLICK_FRAME_2 must be a frame index");
+        let x = std::env::var("KRKR_PROBE_CLICK_X_2")
+            .expect("KRKR_PROBE_CLICK_X_2 is required with KRKR_PROBE_CLICK_FRAME_2")
+            .parse::<f32>()
+            .expect("KRKR_PROBE_CLICK_X_2 must be a number");
+        let y = std::env::var("KRKR_PROBE_CLICK_Y_2")
+            .expect("KRKR_PROBE_CLICK_Y_2 is required with KRKR_PROBE_CLICK_FRAME_2")
+            .parse::<f32>()
+            .expect("KRKR_PROBE_CLICK_Y_2 must be a number");
+        (frame, Point::new(x, y))
+    });
 
     let delta = Duration::from_millis(1000 / 60);
     let realtime = std::env::var_os("KRKR_PROBE_REALTIME").is_some();
@@ -130,7 +144,7 @@ fn main() {
                 .advance_clock(delta.mul_f64(time_scale - 1.0));
         }
         let mut events = Vec::new();
-        if let Some((click_frame, position)) = click {
+        for (click_frame, position) in [click, click_2].into_iter().flatten() {
             if frame_index == click_frame {
                 println!("click press at frame={frame_index} position={position:?}");
                 events.push(EngineEvent::CursorMoved { position });

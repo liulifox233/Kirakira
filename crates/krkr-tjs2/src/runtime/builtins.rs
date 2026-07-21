@@ -814,7 +814,14 @@ fn dictionary_assign<H: TjsHost + 'static>(
     let Some(Variant::Object(src)) = args.first().cloned() else {
         return Ok(Variant::Object(dest));
     };
+    // Builtin Dictionary methods are attached as implementation members in
+    // this runtime. TVP's Dictionary.assign copies data members, not that
+    // helper surface. Copying them into PBD-derived dictionaries makes UI
+    // enumerators mistake `assign`/`clear` for authored controls.
     for (key, value) in runtime.heap[src.0].members.clone() {
+        if is_native_member_name(&key) {
+            continue;
+        }
         runtime.heap[dest.0].set(key, value);
     }
     Ok(Variant::Object(dest))

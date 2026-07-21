@@ -489,9 +489,20 @@ impl<H: TjsHost + 'static> Runtime<H> {
     }
 
     pub fn execute_file(&mut self, file: &BytecodeFile) -> Result<Variant> {
+        self.execute_file_with_this(file, Some(self.global))
+    }
+
+    /// Executes a compiled top-level script with an explicit TJS `this`
+    /// context.  Native APIs such as `Scripts.exec` and `Scripts.eval` expose
+    /// this as their fourth `context` parameter.
+    pub fn execute_file_with_this(
+        &mut self,
+        file: &BytecodeFile,
+        this_obj: Option<ObjectHandle>,
+    ) -> Result<Variant> {
         let file_id = self.install_script_file(Arc::new(file.clone()));
         let mut vm = Vm::new(file_id, self)?;
-        vm.execute_top_level()
+        vm.execute_top_level_with_this(this_obj)
     }
 
     pub fn request_suspend(&mut self) {

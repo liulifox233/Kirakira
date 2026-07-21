@@ -234,6 +234,24 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_assign_copies_data_without_builtin_members() {
+        assert_eq!(
+            execute_source(
+                "dictionary_assign.tjs",
+                r#"
+                var source = new Dictionary();
+                source.answer = 42;
+                var dest = new Dictionary();
+                dest.assign(source);
+                return typeof dest.answer + ":" + typeof dest.assign + ":" + dest.answer;
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("Integer:Object:42".to_string())
+        );
+    }
+
+    #[test]
     fn execute_source_assigns_sparse_array_index() {
         assert_eq!(
             execute_source("inline.tjs", "var a = []; a[30] = false; return a.count;")
@@ -1303,6 +1321,21 @@ mod tests {
             )
             .expect("execute"),
             Variant::Integer(2)
+        );
+    }
+
+    #[test]
+    fn class_definitions_are_instances_of_class_but_not_function() {
+        assert_eq!(
+            execute_source(
+                "class_instanceof.tjs",
+                r#"
+                class C { }
+                return (C instanceof "Class") + ":" + (C instanceof "Function");
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("1:0".to_string())
         );
     }
 

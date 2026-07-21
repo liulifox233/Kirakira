@@ -616,9 +616,16 @@ fn install_layer_effects(runtime: &mut Runtime<KrkrHost>) {
 fn install_data_pack(runtime: &mut Runtime<KrkrHost>) {
     // tjsDataPack attaches these to the Scripts object (games call
     // `Scripts.loadDataPack(...)`); also expose them as globals for safety.
+    // The engine provides the canonical Scripts implementation.  Do not
+    // replace it when this compatibility bundle is loaded later.
     let scripts = ensure_global_object(runtime, "Scripts");
     let global = runtime.global_handle();
-    runtime.register_object_native(scripts, "loadDataPack", load_data_pack);
+    if matches!(
+        runtime.object_member(scripts, "loadDataPack"),
+        Variant::Void
+    ) {
+        runtime.register_object_native(scripts, "loadDataPack", load_data_pack);
+    }
     runtime.register_object_native(global, "loadDataPack", load_data_pack);
     for target in [scripts, global] {
         runtime.register_object_native(target, "saveDataPack", zero);
@@ -633,6 +640,7 @@ fn load_data_pack(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
+    let name = data_pack_storage_name(&name);
     let Ok(bytes) = runtime.host().read_binary_storage(&name) else {
         return Ok(Variant::Void);
     };
@@ -646,6 +654,17 @@ fn load_data_pack(
     Ok(value.unwrap_or(Variant::Void))
 }
 
+fn data_pack_storage_name(name: &str) -> String {
+    if name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("pbd"))
+    {
+        name.to_string()
+    } else {
+        format!("{name}.pbd")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // scriptsEx surface on Scripts
 
@@ -654,6 +673,7 @@ fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(scripts, "encodeTBPS", first_arg_string);
     runtime.register_object_native(scripts, "decodeTBPS", first_arg_string);
     runtime.register_object_native(scripts, "clone", scripts_clone);
+    runtime.register_object_native(scripts, "isNullContext", scripts_is_null_context);
     let logged = Arc::new(AtomicBool::new(false));
     runtime.register_object_native(
         scripts,
@@ -678,6 +698,19 @@ fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
             Ok(Variant::Void)
         },
     );
+}
+
+/// scriptsEx exposes whether a function/object closure carries an ObjThis
+/// context. Action.tjs uses this to bind unqualified completion callbacks to
+/// the action instance before invoking them.
+fn scripts_is_null_context(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let is_null =
+        !matches!(args.first(), Some(Variant::Closure(closure)) if closure.this_obj.is_some());
+    Ok(Variant::Integer(i64::from(is_null)))
 }
 
 fn scripts_clone(
@@ -870,6 +903,7 @@ mod tests {
     use std::{fs, time::SystemTime};
 
     use krkr_engine::KrkrEngine;
+    use krkr_tjs2::runtime::Closure;
 
     use super::*;
 
@@ -932,5 +966,30 @@ mod tests {
 
         assert_eq!(value, Variant::String("1:2:9:7".to_owned()));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn scripts_is_null_context_matches_scriptsex_objthis_semantics() {
+        let mut runtime = Runtime::with_host(KrkrHost::default());
+        let object = runtime.alloc_ordinary_object();
+
+        assert_eq!(
+            scripts_is_null_context(
+                &mut runtime,
+                None,
+                vec![Variant::Closure(Closure::new(object, None))],
+            )
+            .expect("unbound closure"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            scripts_is_null_context(
+                &mut runtime,
+                None,
+                vec![Variant::Closure(Closure::new(object, Some(object)))],
+            )
+            .expect("bound closure"),
+            Variant::Integer(0)
+        );
     }
 }

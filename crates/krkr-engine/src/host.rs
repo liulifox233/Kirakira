@@ -916,16 +916,7 @@ impl KrkrHost {
         let Some(layer_id) = self.native_layer(handle) else {
             return false;
         };
-        let parent_layer = parent.and_then(|parent| self.native_layer(parent));
-        let render_parent = if self
-            .kag_layer_slots
-            .get(&handle)
-            .is_some_and(|slot| slot.page == "fore" && slot.layer == "base")
-        {
-            None
-        } else {
-            parent_layer
-        };
+        let render_parent = self.native_layer_render_parent(handle, parent);
         if !self.layer_tree.set_parent(layer_id, render_parent) {
             return false;
         }
@@ -943,7 +934,7 @@ impl KrkrHost {
         }
         if let Some(new_parent) = parent {
             self.add_native_layer_child(new_parent, handle);
-            let z_order = self.next_sibling_z_order(parent_layer);
+            let z_order = self.next_sibling_z_order(render_parent);
             if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
                 layer.z_order = z_order;
             }
@@ -1024,10 +1015,7 @@ impl KrkrHost {
             .is_some_and(|window| self.native_window_closed(window));
         match instance.render_target.clone() {
             LayerRenderTarget::Native(layer_id) => {
-                let render_parent = match self.kag_layer_slots.get(&handle) {
-                    Some(slot) if slot.page == "fore" && slot.layer == "base" => None,
-                    _ => instance.parent.and_then(|parent| self.native_layer(parent)),
-                };
+                let render_parent = self.native_layer_render_parent(handle, instance.parent);
                 self.layer_tree.set_parent(layer_id, render_parent);
                 if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
                     apply_layer_properties_to_node(layer, &instance.properties, window_closed);
@@ -1042,6 +1030,33 @@ impl KrkrHost {
                     apply_layer_properties_to_node(layer, &instance.properties, window_closed);
                 });
             }
+        }
+    }
+
+    /// Returns the physical parent used by the current fore-page render
+    /// projection.  A page exchange can make the active fore base a TJS child
+    /// of the now-staged back page; that ancestor is deliberately not
+    /// renderable.  Project just that virtual page root to the render root so
+    /// its live children remain visible.  Ordinary fore bases retain their
+    /// real parent, which is essential for sibling popup ordering.
+    fn native_layer_render_parent(
+        &self,
+        handle: ObjectHandle,
+        parent: Option<ObjectHandle>,
+    ) -> Option<LayerId> {
+        let is_fore_base = self
+            .kag_layer_slots
+            .get(&handle)
+            .is_some_and(|slot| slot.page == "fore" && slot.layer == "base");
+        let parent_is_back_page = parent.is_some_and(|parent| {
+            self.kag_layer_slots
+                .get(&parent)
+                .is_some_and(|slot| slot.page == "back")
+        });
+        if is_fore_base && parent_is_back_page {
+            None
+        } else {
+            parent.and_then(|parent| self.native_layer(parent))
         }
     }
 
