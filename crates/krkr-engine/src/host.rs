@@ -812,7 +812,7 @@ impl KrkrHost {
                     instance.parent = parent;
                     instance.children_array = children_array.or(instance.children_array);
                 }
-                let render_parent = parent.and_then(|parent| self.native_layer(parent));
+                let render_parent = self.native_layer_render_parent(handle, parent);
                 self.layer_tree.set_parent(layer_id, render_parent);
                 if parent.is_some() {
                     let z_order = self.next_sibling_z_order(render_parent);
@@ -824,13 +824,7 @@ impl KrkrHost {
             return layer_id;
         }
 
-        let parent_layer = parent.and_then(|parent| self.native_layer(parent));
-        let z_order = if primary {
-            0
-        } else {
-            self.next_sibling_z_order(parent_layer)
-        };
-        let id = self.layer_tree.create_layer(name, parent_layer, z_order);
+        let id = self.layer_tree.create_layer(name, None, 0);
         if let Some(layer) = self.layer_tree.layer_mut(id)
             && primary
         {
@@ -841,6 +835,16 @@ impl KrkrHost {
         let mut instance = LayerInstance::new(id, window, parent, children_array);
         instance.set_property("isPrimary", Variant::Integer(i64::from(primary)));
         self.native_layers.insert(handle, instance);
+        let render_parent = self.native_layer_render_parent(handle, parent);
+        let z_order = if primary {
+            0
+        } else {
+            self.next_sibling_z_order(render_parent)
+        };
+        if let Some(layer) = self.layer_tree.layer_mut(id) {
+            layer.parent = render_parent;
+            layer.z_order = z_order;
+        }
         if let Some(parent) = parent {
             self.add_native_layer_child(parent, handle);
         }
@@ -1055,6 +1059,26 @@ impl KrkrHost {
         });
         if is_fore_base && parent_is_back_page {
             None
+        } else if let Some(parent) = parent
+            && self
+                .kag_layer_slots
+                .get(&parent)
+                .is_some_and(|slot| slot.page == "back" && slot.layer == "base")
+            && self
+                .native_layer(handle)
+                .and_then(|layer_id| self.layer_tree.layer(layer_id))
+                .is_some_and(|layer| layer.renderable)
+        {
+            // `syspage ... page=back` builds UI below the staging base.  On
+            // exchange, KAG projects that live UI subtree into fore while the
+            // back base itself stays non-renderable.  Keep the script parent
+            // untouched, but attach its render root to the corresponding
+            // fore base so draw and hit-test traversal agree.
+            self.kag_layer_slots.iter().find_map(|(handle, slot)| {
+                (slot.page == "fore" && slot.layer == "base")
+                    .then(|| self.native_layer(*handle))
+                    .flatten()
+            })
         } else {
             parent.and_then(|parent| self.native_layer(parent))
         }

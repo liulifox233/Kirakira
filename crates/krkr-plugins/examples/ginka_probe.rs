@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use krkr_core::{
     AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, ImageCommand,
@@ -39,6 +39,14 @@ fn main() {
         engine.has_kag_scenario(),
         engine.kag_state()
     );
+    if let Ok(storage) = std::env::var("KRKR_PROBE_DUMP_STORAGE") {
+        let bytes = engine
+            .host()
+            .read_binary_storage(&storage)
+            .expect("storage dump");
+        println!("---storage {storage} bytes={}---", bytes.len());
+        print!("{}", String::from_utf8_lossy(&bytes));
+    }
 
     // A probe must stay silent.  This mode consumes commands and completes
     // one-shot sounds on the next frame so script waits follow the desktop
@@ -97,8 +105,47 @@ fn main() {
             .expect("KRKR_PROBE_CLICK_Y_2 must be a number");
         (frame, Point::new(x, y))
     });
+    let click_3 = std::env::var("KRKR_PROBE_CLICK_FRAME_3").ok().map(|value| {
+        let frame = value
+            .parse::<usize>()
+            .expect("KRKR_PROBE_CLICK_FRAME_3 must be a frame index");
+        let x = std::env::var("KRKR_PROBE_CLICK_X_3")
+            .expect("KRKR_PROBE_CLICK_X_3 is required with KRKR_PROBE_CLICK_FRAME_3")
+            .parse::<f32>()
+            .expect("KRKR_PROBE_CLICK_X_3 must be a number");
+        let y = std::env::var("KRKR_PROBE_CLICK_Y_3")
+            .expect("KRKR_PROBE_CLICK_Y_3 is required with KRKR_PROBE_CLICK_FRAME_3")
+            .parse::<f32>()
+            .expect("KRKR_PROBE_CLICK_Y_3 must be a number");
+        (frame, Point::new(x, y))
+    });
+    let click_4 = std::env::var("KRKR_PROBE_CLICK_FRAME_4").ok().map(|value| {
+        let frame = value
+            .parse::<usize>()
+            .expect("KRKR_PROBE_CLICK_FRAME_4 must be a frame index");
+        let x = std::env::var("KRKR_PROBE_CLICK_X_4")
+            .expect("KRKR_PROBE_CLICK_X_4 is required with KRKR_PROBE_CLICK_FRAME_4")
+            .parse::<f32>()
+            .expect("KRKR_PROBE_CLICK_X_4 must be a number");
+        let y = std::env::var("KRKR_PROBE_CLICK_Y_4")
+            .expect("KRKR_PROBE_CLICK_Y_4 is required with KRKR_PROBE_CLICK_FRAME_4")
+            .parse::<f32>()
+            .expect("KRKR_PROBE_CLICK_Y_4 must be a number");
+        (frame, Point::new(x, y))
+    });
 
     let delta = Duration::from_millis(1000 / 60);
+    let shot_path = std::env::var("KRKR_PROBE_SHOT").ok();
+    let shot_frame = std::env::var("KRKR_PROBE_SHOT_FRAME")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("KRKR_PROBE_SHOT_FRAME must be a frame index")
+        })
+        .unwrap_or(frames.saturating_sub(1));
+    let mut textures: HashMap<u64, (u32, u32, Arc<[u8]>)> = HashMap::new();
+    let mut shot_commands: Option<Vec<DrawCommand>> = None;
     let realtime = std::env::var_os("KRKR_PROBE_REALTIME").is_some();
     let time_scale = std::env::var("KRKR_PROBE_TIME_SCALE")
         .ok()
@@ -144,7 +191,7 @@ fn main() {
                 .advance_clock(delta.mul_f64(time_scale - 1.0));
         }
         let mut events = Vec::new();
-        for (click_frame, position) in [click, click_2].into_iter().flatten() {
+        for (click_frame, position) in [click, click_2, click_3, click_4].into_iter().flatten() {
             if frame_index == click_frame {
                 println!("click press at frame={frame_index} position={position:?}");
                 events.push(EngineEvent::CursorMoved { position });
@@ -169,6 +216,15 @@ fn main() {
             delta,
         ) {
             Ok(frame) => {
+                for upload in &frame.output.image_uploads {
+                    textures.insert(
+                        upload.texture_id,
+                        (upload.width, upload.height, upload.rgba.clone()),
+                    );
+                }
+                if shot_path.is_some() && frame_index == shot_frame {
+                    shot_commands = Some(frame.output.draw_commands.clone());
+                }
                 let commands = engine.host_mut().take_audio_commands();
                 if virtual_audio {
                     queue_virtual_audio_completions(&commands, &mut pending_audio_stops);
@@ -283,6 +339,225 @@ fn main() {
         }
     }
     println!("done frames={frames}");
+    if let Some(path) = shot_path {
+        // Live layer images take priority over cached uploads: a layer image
+        // can be updated in place without a new upload, which would leave the
+        // cached copy stale (e.g. an opaque black texture turned transparent).
+        for layer in engine.host().layer_tree().layers() {
+            if let Some(image) = &layer.image {
+                textures.insert(
+                    image.upload.texture_id,
+                    (
+                        image.upload.width,
+                        image.upload.height,
+                        image.upload.rgba.clone(),
+                    ),
+                );
+            }
+        }
+        let commands = shot_commands.unwrap_or_default();
+        let (width, height, rgba) = composite_frame(1280, 720, &commands, &textures);
+        write_png(&path, width, height, &rgba).expect("write screenshot");
+        println!("screenshot={path} commands={}", commands.len());
+    }
+}
+
+fn composite_frame(
+    width: u32,
+    height: u32,
+    commands: &[DrawCommand],
+    textures: &HashMap<u64, (u32, u32, Arc<[u8]>)>,
+) -> (u32, u32, Vec<u8>) {
+    let mut canvas = vec![0u8; (width * height * 4) as usize];
+    let mut missing = 0usize;
+    for command in commands {
+        match command {
+            DrawCommand::Rect(rect_command) => {
+                let r = (rect_command.color.r * 255.0).clamp(0.0, 255.0) as u8;
+                let g = (rect_command.color.g * 255.0).clamp(0.0, 255.0) as u8;
+                let b = (rect_command.color.b * 255.0).clamp(0.0, 255.0) as u8;
+                let a = (rect_command.color.a * 255.0).clamp(0.0, 255.0) as u8;
+                fill_rect(&mut canvas, width, height, &rect_command.rect, [r, g, b], a);
+            }
+            DrawCommand::Image(image) => {
+                let Some((tw, th, rgba)) = textures.get(&image.texture_id) else {
+                    missing += 1;
+                    continue;
+                };
+                blend_image(
+                    &mut canvas,
+                    width,
+                    height,
+                    &image.rect,
+                    &image.source_rect,
+                    *tw,
+                    *th,
+                    rgba,
+                    image.opacity,
+                );
+            }
+            DrawCommand::Text(_) => {}
+        }
+    }
+    if missing > 0 {
+        println!("screenshot missing_textures={missing}");
+    }
+    // Flatten onto an opaque black background, matching the window clear color.
+    for pixel in canvas.chunks_exact_mut(4) {
+        let a = pixel[3] as u16;
+        pixel[0] = ((pixel[0] as u16 * a + 255 * (255 - a)) / 255) as u8;
+        pixel[1] = ((pixel[1] as u16 * a + 255 * (255 - a)) / 255) as u8;
+        pixel[2] = ((pixel[2] as u16 * a + 255 * (255 - a)) / 255) as u8;
+        pixel[3] = 255;
+    }
+    (width, height, canvas)
+}
+
+fn fill_rect(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    rect: &krkr_core::Rect,
+    rgb: [u8; 3],
+    alpha: u8,
+) {
+    let x0 = rect.x.max(0.0) as u32;
+    let y0 = rect.y.max(0.0) as u32;
+    let x1 = ((rect.x + rect.width).max(0.0) as u32).min(width);
+    let y1 = ((rect.y + rect.height).max(0.0) as u32).min(height);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            blend_pixel(canvas, width, x, y, rgb, alpha);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blend_image(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    rect: &krkr_core::Rect,
+    source: &krkr_core::Rect,
+    tex_width: u32,
+    tex_height: u32,
+    rgba: &[u8],
+    opacity: f32,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 || source.width <= 0.0 || source.height <= 0.0 {
+        return;
+    }
+    let x0 = rect.x.max(0.0) as u32;
+    let y0 = rect.y.max(0.0) as u32;
+    let x1 = ((rect.x + rect.width).max(0.0) as u32).min(width);
+    let y1 = ((rect.y + rect.height).max(0.0) as u32).min(height);
+    for y in y0..y1 {
+        let v = (y as f32 - rect.y) / rect.height;
+        let sy = (source.y + v * source.height) as u32;
+        if sy >= tex_height {
+            continue;
+        }
+        for x in x0..x1 {
+            let u = (x as f32 - rect.x) / rect.width;
+            let sx = (source.x + u * source.width) as u32;
+            if sx >= tex_width {
+                continue;
+            }
+            let index = ((sy * tex_width + sx) * 4) as usize;
+            let alpha = (rgba[index + 3] as f32 * opacity.clamp(0.0, 1.0)) as u8;
+            blend_pixel(
+                canvas,
+                width,
+                x,
+                y,
+                [rgba[index], rgba[index + 1], rgba[index + 2]],
+                alpha,
+            );
+        }
+    }
+}
+
+fn blend_pixel(canvas: &mut [u8], width: u32, x: u32, y: u32, rgb: [u8; 3], alpha: u8) {
+    let index = ((y * width + x) * 4) as usize;
+    let dst = &mut canvas[index..index + 4];
+    let sa = alpha as u16;
+    let da = dst[3] as u16;
+    let out_a = sa + da * (255 - sa) / 255;
+    if out_a == 0 {
+        dst.fill(0);
+        return;
+    }
+    for (channel, src) in dst.iter_mut().take(3).zip(rgb) {
+        let s = src as u16;
+        let d = *channel as u16;
+        *channel = ((s * sa + d * da * (255 - sa) / 255) / out_a) as u8;
+    }
+    dst[3] = out_a as u8;
+}
+
+fn write_png(path: &str, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let mut raw = Vec::with_capacity((width * height * 4 + height) as usize);
+    for row in rgba.chunks_exact((width * 4) as usize) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    // zlib stream with stored (uncompressed) deflate blocks.
+    let mut zdata = vec![0x78, 0x01];
+    let mut chunks = raw.chunks(65535).peekable();
+    while let Some(chunk) = chunks.next() {
+        let last = chunks.peek().is_none();
+        zdata.push(u8::from(last));
+        zdata.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        zdata.extend_from_slice(&(!(chunk.len() as u16)).to_le_bytes());
+        zdata.extend_from_slice(chunk);
+    }
+    zdata.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    write_png_chunk(&mut png, b"IHDR", &ihdr);
+    write_png_chunk(&mut png, b"IDAT", &zdata);
+    write_png_chunk(&mut png, b"IEND", &[]);
+    std::fs::write(path, png)
+}
+
+fn write_png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    png.extend_from_slice(kind);
+    png.extend_from_slice(data);
+    let mut crc_data = Vec::with_capacity(4 + data.len());
+    crc_data.extend_from_slice(kind);
+    crc_data.extend_from_slice(data);
+    png.extend_from_slice(&crc32(&crc_data).to_be_bytes());
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &byte in data {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
 }
 
 fn variant_kind(value: &Variant) -> &'static str {
