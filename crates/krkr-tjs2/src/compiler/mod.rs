@@ -469,9 +469,9 @@ mod tests {
     #[test]
     fn string_escape_escapes_tjs_string_literal_fragments() {
         assert_eq!(
-            execute_source("inline.tjs", r#"return "voice\\line\"01\n".escape();"#)
+            execute_source("inline.tjs", r#"return "voice\\line'\"01\n".escape();"#)
                 .expect("execute"),
-            Variant::String("voice\\\\line\\\"01\\n".to_string())
+            Variant::String("voice\\\\line\\x27\\\"01\\n".to_string())
         );
     }
 
@@ -1197,6 +1197,18 @@ mod tests {
             )
             .expect("execute"),
             Variant::Integer(42)
+        );
+    }
+
+    #[test]
+    fn eval_operator_preserves_escaped_interpolated_string_delimiters() {
+        assert_eq!(
+            execute_source(
+                "eval_interpolated_string.tjs",
+                r#"return ("@'\\\"Let\\x27s go\\\"'")!;"#,
+            )
+            .expect("execute"),
+            Variant::String("\"Let's go\"".to_string())
         );
     }
 

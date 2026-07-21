@@ -226,12 +226,47 @@ fn scripts_eval(
         Some(Variant::Object(handle)) => Some(*handle),
         _ => None,
     };
-    execute_expression_on_runtime_with_this(runtime, &name, &source, context).map_err(|error| {
-        TjsError::runtime(format!(
-            "Scripts.eval failed for source `{}`: {error}",
-            preview_source(&source)
-        ))
-    })
+    execute_expression_on_runtime_with_this(runtime, &name, &source, context)
+        .or_else(|error| {
+            // KAG3's `applyInlineStringVariableExtract` generates an
+            // interpolated `@'...'` source string. Some translated scripts
+            // feed it an unescaped apostrophe (for example "Let's"), even
+            // though the same text is otherwise a valid literal. KRKR's
+            // dynamic evaluator accepts this common generated form; retry it
+            // with an equivalent double-quoted interpolated delimiter only
+            // after the original source failed to parse.
+            let Some(rewritten) = retry_interpolated_single_quote_source(&source) else {
+                return Err(error);
+            };
+            execute_expression_on_runtime_with_this(runtime, &name, &rewritten, context)
+                .map_err(|_| error)
+        })
+        .map_err(|error| {
+            TjsError::runtime(format!(
+                "Scripts.eval failed for source `{}`: {error}",
+                preview_source(&source)
+            ))
+        })
+}
+
+fn retry_interpolated_single_quote_source(source: &str) -> Option<String> {
+    let body = source.strip_prefix("@'")?.strip_suffix('\'')?;
+    let mut rewritten = String::with_capacity(source.len() + 2);
+    rewritten.push_str("@\"");
+    let mut escaped = false;
+    for ch in body.chars() {
+        if ch == '"' && !escaped {
+            rewritten.push('\\');
+        }
+        rewritten.push(ch);
+        if ch == '\\' {
+            escaped = !escaped;
+        } else {
+            escaped = false;
+        }
+    }
+    rewritten.push('"');
+    Some(rewritten)
 }
 
 fn scripts_get_trace_string(
@@ -486,4 +521,18 @@ fn preview_source(source: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_interpolated_single_quote_source;
+
+    #[test]
+    fn retries_only_standalone_single_quoted_interpolated_source() {
+        assert_eq!(
+            retry_interpolated_single_quote_source("@'\"Let's go\"'"),
+            Some("@\"\\\"Let's go\\\"\"".to_string())
+        );
+        assert_eq!(retry_interpolated_single_quote_source("value + 1"), None);
+    }
 }

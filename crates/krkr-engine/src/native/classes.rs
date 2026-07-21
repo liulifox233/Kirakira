@@ -71,14 +71,15 @@ fn construct_native_instance(
         install_methods(runtime, handle, spec.name, spec.methods);
         install_special_methods(runtime, handle, spec.name);
     }
-    // `onTransitionCompleted` is a native event, not an instance method
-    // implementation.  Keeping the placeholder installed by `Layer` on the
-    // instance shadows overrides supplied by script base classes (for example
-    // BaseLayerBase in KAGWindow).  Leave the no-op declaration on the Layer
-    // class itself for `SUPER.onTransitionCompleted()`, but let normal member
-    // lookup reach the script override for an instance.
+    // These are native events, not instance method implementations. Keeping
+    // Layer's placeholders on the instance shadows overrides supplied by
+    // script base classes (notably MessageLayer.onPaint, which drives GINKA's
+    // message renderer). Leave the no-op declarations on the Layer class for
+    // `SUPER.*()` calls, but let normal member lookup reach script overrides
+    // on each instance.
     if spec.name == "Layer" {
         runtime.delete_object_member(handle, "onTransitionCompleted");
+        runtime.delete_object_member(handle, "onPaint");
     }
     install_properties(runtime, handle, spec.properties);
     apply_constructor_defaults(runtime, handle, spec.name, &args)?;

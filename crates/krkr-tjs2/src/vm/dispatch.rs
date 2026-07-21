@@ -2470,6 +2470,11 @@ fn escape_tjs_string_fragment(value: &str) -> String {
     for ch in value.chars() {
         match ch {
             '\\' => escaped.push_str("\\\\"),
+            // Use a hexadecimal escape instead of `\\'`: callers such as
+            // KAG's applyInlineStringVariableExtract embed this output in an
+            // `@'...'` interpolated source string, where a literal quote must
+            // never be able to terminate the generated source.
+            '\'' => escaped.push_str("\\x27"),
             '"' => escaped.push_str("\\\""),
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
