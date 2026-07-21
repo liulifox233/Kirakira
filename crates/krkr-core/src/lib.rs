@@ -292,10 +292,11 @@ pub struct TextCommand {
 pub type TextureId = u64;
 pub type LayerId = u64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct UploadedImageState {
     width: u32,
     height: u32,
+    rgba: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1388,8 +1389,17 @@ impl Engine {
                 let state = UploadedImageState {
                     width: upload.width,
                     height: upload.height,
+                    rgba: upload.rgba.clone(),
                 };
-                if self.uploaded_images.get(&upload.texture_id) == Some(&state) {
+                if self
+                    .uploaded_images
+                    .get(&upload.texture_id)
+                    .is_some_and(|previous| {
+                        previous.width == state.width
+                            && previous.height == state.height
+                            && Arc::ptr_eq(&previous.rgba, &state.rgba)
+                    })
+                {
                     return false;
                 }
                 self.uploaded_images.insert(upload.texture_id, state);
@@ -2090,6 +2100,39 @@ mod tests {
         assert_eq!(first.image_uploads.len(), 1);
         assert!(second.image_uploads.is_empty());
         assert_eq!(first.draw_commands, second.draw_commands);
+    }
+
+    #[test]
+    fn running_layer_reuploads_replaced_pixels_with_the_same_texture_id() {
+        let mut layers = LayerTree::new();
+        let id = layers.create_layer("image", None, 0);
+        {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 1.0;
+            layer.height = 1.0;
+            layer.visible = true;
+            layer.set_image(LayerImage::new(42, 1, 1, Arc::from([255, 0, 0, 255])));
+        }
+
+        let mut engine = Engine::new(EngineConfig::default());
+        let first = engine.tick_running_with_layers(
+            FrameInput::new(Size::new(320.0, 240.0), 0.0),
+            &layers,
+            &MessageLayerModel::default(),
+        );
+        layers
+            .layer_mut(id)
+            .expect("layer")
+            .set_image(LayerImage::new(42, 1, 1, Arc::from([0, 255, 0, 255])));
+        let second = engine.tick_running_with_layers(
+            FrameInput::new(Size::new(320.0, 240.0), 0.0),
+            &layers,
+            &MessageLayerModel::default(),
+        );
+
+        assert_eq!(first.image_uploads.len(), 1);
+        assert_eq!(second.image_uploads.len(), 1);
+        assert_eq!(second.image_uploads[0].rgba.as_ref(), &[0, 255, 0, 255]);
     }
 
     #[test]
