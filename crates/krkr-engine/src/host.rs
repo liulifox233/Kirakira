@@ -211,6 +211,7 @@ pub struct KrkrHost {
     text_encoding: String,
     pressed_keys: BTreeSet<i64>,
     cursor_position: Option<Point>,
+    clock_offset_millis: i64,
     termination_requested: bool,
     modal_windows: Vec<ObjectHandle>,
 }
@@ -258,6 +259,7 @@ impl Default for KrkrHost {
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             cursor_position: None,
+            clock_offset_millis: 0,
             termination_requested: false,
             modal_windows: Vec::new(),
         }
@@ -313,6 +315,7 @@ impl KrkrHost {
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             cursor_position: None,
+            clock_offset_millis: 0,
             termination_requested: false,
             modal_windows: Vec::new(),
         })
@@ -538,6 +541,15 @@ impl KrkrHost {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(0)
+            .saturating_add(self.clock_offset_millis)
+    }
+
+    /// Advances the engine clock without sleeping. This is intended for
+    /// deterministic headless integration probes; normal platform runtimes
+    /// leave the offset at zero and continue to use wall-clock time.
+    pub fn advance_clock(&mut self, duration: Duration) {
+        let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        self.clock_offset_millis = self.clock_offset_millis.saturating_add(millis);
     }
 
     pub fn log(&mut self, message: &str) {
@@ -2306,6 +2318,14 @@ impl TjsHost for KrkrHost {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn advance_clock_offsets_timer_time_without_sleeping() {
+        let mut host = KrkrHost::default();
+        let before = host.now_millis();
+        host.advance_clock(Duration::from_millis(250));
+        assert!(host.now_millis() >= before.saturating_add(250));
+    }
 
     #[test]
     fn storage_mode_offset_reads_and_writes_struct_tail() {

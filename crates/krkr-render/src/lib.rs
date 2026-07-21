@@ -366,13 +366,6 @@ impl Renderer {
 
     fn upload_images(&mut self, uploads: &[ImageUpload]) {
         for upload in uploads {
-            let needs_upload = self.textures.get(&upload.texture_id).is_none_or(|texture| {
-                texture.width != upload.width || texture.height != upload.height
-            });
-            if !needs_upload {
-                continue;
-            }
-
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Kirakira uploaded texture"),
                 size: wgpu::Extent3d {
@@ -424,8 +417,6 @@ impl Renderer {
             self.textures.insert(
                 upload.texture_id,
                 CachedTexture {
-                    width: upload.width,
-                    height: upload.height,
                     _texture: texture,
                     _view: view,
                     bind_group,
@@ -1028,8 +1019,6 @@ fn sampler_bind_group_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 struct CachedTexture {
-    width: u32,
-    height: u32,
     _texture: wgpu::Texture,
     _view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
