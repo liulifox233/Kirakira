@@ -8,7 +8,8 @@ use crate::{
     host::KrkrHost,
     script::{
         execute_bytecode_if_present_on_runtime, execute_expression_on_runtime,
-        execute_script_on_runtime,
+        execute_expression_on_runtime_with_this, execute_script_on_runtime,
+        execute_script_on_runtime_with_this,
     },
 };
 
@@ -18,6 +19,7 @@ pub(crate) fn install_scripts(runtime: &mut Runtime<KrkrHost>) {
     let scripts = install_static_object(runtime, "Scripts");
     runtime.register_object_native(scripts, "execStorage", scripts_exec_storage);
     runtime.register_object_native(scripts, "evalStorage", scripts_eval_storage);
+    runtime.register_object_native(scripts, "loadDataPack", scripts_load_data_pack);
     runtime.register_object_native(scripts, "compileStorage", scripts_compile_storage);
     runtime.register_object_native(scripts, "exec", scripts_exec);
     runtime.register_object_native(scripts, "eval", scripts_eval);
@@ -91,6 +93,54 @@ fn scripts_eval_storage(
     Ok(value)
 }
 
+/// Loads Kirikiri's binary data-pack (`.pbd`) storage.
+///
+/// `PSDInfo.loadPBD` deliberately passes a storage *base* name here (unlike
+/// `evalStorage`, which receives a complete storage name).  Keeping the
+/// extension handling in this native entry point matches the KRKR API and is
+/// important because ordinary storage lookup does not infer `.pbd`.
+fn scripts_load_data_pack(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = required_arg_string(&args, 0, "Scripts.loadDataPack")?;
+    // The second `options` argument is used by some games to pass an outer IV
+    // for encrypted packs.  Plain PBD packs, including the standard
+    // PSDInfo-generated packs, are already a TJS binary struct and need no
+    // transform before decoding.
+    let storage_name = data_pack_storage_name(&name);
+    let bytes = runtime.host_mut().read_binary(&storage_name, "")?;
+    if bytes.starts_with(b"KBAD100\0") {
+        return runtime.decode_binary_struct(&bytes)?.ok_or_else(|| {
+            TjsError::runtime(format!(
+                "Scripts.loadDataPack could not decode `{storage_name}`"
+            ))
+        });
+    }
+    if bytes.starts_with(b"TJS/ns0\0") || bytes.starts_with(b"TJS/4s0\0") {
+        return runtime.decode_tjs_ns0(&bytes)?.ok_or_else(|| {
+            TjsError::runtime(format!(
+                "Scripts.loadDataPack could not decode `{storage_name}`"
+            ))
+        });
+    }
+    Err(TjsError::runtime(format!(
+        "Scripts.loadDataPack expected a binary data pack in `{storage_name}`"
+    )))
+}
+
+fn data_pack_storage_name(name: &str) -> String {
+    if name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("pbd"))
+    {
+        name.to_string()
+    } else {
+        format!("{name}.pbd")
+    }
+}
+
 fn read_binary_struct_storage(
     runtime: &mut Runtime<KrkrHost>,
     name: &str,
@@ -158,7 +208,11 @@ fn scripts_exec(
 ) -> Result<Variant> {
     let source = required_arg_string(&args, 0, "Scripts.exec")?;
     let name = arg_string(&args, 1)?.unwrap_or_else(|| "inline.tjs".to_string());
-    execute_script_on_runtime(runtime, &name, &source)
+    let context = match args.get(3) {
+        Some(Variant::Object(handle)) => Some(*handle),
+        _ => None,
+    };
+    execute_script_on_runtime_with_this(runtime, &name, &source, context)
 }
 
 fn scripts_eval(
@@ -168,7 +222,11 @@ fn scripts_eval(
 ) -> Result<Variant> {
     let source = required_arg_string(&args, 0, "Scripts.eval")?;
     let name = arg_string(&args, 1)?.unwrap_or_else(|| "inline.tjs".to_string());
-    execute_expression_on_runtime(runtime, &name, &source).map_err(|error| {
+    let context = match args.get(3) {
+        Some(Variant::Object(handle)) => Some(*handle),
+        _ => None,
+    };
+    execute_expression_on_runtime_with_this(runtime, &name, &source, context).map_err(|error| {
         TjsError::runtime(format!(
             "Scripts.eval failed for source `{}`: {error}",
             preview_source(&source)

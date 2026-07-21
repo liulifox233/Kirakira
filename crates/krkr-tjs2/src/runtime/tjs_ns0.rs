@@ -1,7 +1,6 @@
 use crate::{Result, TjsError, runtime::Runtime};
 
 use super::Variant;
-use super::builtins::install_dictionary_methods;
 
 const HEADER_SIZE: usize = 16;
 const MAGIC: &[u8] = b"TJS/";
@@ -150,7 +149,6 @@ impl<'a, H: super::TjsHost + 'static> TjsNs0Decoder<'a, H> {
     fn dictionary(&mut self) -> Result<Variant> {
         let len = self.read_u32()? as usize;
         let handle = self.runtime.alloc_ordinary_object();
-        install_dictionary_methods(self.runtime, handle);
         for _ in 0..len {
             let key = self.read_string()?;
             let value = self.value()?;
@@ -207,5 +205,50 @@ impl<'a, H: super::TjsHost + 'static> TjsNs0Decoder<'a, H> {
         let bytes = &self.bytes[self.index..end];
         self.index = end;
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::Runtime;
+
+    use super::*;
+
+    #[test]
+    fn decoded_dictionary_contains_only_packed_members() {
+        // A seed of zero makes all byte-check and final-check values zero.
+        // The payload is `%[answer => 42]` encoded as a TJS/ns0 dictionary.
+        let mut bytes = b"TJS/ns0\0".to_vec();
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // seed
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // crypt
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // IV length
+        bytes.extend_from_slice(&0x00c1_u16.to_le_bytes()); // Dictionary
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        for unit in "answer".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x0004_u16.to_le_bytes()); // Integer
+        bytes.extend_from_slice(&42_i64.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // final check
+
+        let mut runtime = Runtime::new();
+        let Variant::Object(dictionary) = decode_tjs_ns0(&mut runtime, &bytes).expect("decode")
+        else {
+            panic!("expected dictionary");
+        };
+
+        assert_eq!(
+            runtime.object_member(dictionary, "answer"),
+            Variant::Integer(42)
+        );
+        assert!(matches!(
+            runtime.object_member(dictionary, "assign"),
+            Variant::Void
+        ));
+        assert!(matches!(
+            runtime.object_member(dictionary, "clear"),
+            Variant::Void
+        ));
     }
 }
