@@ -1,8 +1,10 @@
-//! Stub for wamsoft `textrender.dll` (`TextRenderBase` class).
+//! Compatibility implementation for wamsoft `textrender.dll`
+//! (`TextRenderBase` class).
 //!
-//! Games subclass/wrap `TextRenderBase` for custom message text layout.
-//! This stub keeps scripts running without laying out or drawing anything:
-//! `done()` always reports finished so polling loops do not hang.
+//! Games normally subclass this object in TJS.  The subclass supplies font
+//! effects and calls `getCharacters()` to paint each laid-out glyph into a
+//! Layer.  Returning an empty list here is therefore not a harmless stub: it
+//! advances the scenario while drawing no dialogue at all.
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
@@ -86,48 +88,226 @@ fn install_text_render_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
     for method in [
         "setOption",
         "setDefault",
-        "setRenderSize",
-        "clear",
         "resetFont",
         "resetStyle",
         "setFont",
         "setStyle",
         "newline",
-        "getLinkOfPosition",
     ] {
         runtime.register_object_native(handle, method, native_void);
     }
+    runtime.register_object_native(handle, "setRenderSize", set_render_size);
+    runtime.register_object_native(handle, "clear", clear);
+    runtime.register_object_native(handle, "render", render);
+    runtime.register_object_native(handle, "getCharacters", get_characters);
+    runtime.register_object_native(handle, "getLinkOfPosition", native_void);
+    // These are result properties in the real plugin, not methods.  Making
+    // them native functions turns ordinary TJS property reads into objects,
+    // which in turn breaks message-window positioning and delay handling.
+    for (name, value) in [
+        ("renderCount", 0),
+        ("renderDelay", 0),
+        ("renderLeft", 0),
+        ("renderTop", 0),
+        ("renderRight", 0),
+        ("renderBottom", 0),
+        ("maxScrollOffset", 0),
+        ("maxScrollLine", 0),
+        ("renderText", 0),
+    ] {
+        if matches!(runtime.object_member(handle, name), Variant::Void) {
+            runtime.set_object_member(handle, name, Variant::Integer(value));
+        }
+    }
     for method in [
-        "render",
         "renderOver",
         "renderLines",
-        "renderCount",
-        "renderDelay",
-        "renderLeft",
-        "renderTop",
-        "renderRight",
-        "renderBottom",
         "contains",
-        "renderText",
-        "maxScrollOffset",
-        "maxScrollLine",
-        "getKeyWait",
         "calcLineOffset",
         "calcShowCount",
         "isLinkContains",
     ] {
         runtime.register_object_native(handle, method, zero);
     }
-    // Scripts poll done(); 1 = finished so they do not hang.
+    // `getKeyWait()` is consumed as an Array by `TextRender` (it reads
+    // `.count` immediately).  A numeric stub makes the first rendered
+    // message fail inside the game's getter for `hasAnyKeyWait`.
+    runtime.register_object_native(handle, "getKeyWait", empty_array);
+    // Rendering is currently immediate, so scripts may proceed once the full
+    // character list has been materialized.
     runtime.register_object_native(handle, "done", one);
-    for method in [
-        "getCharacters",
-        "getLinkNames",
-        "getLinkRects",
-        "getLinkCharacters",
-    ] {
+    for method in ["getLinkNames", "getLinkRects", "getLinkCharacters"] {
         runtime.register_object_native(handle, method, empty_array);
     }
+}
+
+const CHARACTERS_MEMBER: &str = "__krkr_text_render_characters";
+const RENDER_WIDTH_MEMBER: &str = "__krkr_text_render_width";
+const RENDER_HEIGHT_MEMBER: &str = "__krkr_text_render_height";
+
+fn bound_this(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Option<ObjectHandle> {
+    this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+}
+
+fn set_render_size(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = bound_this(runtime, this_obj) else {
+        return Ok(Variant::Void);
+    };
+    let width = args
+        .first()
+        .cloned()
+        .unwrap_or(Variant::Integer(0))
+        .to_integer()?;
+    let height = args
+        .get(1)
+        .cloned()
+        .unwrap_or(Variant::Integer(0))
+        .to_integer()?;
+    runtime.set_object_member(this, RENDER_WIDTH_MEMBER, Variant::Integer(width.max(0)));
+    runtime.set_object_member(this, RENDER_HEIGHT_MEMBER, Variant::Integer(height.max(0)));
+    runtime.set_object_member(this, "renderLeft", Variant::Integer(0));
+    runtime.set_object_member(this, "renderTop", Variant::Integer(0));
+    runtime.set_object_member(this, "renderRight", Variant::Integer(width.max(0)));
+    runtime.set_object_member(this, "renderBottom", Variant::Integer(height.max(0)));
+    Ok(Variant::Void)
+}
+
+fn clear(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = bound_this(runtime, this_obj) else {
+        return Ok(Variant::Void);
+    };
+    let characters = runtime.alloc_array_object(Vec::new());
+    runtime.set_object_member(this, CHARACTERS_MEMBER, Variant::Object(characters));
+    Ok(Variant::Void)
+}
+
+/// Materialize the minimal character records consumed by GINKA's
+/// `system/textrender.tjs`.  That script owns effect selection and delegates
+/// actual glyph painting to Layer.drawText; the native plugin's responsibility
+/// here is the line layout and character geometry.
+fn render(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = bound_this(runtime, this_obj) else {
+        return Ok(Variant::Integer(0));
+    };
+    let text = args
+        .first()
+        .cloned()
+        .unwrap_or(Variant::String(String::new()))
+        .to_string();
+    let font = args.iter().find_map(|value| match value {
+        Variant::Object(object)
+            if !matches!(runtime.object_member(*object, "size"), Variant::Void) =>
+        {
+            Some(*object)
+        }
+        _ => None,
+    });
+    let font_size = font
+        .map(|font| runtime.object_member(font, "size").to_integer())
+        .transpose()?
+        .unwrap_or_else(|| {
+            runtime
+                .object_member(this, "defaultFontSize")
+                .to_integer()
+                .unwrap_or(24)
+        })
+        .max(1);
+    let color = font
+        .map(|font| runtime.object_member(font, "color").to_integer())
+        .transpose()?
+        .unwrap_or_else(|| {
+            runtime
+                .object_member(this, "defaultChColor")
+                .to_integer()
+                .unwrap_or(0xffffff)
+        });
+    let width = runtime
+        .object_member(this, RENDER_WIDTH_MEMBER)
+        .to_integer()
+        .unwrap_or(0)
+        .max(0);
+    let line_spacing = runtime
+        .object_member(this, "defaultLineSpacing")
+        .to_integer()
+        .unwrap_or(0)
+        .max(0);
+    let pitch = runtime
+        .object_member(this, "defaultPitch")
+        .to_integer()
+        .unwrap_or(0);
+    let char_width = (font_size / 2 + pitch).max(1);
+    let line_height = (font_size + line_spacing).max(1);
+    let mut x = 0_i64;
+    let mut y = 0_i64;
+    let mut records = Vec::new();
+    for character in text.chars() {
+        if character == '\r' {
+            continue;
+        }
+        if character == '\n' {
+            x = 0;
+            y = y.saturating_add(line_height);
+            continue;
+        }
+        if width > 0 && x > 0 && x.saturating_add(char_width) > width {
+            x = 0;
+            y = y.saturating_add(line_height);
+        }
+        let record = runtime.alloc_dictionary_object();
+        runtime.set_object_member(record, "x", Variant::Integer(x));
+        runtime.set_object_member(record, "y", Variant::Integer(y));
+        runtime.set_object_member(record, "cw", Variant::Integer(char_width));
+        runtime.set_object_member(record, "size", Variant::Integer(font_size));
+        runtime.set_object_member(record, "text", Variant::String(character.to_string()));
+        runtime.set_object_member(record, "color", Variant::Integer(color));
+        runtime.set_object_member(record, "edge", Variant::Integer(0));
+        runtime.set_object_member(record, "edgeColor", Variant::Integer(0));
+        runtime.set_object_member(record, "shadow", Variant::Integer(0));
+        runtime.set_object_member(record, "shadowColor", Variant::Integer(0));
+        runtime.set_object_member(record, "italic", Variant::Integer(0));
+        runtime.set_object_member(record, "vertical", Variant::Integer(0));
+        records.push(Variant::Object(record));
+        x = x.saturating_add(char_width);
+    }
+    let count = records.len() as i64;
+    let characters = runtime.alloc_array_object(records);
+    runtime.set_object_member(this, CHARACTERS_MEMBER, Variant::Object(characters));
+    runtime.set_object_member(this, "renderLeft", Variant::Integer(0));
+    runtime.set_object_member(this, "renderTop", Variant::Integer(0));
+    runtime.set_object_member(this, "renderRight", Variant::Integer(x.max(width)));
+    runtime.set_object_member(
+        this,
+        "renderBottom",
+        Variant::Integer(y.saturating_add(line_height)),
+    );
+    Ok(Variant::Integer(count))
+}
+
+fn get_characters(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = bound_this(runtime, this_obj) else {
+        return Ok(Variant::Object(runtime.alloc_array_object(Vec::new())));
+    };
+    let characters = runtime.object_member(this, CHARACTERS_MEMBER);
+    if matches!(characters, Variant::Void) {
+        return Ok(Variant::Object(runtime.alloc_array_object(Vec::new())));
+    }
+    Ok(characters)
 }
 
 fn empty_array(
