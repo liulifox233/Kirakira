@@ -827,15 +827,16 @@ impl KrkrEngine {
                 .object_member(handle, "interval")
                 .to_integer()?
                 .max(0);
-            // TVP uses a zero Timer interval as an idle continuation: it
-            // must run again after the current event turn, not be disabled.
-            // In particular, KAG's conductor returns -2 after a tag that
-            // yields and sets its timer interval to zero so it can parse the
-            // next tag on the following turn.  Treat it as one logical
-            // millisecond here.  This both preserves that continuation
-            // contract and keeps a zero-interval timer from re-entering
-            // endlessly in the same scheduler pump.
-            let interval = interval.max(1);
+            // KRKR2/KRKRZ skip enabled Timers whose interval is zero.  A
+            // zero interval is therefore a disabled schedule, rather than an
+            // idle continuation; KAG continuations use the event queue.
+            if interval == 0 {
+                self.tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
+                    .set_timer_next_fire_millis(handle, None);
+                continue;
+            }
 
             let next_fire = match self
                 .tjs_runtime
@@ -1052,6 +1053,21 @@ impl KrkrEngine {
                     let modal_active = self.active_modal_window().is_some();
                     self.dispatch_window_pointer_event("onMouseUp", 0)?;
                     let release_hit = self.layer_at_cursor()?;
+                    // The click handler can invalidate/rebuild its layer
+                    // (GINKA's title Start does exactly that). Determine
+                    // ownership while the original target is still alive;
+                    // querying afterwards turns a handled click into an
+                    // erroneous KAG click-through.
+                    let handled_by_script = [self.pressed_layer, release_hit]
+                        .into_iter()
+                        .flatten()
+                        .any(|layer_id| {
+                            pointer_event_methods("onMouseDown")
+                                .iter()
+                                .chain(pointer_event_methods("onMouseUp"))
+                                .chain(["onClick"].iter())
+                                .any(|method| self.layer_has_script_handler(layer_id, method))
+                        });
                     self.dispatch_layer_pointer_event(
                         "onMouseUp",
                         0,
@@ -1065,7 +1081,7 @@ impl KrkrEngine {
                     }
                     self.pressed_layer = None;
                     self.captured_layer = None;
-                    if !modal_active {
+                    if !modal_active && !handled_by_script {
                         self.signal_kag_click();
                     }
                 }
@@ -4523,6 +4539,186 @@ mod tests {
             .absolute_position(layer_id)
             .expect("absolute position");
         assert_eq!(position, Point::new(20.0, 30.0));
+    }
+
+    #[test]
+    fn native_layer_get_layer_at_uses_its_window_primary_and_disabled_semantics() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.firstWindow = new Window();
+                global.firstRoot = new Layer(firstWindow, null);
+                firstWindow.add(firstRoot);
+                firstRoot.setSize(80, 60);
+                firstRoot.setImageSize(80, 60);
+                firstRoot.fillRect(0, 0, 80, 60, 0xffffffff);
+                firstRoot.visible = true;
+
+                global.lower = new Layer(firstWindow, firstRoot);
+                lower.setSize(30, 20);
+                lower.setImageSize(30, 20);
+                lower.fillRect(0, 0, 30, 20, 0xffffffff);
+                lower.visible = true;
+
+                global.disabledTop = new Layer(firstWindow, firstRoot);
+                disabledTop.setSize(30, 20);
+                disabledTop.setImageSize(30, 20);
+                disabledTop.fillRect(0, 0, 30, 20, 0xffffffff);
+                disabledTop.visible = true;
+                disabledTop.enabled = false;
+
+                // This root is created later and therefore visually above
+                // firstRoot in a global tree. Layer.getLayerAt must not let
+                // it leak across firstWindow's layer manager.
+                global.secondWindow = new Window();
+                global.secondRoot = new Layer(secondWindow, null);
+                secondWindow.add(secondRoot);
+                secondRoot.setSize(80, 60);
+                secondRoot.setImageSize(80, 60);
+                secondRoot.fillRect(0, 0, 80, 60, 0xffffffff);
+                secondRoot.visible = true;
+
+                return (firstRoot.getLayerAt(5, 5) === null) + ":" +
+                    (firstRoot.getLayerAt(5, 5, false, true) === disabledTop);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result, Variant::String("1:1".to_string()));
+
+        assert!(
+            engine
+                .execute_expression("inline.tjs", "firstRoot.getLayerAt()")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn layer_property_overrides_sync_hit_testing_before_input() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class ScriptHitLayer extends Layer {
+                    function ScriptHitLayer(parent) {
+                        super.Layer(null, parent);
+                        // The native backing property deliberately differs
+                        // from this script-visible override.
+                        super.hitThreshold = 256;
+                    }
+                    property hitThreshold {
+                        getter { return 0; }
+                        setter(value) { super.hitThreshold = value; }
+                    }
+                }
+                global.hits = 0;
+                global.root = new Layer();
+                root.setSize(40, 30);
+                root.setImageSize(40, 30);
+                root.fillRect(0, 0, 40, 30, 0xffffffff);
+                root.visible = true;
+                global.button = new ScriptHitLayer(root);
+                button.setSize(20, 10);
+                button.setImageSize(20, 10);
+                button.fillRect(0, 0, 20, 10, 0xffffffff);
+                button.visible = true;
+                button.onMouseUp = function() { global.hits++; };
+                "#,
+            )
+            .expect("script");
+
+        // Render completion synchronizes script-overridden properties before
+        // the next platform input turn, matching the normal frame lifecycle.
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        let Variant::Object(button) = engine.tjs_runtime().global_member("button") else {
+            panic!("button missing");
+        };
+        let button_id = engine.host().native_layer(button).expect("native button");
+        assert_eq!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(button_id)
+                .expect("button node")
+                .hit_threshold,
+            0
+        );
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(5.0, 5.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Released,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("input frame");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "hits")
+                .expect("hits"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn native_layer_affine_copy_maps_source_rect_to_destination_points() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 1);
+                source.fillRect(0, 0, 1, 1, 0x0000ff);
+                source.fillRect(1, 0, 1, 1, 0x00ff00);
+                global.dest = new Layer();
+                dest.setImageSize(1, 1);
+                dest.affineCopy(source, 1, 0, 1, 1, false, 0, 0, 1, 0, 0, 1);
+                "#,
+            )
+            .expect("script");
+        let Variant::Object(source) = engine.tjs_runtime().global_member("source") else {
+            panic!("source missing");
+        };
+        let Variant::Object(dest) = engine.tjs_runtime().global_member("dest") else {
+            panic!("destination missing");
+        };
+        let source_id = engine.host().native_layer(source).expect("native source");
+        let dest_id = engine
+            .host()
+            .native_layer(dest)
+            .expect("native destination");
+        let source_image = engine
+            .host()
+            .layer_tree()
+            .layer(source_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("source image");
+        let dest_image = engine
+            .host()
+            .layer_tree()
+            .layer(dest_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("destination image");
+        assert_eq!(
+            &dest_image.upload.rgba[..4],
+            &source_image.upload.rgba[4..8]
+        );
     }
 
     #[test]
@@ -11720,7 +11916,7 @@ mod tests {
     }
 
     #[test]
-    fn native_timer_interval_zero_runs_on_the_next_clock_turn() {
+    fn native_timer_interval_zero_does_not_fire() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -11758,7 +11954,7 @@ mod tests {
 
         assert_eq!(
             engine.tjs_runtime().global_member("timerProbeCount"),
-            Variant::Integer(1)
+            Variant::Integer(0)
         );
     }
 

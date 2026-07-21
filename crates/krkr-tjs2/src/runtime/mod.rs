@@ -272,6 +272,15 @@ impl<H: TjsHost + 'static> Runtime<H> {
         handle
     }
 
+    /// Allocates a TJS Dictionary complete with its builtin member surface.
+    /// Native integrations that materialize structured external data should
+    /// use this instead of only attaching Dictionary class metadata.
+    pub fn alloc_dictionary_object(&mut self) -> ObjectHandle {
+        let handle = self.alloc_ordinary_object();
+        builtins::install_dictionary_methods(self, handle);
+        handle
+    }
+
     pub fn array_push(&mut self, object: ObjectHandle, value: Variant) -> bool {
         self.heap[object.0].array_push(value)
     }
@@ -376,6 +385,16 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     pub fn object_member(&self, object: ObjectHandle, name: &str) -> Variant {
         self.heap[object.0].get(name)
+    }
+
+    /// Reads a member through the normal TJS dispatch path, including a
+    /// script or native property's getter. `object_member` intentionally
+    /// exposes the raw member for VM/runtime bookkeeping; native integrations
+    /// that need the value visible to TJS code should use this method.
+    pub fn resolve_object_member(&mut self, object: ObjectHandle, name: &str) -> Result<Variant> {
+        let file_id = self.call_context_file_id();
+        let mut vm = Vm::new(file_id, self)?;
+        vm.get_object_member(object, name)
     }
 
     pub fn object_members(&self, object: ObjectHandle) -> Vec<(String, Variant)> {

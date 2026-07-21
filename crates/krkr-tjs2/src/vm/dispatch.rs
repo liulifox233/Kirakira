@@ -13,6 +13,19 @@ use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form
 use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
 
 impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
+    pub(crate) fn get_object_member(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+    ) -> Result<Variant> {
+        self.prop_get(
+            Variant::Object(object),
+            name,
+            DispatchFlags::default(),
+            Some(object),
+        )
+    }
+
     pub(super) fn resolve_object(&self, value: Variant) -> Result<ObjectHandle> {
         match self.materialize_code_object(value) {
             Variant::Object(handle) => Ok(handle),

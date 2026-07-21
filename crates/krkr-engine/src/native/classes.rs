@@ -93,11 +93,27 @@ fn install_methods(
     methods: &'static [&'static str],
 ) {
     for method in methods {
-        if !matches!(runtime.object_member(handle, method), Variant::Void) {
+        if member_visible_in_chain(runtime, handle, method) {
             continue;
         }
         register_stub_method(runtime, handle, class_name, method);
     }
+}
+
+// Native stubs are placeholders so `SUPER.method()` resolves when nothing
+// else provides the member.  Installing one on an instance whose class chain
+// already supplies `method` (a script class body or a parent native class)
+// would shadow that implementation — krkr2 only declares these on the native
+// class itself — so skip the stub whenever the whole chain has the member.
+fn member_visible_in_chain(runtime: &Runtime<KrkrHost>, handle: ObjectHandle, name: &str) -> bool {
+    let mut current = Some(handle);
+    while let Some(object) = current {
+        if !matches!(runtime.object_member(object, name), Variant::Void) {
+            return true;
+        }
+        current = runtime.object_super_class(object);
+    }
+    false
 }
 
 fn install_properties(
@@ -957,9 +973,11 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "operateRect", layer_operate_rect);
     register_native_method_preserving_script(runtime, handle, "piledCopy", layer_piled_copy);
     register_native_method_preserving_script(runtime, handle, "stretchCopy", layer_stretch_copy);
+    register_native_method_preserving_script(runtime, handle, "affineCopy", layer_affine_copy);
     register_native_method_preserving_script(runtime, handle, "drawText", layer_draw_text);
     register_native_method_preserving_script(runtime, handle, "drawGlyph", layer_draw_glyph);
     register_native_method_preserving_script(runtime, handle, "getProvincePixel", layer_zero);
+    register_native_method_preserving_script(runtime, handle, "getLayerAt", layer_get_layer_at);
     register_native_method_preserving_script(runtime, handle, "update", layer_update);
     register_native_method_preserving_script(runtime, handle, "focus", layer_focus);
     register_native_method_preserving_script(runtime, handle, "focusPrev", layer_focus_prev);
@@ -1300,9 +1318,20 @@ pub(crate) fn complete_layer_before_draw(
     handle: ObjectHandle,
 ) -> Result<()> {
     let handle = runtime.bound_this(handle).unwrap_or(handle);
-    if runtime.host().native_layer(handle).is_none()
-        || !layer_property_value(runtime, handle, "callOnPaint").is_truthy()
-    {
+    if runtime.host().native_layer(handle).is_none() {
+        return Ok(());
+    }
+
+    // A script subclass may override a Layer property with a TJS property
+    // getter/setter. In that case the native backing member can retain the
+    // constructor/default value while ordinary script reads see the override.
+    // Keep the render and hit-test node synchronized from the visible script
+    // surface before every input/render completion. This is especially
+    // important after assignImages/page exchange: GINKA's title buttons read
+    // hitThreshold=0 in TJS but their stale native node was left at 256.
+    sync_script_layer_members_to_render(runtime, handle)?;
+
+    if !layer_property_value(runtime, handle, "callOnPaint").is_truthy() {
         return Ok(());
     }
 
@@ -3271,6 +3300,85 @@ fn kag_base_children_transition_live_overrides(
     Ok(overrides)
 }
 
+fn sync_script_layer_members_to_render(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Result<()> {
+    let Some(target) = render_layer_target(runtime, handle)? else {
+        return Ok(());
+    };
+    let Some(mut script_state) = render_layer_snapshot(runtime, &target) else {
+        return Ok(());
+    };
+    apply_visible_script_layer_members(runtime, handle, &mut script_state)?;
+    mutate_render_layer(runtime, &target, |layer| {
+        copy_render_content(layer, &script_state);
+    });
+    Ok(())
+}
+
+fn apply_visible_script_layer_members(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    layer: &mut LayerNode,
+) -> Result<()> {
+    // A closed owner Window suppresses every owned layer regardless of the
+    // script-facing `visible` member.  The native Window.close implementation
+    // deliberately leaves that member intact, so replaying a property getter
+    // here must not revive the render node.
+    let window_closed = runtime
+        .host()
+        .native_layer_window(handle)
+        .is_some_and(|window| runtime.host().native_window_closed(window));
+    for (name, current) in [
+        ("left", layer.left as i64),
+        ("top", layer.top as i64),
+        ("width", layer.width.max(0.0) as i64),
+        ("height", layer.height.max(0.0) as i64),
+        ("imageLeft", layer.image_left as i64),
+        ("imageTop", layer.image_top as i64),
+        ("imageWidth", layer.image_width.max(0.0) as i64),
+        ("imageHeight", layer.image_height.max(0.0) as i64),
+        ("visible", i64::from(layer.visible)),
+        ("opacity", i64::from(layer.opacity)),
+        ("enabled", i64::from(layer.enabled)),
+        ("nodeEnabled", i64::from(layer.node_enabled)),
+        ("type", i64::from(layer.layer_type)),
+        ("face", i64::from(layer.face)),
+        ("hitType", i64::from(layer.hit_type)),
+        ("hitThreshold", i64::from(layer.hit_threshold)),
+    ] {
+        let value = runtime.resolve_object_member(handle, name)?;
+        let value = if matches!(value, Variant::Void) {
+            current
+        } else {
+            value.to_integer()?
+        };
+        match name {
+            "left" => layer.left = value as f32,
+            "top" => layer.top = value as f32,
+            "width" => layer.width = value.max(0) as f32,
+            "height" => layer.height = value.max(0) as f32,
+            "imageLeft" => layer.image_left = value as f32,
+            "imageTop" => layer.image_top = value as f32,
+            "imageWidth" => layer.image_width = value.max(0) as f32,
+            "imageHeight" => layer.image_height = value.max(0) as f32,
+            "visible" => layer.visible = value != 0 && !window_closed,
+            "opacity" => layer.opacity = value.clamp(0, 255) as u8,
+            "enabled" => layer.enabled = value != 0,
+            "nodeEnabled" => layer.node_enabled = value != 0,
+            "type" => layer.layer_type = value as i32,
+            "face" => layer.face = value as i32,
+            "hitType" => layer.hit_type = value as i32,
+            "hitThreshold" => {
+                layer.hit_threshold = value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+            }
+            _ => unreachable!("fixed layer property list"),
+        }
+    }
+    Ok(())
+}
+
 fn kag_layer_object_snapshot(
     runtime: &Runtime<KrkrHost>,
     page: &str,
@@ -3643,6 +3751,89 @@ fn layer_stretch_copy(
             );
         },
     )?;
+    mark_image_modified(runtime, this);
+    Ok(Variant::Void)
+}
+
+// KRKR2 Layer.affineCopy(src, sx, sy, sw, sh, affine,
+//                         x0/a, y0/b, x1/c, y1/d, x2/tx, y2/ty, mode=0)
+// performs an opaque affine blit. The points form maps source (0,0),
+// (sw,0), (0,sh); matrix mode supplies the equivalent affine coefficients.
+fn layer_affine_copy(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    if args.len() < 12 {
+        return Err(TjsError::runtime("Layer.affineCopy requires 12 arguments"));
+    }
+    let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
+    if is_province_face(runtime, this) {
+        return Ok(Variant::Void);
+    }
+    let Some(source_object) = args.first().and_then(variant_object) else {
+        return Err(TjsError::runtime(
+            "Layer.affineCopy requires a source Layer",
+        ));
+    };
+    let sx = args[1].to_integer()?;
+    let sy = args[2].to_integer()?;
+    let source_width = args[3].to_integer()?;
+    let source_height = args[4].to_integer()?;
+    if source_width <= 0 || source_height <= 0 {
+        return Ok(Variant::Void);
+    }
+    let affine = args[5].is_truthy();
+    let values = args[6..12]
+        .iter()
+        .map(Variant::to_real)
+        .collect::<Result<Vec<_>>>()?;
+    let Some(dest_target) = dest_target else {
+        return Ok(Variant::Void);
+    };
+    complete_layer_before_draw(runtime, source_object)?;
+    let Some(source_target) = render_layer_target(runtime, source_object)? else {
+        return Ok(Variant::Void);
+    };
+    let Some(source_image) =
+        render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
+    else {
+        return Ok(Variant::Void);
+    };
+    let source_pixels = source_image.upload.rgba.as_ref().to_vec();
+    let texture_width = source_image.upload.width;
+    let texture_height = source_image.upload.height;
+    let points = if affine {
+        let (a, b, c, d, tx, ty) = (
+            values[0], values[1], values[2], values[3], values[4], values[5],
+        );
+        [
+            (tx, ty),
+            (a * source_width as f64 + tx, b * source_width as f64 + ty),
+            (c * source_height as f64 + tx, d * source_height as f64 + ty),
+        ]
+    } else {
+        [
+            (values[0], values[1]),
+            (values[2], values[3]),
+            (values[4], values[5]),
+        ]
+    };
+    mutate_layer_pixels(runtime, &dest_target, |pixels, dest_width, dest_height| {
+        affine_copy_pixels(
+            pixels,
+            dest_width,
+            dest_height,
+            &source_pixels,
+            texture_width,
+            texture_height,
+            sx,
+            sy,
+            source_width,
+            source_height,
+            points,
+        );
+    })?;
     mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
@@ -4445,6 +4636,207 @@ fn layer_on_hit_test(
         Variant::Integer(i64::from(hit)),
     );
     Ok(Variant::Void)
+}
+
+// Mirrors krkr2 `Layer.getLayerAt(x, y, excludeSelf=false, getDisabled=false)`
+// (LayerIntf.cpp `tTJSNI_BaseLayer::GetMostFrontChildAt`): the point is given
+// in this layer's coordinates, converted to primary coordinates, then its
+// owning window's primary layer is searched front-to-back. Invisible subtrees
+// and layers whose rectangle does not contain the point are skipped; htMask
+// compares image alpha against `hitThreshold`, while a layer without a mask
+// image cannot hit. A script `onHitTest` may veto; a disabled layer blocks the
+// search and returns null (unless getDisabled).
+fn layer_get_layer_at(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
+        return Ok(Variant::Null);
+    };
+    if args.len() < 2 {
+        return Err(TjsError::runtime("Layer.getLayerAt requires x and y"));
+    }
+    let x = args[0].to_integer()?;
+    let y = args[1].to_integer()?;
+    let exclude_self = args.get(2).is_some_and(Variant::is_truthy);
+    let get_disabled = args.get(3).is_some_and(Variant::is_truthy);
+    let Some(this_layer) = runtime.host().native_layer(this) else {
+        return Ok(Variant::Null);
+    };
+    let Some(origin) = runtime.host().layer_tree().absolute_position(this_layer) else {
+        return Ok(Variant::Null);
+    };
+    let point_x = origin.x + x as f32;
+    let point_y = origin.y + y as f32;
+
+    // KRKR2 delegates to the owner manager, which always starts from that
+    // window's primary layer rather than unrelated layer-tree roots.
+    let primary = runtime
+        .host()
+        .native_layer_window(this)
+        .and_then(|window| runtime.host().native_window_primary_layer(window))
+        .and_then(|primary| runtime.host().native_layer(primary))
+        .or_else(|| render_root_for_layer(runtime.host().layer_tree(), this_layer));
+    let Some(primary) = primary else {
+        return Ok(Variant::Null);
+    };
+
+    // Build the candidate order: children before self. `renderable=false`
+    // represents the engine's staged back-page copy and must not participate.
+    let mut candidates = Vec::new();
+    {
+        let tree = runtime.host().layer_tree();
+        collect_front_child_candidates(tree, primary, 0.0, 0.0, point_x, point_y, &mut candidates);
+    }
+
+    for layer_id in candidates {
+        if exclude_self && layer_id == this_layer {
+            continue;
+        }
+        let (origin, hit_threshold, hit_type, image_left, image_top, image) = {
+            let Some(layer) = runtime.host().layer_tree().layer(layer_id) else {
+                continue;
+            };
+            let Some(origin) = runtime.host().layer_tree().absolute_position(layer_id) else {
+                continue;
+            };
+            (
+                origin,
+                layer.hit_threshold,
+                layer.hit_type,
+                layer.image_left,
+                layer.image_top,
+                layer.image.clone(),
+            )
+        };
+        let local_x = (point_x - origin.x).floor() as i64;
+        let local_y = (point_y - origin.y).floor() as i64;
+        let pixel_hit = if hit_type == 1 {
+            // htProvince is unsupported; province layers never hit.
+            false
+        } else if let Some(image) = &image {
+            let px = local_x - image_left as i64;
+            let py = local_y - image_top as i64;
+            px >= 0
+                && py >= 0
+                && px < image.upload.width as i64
+                && py < image.upload.height as i64
+                && {
+                    let index = ((py as u32 * image.upload.width + px as u32) * 4 + 3) as usize;
+                    i32::from(image.upload.rgba[index]) >= hit_threshold
+                }
+        } else {
+            // KRKR2's htMask requires MainImage; a transparent/no-image
+            // control is not a hit merely because its threshold is zero.
+            false
+        };
+        if !pixel_hit {
+            continue;
+        }
+        let Some(object) = runtime.host().native_object_for_layer(layer_id) else {
+            continue;
+        };
+        // Script veto via onHitTest, same protocol as the input dispatcher.
+        runtime.set_object_member(object, "__nativeHitTestWork", Variant::Integer(1));
+        if !matches!(runtime.object_member(object, "onHitTest"), Variant::Void) {
+            runtime.call_object_method(
+                object,
+                "onHitTest",
+                vec![
+                    Variant::Integer(local_x),
+                    Variant::Integer(local_y),
+                    Variant::Integer(1),
+                ],
+            )?;
+        }
+        if !runtime
+            .object_member(object, "__nativeHitTestWork")
+            .is_truthy()
+        {
+            continue;
+        }
+        if !get_disabled && !render_node_enabled(runtime.host().layer_tree(), layer_id) {
+            // Disabled front layer blocks events to everything below it.
+            return Ok(Variant::Null);
+        }
+        return Ok(Variant::Object(object));
+    }
+    Ok(Variant::Null)
+}
+
+fn render_root_for_layer(
+    tree: &krkr_core::LayerTree,
+    mut id: krkr_core::LayerId,
+) -> Option<krkr_core::LayerId> {
+    loop {
+        let layer = tree.layer(id)?;
+        match layer.parent {
+            Some(parent) => id = parent,
+            None => return Some(id),
+        }
+    }
+}
+
+// `nodeEnabled` in KRKR2 is derived from this layer's enabled state, every
+// ancestor, and the current modal layer. The host has no layer-modal state,
+// but deriving the ancestor portion here avoids treating a child of a disabled
+// parent as clickable when its cached render-node flag has not yet been synced.
+fn render_node_enabled(tree: &krkr_core::LayerTree, mut id: krkr_core::LayerId) -> bool {
+    loop {
+        let Some(layer) = tree.layer(id) else {
+            return false;
+        };
+        if !layer.enabled || !layer.node_enabled {
+            return false;
+        }
+        match layer.parent {
+            Some(parent) => id = parent,
+            None => return true,
+        }
+    }
+}
+
+fn collect_front_child_candidates(
+    tree: &krkr_core::LayerTree,
+    id: krkr_core::LayerId,
+    origin_x: f32,
+    origin_y: f32,
+    point_x: f32,
+    point_y: f32,
+    out: &mut Vec<krkr_core::LayerId>,
+) {
+    let Some(layer) = tree.layer(id) else {
+        return;
+    };
+    if !layer.visible || !layer.renderable {
+        return;
+    }
+    let local_x = point_x - origin_x - layer.left;
+    let local_y = point_y - origin_y - layer.top;
+    if local_x < 0.0 || local_y < 0.0 || local_x >= layer.width || local_y >= layer.height {
+        return;
+    }
+    let child_origin_x = origin_x + layer.left;
+    let child_origin_y = origin_y + layer.top;
+    let mut children: Vec<_> = tree
+        .layers()
+        .filter(|child| child.parent == Some(id))
+        .map(|child| (child.z_order, child.id))
+        .collect();
+    children.sort();
+    for (_, child) in children.into_iter().rev() {
+        collect_front_child_candidates(
+            tree,
+            child,
+            child_origin_x,
+            child_origin_y,
+            point_x,
+            point_y,
+            out,
+        );
+    }
+    out.push(id);
 }
 
 fn layer_zero(
@@ -5267,6 +5659,61 @@ fn fill_pixels(
                     .write_unaligned(pixel);
             }
             offset += 4;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn affine_copy_pixels(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    source: &[u8],
+    texture_width: u32,
+    texture_height: u32,
+    sx: i64,
+    sy: i64,
+    source_width: i64,
+    source_height: i64,
+    points: [(f64, f64); 3],
+) {
+    let [(x0, y0), (x1, y1), (x2, y2)] = points;
+    let ux = x1 - x0;
+    let uy = y1 - y0;
+    let vx = x2 - x0;
+    let vy = y2 - y0;
+    let determinant = ux * vy - uy * vx;
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return;
+    }
+    let x3 = x1 + x2 - x0;
+    let y3 = y1 + y2 - y0;
+    let min_x = x0.min(x1).min(x2).min(x3).floor().max(0.0) as i64;
+    let max_x = x0.max(x1).max(x2).max(x3).ceil().min(dest_width as f64) as i64;
+    let min_y = y0.min(y1).min(y2).min(y3).floor().max(0.0) as i64;
+    let max_y = y0.max(y1).max(y2).max(y3).ceil().min(dest_height as f64) as i64;
+    for dy in min_y..max_y {
+        for dx in min_x..max_x {
+            let px = dx as f64 + 0.5 - x0;
+            let py = dy as f64 + 0.5 - y0;
+            let u = (px * vy - py * vx) / determinant;
+            let v = (ux * py - uy * px) / determinant;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                continue;
+            }
+            let src_x = sx + (u * source_width as f64).floor() as i64;
+            let src_y = sy + (v * source_height as f64).floor() as i64;
+            if src_x < 0
+                || src_y < 0
+                || src_x >= i64::from(texture_width)
+                || src_y >= i64::from(texture_height)
+            {
+                continue;
+            }
+            let source_offset = ((src_y as u32 * texture_width + src_x as u32) * 4) as usize;
+            let dest_offset = ((dy as u32 * dest_width + dx as u32) * 4) as usize;
+            dest[dest_offset..dest_offset + 4]
+                .copy_from_slice(&source[source_offset..source_offset + 4]);
         }
     }
 }

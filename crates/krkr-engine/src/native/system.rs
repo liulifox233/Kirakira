@@ -79,16 +79,33 @@ fn exe_path(runtime: &Runtime<KrkrHost>) -> String {
     runtime
         .host()
         .project_root()
-        .map(|path| format!("{}/", path.display()))
+        .map(|path| {
+            let display = path.display().to_string();
+            format!("{}/", display.trim_end_matches('/'))
+        })
         .unwrap_or_default()
 }
 
 fn data_path(runtime: &Runtime<KrkrHost>) -> String {
-    runtime
-        .host()
-        .data_path()
-        .map(|path| format!("{}/", path.display()))
-        .unwrap_or_else(temp_path)
+    // krkr2 exposes an absolute Windows path here (containing a drive colon),
+    // and KAGWindow's setup only prepends `System.exePath` when the value has
+    // no colon.  An absolute POSIX path never contains a colon, so the script
+    // would mangle it into `<root>/<root>/savedata/...`.  Returning the
+    // project-relative form keeps that heuristic working.
+    let Some(path) = runtime.host().data_path() else {
+        return temp_path();
+    };
+
+    // Preserve the native Windows contract: KRKR2 exposes an absolute path
+    // there, and its drive colon already prevents KAGWindow from prepending
+    // `exePath`.  POSIX absolute paths need the relative spelling above for
+    // that Windows-oriented script heuristic to work.
+    if cfg!(windows) {
+        let display = path.display().to_string();
+        format!("{}\\", display.trim_end_matches(['/', '\\']))
+    } else {
+        "savedata/".to_string()
+    }
 }
 
 fn temp_path() -> String {
