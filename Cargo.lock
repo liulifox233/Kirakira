@@ -1164,6 +1164,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-disasm"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "krkr-tjs2",
+ "krkr-xp3",
+]
+
+[[package]]
 name = "krkr-engine"
 version = "0.1.0"
 dependencies = [

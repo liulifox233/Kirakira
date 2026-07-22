@@ -2,6 +2,7 @@
 members = [
     "apps/debugger",
     "apps/desktop",
+    "apps/disasm",
     "apps/terminal",
     "crates/krkr-audio",
     "crates/krkr-core",
