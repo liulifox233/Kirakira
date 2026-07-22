@@ -329,16 +329,49 @@ fn main() {
     }
     if let Ok(name) = std::env::var("KRKR_PROBE_DUMP_GLOBAL") {
         println!("---global {name}---");
-        match engine.tjs_runtime().global_member(&name) {
+        let mut current = engine.tjs_runtime().global_member(&name);
+        if name.contains('.') {
+            let mut parts = name.split('.');
+            current = engine.tjs_runtime().global_member(parts.next().unwrap());
+            for part in parts {
+                let Variant::Object(object) = current else {
+                    break;
+                };
+                current = engine.tjs_runtime().object_member(object, part);
+            }
+        }
+        match current {
             Variant::Object(object) => {
                 for (member, value) in engine.tjs_runtime().object_members(object) {
-                    println!("{member}={}", variant_kind(&value));
+                    match &value {
+                        Variant::Integer(_) | Variant::Real(_) | Variant::String(_) => {
+                            println!("{member}={value}")
+                        }
+                        _ => println!("{member}={}", variant_kind(&value)),
+                    }
                 }
             }
             value => println!("{name}={}", variant_kind(&value)),
         }
     }
     println!("done frames={frames}");
+    if let Ok(dir) = std::env::var("KRKR_PROBE_DUMP_LAYER_IMAGES") {
+        for layer in engine.host().layer_tree().layers() {
+            if let Some(image) = &layer.image {
+                let path = format!(
+                    "{dir}/layer_{}_{}x{}.png",
+                    layer.id, image.upload.width, image.upload.height
+                );
+                write_png(
+                    &path,
+                    image.upload.width,
+                    image.upload.height,
+                    &image.upload.rgba,
+                )
+                .expect("dump layer image");
+            }
+        }
+    }
     if let Some(path) = shot_path {
         // Live layer images take priority over cached uploads: a layer image
         // can be updated in place without a new upload, which would leave the
@@ -405,9 +438,9 @@ fn composite_frame(
     // Flatten onto an opaque black background, matching the window clear color.
     for pixel in canvas.chunks_exact_mut(4) {
         let a = pixel[3] as u16;
-        pixel[0] = ((pixel[0] as u16 * a + 255 * (255 - a)) / 255) as u8;
-        pixel[1] = ((pixel[1] as u16 * a + 255 * (255 - a)) / 255) as u8;
-        pixel[2] = ((pixel[2] as u16 * a + 255 * (255 - a)) / 255) as u8;
+        pixel[0] = ((pixel[0] as u16 * a + 127) / 255) as u8;
+        pixel[1] = ((pixel[1] as u16 * a + 127) / 255) as u8;
+        pixel[2] = ((pixel[2] as u16 * a + 127) / 255) as u8;
         pixel[3] = 255;
     }
     (width, height, canvas)
@@ -480,16 +513,16 @@ fn blend_image(
 fn blend_pixel(canvas: &mut [u8], width: u32, x: u32, y: u32, rgb: [u8; 3], alpha: u8) {
     let index = ((y * width + x) * 4) as usize;
     let dst = &mut canvas[index..index + 4];
-    let sa = alpha as u16;
-    let da = dst[3] as u16;
+    let sa = alpha as u32;
+    let da = dst[3] as u32;
     let out_a = sa + da * (255 - sa) / 255;
     if out_a == 0 {
         dst.fill(0);
         return;
     }
     for (channel, src) in dst.iter_mut().take(3).zip(rgb) {
-        let s = src as u16;
-        let d = *channel as u16;
+        let s = src as u32;
+        let d = *channel as u32;
         *channel = ((s * sa + d * da * (255 - sa) / 255) / out_a) as u8;
     }
     dst[3] = out_a as u8;

@@ -90,7 +90,6 @@ fn install_text_render_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
         "setDefault",
         "resetFont",
         "resetStyle",
-        "setFont",
         "setStyle",
         "newline",
     ] {
@@ -193,6 +192,12 @@ fn clear(
 /// `system/textrender.tjs`.  That script owns effect selection and delegates
 /// actual glyph painting to Layer.drawText; the native plugin's responsibility
 /// here is the line layout and character geometry.
+///
+/// Two call shapes are accepted, matching the observed `textrender.dll` usage:
+/// - `render(textString, ...)`
+/// - `render(msgObject, size, ...)` where the object carries a `text` member
+///   (GINKA's scenario message model; it may contain `[ruby,count]` inline
+///   annotations, where the ruby covers the following `count + 1` characters).
 fn render(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -201,22 +206,39 @@ fn render(
     let Some(this) = bound_this(runtime, this_obj) else {
         return Ok(Variant::Integer(0));
     };
-    let text = args
-        .first()
-        .cloned()
-        .unwrap_or(Variant::String(String::new()))
-        .to_string();
-    let font = args.iter().find_map(|value| match value {
-        Variant::Object(object)
-            if !matches!(runtime.object_member(*object, "size"), Variant::Void) =>
-        {
-            Some(*object)
-        }
+    let text = match args.first() {
+        Some(Variant::Object(message)) => runtime
+            .object_member(*message, "text")
+            .to_tjs_string()
+            .unwrap_or_default(),
+        Some(value) => value.to_tjs_string()?,
+        None => String::new(),
+    };
+    // textrender.dll measures every glyph through TextRender.onGetTextWidth:
+    // the callback sets `this.font.height` and calls Font.getEscWidthX (or
+    // Font.getTextWidth).  `font` belongs to the TextRender instance, not the
+    // render arguments.  Using `font_size / 2` here was especially wrong for
+    // full-width Japanese glyphs and caused progressive line-wrap drift.
+    let font = match runtime.object_member(this, "font") {
+        Variant::Object(font) => Some(font),
         _ => None,
-    });
-    let font_size = font
-        .map(|font| runtime.object_member(font, "size").to_integer())
-        .transpose()?
+    };
+    // GINKA passes the target layer's native Font to setFont(), whose glyph
+    // size lives in the native `height` property; plain script font-info
+    // objects carry `size` instead.  Resolve through the TJS dispatch path so
+    // native property getters run — a raw member read would see the property
+    // object itself or `void`.  An explicit numeric size argument wins over
+    // both, then the TextRender default.
+    let size_argument = args
+        .get(1)
+        .and_then(|value| match value {
+            Variant::Integer(value) => Some(*value),
+            Variant::Real(value) => Some(*value as i64),
+            _ => None,
+        })
+        .filter(|value| *value > 0);
+    let font_size = size_argument
+        .or_else(|| font.and_then(|font| resolve_font_int(runtime, font, &["height", "size"])))
         .unwrap_or_else(|| {
             runtime
                 .object_member(this, "defaultFontSize")
@@ -225,8 +247,7 @@ fn render(
         })
         .max(1);
     let color = font
-        .map(|font| runtime.object_member(font, "color").to_integer())
-        .transpose()?
+        .and_then(|font| resolve_font_int(runtime, font, &["color"]))
         .unwrap_or_else(|| {
             runtime
                 .object_member(this, "defaultChColor")
@@ -247,12 +268,33 @@ fn render(
         .object_member(this, "defaultPitch")
         .to_integer()
         .unwrap_or(0);
-    let char_width = (font_size / 2 + pitch).max(1);
+    let ruby_size = runtime
+        .object_member(this, "defaultRubySize")
+        .to_integer()
+        .unwrap_or(0)
+        .max(font_size / 2)
+        .max(1);
     let line_height = (font_size + line_spacing).max(1);
     let mut x = 0_i64;
     let mut y = 0_i64;
     let mut records = Vec::new();
-    for character in text.chars() {
+    // Ruby group tracking: `[ruby,count]` covers the following count + 1 base
+    // characters.  The ruby record (a whole-string annotation dictionary, as
+    // GINKA's drawRuby expects) is attached to the group's first character
+    // once the group's advance is known.
+    let mut pending_ruby: Option<String> = None;
+    let mut ruby_remaining = 0_usize;
+    let mut group_first_record: Option<ObjectHandle> = None;
+    let mut group_base_width = 0_i64;
+    for token in parse_ruby_annotations(&text) {
+        let character = match token {
+            RubyToken::Ruby { text: ruby, count } => {
+                pending_ruby = Some(ruby);
+                ruby_remaining = count + 1;
+                continue;
+            }
+            RubyToken::Char(character) => character,
+        };
         if character == '\r' {
             continue;
         }
@@ -261,16 +303,21 @@ fn render(
             y = y.saturating_add(line_height);
             continue;
         }
+        let character = character.to_string();
+        let char_width = measure_character_width(runtime, this, font, &character, font_size)
+            .unwrap_or(font_size)
+            .max(1);
         if width > 0 && x > 0 && x.saturating_add(char_width) > width {
             x = 0;
             y = y.saturating_add(line_height);
         }
+        let in_ruby_group = ruby_remaining > 0;
         let record = runtime.alloc_dictionary_object();
         runtime.set_object_member(record, "x", Variant::Integer(x));
         runtime.set_object_member(record, "y", Variant::Integer(y));
         runtime.set_object_member(record, "cw", Variant::Integer(char_width));
         runtime.set_object_member(record, "size", Variant::Integer(font_size));
-        runtime.set_object_member(record, "text", Variant::String(character.to_string()));
+        runtime.set_object_member(record, "text", Variant::String(character));
         runtime.set_object_member(record, "color", Variant::Integer(color));
         runtime.set_object_member(record, "edge", Variant::Integer(0));
         runtime.set_object_member(record, "edgeColor", Variant::Integer(0));
@@ -279,7 +326,41 @@ fn render(
         runtime.set_object_member(record, "italic", Variant::Integer(0));
         runtime.set_object_member(record, "vertical", Variant::Integer(0));
         records.push(Variant::Object(record));
-        x = x.saturating_add(char_width);
+        x = x.saturating_add(char_width).saturating_add(pitch);
+        if in_ruby_group {
+            if group_first_record.is_none() {
+                group_first_record = Some(record);
+                group_base_width = 0;
+            }
+            group_base_width = group_base_width.saturating_add(char_width);
+            ruby_remaining -= 1;
+            if ruby_remaining == 0
+                && let (Some(first), Some(ruby)) = (group_first_record, pending_ruby.take())
+            {
+                let ruby_record = runtime.alloc_dictionary_object();
+                let ruby_width = ruby.chars().count() as i64 * ruby_size;
+                let ruby_x = (group_base_width.max(ruby_width) - ruby_width) / 2;
+                runtime.set_object_member(ruby_record, "text", Variant::String(ruby));
+                runtime.set_object_member(ruby_record, "x", Variant::Integer(ruby_x));
+                runtime.set_object_member(ruby_record, "y", Variant::Integer(-ruby_size));
+                runtime.set_object_member(ruby_record, "size", Variant::Integer(ruby_size));
+                runtime.set_object_member(first, "ruby", Variant::Object(ruby_record));
+            }
+        }
+    }
+    // A trailing annotation whose group never completed still gets its ruby
+    // attached to the first covered character.
+    if let (Some(first), Some(ruby)) = (group_first_record, pending_ruby)
+        && ruby_remaining > 0
+    {
+        let ruby_record = runtime.alloc_dictionary_object();
+        let ruby_width = ruby.chars().count() as i64 * ruby_size;
+        let ruby_x = (group_base_width.max(ruby_width) - ruby_width) / 2;
+        runtime.set_object_member(ruby_record, "text", Variant::String(ruby));
+        runtime.set_object_member(ruby_record, "x", Variant::Integer(ruby_x));
+        runtime.set_object_member(ruby_record, "y", Variant::Integer(-ruby_size));
+        runtime.set_object_member(ruby_record, "size", Variant::Integer(ruby_size));
+        runtime.set_object_member(first, "ruby", Variant::Object(ruby_record));
     }
     let count = records.len() as i64;
     let characters = runtime.alloc_array_object(records);
@@ -293,6 +374,115 @@ fn render(
         Variant::Integer(y.saturating_add(line_height)),
     );
     Ok(Variant::Integer(count))
+}
+
+enum RubyToken {
+    Char(char),
+    Ruby { text: String, count: usize },
+}
+
+/// Split raw message text into characters and `[ruby,count]` annotations.
+/// Bracket runs without a comma are literal text (e.g. English asides).
+fn parse_ruby_annotations(text: &str) -> Vec<RubyToken> {
+    let mut tokens = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '[' {
+            tokens.push(RubyToken::Char(character));
+            continue;
+        }
+        let mut content = String::new();
+        let mut closed = false;
+        for next in chars.by_ref() {
+            if next == ']' {
+                closed = true;
+                break;
+            }
+            content.push(next);
+        }
+        let annotation = closed.then(|| {
+            let (ruby, count) = content.split_once(',')?;
+            let count = count.trim().parse::<usize>().ok()?;
+            (!ruby.is_empty()).then_some(RubyToken::Ruby {
+                text: ruby.to_string(),
+                count,
+            })
+        });
+        match annotation.flatten() {
+            Some(ruby) => tokens.push(ruby),
+            None => {
+                tokens.push(RubyToken::Char('['));
+                tokens.extend(content.chars().map(RubyToken::Char));
+                if closed {
+                    tokens.push(RubyToken::Char(']'));
+                }
+            }
+        }
+    }
+    tokens
+}
+
+/// Query glyph advance through the same virtual callback as textrender.dll.
+///
+/// `TextRenderBase` deliberately exposes this hook because a game can select
+/// a font or apply a scale in TJS.  GINKA's implementation writes the current
+/// height to its Layer Font and uses `getEscWidthX`; the direct Font fallback
+/// preserves that behaviour when a game does not supply the callback.
+fn measure_character_width(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    font: Option<ObjectHandle>,
+    character: &str,
+    font_size: i64,
+) -> Option<i64> {
+    runtime
+        .call_object_method(
+            this,
+            "onGetTextWidth",
+            vec![
+                Variant::String(character.to_string()),
+                Variant::Integer(font_size),
+            ],
+        )
+        .ok()
+        .and_then(|width| width.to_integer().ok())
+        .or_else(|| {
+            font.and_then(|font| {
+                runtime.set_object_member(font, "height", Variant::Integer(font_size));
+                runtime
+                    .call_object_method(
+                        font,
+                        "getEscWidthX",
+                        vec![Variant::String(character.to_string())],
+                    )
+                    .or_else(|_| {
+                        runtime.call_object_method(
+                            font,
+                            "getTextWidth",
+                            vec![Variant::String(character.to_string())],
+                        )
+                    })
+                    .ok()
+                    .and_then(|width| width.to_integer().ok())
+            })
+        })
+}
+
+/// Read an integer font attribute through the TJS dispatch path (running any
+/// property getter), trying each name in order.
+fn resolve_font_int(
+    runtime: &mut Runtime<KrkrHost>,
+    font: ObjectHandle,
+    names: &[&str],
+) -> Option<i64> {
+    for name in names {
+        if let Ok(value) = runtime.resolve_object_member(font, name)
+            && let Ok(value) = value.to_integer()
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn get_characters(
