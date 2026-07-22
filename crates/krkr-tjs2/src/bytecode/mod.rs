@@ -6,9 +6,10 @@ mod instruction;
 mod parse;
 mod verify;
 
+pub use self::disasm::DisasmOptions;
 pub use self::instruction::{CallArgs, ExpandedArg, Instruction};
 
-use self::disasm::disassemble_instruction;
+use self::disasm::{disassemble_file, disassemble_instruction, render_object_full};
 use self::instruction::decode_instructions;
 use self::parse::{parse_bytecode, parse_bytecode_unverified};
 use self::verify::verify_bytecode;
@@ -50,6 +51,29 @@ impl BytecodeFile {
                     .collect()
             })
             .map_err(|err| TjsError::bytecode(err.message))
+    }
+
+    /// Renders a full disassembly of the file: header, data pool, and code
+    /// object sections, controlled by `options`.
+    pub fn disassemble(&self, options: &DisasmOptions) -> Result<String> {
+        if let Some(index) = options.object_index
+            && index >= self.objects.len()
+        {
+            return Err(TjsError::bytecode(format!("object {index} does not exist")));
+        }
+        Ok(disassemble_file(self, options))
+    }
+
+    /// Renders one code object section: header fields, data slot table,
+    /// properties, source positions, and instruction lines.
+    pub fn disassemble_object_full(&self, object_index: usize) -> Result<String> {
+        let object = self
+            .objects
+            .get(object_index)
+            .ok_or_else(|| TjsError::bytecode(format!("object {object_index} does not exist")))?;
+        let mut out = String::new();
+        render_object_full(self, object, object_index, &mut out);
+        Ok(out)
     }
 }
 
@@ -326,6 +350,80 @@ mod tests {
                 "00000005 ret".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn disassembles_full_file_fixture() {
+        let file = BytecodeFile::parse(&integer_return_bytecode()).expect("parse");
+        let dump = file
+            .disassemble(&DisasmOptions::full())
+            .expect("disassemble");
+        assert_eq!(
+            dump,
+            concat!(
+                "; objects=1 top_level=0\n",
+                ".data\n",
+                "  pools: bytes=0 shorts=0 integers=1 longs=0 reals=0 strings=1 octets=0\n",
+                "  integer pool:\n",
+                "    0: 42\n",
+                "  string pool:\n",
+                "    0: \"global\"\n",
+                "\n",
+                "=== object 0 name=\"global\" type=TopLevel parent=-\n",
+                "  vars=0 reserve=2 frame=1 args=0 unnamed_base=0 collapse=-\n",
+                "  setter=- getter=- super=-\n",
+                "  data slots:\n",
+                "    *0: Integer = 42\n",
+                "  code:\n",
+                "00000000 const %0, *0 // *0 = 42\n",
+                "00000003 srv %0\n",
+                "00000005 ret\n",
+            )
+        );
+    }
+
+    #[test]
+    fn disassemble_honors_options() {
+        let file = BytecodeFile::parse(&integer_return_bytecode()).expect("parse");
+
+        let no_data = DisasmOptions {
+            include_data_pool: false,
+            ..DisasmOptions::full()
+        };
+        let dump = file.disassemble(&no_data).expect("disassemble");
+        assert!(!dump.contains(".data"));
+        assert!(dump.contains("=== object 0"));
+
+        let matching = DisasmOptions {
+            object_name_filter: Some("glob".to_string()),
+            ..DisasmOptions::full()
+        };
+        assert!(
+            file.disassemble(&matching)
+                .expect("disassemble")
+                .contains("=== object 0")
+        );
+
+        let missing = DisasmOptions {
+            object_name_filter: Some("zzz".to_string()),
+            ..DisasmOptions::full()
+        };
+        assert!(
+            !file
+                .disassemble(&missing)
+                .expect("disassemble")
+                .contains("=== object")
+        );
+
+        let wrong_index = DisasmOptions {
+            object_index: Some(5),
+            ..DisasmOptions::full()
+        };
+        assert!(file.disassemble(&wrong_index).is_err());
+
+        let full_object = file.disassemble_object_full(0).expect("object");
+        assert!(full_object.starts_with("=== object 0"));
+        assert!(file.disassemble_object_full(5).is_err());
     }
 
     #[test]

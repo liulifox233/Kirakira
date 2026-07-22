@@ -17,4 +17,5 @@
 - `krkr-audio`: Kira/CPAL audio backend for static/streaming playback, buses, volume, fade, pause/resume, and stop commands.
 - `krkr-xp3`: XP3 archive parsing and resource streaming.
 - `apps/debugger`: `krkr-debug` headless CLI combining an LLDB-style interactive script debugger (stdin REPL over the tjs2 debugger core; TJS2 + KAG breakpoints, stepping, exception breaks, expression eval) with batch probing (screenshot/pixel/layer dumps, at-frame script injection, synthetic clicks, virtual clock/audio).
+- `apps/disasm`: `krkr-disasm` standalone TJS2 bytecode disassembler. Dumps full structured disassembly (data pool, object headers, data slots, instructions) of official `TJS2100\0` bytecode from loose files, XP3 members, or game directories (engine archive priority), and of krkr's own compiler output from TJS source.
 - `apps/desktop`: `winit` app lifecycle, input mapping, launcher/settings/runtime state transitions, renderer/audio integration, project selection, and fullscreen/window sizing.
