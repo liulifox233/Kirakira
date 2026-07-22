@@ -1323,15 +1323,6 @@ pub(crate) fn complete_layer_before_draw(
         return Ok(());
     }
 
-    // A script subclass may override a Layer property with a TJS property
-    // getter/setter. In that case the native backing member can retain the
-    // constructor/default value while ordinary script reads see the override.
-    // Keep the render and hit-test node synchronized from the visible script
-    // surface before every input/render completion. This is especially
-    // important after assignImages/page exchange: GINKA's title buttons read
-    // hitThreshold=0 in TJS but their stale native node was left at 256.
-    sync_script_layer_members_to_render(runtime, handle)?;
-
     if !layer_property_value(runtime, handle, "callOnPaint").is_truthy() {
         return Ok(());
     }
@@ -3301,85 +3292,6 @@ fn kag_base_children_transition_live_overrides(
     Ok(overrides)
 }
 
-fn sync_script_layer_members_to_render(
-    runtime: &mut Runtime<KrkrHost>,
-    handle: ObjectHandle,
-) -> Result<()> {
-    let Some(target) = render_layer_target(runtime, handle)? else {
-        return Ok(());
-    };
-    let Some(mut script_state) = render_layer_snapshot(runtime, &target) else {
-        return Ok(());
-    };
-    apply_visible_script_layer_members(runtime, handle, &mut script_state)?;
-    mutate_render_layer(runtime, &target, |layer| {
-        copy_render_content(layer, &script_state);
-    });
-    Ok(())
-}
-
-fn apply_visible_script_layer_members(
-    runtime: &mut Runtime<KrkrHost>,
-    handle: ObjectHandle,
-    layer: &mut LayerNode,
-) -> Result<()> {
-    // A closed owner Window suppresses every owned layer regardless of the
-    // script-facing `visible` member.  The native Window.close implementation
-    // deliberately leaves that member intact, so replaying a property getter
-    // here must not revive the render node.
-    let window_closed = runtime
-        .host()
-        .native_layer_window(handle)
-        .is_some_and(|window| runtime.host().native_window_closed(window));
-    for (name, current) in [
-        ("left", layer.left as i64),
-        ("top", layer.top as i64),
-        ("width", layer.width.max(0.0) as i64),
-        ("height", layer.height.max(0.0) as i64),
-        ("imageLeft", layer.image_left as i64),
-        ("imageTop", layer.image_top as i64),
-        ("imageWidth", layer.image_width.max(0.0) as i64),
-        ("imageHeight", layer.image_height.max(0.0) as i64),
-        ("visible", i64::from(layer.visible)),
-        ("opacity", i64::from(layer.opacity)),
-        ("enabled", i64::from(layer.enabled)),
-        ("nodeEnabled", i64::from(layer.node_enabled)),
-        ("type", i64::from(layer.layer_type)),
-        ("face", i64::from(layer.face)),
-        ("hitType", i64::from(layer.hit_type)),
-        ("hitThreshold", i64::from(layer.hit_threshold)),
-    ] {
-        let value = runtime.resolve_object_member(handle, name)?;
-        let value = if matches!(value, Variant::Void) {
-            current
-        } else {
-            value.to_integer()?
-        };
-        match name {
-            "left" => layer.left = value as f32,
-            "top" => layer.top = value as f32,
-            "width" => layer.width = value.max(0) as f32,
-            "height" => layer.height = value.max(0) as f32,
-            "imageLeft" => layer.image_left = value as f32,
-            "imageTop" => layer.image_top = value as f32,
-            "imageWidth" => layer.image_width = value.max(0) as f32,
-            "imageHeight" => layer.image_height = value.max(0) as f32,
-            "visible" => layer.visible = value != 0 && !window_closed,
-            "opacity" => layer.opacity = value.clamp(0, 255) as u8,
-            "enabled" => layer.enabled = value != 0,
-            "nodeEnabled" => layer.node_enabled = value != 0,
-            "type" => layer.layer_type = value as i32,
-            "face" => layer.face = value as i32,
-            "hitType" => layer.hit_type = value as i32,
-            "hitThreshold" => {
-                layer.hit_threshold = value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
-            }
-            _ => unreachable!("fixed layer property list"),
-        }
-    }
-    Ok(())
-}
-
 fn kag_layer_object_snapshot(
     runtime: &Runtime<KrkrHost>,
     page: &str,
@@ -5328,65 +5240,71 @@ fn first_text_arg(args: &[Variant]) -> Result<String> {
         .map(|text| text.unwrap_or_default())
 }
 
-fn this_font_spec(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Result<FontSpec> {
+fn this_font_spec(runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Result<FontSpec> {
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(FontSpec::default());
     };
     font_spec_from_object(runtime, this)
 }
 
-fn layer_font_spec(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Result<FontSpec> {
+fn layer_font_spec(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<FontSpec> {
     match layer_property_value(runtime, layer, "font") {
         Variant::Object(font) => font_spec_from_object(runtime, font),
         _ => Ok(FontSpec::default()),
     }
 }
 
-fn font_spec_from_object(runtime: &Runtime<KrkrHost>, font: ObjectHandle) -> Result<FontSpec> {
-    let face = match runtime.object_member(font, "face") {
-        Variant::Void | Variant::Null => String::new(),
-        value => value.to_tjs_string()?,
+/// Read a font attribute through the TJS dispatch path.  GINKA wraps the
+/// layer font in a script `FontHook` whose `face`/`height`/style members are
+/// TJS properties forwarding to the real native font; a raw member read would
+/// see the property object itself and fall back to defaults (GINKA's ruby was
+/// drawn at the base font height because of this).
+fn resolve_font_member(
+    runtime: &mut Runtime<KrkrHost>,
+    font: ObjectHandle,
+    name: &str,
+) -> Option<Variant> {
+    runtime
+        .resolve_object_member(font, name)
+        .ok()
+        .filter(|value| !matches!(value, Variant::Void | Variant::Null))
+}
+
+fn font_spec_from_object(runtime: &mut Runtime<KrkrHost>, font: ObjectHandle) -> Result<FontSpec> {
+    let face = match resolve_font_member(runtime, font, "face") {
+        None => String::new(),
+        Some(value) => value.to_tjs_string()?,
     };
-    let raw_height = runtime
-        .object_member(font, "height")
-        .to_integer()
+    let raw_height = resolve_font_member(runtime, font, "height")
+        .map(|value| value.to_integer())
+        .transpose()?
         .unwrap_or(FontSpec::default().height as i64);
     let height = if raw_height == 0 {
         FontSpec::default().height
     } else {
         raw_height.unsigned_abs().max(1) as f32
     };
-    let rasterizer = match runtime.object_member(font, "rasterizer") {
-        Variant::Void | Variant::Null => String::new(),
-        value => value.to_tjs_string()?,
+    let rasterizer = match resolve_font_member(runtime, font, "rasterizer") {
+        None => String::new(),
+        Some(value) => value.to_tjs_string()?,
+    };
+    let flag = |runtime: &mut Runtime<KrkrHost>, name: &str| {
+        resolve_font_member(runtime, font, name)
+            .map(|value| value.to_integer().unwrap_or(0) != 0)
+            .unwrap_or(false)
     };
     Ok(FontSpec {
         face,
         height,
-        bold: runtime
-            .object_member(font, "bold")
-            .to_integer()
-            .is_ok_and(|value| value != 0),
-        italic: runtime
-            .object_member(font, "italic")
-            .to_integer()
-            .is_ok_and(|value| value != 0),
-        strikeout: runtime
-            .object_member(font, "strikeout")
-            .to_integer()
-            .is_ok_and(|value| value != 0),
-        underline: runtime
-            .object_member(font, "underline")
-            .to_integer()
-            .is_ok_and(|value| value != 0),
-        angle: runtime
-            .object_member(font, "angle")
-            .to_integer()
+        bold: flag(runtime, "bold"),
+        italic: flag(runtime, "italic"),
+        strikeout: flag(runtime, "strikeout"),
+        underline: flag(runtime, "underline"),
+        angle: resolve_font_member(runtime, font, "angle")
+            .map(|value| value.to_integer())
+            .transpose()?
             .unwrap_or(0) as i32,
-        face_is_file_name: runtime
-            .object_member(font, "faceIsFileName")
-            .to_integer()
-            .is_ok_and(|value| value != 0),
+        face_is_file_name: flag(runtime, "faceIsFileName"),
         rasterizer,
     })
 }

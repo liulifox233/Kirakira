@@ -4595,7 +4595,14 @@ mod tests {
     }
 
     #[test]
-    fn layer_property_overrides_sync_hit_testing_before_input() {
+    fn script_property_override_does_not_reach_render_node() {
+        // KRKR2 semantics: a script subclass overriding a Layer property with
+        // a TJS property getter/setter only shadows it for script access; the
+        // native render/hit-test node keeps the value set through the native
+        // setter.  GINKA's world system (AffineLayer) overrides left/top/width/
+        // height with world-space computed values that must never move the
+        // native layer, while its ButtonLayer overrides hitThreshold with a
+        // script-side value that likewise stays script-side.
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -4607,10 +4614,15 @@ mod tests {
                         // The native backing property deliberately differs
                         // from this script-visible override.
                         super.hitThreshold = 256;
+                        super.left = 10;
                     }
                     property hitThreshold {
                         getter { return 0; }
                         setter(value) { super.hitThreshold = value; }
+                    }
+                    property left {
+                        getter { return -700; }
+                        setter(value) { }
                     }
                 }
                 global.hits = 0;
@@ -4629,8 +4641,6 @@ mod tests {
             )
             .expect("script");
 
-        // Render completion synchronizes script-overridden properties before
-        // the next platform input turn, matching the normal frame lifecycle.
         engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
@@ -4641,22 +4651,23 @@ mod tests {
             panic!("button missing");
         };
         let button_id = engine.host().native_layer(button).expect("native button");
-        assert_eq!(
-            engine
-                .host()
-                .layer_tree()
-                .layer(button_id)
-                .expect("button node")
-                .hit_threshold,
-            0
-        );
+        let node = engine
+            .host()
+            .layer_tree()
+            .layer(button_id)
+            .expect("button node")
+            .clone();
+        // The render node reflects the native property values, not the
+        // script-side getter overrides.
+        assert_eq!(node.hit_threshold, 256);
+        assert_eq!(node.left, 10.0);
         engine
             .update(
                 EngineInput::new(
                     FrameInput::new(Size::new(320.0, 240.0), 0.0),
                     vec![
                         EngineEvent::CursorMoved {
-                            position: Point::new(5.0, 5.0),
+                            position: Point::new(15.0, 5.0),
                         },
                         EngineEvent::PointerInput {
                             button: PointerButton::Primary,
@@ -4671,7 +4682,7 @@ mod tests {
             engine
                 .execute_expression("inline.tjs", "hits")
                 .expect("hits"),
-            Variant::Integer(1)
+            Variant::Integer(0)
         );
     }
 
