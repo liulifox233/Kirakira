@@ -37,6 +37,7 @@ pub enum TjsErrorKind {
     Verify,
     Runtime,
     Codegen,
+    DebugQuit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +93,16 @@ impl TjsError {
 
     pub fn codegen(message: impl Into<String>) -> Self {
         Self::new(TjsErrorKind::Codegen, message)
+    }
+
+    /// Raised when the user quits an interactive debug session. It is never
+    /// converted into a catchable TJS exception.
+    pub fn debug_quit() -> Self {
+        Self::new(TjsErrorKind::DebugQuit, "debug session terminated")
+    }
+
+    pub fn is_debug_quit(&self) -> bool {
+        self.kind == TjsErrorKind::DebugQuit
     }
 
     pub fn with_context(mut self, context: TjsErrorContext) -> Self {

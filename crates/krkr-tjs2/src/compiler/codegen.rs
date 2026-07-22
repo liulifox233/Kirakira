@@ -278,6 +278,7 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
     fn emit_inst(&mut self, inst: &MirInst) -> Result<()> {
         match inst {
             MirInst::Nop => self.emit_op(0),
+            MirInst::SourceMark { span } => self.record_span_source_position(*span),
             MirInst::LoadConst { dst, value } => {
                 let dst = self.slot_reg(*dst)?;
                 let data = self.data_for_const(*value)?;
@@ -1175,20 +1176,29 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
         let Some(span_id) = block.source_span else {
             return;
         };
+        self.record_span_source_position(span_id);
+    }
+
+    fn record_span_source_position(&mut self, span_id: super::mir::SpanId) {
         let Some(span) = self.module.spans.get(span_id.0 as usize) else {
             return;
         };
+        self.push_source_position(span.utf16_start);
+    }
+
+    fn push_source_position(&mut self, source_pos: u32) {
         let code_pos = self.code.len() as u32;
-        if self
-            .source_positions
-            .last()
-            .is_some_and(|position| position.code_pos == code_pos)
+        // A later mark at the same code position is more precise (a
+        // statement-level `SourceMark` after a block-level span), so it wins.
+        if let Some(last) = self.source_positions.last_mut()
+            && last.code_pos == code_pos
         {
+            last.source_pos = source_pos;
             return;
         }
         self.source_positions.push(SourcePosition {
             code_pos,
-            source_pos: span.utf16_start,
+            source_pos,
         });
     }
 

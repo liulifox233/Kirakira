@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
 use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
-use crate::error::{Result, TjsError, TjsSourceLocation, TjsStackFrame};
+use crate::debug::{LocationKey, Pause, StopReason};
+use crate::error::{Result, TjsError, TjsErrorKind, TjsSourceLocation, TjsStackFrame};
 use crate::runtime::{
     Closure, NativeFunction, NoHost, ObjectHandle, ObjectKind, Runtime, TjsHost, Variant,
 };
@@ -10,8 +11,9 @@ mod dispatch;
 mod frame;
 mod opcode;
 
+pub(crate) use frame::Frame;
 pub(crate) use frame::SuspendedCallStack;
-use frame::{CallFrame, Continuation, ExceptionEntry, Frame};
+use frame::{CallFrame, Continuation, ExceptionEntry};
 use opcode::{branch_index, next_instruction_index};
 
 pub fn execute_bytecode(bytes: &[u8]) -> Result<Variant> {
@@ -234,6 +236,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 }
             };
 
+            if self.runtime.debugger.is_some()
+                && let Err(error) = self.debug_pre_execute(&mut call_frame, &stack, &inst)
+            {
+                break Err(error);
+            }
+
             match self.execute_instruction(
                 &call_frame.object,
                 call_frame.object_handle,
@@ -266,11 +274,45 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     break Ok(Variant::Void);
                 }
                 Err(error) => {
+                    // A debug-session quit must never become a catchable TJS
+                    // exception.
+                    if error.kind == TjsErrorKind::DebugQuit {
+                        break Err(error);
+                    }
                     let error = error.with_stack_frame(self.stack_frame_for(
                         &call_frame.file,
                         &call_frame.object,
                         inst.offset,
                     ));
+                    if self
+                        .runtime
+                        .debugger
+                        .as_ref()
+                        .is_some_and(|debugger| debugger.break_on_exception())
+                    {
+                        let caught = !call_frame.frame.entries.is_empty()
+                            || stack.iter().any(|frame| !frame.frame.entries.is_empty());
+                        let reason = StopReason::Exception {
+                            caught,
+                            message: error.message.clone(),
+                        };
+                        let object_index = match self.runtime.heap.get(call_frame.object_handle.0) {
+                            Some(object) => match object.kind {
+                                ObjectKind::InterCode { object_index, .. } => Some(object_index),
+                                _ => None,
+                            },
+                            None => None,
+                        };
+                        if let Err(quit) = self.debug_pause(
+                            &mut call_frame,
+                            &stack,
+                            reason,
+                            inst.offset,
+                            object_index,
+                        ) {
+                            break Err(quit);
+                        }
+                    }
                     match self.unwind_to_catch(error, call_frame, &mut stack) {
                         Ok(()) => {}
                         Err(error) => break Err(error),
@@ -421,6 +463,95 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 error.with_stack_frame(self.stack_frame_for(&frame.file, &frame.object, offset));
         }
         error
+    }
+
+    /// Debugger hook run before each instruction dispatch. Cheap fast path:
+    /// returns immediately when no stop condition matches.
+    fn debug_pre_execute(
+        &mut self,
+        call_frame: &mut CallFrame,
+        stack: &[CallFrame],
+        inst: &Instruction,
+    ) -> Result<()> {
+        let depth = stack.len() + 1;
+        let object_index = match self.runtime.heap.get(call_frame.object_handle.0) {
+            Some(object) => match object.kind {
+                ObjectKind::InterCode { object_index, .. } => Some(object_index),
+                _ => None,
+            },
+            None => None,
+        };
+        let Some(debugger) = self.runtime.debugger.as_mut() else {
+            return Ok(());
+        };
+        let Some(reason) = debugger.check_tjs(
+            &call_frame.file,
+            call_frame.file_id,
+            object_index,
+            &call_frame.object,
+            inst.offset,
+            inst.opcode,
+            depth,
+        ) else {
+            return Ok(());
+        };
+        self.debug_pause(call_frame, stack, reason, inst.offset, object_index)
+    }
+
+    /// Builds the backtrace, invokes the registered debug UI synchronously,
+    /// and applies the returned action to the stepping state machine.
+    fn debug_pause(
+        &mut self,
+        call_frame: &mut CallFrame,
+        stack: &[CallFrame],
+        reason: StopReason,
+        offset: usize,
+        object_index: Option<usize>,
+    ) -> Result<()> {
+        let Some(mut ui) = self.runtime.debug_ui.take() else {
+            return Ok(());
+        };
+        let depth = stack.len() + 1;
+        let mut backtrace = Vec::with_capacity(depth);
+        backtrace.push(self.stack_frame_for(&call_frame.file, &call_frame.object, offset));
+        for caller in stack.iter().rev() {
+            let caller_offset = caller
+                .instructions
+                .get(caller.pc)
+                .map(|inst| inst.offset)
+                .unwrap_or_else(|| {
+                    caller
+                        .instructions
+                        .last()
+                        .map(|inst| inst.offset)
+                        .unwrap_or(0)
+                });
+            backtrace.push(self.stack_frame_for(&caller.file, &caller.object, caller_offset));
+        }
+        let key: Option<LocationKey> = self
+            .source_location_for(&call_frame.file, &call_frame.object, offset)
+            .map(|location| {
+                (
+                    call_frame.file_id,
+                    location.line.or(location.utf16_offset).unwrap_or(0),
+                )
+            });
+        let action = {
+            let mut pause = Pause::new_tjs(
+                reason,
+                self.runtime,
+                &mut call_frame.frame,
+                Arc::clone(&call_frame.file),
+                object_index,
+                backtrace,
+            );
+            ui.on_pause(&mut pause)
+        };
+        self.runtime.debug_ui = Some(ui);
+        let Some(debugger) = self.runtime.debugger.as_mut() else {
+            return Ok(());
+        };
+        debugger.apply_action(action, key, depth)
     }
 
     fn execute_instruction(

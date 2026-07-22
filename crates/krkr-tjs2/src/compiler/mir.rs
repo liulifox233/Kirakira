@@ -299,6 +299,7 @@ impl MirObject {
     fn validate_inst(&self, module: &MirModule, inst: &MirInst) -> Result<()> {
         match inst {
             MirInst::Nop | MirInst::RegisterMembers | MirInst::Debugger => Ok(()),
+            MirInst::SourceMark { .. } => Ok(()),
             MirInst::LoadConst { dst, value } => {
                 self.validate_slot(*dst)?;
                 module.require_const(*value)
@@ -818,6 +819,12 @@ pub struct BlockParam {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirInst {
     Nop,
+    /// Records the source span of the enclosing statement. Emits no bytecode;
+    /// codegen turns it into a `source_positions` entry so debuggers and
+    /// stack traces get statement-level line granularity.
+    SourceMark {
+        span: SpanId,
+    },
     LoadConst {
         dst: SlotId,
         value: ConstId,
@@ -2152,6 +2159,13 @@ impl ObjectBuilder {
         statement: &'a syntax::Stmt,
         tasks: &mut Vec<StmtTask<'a>>,
     ) -> Result<()> {
+        // Mark the statement's source span so codegen can emit
+        // statement-level source positions. Skip unreachable blocks to avoid
+        // resurrecting dead code into empty blocks.
+        if self.current_open() {
+            let span = lowerer.add_span(statement.span);
+            self.emit(MirInst::SourceMark { span });
+        }
         match &statement.kind {
             syntax::StmtKind::Empty => {}
             syntax::StmtKind::Block(statements) => push_stmt_tasks(tasks, statements),
