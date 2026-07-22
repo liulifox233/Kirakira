@@ -1138,6 +1138,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-debug"
+version = "0.1.0"
+dependencies = [
+ "krkr-core",
+ "krkr-engine",
+ "krkr-plugins",
+ "krkr-tjs2",
+]
+
+[[package]]
 name = "krkr-desktop"
 version = "0.1.0"
 dependencies = [
