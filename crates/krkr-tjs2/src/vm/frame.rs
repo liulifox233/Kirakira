@@ -48,7 +48,7 @@ pub(super) enum Continuation {
     },
 }
 
-pub(super) struct Frame {
+pub(crate) struct Frame {
     pub(super) regs: Vec<Variant>,
     pub(super) negative: Vec<Variant>,
     pub(super) caller_args: Vec<Variant>,
@@ -93,7 +93,7 @@ impl Frame {
         })
     }
 
-    pub(super) fn get(&self, reg: i16) -> Result<Variant> {
+    pub(crate) fn get(&self, reg: i16) -> Result<Variant> {
         if reg >= 0 {
             return self
                 .regs
@@ -111,7 +111,7 @@ impl Frame {
         }
     }
 
-    pub(super) fn set(&mut self, reg: i16, value: Variant) -> Result<()> {
+    pub(crate) fn set(&mut self, reg: i16, value: Variant) -> Result<()> {
         if reg >= 0 {
             let slot = self
                 .regs
@@ -133,6 +133,24 @@ impl Frame {
                 Ok(())
             }
         }
+    }
+
+    /// Enumerates every register for the debugger: `-1` = `this`, `-2` =
+    /// this-proxy, `-3..` = locals/args, `0..` = temporaries.
+    pub(crate) fn debug_registers(&self) -> Vec<(i16, Variant)> {
+        let mut registers = Vec::with_capacity(self.negative.len() + self.regs.len() + 2);
+        registers.push((
+            -1,
+            self.this_obj.map(Variant::Object).unwrap_or(Variant::Null),
+        ));
+        registers.push((-2, Variant::Object(self.this_proxy)));
+        for (index, value) in self.negative.iter().enumerate() {
+            registers.push((-3 - index as i16, value.clone()));
+        }
+        for (index, value) in self.regs.iter().enumerate() {
+            registers.push((index as i16, value.clone()));
+        }
+        registers
     }
 }
 

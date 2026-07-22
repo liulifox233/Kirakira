@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
+use crate::debug::{DebugUi, Debugger};
 use crate::error::{Result, TjsError};
 use crate::vm::{SuspendedCallStack, Vm};
 
@@ -206,6 +207,8 @@ pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) max_call_depth: usize,
     pub(crate) suspend_requested: bool,
     pub(crate) suspended_call: Option<SuspendedCallStack>,
+    pub(crate) debugger: Option<Debugger>,
+    pub(crate) debug_ui: Option<Box<dyn DebugUi<H>>>,
     host: H,
 }
 
@@ -248,6 +251,8 @@ impl<H: TjsHost + 'static> Runtime<H> {
             max_call_depth: 1024,
             suspend_requested: false,
             suspended_call: None,
+            debugger: None,
+            debug_ui: None,
             host,
         };
         builtins::install(&mut runtime);
@@ -526,6 +531,36 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     pub fn request_suspend(&mut self) {
         self.suspend_requested = true;
+    }
+
+    /// Enables the interactive debugger and returns it for configuration
+    /// (breakpoints, exception breaks, stepping).
+    pub fn enable_debugger(&mut self) -> &mut Debugger {
+        self.debugger.get_or_insert_with(Debugger::new)
+    }
+
+    pub fn debugger(&self) -> Option<&Debugger> {
+        self.debugger.as_ref()
+    }
+
+    pub fn debugger_mut(&mut self) -> Option<&mut Debugger> {
+        self.debugger.as_mut()
+    }
+
+    /// Registers the synchronous debug UI invoked whenever execution pauses.
+    pub fn set_debug_ui(&mut self, ui: Box<dyn DebugUi<H>>) {
+        self.debug_ui = Some(ui);
+    }
+
+    /// Takes the debug UI out so the VM/engine can invoke it while a
+    /// [`crate::debug::Pause`] holds `&mut Runtime`. Callers must hand it back
+    /// via [`Runtime::put_debug_ui`] once the pause ends.
+    pub fn take_debug_ui(&mut self) -> Option<Box<dyn DebugUi<H>>> {
+        self.debug_ui.take()
+    }
+
+    pub fn put_debug_ui(&mut self, ui: Box<dyn DebugUi<H>>) {
+        self.debug_ui = Some(ui);
     }
 
     pub fn is_suspended(&self) -> bool {

@@ -15,6 +15,7 @@
 
 pub mod bytecode;
 pub mod compiler;
+pub mod debug;
 pub mod error;
 pub mod frontend;
 pub mod runtime;
