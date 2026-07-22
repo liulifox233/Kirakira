@@ -5240,7 +5240,10 @@ fn first_text_arg(args: &[Variant]) -> Result<String> {
         .map(|text| text.unwrap_or_default())
 }
 
-fn this_font_spec(runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Result<FontSpec> {
+fn this_font_spec(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+) -> Result<FontSpec> {
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(FontSpec::default());
     };
