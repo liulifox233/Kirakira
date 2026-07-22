@@ -13,6 +13,7 @@ use krkr_core::{
 use krkr_kag::{KagError, KagParser, ParserSnapshot, Tag};
 use krkr_tjs2::{
     Result, TjsError,
+    debug::Pause,
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
@@ -1738,6 +1739,39 @@ enum RuntimeSchedulerPump {
     WindowUpdatesOnly,
 }
 
+/// Debugger hook run before each KAG tag is processed. Stops on KAG
+/// line/label breakpoints and KAG tag stepping, invoking the same debug UI
+/// the TJS VM uses.
+fn debug_check_kag_tag(
+    parser: &KagParser,
+    runtime: &mut Runtime<KrkrHost>,
+    tag: &Tag,
+) -> Result<()> {
+    if runtime.debugger().is_none() {
+        return Ok(());
+    }
+    let storage = parser.cur_storage().unwrap_or_default().to_string();
+    let label = parser.cur_label().map(str::to_string);
+    let reason = runtime.debugger_mut().and_then(|debugger| {
+        debugger.check_kag(&storage, Some(tag.location.line), label.as_deref())
+    });
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    let Some(mut ui) = runtime.take_debug_ui() else {
+        return Ok(());
+    };
+    let action = {
+        let mut pause = Pause::new_kag(reason, runtime);
+        ui.on_pause(&mut pause)
+    };
+    runtime.put_debug_ui(ui);
+    if let Some(debugger) = runtime.debugger_mut() {
+        debugger.apply_action(action, None, 0)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct KagSession {
     parser: Option<ObjectHandle>,
@@ -2097,6 +2131,7 @@ impl KagSession {
             };
 
             tags_processed += 1;
+            debug_check_kag_tag(parser, runtime, &tag)?;
             let action = self.process_tag(parser, runtime, owner, tag)?;
             match action {
                 TagAction::Continue => {}
@@ -5545,6 +5580,59 @@ mod tests {
         let blocked = engine.tick().expect("blocked tick");
         assert_eq!(blocked.tags_processed, 0);
         assert_eq!(blocked.reason, KagYieldReason::AlreadyBlocked);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_debugger_stops_at_line_breakpoint_and_tag_step() {
+        use std::sync::{Arc, Mutex};
+
+        use krkr_tjs2::debug::{DebugAction, DebugUi, Pause, StopReason};
+
+        struct MockUi {
+            stops: Arc<Mutex<Vec<(bool, Option<usize>)>>>,
+            actions: std::collections::VecDeque<DebugAction>,
+        }
+
+        impl DebugUi<KrkrHost> for MockUi {
+            fn on_pause(&mut self, pause: &mut Pause<'_, KrkrHost>) -> DebugAction {
+                if let StopReason::Kag { line, stepped, .. } = pause.reason() {
+                    self.stops.lock().expect("stops").push((*stepped, *line));
+                }
+                self.actions.pop_front().unwrap_or(DebugAction::Continue)
+            }
+        }
+
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A\n[p]\nC").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        {
+            let runtime = engine.tjs_runtime_mut();
+            runtime
+                .enable_debugger()
+                .add_kag_line_breakpoint("first.ks", 2);
+            runtime.set_debug_ui(Box::new(MockUi {
+                stops: Arc::clone(&stops),
+                actions: vec![DebugAction::KagStep].into(),
+            }));
+        }
+
+        engine.tick().expect("first tick");
+        engine.signal_kag_click();
+        engine.tick().expect("second tick");
+
+        // [p] on line 2 triggers the line breakpoint; the following text tag
+        // on line 3 triggers the queued KAG tag step.
+        assert_eq!(
+            *stops.lock().expect("stops"),
+            vec![(false, Some(2)), (true, Some(3))]
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }
