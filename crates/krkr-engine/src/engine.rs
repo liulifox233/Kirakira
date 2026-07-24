@@ -26,7 +26,10 @@ use crate::{
         complete_layer_before_draw, complete_pending_layer_paints,
         finish_completed_native_transitions, register_kag_layer_slots_from_tjs,
     },
-    native::{create_kag_parser_object, refresh_kag_parser_object},
+    native::{
+        create_kag_parser_object, refresh_kag_parser_object, tick_video_overlays,
+        video_overlay_frame_quads,
+    },
     plugin::KrkrPlugin,
     scheduler::{
         ASYNC_TRIGGER_EVENT_NAME, AUDIO_FADE_COMPLETED_EVENT_NAME, AsyncTriggerMode, IdleEvent,
@@ -559,6 +562,11 @@ impl KrkrEngine {
         self.pump_runtime_scheduler(RuntimeSchedulerPump::Full)?;
         self.resume_modal_call_if_ready()?;
         let tick = self.advance(delta)?;
+        // Video overlays advance on the same clock; status events fired here
+        // (notably the end-of-stream `stop` KAG movie conductors wait for)
+        // wake the scenario on the next advance.
+        let video_tick = tick_video_overlays(&mut self.tjs_runtime);
+        self.sync_kag_slots_after_ok(video_tick)?;
         self.pump_runtime_scheduler(RuntimeSchedulerPump::WindowUpdatesOnly)?;
         complete_pending_layer_paints(&mut self.tjs_runtime)?;
         self.tjs_runtime
@@ -566,7 +574,7 @@ impl KrkrEngine {
             .reapply_transition_live_layer_overrides();
         let suppressed_images = self.tjs_runtime.host().suppressed_transition_live_images();
         let transition = self.tjs_runtime.host().frame_transition();
-        let output = self
+        let mut output = self
             .core_engine
             .tick_running_with_layers_suppressing_images_and_transition(
                 input.frame,
@@ -575,6 +583,12 @@ impl KrkrEngine {
                 &suppressed_images,
                 transition,
             );
+        // Movie quads present on top of the layer tree (krkrz draws the
+        // overlay/mixer video above the normal window contents).
+        let (mut video_uploads, video_commands) =
+            video_overlay_frame_quads(self.tjs_runtime.host_mut());
+        output.image_uploads.append(&mut video_uploads);
+        output.draw_commands.extend(video_commands);
         let frame = EngineFrame {
             output,
             tick,

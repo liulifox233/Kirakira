@@ -12,6 +12,14 @@ krkr-core.workspace = true
 krkr-font.workspace = true
 krkr-kag.workspace = true
 krkr-tjs2.workspace = true
+krkr-video.workspace = true
 krkr-xp3.workspace = true
 libtlg-rs.workspace = true
 memmap2.workspace = true
+
+# The VideoOverlay native object decodes through the host platform's media
+# framework (krkr2/krkrz use DirectShow / Media Foundation); on macOS that is
+# AVFoundation. Other platforms get an "unsupported" backend until their
+# decoders are implemented.
+[target.'cfg(target_os = "macos")'.dependencies]
+krkr-video = { workspace = true, features = ["macos-avfoundation"] }
