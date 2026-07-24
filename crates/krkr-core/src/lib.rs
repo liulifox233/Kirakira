@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
+    fmt,
     io::{self, Cursor, Read, Seek},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 pub use krkr_font::{FontSpec, TextStyle};
@@ -128,6 +129,50 @@ pub enum AudioLoadPolicy {
     StaticUncached,
 }
 
+/// Format of an externally decoded PCM stream (movie audio tracks).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PcmAudioSpec {
+    pub sample_rate: u32,
+    pub channels: u32,
+}
+
+/// One chunk of an externally decoded PCM stream: interleaved f32 samples in
+/// the layout described by [`PcmAudioSpec`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PcmAudioChunk {
+    pub pts_ms: i64,
+    pub samples: Arc<[f32]>,
+}
+
+/// A live PCM source fed by an external decoder (krkr-video decodes movie
+/// soundtracks; the audio system pulls chunks from the channel). Clones share
+/// the same receiver, so there is still only one consumer.
+#[derive(Clone)]
+pub struct PcmStreamSource {
+    pub spec: PcmAudioSpec,
+    /// Approximate total frames per channel; used for end-of-stream
+    /// detection only.
+    pub total_frames: u64,
+    pub receiver: Arc<Mutex<std::sync::mpsc::Receiver<PcmAudioChunk>>>,
+}
+
+impl fmt::Debug for PcmStreamSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PcmStreamSource")
+            .field("spec", &self.spec)
+            .field("total_frames", &self.total_frames)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PcmStreamSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec
+            && self.total_frames == other.total_frames
+            && Arc::ptr_eq(&self.receiver, &other.receiver)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AudioSourceRef {
     pub storage: String,
@@ -153,6 +198,15 @@ pub enum AudioCommand {
         source: AudioSourceRef,
         load_policy: AudioLoadPolicy,
         looping: bool,
+        volume: f32,
+    },
+    /// Plays a live PCM stream produced by an external decoder. Used for
+    /// movie soundtracks: the movie container belongs to the video backend,
+    /// not to the audio file loaders.
+    PlayPcmStream {
+        id: AudioInstanceId,
+        bus: AudioBus,
+        source: PcmStreamSource,
         volume: f32,
     },
     Preload {

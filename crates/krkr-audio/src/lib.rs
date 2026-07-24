@@ -23,8 +23,8 @@ use kira::{
     track::{TrackBuilder, TrackHandle},
 };
 use krkr_core::{
-    AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, ResourceProvider,
-    ResourceStream,
+    AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, PcmStreamSource,
+    ResourceProvider, ResourceStream,
 };
 use symphonia::core::{
     codecs::CODEC_TYPE_OPUS,
@@ -440,6 +440,36 @@ fn handle_audio_command(command: AudioCommand, mut context: ControlContext<'_>) 
             source,
             load_policy,
         } => dispatch_preload(source, load_policy, &context),
+        AudioCommand::PlayPcmStream {
+            id,
+            bus,
+            source,
+            volume,
+        } => {
+            // Live PCM (movie soundtracks) needs no loader round-trip; play
+            // it right away and register the slot so Stop/SetVolume/Pause and
+            // end-of-stream reporting behave like any other sound.
+            let generation = *context.next_generation;
+            *context.next_generation = context.next_generation.saturating_add(1);
+            context.slots.insert(
+                id,
+                SoundSlot {
+                    generation,
+                    bus,
+                    looping: false,
+                    volume,
+                    paused: false,
+                },
+            );
+            if let Err(error) = context.backend.play_pcm_stream(id, bus, source, volume) {
+                context.slots.remove(&id);
+                report_event(
+                    context.event_tx,
+                    AudioStatusLevel::Warning,
+                    error.to_string(),
+                );
+            }
+        }
         AudioCommand::Stop { id, fade_seconds } => {
             context.slots.remove(&id);
             context.backend.stop_id(id, tween(fade_seconds));
@@ -874,6 +904,69 @@ fn load_streaming_sound(
     })
 }
 
+/// kira streaming decoder that pulls PCM chunks from a live channel fed by
+/// an external decoder (movie soundtracks decoded by krkr-video). The video
+/// container never enters the audio file loaders.
+struct ChannelPcmDecoder {
+    spec: krkr_core::PcmAudioSpec,
+    total_frames: usize,
+    receiver: Arc<Mutex<mpsc::Receiver<krkr_core::PcmAudioChunk>>>,
+}
+
+impl ChannelPcmDecoder {
+    fn new(source: PcmStreamSource) -> Self {
+        Self {
+            spec: source.spec,
+            total_frames: source.total_frames as usize,
+            receiver: source.receiver,
+        }
+    }
+}
+
+impl kira::sound::streaming::Decoder for ChannelPcmDecoder {
+    type Error = FromFileError;
+
+    fn sample_rate(&self) -> u32 {
+        self.spec.sample_rate
+    }
+
+    fn num_frames(&self) -> usize {
+        self.total_frames
+    }
+
+    fn decode(&mut self) -> Result<Vec<Frame>, FromFileError> {
+        let chunk = self
+            .receiver
+            .lock()
+            .ok()
+            .and_then(|rx| rx.recv_timeout(Duration::from_secs(2)).ok());
+        let Some(chunk) = chunk else {
+            // Producer closed (end of stream) or stalled: emit silence so
+            // kira's decode loop never spins on empty chunks. The transport
+            // still stops the sound once `num_frames` is reached.
+            return Ok(vec![Frame::ZERO; 4096]);
+        };
+        Ok(match self.spec.channels {
+            1 => chunk
+                .samples
+                .iter()
+                .map(|sample| Frame::from_mono(*sample))
+                .collect(),
+            _ => chunk
+                .samples
+                .chunks_exact(2)
+                .map(|pair| Frame::new(pair[0], pair[1]))
+                .collect(),
+        })
+    }
+
+    fn seek(&mut self, index: usize) -> Result<usize, FromFileError> {
+        // Live streams cannot rewind; movie seeks re-feed the channel from
+        // the decoder side instead.
+        Ok(index)
+    }
+}
+
 fn load_opus_static_sound(request: &LoadRequest) -> Result<StaticSoundData, String> {
     let stream = request
         .provider
@@ -1037,6 +1130,30 @@ impl KiraBackend {
             handle.pause(Tween::default());
         }
         self.handles.insert(request.id, handle);
+        Ok(())
+    }
+
+    fn play_pcm_stream(
+        &mut self,
+        id: AudioInstanceId,
+        bus: AudioBus,
+        source: PcmStreamSource,
+        volume: f32,
+    ) -> Result<(), AudioError> {
+        self.stop_id(id, Tween::default());
+        let data = StreamingSoundData::from_decoder(ChannelPcmDecoder::new(source))
+            .volume(linear_volume_to_decibels(volume));
+        let handle = match bus {
+            AudioBus::Master => self.manager.play(data),
+            AudioBus::Bgm => self.bgm_track.play(data),
+            AudioBus::SoundEffect => self.se_track.play(data),
+        }
+        .map_err(|error| AudioError::PlaybackFailed {
+            storage: "pcm-stream".to_string(),
+            message: error.to_string(),
+        })?;
+        self.handles
+            .insert(id, PlayingSound::Streaming { bus, handle });
         Ok(())
     }
 
