@@ -20,7 +20,13 @@ use crate::host::{
 };
 use crate::scheduler::AsyncTriggerMode;
 
-use super::{native_void, register_stub_method};
+use super::{
+    native_void, register_stub_method,
+    video::{
+        install_video_native_properties, install_video_overlay_methods,
+        install_video_overlay_property_placeholders,
+    },
+};
 
 pub(crate) fn install_native_class(
     runtime: &mut Runtime<KrkrHost>,
@@ -67,7 +73,11 @@ fn construct_native_instance(
     {
         runtime.set_object_super_class(handle, class_handle);
     }
-    if spec.name != "WaveSoundBuffer" {
+    // WaveSoundBuffer and VideoOverlay keep their native methods on the class
+    // object only: script subclasses override `open`/`play`/`stop` (GINKA's
+    // Movie extends VideoOverlay) and forward with `SUPER.*()`, so installing
+    // the natives directly on each instance would shadow those overrides.
+    if !matches!(spec.name, "WaveSoundBuffer" | "VideoOverlay") {
         install_methods(runtime, handle, spec.name, spec.methods);
         install_special_methods(runtime, handle, spec.name);
     }
@@ -81,7 +91,14 @@ fn construct_native_instance(
         runtime.delete_object_member(handle, "onTransitionCompleted");
         runtime.delete_object_member(handle, "onPaint");
     }
-    install_properties(runtime, handle, spec.properties);
+    // VideoOverlay has the same shadowing problem for script *properties*
+    // (Movie.left/top/audioVolume/...): skip placeholders that a script class
+    // in the chain already declares.
+    if spec.name == "VideoOverlay" {
+        install_video_overlay_property_placeholders(runtime, handle);
+    } else {
+        install_properties(runtime, handle, spec.properties);
+    }
     apply_constructor_defaults(runtime, handle, spec.name, &args)?;
     install_instance_native_properties(runtime, handle, spec.name);
     Ok(Variant::Object(handle))
@@ -139,6 +156,7 @@ fn install_native_properties(
         "Layer" => install_layer_native_properties(runtime, handle, false),
         "Window" => install_window_native_properties(runtime, handle, false),
         "WaveSoundBuffer" => install_wave_native_properties(runtime, handle, false),
+        "VideoOverlay" => install_video_native_properties(runtime, handle, false),
         _ => {}
     }
 }
@@ -152,6 +170,7 @@ fn install_instance_native_properties(
         "Layer" => install_layer_native_properties(runtime, handle, true),
         "Window" => install_window_native_properties(runtime, handle, true),
         "WaveSoundBuffer" => install_wave_native_properties(runtime, handle, true),
+        "VideoOverlay" => install_video_native_properties(runtime, handle, true),
         _ => {}
     }
 }
@@ -559,6 +578,8 @@ fn install_special_methods(
         install_window_methods(runtime, handle);
     } else if class_name == "WaveSoundBuffer" {
         install_wave_sound_buffer_methods(runtime, handle);
+    } else if class_name == "VideoOverlay" {
+        install_video_overlay_methods(runtime, handle);
     }
 }
 
@@ -6595,6 +6616,12 @@ pub(crate) static PHASE_VOCODER_CLASS: NativeClassSpec = NativeClassSpec {
     static_methods: &[],
     static_properties: &[],
 };
+
+/// Property names of the VideoOverlay native class, shared with the video
+/// module (which installs the actual native property handlers).
+pub(crate) fn video_overlay_property_names() -> &'static [&'static str] {
+    VIDEO_OVERLAY_CLASS.properties
+}
 
 pub(crate) static VIDEO_OVERLAY_CLASS: NativeClassSpec = NativeClassSpec {
     name: "VideoOverlay",

@@ -18,6 +18,7 @@ use krkr_tjs2::{
 };
 
 use crate::{
+    native::video::VideoOverlayState,
     resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId, decode_image_bytes},
     scheduler::{AsyncTriggerMode, TvpScheduler},
     storage::{
@@ -208,6 +209,7 @@ pub struct KrkrHost {
     native_audio_buffers: BTreeMap<ObjectHandle, NativeAudioBuffer>,
     native_audio_global_volume: i64,
     pending_audio_commands: Vec<AudioCommand>,
+    video_overlays: BTreeMap<ObjectHandle, VideoOverlayState>,
     text_encoding: String,
     pressed_keys: BTreeSet<i64>,
     cursor_position: Option<Point>,
@@ -256,6 +258,7 @@ impl Default for KrkrHost {
             native_audio_buffers: BTreeMap::new(),
             native_audio_global_volume: 100000,
             pending_audio_commands: Vec::new(),
+            video_overlays: BTreeMap::new(),
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             cursor_position: None,
@@ -312,6 +315,7 @@ impl KrkrHost {
             native_audio_buffers: BTreeMap::new(),
             native_audio_global_volume: 100000,
             pending_audio_commands: Vec::new(),
+            video_overlays: BTreeMap::new(),
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             cursor_position: None,
@@ -359,6 +363,10 @@ impl KrkrHost {
 
     pub fn logs(&self) -> &[String] {
         &self.logs
+    }
+
+    pub fn drain_logs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.logs)
     }
 
     pub fn linked_plugins(&self) -> impl Iterator<Item = &str> {
@@ -1724,6 +1732,35 @@ impl KrkrHost {
         self.pending_audio_commands.push(command);
     }
 
+    pub(crate) fn video_overlay_state(&self, handle: ObjectHandle) -> Option<&VideoOverlayState> {
+        self.video_overlays.get(&handle)
+    }
+
+    pub(crate) fn video_overlay_state_mut(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> &mut VideoOverlayState {
+        self.video_overlays.entry(handle).or_default()
+    }
+
+    pub(crate) fn video_overlay_handles(&self) -> Vec<ObjectHandle> {
+        self.video_overlays.keys().copied().collect()
+    }
+
+    pub(crate) fn video_overlays_mut(&mut self) -> &mut BTreeMap<ObjectHandle, VideoOverlayState> {
+        &mut self.video_overlays
+    }
+
+    pub(crate) fn remove_video_overlay(&mut self, handle: ObjectHandle) {
+        self.video_overlays.remove(&handle);
+    }
+
+    pub(crate) fn allocate_video_texture_id(&mut self) -> TextureId {
+        let texture_id = self.next_texture_id;
+        self.next_texture_id = self.next_texture_id.saturating_add(1);
+        texture_id
+    }
+
     pub fn take_audio_commands(&mut self) -> Vec<AudioCommand> {
         std::mem::take(&mut self.pending_audio_commands)
     }
@@ -1752,6 +1789,31 @@ impl KrkrHost {
     fn allocate_audio_instance_id(&mut self) -> AudioInstanceId {
         let id = AudioInstanceId(self.next_audio_instance_id);
         self.next_audio_instance_id = self.next_audio_instance_id.saturating_add(1);
+        id
+    }
+
+    /// Queues playback of a live PCM stream (movie soundtrack decoded by
+    /// krkr-video) and returns its audio instance id.
+    pub(crate) fn queue_pcm_stream_play(
+        &mut self,
+        bus: AudioBus,
+        spec: krkr_core::PcmAudioSpec,
+        total_frames: u64,
+        rx: std::sync::mpsc::Receiver<krkr_core::PcmAudioChunk>,
+        volume: f32,
+    ) -> AudioInstanceId {
+        let id = self.allocate_audio_instance_id();
+        self.pending_audio_commands
+            .push(AudioCommand::PlayPcmStream {
+                id,
+                bus,
+                source: krkr_core::PcmStreamSource {
+                    spec,
+                    total_frames,
+                    receiver: std::sync::Arc::new(std::sync::Mutex::new(rx)),
+                },
+                volume,
+            });
         id
     }
 

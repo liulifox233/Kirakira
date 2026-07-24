@@ -6,6 +6,7 @@ mod plugins;
 mod scripts;
 mod storages;
 mod system;
+pub(crate) mod video;
 
 pub(crate) use classes::{
     ASYNC_TRIGGER_CLASS, BASIC_DRAW_DEVICE_CLASS, BITMAP_CLASS, BITMAP_LAYER_TREE_OWNER_CLASS,
@@ -20,6 +21,7 @@ pub(crate) use plugins::install_plugins;
 pub(crate) use scripts::install_scripts;
 pub(crate) use storages::install_storages;
 pub(crate) use system::install_system;
+pub(crate) use video::{tick_video_overlays, video_overlay_frame_quads};
 
 use krkr_tjs2::{
     Result, TjsError,
