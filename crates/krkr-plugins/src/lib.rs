@@ -28,6 +28,8 @@ pub use lzfs::LzfsPlugin;
 pub use motion_player::MotionPlayerPlugin;
 pub use packinone::PackinOnePlugin;
 pub use psb_file::PsbFilePlugin;
+#[doc(hidden)]
+pub use psb_file::{PsbValue, debug_parse_psb};
 pub use text_render::TextRenderPlugin;
 pub use win32_dialog::Win32DialogPlugin;
 pub use window_ex::WindowExPlugin;

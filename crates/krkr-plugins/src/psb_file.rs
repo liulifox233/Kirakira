@@ -129,8 +129,17 @@ fn load_psb_storage(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle, storage
     }
 }
 
+/// Parses a PSB document into its value tree.  Exposed for offline
+/// debugging tools (e.g. the `psb_dump` example); not part of the plugin
+/// surface seen by games.
+#[doc(hidden)]
+pub fn debug_parse_psb(bytes: &[u8]) -> std::result::Result<PsbValue, String> {
+    PsbDocument::parse(bytes)
+}
+
 #[derive(Debug, Clone, PartialEq)]
-enum PsbValue {
+#[doc(hidden)]
+pub enum PsbValue {
     Null,
     Bool(bool),
     Integer(i64),
