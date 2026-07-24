@@ -118,6 +118,9 @@ struct DesktopApp {
     initial_project_root: Option<PathBuf>,
     status: Option<DesktopStatus>,
     last_frame: Instant,
+    rendered_frames: u64,
+    video_present_frame: Option<u64>,
+    video_texture_id: Option<u64>,
 }
 
 impl DesktopApp {
@@ -135,6 +138,9 @@ impl DesktopApp {
             initial_project_root,
             status: None,
             last_frame: Instant::now(),
+            rendered_frames: 0,
+            video_present_frame: None,
+            video_texture_id: None,
         }
     }
 
@@ -240,6 +246,15 @@ impl DesktopApp {
                                 }
                             }
                             exit_after_render |= krkr_engine.host().termination_requested();
+                            for line in krkr_engine.host_mut().drain_logs() {
+                                log_info(&line);
+                                if line.starts_with("VideoOverlay: presenting")
+                                    && self.video_present_frame.is_none()
+                                {
+                                    self.video_present_frame = Some(self.rendered_frames);
+                                    self.video_texture_id = parse_presenting_texture_id(&line);
+                                }
+                            }
                             let audio_commands = krkr_engine.host_mut().take_audio_commands();
                             if let Err(error) = self.audio.submit_commands(audio_commands) {
                                 let message = format!("audio command failed: {error}");
@@ -256,6 +271,9 @@ impl DesktopApp {
                         Err(error) => {
                             let message = format!("engine update failed: {error}");
                             log_error(&message);
+                            for line in krkr_engine.host_mut().drain_logs() {
+                                log_info(&line);
+                            }
                             self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
                             self.engine.set_status_level(Some(StatusLevel::Error));
                             self.engine.tick_running(frame_input)
@@ -272,6 +290,31 @@ impl DesktopApp {
         };
 
         renderer.set_content_size(Some(content_size));
+        if let Some(target) = capture_frame_target(self.rendered_frames) {
+            let path = std::env::var("KRKR_CAPTURE_PATH")
+                .unwrap_or_else(|_| "/tmp/krkr_capture.png".to_string());
+            renderer.capture_next_frame(&path);
+            log_info(&format!(
+                "surface capture armed for frame {target} at {path}"
+            ));
+        }
+        if let (Some(delay), Some(start)) = (capture_video_delay(), self.video_present_frame)
+            && self.rendered_frames == start + delay
+        {
+            let path = std::env::var("KRKR_CAPTURE_PATH")
+                .unwrap_or_else(|_| "/tmp/krkr_capture.png".to_string());
+            renderer.capture_next_frame(&path);
+            log_info(&format!("video surface capture armed at {path}"));
+            if let Some(texture_id) = self.video_texture_id {
+                let texture_path = std::env::var("KRKR_CAPTURE_TEXTURE_PATH")
+                    .unwrap_or_else(|_| "/tmp/krkr_capture_tex.png".to_string());
+                renderer.capture_texture_next_frame(texture_id, &texture_path);
+                log_info(&format!(
+                    "video texture capture armed for texture={texture_id} at {texture_path}"
+                ));
+            }
+        }
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
         if let Err(error) = renderer.render(&frame) {
             match error {
                 RenderError::OutOfMemory => {
@@ -751,6 +794,31 @@ fn status_level_label(level: StatusLevel) -> &'static str {
         StatusLevel::Warning => "warning",
         StatusLevel::Error => "error",
     }
+}
+
+/// `KRKR_CAPTURE_FRAME=<n>` arms a one-shot surface capture just before frame
+/// `n` is rendered (path from `KRKR_CAPTURE_PATH`, default
+/// `/tmp/krkr_capture.png`).
+fn capture_frame_target(rendered_frames: u64) -> Option<u64> {
+    let target: u64 = std::env::var("KRKR_CAPTURE_FRAME").ok()?.parse().ok()?;
+    (rendered_frames == target).then_some(target)
+}
+
+/// `KRKR_CAPTURE_VIDEO=<frames>` arms a one-shot surface capture this many
+/// frames after the first video quad is presented (path from
+/// `KRKR_CAPTURE_PATH`, default `/tmp/krkr_capture.png`).
+fn capture_video_delay() -> Option<u64> {
+    std::env::var("KRKR_CAPTURE_VIDEO").ok()?.parse().ok()
+}
+
+/// Extracts the `texture=N` id out of a `VideoOverlay: presenting (...)` log
+/// line so the desktop app can capture that exact texture from the renderer.
+fn parse_presenting_texture_id(line: &str) -> Option<u64> {
+    let start = line.find("texture=")? + "texture=".len();
+    let end = line[start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|offset| start + offset)?;
+    line[start..end].parse().ok()
 }
 
 fn log_info(message: &str) {

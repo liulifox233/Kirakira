@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -65,6 +66,13 @@ pub struct Renderer {
     physical_size: PhysicalSize<u32>,
     scale_factor: f64,
     content_size: Option<Size>,
+    /// One-shot surface capture target set through `capture_next_frame`.
+    capture_path: Option<PathBuf>,
+    /// One-shot per-texture capture target set through `capture_texture_next_frame`.
+    capture_texture: Option<(TextureId, PathBuf)>,
+    /// Whether capture support is enabled (adds COPY_SRC usage to surfaces and
+    /// uploaded textures). Enabled via the KRKR_CAPTURE_* environment variables.
+    capture_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,8 +142,16 @@ impl Renderer {
             capabilities.present_modes[0]
         };
         let alpha_mode = capabilities.alpha_modes[0];
+        // Surface capture (KRKR_CAPTURE_FRAME at the desktop app) copies the
+        // presented texture for headless render diagnostics.
+        let capture_enabled = std::env::var_os("KRKR_CAPTURE_FRAME").is_some()
+            || std::env::var_os("KRKR_CAPTURE_VIDEO").is_some();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if capture_enabled {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format,
             width: physical_size.width.max(1),
             height: physical_size.height.max(1),
@@ -165,7 +181,22 @@ impl Renderer {
             physical_size,
             scale_factor,
             content_size: None,
+            capture_path: None,
+            capture_texture: None,
+            capture_enabled,
         })
+    }
+
+    /// Arms a one-shot capture of the next presented frame into a PNG file.
+    pub fn capture_next_frame(&mut self, path: impl Into<PathBuf>) {
+        self.capture_path = Some(path.into());
+    }
+
+    /// Arms a one-shot capture of a specific uploaded texture (as currently
+    /// cached) into a PNG file on the next rendered frame. Used together with
+    /// `capture_next_frame` to tell upload-path faults from draw-path faults.
+    pub fn capture_texture_next_frame(&mut self, texture_id: TextureId, path: impl Into<PathBuf>) {
+        self.capture_texture = Some((texture_id, path.into()));
     }
 
     pub fn resize(&mut self, physical_size: PhysicalSize<u32>, scale_factor: f64) {
@@ -275,9 +306,138 @@ impl Renderer {
             );
         }
 
+        let capture_path = self.capture_path.take();
+        let capture_buffer = capture_path.as_ref().map(|_| {
+            let padded_bytes_per_row = padded_capture_row_bytes(self.config.width);
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Kirakira surface capture buffer"),
+                size: u64::from(padded_bytes_per_row) * u64::from(self.config.height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+        if let Some(buffer) = &capture_buffer {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &surface_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_capture_row_bytes(self.config.width)),
+                        rows_per_image: Some(self.config.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let capture_texture = self.capture_texture.take();
+        let capture_texture_buffer = capture_texture
+            .as_ref()
+            .and_then(|(texture_id, _)| self.textures.get(texture_id))
+            .map(|cached| {
+                let padded_bytes_per_row = padded_capture_row_bytes(cached.width);
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Kirakira texture capture buffer"),
+                    size: u64::from(padded_bytes_per_row) * u64::from(cached.height),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &cached._texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(padded_bytes_per_row),
+                            rows_per_image: Some(cached.height),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: cached.width,
+                        height: cached.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                (buffer, cached.width, cached.height)
+            });
         self.queue.submit(Some(encoder.finish()));
+        if let (Some(path), Some(buffer)) = (capture_path, capture_buffer)
+            && let Err(error) = self.save_capture_buffer(
+                &buffer,
+                &path,
+                self.config.width,
+                self.config.height,
+                matches!(
+                    self.config.format,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+                ),
+            )
+        {
+            eprintln!("[krkr-render][warn] surface capture failed: {error}");
+        }
+        if let (Some((_, path)), Some((buffer, width, height))) =
+            (capture_texture, capture_texture_buffer)
+        {
+            // Uploaded textures are Rgba8UnormSrgb, so no BGRA swap.
+            if let Err(error) = self.save_capture_buffer(&buffer, &path, width, height, false) {
+                eprintln!("[krkr-render][warn] texture capture failed: {error}");
+            }
+        }
         surface_texture.present();
         Ok(())
+    }
+
+    fn save_capture_buffer(
+        &self,
+        buffer: &wgpu::Buffer,
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        bgra: bool,
+    ) -> Result<(), String> {
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| error.to_string())?;
+        rx.recv()
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let padded_bytes_per_row = padded_capture_row_bytes(width);
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        {
+            let mapped = slice.get_mapped_range();
+            for row in 0..height {
+                let start = (row * padded_bytes_per_row) as usize;
+                let row_data = &mapped[start..start + (width * 4) as usize];
+                if bgra {
+                    for pixel in row_data.chunks_exact(4) {
+                        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                    }
+                } else {
+                    rgba.extend_from_slice(row_data);
+                }
+            }
+        }
+        buffer.unmap();
+        write_capture_png(path, width, height, &rgba).map_err(|error| error.to_string())
     }
 
     fn prepare_frame(&mut self, frame: &FrameOutput) -> FrameOutput {
@@ -377,7 +537,13 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: if self.capture_enabled {
+                    wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC
+                } else {
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+                },
                 view_formats: &[],
             });
             self.queue.write_texture(
@@ -420,6 +586,8 @@ impl Renderer {
                     _texture: texture,
                     _view: view,
                     bind_group,
+                    width: upload.width,
+                    height: upload.height,
                 },
             );
         }
@@ -1022,6 +1190,8 @@ struct CachedTexture {
     _texture: wgpu::Texture,
     _view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
 }
 
 struct OffscreenTarget {
@@ -1169,4 +1339,76 @@ impl TexturedVertex {
             attributes: &Self::ATTRIBUTES,
         }
     }
+}
+
+fn padded_capture_row_bytes(width: u32) -> u32 {
+    (width * 4).div_ceil(256) * 256
+}
+
+fn write_capture_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> std::io::Result<()> {
+    let mut raw = Vec::with_capacity((width * height * 4 + height) as usize);
+    for row in rgba.chunks_exact((width * 4) as usize) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    // zlib stream with stored (uncompressed) deflate blocks.
+    let mut zdata = vec![0x78, 0x01];
+    let mut chunks = raw.chunks(65535).peekable();
+    while let Some(chunk) = chunks.next() {
+        let last = chunks.peek().is_none();
+        zdata.push(u8::from(last));
+        zdata.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        zdata.extend_from_slice(&(!(chunk.len() as u16)).to_le_bytes());
+        zdata.extend_from_slice(chunk);
+    }
+    zdata.extend_from_slice(&capture_adler32(&raw).to_be_bytes());
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    write_capture_png_chunk(&mut png, b"IHDR", &ihdr);
+    write_capture_png_chunk(&mut png, b"IDAT", &zdata);
+    write_capture_png_chunk(&mut png, b"IEND", &[]);
+    std::fs::write(path, png)
+}
+
+fn write_capture_png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    png.extend_from_slice(kind);
+    png.extend_from_slice(data);
+    png.extend_from_slice(&capture_crc32(kind, data).to_be_bytes());
+}
+
+fn capture_crc32(kind: &[u8], data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in kind.iter().chain(data) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn capture_adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for byte in data {
+        a = (a + u32::from(*byte)) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
 }
