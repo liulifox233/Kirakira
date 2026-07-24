@@ -552,9 +552,12 @@ fn main() {
 
 fn dump_logs(engine: &KrkrEngine) {
     let logs = engine.host().logs();
-    let start = logs.len().saturating_sub(500);
-    println!("---host logs (last {})---", logs.len() - start);
-    for line in &logs[start..] {
+    let filtered: Vec<&String> = logs
+        .iter()
+        .filter(|line| !line.contains("is registered as a runtime stub"))
+        .collect();
+    println!("---host logs ({} of {})---", filtered.len(), logs.len());
+    for line in filtered {
         println!("log: {line}");
     }
 }
@@ -580,6 +583,7 @@ fn queue_virtual_audio_completions(
     for command in commands {
         match command {
             AudioCommand::Play { id, looping, .. } if !looping => pending_stops.push(*id),
+            AudioCommand::PlayPcmStream { id, .. } => pending_stops.push(*id),
             AudioCommand::Stop { id, .. } => pending_stops.push(*id),
             _ => {}
         }
