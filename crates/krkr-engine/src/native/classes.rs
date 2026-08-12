@@ -16,7 +16,7 @@ use krkr_tjs2::{
 
 use crate::host::{
     CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KagLayerSlot, KrkrHost,
-    LayerRenderTarget, NativeTransitionCompletion,
+    LayerRenderTarget, NativeTransitionCompletion, TraceCategory,
 };
 use crate::scheduler::AsyncTriggerMode;
 
@@ -1763,6 +1763,15 @@ fn wave_sound_buffer_open(
     runtime
         .host_mut()
         .open_native_audio_storage(this, storage)?;
+    let opened_storage = runtime
+        .host()
+        .native_audio_buffer(this)
+        .and_then(|buffer| buffer.storage.clone())
+        .unwrap_or_default();
+    runtime.host_mut().trace(
+        TraceCategory::Audio,
+        &format!("WaveSoundBuffer.open: {opened_storage}"),
+    );
     runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
     runtime.set_object_member(this, "position", Variant::Integer(0));
     runtime.set_object_member(this, "samplePosition", Variant::Integer(0));
@@ -1785,6 +1794,15 @@ fn wave_sound_buffer_play(
     } else {
         AudioBus::SoundEffect
     };
+    let play_storage = runtime
+        .host()
+        .native_audio_buffer(this)
+        .and_then(|buffer| buffer.storage.clone())
+        .unwrap_or_else(|| "<unopened>".to_string());
+    runtime.host_mut().trace(
+        TraceCategory::Audio,
+        &format!("WaveSoundBuffer.play: {play_storage} bus={bus:?}"),
+    );
     runtime
         .host_mut()
         .queue_native_audio_play(this, bus, AudioLoadPolicy::Auto)?;
@@ -1800,6 +1818,15 @@ fn wave_sound_buffer_stop(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.stop")?;
+    let stop_storage = runtime
+        .host()
+        .native_audio_buffer(this)
+        .and_then(|buffer| buffer.storage.clone())
+        .unwrap_or_else(|| "<unopened>".to_string());
+    runtime.host_mut().trace(
+        TraceCategory::Audio,
+        &format!("WaveSoundBuffer.stop: {stop_storage}"),
+    );
     runtime.host_mut().cancel_audio_fade_completion(this);
     if let Some(id) = runtime
         .host()
@@ -1871,6 +1898,15 @@ fn wave_sound_buffer_fade(
     };
     set_wave_property_storage(runtime, this, "volume", Variant::Integer(target));
     let fade_seconds = millis as f32 / 1000.0;
+    let fade_storage = runtime
+        .host()
+        .native_audio_buffer(this)
+        .and_then(|buffer| buffer.storage.clone())
+        .unwrap_or_else(|| "<unopened>".to_string());
+    runtime.host_mut().trace(
+        TraceCategory::Audio,
+        &format!("WaveSoundBuffer.fade: {fade_storage} target={target} millis={millis}"),
+    );
     runtime
         .host_mut()
         .set_native_audio_volume_with_fade(this, target, fade_seconds);

@@ -48,13 +48,48 @@ fn register_stub_method(
         method,
         move |runtime: &mut Runtime<KrkrHost>,
               _this_obj: Option<ObjectHandle>,
-              _args: Vec<Variant>| {
-            runtime.host_mut().log(&format!(
-                "{class_name}.{method} is registered as a runtime stub"
-            ));
+              args: Vec<Variant>| {
+            let summary = summarize_stub_args(&args);
+            runtime
+                .host_mut()
+                .record_stub_call(class_name, method, &summary);
             Ok(Variant::Void)
         },
     );
+}
+
+/// Short human-readable summary of stub call arguments for the first-call
+/// warning — storage names are the most useful clue when deciding which
+/// stub a game actually depends on.
+fn summarize_stub_args(args: &[Variant]) -> String {
+    const MAX_ARGS: usize = 3;
+    const MAX_STRING_CHARS: usize = 60;
+    let mut parts: Vec<String> = args
+        .iter()
+        .take(MAX_ARGS)
+        .map(|arg| match arg {
+            Variant::String(text) => {
+                if text.chars().count() > MAX_STRING_CHARS {
+                    let head: String = text.chars().take(MAX_STRING_CHARS).collect();
+                    format!("\"{head}...\"")
+                } else {
+                    format!("\"{text}\"")
+                }
+            }
+            Variant::Integer(value) => value.to_string(),
+            Variant::Real(value) => value.to_string(),
+            Variant::Null => "null".to_string(),
+            Variant::Void => "void".to_string(),
+            Variant::Octet(bytes) => format!("<octet {}B>", bytes.len()),
+            Variant::Object(_) => "<object>".to_string(),
+            Variant::Closure(_) => "<closure>".to_string(),
+            Variant::CodeObject(_) => "<code>".to_string(),
+        })
+        .collect();
+    if args.len() > MAX_ARGS {
+        parts.push("...".to_string());
+    }
+    parts.join(", ")
 }
 
 fn native_void(

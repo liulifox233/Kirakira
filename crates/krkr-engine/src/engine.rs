@@ -19,7 +19,7 @@ use krkr_tjs2::{
 
 use crate::{
     globals::install_tvp_globals,
-    host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost},
+    host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost, TraceCategory},
     kag::{EngineKagHost, tag_to_dictionary},
     native::classes::{
         apply_completed_image_load, apply_completed_resource_loads, call_wave_status_changed,
@@ -2204,6 +2204,10 @@ impl KagSession {
                     Variant::Void
                 )
             {
+                runtime.host_mut().trace(
+                    TraceCategory::Kag,
+                    &format!("kag: tag `{}` -> onUnknownTag", tag.tagname),
+                );
                 let tag_object = tag_to_dictionary(runtime, tag)?;
                 let value = self.call_tag_handler(
                     runtime,
@@ -2264,6 +2268,10 @@ impl KagSession {
         tag: &Tag,
     ) -> Result<TagAction> {
         let Some(native_tag) = NativeFallbackTag::from_name(&tag.tagname) else {
+            runtime.host_mut().trace(
+                TraceCategory::Kag,
+                &format!("kag: no handler for tag `{}`, ignored", tag.tagname),
+            );
             return Ok(TagAction::Continue);
         };
         match native_tag {
@@ -2463,6 +2471,9 @@ impl KagSession {
             NativeFallbackTag::StopBgm => {
                 runtime
                     .host_mut()
+                    .trace(TraceCategory::Audio, "kag audio stop: bus=Bgm");
+                runtime
+                    .host_mut()
                     .queue_audio_command(AudioCommand::StopBus {
                         bus: AudioBus::Bgm,
                         fade_seconds: tag_millis(tag, "time")
@@ -2472,6 +2483,9 @@ impl KagSession {
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::StopSe | NativeFallbackTag::StopVoice => {
+                runtime
+                    .host_mut()
+                    .trace(TraceCategory::Audio, "kag audio stop: bus=SoundEffect");
                 runtime
                     .host_mut()
                     .queue_audio_command(AudioCommand::StopBus {
@@ -2976,6 +2990,10 @@ fn play_kag_audio_tag(
     let volume = tag_i64(tag, "volume")?
         .map(|value| (value as f32 / 100.0).clamp(0.0, 1.0))
         .unwrap_or(1.0);
+    runtime.host_mut().trace(
+        TraceCategory::Audio,
+        &format!("kag audio play: storage={storage} bus={bus:?} looping={looping}"),
+    );
     runtime
         .host_mut()
         .queue_kag_audio_play(storage, bus, load_policy, looping, volume)?;
