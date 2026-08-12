@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use super::mir::{
     ArgList, ArgPart, ArrayElement, BinaryOp, CallTarget, CompareOp, Condition, ContextType,
@@ -1107,7 +1108,96 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
     }
 
     fn patch_branches(&mut self) -> Result<()> {
-        for patch in &self.patches {
+        // Branch relaxation: the VM's jump operands are i16-relative, so an
+        // out-of-range branch routes through a ladder of `jmp` veneers
+        // placed at 30000-word intervals between the branch and its target.
+        // Insertions shift every recorded offset, so the ladder is rebuilt
+        // until no branch needs one (bounded: each round only adds veneers
+        // for still-unreachable targets).
+        let mut chained: BTreeSet<usize> = BTreeSet::new();
+        for _round in 0..8 {
+            let mut chains: Vec<(usize, Vec<usize>)> = Vec::new();
+            for (index, patch) in self.patches.iter().enumerate() {
+                let target = *self
+                    .block_offsets
+                    .get(&patch.target)
+                    .ok_or_else(|| {
+                        TjsError::codegen(format!("missing block {}", patch.target.0))
+                    })?;
+                let delta = target as isize - patch.inst_offset as isize;
+                if i16::try_from(delta).is_ok() {
+                    continue;
+                }
+                let direction: isize = if delta > 0 { 1 } else { -1 };
+                let mut hops = Vec::new();
+                let mut pos = patch.inst_offset as isize;
+                let mut remaining = delta.unsigned_abs();
+                while remaining > 30000 {
+                    pos += direction * 30000;
+                    hops.push(pos as usize);
+                    remaining -= 30000;
+                }
+                chained.insert(index);
+                chains.push((index, hops));
+            }
+            if chains.is_empty() {
+                break;
+            }
+            // Insert every veneer (`jmp` + operand) in descending position
+            // order so earlier indices stay valid.
+            let mut positions: Vec<usize> = chains
+                .iter()
+                .flat_map(|(_, hops)| hops.iter().copied())
+                .collect();
+            positions.sort_unstable();
+            positions.dedup();
+            for &pos in positions.iter().rev() {
+                self.code.splice(pos..pos, [17i16, 0]);
+            }
+            // Shift every recorded offset by the veneer words inserted
+            // before it.
+            let shift_at = |pos: usize| -> usize { 2 * positions.partition_point(|&v| v < pos) };
+            for (_, offset) in self.block_offsets.iter_mut() {
+                *offset += shift_at(*offset);
+            }
+            for patch in &mut self.patches {
+                patch.inst_offset += shift_at(patch.inst_offset);
+                patch.operand_offset += shift_at(patch.operand_offset);
+            }
+            for position in &mut self.source_positions {
+                position.code_pos += shift_at(position.code_pos as usize) as u32;
+            }
+            for (_, hops) in &mut chains {
+                for hop in hops {
+                    *hop += shift_at(*hop);
+                }
+            }
+            // Write the veneer operands (each hop jumps to the next hop,
+            // the last one to the target) and redirect the branch to its
+            // first hop.
+            for (patch_index, hops) in &chains {
+                let patch = &self.patches[*patch_index];
+                let target = *self.block_offsets.get(&patch.target).ok_or_else(|| {
+                    TjsError::codegen(format!("missing block {}", patch.target.0))
+                })?;
+                for (i, &hop) in hops.iter().enumerate() {
+                    let next = hops.get(i + 1).copied().unwrap_or(target);
+                    let hop_delta = next as isize - hop as isize;
+                    self.code[hop + 1] = i16::try_from(hop_delta)
+                        .map_err(|_| TjsError::codegen("veneer offset does not fit i16"))?;
+                }
+                let first = hops[0];
+                let branch_delta = first as isize - patch.inst_offset as isize;
+                self.code[patch.operand_offset] = i16::try_from(branch_delta)
+                    .map_err(|_| TjsError::codegen("branch offset does not fit i16"))?;
+            }
+        }
+        // Final pass: write the remaining direct branch operands (branches
+        // routed through veneers already point at their first hop).
+        for (index, patch) in self.patches.iter().enumerate() {
+            if chained.contains(&index) {
+                continue;
+            }
             let target = *self
                 .block_offsets
                 .get(&patch.target)

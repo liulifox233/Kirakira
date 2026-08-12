@@ -157,6 +157,27 @@ mod tests {
     }
 
     #[test]
+    fn codegen_relaxes_out_of_range_branches_with_veneers() {
+        // A branch spanning more than the VM's i16-relative range must be
+        // routed through jmp veneers and still execute correctly.
+        let mut source = String::from("if (x) { return 1; }\n");
+        for index in 0..4000 {
+            source.push_str(&format!("x = x + {index};\n"));
+        }
+        source.push_str("return x;\n");
+        let file = compile_source_to_bytecode("big_function.tjs", &source).expect("compile");
+        // The `jf` from the top to the function end crosses the whole body
+        // (~36K words), forcing veneer insertion; the executed result must
+        // match direct compilation semantics.
+        let result = crate::runtime::Runtime::new()
+            .execute_file(&file)
+            .expect("execute");
+        // x is undefined (0), so the if is skipped and all 4000 additions
+        // run: sum(0..4000) = 4000 * 3999 / 2.
+        assert_eq!(result, Variant::Integer(7_998_000));
+    }
+
+    #[test]
     fn execute_source_builds_and_indexes_array() {
         assert_eq!(
             execute_source("inline.tjs", "var a = [1, 4, 9]; return a[1];").expect("execute"),
