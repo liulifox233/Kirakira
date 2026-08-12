@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/debugger",
+    "apps/decomp",
     "apps/desktop",
     "apps/disasm",
     "apps/terminal",

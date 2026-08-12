@@ -1148,6 +1148,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-decomp"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "krkr-tjs2",
+ "krkr-xp3",
+]
+
+[[package]]
 name = "krkr-desktop"
 version = "0.1.0"
 dependencies = [

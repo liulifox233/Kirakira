@@ -181,14 +181,14 @@ fn decode_call_instruction(code_words: &[i16], offset: usize, opcode: u8) -> Res
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BinaryForm {
+pub(crate) enum BinaryForm {
     Slot,
     DirectProperty,
     IndirectProperty,
     DefaultProperty,
 }
 
-pub(super) fn binary_form(opcode: u8) -> BinaryForm {
+pub(crate) fn binary_form(opcode: u8) -> BinaryForm {
     match (opcode - 26) % 4 {
         0 => BinaryForm::Slot,
         1 => BinaryForm::DirectProperty,
