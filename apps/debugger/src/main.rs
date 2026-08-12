@@ -33,6 +33,8 @@
 //!   --dump-layer-images <dir>
 //!                           write one PNG per layer image at the end
 //!   --logs                  dump host logs at the end
+//!   --trace <cats>          enable trace categories: audio,kag or all
+//!                           (same syntax as the KRKR_TRACE env var)
 //!   --timed-transitions     keep timed transitions (default: immediate)
 //!   --time-scale <f>        virtual clock multiplier (default 1.0)
 //!   --realtime              sleep per frame instead of fast-forwarding
@@ -97,6 +99,7 @@ struct Config {
     time_scale: f64,
     realtime: bool,
     virtual_audio: bool,
+    trace: Option<String>,
     max_frames: usize,
 }
 
@@ -186,6 +189,7 @@ fn parse_args() -> Config {
             }
             "--realtime" => config.realtime = true,
             "--virtual-audio" => config.virtual_audio = true,
+            "--trace" => config.trace = Some(next_arg(&mut args, "--trace")),
             "--max-frames" => {
                 config.max_frames = next_arg(&mut args, "--max-frames")
                     .parse()
@@ -214,6 +218,9 @@ fn main() {
         .expect("usage: krkr-debug <game_dir> [-b spec]... [options]");
 
     let mut engine = KrkrEngine::for_project(&root).expect("engine");
+    if let Some(categories) = &config.trace {
+        engine.host_mut().set_trace_categories(categories);
+    }
     if !config.timed_transitions {
         engine
             .host_mut()
@@ -252,11 +259,13 @@ fn main() {
         Ok(startup) => println!("startup=ok {startup}"),
         Err(error) if error.is_debug_quit() => {
             println!("debug session terminated during startup");
+            dump_stub_calls(&engine);
             return;
         }
         Err(error) => {
             println!("startup=error\n{error}\n---debug---\n{error:?}");
             dump_logs(&engine);
+            dump_stub_calls(&engine);
             std::process::exit(1);
         }
     }
@@ -417,11 +426,13 @@ fn main() {
             }
             Err(error) if error.is_debug_quit() => {
                 println!("debug session terminated at frame={frame_index}");
+                dump_stub_calls(&engine);
                 return;
             }
             Err(error) => {
                 println!("frame={frame_index} error\n{error}\n---debug---\n{error:?}");
                 dump_logs(&engine);
+                dump_stub_calls(&engine);
                 std::process::exit(1);
             }
         }
@@ -439,6 +450,7 @@ fn main() {
     if config.logs {
         dump_logs(&engine);
     }
+    dump_stub_calls(&engine);
     if config.layers {
         println!("---layers---");
         for layer in engine.host().layer_tree().layers() {
@@ -552,13 +564,25 @@ fn main() {
 
 fn dump_logs(engine: &KrkrEngine) {
     let logs = engine.host().logs();
-    let filtered: Vec<&String> = logs
-        .iter()
-        .filter(|line| !line.contains("is registered as a runtime stub"))
-        .collect();
-    println!("---host logs ({} of {})---", filtered.len(), logs.len());
-    for line in filtered {
+    println!("---host logs ({})---", logs.len());
+    for line in logs {
         println!("log: {line}");
+    }
+}
+
+/// Prints how often each stubbed native method was actually invoked —
+/// the strongest signal for what a game depends on that we have not
+/// implemented yet.
+fn dump_stub_calls(engine: &KrkrEngine) {
+    let counts = engine.host().stub_call_counts();
+    if counts.is_empty() {
+        return;
+    }
+    let mut entries: Vec<(&String, &u64)> = counts.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    println!("---stub calls ({})---", entries.len());
+    for (name, count) in entries {
+        println!("stub: {name} x{count}");
     }
 }
 

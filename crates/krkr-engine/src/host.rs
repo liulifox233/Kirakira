@@ -30,6 +30,65 @@ use crate::{
 const IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
 
+/// Bounds the in-memory host log; long headless runs with trace categories
+/// enabled would otherwise grow it without limit. When the cap is hit the
+/// oldest half is dropped in one drain.
+const MAX_LOG_LINES: usize = 200_000;
+
+/// High-frequency diagnostic categories, enabled through the `KRKR_TRACE`
+/// environment variable (comma-separated, case-insensitive; `all` enables
+/// everything). Trace lines are tagged `[<category>]` in the host log.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TraceCategory {
+    /// WaveSoundBuffer and KAG audio lifecycle (open/play/stop/fade).
+    Audio,
+    /// KAG tag dispatch (unknown-tag routing, unhandled tags).
+    Kag,
+}
+
+impl TraceCategory {
+    fn bit(self) -> u8 {
+        match self {
+            TraceCategory::Audio => TRACE_AUDIO,
+            TraceCategory::Kag => TRACE_KAG,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            TraceCategory::Audio => "audio",
+            TraceCategory::Kag => "kag",
+        }
+    }
+}
+
+const TRACE_AUDIO: u8 = 1 << 0;
+const TRACE_KAG: u8 = 1 << 1;
+const TRACE_ALL: u8 = TRACE_AUDIO | TRACE_KAG;
+
+/// Parses a `KRKR_TRACE`-style category list; unknown names are ignored.
+fn parse_trace_mask(value: &str) -> u8 {
+    let mut mask = 0;
+    for name in value.split(',').map(str::trim) {
+        if name.is_empty() {
+            continue;
+        }
+        mask |= match name.to_ascii_lowercase().as_str() {
+            "all" => TRACE_ALL,
+            "audio" => TRACE_AUDIO,
+            "kag" => TRACE_KAG,
+            _ => continue,
+        };
+    }
+    mask
+}
+
+fn trace_mask_from_env() -> u8 {
+    std::env::var("KRKR_TRACE")
+        .map(|value| parse_trace_mask(&value))
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TransitionPolicy {
     #[default]
@@ -179,6 +238,9 @@ pub struct KrkrHost {
     resource_manager: Option<ResourceManager>,
     auto_paths: Vec<String>,
     logs: Vec<String>,
+    trace_mask: u8,
+    /// Invocation counts of stubbed native methods, keyed `Class.method`.
+    stub_calls: BTreeMap<String, u64>,
     linked_plugins: BTreeSet<String>,
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
     kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
@@ -226,6 +288,8 @@ impl Default for KrkrHost {
             resource_manager: None,
             auto_paths: Vec::new(),
             logs: Vec::new(),
+            trace_mask: trace_mask_from_env(),
+            stub_calls: BTreeMap::new(),
             linked_plugins: BTreeSet::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
@@ -283,6 +347,8 @@ impl KrkrHost {
             resource_manager: Some(resource_manager),
             auto_paths: Vec::new(),
             logs: Vec::new(),
+            trace_mask: trace_mask_from_env(),
+            stub_calls: BTreeMap::new(),
             linked_plugins: BTreeSet::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
@@ -561,7 +627,50 @@ impl KrkrHost {
     }
 
     pub fn log(&mut self, message: &str) {
+        if self.logs.len() >= MAX_LOG_LINES {
+            self.logs.drain(..MAX_LOG_LINES / 2);
+        }
         self.logs.push(message.to_string());
+    }
+
+    pub fn trace_enabled(&self, category: TraceCategory) -> bool {
+        self.trace_mask & category.bit() != 0
+    }
+
+    /// Appends a category-tagged diagnostic line when the category is
+    /// enabled (see [`TraceCategory`]). Used for high-frequency lifecycle
+    /// diagnostics that would flood the log if always on.
+    pub fn trace(&mut self, category: TraceCategory, message: &str) {
+        if self.trace_enabled(category) {
+            self.log(&format!("[{}] {message}", category.as_str()));
+        }
+    }
+
+    /// Replaces the trace mask from a `KRKR_TRACE`-style category list.
+    pub fn set_trace_categories(&mut self, categories: &str) {
+        self.trace_mask = parse_trace_mask(categories);
+    }
+
+    /// Records one invocation of a stubbed native method. The first call to
+    /// each stub is logged as a warning — a game actively calling an
+    /// unimplemented method is the strongest compatibility signal there
+    /// is; later calls only bump the counter (see [`Self::stub_call_counts`]).
+    pub(crate) fn record_stub_call(&mut self, class_name: &str, method: &str, args_summary: &str) {
+        let count = self
+            .stub_calls
+            .entry(format!("{class_name}.{method}"))
+            .or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            self.log(&format!(
+                "WARN stub method called: {class_name}.{method}({args_summary})"
+            ));
+        }
+    }
+
+    /// Invocation counts of stubbed native methods, keyed `Class.method`.
+    pub fn stub_call_counts(&self) -> &BTreeMap<String, u64> {
+        &self.stub_calls
     }
 
     pub fn layer_tree(&self) -> &LayerTree {
@@ -2426,6 +2535,64 @@ mod tests {
         let before = host.now_millis();
         host.advance_clock(Duration::from_millis(250));
         assert!(host.now_millis() >= before.saturating_add(250));
+    }
+
+    #[test]
+    fn trace_categories_gate_trace_lines() {
+        let mut host = KrkrHost::default();
+        host.set_trace_categories("audio, kag");
+        assert!(host.trace_enabled(TraceCategory::Audio));
+        assert!(host.trace_enabled(TraceCategory::Kag));
+        host.trace(TraceCategory::Audio, "open bgm002.ogg");
+        host.trace(TraceCategory::Kag, "tag `playbgm`");
+        assert_eq!(
+            host.logs(),
+            &[
+                "[audio] open bgm002.ogg".to_string(),
+                "[kag] tag `playbgm`".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_all_enables_every_category_case_insensitively() {
+        let mut host = KrkrHost::default();
+        host.set_trace_categories("ALL");
+        assert!(host.trace_enabled(TraceCategory::Audio));
+        assert!(host.trace_enabled(TraceCategory::Kag));
+    }
+
+    #[test]
+    fn first_stub_call_warns_and_later_calls_only_count() {
+        let mut host = KrkrHost::default();
+        host.record_stub_call("VideoOverlay", "open", "\"op.wmv\"");
+        host.record_stub_call("VideoOverlay", "open", "\"ed.wmv\"");
+        host.record_stub_call("System", "shellExecute", "");
+        assert_eq!(host.stub_call_counts().get("VideoOverlay.open"), Some(&2));
+        assert_eq!(host.stub_call_counts().get("System.shellExecute"), Some(&1));
+        let warnings = host
+            .logs()
+            .iter()
+            .filter(|line| line.starts_with("WARN stub method called:"))
+            .count();
+        assert_eq!(warnings, 2);
+        assert!(
+            host.logs()
+                .iter()
+                .any(|line| line.contains("VideoOverlay.open(\"op.wmv\")"))
+        );
+    }
+
+    #[test]
+    fn log_cap_drops_oldest_half() {
+        let mut host = KrkrHost::default();
+        for index in 0..MAX_LOG_LINES {
+            host.log(&format!("line {index}"));
+        }
+        host.log("overflow");
+        assert_eq!(host.logs().len(), MAX_LOG_LINES / 2 + 1);
+        assert_eq!(host.logs()[0], format!("line {}", MAX_LOG_LINES / 2));
+        assert_eq!(host.logs().last().unwrap(), "overflow");
     }
 
     #[test]
