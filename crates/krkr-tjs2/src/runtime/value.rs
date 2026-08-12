@@ -120,7 +120,17 @@ impl Variant {
             Self::Real(value) => real_to_string(*value),
             Self::String(value) => value.clone(),
             Self::Octet(value) => value.iter().map(|byte| format!("{byte:02x}")).collect(),
-            Self::Object(_) | Self::Closure(_) | Self::CodeObject(_) => "[object]".to_string(),
+            // krkrz TJSObjectToString renders objects by identity
+            // ("(object 0x<obj>:0x<objthis>)"), so distinct objects must never
+            // collapse to one shared string. The handle index plays the role of
+            // the official object pointer.
+            Self::Object(handle) => format!("(object 0x{:x}:0x0)", handle.0),
+            Self::Closure(closure) => format!(
+                "(object 0x{:x}:0x{:x})",
+                closure.object.0,
+                closure.this_obj.map(|this| this.0).unwrap_or(0)
+            ),
+            Self::CodeObject(index) => format!("(object 0x{:x}:0x0)", index),
         })
     }
 
