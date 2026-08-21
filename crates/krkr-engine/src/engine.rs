@@ -12432,7 +12432,9 @@ mod tests {
                 "#,
             )
             .expect("script");
-        assert_eq!(result, Variant::String("0:128:512".to_string()));
+        // `sampleValue` is a real in the official getSample plugin, and
+        // official TJS2 renders positive zero as `+0.0`.
+        assert_eq!(result, Variant::String("+0.0:128:512".to_string()));
     }
 
     #[test]
