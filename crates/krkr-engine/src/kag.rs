@@ -265,19 +265,17 @@ fn fill_attributes_dictionary(
     }
 }
 
+/// Official KAGParser stores every attribute value as a plain string (ttstr):
+/// `EntryParam` ends in `ValueVariant = value`, a bare `[tag attr]` becomes the
+/// *string* `"true"`, and even the `[r]` it synthesises at end of line carries
+/// `eol` as `tTJSVariant(TJS_W("true"))`. Converting `true`/`false`/`yes`/`no`
+/// to integers here would break `tag.attr == "true"` comparisons that games
+/// rely on. Handlers coerce for themselves with `+elm.attr`, which works
+/// because TJS's own string-to-number parser maps `"true"` to 1 — see
+/// `Variant::to_integer`.
 fn attribute_value_to_variant(value: &AttributeValue) -> Variant {
     match value {
         AttributeValue::Void => Variant::Void,
-        value => raw_attribute_value_to_variant(value.raw()),
-    }
-}
-
-fn raw_attribute_value_to_variant(value: &str) -> Variant {
-    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
-        Variant::Integer(1)
-    } else if value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("no") {
-        Variant::Integer(0)
-    } else {
-        Variant::String(value.to_string())
+        value => Variant::String(value.raw().to_string()),
     }
 }

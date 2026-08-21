@@ -13163,7 +13163,9 @@ mod tests {
                 "#,
             )
             .expect("script");
-        assert_eq!(value, Variant::String("ch:A:r:1".to_string()));
+        // Official KAGParser keeps attribute values strings, and the `[r]`
+        // it synthesises at end of line carries `eol` as the string "true".
+        assert_eq!(value, Variant::String("ch:A:r:true".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
