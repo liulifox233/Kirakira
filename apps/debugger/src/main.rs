@@ -24,6 +24,15 @@
 //!   --click <n,x,y>         inject a click at (x, y) on frame n, release on
 //!                           frame n+1 (repeatable)
 //!   --auto-click            automatically confirm [l]/[p] click waits
+//!   --kag-state             log semantic KAG state transitions: the game's
+//!                           own `kag` object (storage/label/line/conductor
+//!                           status/wait keys), unlike `kag=` in the frame
+//!                           log which reflects the engine-side session
+//!   --kag-click <frame>     semantic click on frame n (repeatable): wake the
+//!                           conductor when it waits for a click, or create
+//!                           the click wait a `[s]` handler left unset and
+//!                           wake it — equivalent to a player's primary click
+//!                           and a no-op when the game is not waiting
 //!   --expr <expr>           evaluate a TJS expression after the frame loop
 //!   --shot <path>           write a composited screenshot PNG
 //!   --shot-frame <n>        capture draw commands at frame n (default last)
@@ -74,7 +83,7 @@ use krkr_engine::{
     EngineConfig, EngineInput, KagTaskState, KrkrEngine, RuntimeSession, SystemPaths,
     TransitionPolicy,
 };
-use krkr_tjs2::runtime::Variant;
+use krkr_tjs2::runtime::{ObjectHandle, Variant};
 use snapshot::TextureCache;
 
 use crate::cli::{BreakpointSpec, CliDebugger, parse_breakpoint_spec};
@@ -92,6 +101,8 @@ struct Config {
     at_frames: Vec<(usize, Option<String>)>,
     clicks: Vec<(usize, Point)>,
     auto_click: bool,
+    kag_clicks: Vec<usize>,
+    kag_state: bool,
     expr: Option<String>,
     shot: Option<String>,
     shot_frame: Option<usize>,
@@ -162,6 +173,14 @@ fn parse_args() -> Config {
                 ));
             }
             "--auto-click" => config.auto_click = true,
+            "--kag-click" => {
+                config.kag_clicks.push(
+                    next_arg(&mut args, "--kag-click")
+                        .parse()
+                        .expect("--kag-click must be a frame index"),
+                );
+            }
+            "--kag-state" => config.kag_state = true,
             "--expr" => config.expr = Some(next_arg(&mut args, "--expr")),
             "--shot" => config.shot = Some(next_arg(&mut args, "--shot")),
             "--shot-frame" => {
@@ -214,6 +233,104 @@ fn parse_args() -> Config {
         );
     }
     config
+}
+
+/// Semantic click: the accessibility-style way to advance the game, defined
+/// in game terms instead of screen coordinates. Wakes the conductor when it
+/// already waits for a click, or — when the `[s]` handler has put the game to
+/// sleep without establishing a click wait — creates the wait the game's
+/// `waitClick` would normally build and then wakes it. Both paths are exactly
+/// what a player's primary click triggers in the official engine; when the
+/// game is not waiting the script is a no-op.
+const KAG_CLICK_SOURCE: &str = r#"
+(function() {
+    var k = global.kag;
+    if (typeof k != "Object") return "no-kag";
+    var c = typeof k.conductor == "Object" ? k.conductor : void;
+    var stor = typeof k.currentStorage == "String" ? k.currentStorage : "-";
+    var line = c != void ? c.curLine : -1;
+    if (c != void && c.status == c.mWait) {
+        c.trigger("click");
+        return "wake " + stor + ":" + line;
+    }
+    if (k.inSleep) {
+        // KAG3's waitClick(elm) ignores elm, but pass a dictionary so a
+        // KAGEX override that reads elm members cannot throw on a string.
+        if (k.waitClick != void) k.waitClick(%[]);
+        if (c != void && c.status == c.mWait) {
+            c.trigger("click");
+            return "wake-sleep " + stor + ":" + line;
+        }
+        return "sleep-no-wait " + stor + ":" + line;
+    }
+    return "not-waiting " + stor + ":" + line;
+})()
+"#;
+
+/// Reads the game's own KAG layer (`global.kag`, the KAG3/KAGEX object) rather
+/// than the engine-side KAG session. The engine session reports `Finished`
+/// while the game is sitting at its title screen, so this is the state that
+/// reflects what the player actually sees.
+fn semantic_kag_state(engine: &KrkrEngine) -> Option<String> {
+    let runtime = engine.tjs_runtime();
+    let Variant::Object(kag) = runtime.global_member("kag") else {
+        return None;
+    };
+    let member = |object: ObjectHandle, name: &str| runtime.object_member(object, name);
+    let as_int = |object: ObjectHandle, name: &str| match member(object, name) {
+        Variant::Integer(value) => Some(value),
+        _ => None,
+    };
+    let as_string = |object: ObjectHandle, name: &str| match member(object, name) {
+        Variant::String(value) => Some(value),
+        _ => None,
+    };
+    let conductor = match member(kag, "conductor") {
+        Variant::Object(object) => Some(object),
+        _ => None,
+    };
+    let status = conductor
+        .and_then(|object| as_int(object, "status"))
+        .unwrap_or(-1);
+    let line = conductor
+        .and_then(|object| as_int(object, "curLine"))
+        .unwrap_or(-1);
+    let timer_enabled = conductor
+        .and_then(|object| as_int(object, "timerEnabled"))
+        .unwrap_or(-1);
+    let waits: Vec<String> = conductor
+        .and_then(|object| match member(object, "waitUntil") {
+            Variant::Object(wait_until) => Some(wait_until),
+            _ => None,
+        })
+        .map(|wait_until| {
+            runtime
+                .object_members(wait_until)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "{}@{}:{} st={} sleep={} clickwait={} timer={} wait=[{}]",
+        as_string(kag, "currentStorage").unwrap_or_default(),
+        as_string(kag, "currentLabel").unwrap_or_default(),
+        line,
+        status_name(status),
+        as_int(kag, "inSleep").unwrap_or_default(),
+        as_int(kag, "clickWaiting").unwrap_or_default(),
+        timer_enabled,
+        waits.join(","),
+    ))
+}
+
+fn status_name(status: i64) -> String {
+    match status {
+        0 => "stop(0)".to_string(),
+        1 => "run(1)".to_string(),
+        2 => "wait(2)".to_string(),
+        other => format!("{other}"),
+    }
 }
 
 fn main() {
@@ -335,6 +452,7 @@ fn main() {
     let mut textures: TextureCache = TextureCache::new();
     let mut shot_commands: Option<Vec<DrawCommand>> = None;
     let mut pending_audio_stops: Vec<AudioInstanceId> = Vec::new();
+    let mut last_kag_semantic: Option<String> = None;
     for frame_index in 0..config.max_frames {
         for (at_frame, script) in &config.at_frames {
             if *at_frame == frame_index {
@@ -344,6 +462,17 @@ fn main() {
                     .engine_mut()
                     .execute_script("krkr_debug_at_frame.tjs", script)
                     .expect("at-frame script");
+            }
+        }
+        for click_frame in &config.kag_clicks {
+            if frame_index == *click_frame {
+                match runtime
+                    .engine_mut()
+                    .execute_expression("krkr_debug_kag_click.tjs", KAG_CLICK_SOURCE)
+                {
+                    Ok(value) => println!("kag-click frame={frame_index} -> {value}"),
+                    Err(error) => println!("kag-click frame={frame_index} error: {error}"),
+                }
             }
         }
         for id in pending_audio_stops.drain(..) {
@@ -434,6 +563,16 @@ fn main() {
                             runtime.engine().scheduler_diagnostics(),
                             timer_diagnostics
                         );
+                    }
+                }
+                if config.kag_state {
+                    let semantic = semantic_kag_state(runtime.engine());
+                    if semantic != last_kag_semantic {
+                        println!(
+                            "kag-state frame={frame_index} {}",
+                            semantic.as_deref().unwrap_or("-")
+                        );
+                        last_kag_semantic = semantic;
                     }
                 }
                 if config.pixels
@@ -564,6 +703,12 @@ fn main() {
             }
             value => println!("{name}={}", variant_kind(&value)),
         }
+    }
+    if config.kag_state {
+        println!(
+            "kag-state final {}",
+            semantic_kag_state(runtime.engine()).unwrap_or_else(|| "-".to_string())
+        );
     }
     println!("done frames={}", config.max_frames);
     if let Some(dir) = &config.dump_layer_images {
