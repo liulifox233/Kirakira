@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kirakira</title>
+  </head>
+  <body>
+    <canvas id="kirakira-canvas" tabindex="0"></canvas>
+    <script>
+      document.body.dataset.wasm = "./pkg/krkr_web.js";
+      // A staged static publication puts manifest.json beside this shell.
+      // Change this static attribute when the shell is hosted below a
+      // package subdirectory; no query-string path is required at runtime.
+      document.body.dataset.package = "./";
+      // Optional KAG entry point. Static staging fills this from manifest.entry
+      // (or an explicit CLI override) without changing the browser URL.
+      document.body.dataset.scenario = "";
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

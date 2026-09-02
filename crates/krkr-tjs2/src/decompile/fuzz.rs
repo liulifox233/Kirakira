@@ -16,7 +16,9 @@
 use std::collections::BTreeSet;
 
 use crate::error::Span;
-use crate::frontend::syntax::{self, AssignOp, BinaryOp, Expr, ExprKind, Ident, Stmt, StmtKind, UnaryOp};
+use crate::frontend::syntax::{
+    self, AssignOp, BinaryOp, Expr, ExprKind, Ident, Stmt, StmtKind, UnaryOp,
+};
 
 fn sp() -> Span {
     Span::empty(0)
@@ -301,10 +303,7 @@ impl Gen {
                         )),
                         sp(),
                     ),
-                    Stmt::new(
-                        StmtKind::Return(Some(self.expr(4))),
-                        sp(),
-                    ),
+                    Stmt::new(StmtKind::Return(Some(self.expr(4))), sp()),
                 ]),
                 sp(),
             )),
@@ -348,10 +347,7 @@ impl Gen {
                 StmtKind::If {
                     condition: self.expr(depth + 1),
                     then_branch: Box::new(self.block(depth + 1)),
-                    else_branch: self
-                        .rng
-                        .chance(60)
-                        .then(|| Box::new(self.block(depth + 1))),
+                    else_branch: self.rng.chance(60).then(|| Box::new(self.block(depth + 1))),
                 }
             }
             3 => {
@@ -359,10 +355,7 @@ impl Gen {
                 // never assign it, so the loop always terminates).
                 self.in_loop = true;
                 let mut body_stmts = self.statements(depth + 1, 2);
-                body_stmts.push(Stmt::new(
-                    StmtKind::Expr(incr_counter()),
-                    sp(),
-                ));
+                body_stmts.push(Stmt::new(StmtKind::Expr(incr_counter()), sp()));
                 self.in_loop = false;
                 StmtKind::While {
                     condition: counter_lt(2),
@@ -373,10 +366,7 @@ impl Gen {
                 // Bounded do-while.
                 self.in_loop = true;
                 let mut body_stmts = self.statements(depth + 1, 2);
-                body_stmts.push(Stmt::new(
-                    StmtKind::Expr(incr_counter()),
-                    sp(),
-                ));
+                body_stmts.push(Stmt::new(StmtKind::Expr(incr_counter()), sp()));
                 self.in_loop = false;
                 StmtKind::DoWhile {
                     body: Box::new(Stmt::new(StmtKind::Block(body_stmts), sp())),
@@ -421,10 +411,7 @@ impl Gen {
                 for value in 0..=2 {
                     cases.push(syntax::SwitchCase {
                         test: Some(Expr::new(ExprKind::Integer(value), sp())),
-                        body: vec![
-                            self.simple_statement(),
-                            Stmt::new(StmtKind::Break, sp()),
-                        ],
+                        body: vec![self.simple_statement(), Stmt::new(StmtKind::Break, sp())],
                         span: sp(),
                     });
                 }
@@ -517,10 +504,7 @@ impl Gen {
             ));
         }
         statements.extend(self.statements(0, 4));
-        statements.push(Stmt::new(
-            StmtKind::Return(Some(self.expr(2))),
-            sp(),
-        ));
+        statements.push(Stmt::new(StmtKind::Return(Some(self.expr(2))), sp()));
         syntax::Program {
             statements,
             span: sp(),

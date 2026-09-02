@@ -1,20 +1,22 @@
 use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
 
-use krkr_audio::{AudioEvent, AudioStatusLevel, AudioSystem};
+use krkr_assets::NativeAssetStore;
+use krkr_audio::AudioSystem;
 use krkr_core::{
-    ButtonState, Engine, EngineConfig, EngineEvent, EngineKey, FrameInput, Point, PointerButton,
-    Size, StatusLevel,
+    AudioEvent, AudioStatusLevel, ButtonState, Clock, Engine, EngineConfig, EngineEvent, EngineKey,
+    FrameInput, Point, PointerButton, Size, StatusLevel,
 };
 use krkr_engine::{
-    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, SystemMetrics,
+    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, RuntimeSession,
+    SystemMetrics,
 };
-use krkr_platform::show_error;
 use krkr_plugins::register_reference_plugins;
 use krkr_render::{RenderError, Renderer};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, NamedKey},
     window::{Fullscreen, Window, WindowAttributes, WindowId},
@@ -42,6 +44,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn show_error(title: &str, message: &str) {
+    let _ = MessageDialog::new()
+        .set_level(MessageLevel::Error)
+        .set_title(title)
+        .set_description(message)
+        .set_buttons(MessageButtons::Ok)
+        .show();
 }
 
 fn initial_project_root() -> Option<PathBuf> {
@@ -90,6 +101,25 @@ enum DesktopState {
     FatalError,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DesktopClock {
+    started: Instant,
+}
+
+impl DesktopClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Clock for DesktopClock {
+    fn now_millis(&mut self) -> i64 {
+        self.started.elapsed().as_millis().min(i64::MAX as u128) as i64
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DesktopStatus {
     level: StatusLevel,
@@ -109,10 +139,10 @@ struct DesktopApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     engine: Engine,
-    audio: AudioSystem,
-    krkr_engine: Option<KrkrEngine>,
+    runtime: Option<RuntimeSession>,
     runtime_viewport_size: Option<Size>,
     pending_runtime_events: Vec<EngineEvent>,
+    pending_runtime_text: Vec<krkr_core::TextInputEvent>,
     state: DesktopState,
     project_root: Option<PathBuf>,
     initial_project_root: Option<PathBuf>,
@@ -129,10 +159,10 @@ impl DesktopApp {
             window: None,
             renderer: None,
             engine: Engine::new(EngineConfig::default()),
-            audio: AudioSystem::new(),
-            krkr_engine: None,
+            runtime: None,
             runtime_viewport_size: None,
             pending_runtime_events: Vec::new(),
+            pending_runtime_text: Vec::new(),
             state: DesktopState::Running,
             project_root: None,
             initial_project_root,
@@ -182,12 +212,6 @@ impl DesktopApp {
             renderer.capabilities()
         ));
 
-        if let Err(error) = self.audio.prepare() {
-            let message = format!("audio backend unavailable: {error}");
-            log_warn(&message);
-            self.set_status(StatusLevel::Warning, message, Some(&window));
-        }
-
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
         self.update_window_title(&window);
@@ -223,21 +247,24 @@ impl DesktopApp {
         let mut exit_after_render = false;
         let frame = match self.state {
             DesktopState::Running => {
-                if let Some(krkr_engine) = &mut self.krkr_engine {
+                if let Some(runtime) = &mut self.runtime {
                     let events = std::mem::take(&mut self.pending_runtime_events);
-                    match krkr_engine.update(
-                        KrkrEngineInput::new(frame_input, events),
+                    let text = std::mem::take(&mut self.pending_runtime_text);
+                    match runtime.update(
+                        KrkrEngineInput::new(frame_input, events).with_text(text),
                         std::time::Duration::from_secs_f32(delta_seconds.max(0.0)),
                     ) {
-                        Ok(frame) => {
+                        Ok(runtime_frame) => {
+                            let frame = runtime_frame.engine;
                             if frame.input.unhandled_escape_pressed
-                                && !krkr_engine.host().termination_requested()
+                                && !runtime.engine().host().termination_requested()
                             {
-                                if let Err(error) = krkr_engine.request_runtime_close() {
+                                if let Err(error) = runtime.engine_mut().request_runtime_close() {
                                     log_warn(&format!(
                                         "failed to request runtime close from Escape fallback: {error}"
                                     ));
-                                    if let Err(error) = krkr_engine.persist_runtime_state() {
+                                    if let Err(error) = runtime.engine_mut().persist_runtime_state()
+                                    {
                                         log_warn(&format!(
                                             "failed to persist runtime state before Escape fallback close: {error}"
                                         ));
@@ -245,8 +272,8 @@ impl DesktopApp {
                                     exit_after_render = true;
                                 }
                             }
-                            exit_after_render |= krkr_engine.host().termination_requested();
-                            for line in krkr_engine.host_mut().drain_logs() {
+                            exit_after_render |= runtime.engine().host().termination_requested();
+                            for line in runtime.engine_mut().host_mut().drain_logs() {
                                 log_info(&line);
                                 if line.starts_with("VideoOverlay: presenting")
                                     && self.video_present_frame.is_none()
@@ -255,23 +282,18 @@ impl DesktopApp {
                                     self.video_texture_id = parse_presenting_texture_id(&line);
                                 }
                             }
-                            let audio_commands = krkr_engine.host_mut().take_audio_commands();
-                            if let Err(error) = self.audio.submit_commands(audio_commands) {
-                                let message = format!("audio command failed: {error}");
-                                log_warn(&message);
-                                self.status =
-                                    Some(DesktopStatus::new(StatusLevel::Warning, message));
-                                self.engine.set_status_level(Some(StatusLevel::Warning));
-                            }
                             if let Some(window) = window.as_deref() {
-                                apply_window_fullscreen(window, krkr_engine.window_fullscreen());
+                                apply_window_fullscreen(
+                                    window,
+                                    runtime.engine().window_fullscreen(),
+                                );
                             }
                             frame.output
                         }
                         Err(error) => {
                             let message = format!("engine update failed: {error}");
                             log_error(&message);
-                            for line in krkr_engine.host_mut().drain_logs() {
+                            for line in runtime.engine_mut().host_mut().drain_logs() {
                                 log_info(&line);
                             }
                             self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
@@ -333,6 +355,15 @@ impl DesktopApp {
     }
 
     fn resize_renderer(&mut self, size: PhysicalSize<u32>) {
+        if self.state == DesktopState::Running {
+            self.pending_runtime_events.push(EngineEvent::Lifecycle {
+                state: if size.width == 0 || size.height == 0 {
+                    krkr_core::LifecycleState::SurfaceSuspended
+                } else {
+                    krkr_core::LifecycleState::SurfaceResumed
+                },
+            });
+        }
         if let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) {
             renderer.resize(size, window.scale_factor());
             log_info(&format!("resized viewport: {:?}", renderer.viewport()));
@@ -369,50 +400,41 @@ impl DesktopApp {
             self.state = DesktopState::FatalError;
             return false;
         }
-        let has_startup_tjs = krkr_engine.host().storage_exists("startup.tjs");
-        let has_startup_ks = krkr_engine.host().storage_exists("startup.ks");
-        if has_startup_tjs || !has_startup_ks {
-            match krkr_engine.execute_startup() {
-                Ok(value) => log_info(&format!(
-                    "startup.tjs completed for {} with result {}",
-                    root.display(),
-                    value
-                )),
-                Err(error) => {
-                    let message = format!("startup.tjs failed: {error}");
-                    self.set_status(StatusLevel::Error, message.clone(), Some(window));
-                    show_error("Project startup failed", &message);
-                    self.state = DesktopState::FatalError;
-                    return false;
-                }
-            }
+        let mut audio = AudioSystem::new();
+        if let Err(error) = audio.prepare() {
+            let message = format!("audio backend unavailable: {error}");
+            log_warn(&message);
+            self.set_status(StatusLevel::Warning, message, Some(window));
         }
-
-        if !krkr_engine.has_kag_scenario() && has_startup_ks {
-            if let Err(error) = krkr_engine.load_kag_scenario("startup.ks") {
-                let message = format!("startup.ks failed: {error}");
-                self.set_status(StatusLevel::Error, message.clone(), Some(window));
-                show_error("Project KAG startup failed", &message);
-                self.state = DesktopState::FatalError;
-                return false;
-            }
-            log_info(&format!("loaded startup.ks for {}", root.display()));
-        }
-
-        let preferred_size = krkr_engine.preferred_viewport_size();
-        if let Some(size) = preferred_size {
-            self.resize_window_for_runtime(window, size);
-        }
-        apply_window_fullscreen(window, krkr_engine.window_fullscreen());
-        if let Err(error) = self
-            .audio
-            .set_resource_provider(krkr_engine.host().resource_provider())
-        {
+        if let Err(error) = audio.set_resource_provider(krkr_engine.host().resource_provider()) {
             let message = format!("audio worker unavailable: {error}");
             self.set_status(StatusLevel::Warning, message, Some(window));
         }
 
-        self.krkr_engine = Some(krkr_engine);
+        let mut runtime = RuntimeSession::new(
+            krkr_engine,
+            Box::new(NativeAssetStore::new(root.clone())),
+            Box::new(audio),
+            Box::new(DesktopClock::new()),
+        );
+        if let Err(error) = runtime.start_project() {
+            let message = format!("project startup failed: {error}");
+            self.set_status(StatusLevel::Error, message.clone(), Some(window));
+            show_error("Project startup failed", &message);
+            self.state = DesktopState::FatalError;
+            return false;
+        }
+        log_info(&format!(
+            "project startup dispatched for {}",
+            root.display()
+        ));
+
+        let preferred_size = runtime.engine().preferred_viewport_size();
+        if let Some(size) = preferred_size {
+            self.resize_window_for_runtime(window, size);
+        }
+        apply_window_fullscreen(window, runtime.engine().window_fullscreen());
+        self.runtime = Some(runtime);
         self.runtime_viewport_size = preferred_size
             .filter(|size| !size.is_empty())
             .or_else(|| self.renderer.as_ref().map(Renderer::logical_size));
@@ -424,10 +446,10 @@ impl DesktopApp {
     }
 
     fn persist_running_project(&mut self) {
-        let Some(krkr_engine) = &mut self.krkr_engine else {
+        let Some(runtime) = &mut self.runtime else {
             return;
         };
-        if let Err(error) = krkr_engine.persist_runtime_state() {
+        if let Err(error) = runtime.engine_mut().persist_runtime_state() {
             log_warn(&format!(
                 "failed to persist runtime state before shutdown: {error}"
             ));
@@ -435,10 +457,10 @@ impl DesktopApp {
     }
 
     fn request_running_project_close(&mut self) -> bool {
-        let Some(krkr_engine) = &mut self.krkr_engine else {
+        let Some(runtime) = &mut self.runtime else {
             return false;
         };
-        if let Err(error) = krkr_engine.request_runtime_close() {
+        if let Err(error) = runtime.engine_mut().request_runtime_close() {
             log_warn(&format!("failed to request runtime close: {error}"));
             self.persist_running_project();
             return false;
@@ -472,7 +494,12 @@ impl DesktopApp {
     }
 
     fn report_audio_events(&mut self) {
-        for event in self.audio.drain_events() {
+        let events = self
+            .runtime
+            .as_mut()
+            .map(|runtime| runtime.audio_mut().poll_events())
+            .unwrap_or_default();
+        for event in events {
             match event {
                 AudioEvent::Status(event) => {
                     let level = match event.level {
@@ -489,8 +516,8 @@ impl DesktopApp {
                     self.status = Some(DesktopStatus::new(level, message));
                 }
                 AudioEvent::PlaybackStopped { id } => {
-                    if let Some(engine) = &mut self.krkr_engine
-                        && let Err(error) = engine.notify_audio_stopped(id)
+                    if let Some(runtime) = &mut self.runtime
+                        && let Err(error) = runtime.engine_mut().notify_audio_stopped(id)
                     {
                         let message = format!("audio completion callback failed: {error}");
                         log_warn(&message);
@@ -641,6 +668,36 @@ impl ApplicationHandler for DesktopApp {
                             state: map_button_state(event.state),
                             repeat: event.repeat,
                         });
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                if self.state == DesktopState::Running {
+                    self.pending_runtime_text.push(krkr_core::TextInputEvent {
+                        text,
+                        composing: false,
+                    });
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                if self.state == DesktopState::Running {
+                    self.pending_runtime_text.push(krkr_core::TextInputEvent {
+                        text,
+                        composing: true,
+                    });
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                if self.state == DesktopState::Running {
+                    self.pending_runtime_events.push(EngineEvent::Lifecycle {
+                        state: if occluded {
+                            krkr_core::LifecycleState::Background
+                        } else {
+                            krkr_core::LifecycleState::Foreground
+                        },
+                    });
                     window.request_redraw();
                 }
             }

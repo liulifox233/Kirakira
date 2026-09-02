@@ -9,12 +9,14 @@ mod native;
 pub mod resource_manager;
 mod scheduler;
 mod script;
+pub mod session;
 
 pub use engine::{
-    EngineConfig, EngineFrame, EngineInput, EngineTickResult, KagLocation, KagRunBudget,
-    KagTaskState, KagYieldReason, KrkrEngine, SystemMetrics,
+    EngineConfig, EngineFrame, EngineInput, EngineStep, EngineTickResult, ExternalResourceRequest,
+    KagLocation, KagRunBudget, KagTaskState, KagYieldReason, KrkrEngine, SystemMetrics,
 };
-pub use host::{KrkrHost, NativeTextDrawEvent, TransitionPolicy};
+pub use host::{KrkrHost, NativeTextDrawEvent, TransitionPolicy, VideoOverlaySnapshot};
 pub use plugin::KrkrPlugin;
 pub use resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId};
-pub use storage::ProjectStorage;
+pub use session::{RuntimeFrame, RuntimeSession, RuntimeSessionError};
+pub use storage::{PackageMount, ProjectStorage};

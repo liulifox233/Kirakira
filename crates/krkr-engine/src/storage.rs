@@ -1,9 +1,9 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, File},
     hash::Hash,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -13,7 +13,7 @@ use std::{
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use krkr_core::{ResourceData, ResourceDataSource, ResourceProvider, ResourceStream};
+use krkr_core::{ResourceData, ResourceDataSource, ResourceStream, StoragePort};
 use krkr_tjs2::{Result, TjsError};
 use krkr_xp3::Xp3ResourceProvider;
 use memmap2::{Mmap, MmapOptions};
@@ -26,7 +26,12 @@ pub struct ProjectStorage {
     inner: Arc<ProjectStorageInner>,
 }
 
-pub type ProjectResourceProvider = ProjectStorage;
+/// Read-only package view exposed to host capabilities. Save writes remain on
+/// `ProjectStorage`'s journal and are never available through this type, which
+/// lets audio/media/mobile adapters depend on a package mount without gaining
+/// access to mutable game storage.
+#[derive(Clone)]
+pub struct PackageMount(ProjectStorage);
 
 struct ProjectStorageInner {
     root: Option<PathBuf>,
@@ -35,6 +40,11 @@ struct ProjectStorageInner {
     case_insensitive_dir_cache: Mutex<HashMap<PathBuf, HashMap<String, PathBuf>>>,
     raw_cache: Mutex<RawDataCache>,
     xp3_provider: Option<Xp3ResourceProvider>,
+    memory_files: RwLock<BTreeMap<String, Arc<[u8]>>>,
+    /// Files written through a memory-backed storage view since the last
+    /// drain. Browser hosts persist this journal in their own origin storage;
+    /// native filesystem-backed views never use it.
+    memory_writes: Mutex<BTreeMap<String, Arc<[u8]>>>,
     auto_paths: RwLock<Vec<String>>,
     revision: AtomicU64,
 }
@@ -65,6 +75,11 @@ enum LocatedResource {
         entry_name: String,
         byte_len: u64,
     },
+    Memory {
+        storage_name: String,
+        data: Arc<[u8]>,
+        encoding_hint: Option<&'static Encoding>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -77,6 +92,7 @@ struct RawCacheKey {
 enum RawCacheSource {
     Fs(PathBuf),
     Xp3(String),
+    Memory(String),
 }
 
 struct RawDataCacheEntry {
@@ -102,6 +118,9 @@ struct MmapResourceStream {
 }
 
 impl ProjectStorage {
+    pub fn package_mount(&self) -> PackageMount {
+        PackageMount(self.clone())
+    }
     pub fn for_root(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let fs_layers = project_layers(&root);
@@ -115,6 +134,16 @@ impl ProjectStorage {
         xp3_provider: Option<Xp3ResourceProvider>,
         auto_paths: Vec<String>,
     ) -> Self {
+        Self::new_with_memory(root, fs_layers, xp3_provider, auto_paths, BTreeMap::new())
+    }
+
+    fn new_with_memory(
+        root: Option<PathBuf>,
+        fs_layers: Vec<ProjectLayer>,
+        xp3_provider: Option<Xp3ResourceProvider>,
+        auto_paths: Vec<String>,
+        memory_files: BTreeMap<String, Arc<[u8]>>,
+    ) -> Self {
         Self {
             inner: Arc::new(ProjectStorageInner {
                 root,
@@ -126,10 +155,70 @@ impl ProjectStorage {
                     RAW_CACHE_MAX_ENTRY_BYTES,
                 )),
                 xp3_provider,
+                memory_files: RwLock::new(memory_files),
+                memory_writes: Mutex::new(BTreeMap::new()),
                 auto_paths: RwLock::new(auto_paths),
                 revision: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// Creates a synchronous storage view over files already downloaded by a
+    /// browser host. This keeps the TJS/KAG engine synchronous while fetches
+    /// happen asynchronously outside the VM.
+    pub fn from_memory<I, K, V>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Vec<u8>>,
+    {
+        let files = entries
+            .into_iter()
+            .map(|(path, bytes)| {
+                (
+                    normalize_storage_separators(&path.into()),
+                    Arc::from(bytes.into()),
+                )
+            })
+            .collect();
+        Self::new_with_memory(
+            None,
+            Vec::new(),
+            None,
+            vec![
+                "data".to_string(),
+                "sys".to_string(),
+                "patch".to_string(),
+                "patch2".to_string(),
+                "patch3".to_string(),
+                "special".to_string(),
+            ],
+            files,
+        )
+    }
+
+    /// Adds a file to a memory-backed storage view. Web resource schedulers
+    /// use this after an asynchronous fetch completes; native storage views
+    /// simply reject the mutation because they have no memory overlay.
+    pub fn insert_memory(&self, path: impl Into<String>, bytes: impl Into<Vec<u8>>) {
+        let path = normalize_storage_separators(&path.into());
+        if let Ok(mut files) = self.inner.memory_files.write() {
+            files.insert(path, Arc::from(bytes.into()));
+            self.invalidate_caches();
+        }
+    }
+
+    /// Returns and clears files written to a memory-backed project. This is a
+    /// synchronous hand-off point for browser persistence (IndexedDB,
+    /// localStorage, or a host-provided adapter).
+    pub fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)> {
+        let Ok(mut writes) = self.inner.memory_writes.lock() else {
+            return Vec::new();
+        };
+        std::mem::take(&mut *writes)
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect()
     }
 
     pub fn revision(&self) -> u64 {
@@ -181,7 +270,7 @@ impl ProjectStorage {
     pub fn placed_path(&self, name: &str) -> Option<PathBuf> {
         match self.resolve_storage(name).ok()? {
             LocatedResource::Fs { path, .. } => Some(path),
-            LocatedResource::Xp3 { .. } => None,
+            LocatedResource::Xp3 { .. } | LocatedResource::Memory { .. } => None,
         }
     }
 
@@ -220,11 +309,33 @@ impl ProjectStorage {
     }
 
     pub fn write_binary_storage(&self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
-        let root = self
-            .inner
-            .root
-            .as_ref()
-            .ok_or_else(|| TjsError::runtime("project root is not set"))?;
+        let Some(root) = self.inner.root.as_ref() else {
+            let key = memory_write_key(name)?;
+            let mut output = bytes.to_vec();
+            if let Some(offset) = storage_mode_offset(mode) {
+                let mut current = self.read_binary_vec(&key).unwrap_or_default();
+                let offset = usize::try_from(offset).map_err(|_| {
+                    TjsError::runtime(format!("storage offset is too large: {offset}"))
+                })?;
+                let end = offset
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| TjsError::runtime("storage write is too large"))?;
+                if current.len() < end {
+                    current.resize(end, 0);
+                }
+                current[offset..end].copy_from_slice(bytes);
+                output = current;
+            }
+            let data: Arc<[u8]> = Arc::from(output);
+            if let Ok(mut files) = self.inner.memory_files.write() {
+                files.insert(key.clone(), Arc::clone(&data));
+            }
+            if let Ok(mut writes) = self.inner.memory_writes.lock() {
+                writes.insert(key, data);
+            }
+            self.invalidate_caches();
+            return Ok(());
+        };
         let path = storage_write_path(root, name)?;
         // Release cached raw file views before writing so Windows does not reject
         // overwriting a file that is still held by a read-only mmap in `raw_cache`.
@@ -261,6 +372,7 @@ impl ProjectStorage {
                 })?;
                 provider.open(&entry_name)
             }
+            LocatedResource::Memory { data, .. } => Ok(Box::new(Cursor::new(data.to_vec()))),
         }
     }
 
@@ -308,6 +420,72 @@ impl ProjectStorage {
                     self.cache_lookup(name, Some(storage.clone()));
                     return Ok(storage);
                 }
+            }
+        }
+
+        for candidate in &candidates {
+            let normalized = normalize_storage_separators(candidate);
+            let Ok(memory_files) = self.inner.memory_files.read() else {
+                continue;
+            };
+            if let Some(data) = memory_files.get(&normalized) {
+                let storage = LocatedResource::Memory {
+                    storage_name: candidate.clone(),
+                    encoding_hint: infer_encoding_from_path(Path::new(candidate)),
+                    data: Arc::clone(data),
+                };
+                self.cache_lookup(name, Some(storage.clone()));
+                return Ok(storage);
+            }
+            if let Some((stored_path, data)) = memory_files
+                .iter()
+                .find(|(stored, _)| stored.eq_ignore_ascii_case(&normalized))
+            {
+                let storage = LocatedResource::Memory {
+                    storage_name: candidate.clone(),
+                    encoding_hint: infer_encoding_from_path(Path::new(stored_path)),
+                    data: Arc::clone(data),
+                };
+                self.cache_lookup(name, Some(storage.clone()));
+                return Ok(storage);
+            }
+        }
+
+        // Remote Web manifests expose unambiguous basename aliases for KRKR's
+        // auto-path lookup. Mirror that behavior in the memory overlay so a
+        // preloaded `main/Config.tjs` also satisfies `Config.tjs` without a
+        // duplicate network request.
+        for candidate in &candidates {
+            let normalized = normalize_storage_separators(candidate);
+            if normalized.contains('/') {
+                continue;
+            }
+            let Ok(memory_files) = self.inner.memory_files.read() else {
+                continue;
+            };
+            let mut matched: Option<(&String, &Arc<[u8]>)> = None;
+            let mut ambiguous = false;
+            for (stored_path, data) in memory_files.iter() {
+                if stored_path
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|basename| basename.eq_ignore_ascii_case(&normalized))
+                {
+                    if matched.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    matched = Some((stored_path, data));
+                }
+            }
+            if !ambiguous && let Some((stored_path, data)) = matched {
+                let storage = LocatedResource::Memory {
+                    storage_name: candidate.clone(),
+                    encoding_hint: infer_encoding_from_path(Path::new(stored_path)),
+                    data: Arc::clone(data),
+                };
+                self.cache_lookup(name, Some(storage.clone()));
+                return Ok(storage);
             }
         }
 
@@ -451,6 +629,7 @@ impl ProjectStorage {
                 stream.read_to_end(&mut bytes)?;
                 ResourceData::from_vec(bytes)
             }
+            LocatedResource::Memory { data, .. } => ResourceData::from_vec(data.to_vec()),
         };
 
         if let Ok(mut cache) = self.inner.raw_cache.lock() {
@@ -491,7 +670,29 @@ impl ProjectStorage {
     }
 }
 
-impl ResourceProvider for ProjectStorage {
+impl StoragePort for PackageMount {
+    fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>> {
+        self.0.open(path)
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.0.exists(path)
+    }
+
+    fn data(&self, path: &str) -> io::Result<ResourceData> {
+        self.0.data(path)
+    }
+
+    fn byte_len(&self, path: &str) -> io::Result<Option<u64>> {
+        self.0.byte_len(path)
+    }
+
+    fn revision(&self) -> u64 {
+        self.0.revision()
+    }
+}
+
+impl StoragePort for ProjectStorage {
     fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>> {
         self.open_storage(path)
     }
@@ -516,7 +717,9 @@ impl ResourceProvider for ProjectStorage {
 impl LocatedResource {
     fn storage_name(&self) -> &str {
         match self {
-            Self::Fs { storage_name, .. } | Self::Xp3 { storage_name, .. } => storage_name,
+            Self::Fs { storage_name, .. }
+            | Self::Xp3 { storage_name, .. }
+            | Self::Memory { storage_name, .. } => storage_name,
         }
     }
 
@@ -524,12 +727,14 @@ impl LocatedResource {
         match self {
             Self::Fs { encoding_hint, .. } => *encoding_hint,
             Self::Xp3 { .. } => None,
+            Self::Memory { encoding_hint, .. } => *encoding_hint,
         }
     }
 
     fn byte_len(&self) -> u64 {
         match self {
             Self::Fs { byte_len, .. } | Self::Xp3 { byte_len, .. } => *byte_len,
+            Self::Memory { data, .. } => data.len() as u64,
         }
     }
 
@@ -537,6 +742,7 @@ impl LocatedResource {
         match self {
             Self::Fs { path, .. } => RawCacheSource::Fs(path.clone()),
             Self::Xp3 { entry_name, .. } => RawCacheSource::Xp3(entry_name.clone()),
+            Self::Memory { storage_name, .. } => RawCacheSource::Memory(storage_name.clone()),
         }
     }
 }
@@ -980,6 +1186,18 @@ fn is_safe_absolute_storage_path(path: &Path) -> bool {
         .all(|component| !matches!(component, Component::ParentDir))
 }
 
+fn memory_write_key(name: &str) -> Result<String> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(TjsError::runtime(format!(
+            "memory storage path must be relative: {name}"
+        )));
+    }
+    Ok(normalize_storage_separators(
+        clean_relative_path(name)?.to_str().unwrap_or_default(),
+    ))
+}
+
 pub(crate) fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
     let path = Path::new(name);
     if path.is_absolute() {
@@ -1082,7 +1300,7 @@ fn storage_not_found(name: &str) -> io::Error {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use krkr_core::ResourceProvider;
+    use krkr_core::StoragePort;
 
     use super::*;
 
@@ -1185,6 +1403,36 @@ mod tests {
         assert_eq!(text, "hello");
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn memory_storage_serves_case_insensitive_candidates() {
+        let storage = ProjectStorage::from_memory([("startup.ks", b"WEB".to_vec())]);
+        assert!(storage.storage_exists("STARTUP.KS"));
+        assert_eq!(
+            storage.read_binary_vec("startup.ks").expect("memory data"),
+            b"WEB"
+        );
+    }
+
+    #[test]
+    fn memory_storage_accepts_writes_and_exposes_a_journal() {
+        let storage = ProjectStorage::from_memory([("savedata/state.bin", b"old".to_vec())]);
+        storage
+            .write_binary_storage("savedata/state.bin", "o1", b"X")
+            .expect("write memory data");
+        assert_eq!(
+            storage
+                .read_binary_vec("savedata/state.bin")
+                .expect("read memory data"),
+            b"oXd".as_slice()
+        );
+        let writes = storage.drain_memory_writes();
+        assert_eq!(
+            writes,
+            vec![("savedata/state.bin".to_string(), b"oXd".to_vec())]
+        );
+        assert!(storage.drain_memory_writes().is_empty());
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

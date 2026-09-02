@@ -1,0 +1,19 @@
+{
+  "name": "kirakira-web-shell",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:wasm": "wasm-pack build . --target web --release --out-dir public/pkg --out-name krkr_web --no-typescript --no-opt",
+    "build": "pnpm build:wasm && vite build",
+    "stage:static": "node scripts/stage-static.mjs",
+    "test:web": "node scripts/smoke.mjs",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "test:ginka": "node scripts/ginka-smoke.mjs",
+    "play:browser": "node scripts/browser-play.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.52.0",
+    "vite": "^7.1.3"
+  }
+}

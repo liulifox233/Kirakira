@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-audiopus.workspace = true
-audiopus_sys.workspace = true
+## Opus decoding is an optional native capability. Keeping it out of the
+## default feature set lets the core audio protocol compile for wasm and
+## avoids forcing a CMake toolchain on every consumer.
+audiopus = { workspace = true, optional = true }
+audiopus_sys = { workspace = true, optional = true }
 cpal.workspace = true
 kira.workspace = true
 krkr-core.workspace = true
 symphonia.workspace = true
+
+[features]
+default = []
+opus = ["dep:audiopus", "dep:audiopus_sys"]

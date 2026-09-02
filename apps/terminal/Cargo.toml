@@ -9,6 +9,7 @@ base64.workspace = true
 crossterm.workspace = true
 image.workspace = true
 krkr-audio.workspace = true
+krkr-assets.workspace = true
 krkr-core.workspace = true
 krkr-engine.workspace = true
 krkr-kag.workspace = true

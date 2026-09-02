@@ -1,16 +1,17 @@
 [workspace]
 members = [
     "apps/debugger",
-    "apps/decomp",
     "apps/desktop",
-    "apps/disasm",
+    "apps/tjs-tools",
+    "apps/pack",
     "apps/terminal",
+    "apps/web",
     "crates/krkr-audio",
+    "crates/krkr-assets",
     "crates/krkr-core",
     "crates/krkr-plugins",
     "crates/krkr-font",
     "crates/krkr-kag",
-    "crates/krkr-platform",
     "crates/krkr-render",
     "crates/krkr-engine",
     "crates/krkr-tjs2",
@@ -23,6 +24,20 @@ resolver = "3"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 license-file = "LICENSE"
+
+# The debugger and headless acceptance runner execute real TJS/KAG workloads.
+# Keep symbols and overflow checks, but use release-level optimization so
+# `cargo run` is representative of an actual game session.
+[profile.dev]
+opt-level = 3
+debug = 2
+overflow-checks = true
+incremental = true
+
+[profile.test]
+opt-level = 3
+debug = 2
+overflow-checks = true
 
 [workspace.dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
@@ -42,18 +57,24 @@ memmap2 = "0.9.9"
 pollster = "0.4.0"
 rfd = "=0.17.2"
 swash = "0.2.7"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 symphonia = { version = "=0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
 terminal_size = "0.4.4"
 wgpu = "=29.0.1"
 winit = "=0.30.13"
+wasm-bindgen = "0.2.104"
+wasm-bindgen-futures = "0.4.54"
+js-sys = "0.3.81"
+web-sys = { version = "0.3.81", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Performance", "Response", "Storage", "console"] }
 
 krkr-audio = { path = "crates/krkr-audio" }
+krkr-assets = { path = "crates/krkr-assets" }
 krkr-core = { path = "crates/krkr-core" }
 krkr-plugins = { path = "crates/krkr-plugins" }
 krkr-font = { path = "crates/krkr-font" }
 krkr-kag = { path = "crates/krkr-kag" }
-krkr-platform = { path = "crates/krkr-platform" }
-krkr-render = { path = "crates/krkr-render" }
+krkr-render = { path = "crates/krkr-render", default-features = false }
 krkr-engine = { path = "crates/krkr-engine" }
 krkr-tjs2 = { path = "crates/krkr-tjs2" }
 krkr-video = { path = "crates/krkr-video" }

@@ -3,7 +3,7 @@ use krkr_kag::{
     ScenarioLoadEvent, ScriptEvent, Tag,
 };
 use krkr_tjs2::{
-    Result,
+    Result, TjsError, TjsErrorKind,
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
@@ -30,7 +30,7 @@ impl<'a> EngineKagHost<'a> {
         self.runtime
             .call_object_method(self.owner, name, args)
             .map(Some)
-            .map_err(kag_host_error)
+            .map_err(kag_tjs_error)
     }
 
     fn call_process_event(&mut self, name: &str, tag: &Tag) -> krkr_kag::Result<bool> {
@@ -52,9 +52,14 @@ impl KagHost for EngineKagHost<'_> {
 
     fn load_scenario(&mut self, storage: &str) -> krkr_kag::Result<String> {
         self.runtime
-            .host()
-            .read_text_storage(storage)
-            .map_err(kag_host_error)
+            .host_mut()
+            .read_text_storage_for_tjs(storage)
+            .map_err(|error| match error.kind {
+                TjsErrorKind::ResourcePending => krkr_kag::KagError::ResourcePending {
+                    storage: storage.to_string(),
+                },
+                _ => kag_tjs_error(error),
+            })
     }
 
     fn on_scenario_load(
@@ -148,7 +153,7 @@ impl KagHost for EngineKagHost<'_> {
         }
         execute_script_on_runtime(self.runtime, event.storage, event.script)
             .map(|_| ())
-            .map_err(kag_host_error)
+            .map_err(kag_tjs_error)
     }
 
     fn on_jump(
@@ -194,11 +199,28 @@ impl KagHost for EngineKagHost<'_> {
 }
 
 fn eval_expression(runtime: &mut Runtime<KrkrHost>, expression: &str) -> krkr_kag::Result<Variant> {
-    execute_expression_on_runtime(runtime, expression, expression).map_err(kag_host_error)
+    execute_expression_on_runtime(runtime, expression, expression).map_err(kag_tjs_error)
 }
 
 fn kag_host_error(error: impl std::fmt::Display) -> KagError {
     KagError::host(error.to_string())
+}
+
+fn kag_tjs_error(error: TjsError) -> KagError {
+    if error.kind == TjsErrorKind::ResourcePending
+        || error.to_string().contains("KAG resource is pending:")
+    {
+        let storage = error
+            .to_string()
+            .split_once("KAG resource is pending:")
+            .and_then(|(_, value)| value.lines().next())
+            .unwrap_or(error.message.as_str())
+            .trim()
+            .to_string();
+        KagError::ResourcePending { storage }
+    } else {
+        kag_host_error(error)
+    }
 }
 
 pub(crate) fn tag_to_dictionary(

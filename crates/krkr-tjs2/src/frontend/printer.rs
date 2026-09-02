@@ -13,9 +13,9 @@
 //! identical, shape-stable).
 
 use super::syntax::{
-    ArrayElement, AssignOp, BinaryOp, CallArg, ClassDecl, DictionaryEntry, Expr, ExprKind,
-    ForInit, FunctionDecl, ParamDecl, Program, PropertyDecl, Stmt, StmtKind, SwitchCase, UnaryOp,
-    VarDecl, VarKind,
+    ArrayElement, AssignOp, BinaryOp, CallArg, ClassDecl, DictionaryEntry, Expr, ExprKind, ForInit,
+    FunctionDecl, ParamDecl, Program, PropertyDecl, Stmt, StmtKind, SwitchCase, UnaryOp, VarDecl,
+    VarKind,
 };
 
 /// Expression precedence levels, mirroring the parser recursion:
@@ -235,7 +235,10 @@ impl Printer {
                     None => self.line("}"),
                 }
             }
-            StmtKind::Switch { discriminant, cases } => {
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => {
                 let disc = self.expression(discriminant);
                 self.line(&format!("switch ({disc}) {{"));
                 for case in cases {
@@ -494,11 +497,7 @@ impl Printer {
                 let is_new = matches!(value.kind, ExprKind::New { .. });
                 let value = self.expr(value, PREC_ASSIGN);
                 // The parser's assignment operand level does not reach `new`.
-                let value = if is_new {
-                    format!("({value})")
-                } else {
-                    value
-                };
+                let value = if is_new { format!("({value})") } else { value };
                 format!("{target} {} {value}", assign_op_text(*op))
             }
             ExprKind::Conditional {
@@ -634,22 +633,14 @@ impl Printer {
                 // the `new` keyword; parenthesize it.
                 let is_new = matches!(rhs.kind, ExprKind::New { .. });
                 let rhs = self.expr(rhs, PREC_INCTX);
-                let rhs_text = if is_new {
-                    format!("({rhs})")
-                } else {
-                    rhs
-                };
+                let rhs_text = if is_new { format!("({rhs})") } else { rhs };
                 format!("{lhs} incontextof {rhs_text}")
             }
             BinaryOp::InstanceOf => {
                 let lhs = self.expr(lhs, PREC_INCTX);
                 let is_new = matches!(rhs.kind, ExprKind::New { .. });
                 let rhs = self.expr(rhs, PREC_UNARY);
-                let rhs_text = if is_new {
-                    format!("({rhs})")
-                } else {
-                    rhs
-                };
+                let rhs_text = if is_new { format!("({rhs})") } else { rhs };
                 format!("{lhs} instanceof {rhs_text}")
             }
             _ => {
@@ -682,7 +673,9 @@ impl Printer {
 
 fn natural_prec(expr: &Expr) -> u8 {
     match &expr.kind {
-        ExprKind::Binary { op: BinaryOp::If, .. } => PREC_IF,
+        ExprKind::Binary {
+            op: BinaryOp::If, ..
+        } => PREC_IF,
         ExprKind::Comma(_) => PREC_COMMA,
         ExprKind::Assignment { .. } => PREC_ASSIGN,
         ExprKind::Conditional { .. } => PREC_CONDITIONAL,
@@ -1065,7 +1058,11 @@ mod tests {
             StmtKind::ClassDecl(decl) => format!(
                 "class:{}:[{}]",
                 decl.name.name,
-                decl.body.iter().map(stmt_shape).collect::<Vec<_>>().join(",")
+                decl.body
+                    .iter()
+                    .map(stmt_shape)
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             StmtKind::PropertyDecl(decl) => format!(
                 "prop:{}:{}/{}",
@@ -1079,10 +1076,9 @@ mod tests {
                     .map(|setter| stmt_shape(&setter.body))
                     .unwrap_or_default()
             ),
-            StmtKind::Return(expr) => format!(
-                "return:{}",
-                expr.as_ref().map(shape).unwrap_or_default()
-            ),
+            StmtKind::Return(expr) => {
+                format!("return:{}", expr.as_ref().map(shape).unwrap_or_default())
+            }
             StmtKind::Throw(expr) => format!("throw:{}", shape(expr)),
             StmtKind::If {
                 condition,
@@ -1137,12 +1133,21 @@ mod tests {
                 stmt_shape(body),
                 catch
                     .as_ref()
-                    .map(|catch| format!("catch:{}/{}",
-                        catch.binding.as_ref().map(|b| b.name.clone()).unwrap_or_default(),
-                        stmt_shape(&catch.body)))
+                    .map(|catch| format!(
+                        "catch:{}/{}",
+                        catch
+                            .binding
+                            .as_ref()
+                            .map(|b| b.name.clone())
+                            .unwrap_or_default(),
+                        stmt_shape(&catch.body)
+                    ))
                     .unwrap_or_default()
             ),
-            StmtKind::Switch { discriminant, cases } => format!(
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => format!(
                 "switch:{}/[{}]",
                 shape(discriminant),
                 cases
@@ -1150,15 +1155,18 @@ mod tests {
                     .map(|case| format!(
                         "{}/[{}]",
                         case.test.as_ref().map(shape).unwrap_or_default(),
-                        case.body.iter().map(stmt_shape).collect::<Vec<_>>().join(",")
+                        case.body
+                            .iter()
+                            .map(stmt_shape)
+                            .collect::<Vec<_>>()
+                            .join(",")
                     ))
                     .collect::<Vec<_>>()
                     .join(";")
             ),
-            StmtKind::Case { test } => format!(
-                "case:{}",
-                test.as_ref().map(shape).unwrap_or_default()
-            ),
+            StmtKind::Case { test } => {
+                format!("case:{}", test.as_ref().map(shape).unwrap_or_default())
+            }
             StmtKind::Debugger => "debugger".to_string(),
         }
     }

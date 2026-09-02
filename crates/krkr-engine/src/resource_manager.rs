@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     collections::{HashMap, VecDeque},
     io::Cursor,
     sync::{
@@ -24,6 +25,7 @@ pub struct ResourceManager {
     task_tx: mpsc::Sender<ResourceTask>,
     completion_rx: Arc<Mutex<mpsc::Receiver<ResourceCompletion>>>,
     next_task_id: Arc<AtomicU64>,
+    cancelled: Arc<Mutex<BTreeSet<ResourceTaskId>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,11 +61,6 @@ enum ResourceTask {
     ClearDecodedImageCache {
         reply_tx: mpsc::Sender<()>,
     },
-    DecodeImageBlocking {
-        revision: u64,
-        storage: String,
-        reply_tx: mpsc::Sender<std::result::Result<DecodedImageData, String>>,
-    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -89,13 +86,16 @@ impl ResourceManager {
     pub fn new(storage: ProjectStorage) -> std::io::Result<Self> {
         let (task_tx, task_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
+        let cancelled = Arc::new(Mutex::new(BTreeSet::new()));
+        let worker_cancelled = Arc::clone(&cancelled);
         thread::Builder::new()
             .name("krkr-resource-worker".to_string())
-            .spawn(move || resource_worker(storage, task_rx, completion_tx))?;
+            .spawn(move || resource_worker(storage, task_rx, completion_tx, worker_cancelled))?;
         Ok(Self {
             task_tx,
             completion_rx: Arc::new(Mutex::new(completion_rx)),
             next_task_id: Arc::new(AtomicU64::new(1)),
+            cancelled,
         })
     }
 
@@ -150,25 +150,6 @@ impl ResourceManager {
             .map_err(|_| format!("resource worker stopped while loading text `{storage}`"))?
     }
 
-    pub fn decode_image_blocking(
-        &self,
-        storage: impl Into<String>,
-        revision: u64,
-    ) -> std::result::Result<DecodedImageData, String> {
-        let storage = storage.into();
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.task_tx
-            .send(ResourceTask::DecodeImageBlocking {
-                revision,
-                storage: storage.clone(),
-                reply_tx,
-            })
-            .map_err(|_| format!("resource worker is not available for `{storage}`"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| format!("resource worker stopped while decoding `{storage}`"))?
-    }
-
     pub fn clear_decoded_image_cache_blocking(&self) -> std::result::Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.task_tx
@@ -190,6 +171,16 @@ impl ResourceManager {
         completions
     }
 
+    /// Marks an in-flight decode as no longer needed. The worker checks this
+    /// before and after decoding, so stale image work is dropped without ever
+    /// waking the VM after a storage revision or layer generation change.
+    pub fn cancel(&self, id: ResourceTaskId) -> bool {
+        self.cancelled
+            .lock()
+            .map(|mut cancelled| cancelled.insert(id))
+            .unwrap_or(false)
+    }
+
     fn next_id(&self) -> ResourceTaskId {
         ResourceTaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -199,6 +190,7 @@ fn resource_worker(
     storage: ProjectStorage,
     task_rx: mpsc::Receiver<ResourceTask>,
     completion_tx: mpsc::Sender<ResourceCompletion>,
+    cancelled: Arc<Mutex<BTreeSet<ResourceTaskId>>>,
 ) {
     let mut image_cache = DecodedImageCache::new(
         DECODED_IMAGE_CACHE_CAPACITY_BYTES,
@@ -211,12 +203,21 @@ fn resource_worker(
                 id,
                 revision,
                 storage: name,
-            } => ResourceCompletion {
-                id,
-                revision,
-                storage: name.clone(),
-                result: decode_image(&storage, &mut image_cache, revision, &name),
-            },
+            } => {
+                if take_cancelled(&cancelled, id) {
+                    continue;
+                }
+                let result = decode_image(&storage, &mut image_cache, revision, &name);
+                if take_cancelled(&cancelled, id) {
+                    continue;
+                }
+                ResourceCompletion {
+                    id,
+                    revision,
+                    storage: name.clone(),
+                    result,
+                }
+            }
             ResourceTask::LoadBytesBlocking {
                 storage: name,
                 reply_tx,
@@ -245,19 +246,18 @@ fn resource_worker(
                 let _ = reply_tx.send(());
                 continue;
             }
-            ResourceTask::DecodeImageBlocking {
-                revision,
-                storage: name,
-                reply_tx,
-            } => {
-                let _ = reply_tx.send(decode_image(&storage, &mut image_cache, revision, &name));
-                continue;
-            }
         };
         if completion_tx.send(completion).is_err() {
             break;
         }
     }
+}
+
+fn take_cancelled(cancelled: &Mutex<BTreeSet<ResourceTaskId>>, id: ResourceTaskId) -> bool {
+    cancelled
+        .lock()
+        .map(|mut ids| ids.remove(&id))
+        .unwrap_or(false)
 }
 
 fn decode_image(
@@ -296,11 +296,23 @@ pub(crate) fn decode_image_bytes(
     let decoded = image::load_from_memory(bytes)
         .map_err(|error| format!("failed to decode image `{name}`: {error}"))?
         .to_rgba8();
+    let width = decoded.width();
+    let height = decoded.height();
+    let mut rgba = decoded.into_raw();
+    apply_magenta_color_key(&mut rgba);
     Ok(DecodedImageData {
-        width: decoded.width(),
-        height: decoded.height(),
-        rgba: Arc::<[u8]>::from(decoded.into_raw()),
+        width,
+        height,
+        rgba: Arc::<[u8]>::from(rgba),
     })
+}
+
+fn apply_magenta_color_key(rgba: &mut [u8]) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 255 && pixel[3] == 255 {
+            pixel[3] = 0;
+        }
+    }
 }
 
 fn tlg_to_rgba(tlg: libtlg_rs::Tlg, name: &str) -> std::result::Result<DecodedImageData, String> {
@@ -342,12 +354,28 @@ fn tlg_to_rgba(tlg: libtlg_rs::Tlg, name: &str) -> std::result::Result<DecodedIm
         }
         TlgColorType::Bgr24 => {
             for pixel in tlg.data.chunks_exact(3) {
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+                let alpha = if pixel[2] == 255 && pixel[1] == 0 && pixel[0] == 255 {
+                    0
+                } else {
+                    255
+                };
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], alpha]);
             }
         }
         TlgColorType::Bgra32 => {
             for pixel in tlg.data.chunks_exact(4) {
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                // A number of KRKR UI assets use the historical magenta
+                // colour key (RGB 255,0,255) for transparent pixels.  TLG
+                // stores those pixels as fully opaque BGRA, so preserve the
+                // engine's colour-key semantics while retaining real alpha
+                // values on ordinary pixels.
+                let alpha =
+                    if pixel[2] == 255 && pixel[1] == 0 && pixel[0] == 255 && pixel[3] == 255 {
+                        0
+                    } else {
+                        pixel[3]
+                    };
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], alpha]);
             }
         }
     }
@@ -441,6 +469,38 @@ mod tests {
         assert_eq!(image.width, 2);
         assert_eq!(image.height, 1);
         assert_eq!(image.rgba.as_ref(), &[1, 2, 3, 4, 10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn converts_tlg_magenta_colour_key_to_transparency() {
+        let image = tlg_to_rgba(
+            libtlg_rs::Tlg {
+                tags: HashMap::new(),
+                version: 6,
+                width: 1,
+                height: 1,
+                color: libtlg_rs::TlgColorType::Bgra32,
+                data: vec![255, 0, 255, 255],
+            },
+            "colour-key.tlg",
+        )
+        .expect("convert TLG colour key");
+
+        assert_eq!(image.rgba.as_ref(), &[255, 0, 255, 0]);
+
+        let image = tlg_to_rgba(
+            libtlg_rs::Tlg {
+                tags: HashMap::new(),
+                version: 6,
+                width: 1,
+                height: 1,
+                color: libtlg_rs::TlgColorType::Bgr24,
+                data: vec![255, 0, 255],
+            },
+            "colour-key24.tlg",
+        )
+        .expect("convert TLG 24-bit colour key");
+        assert_eq!(image.rgba.as_ref(), &[255, 0, 255, 0]);
     }
 
     #[test]

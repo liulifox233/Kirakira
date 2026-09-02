@@ -54,7 +54,10 @@ fn parse_args() -> Result<Config, String> {
     let mut config = Config::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        let mut value = |flag: &str| args.next().ok_or_else(|| format!("{flag} requires a value"));
+        let mut value = |flag: &str| {
+            args.next()
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
         match arg.as_str() {
             "--filter" => config.filter = Some(value("--filter")?),
             "--object" => {
@@ -140,7 +143,12 @@ fn decompile_game_dir(config: &Config, dir: &Path) -> Result<(), String> {
     if loose.is_file() {
         let bytes = std::fs::read(&loose)
             .map_err(|error| format!("cannot read {}: {error}", loose.display()))?;
-        return decompile_bytes(config, &bytes, &format!("loose {}", loose.display()), &loose);
+        return decompile_bytes(
+            config,
+            &bytes,
+            &format!("loose {}", loose.display()),
+            &loose,
+        );
     }
     let mut archives = xp3_files(&dir.join("sys"));
     archives.extend(xp3_files(dir));
@@ -152,7 +160,12 @@ fn decompile_game_dir(config: &Config, dir: &Path) -> Result<(), String> {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| archive_path.display().to_string());
-            return decompile_bytes(config, &bytes, &format!("{archive_name}>{member}"), archive_path);
+            return decompile_bytes(
+                config,
+                &bytes,
+                &format!("{archive_name}>{member}"),
+                archive_path,
+            );
         }
     }
     Err(format!("{member} not found in {}", dir.display()))
@@ -311,10 +324,8 @@ fn decompile_bytes(
     if config.verify {
         match krkr_tjs2::compiler::parse_source(&source.text) {
             Ok(program) => {
-                let reparsed = krkr_tjs2::compiler::compile_source_to_bytecode(
-                    &source.name,
-                    &source.text,
-                );
+                let reparsed =
+                    krkr_tjs2::compiler::compile_source_to_bytecode(&source.name, &source.text);
                 eprintln!(
                     "; verify: reparse ok ({} statements), recompile {}",
                     program.statements.len(),

@@ -186,7 +186,10 @@ fn build_blocks(instructions: &[Instruction]) -> Vec<Block> {
         };
         block.term = match block.term {
             Term::Jmp(target) => Term::Jmp(resolve(target)),
-            Term::Cond { target, jump_if_true } => Term::Cond {
+            Term::Cond {
+                target,
+                jump_if_true,
+            } => Term::Cond {
                 target: resolve(target),
                 jump_if_true,
             },
@@ -282,9 +285,8 @@ impl<'f> BodyDecompiler<'f> {
                 || !followed.insert(target)
             {
                 self.unhandled += 1;
-                statements.push(self.marker(&format!(
-                    "unexpected trailing jump to block {target}"
-                )));
+                statements
+                    .push(self.marker(&format!("unexpected trailing jump to block {target}")));
                 break;
             }
             let (more, next) = self.seq(target, &SeqCtx::default());
@@ -347,7 +349,10 @@ impl<'f> BodyDecompiler<'f> {
     /// target, jump_if_true).
     fn cond_info(&mut self, index: usize) -> (Vec<Stmt>, Expr, usize, bool) {
         let (target, jump_if_true) = match self.blocks[index].term {
-            Term::Cond { target, jump_if_true } => (target, jump_if_true),
+            Term::Cond {
+                target,
+                jump_if_true,
+            } => (target, jump_if_true),
             _ => unreachable!("cond_info on non-cond block"),
         };
         let body = self.block_body(index);
@@ -623,19 +628,20 @@ impl<'f> BodyDecompiler<'f> {
                 None
             };
             let is_value_form = rhs_block.is_some()
-                && rhs_block.map(|rhs_block| {
-                    self.block_body(rhs_block)
-                        .last()
-                        .is_some_and(|inst| matches!(inst.opcode, 11 | 12))
-                        && matches!(
-                            self.blocks[rhs_block].term,
-                            Term::Jmp(merge) if merge == rhs_block + 1
-                        )
-                        && self
-                            .scanner
-                            .is_pure_condition_block(&self.block_body(rhs_block))
-                })
-                .unwrap_or(false);
+                && rhs_block
+                    .map(|rhs_block| {
+                        self.block_body(rhs_block)
+                            .last()
+                            .is_some_and(|inst| matches!(inst.opcode, 11 | 12))
+                            && matches!(
+                                self.blocks[rhs_block].term,
+                                Term::Jmp(merge) if merge == rhs_block + 1
+                            )
+                            && self
+                                .scanner
+                                .is_pure_condition_block(&self.block_body(rhs_block))
+                    })
+                    .unwrap_or(false);
             if let Some(rhs_block) = rhs_block.filter(|_| is_value_form) {
                 let (raw1, prelude1) = self.raw_cond(last_cond);
                 let raw1 = raw1?;
@@ -833,9 +839,15 @@ impl<'f> BodyDecompiler<'f> {
         // to the else branch, so the entries swap without negating the
         // condition (the flag polarity already carries any negation).
         let (then_entry, else_entry) = if jump_if_true {
-            (self.skip_trampolines(target), self.skip_trampolines(last_cond + 1))
+            (
+                self.skip_trampolines(target),
+                self.skip_trampolines(last_cond + 1),
+            )
         } else {
-            (self.skip_trampolines(last_cond + 1), self.skip_trampolines(target))
+            (
+                self.skip_trampolines(last_cond + 1),
+                self.skip_trampolines(target),
+            )
         };
         Some(FusedCondition {
             prelude,
@@ -851,7 +863,12 @@ impl<'f> BodyDecompiler<'f> {
     /// continuation block. Returns the merge block index on success; the
     /// scanner's register then carries the conditional expression and the
     /// branch blocks are marked dead.
-    fn ternary_restore(&mut self, cond: &Expr, then_entry: usize, else_entry: usize) -> Option<usize> {
+    fn ternary_restore(
+        &mut self,
+        cond: &Expr,
+        then_entry: usize,
+        else_entry: usize,
+    ) -> Option<usize> {
         let then_body = self.block_body(then_entry);
         let else_body = self.block_body(else_entry);
         if then_body.len() != 1 || else_body.len() != 1 {
@@ -872,7 +889,9 @@ impl<'f> BodyDecompiler<'f> {
         self.scanner.scan_linear(&then_body);
         let then_clean = self.scanner.out_is_empty();
         let then_reg = then_inst.operands.first().copied();
-        let then_expr = then_reg.filter(|reg| *reg > 0).map(|reg| self.scanner.reg_expr(reg));
+        let then_expr = then_reg
+            .filter(|reg| *reg > 0)
+            .map(|reg| self.scanner.reg_expr(reg));
         let else_inst = else_body[0].clone();
         self.scanner.scan_linear(&else_body);
         let else_clean = self.scanner.out_is_empty();
@@ -951,12 +970,15 @@ impl<'f> BodyDecompiler<'f> {
     ) -> Option<Vec<Stmt>> {
         let mut stop = ctx.stop.clone();
         stop.insert(then_entry);
-        let (stmts, end) = self.seq(else_entry, &SeqCtx {
-            stop,
-            loop_ctx: ctx.loop_ctx,
-            suppress_loop_at_entry: false,
-            suppress_try_at_entry: false,
-        });
+        let (stmts, end) = self.seq(
+            else_entry,
+            &SeqCtx {
+                stop,
+                loop_ctx: ctx.loop_ctx,
+                suppress_loop_at_entry: false,
+                suppress_try_at_entry: false,
+            },
+        );
         match end {
             SeqEnd::StoppedAt(block) | SeqEnd::Jumped(block) if block == then_entry => Some(stmts),
             _ => None,
@@ -983,10 +1005,7 @@ impl<'f> BodyDecompiler<'f> {
             let if_stmt = Stmt::new(
                 StmtKind::If {
                     condition: negate_condition(cond),
-                    then_branch: Box::new(Stmt::new(
-                        StmtKind::Block(guard_stmts),
-                        Span::empty(0),
-                    )),
+                    then_branch: Box::new(Stmt::new(StmtKind::Block(guard_stmts), Span::empty(0))),
                     else_branch: None,
                 },
                 Span::empty(0),
@@ -1004,12 +1023,15 @@ impl<'f> BodyDecompiler<'f> {
         if let Some(merge) = mirror_merge {
             then_stop.insert(merge);
         }
-        let (mut then_stmts, mut then_end) = self.seq(then_entry, &SeqCtx {
-            stop: then_stop.clone(),
-            loop_ctx: ctx.loop_ctx,
-            suppress_loop_at_entry: false,
-            suppress_try_at_entry: false,
-        });
+        let (mut then_stmts, mut then_end) = self.seq(
+            then_entry,
+            &SeqCtx {
+                stop: then_stop.clone(),
+                loop_ctx: ctx.loop_ctx,
+                suppress_loop_at_entry: false,
+                suppress_try_at_entry: false,
+            },
+        );
         // The then branch can dispatch forward within its own region
         // (official `typeof` pre-checks, switch-style dispatch): follow
         // strictly-internal forward jumps before matching the branch end. A
@@ -1025,12 +1047,15 @@ impl<'f> BodyDecompiler<'f> {
             if real == end && end >= else_entry {
                 break;
             }
-            let (more, end2) = self.seq(real, &SeqCtx {
-                stop: then_stop.clone(),
-                loop_ctx: ctx.loop_ctx,
-                suppress_loop_at_entry: false,
-                suppress_try_at_entry: false,
-            });
+            let (more, end2) = self.seq(
+                real,
+                &SeqCtx {
+                    stop: then_stop.clone(),
+                    loop_ctx: ctx.loop_ctx,
+                    suppress_loop_at_entry: false,
+                    suppress_try_at_entry: false,
+                },
+            );
             then_stmts.extend(more);
             then_end = end2;
         }
@@ -1043,12 +1068,15 @@ impl<'f> BodyDecompiler<'f> {
             SeqEnd::StoppedAt(block)
                 if block == then_entry && block != else_entry && ctx.stop.contains(&block) =>
             {
-                let (else_stmts, else_end) = self.seq(else_entry, &SeqCtx {
-                    stop: ctx.stop.clone(),
-                    loop_ctx: ctx.loop_ctx,
-                    suppress_loop_at_entry: false,
-                    suppress_try_at_entry: false,
-                });
+                let (else_stmts, else_end) = self.seq(
+                    else_entry,
+                    &SeqCtx {
+                        stop: ctx.stop.clone(),
+                        loop_ctx: ctx.loop_ctx,
+                        suppress_loop_at_entry: false,
+                        suppress_try_at_entry: false,
+                    },
+                );
                 if !matches!(
                     else_end,
                     SeqEnd::StoppedAt(block) | SeqEnd::Jumped(block) if block == then_entry
@@ -1087,15 +1115,16 @@ impl<'f> BodyDecompiler<'f> {
             }
             // The else side jumps forward to the merge right after the then
             // side: an if-else whose then falls into the merge.
-            SeqEnd::StoppedAt(block)
-                if mirror_merge == Some(block) && block != else_entry =>
-            {
-                let (else_stmts, else_end) = self.seq(else_entry, &SeqCtx {
-                    stop: BTreeSet::from([block]),
-                    loop_ctx: ctx.loop_ctx,
-                    suppress_loop_at_entry: false,
-                    suppress_try_at_entry: false,
-                });
+            SeqEnd::StoppedAt(block) if mirror_merge == Some(block) && block != else_entry => {
+                let (else_stmts, else_end) = self.seq(
+                    else_entry,
+                    &SeqCtx {
+                        stop: BTreeSet::from([block]),
+                        loop_ctx: ctx.loop_ctx,
+                        suppress_loop_at_entry: false,
+                        suppress_try_at_entry: false,
+                    },
+                );
                 if !matches!(
                     else_end,
                     SeqEnd::StoppedAt(block2) | SeqEnd::Jumped(block2) if block2 == block
@@ -1164,15 +1193,20 @@ impl<'f> BodyDecompiler<'f> {
                 let mut cursor = else_entry;
                 let mut hopped = BTreeSet::new();
                 let else_end = loop {
-                    let (more, end) = self.seq(cursor, &SeqCtx {
-                        stop: else_stop.clone(),
-                        loop_ctx: ctx.loop_ctx,
-                        suppress_loop_at_entry: false,
-                        suppress_try_at_entry: false,
-                    });
+                    let (more, end) = self.seq(
+                        cursor,
+                        &SeqCtx {
+                            stop: else_stop.clone(),
+                            loop_ctx: ctx.loop_ctx,
+                            suppress_loop_at_entry: false,
+                            suppress_try_at_entry: false,
+                        },
+                    );
                     else_stmts.extend(more);
                     match end {
-                        SeqEnd::Jumped(next) if next != merge && next > cursor && hopped.insert(next) => {
+                        SeqEnd::Jumped(next)
+                            if next != merge && next > cursor && hopped.insert(next) =>
+                        {
                             cursor = next;
                         }
                         other => break other,
@@ -1214,16 +1248,21 @@ impl<'f> BodyDecompiler<'f> {
             SeqEnd::Jumped(end)
                 if end != usize::MAX
                     && end < else_entry
-                    && ctx.loop_ctx.is_some_and(|loop_ctx| loop_ctx.continue_target == end) =>
+                    && ctx
+                        .loop_ctx
+                        .is_some_and(|loop_ctx| loop_ctx.continue_target == end) =>
             {
                 let mut else_stop = ctx.stop.clone();
                 else_stop.insert(end);
-                let (else_stmts, else_end) = self.seq(else_entry, &SeqCtx {
-                    stop: else_stop,
-                    loop_ctx: ctx.loop_ctx,
-                    suppress_loop_at_entry: false,
-                    suppress_try_at_entry: false,
-                });
+                let (else_stmts, else_end) = self.seq(
+                    else_entry,
+                    &SeqCtx {
+                        stop: else_stop,
+                        loop_ctx: ctx.loop_ctx,
+                        suppress_loop_at_entry: false,
+                        suppress_try_at_entry: false,
+                    },
+                );
                 let next = match else_end {
                     SeqEnd::StoppedAt(block) | SeqEnd::Jumped(block)
                         if block == end || ctx.stop.contains(&block) =>
@@ -1254,7 +1293,10 @@ impl<'f> BodyDecompiler<'f> {
                 let if_stmt = Stmt::new(
                     StmtKind::If {
                         condition: cond,
-                        then_branch: Box::new(Stmt::new(StmtKind::Block(then_stmts), Span::empty(0))),
+                        then_branch: Box::new(Stmt::new(
+                            StmtKind::Block(then_stmts),
+                            Span::empty(0),
+                        )),
                         else_branch: Some(Box::new(Stmt::new(
                             StmtKind::Block(else_stmts),
                             Span::empty(0),
@@ -1304,20 +1346,27 @@ impl<'f> BodyDecompiler<'f> {
         let sources = self.back_edges.get(&index)?.clone();
         let tail = sources.iter().copied().max()?;
 
-        if let Term::Cond { target, jump_if_true } = self.blocks[tail].term {
+        if let Term::Cond {
+            target,
+            jump_if_true,
+        } = self.blocks[tail].term
+        {
             if target == index && jump_if_true && !matches!(header_term, Term::Cond { .. }) {
                 let (prelude, cond, _, _) = self.cond_info(tail);
                 let mut stop = BTreeSet::new();
                 stop.insert(tail);
-                let (body, _) = self.seq(index, &SeqCtx {
-                    stop,
-                    loop_ctx: Some(LoopCtx {
-                        exit: tail + 1,
-                        continue_target: tail,
-                    }),
-                    suppress_loop_at_entry: true,
-                    suppress_try_at_entry: false,
-                });
+                let (body, _) = self.seq(
+                    index,
+                    &SeqCtx {
+                        stop,
+                        loop_ctx: Some(LoopCtx {
+                            exit: tail + 1,
+                            continue_target: tail,
+                        }),
+                        suppress_loop_at_entry: true,
+                        suppress_try_at_entry: false,
+                    },
+                );
                 let stmt = Stmt::new(
                     StmtKind::DoWhile {
                         body: Box::new(Stmt::new(StmtKind::Block(body), Span::empty(0))),
@@ -1334,15 +1383,18 @@ impl<'f> BodyDecompiler<'f> {
         if !matches!(header_term, Term::Cond { .. }) {
             let mut stop = BTreeSet::new();
             stop.insert(tail);
-            let (body, _) = self.seq(index, &SeqCtx {
-                stop,
-                loop_ctx: Some(LoopCtx {
-                    exit: tail + 1,
-                    continue_target: index,
-                }),
-                suppress_loop_at_entry: true,
-                suppress_try_at_entry: false,
-            });
+            let (body, _) = self.seq(
+                index,
+                &SeqCtx {
+                    stop,
+                    loop_ctx: Some(LoopCtx {
+                        exit: tail + 1,
+                        continue_target: index,
+                    }),
+                    suppress_loop_at_entry: true,
+                    suppress_try_at_entry: false,
+                },
+            );
             let cond = Expr::new(ExprKind::Bool(true), Span::empty(0));
             let stmt = Stmt::new(
                 StmtKind::While {
@@ -1396,15 +1448,18 @@ impl<'f> BodyDecompiler<'f> {
         let body_end = post_block.unwrap_or(tail);
         let mut stop = BTreeSet::new();
         stop.insert(body_end);
-        let (mut body, _) = self.seq(body_entry, &SeqCtx {
-            stop,
-            loop_ctx: Some(LoopCtx {
-                exit,
-                continue_target,
-            }),
-            suppress_loop_at_entry: false,
-            suppress_try_at_entry: false,
-        });
+        let (mut body, _) = self.seq(
+            body_entry,
+            &SeqCtx {
+                stop,
+                loop_ctx: Some(LoopCtx {
+                    exit,
+                    continue_target,
+                }),
+                suppress_loop_at_entry: false,
+                suppress_try_at_entry: false,
+            },
+        );
         if post_block.is_none() {
             let tail_body = self.block_body(tail);
             self.scanner.scan_linear(&tail_body);
@@ -1421,10 +1476,12 @@ impl<'f> BodyDecompiler<'f> {
                 self.scanner.materialize = saved;
                 let post_out = self.scanner.take_out();
                 let step = match post_out.as_slice() {
-                    [Stmt {
-                        kind: StmtKind::Expr(expr),
-                        ..
-                    }] => Some(expr.clone()),
+                    [
+                        Stmt {
+                            kind: StmtKind::Expr(expr),
+                            ..
+                        },
+                    ] => Some(expr.clone()),
                     _ => None,
                 };
                 Stmt::new(
@@ -1469,7 +1526,9 @@ impl<'f> BodyDecompiler<'f> {
                 .into_iter()
                 .find(|inst| inst.opcode != 1);
             match first {
-                Some(inst) if inst.opcode == 7 && inst.operands[0] == anchor => return Some(anchor),
+                Some(inst) if inst.opcode == 7 && inst.operands[0] == anchor => {
+                    return Some(anchor);
+                }
                 None if matches!(self.blocks[test].term, Term::Fall) => test += 1,
                 _ => return None,
             }
@@ -1504,10 +1563,7 @@ impl<'f> BodyDecompiler<'f> {
         let mut test = test_block;
         let terminal = loop {
             let mut eval_insts = Vec::new();
-            while self
-                .block_body(test)
-                .iter()
-                .all(|inst| inst.opcode == 1)
+            while self.block_body(test).iter().all(|inst| inst.opcode == 1)
                 && matches!(self.blocks[test].term, Term::Fall)
             {
                 eval_insts.extend(self.block_body(test));
@@ -1590,12 +1646,15 @@ impl<'f> BodyDecompiler<'f> {
             let next_entry = entries.get(index + 1).copied().unwrap_or(exit);
             let mut stop = BTreeSet::from([next_entry, exit]);
             stop.remove(body_entry);
-            let (mut body, end) = self.seq(*body_entry, &SeqCtx {
-                stop,
-                loop_ctx: ctx.loop_ctx,
-                suppress_loop_at_entry: false,
-            suppress_try_at_entry: false,
-            });
+            let (mut body, end) = self.seq(
+                *body_entry,
+                &SeqCtx {
+                    stop,
+                    loop_ctx: ctx.loop_ctx,
+                    suppress_loop_at_entry: false,
+                    suppress_try_at_entry: false,
+                },
+            );
             // A jump to the exit is the case's `break`; TJS2 switch falls
             // through by default, so preserve it explicitly.
             match end {
@@ -1614,12 +1673,15 @@ impl<'f> BodyDecompiler<'f> {
         if let Some(default_body) = default_body {
             let mut stop = BTreeSet::from([exit]);
             stop.remove(&default_body);
-            let (default_stmts, _) = self.seq(default_body, &SeqCtx {
-                stop,
-                loop_ctx: ctx.loop_ctx,
-                suppress_loop_at_entry: false,
-            suppress_try_at_entry: false,
-            });
+            let (default_stmts, _) = self.seq(
+                default_body,
+                &SeqCtx {
+                    stop,
+                    loop_ctx: ctx.loop_ctx,
+                    suppress_loop_at_entry: false,
+                    suppress_try_at_entry: false,
+                },
+            );
             switch_cases.push(syntax::SwitchCase {
                 test: None,
                 body: default_stmts,
@@ -1656,13 +1718,21 @@ impl<'f> BodyDecompiler<'f> {
         // the first `extry` block in that case.
         let mut tail = None;
         for block in index..catch {
-            if self.block_insts(block).iter().any(|inst| inst.opcode == 121) {
+            if self
+                .block_insts(block)
+                .iter()
+                .any(|inst| inst.opcode == 121)
+            {
                 tail = Some(block);
             }
         }
         if tail.is_none() {
             for block in catch..self.blocks.len() {
-                if self.block_insts(block).iter().any(|inst| inst.opcode == 121) {
+                if self
+                    .block_insts(block)
+                    .iter()
+                    .any(|inst| inst.opcode == 121)
+                {
                     tail = Some(block);
                     break;
                 }
@@ -1678,12 +1748,15 @@ impl<'f> BodyDecompiler<'f> {
 
         let mut stop = BTreeSet::new();
         stop.insert(tail);
-        let (mut body, _) = self.seq(index, &SeqCtx {
-            stop,
-            loop_ctx: ctx.loop_ctx,
-            suppress_loop_at_entry: false,
-            suppress_try_at_entry: true,
-        });
+        let (mut body, _) = self.seq(
+            index,
+            &SeqCtx {
+                stop,
+                loop_ctx: ctx.loop_ctx,
+                suppress_loop_at_entry: false,
+                suppress_try_at_entry: true,
+            },
+        );
         let tail_body = self.block_body(tail);
         self.scanner.scan_linear(&tail_body);
         body.extend(self.scanner.take_out());
@@ -1727,12 +1800,15 @@ impl<'f> BodyDecompiler<'f> {
 
         let mut catch_stop = BTreeSet::new();
         catch_stop.insert(end);
-        let (rest, catch_end) = self.seq(catch + 1, &SeqCtx {
-            stop: catch_stop,
-            loop_ctx: ctx.loop_ctx,
-            suppress_loop_at_entry: false,
-            suppress_try_at_entry: false,
-        });
+        let (rest, catch_end) = self.seq(
+            catch + 1,
+            &SeqCtx {
+                stop: catch_stop,
+                loop_ctx: ctx.loop_ctx,
+                suppress_loop_at_entry: false,
+                suppress_try_at_entry: false,
+            },
+        );
         catch_stmts.extend(rest);
         // The catch may end by reaching the continuation (in layout order,
         // via a jump to it, or by returning/throwing); the try body still
@@ -1904,8 +1980,9 @@ mod tests {
             decompile("var i = 0; while (i < 9) { i++; if (i > 3) { break; } }");
         assert_eq!(unhandled, 0, "{text}");
         assert!(text.contains("break;"), "{text}");
-        let (text, unhandled) =
-            decompile("var s = 0; for (var j = 0; j < 5; j++) { if (j == 2) { continue; } s += j; } return s;");
+        let (text, unhandled) = decompile(
+            "var s = 0; for (var j = 0; j < 5; j++) { if (j == 2) { continue; } s += j; } return s;",
+        );
         assert_eq!(unhandled, 0, "{text}");
         assert!(text.contains("continue;"), "{text}");
     }

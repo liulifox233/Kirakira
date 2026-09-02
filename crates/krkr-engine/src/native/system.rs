@@ -11,6 +11,8 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     let system = install_static_object(runtime, "System");
     for method in [
         "assignMessage",
+        // addFont is implemented below; keep the remaining legacy methods as
+        // observable stubs for compatibility diagnostics.
         "doCompact",
         "system",
         "readRegValue",
@@ -43,6 +45,7 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(system, "toActualColor", first_arg_or_void);
     runtime.register_object_native(system, "createUUID", system_create_uuid);
     runtime.register_object_native(system, "getArgument", system_get_argument);
+    runtime.register_object_native(system, "addFont", system_add_font);
 
     for (name, value) in [
         ("versionString", Variant::String("Kirakira".to_string())),
@@ -93,6 +96,13 @@ fn data_path(runtime: &Runtime<KrkrHost>) -> String {
     // would mangle it into `<root>/<root>/savedata/...`.  Returning the
     // project-relative form keeps that heuristic working.
     let Some(path) = runtime.host().data_path() else {
+        // Browser projects have no native root, but their persistent storage
+        // still lives under the same relative KRKR data path. Keeping this
+        // relative is what lets ProjectStorage's memory overlay capture
+        // `datasu.ksd` instead of attempting to write `/datasu.ksd`.
+        #[cfg(target_arch = "wasm32")]
+        return "savedata/".to_string();
+        #[cfg(not(target_arch = "wasm32"))]
         return temp_path();
     };
 
@@ -109,6 +119,14 @@ fn data_path(runtime: &Runtime<KrkrHost>) -> String {
 }
 
 fn temp_path() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // WASM has no process filesystem. Keep the TVP path contract stable
+        // with a virtual root; browser hosts can map writes to IndexedDB or a
+        // downloaded save package later.
+        return "/".to_string();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     format!("{}/", std::env::temp_dir().display())
 }
 
@@ -284,4 +302,30 @@ fn system_get_argument(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Void)
+}
+
+fn system_add_font(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_else(|| "web-font".to_string());
+    let bytes = match args.get(1) {
+        Some(Variant::Octet(bytes)) => bytes.clone(),
+        Some(value) => value.to_tjs_string()?.into_bytes(),
+        None => Vec::new(),
+    };
+    if bytes.is_empty() {
+        return Ok(Variant::Integer(0));
+    }
+    runtime
+        .host_mut()
+        .font_system_mut()
+        .load_font_data(name, bytes)
+        .map(|_| Variant::Integer(1))
+        .map_err(TjsError::runtime)
 }

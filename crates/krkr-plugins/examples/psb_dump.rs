@@ -33,7 +33,9 @@ fn print_value(value: &PsbValue, depth: usize, max_depth: usize, name: &str) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: psb_dump <file> [depth]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: psb_dump <file> [depth]");
     let max_depth: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())

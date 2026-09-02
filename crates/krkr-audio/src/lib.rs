@@ -1,7 +1,7 @@
+#[cfg(feature = "opus")]
+use std::convert::TryFrom;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    convert::TryFrom,
-    error::Error,
     fmt,
     io::{self, Read, Seek, SeekFrom},
     sync::{Arc, Mutex, mpsc},
@@ -9,23 +9,32 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "opus")]
 use audiopus::{
     Channels as OpusChannels, MutSignals, SampleRate as OpusSampleRate,
     coder::Decoder as OpusDecoder, packet::Packet as OpusPacket,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use kira::sound::streaming::{StreamingSoundData, StreamingSoundHandle};
 use kira::{
-    AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Frame, Tween,
+    AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Tween,
     sound::{
-        FromFileError, PlaybackState,
-        static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
-        streaming::{StreamingSoundData, StreamingSoundHandle},
+        PlaybackState,
+        static_sound::{StaticSoundData, StaticSoundHandle},
     },
     track::{TrackBuilder, TrackHandle},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use kira::{Frame, sound::FromFileError};
 use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, PcmStreamSource,
-    ResourceProvider, ResourceStream,
+    ResourceStream, StoragePort,
 };
+pub use krkr_core::{
+    AudioError, AudioEvent, AudioSink, AudioState, AudioStatusEvent, AudioStatusLevel,
+};
+use symphonia::core::io::MediaSource;
+#[cfg(feature = "opus")]
 use symphonia::core::{
     codecs::CODEC_TYPE_OPUS,
     errors::Error as SymphoniaError,
@@ -35,57 +44,6 @@ use symphonia::core::{
 const STATIC_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const STATIC_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const PRELOAD_MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioState {
-    Stopped,
-    Ready,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioStatusLevel {
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AudioStatusEvent {
-    pub level: AudioStatusLevel,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AudioEvent {
-    Status(AudioStatusEvent),
-    PlaybackStopped { id: AudioInstanceId },
-}
-
-#[derive(Debug)]
-pub enum AudioError {
-    BackendUnavailable(String),
-    WorkerUnavailable(String),
-    CommandFailed(String),
-    PlaybackFailed { storage: String, message: String },
-}
-
-impl fmt::Display for AudioError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BackendUnavailable(message) => {
-                write!(formatter, "audio backend is unavailable: {message}")
-            }
-            Self::WorkerUnavailable(message) => {
-                write!(formatter, "audio worker stopped: {message}")
-            }
-            Self::CommandFailed(message) => write!(formatter, "audio command failed: {message}"),
-            Self::PlaybackFailed { storage, message } => {
-                write!(formatter, "failed to play audio `{storage}`: {message}")
-            }
-        }
-    }
-}
-
-impl Error for AudioError {}
 
 pub struct AudioSystem {
     state: AudioState,
@@ -114,6 +72,7 @@ enum PlayingSound {
         bus: AudioBus,
         handle: StaticSoundHandle,
     },
+    #[cfg(not(target_arch = "wasm32"))]
     Streaming {
         bus: AudioBus,
         handle: StreamingSoundHandle<FromFileError>,
@@ -122,12 +81,13 @@ enum PlayingSound {
 
 enum PreparedSound {
     Static(StaticSoundData),
+    #[cfg(not(target_arch = "wasm32"))]
     Streaming(StreamingSoundData<FromFileError>),
 }
 
 enum ControlMessage {
     Command(AudioCommand),
-    SetResourceProvider(Option<Arc<dyn ResourceProvider>>),
+    SetResourceProvider(Option<Arc<dyn StoragePort>>),
     Prepared(Box<PreparedAudio>),
     Shutdown,
 }
@@ -140,7 +100,7 @@ enum LoaderMessage {
 struct LoadRequest {
     source: AudioSourceRef,
     load_policy: AudioLoadPolicy,
-    provider: Arc<dyn ResourceProvider>,
+    provider: Arc<dyn StoragePort>,
     provider_epoch: u64,
     provider_revision: u64,
     kind: LoadRequestKind,
@@ -265,7 +225,7 @@ impl AudioSystem {
 
     pub fn set_resource_provider(
         &mut self,
-        provider: Option<Arc<dyn ResourceProvider>>,
+        provider: Option<Arc<dyn StoragePort>>,
     ) -> Result<(), AudioError> {
         self.send_control(ControlMessage::SetResourceProvider(provider))
     }
@@ -309,6 +269,58 @@ impl AudioSystem {
             self.state = AudioState::Stopped;
             AudioError::CommandFailed(error.to_string())
         })
+    }
+}
+
+impl AudioSink for AudioSystem {
+    fn prepare(&mut self) -> Result<(), AudioError> {
+        AudioSystem::prepare(self)
+    }
+
+    fn submit(&mut self, commands: &[AudioCommand]) -> Result<(), AudioError> {
+        self.submit_commands(commands.iter().cloned())
+    }
+
+    fn poll_events(&mut self) -> Vec<AudioEvent> {
+        self.drain_events()
+    }
+}
+
+/// Deterministic sink used by headless tools and tests. It intentionally does
+/// not decode or play anything; callers can inspect submitted commands and
+/// inject completion events explicitly.
+#[derive(Clone, Debug, Default)]
+pub struct VirtualAudioSink {
+    commands: Vec<AudioCommand>,
+    events: Vec<AudioEvent>,
+}
+
+impl VirtualAudioSink {
+    pub fn commands(&self) -> &[AudioCommand] {
+        &self.commands
+    }
+
+    pub fn take_commands(&mut self) -> Vec<AudioCommand> {
+        std::mem::take(&mut self.commands)
+    }
+
+    pub fn push_event(&mut self, event: AudioEvent) {
+        self.events.push(event);
+    }
+}
+
+impl AudioSink for VirtualAudioSink {
+    fn prepare(&mut self) -> Result<(), AudioError> {
+        Ok(())
+    }
+
+    fn submit(&mut self, commands: &[AudioCommand]) -> Result<(), AudioError> {
+        self.commands.extend_from_slice(commands);
+        Ok(())
+    }
+
+    fn poll_events(&mut self) -> Vec<AudioEvent> {
+        std::mem::take(&mut self.events)
     }
 }
 
@@ -394,7 +406,7 @@ fn audio_control_worker(
 
 struct ControlContext<'a> {
     backend: &'a mut KiraBackend,
-    provider: Option<Arc<dyn ResourceProvider>>,
+    provider: Option<Arc<dyn StoragePort>>,
     provider_epoch: u64,
     next_generation: &'a mut u64,
     slots: &'a mut BTreeMap<AudioInstanceId, SoundSlot>,
@@ -876,6 +888,7 @@ fn should_preload_static(request: &LoadRequest) -> Result<bool, AudioLoadFailure
         .is_none_or(|len| len <= PRELOAD_MAX_SOURCE_BYTES))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_streaming_or_opus_sound(request: LoadRequest) -> Result<PreparedSound, AudioLoadFailure> {
     match load_streaming_sound(&request) {
         Ok(data) => Ok(PreparedSound::Streaming(data)),
@@ -885,6 +898,15 @@ fn load_streaming_or_opus_sound(request: LoadRequest) -> Result<PreparedSound, A
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn load_streaming_or_opus_sound(request: LoadRequest) -> Result<PreparedSound, AudioLoadFailure> {
+    Err(AudioLoadFailure {
+        storage: request.source.storage().to_string(),
+        message: "streaming audio is provided by the browser Web Audio adapter".to_string(),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn load_streaming_sound(
     request: &LoadRequest,
 ) -> Result<StreamingSoundData<FromFileError>, AudioLoadFailure> {
@@ -907,22 +929,25 @@ fn load_streaming_sound(
 /// kira streaming decoder that pulls PCM chunks from a live channel fed by
 /// an external decoder (movie soundtracks decoded by krkr-video). The video
 /// container never enters the audio file loaders.
+#[cfg(not(target_arch = "wasm32"))]
 struct ChannelPcmDecoder {
     spec: krkr_core::PcmAudioSpec,
     total_frames: usize,
-    receiver: Arc<Mutex<mpsc::Receiver<krkr_core::PcmAudioChunk>>>,
+    stream: Arc<Mutex<Box<dyn krkr_core::PcmStream>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ChannelPcmDecoder {
     fn new(source: PcmStreamSource) -> Self {
         Self {
             spec: source.spec,
             total_frames: source.total_frames as usize,
-            receiver: source.receiver,
+            stream: source.stream,
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl kira::sound::streaming::Decoder for ChannelPcmDecoder {
     type Error = FromFileError;
 
@@ -936,10 +961,10 @@ impl kira::sound::streaming::Decoder for ChannelPcmDecoder {
 
     fn decode(&mut self) -> Result<Vec<Frame>, FromFileError> {
         let chunk = self
-            .receiver
+            .stream
             .lock()
             .ok()
-            .and_then(|rx| rx.recv_timeout(Duration::from_secs(2)).ok());
+            .and_then(|mut stream| stream.next_chunk());
         let Some(chunk) = chunk else {
             // Producer closed (end of stream) or stalled: emit silence so
             // kira's decode loop never spins on empty chunks. The transport
@@ -967,6 +992,7 @@ impl kira::sound::streaming::Decoder for ChannelPcmDecoder {
     }
 }
 
+#[cfg(feature = "opus")]
 fn load_opus_static_sound(request: &LoadRequest) -> Result<StaticSoundData, String> {
     let stream = request
         .provider
@@ -1035,9 +1061,14 @@ fn load_opus_static_sound(request: &LoadRequest) -> Result<StaticSoundData, Stri
     Ok(StaticSoundData {
         sample_rate: 48_000,
         frames: frames.into(),
-        settings: StaticSoundSettings::default(),
+        settings: kira::sound::static_sound::StaticSoundSettings::default(),
         slice: None,
     })
+}
+
+#[cfg(not(feature = "opus"))]
+fn load_opus_static_sound(_request: &LoadRequest) -> Result<StaticSoundData, String> {
+    Err("Opus decoding is disabled; enable the `opus` feature for native builds".to_string())
 }
 
 fn resolve_play_policy(policy: AudioLoadPolicy, bus: AudioBus, looping: bool) -> AudioLoadPolicy {
@@ -1106,6 +1137,7 @@ impl KiraBackend {
                     handle,
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             PreparedSound::Streaming(data) => {
                 let mut data = data.volume(db);
                 if request.looping {
@@ -1133,6 +1165,7 @@ impl KiraBackend {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn play_pcm_stream(
         &mut self,
         id: AudioInstanceId,
@@ -1155,6 +1188,19 @@ impl KiraBackend {
         self.handles
             .insert(id, PlayingSound::Streaming { bus, handle });
         Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn play_pcm_stream(
+        &mut self,
+        _id: AudioInstanceId,
+        _bus: AudioBus,
+        _source: PcmStreamSource,
+        _volume: f32,
+    ) -> Result<(), AudioError> {
+        Err(AudioError::CommandFailed(
+            "PCM streams require the browser Web Audio adapter".to_string(),
+        ))
     }
 
     fn stop_id(&mut self, id: AudioInstanceId, tween: Tween) {
@@ -1234,13 +1280,16 @@ impl KiraBackend {
 impl PlayingSound {
     fn bus(&self) -> AudioBus {
         match self {
-            Self::Static { bus, .. } | Self::Streaming { bus, .. } => *bus,
+            Self::Static { bus, .. } => *bus,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Streaming { bus, .. } => *bus,
         }
     }
 
     fn stop(&mut self, tween: Tween) {
         match self {
             Self::Static { handle, .. } => handle.stop(tween),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Streaming { handle, .. } => handle.stop(tween),
         }
     }
@@ -1248,6 +1297,7 @@ impl PlayingSound {
     fn state(&self) -> PlaybackState {
         match self {
             Self::Static { handle, .. } => handle.state(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Streaming { handle, .. } => handle.state(),
         }
     }
@@ -1255,6 +1305,7 @@ impl PlayingSound {
     fn set_volume(&mut self, volume: Decibels, tween: Tween) {
         match self {
             Self::Static { handle, .. } => handle.set_volume(volume, tween),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Streaming { handle, .. } => handle.set_volume(volume, tween),
         }
     }
@@ -1262,6 +1313,7 @@ impl PlayingSound {
     fn pause(&mut self, tween: Tween) {
         match self {
             Self::Static { handle, .. } => handle.pause(tween),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Streaming { handle, .. } => handle.pause(tween),
         }
     }
@@ -1269,6 +1321,7 @@ impl PlayingSound {
     fn resume(&mut self, tween: Tween) {
         match self {
             Self::Static { handle, .. } => handle.resume(tween),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Streaming { handle, .. } => handle.resume(tween),
         }
     }

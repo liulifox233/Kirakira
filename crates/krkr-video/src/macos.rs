@@ -3,8 +3,12 @@
 //! Decoded frames come out of `CVPixelBuffer` in 32-bit BGRA and are copied
 //! row-wise into engine-owned buffers, honouring the pixel buffer stride.
 
-use std::path::Path;
 use std::ptr::NonNull;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use objc2::{AllocAnyThread as _, rc::Retained, runtime::AnyObject};
 use objc2_av_foundation::{
@@ -22,9 +26,16 @@ use objc2_core_video::{
 };
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 
-use crate::{AudioChunk, AudioSpec, VideoDecoder, VideoError, VideoFrame, VideoMetadata};
+use crate::{
+    AudioChunk, AudioSpec, VideoDecoder, VideoError, VideoFrame, VideoMetadata, VideoSource,
+};
 
 pub struct AvfDecoder {
+    /// Bytes-backed sources are staged by this backend only because the
+    /// current AVFoundation bindings expose URL assets. Keeping ownership
+    /// here (rather than in VideoOverlay) leaves mobile/browser backends free
+    /// to use in-memory/native media APIs without temporary files.
+    owned_path: Option<PathBuf>,
     asset: Retained<AVURLAsset>,
     track: Retained<objc2_av_foundation::AVAssetTrack>,
     audio_track: Option<Retained<objc2_av_foundation::AVAssetTrack>>,
@@ -37,7 +48,31 @@ pub struct AvfDecoder {
 }
 
 impl AvfDecoder {
-    pub fn open(path: &Path) -> Result<Self, VideoError> {
+    pub fn open(source: VideoSource) -> Result<Self, VideoError> {
+        let (path, owned_path) = match source {
+            VideoSource::Path(path) => (path, None),
+            VideoSource::Bytes { data, name } => {
+                let extension = sniff_video_extension(&data, name.as_deref());
+                let path = stage_bytes(&data, &extension)?;
+                (path.clone(), Some(path))
+            }
+        };
+        let result = Self::open_path(&path);
+        match result {
+            Ok(mut decoder) => {
+                decoder.owned_path = owned_path;
+                Ok(decoder)
+            }
+            Err(error) => {
+                if let Some(path) = owned_path {
+                    let _ = fs::remove_file(path);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn open_path(path: &Path) -> Result<Self, VideoError> {
         let url = NSURL::from_file_path(path)
             .ok_or_else(|| VideoError::Open(format!("invalid path {}", path.display())))?;
         let asset = unsafe { AVURLAsset::assetWithURL(&url) };
@@ -86,6 +121,7 @@ impl AvfDecoder {
         };
         let output_settings = bgra_output_settings();
         let mut decoder = Self {
+            owned_path: None,
             asset,
             track,
             audio_track,
@@ -148,7 +184,7 @@ impl AvfDecoder {
             let message = unsafe { reader.error() }
                 .map(|error| {
                     let description = error.localizedDescription().to_string();
-                    match unsafe { error.localizedFailureReason() } {
+                    match error.localizedFailureReason() {
                         Some(reason) => format!("{description} ({reason})"),
                         None => description,
                     }
@@ -163,6 +199,53 @@ impl AvfDecoder {
         self.audio_output = audio_output;
         Ok(())
     }
+}
+
+impl Drop for AvfDecoder {
+    fn drop(&mut self) {
+        if let Some(path) = self.owned_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn sniff_video_extension(bytes: &[u8], name: Option<&str>) -> String {
+    const ASF_GUID: &[u8] = &[
+        0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE,
+        0x6C,
+    ];
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return ".mp4".to_string();
+    }
+    if bytes.starts_with(ASF_GUID) {
+        return ".wmv".to_string();
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"AVI " {
+        return ".avi".to_string();
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0xBA]) {
+        return ".mpg".to_string();
+    }
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return ".webm".to_string();
+    }
+    name.and_then(|name| Path::new(name).extension().and_then(|ext| ext.to_str()))
+        .map(|ext| format!(".{ext}"))
+        .unwrap_or_else(|| ".mp4".to_string())
+}
+
+fn stage_bytes(bytes: &[u8], extension: &str) -> Result<PathBuf, VideoError> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "krkr-video-{}-{}{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+        extension
+    ));
+    fs::write(&path, bytes).map_err(|error| {
+        VideoError::Open(format!("cannot stage video for AVFoundation: {error}"))
+    })?;
+    Ok(path)
 }
 
 fn bgra_output_settings() -> Retained<NSDictionary<NSString, AnyObject>> {

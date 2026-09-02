@@ -14,6 +14,8 @@ mod text_render;
 mod win32_dialog;
 mod window_ex;
 
+use std::collections::BTreeSet;
+
 use krkr_engine::KrkrEngine;
 
 pub use add_font::AddFontPlugin;
@@ -148,21 +150,81 @@ pub const IMPLEMENTED_MAPPINGS: &[PluginMapping] = &[
 ];
 
 pub fn register_reference_plugins(engine: &mut KrkrEngine) -> krkr_tjs2::Result<()> {
-    engine.register_plugin(AddFontPlugin)?;
-    engine.register_plugin(MotionPlayerPlugin)?;
-    engine.register_plugin(Win32DialogPlugin)?;
-    engine.register_plugin(WindowExPlugin)?;
-    engine.register_plugin(JsonPlugin)?;
-    engine.register_plugin(PackinOnePlugin)?;
-    engine.register_plugin(LayerExDrawPlugin)?;
-    engine.register_plugin(TextRenderPlugin)?;
-    engine.register_plugin(PsbFilePlugin)?;
-    engine.register_plugin(AlphaMoviePlugin)?;
-    engine.register_plugin(GetSamplePlugin)?;
-    engine.register_plugin(KagParserExPlugin)?;
-    engine.register_plugin(ExtransPlugin)?;
-    engine.register_plugin(ExtNaganoPlugin)?;
-    engine.register_plugin(LzfsPlugin)?;
+    register_profile_plugins(engine, &GameProfile::all())
+}
+
+/// Declares the compatibility capabilities a game actually needs. Hosts can
+/// construct this from a package manifest or a known title profile instead of
+/// linking/initialising every marker plugin on every platform.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameProfile {
+    plugins: BTreeSet<String>,
+    allow_all: bool,
+}
+
+impl Default for GameProfile {
+    fn default() -> Self {
+        Self {
+            plugins: BTreeSet::new(),
+            allow_all: true,
+        }
+    }
+}
+
+impl GameProfile {
+    pub fn all() -> Self {
+        Self {
+            plugins: default_plugin_names().map(str::to_string).collect(),
+            allow_all: true,
+        }
+    }
+
+    pub fn only<I, S>(plugins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            plugins: plugins.into_iter().map(Into::into).collect(),
+            allow_all: false,
+        }
+    }
+
+    pub fn enables(&self, plugin_name: &str) -> bool {
+        self.allow_all || self.plugins.contains(plugin_name)
+    }
+
+    pub fn plugins(&self) -> impl Iterator<Item = &str> {
+        self.plugins.iter().map(String::as_str)
+    }
+}
+
+pub fn register_profile_plugins(
+    engine: &mut KrkrEngine,
+    profile: &GameProfile,
+) -> krkr_tjs2::Result<()> {
+    macro_rules! register_if {
+        ($name:literal, $plugin:expr) => {
+            if profile.enables($name) {
+                engine.register_plugin($plugin)?;
+            }
+        };
+    }
+    register_if!("addFont.dll", AddFontPlugin);
+    register_if!("motionplayer.dll", MotionPlayerPlugin);
+    register_if!("win32dialog.dll", Win32DialogPlugin);
+    register_if!("windowEx.dll", WindowExPlugin);
+    register_if!("json.dll", JsonPlugin);
+    register_if!("PackinOne.dll", PackinOnePlugin);
+    register_if!("layerExDraw.dll", LayerExDrawPlugin);
+    register_if!("textrender.dll", TextRenderPlugin);
+    register_if!("psbfile.dll", PsbFilePlugin);
+    register_if!("AlphaMovie.dll", AlphaMoviePlugin);
+    register_if!("getSample.dll", GetSamplePlugin);
+    register_if!("KAGParserEx.dll", KagParserExPlugin);
+    register_if!("extrans.dll", ExtransPlugin);
+    register_if!("extNagano.dll", ExtNaganoPlugin);
+    register_if!("lzfs.dll", LzfsPlugin);
     Ok(())
 }
 
@@ -170,4 +232,16 @@ pub fn default_plugin_names() -> impl Iterator<Item = &'static str> {
     IMPLEMENTED_MAPPINGS
         .iter()
         .filter_map(|mapping| mapping.plugin_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GameProfile;
+
+    #[test]
+    fn empty_profile_is_explicitly_empty_while_default_keeps_compatibility() {
+        assert!(GameProfile::default().enables("json.dll"));
+        assert!(!GameProfile::only(["addFont.dll"]).enables("json.dll"));
+        assert!(!GameProfile::only(std::iter::empty::<&str>()).enables("json.dll"));
+    }
 }

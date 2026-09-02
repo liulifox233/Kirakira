@@ -26,7 +26,9 @@ pub(crate) fn data_slot_expr(
         .get(usize::try_from(slot_index).map_err(|_| {
             crate::error::TjsError::bytecode(format!("negative data slot index {slot_index}"))
         })?)
-        .ok_or_else(|| crate::error::TjsError::bytecode(format!("data slot {slot_index} missing")))?;
+        .ok_or_else(|| {
+            crate::error::TjsError::bytecode(format!("data slot {slot_index} missing"))
+        })?;
     data_slot_expr_inner(file, slot, names)
 }
 
@@ -75,9 +77,9 @@ fn data_slot_expr_inner(file: &BytecodeFile, slot: &DataSlot, names: &Names) -> 
         Err(_) => {
             // Unsupported/unknown slot types become a placeholder reference
             // so output stays syntactically valid.
-            ExprKind::Identifier(syntax::Ident::new(
-                super::stmt::unhandled_marker("unsupported constant"),
-            ))
+            ExprKind::Identifier(syntax::Ident::new(super::stmt::unhandled_marker(
+                "unsupported constant",
+            )))
         }
     };
     let _ = names;
@@ -117,11 +119,6 @@ fn function_placeholder(object_index: usize) -> Expr {
 /// Builds a member access expression for `object_reg` with a direct or
 /// computed key. `at_top_level` rewrites `this.*name` to a bare identifier
 /// (at the top level `this` is the global object).
-pub(crate) fn member_expr(
-    names: &Names,
-    object_reg: i16,
-    name: &str,
-    at_top_level: bool,
-) -> Expr {
+pub(crate) fn member_expr(names: &Names, object_reg: i16, name: &str, at_top_level: bool) -> Expr {
     names.member_target(object_reg, name, at_top_level)
 }

@@ -88,7 +88,8 @@ fn split_registration_comma(stmt: &Stmt) -> Vec<Stmt> {
             other.push(element.clone());
             continue;
         };
-        if is_function_placeholder_value(value).is_none() && function_literal_value(value).is_none() {
+        if is_function_placeholder_value(value).is_none() && function_literal_value(value).is_none()
+        {
             other.push(element.clone());
             continue;
         }
@@ -108,9 +109,7 @@ fn split_registration_comma(stmt: &Stmt) -> Vec<Stmt> {
     {
         for element in elements {
             if let Some((target, _)) = assignment_parts(element)
-                && registrations
-                    .iter()
-                    .any(|(name, _)| *name == target)
+                && registrations.iter().any(|(name, _)| *name == target)
             {
                 let registration = registrations
                     .iter()
@@ -127,9 +126,11 @@ fn split_registration_comma(stmt: &Stmt) -> Vec<Stmt> {
     for (_, stmt) in registrations {
         statements.push(stmt);
     }
-    statements.extend(other.into_iter().map(|expr| {
-        Stmt::new(StmtKind::Expr(expr), Span::empty(0))
-    }));
+    statements.extend(
+        other
+            .into_iter()
+            .map(|expr| Stmt::new(StmtKind::Expr(expr), Span::empty(0))),
+    );
     statements
 }
 
@@ -183,10 +184,12 @@ fn object_placeholder(expr: &Expr) -> Option<usize> {
     let StmtKind::Block(body) = &function.body.kind else {
         return None;
     };
-    let [Stmt {
-        kind: StmtKind::Expr(marker),
-        ..
-    }] = body.as_slice()
+    let [
+        Stmt {
+            kind: StmtKind::Expr(marker),
+            ..
+        },
+    ] = body.as_slice()
     else {
         return None;
     };
@@ -282,10 +285,12 @@ fn lift_registration(
                 && let Some(getter) = file.objects.get(getter_index)
             {
                 let getter_body = stmt::decompile_body(file, getter);
-                if let [Stmt {
-                    kind: StmtKind::Return(Some(expr)),
-                    ..
-                }] = getter_body.statements.as_slice()
+                if let [
+                    Stmt {
+                        kind: StmtKind::Return(Some(expr)),
+                        ..
+                    },
+                ] = getter_body.statements.as_slice()
                 {
                     extends.push(expr.clone());
                 }
@@ -373,9 +378,7 @@ fn registration_target(stmt: &Stmt) -> Option<(String, Expr)> {
                 },
             ..
         }) => match &target.kind {
-            ExprKind::Identifier(target) => {
-                Some((target.name.clone(), (**value).clone()))
-            }
+            ExprKind::Identifier(target) => Some((target.name.clone(), (**value).clone())),
             // Class-body method registrations render as `this.name = ...`.
             ExprKind::Member { object, property } if matches!(object.kind, ExprKind::This) => {
                 Some((property.clone(), (**value).clone()))
@@ -399,9 +402,7 @@ pub(crate) fn function_decl(
     let unnamed_base = object.func_decl_unnamed_arg_array_base as usize;
     let names = Names::new(object);
     for index in 0..arg_count {
-        if object.func_decl_unnamed_arg_array_base != 0
-            && index == unnamed_base
-        {
+        if object.func_decl_unnamed_arg_array_base != 0 && index == unnamed_base {
             // Bare `*`: unnamed argument array parameter.
             params.push(ParamDecl {
                 name: None,
@@ -441,10 +442,11 @@ pub(crate) fn function_decl(
 fn class_body_statements(body: BodyOutput) -> Vec<Stmt> {
     let mut statements = body.statements;
     if let Some(Stmt {
-        kind: StmtKind::Expr(Expr {
-            kind: ExprKind::String(name),
-            ..
-        }),
+        kind:
+            StmtKind::Expr(Expr {
+                kind: ExprKind::String(name),
+                ..
+            }),
         ..
     }) = statements.first()
         && statements.len() > 1
@@ -527,9 +529,11 @@ fn block_mentions(stmt: &Stmt, name: &str) -> bool {
 fn stmt_mentions(stmt: &Stmt, name: &str) -> bool {
     match &stmt.kind {
         StmtKind::Expr(expr) | StmtKind::Return(Some(expr)) => expr_mentions(expr, name),
-        StmtKind::Var { declarations, .. } => declarations
-            .iter()
-            .any(|decl| decl.initializer.as_ref().is_some_and(|expr| expr_mentions(expr, name))),
+        StmtKind::Var { declarations, .. } => declarations.iter().any(|decl| {
+            decl.initializer
+                .as_ref()
+                .is_some_and(|expr| expr_mentions(expr, name))
+        }),
         StmtKind::If {
             condition,
             then_branch,
@@ -557,7 +561,9 @@ fn stmt_mentions(stmt: &Stmt, name: &str) -> bool {
                 || stmt_mentions(body, name)
         }
         StmtKind::Switch {
-            discriminant, cases, ..
+            discriminant,
+            cases,
+            ..
         } => {
             expr_mentions(discriminant, name)
                 || cases
@@ -580,10 +586,16 @@ fn expr_mentions(expr: &Expr, name: &str) -> bool {
         ExprKind::Identifier(ident) => ident.name == name,
         ExprKind::Unary { expr, .. } | ExprKind::Postfix { expr, .. } => expr_mentions(expr, name),
         ExprKind::Binary { lhs, rhs, .. }
-        | ExprKind::Assignment { target: lhs, value: rhs, .. }
-        | ExprKind::Index { object: lhs, index: rhs, .. } => {
-            expr_mentions(lhs, name) || expr_mentions(rhs, name)
+        | ExprKind::Assignment {
+            target: lhs,
+            value: rhs,
+            ..
         }
+        | ExprKind::Index {
+            object: lhs,
+            index: rhs,
+            ..
+        } => expr_mentions(lhs, name) || expr_mentions(rhs, name),
         ExprKind::Conditional {
             condition,
             then_expr,
@@ -597,8 +609,9 @@ fn expr_mentions(expr: &Expr, name: &str) -> bool {
         ExprKind::Call { callee, args } | ExprKind::New { callee, args } => {
             expr_mentions(callee, name)
                 || args.iter().any(|arg| match arg {
-                    syntax::CallArg::Value(expr)
-                    | syntax::CallArg::Expand(Some(expr)) => expr_mentions(expr, name),
+                    syntax::CallArg::Value(expr) | syntax::CallArg::Expand(Some(expr)) => {
+                        expr_mentions(expr, name)
+                    }
                     _ => false,
                 })
         }
@@ -641,9 +654,10 @@ pub(crate) fn select_objects(
     if let Some(wanted) = object_index
         && !file.objects.get(wanted).is_some()
     {
-        return Err(TjsError::bytecode(format!("object {wanted} does not exist")));
+        return Err(TjsError::bytecode(format!(
+            "object {wanted} does not exist"
+        )));
     }
     let _ = BTreeSet::<usize>::new();
     Ok(selected)
 }
-

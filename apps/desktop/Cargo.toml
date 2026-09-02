@@ -6,12 +6,13 @@ license.workspace = true
 
 [dependencies]
 krkr-audio.workspace = true
+krkr-assets.workspace = true
 krkr-core.workspace = true
-krkr-platform.workspace = true
 krkr-plugins.workspace = true
-krkr-render.workspace = true
+krkr-render = { workspace = true, features = ["winit-surface"] }
 krkr-engine.workspace = true
 pollster.workspace = true
+rfd.workspace = true
 winit.workspace = true
 
 [dev-dependencies]

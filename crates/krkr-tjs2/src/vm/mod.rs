@@ -252,6 +252,33 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             ) {
                 Ok(Step::Next(next)) => {
                     call_frame.pc = next;
+                    if self.runtime.suspended_call.is_some() {
+                        // A native host method may invoke a nested bytecode
+                        // file (for example Scripts.execStorage). If that
+                        // nested VM suspended on a remote resource, keep the
+                        // complete caller stack below it so resume continues
+                        // after the native call instead of losing any outer
+                        // execution context. This matters when a resource
+                        // load occurs inside a helper function: preserving
+                        // only the current frame would drop that helper's
+                        // caller and eventually leave an empty VM stack.
+                        // Property getters are executed synchronously by the
+                        // dispatch layer.  If such a getter starts an
+                        // asynchronous resource load, `prop_get` returns a
+                        // temporary `void` value while the getter's call
+                        // stack is parked.  Re-enter the same property-get
+                        // instruction after the nested stack resumes so the
+                        // caller observes the getter's actual result (rather
+                        // than passing `void` to the next instruction).  A
+                        // native call, on the other hand, has already
+                        // committed its side effects and should continue at
+                        // the next instruction as before.
+                        if matches!(inst.opcode, 103 | 107 | 115) {
+                            call_frame.pc = pc;
+                        }
+                        self.merge_nested_suspend(&mut stack, call_frame);
+                        break Ok(Variant::Void);
+                    }
                     stack.push(call_frame);
                 }
                 Ok(Step::Return(value)) => {
@@ -268,12 +295,54 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     stack.push(*frame);
                 }
                 Ok(Step::Suspend { resume_pc }) => {
+                    let object_name = call_frame
+                        .object
+                        .name(&call_frame.file)
+                        .unwrap_or("<anonymous>");
+                    self.runtime.host_mut().log(&format!(
+                        "TJS VM suspend at file={} object={} pc={} resumePc={}",
+                        self.file_id, object_name, pc, resume_pc
+                    ));
                     call_frame.pc = resume_pc;
                     stack.push(call_frame);
                     self.runtime.suspended_call = Some(SuspendedCallStack { stack, base_depth });
                     break Ok(Variant::Void);
                 }
                 Err(error) => {
+                    // A direct member call can resolve a lazy property getter
+                    // before invoking the returned value.  When that getter
+                    // suspends on an external resource, the dispatch layer
+                    // observes a temporary `void` callee and reports
+                    // "void is not callable".  Park the caller and retry the
+                    // complete call instruction once the getter's nested
+                    // stack has resumed, just like the property-read path
+                    // above.  Native calls do not return an error while a
+                    // nested resource stack is parked, so this is limited to
+                    // the call opcodes.
+                    if self.runtime.suspended_call.is_some() && matches!(inst.opcode, 99..=102) {
+                        call_frame.pc = pc;
+                        self.merge_nested_suspend(&mut stack, call_frame);
+                        break Ok(Variant::Void);
+                    }
+                    if error.kind == TjsErrorKind::ResourcePending {
+                        let object_name = call_frame
+                            .object
+                            .name(&call_frame.file)
+                            .unwrap_or("<anonymous>");
+                        self.runtime.host_mut().log(&format!(
+                            "TJS VM resource pending at file={} object={} pc={}",
+                            self.file_id, object_name, pc
+                        ));
+                        // Re-run the same instruction after the host has
+                        // completed the asynchronous resource request. This
+                        // is deliberately below native-call dispatch so a
+                        // host read is not treated as a catchable script
+                        // exception.
+                        stack.push(call_frame);
+                        self.runtime.suspended_call =
+                            Some(SuspendedCallStack { stack, base_depth });
+                        break Ok(Variant::Void);
+                    }
                     // A debug-session quit must never become a catchable TJS
                     // exception.
                     if error.kind == TjsErrorKind::DebugQuit {
@@ -552,6 +621,22 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Ok(());
         };
         debugger.apply_action(action, key, depth)
+    }
+
+    fn merge_nested_suspend(&mut self, stack: &mut Vec<CallFrame>, outer: CallFrame) {
+        let Some(mut suspended) = self.runtime.suspended_call.take() else {
+            return;
+        };
+        if let Some(root) = suspended.stack.first_mut() {
+            root.continuation = Continuation::CallerRegister { dest: None };
+        }
+        // `stack` is ordered bottom-to-top and already contains callers of
+        // `outer`; append the current frame and the nested suspended stack so
+        // the normal pop/resume loop can unwind every frame in order.
+        stack.push(outer);
+        stack.append(&mut suspended.stack);
+        suspended.stack = std::mem::take(stack);
+        self.runtime.suspended_call = Some(suspended);
     }
 
     fn execute_instruction(

@@ -11,7 +11,7 @@ use std::{
 };
 
 use flate2::{Compression, write::ZlibEncoder};
-use krkr_core::ResourceProvider;
+use krkr_core::StoragePort;
 
 use crate::{
     SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3Error, Xp3OpenOptions, Xp3ResourceProvider,

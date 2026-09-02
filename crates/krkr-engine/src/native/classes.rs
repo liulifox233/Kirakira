@@ -754,9 +754,26 @@ fn window_show_modal(
     set_window_property_storage(runtime, this, "visible", Variant::Integer(1));
     set_window_property_storage(runtime, this, "__nativeClosed", Variant::Integer(0));
     set_window_property_storage(runtime, this, "__nativeModal", Variant::Integer(1));
-    runtime.host_mut().push_modal_window(this);
-    runtime.request_suspend();
-    Ok(Variant::Void)
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The Web shell has no separate native dialog surface. Suspending on
+        // showModal would leave startup scripts blocked forever, so expose
+        // the window state but continue synchronously until a DOM dialog
+        // bridge is available.
+        runtime
+            .host_mut()
+            .log(&format!("Window.showModal skipped on Web handle={this:?}"));
+        Ok(Variant::Void)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        runtime.host_mut().push_modal_window(this);
+        runtime
+            .host_mut()
+            .log(&format!("Window.showModal handle={this:?}"));
+        runtime.request_suspend();
+        Ok(Variant::Void)
+    }
 }
 
 fn window_close(
@@ -767,6 +784,9 @@ fn window_close(
     let this = require_window_this(runtime, this_obj, "Window.close")?;
     set_window_property_storage(runtime, this, "visible", Variant::Integer(0));
     set_window_property_storage(runtime, this, "__nativeClosed", Variant::Integer(1));
+    runtime
+        .host_mut()
+        .log(&format!("Window.close handle={this:?}"));
     if is_main_window(runtime, this) {
         runtime.host_mut().request_termination();
     }
@@ -4578,17 +4598,30 @@ fn layer_on_click(
     else {
         return Ok(Variant::Void);
     };
+    runtime.host_mut().log(&format!(
+        "input native Layer.onClick layer={:?} window={:?}",
+        this, window
+    ));
     if matches!(runtime.object_member(window, "action"), Variant::Void) {
+        runtime
+            .host_mut()
+            .log("input Layer.onClick skipped: window.action is void");
         return Ok(Variant::Void);
     }
+    let action = runtime.object_member(window, "action");
+    runtime.host_mut().log(&format!(
+        "input Layer.onClick invoking window.action={action:?}"
+    ));
 
     let event = runtime.alloc_ordinary_object();
     runtime.add_object_class_info(event, "Dictionary");
     runtime.set_object_member(event, "target", Variant::Object(this));
     runtime.set_object_member(event, "type", Variant::String("onClick".to_string()));
+    let result = runtime.call_object_method(window, "action", vec![Variant::Object(event)]);
     runtime
-        .call_object_method(window, "action", vec![Variant::Object(event)])
-        .map(|_| Variant::Void)
+        .host_mut()
+        .log(&format!("input Layer.onClick action result={result:?}"));
+    result
 }
 
 fn layer_on_hit_test(
@@ -4952,12 +4985,11 @@ fn font_map_prerendered_font(
         .transpose()?
         .ok_or_else(|| TjsError::runtime("Font.mapPrerenderedFont requires a font name"))?;
     let font = this_font_spec(runtime, this_obj)?;
-    let data = runtime.host().read_resource_storage(&storage)?;
-    let bytes = data.to_arc_bytes().map_err(crate::storage::io_error)?;
+    let bytes = runtime.host_mut().read_binary_storage_for_tjs(&storage)?;
     runtime
         .host_mut()
         .font_system_mut()
-        .map_prerendered_font_for_spec_arc(&font, bytes)
+        .map_prerendered_font_for_spec_arc(&font, std::sync::Arc::from(bytes))
         .map_err(TjsError::runtime)?;
     Ok(Variant::Void)
 }
@@ -5373,11 +5405,7 @@ fn ensure_font_file_loaded(runtime: &mut Runtime<KrkrHost>, spec: &FontSpec) -> 
     if !spec.face_is_file_name || spec.face.is_empty() {
         return Ok(());
     }
-    let data = runtime.host().read_resource_storage(&spec.face)?;
-    let bytes = data
-        .as_bytes()
-        .map(|bytes| bytes.into_owned())
-        .map_err(crate::storage::io_error)?;
+    let bytes = runtime.host_mut().read_binary_storage_for_tjs(&spec.face)?;
     runtime
         .host_mut()
         .font_system_mut()

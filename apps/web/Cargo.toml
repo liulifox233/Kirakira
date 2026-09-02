@@ -1,0 +1,22 @@
+[package]
+name = "krkr-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+krkr-assets.workspace = true
+krkr-core.workspace = true
+krkr-engine.workspace = true
+krkr-plugins.workspace = true
+krkr-render = { workspace = true, default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+wgpu.workspace = true

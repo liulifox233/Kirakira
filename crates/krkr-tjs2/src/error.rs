@@ -36,6 +36,10 @@ pub enum TjsErrorKind {
     Bytecode,
     Verify,
     Runtime,
+    /// A host operation cannot complete yet (for example a Web resource
+    /// fetch). The VM preserves its call stack and retries the instruction
+    /// after the host supplies the resource.
+    ResourcePending,
     Codegen,
     DebugQuit,
 }
@@ -89,6 +93,10 @@ impl TjsError {
 
     pub fn runtime(message: impl Into<String>) -> Self {
         Self::new(TjsErrorKind::Runtime, message)
+    }
+
+    pub fn resource_pending(name: impl Into<String>) -> Self {
+        Self::new(TjsErrorKind::ResourcePending, name)
     }
 
     pub fn codegen(message: impl Into<String>) -> Self {

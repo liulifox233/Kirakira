@@ -56,8 +56,16 @@ pub(crate) fn decompile_body(file: &BytecodeFile, object: &CodeObject) -> BodyOu
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Cond {
-    Truthy { reg: i16, inv: bool },
-    Compare { op: BinaryOp, lhs: i16, rhs: i16, inv: bool },
+    Truthy {
+        reg: i16,
+        inv: bool,
+    },
+    Compare {
+        op: BinaryOp,
+        lhs: i16,
+        rhs: i16,
+        inv: bool,
+    },
 }
 
 enum Effect {
@@ -232,7 +240,10 @@ impl<'f> Scanner<'f> {
     /// flag), together with any statements the scan produced (side effects
     /// interleaved with the condition evaluation — the caller must emit them
     /// before the construct).
-    pub(crate) fn scan_condition_block(&mut self, instructions: &[Instruction]) -> (Option<Expr>, Vec<Stmt>) {
+    pub(crate) fn scan_condition_block(
+        &mut self,
+        instructions: &[Instruction],
+    ) -> (Option<Expr>, Vec<Stmt>) {
         let saved = self.materialize;
         self.materialize = false;
         let saved_cond_scan = self.cond_scan;
@@ -281,7 +292,11 @@ impl<'f> Scanner<'f> {
         for inst in &slice[..slice.len() - 1] {
             let effect = self.effect(inst);
             match effect {
-                Effect::Def { reg, expr, side: extra } => {
+                Effect::Def {
+                    reg,
+                    expr,
+                    side: extra,
+                } => {
                     if let Some(extra) = extra {
                         side.push(SideEffect::Expr(extra));
                     }
@@ -373,10 +388,7 @@ impl<'f> Scanner<'f> {
             side.push(SideEffect::Stmt(self.top_level_stmt(stmt)));
             self.regs.insert(
                 reg,
-                Expr::new(
-                    ExprKind::Identifier(Ident::new(name)),
-                    Span::empty(0),
-                ),
+                Expr::new(ExprKind::Identifier(Ident::new(name)), Span::empty(0)),
             );
         } else {
             self.regs.insert(reg, expr);
@@ -385,7 +397,11 @@ impl<'f> Scanner<'f> {
 
     fn finalize(&mut self, last: &Instruction, mut side: Vec<SideEffect>) {
         match self.effect(last) {
-            Effect::Def { reg, expr, side: extra } => {
+            Effect::Def {
+                reg,
+                expr,
+                side: extra,
+            } => {
                 if let Some(extra) = extra {
                     side.push(SideEffect::Expr(extra));
                 }
@@ -412,10 +428,8 @@ impl<'f> Scanner<'f> {
                     // scans this block; only its side effects stay observable.
                     self.push_side_only(side);
                 } else {
-                    let stmt = Stmt::new(
-                        StmtKind::Expr(self.cond_expr(cond, false)),
-                        Span::empty(0),
-                    );
+                    let stmt =
+                        Stmt::new(StmtKind::Expr(self.cond_expr(cond, false)), Span::empty(0));
                     self.push_combined(side, stmt);
                 }
             }
@@ -607,7 +621,10 @@ impl<'f> Scanner<'f> {
         Expr::new(
             ExprKind::Index {
                 object: Box::new(self.reg_expr(object_reg)),
-                index: Box::new(Expr::new(ExprKind::String(name.to_string()), Span::empty(0))),
+                index: Box::new(Expr::new(
+                    ExprKind::String(name.to_string()),
+                    Span::empty(0),
+                )),
             },
             Span::empty(0),
         )
@@ -626,10 +643,7 @@ impl<'f> Scanner<'f> {
 
     fn call_expr(&mut self, opcode: u8, inst: &Instruction) -> Expr {
         let (callee, args) = match opcode {
-            99 => (
-                self.reg_expr(inst.operands[1]),
-                inst.call_args.as_ref(),
-            ),
+            99 => (self.reg_expr(inst.operands[1]), inst.call_args.as_ref()),
             100 => (
                 self.member_from_data(inst.operands[1], inst.operands[2]),
                 inst.call_args.as_ref(),
@@ -771,9 +785,10 @@ impl<'f> Scanner<'f> {
                 inv: false,
             }),
             11 => {
-                let expr = self.flag.map(|cond| self.cond_expr(cond, false)).unwrap_or_else(|| {
-                    Expr::new(ExprKind::Bool(false), Span::empty(0))
-                });
+                let expr = self
+                    .flag
+                    .map(|cond| self.cond_expr(cond, false))
+                    .unwrap_or_else(|| Expr::new(ExprKind::Bool(false), Span::empty(0)));
                 Effect::Def {
                     reg: inst.operands[0],
                     expr,
@@ -781,9 +796,10 @@ impl<'f> Scanner<'f> {
                 }
             }
             12 => {
-                let expr = self.flag.map(|cond| self.cond_expr(cond, true)).unwrap_or_else(|| {
-                    Expr::new(ExprKind::Bool(false), Span::empty(0))
-                });
+                let expr = self
+                    .flag
+                    .map(|cond| self.cond_expr(cond, true))
+                    .unwrap_or_else(|| Expr::new(ExprKind::Bool(false), Span::empty(0)));
                 Effect::Def {
                     reg: inst.operands[0],
                     expr,
@@ -814,7 +830,11 @@ impl<'f> Scanner<'f> {
             18 | 22 => {
                 let reg = inst.operands[0];
                 let old = self.reg_expr(reg);
-                let op = if opcode == 18 { BinaryOp::Add } else { BinaryOp::Sub };
+                let op = if opcode == 18 {
+                    BinaryOp::Add
+                } else {
+                    BinaryOp::Sub
+                };
                 // Fold literal increments so `t1[0 + 1]` prints as `t1[1]`.
                 let expr = match (&old.kind, op) {
                     (ExprKind::Integer(value), BinaryOp::Add) => {
@@ -1228,11 +1248,7 @@ impl<'f> Scanner<'f> {
     }
 }
 
-pub(crate) fn cond_expr(
-    cond: Cond,
-    negate: bool,
-    resolve: impl Fn(i16) -> Expr,
-) -> Expr {
+pub(crate) fn cond_expr(cond: Cond, negate: bool, resolve: impl Fn(i16) -> Expr) -> Expr {
     match cond {
         Cond::Truthy { reg, inv } => {
             let base = resolve(reg);
@@ -1248,12 +1264,7 @@ pub(crate) fn cond_expr(
                 base
             }
         }
-        Cond::Compare {
-            op,
-            lhs,
-            rhs,
-            inv,
-        } => {
+        Cond::Compare { op, lhs, rhs, inv } => {
             let base = Expr::new(
                 ExprKind::Binary {
                     op,
@@ -1280,12 +1291,7 @@ pub(crate) fn cond_expr(
 fn invert_cond(cond: Cond) -> Cond {
     match cond {
         Cond::Truthy { reg, inv } => Cond::Truthy { reg, inv: !inv },
-        Cond::Compare {
-            op,
-            lhs,
-            rhs,
-            inv,
-        } => Cond::Compare {
+        Cond::Compare { op, lhs, rhs, inv } => Cond::Compare {
             op,
             lhs,
             rhs,

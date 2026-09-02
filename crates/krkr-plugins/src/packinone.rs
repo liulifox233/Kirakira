@@ -18,15 +18,17 @@
 //!   other objects to their own `clone` method, matching scriptsEx.
 //!
 //! Everything else (System version/env shims, Layer effect methods, Process,
-//! fstat, proxyfs, ...) is a no-op stub returning benign values.
+//! fstat, proxyfs, ...) is a no-op stub returning benign values. The
+//! `safeEvalStorage` wrapper remains functional because KRKR startup scripts
+//! use it to restore system variables before choosing their opening flow.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::BTreeMap, sync::Arc};
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
-    Result,
-    runtime::{ObjectHandle, Runtime, Variant},
+    Result, TjsErrorKind,
+    runtime::{ObjectHandle, Runtime, TjsHost, Variant},
 };
 
 pub struct PackinOnePlugin;
@@ -194,7 +196,12 @@ fn csv_init_storage(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-    let bytes = runtime.host().read_binary_storage(&name)?;
+    // Go through the TJS host read path instead of the synchronous storage
+    // helper.  Browser packages materialize non-bootstrap assets lazily; the
+    // host path turns a cache miss for a manifest-known file into a resumable
+    // ResourcePending request.  Calling read_binary_storage directly made
+    // packed UI `.func` files look permanently missing on Web.
+    let bytes = TjsHost::read_binary(runtime.host_mut(), &name, "")?;
     if let Some(this) = csv_this(runtime, this_obj) {
         runtime.set_object_member(this, "__csvFile", Variant::String(name));
         set_csv_text(runtime, this, decode_csv_text(&bytes));
@@ -248,7 +255,7 @@ fn csv_parse_storage(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-    let bytes = runtime.host().read_binary_storage(&name)?;
+    let bytes = TjsHost::read_binary(runtime.host_mut(), &name, "")?;
     if let Some(this) = csv_this(runtime, this_obj) {
         runtime.set_object_member(this, "__csvFile", Variant::String(name));
         set_csv_text(runtime, this, decode_csv_text(&bytes));
@@ -687,17 +694,35 @@ fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
             Ok(Variant::String(String::new()))
         },
     );
-    runtime.register_object_native(
-        scripts,
-        "safeEvalStorage",
-        |runtime: &mut Runtime<KrkrHost>, _this_obj, args: Vec<Variant>| {
-            let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-            runtime
-                .host_mut()
-                .log(&format!("PackinOne.dll: safeEvalStorage({name}) skipped"));
+    runtime.register_object_native(scripts, "safeEvalStorage", safe_eval_storage);
+}
+
+/// Evaluates a persisted TJS/KSD value while preserving PackinOne's
+/// error-tolerant contract. GINKA calls this for `datasc.ksd` and
+/// `datasu.ksd` during `Initialize.tjs`; returning void unconditionally makes
+/// every launch look like a first run. ResourcePending must still escape so a
+/// Web asset scheduler can fetch a lazy save file.
+fn safe_eval_storage(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
+    let scripts = match runtime.global_member("Scripts") {
+        Variant::Object(handle) => handle,
+        _ => return Ok(Variant::Void),
+    };
+
+    match runtime.call_object_method(scripts, "evalStorage", args) {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind == TjsErrorKind::ResourcePending => Err(error),
+        Err(error) => {
+            runtime.host_mut().log(&format!(
+                "PackinOne.dll: safeEvalStorage({name}) failed: {error}"
+            ));
             Ok(Variant::Void)
-        },
-    );
+        }
+    }
 }
 
 /// scriptsEx exposes whether a function/object closure carries an ObjThis
@@ -902,6 +927,7 @@ fn install_misc_class_members(
 mod tests {
     use std::{fs, time::SystemTime};
 
+    use krkr_core::{FrameInput, Size};
     use krkr_engine::KrkrEngine;
     use krkr_tjs2::runtime::Closure;
 
@@ -933,6 +959,86 @@ mod tests {
             .expect("load data pack");
 
         assert_eq!(value, Variant::Integer(42));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn csv_parse_storage_requests_manifest_resource_before_reading() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kirakira-packinone-csv-pending-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create project root");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        engine.set_external_resource_catalog(["title_first.func"]);
+
+        let result = engine
+            .execute_script("inline.tjs", "csvProbe = new CSVParser();")
+            .expect("CSV parser allocation");
+        assert_eq!(result, Variant::Void);
+        let result = engine
+            .execute_script("inline.tjs", "csvProbe.parseStorage(\"title_first.func\");")
+            .expect("resource-pending VM execution parks and returns void");
+        assert_eq!(result, Variant::Void);
+        assert_eq!(
+            engine.take_external_resource_requests(),
+            vec![("title_first.func".to_owned(), krkr_core::AssetKind::Binary)]
+        );
+
+        engine
+            .provide_external_resource("title_first.func", b"name,value\nstart,1\n".to_vec())
+            .expect("provide fetched CSV");
+        assert!(!engine.is_script_suspended());
+        engine
+            .update(
+                krkr_engine::EngineInput::new(
+                    FrameInput::new(Size::new(640.0, 360.0), 0.0),
+                    vec![],
+                ),
+                std::time::Duration::ZERO,
+            )
+            .expect("suspended CSV call should resume after bytes arrive");
+        let file = engine
+            .execute_expression("inline.tjs", "csvProbe.__csvFile")
+            .expect("CSV parser state should be visible after resume");
+        assert_eq!(file, Variant::String("title_first.func".to_owned()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn safe_eval_storage_restores_structured_system_state() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kirakira-packinone-safe-eval-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create project root");
+        fs::write(
+            root.join("system-state.ksd"),
+            "(const) %[\"notFirst\" => 1, \"language\" => \"en\",]",
+        )
+        .expect("write system state");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "Scripts.safeEvalStorage(\"system-state.ksd\").notFirst",
+            )
+            .expect("safe eval storage");
+
+        assert_eq!(value, Variant::Integer(1));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

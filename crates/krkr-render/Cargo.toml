@@ -9,4 +9,8 @@ bytemuck.workspace = true
 krkr-core.workspace = true
 krkr-font.workspace = true
 wgpu.workspace = true
-winit.workspace = true
+winit = { workspace = true, optional = true }
+
+[features]
+default = ["winit-surface"]
+winit-surface = ["dep:winit"]
