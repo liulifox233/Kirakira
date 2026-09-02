@@ -134,6 +134,11 @@ pub struct VideoOverlaySnapshot {
     pub width: i64,
     pub height: i64,
     pub visible: bool,
+    pub looping: bool,
+    pub position_ms: i64,
+    pub play_rate: f64,
+    pub audio_volume: i64,
+    pub audio_balance: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -501,7 +506,8 @@ impl KrkrHost {
         self.project_root.as_deref()
     }
 
-    pub fn video_overlay_snapshots(&self) -> Vec<VideoOverlaySnapshot> {
+    pub fn video_overlay_snapshots(&mut self) -> Vec<VideoOverlaySnapshot> {
+        let now = self.now_millis();
         self.video_overlays
             .values()
             .map(|state| VideoOverlaySnapshot {
@@ -512,6 +518,11 @@ impl KrkrHost {
                 width: state.width,
                 height: state.height,
                 visible: state.visible,
+                looping: state.looping,
+                position_ms: state.elapsed_ms(now),
+                play_rate: state.play_rate,
+                audio_volume: state.audio_volume,
+                audio_balance: state.audio_balance,
             })
             .collect()
     }

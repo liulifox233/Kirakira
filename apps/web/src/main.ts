@@ -47,6 +47,12 @@ const persistStorageWrites = (runtime: any, game: string, flush = false) => {
 
 const bootStartedAt = performance.now();
 log("boot", { href: window.location.href, userAgent: navigator.userAgent });
+if (window.location.protocol === "file:") {
+  const message = "Kirakira Web requires an HTTP(S) static server; file:// cannot fetch WASM or game assets in browsers";
+  document.body.dataset.status = message;
+  errorLog(message);
+  throw new Error(message);
+}
 
 const resize = () => {
   const ratio = window.devicePixelRatio || 1;
@@ -88,6 +94,10 @@ if (wasmUrl) {
   await wasm.default(wasmBytes);
   wasm.attach_canvas("kirakira-canvas");
   const runtime = new wasm.WebRuntime(canvas.clientWidth, canvas.clientHeight);
+  runtime.set_device_pixel_ratio?.(window.devicePixelRatio || 1);
+  window.addEventListener("resize", () => {
+    runtime.set_device_pixel_ratio?.(window.devicePixelRatio || 1);
+  });
   log("runtime created", { elapsedMs: Math.round(performance.now() - bootStartedAt) });
   if (debugMode) {
     (window as any).__kirakiraRuntime = runtime;
@@ -201,8 +211,13 @@ if (wasmUrl) {
   type AudioNodeState = {
     source: AudioBufferSourceNode;
     gain: GainNode;
+    buffer: AudioBuffer;
     bus: string;
     volume: number;
+    looping: boolean;
+    offset: number;
+    startedAt: number;
+    paused: boolean;
   };
   const audioNodes = new Map<number, AudioNodeState>();
   // KRKR's BGM/voice channels are logically single-instance even when the
@@ -215,11 +230,15 @@ if (wasmUrl) {
   const audioEpochs = new Map<number, number>();
   const audioPending = new Map<number, { bus: string; epoch: number }>();
   const audioBusVolumes = new Map<string, number>([["master", 1], ["bgm", 1], ["sound-effect", 1]]);
+  const pendingGestureAudio = new Map<number, any>();
+  const pendingPaused = new Set<number>();
+  let audioQueue: Promise<void> = Promise.resolve();
   const videoElements = new Map<string, HTMLVideoElement>();
   const videoLoads = new Map<string, Promise<void>>();
   const videoPlayRequests = new Map<string, Promise<void>>();
   const videoDesiredStatus = new Map<string, string>();
   const videoObjectUrls = new Map<string, string>();
+  const videoAudioNodes = new Map<string, { source: MediaElementAudioSourceNode; panner: StereoPannerNode }>();
   const endedVideos = new Set<string>();
   let userGesture = false;
 
@@ -259,6 +278,14 @@ if (wasmUrl) {
       video.muted = false;
       requestVideoPlay(storage, video);
     }
+    if (pendingGestureAudio.size) {
+      const commands = [...pendingGestureAudio.values()];
+      pendingGestureAudio.clear();
+      audioQueue = audioQueue
+        .then(() => handleAudio(commands))
+        .catch((error) => warn("deferred WebAudio batch failed", error));
+      log("deferred audio activated", { count: commands.length });
+    }
   };
 
   const handleVideos = async (videos: any[]) => {
@@ -281,6 +308,17 @@ if (wasmUrl) {
         video.style.zIndex = "2";
         document.body.appendChild(video);
         videoElements.set(storage, video);
+        try {
+          const videoContext = getAudioContext();
+          const source = videoContext.createMediaElementSource(video);
+          const panner = videoContext.createStereoPanner();
+          source.connect(panner).connect(videoContext.destination);
+          videoAudioNodes.set(storage, { source, panner });
+        } catch (error) {
+          // Older browsers may not expose MediaElementSource/StereoPanner;
+          // the element still plays with its native volume path in that case.
+          warn("video balance bridge unavailable", { storage, error });
+        }
         video.addEventListener("ended", () => {
           try {
             runtime.notify_video_ended(storage);
@@ -295,6 +333,10 @@ if (wasmUrl) {
           const objectUrl = videoObjectUrls.get(storage);
           if (objectUrl) URL.revokeObjectURL(objectUrl);
           videoObjectUrls.delete(storage);
+          const audioNodes = videoAudioNodes.get(storage);
+          audioNodes?.source.disconnect();
+          audioNodes?.panner.disconnect();
+          videoAudioNodes.delete(storage);
           video.remove();
         }, { once: true });
         const load = (async () => {
@@ -302,7 +344,28 @@ if (wasmUrl) {
             const bytes = await runtime.load_video(storage);
             log("video bytes ready", { storage, bytes: bytes.byteLength });
             if (videoElements.get(storage) !== video) return;
-            const objectUrl = URL.createObjectURL(new Blob([bytes], { type: "video/mp4" }));
+            // Prefer the container signature over the semantic extension: a
+            // number of KRKR projects keep MPEG-4 data under a `.wmv` name.
+            // Supplying the right MIME lets browsers select the decoder and
+            // avoids the silent black overlay caused by a mismatched Blob.
+            const signature = bytes.byteLength >= 12
+              ? String.fromCharCode(...bytes.subarray(4, 8))
+              : "";
+            const extension = storage.toLowerCase().split(".").pop() ?? "";
+            const extensionMime: Record<string, string> = {
+              mp4: "video/mp4",
+              m4v: "video/mp4",
+              webm: "video/webm",
+              ogv: "video/ogg",
+              ogg: "video/ogg",
+              mov: "video/quicktime",
+              wmv: "video/x-ms-wmv",
+              avi: "video/x-msvideo",
+            };
+            const mime = signature === "ftyp"
+              ? "video/mp4"
+              : (extensionMime[extension] ?? "application/octet-stream");
+            const objectUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
             videoObjectUrls.set(storage, objectUrl);
             video.src = objectUrl;
             // `play()` used to run on the frame immediately after element
@@ -322,6 +385,25 @@ if (wasmUrl) {
       video.style.top = `${item.top}px`;
       video.style.width = `${item.width || canvas.width}px`;
       video.style.height = `${item.height || canvas.height}px`;
+      video.loop = Boolean(item.looping);
+      if (Number.isFinite(item.playRate) && item.playRate > 0) {
+        video.playbackRate = Number(item.playRate);
+      }
+      if (Number.isFinite(item.audioVolume)) {
+        video.volume = Math.max(0, Math.min(1, Number(item.audioVolume) / 100000));
+      }
+      const videoAudio = videoAudioNodes.get(storage);
+      if (videoAudio && Number.isFinite(item.audioBalance)) {
+        videoAudio.panner.pan.value = Math.max(-1, Math.min(1, Number(item.audioBalance) / 100000));
+      }
+      if (Number.isFinite(item.position) && video.readyState >= 1) {
+        const target = Math.max(0, Number(item.position) / 1000);
+        // Do not seek every frame; the engine position is authoritative only
+        // when a script explicitly seeks or a new overlay starts.
+        if (Math.abs(video.currentTime - target) > 0.35) {
+          try { video.currentTime = target; } catch { /* metadata not ready */ }
+        }
+      }
       if (item.status === "play") requestVideoPlay(storage, video);
       else if (item.status === "pause") video.pause();
     }
@@ -333,6 +415,10 @@ if (wasmUrl) {
         const objectUrl = videoObjectUrls.get(storage);
         if (objectUrl) URL.revokeObjectURL(objectUrl);
         videoObjectUrls.delete(storage);
+        const audioNodes = videoAudioNodes.get(storage);
+        audioNodes?.source.disconnect();
+        audioNodes?.panner.disconnect();
+        videoAudioNodes.delete(storage);
         video.remove();
         videoElements.delete(storage);
       }
@@ -340,11 +426,82 @@ if (wasmUrl) {
   };
 
   const handleAudio = async (commands: any[]) => {
-    const stopNode = (id: number) => {
+    const effectiveGain = (state: { bus: string; volume: number }) =>
+      state.volume
+      * (audioBusVolumes.get(state.bus) ?? 1)
+      * (audioBusVolumes.get("master") ?? 1);
+    const rampGain = (gain: GainNode, target: number, fadeSeconds = 0) => {
+      const context = getAudioContext();
+      const now = context.currentTime;
+      gain.gain.cancelScheduledValues(now);
+      if (fadeSeconds > 0) {
+        gain.gain.setValueAtTime(gain.gain.value, now);
+        gain.gain.linearRampToValueAtTime(target, now + fadeSeconds);
+      } else {
+        gain.gain.setValueAtTime(target, now);
+      }
+    };
+    const stopNode = (id: number, fadeSeconds = 0) => {
       const state = audioNodes.get(id);
       if (!state) return;
-      try { state.source.stop(); } catch { /* already ended */ }
+      try {
+        if (fadeSeconds > 0) {
+          const context = getAudioContext();
+          rampGain(state.gain, 0, fadeSeconds);
+          state.source.stop(context.currentTime + fadeSeconds);
+        } else {
+          state.source.stop();
+        }
+      } catch { /* already ended */ }
       audioNodes.delete(id);
+    };
+    const installEndedHandler = (id: number, source: AudioBufferSourceNode) => {
+      source.addEventListener("ended", () => {
+        const state = audioNodes.get(id);
+        if (state?.source !== source) return;
+        audioNodes.delete(id);
+        if (!state.paused) {
+          try {
+            runtime.notify_audio_stopped(id);
+          } catch (error) {
+            warn("audio completion callback failed", { id, error });
+          }
+          log("audio ended", { id });
+        }
+      }, { once: true });
+    };
+    const pauseNode = (id: number) => {
+      const state = audioNodes.get(id);
+      if (!state || state.paused) return;
+      const context = getAudioContext();
+      const elapsed = Math.max(0, context.currentTime - state.startedAt);
+      const duration = state.buffer.duration;
+      state.offset = state.looping && duration > 0
+        ? (state.offset + elapsed) % duration
+        : Math.min(duration, state.offset + elapsed);
+      state.paused = true;
+      try { state.source.stop(); } catch { /* already ended */ }
+      log("audio paused", { id, offset: state.offset });
+    };
+    const resumeNode = async (id: number) => {
+      const state = audioNodes.get(id);
+      if (!state?.paused) return;
+      const context = getAudioContext();
+      await context.resume();
+      const source = context.createBufferSource();
+      source.buffer = state.buffer;
+      source.loop = state.looping;
+      source.connect(state.gain);
+      source.start(0, state.offset);
+      const resumed = {
+        ...state,
+        source,
+        startedAt: context.currentTime,
+        paused: false,
+      };
+      audioNodes.set(id, resumed);
+      installEndedHandler(id, source);
+      log("audio resumed", { id, offset: resumed.offset });
     };
     const nextEpoch = (id: number) => {
       const epoch = (audioEpochs.get(id) ?? 0) + 1;
@@ -364,6 +521,9 @@ if (wasmUrl) {
           audioPending.delete(id);
         }
       }
+      for (const [id, pending] of pendingGestureAudio) {
+        if (pending.bus === bus || bus === "master") pendingGestureAudio.delete(id);
+      }
       for (const [channel, id] of audioChannels) {
         if (channel === bus || bus === "master") audioChannels.delete(channel);
       }
@@ -382,6 +542,7 @@ if (wasmUrl) {
           if (previousId !== undefined && previousId !== command.id) {
             nextEpoch(previousId);
             audioPending.delete(previousId);
+            pendingGestureAudio.delete(previousId);
             stopNode(previousId);
           }
           audioChannels.set(bus, command.id);
@@ -390,6 +551,11 @@ if (wasmUrl) {
         // that id replaces the old one; leaving it alive is what causes
         // overlapping BGM/SE after a scenario transition.
         stopNode(command.id);
+        if (!userGesture) {
+          pendingGestureAudio.set(command.id, { ...command, bus });
+          log("audio deferred until user gesture", { source: command.source, id: command.id });
+          continue;
+        }
         audioPending.set(command.id, { bus, epoch });
         try {
           const context = getAudioContext();
@@ -412,12 +578,23 @@ if (wasmUrl) {
             try { source.stop(); } catch { /* not started */ }
             continue;
           }
+          audioNodes.set(command.id, {
+            source,
+            gain,
+            buffer,
+            bus,
+            volume,
+            looping: Boolean(command.looping),
+            offset: 0,
+            startedAt: context.currentTime,
+            paused: false,
+          });
+          installEndedHandler(command.id, source);
           source.start();
-          audioNodes.set(command.id, { source, gain, bus, volume });
-          source.addEventListener("ended", () => {
-            const state = audioNodes.get(command.id);
-            if (state?.source === source) audioNodes.delete(command.id);
-          }, { once: true });
+          if (pendingPaused.has(command.id)) {
+            pendingPaused.delete(command.id);
+            pauseNode(command.id);
+          }
           log("audio playing", { source: command.source, id: command.id });
         } catch (error) {
           // A game may request codecs unavailable in the current browser.
@@ -429,7 +606,9 @@ if (wasmUrl) {
       } else if (command.kind === "stop") {
         nextEpoch(command.id);
         audioPending.delete(command.id);
-        stopNode(command.id);
+        pendingGestureAudio.delete(command.id);
+        pendingPaused.delete(command.id);
+        stopNode(command.id, Number(command.fadeSeconds ?? 0));
         for (const [channel, id] of audioChannels) {
           if (id === command.id) audioChannels.delete(channel);
         }
@@ -442,32 +621,50 @@ if (wasmUrl) {
         const state = audioNodes.get(command.id);
         if (state) {
           state.volume = command.volume ?? 1;
-          state.gain.gain.value = state.volume
-            * (audioBusVolumes.get(state.bus) ?? 1)
-            * (audioBusVolumes.get("master") ?? 1);
+          rampGain(state.gain, effectiveGain(state), Number(command.fadeSeconds ?? 0));
+        } else {
+          const pending = pendingGestureAudio.get(command.id);
+          if (pending) pending.volume = command.volume ?? 1;
         }
       } else if (command.kind === "set-bus-volume") {
         const bus = command.bus ?? "master";
         audioBusVolumes.set(bus, command.volume ?? 1);
         for (const state of audioNodes.values()) {
           if (bus === "master" || state.bus === bus) {
-            state.gain.gain.value = state.volume
-              * (audioBusVolumes.get(state.bus) ?? 1)
-              * (audioBusVolumes.get("master") ?? 1);
+            rampGain(state.gain, effectiveGain(state), Number(command.fadeSeconds ?? 0));
           }
         }
       } else if (command.kind === "preload") {
         // The browser's fetch cache handles preloads; no source is started.
       } else if (command.kind === "play-pcm") {
         warn("WebAudio PCM stream is not supported by the browser bridge yet", command.id);
-      } else if (command.kind === "pause" || command.kind === "resume") {
-        // Web Audio buffer sources are one-shot; lifecycle events are fed
-        // back through the Rust sink when a dedicated stream backend is used.
+      } else if (command.kind === "pause") {
+        if (audioNodes.has(command.id)) pauseNode(command.id);
+        else if (audioPending.has(command.id)) pendingPaused.add(command.id);
+      } else if (command.kind === "resume") {
+        pendingPaused.delete(command.id);
+        await resumeNode(command.id);
       }
     }
   };
 
   const color = (item: any) => `rgba(${Math.round(item.r * 255)},${Math.round(item.g * 255)},${Math.round(item.b * 255)},${item.a ?? 1})`;
+  const transitionTextures = new Map<number, HTMLCanvasElement>();
+  const uploadTextures = (uploads: any[], target: Map<number, HTMLCanvasElement>) => {
+    for (const upload of uploads ?? []) {
+      const bitmap = document.createElement("canvas");
+      bitmap.width = upload.width;
+      bitmap.height = upload.height;
+      const bitmapContext = bitmap.getContext("2d");
+      if (!bitmapContext) continue;
+      bitmapContext.putImageData(
+        new ImageData(new Uint8ClampedArray(upload.rgba), upload.width, upload.height),
+        0,
+        0,
+      );
+      target.set(Number(upload.textureId), bitmap);
+    }
+  };
   const render = (model: any) => {
     if (!context) return;
     const logicalWidth = Math.max(1, canvas.clientWidth || canvas.width);
@@ -482,57 +679,66 @@ if (wasmUrl) {
     context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
     context.fillStyle = color(model);
     context.fillRect(0, 0, logicalWidth, logicalHeight);
-    for (const upload of model.uploads ?? []) {
-      const bitmap = document.createElement("canvas");
-      bitmap.width = upload.width;
-      bitmap.height = upload.height;
-      const bitmapContext = bitmap.getContext("2d");
-      if (!bitmapContext) continue;
-      bitmapContext.putImageData(new ImageData(new Uint8ClampedArray(upload.rgba), upload.width, upload.height), 0, 0);
-      textures.set(upload.textureId, bitmap);
-    }
+    uploadTextures(model.uploads, textures);
     for (const textureId of model.imageReleases ?? []) {
       textures.delete(Number(textureId));
     }
-    for (const item of model.drawList ?? []) {
-      if (item.kind === "rect") {
-        context.fillStyle = color(item);
-        context.fillRect(item.x, item.y, item.width, item.height);
-      } else if (item.kind === "text") {
-        context.fillStyle = color(item);
-        const face = item.fontFace?.trim() || "sans-serif";
-        const style = item.italic ? "italic " : "";
-        const weight = item.bold ? "700 " : "400 ";
-        context.font = `${style}${weight}${item.size}px "${face.replaceAll('"', '')}"`;
-        context.textBaseline = "top";
-        context.shadowColor = item.shadowR !== undefined
-          ? `rgba(${Math.round(item.shadowR * 255)},${Math.round(item.shadowG * 255)},${Math.round(item.shadowB * 255)},${item.shadowA ?? 1})`
-          : "transparent";
-        context.shadowOffsetX = item.shadowX ?? 0;
-        context.shadowOffsetY = item.shadowY ?? 0;
-        context.fillText(item.text, item.x, item.y);
-        context.shadowColor = "transparent";
-        if (item.underline || item.strikeout) {
-          const metrics = context.measureText(item.text);
-          context.fillRect(item.x, item.y + item.size * (item.strikeout ? 0.55 : 0.9), metrics.width, Math.max(1, item.size / 16));
+    const drawCommands = (commands: any[], alpha: number, preferred?: Map<number, HTMLCanvasElement>) => {
+      context.save();
+      context.globalAlpha = alpha;
+      for (const item of commands ?? []) {
+        if (item.kind === "rect") {
+          context.fillStyle = color(item);
+          context.fillRect(item.x, item.y, item.width, item.height);
+        } else if (item.kind === "text") {
+          context.fillStyle = color(item);
+          const face = item.fontFace?.trim() || "sans-serif";
+          const style = item.italic ? "italic " : "";
+          const weight = item.bold ? "700 " : "400 ";
+          context.font = `${style}${weight}${item.size}px "${face.replaceAll('"', '')}"`;
+          context.textBaseline = "top";
+          context.shadowColor = item.shadowR !== undefined
+            ? `rgba(${Math.round(item.shadowR * 255)},${Math.round(item.shadowG * 255)},${Math.round(item.shadowB * 255)},${item.shadowA ?? 1})`
+            : "transparent";
+          context.shadowOffsetX = item.shadowX ?? 0;
+          context.shadowOffsetY = item.shadowY ?? 0;
+          context.fillText(item.text, item.x, item.y);
+          context.shadowColor = "transparent";
+          if (item.underline || item.strikeout) {
+            const metrics = context.measureText(item.text);
+            context.fillRect(item.x, item.y + item.size * (item.strikeout ? 0.55 : 0.9), metrics.width, Math.max(1, item.size / 16));
+          }
+        } else if (item.kind === "image") {
+          const bitmap = preferred?.get(Number(item.textureId)) ?? textures.get(Number(item.textureId));
+          if (!bitmap) continue;
+          context.globalAlpha = alpha * (item.opacity ?? 1);
+          const sx = item.sourceX ?? 0;
+          const sy = item.sourceY ?? 0;
+          const sw = item.sourceWidth ?? bitmap.width;
+          const sh = item.sourceHeight ?? bitmap.height;
+          // Draw the same atlas sub-rectangle selected by the Rust renderer.
+          if (sw > 0 && sh > 0 && item.width > 0 && item.height > 0) {
+            context.drawImage(bitmap, sx, sy, sw, sh, item.x, item.y, item.width, item.height);
+          }
+          context.globalAlpha = alpha;
         }
-      } else if (item.kind === "image") {
-        const bitmap = textures.get(item.textureId);
-        if (!bitmap) continue;
-        context.globalAlpha = item.opacity ?? 1;
-        const sx = item.sourceX ?? 0;
-        const sy = item.sourceY ?? 0;
-        const sw = item.sourceWidth ?? bitmap.width;
-        const sh = item.sourceHeight ?? bitmap.height;
-        // Draw the same atlas sub-rectangle selected by the Rust renderer.
-        // Without the 9-argument overload Firefox scales the whole UI atlas
-        // into every layer, which appears as opaque magenta bars and hides
-        // the title background.
-        if (sw > 0 && sh > 0 && item.width > 0 && item.height > 0) {
-          context.drawImage(bitmap, sx, sy, sw, sh, item.x, item.y, item.width, item.height);
-        }
-        context.globalAlpha = 1;
       }
+      context.restore();
+    };
+    const transition = model.transition;
+    if (transition) {
+      uploadTextures(transition.frozenUploads, transitionTextures);
+      uploadTextures(transition.ruleUploads, transitionTextures);
+      const progress = Math.max(0, Math.min(1, Number(transition.progress ?? 1)));
+      // Canvas2D does not implement every KRKR transition shader. Rendering
+      // the frozen frame beneath the live frame is a deterministic crossfade
+      // fallback for universal/scroll/wave/etc. and, importantly, avoids the
+      // abrupt black/flash frame of the old fallback.
+      drawCommands(transition.frozenDrawList, 1 - progress, transitionTextures);
+      drawCommands(model.drawList, progress);
+    } else {
+      transitionTextures.clear();
+      drawCommands(model.drawList, 1);
     }
     context.restore();
   };
@@ -646,7 +852,12 @@ if (wasmUrl) {
     if (debugMode || renderElapsedMs >= 50) {
       log("frame render complete", { frame: frameNumber, elapsedMs: Math.round(renderElapsedMs) });
     }
-    void handleAudio(model.audio);
+    // Keep command batches serialized.  A frame can arrive while a previous
+    // decode/fetch is still pending; running both handlers concurrently was
+    // the source of duplicate BGM/voice sources and overlapping fades.
+    audioQueue = audioQueue
+      .then(() => handleAudio(model.audio))
+      .catch((error) => warn("audio command batch failed", error));
     void handleVideos(model.videos);
     window.requestAnimationFrame(frame);
   };

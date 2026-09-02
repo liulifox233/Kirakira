@@ -363,13 +363,28 @@ pub fn pack_web_directory_with_entry(
     extract_xp3: bool,
     entry: Option<&str>,
 ) -> io::Result<WebManifest> {
-    let input = input.as_ref();
-    let output = output.as_ref();
-    fs::create_dir_all(output)?;
+    let input = fs::canonicalize(input.as_ref())?;
+    let output_path = output.as_ref();
+    let output =
+        if output_path.exists() {
+            fs::canonicalize(output_path)?
+        } else {
+            let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+            fs::create_dir_all(parent)?;
+            fs::canonicalize(parent)?.join(output_path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid output path")
+            })?)
+        };
+    if input == output {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Web package output must differ from the input directory",
+        ));
+    }
 
     let mut files = Vec::new();
-    let excluded = output.strip_prefix(input).ok().map(Path::to_path_buf);
-    collect_files(input, input, &mut files, excluded.as_deref())?;
+    let excluded = output.strip_prefix(&input).ok().map(Path::to_path_buf);
+    collect_files(&input, &input, &mut files, excluded.as_deref())?;
     files.sort();
     let mut assets = BTreeMap::<String, Vec<u8>>::new();
     for relative in files {
@@ -401,6 +416,12 @@ pub fn pack_web_directory_with_entry(
             assets.insert(normalize_path(&relative.to_string_lossy()), fs::read(path)?);
         }
     }
+
+    // A publish directory is an artifact, so stale files from an earlier
+    // package must not survive and be served by a static host.  Clear only
+    // the validated output directory after all source bytes have been read;
+    // this also keeps the supported "output nested under input" layout safe.
+    clear_directory_contents(&output)?;
 
     let mut entries = BTreeMap::new();
     for (path, bytes) in assets {
@@ -494,6 +515,20 @@ pub fn pack_web_directory_with_entry(
     Ok(manifest)
 }
 
+fn clear_directory_contents(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        if child.is_dir() {
+            fs::remove_dir_all(child)?;
+        } else {
+            fs::remove_file(child)?;
+        }
+    }
+    Ok(())
+}
+
 fn asset_kind_for_path(path: &str) -> &'static str {
     match Path::new(path)
         .extension()
@@ -505,7 +540,7 @@ fn asset_kind_for_path(path: &str) -> &'static str {
         "tjs" | "ks" | "pbd" => "script",
         "png" | "jpg" | "jpeg" | "webp" | "tlg" | "bmp" => "image",
         "wav" | "ogg" | "mp3" | "opus" | "flac" => "audio",
-        "wmv" | "mp4" | "avi" | "webm" => "video",
+        "wmv" | "mp4" | "m4v" | "avi" | "webm" | "ogv" | "mov" | "mkv" => "video",
         _ => "binary",
     }
 }
@@ -530,7 +565,11 @@ fn mime_for_path(path: &str) -> &'static str {
         "flac" => "audio/flac",
         "wmv" => "video/x-ms-wmv",
         "mp4" => "video/mp4",
+        "m4v" => "video/mp4",
         "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
         _ => "application/octet-stream",
     }
 }
@@ -610,6 +649,20 @@ mod tests {
         assert!(output.join(&large.path).is_file());
         assert!(!output.join("objects").exists());
         assert!(!output.join("bundles").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn web_publish_clears_stale_output_files() {
+        let root = temp_root();
+        let output = root.join("out");
+        fs::create_dir_all(output.join("stale/nested")).expect("create stale output");
+        fs::write(output.join("stale/nested/old.bin"), b"old").expect("write stale output");
+        fs::write(root.join("startup.tjs"), b"System.init();").expect("write script");
+
+        pack_web_directory(&root, &output, false).expect("pack web fixture");
+        assert!(!output.join("stale").exists());
+        assert!(output.join("startup.tjs").is_file());
         let _ = fs::remove_dir_all(root);
     }
 

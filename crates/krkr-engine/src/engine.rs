@@ -291,8 +291,8 @@ impl KrkrEngine {
         self.tjs_runtime.host_mut()
     }
 
-    pub fn video_overlay_snapshots(&self) -> Vec<crate::VideoOverlaySnapshot> {
-        self.tjs_runtime.host().video_overlay_snapshots()
+    pub fn video_overlay_snapshots(&mut self) -> Vec<crate::VideoOverlaySnapshot> {
+        self.tjs_runtime.host_mut().video_overlay_snapshots()
     }
 
     pub fn preferred_viewport_size(&self) -> Option<Size> {
