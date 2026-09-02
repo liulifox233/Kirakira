@@ -216,6 +216,15 @@ impl RuntimeSession {
         let commands = self.engine.host_mut().take_audio_commands();
         self.audio.submit(&commands)?;
         let audio = self.audio.poll_events();
+        // Audio completion is part of the runtime boundary, not a platform
+        // UI concern.  KAG conductors wait on this signal and must be woken
+        // even when a host only consumes the returned diagnostics (the Web
+        // shell does not have a native audio worker to do it for us).
+        for event in &audio {
+            if let AudioEvent::PlaybackStopped { id } = event {
+                self.engine.notify_audio_stopped(*id)?;
+            }
+        }
         let saves = self
             .save
             .as_mut()

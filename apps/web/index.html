@@ -4,15 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kirakira</title>
+    <style>
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; }
+      #kirakira-canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
   </head>
   <body>
     <canvas id="kirakira-canvas" tabindex="0"></canvas>
     <script>
       document.body.dataset.wasm = "./pkg/krkr_web.js";
-      // A staged static publication puts manifest.json beside this shell.
-      // Change this static attribute when the shell is hosted below a
-      // package subdirectory; no query-string path is required at runtime.
-      document.body.dataset.package = "./";
+      // Static staging replaces this empty value with "./" after copying a
+      // semantic-path game package beside the shell.  The Vite dev shell can
+      // therefore start without treating its HTML fallback as a manifest.
+      document.body.dataset.package = "";
       // Optional KAG entry point. Static staging fills this from manifest.entry
       // (or an explicit CLI override) without changing the browser URL.
       document.body.dataset.scenario = "";

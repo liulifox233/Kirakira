@@ -23,6 +23,7 @@
             clippy
             wasm-bindgen-cli
             wasm-pack
+            binaryen
             lld
             nodejs
             pnpm
@@ -45,7 +46,12 @@
           shellHook = ''
             export CARGO_NET_GIT_FETCH_WITH_CLI=true
             echo "Kirakira dev shell: $(rustc --version) / $(node --version)"
-            echo "wasm target: rustup target add wasm32-unknown-unknown (if absent)"
+            kirakira_wasm_target_libdir="$(rustc --target wasm32-unknown-unknown --print target-libdir 2>/dev/null || true)"
+            if [ ! -d "$kirakira_wasm_target_libdir" ]; then
+              echo "error: the selected nixpkgs Rust toolchain does not provide wasm32-unknown-unknown" >&2
+              exit 1
+            fi
+            echo "wasm target: $kirakira_wasm_target_libdir"
           '';
         };
       });

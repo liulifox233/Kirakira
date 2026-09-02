@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build:wasm": "wasm-pack build . --target web --release --out-dir public/pkg --out-name krkr_web --no-typescript --no-opt",
+    "build:wasm": "wasm-pack build . --target web --release --out-dir public/pkg --out-name krkr_web --no-typescript",
     "build": "pnpm build:wasm && vite build",
     "stage:static": "node scripts/stage-static.mjs",
     "test:web": "node scripts/smoke.mjs",

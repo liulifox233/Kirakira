@@ -277,6 +277,7 @@ pub struct WebRuntime {
     last_timestamp_ms: Option<f64>,
     viewport_width: f32,
     viewport_height: f32,
+    device_pixel_ratio: f64,
     safe_area: krkr_core::SafeAreaInsets,
     orientation: krkr_core::Orientation,
     pending_events: Vec<krkr_core::EngineEvent>,
@@ -313,6 +314,7 @@ impl WebRuntime {
             last_timestamp_ms: None,
             viewport_width: width.max(1.0),
             viewport_height: height.max(1.0),
+            device_pixel_ratio: 1.0,
             safe_area: krkr_core::SafeAreaInsets::default(),
             orientation: krkr_core::Orientation::default(),
             pending_events: Vec::new(),
@@ -357,8 +359,8 @@ impl WebRuntime {
         let renderer = match Renderer::new_with_surface(
             instance,
             surface,
-            PhysicalSize::new(self.viewport_width as u32, self.viewport_height as u32),
-            1.0,
+            self.physical_viewport_size(),
+            self.device_pixel_ratio,
         )
         .await
         {
@@ -678,6 +680,16 @@ impl WebRuntime {
             .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))
     }
 
+    /// Delivers a WebAudio buffer-source completion to the engine.  Browser
+    /// audio is driven by JavaScript, so without this explicit bridge KAG
+    /// `wait`/conductor callbacks would remain suspended forever.
+    pub fn notify_audio_stopped(&mut self, id: u64) -> Result<(), wasm_bindgen::JsValue> {
+        self.session
+            .engine_mut()
+            .notify_audio_stopped(krkr_core::AudioInstanceId(id))
+            .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))
+    }
+
     /// Returns the current engine hit-test candidates at a CSS/logical point.
     /// This is intentionally diagnostic-only and is consumed by the browser
     /// play tool when explaining why a control did (or did not) receive a
@@ -710,14 +722,30 @@ impl WebRuntime {
             .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))
     }
 
+    fn physical_viewport_size(&self) -> PhysicalSize<u32> {
+        PhysicalSize::new(
+            (self.viewport_width as f64 * self.device_pixel_ratio).round() as u32,
+            (self.viewport_height as f64 * self.device_pixel_ratio).round() as u32,
+        )
+    }
+
     pub fn resize(&mut self, width: f32, height: f32) {
         self.viewport_width = width.max(1.0);
         self.viewport_height = height.max(1.0);
+        let physical_size = self.physical_viewport_size();
         if let Some(renderer) = &mut self.renderer {
-            renderer.resize(
-                PhysicalSize::new(self.viewport_width as u32, self.viewport_height as u32),
-                1.0,
-            );
+            renderer.resize(physical_size, self.device_pixel_ratio);
+        }
+    }
+
+    /// Updates the browser backing-store scale independently from the logical
+    /// game viewport. This keeps WebGPU pixels aligned with HiDPI Canvas CSS
+    /// coordinates instead of stretching a low-resolution surface.
+    pub fn set_device_pixel_ratio(&mut self, ratio: f64) {
+        self.device_pixel_ratio = ratio.max(1.0);
+        let physical_size = self.physical_viewport_size();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.resize(physical_size, self.device_pixel_ratio);
         }
     }
 
@@ -745,11 +773,9 @@ impl WebRuntime {
     }
 
     pub fn resume_renderer(&mut self) {
+        let physical_size = self.physical_viewport_size();
         if let Some(renderer) = &mut self.renderer {
-            renderer.resume(
-                PhysicalSize::new(self.viewport_width as u32, self.viewport_height as u32),
-                1.0,
-            );
+            renderer.resume(physical_size, self.device_pixel_ratio);
         }
     }
 
@@ -1062,6 +1088,34 @@ impl WebRuntime {
                 "transitionFrozenDraws",
                 transition.frozen_draw_commands.len() as f64,
             )?;
+            let transition_model = js_sys::Object::new();
+            set_str(&transition_model, "method", &transition.method)?;
+            set_num(&transition_model, "progress", transition.progress as f64)?;
+            let frozen_draws = draw_commands_to_js(&transition.frozen_draw_commands)?;
+            js_sys::Reflect::set(
+                &transition_model,
+                &wasm_bindgen::JsValue::from_str("frozenDrawList"),
+                &frozen_draws,
+            )?;
+            let frozen_uploads = image_uploads_to_js(&transition.frozen_image_uploads)?;
+            js_sys::Reflect::set(
+                &transition_model,
+                &wasm_bindgen::JsValue::from_str("frozenUploads"),
+                &frozen_uploads,
+            )?;
+            if let Some(upload) = &transition.rule_image_upload {
+                let rule_uploads = image_uploads_to_js(std::slice::from_ref(upload))?;
+                js_sys::Reflect::set(
+                    &transition_model,
+                    &wasm_bindgen::JsValue::from_str("ruleUploads"),
+                    &rule_uploads,
+                )?;
+            }
+            js_sys::Reflect::set(
+                &model,
+                &wasm_bindgen::JsValue::from_str("transition"),
+                &transition_model,
+            )?;
         }
         set_num(
             &model,
@@ -1181,80 +1235,13 @@ impl WebRuntime {
             log_list.push(&wasm_bindgen::JsValue::from_str(&log));
         }
         js_sys::Reflect::set(&model, &wasm_bindgen::JsValue::from_str("logs"), &log_list)?;
-        let draw_list = js_sys::Array::new();
-        for command in &output.draw_commands {
-            let item = js_sys::Object::new();
-            match command {
-                krkr_core::DrawCommand::Rect(rect) => {
-                    set_str(&item, "kind", "rect")?;
-                    set_rect(&item, rect.rect)?;
-                    set_color(&item, rect.color)?;
-                }
-                krkr_core::DrawCommand::Text(text) => {
-                    set_str(&item, "kind", "text")?;
-                    set_num(&item, "x", text.position.x as f64)?;
-                    set_num(&item, "y", text.position.y as f64)?;
-                    set_num(&item, "size", text.size as f64)?;
-                    set_str(&item, "text", &text.text)?;
-                    set_color(&item, text.color)?;
-                    set_str(&item, "fontFace", &text.font.face)?;
-                    set_num(&item, "bold", f64::from(text.font.bold as u8))?;
-                    set_num(&item, "italic", f64::from(text.font.italic as u8))?;
-                    set_num(&item, "underline", f64::from(text.font.underline as u8))?;
-                    set_num(&item, "antiAlias", f64::from(text.style.anti_alias as u8))?;
-                    if let Some(shadow) = text.style.shadow {
-                        set_num(&item, "shadowX", shadow.offset_x as f64)?;
-                        set_num(&item, "shadowY", shadow.offset_y as f64)?;
-                        set_color_prefixed(&item, "shadow", shadow.color)?;
-                    }
-                }
-                krkr_core::DrawCommand::Image(image) => {
-                    set_str(&item, "kind", "image")?;
-                    set_num(&item, "textureId", image.texture_id as f64)?;
-                    set_rect(&item, image.rect)?;
-                    // Preserve atlas sampling coordinates for browser renderers.
-                    set_rect_prefixed(&item, "source", image.source_rect)?;
-                    set_rect_prefixed(
-                        &item,
-                        "texture",
-                        krkr_core::Rect::new(
-                            0.0,
-                            0.0,
-                            image.texture_size.width,
-                            image.texture_size.height,
-                        ),
-                    )?;
-                    set_num(&item, "opacity", image.opacity as f64)?;
-                }
-            }
-            draw_list.push(&item);
-        }
+        let draw_list = draw_commands_to_js(&output.draw_commands)?;
         js_sys::Reflect::set(
             &model,
             &wasm_bindgen::JsValue::from_str("drawList"),
             &draw_list,
         )?;
-        let uploads = js_sys::Array::new();
-        for upload in &output.image_uploads {
-            if upload.texture_id <= 4 {
-                let nonzero = upload.rgba.iter().filter(|value| **value != 0).count();
-                web_log(format!(
-                    "image upload bridge: texture={} {}x{} bytes={} nonzero={}",
-                    upload.texture_id,
-                    upload.width,
-                    upload.height,
-                    upload.rgba.len(),
-                    nonzero
-                ));
-            }
-            let item = js_sys::Object::new();
-            set_num(&item, "textureId", upload.texture_id as f64)?;
-            set_num(&item, "width", upload.width as f64)?;
-            set_num(&item, "height", upload.height as f64)?;
-            let bytes = js_sys::Uint8Array::from(upload.rgba.as_ref());
-            js_sys::Reflect::set(&item, &wasm_bindgen::JsValue::from_str("rgba"), &bytes)?;
-            uploads.push(&item);
-        }
+        let uploads = image_uploads_to_js(&output.image_uploads)?;
         js_sys::Reflect::set(
             &model,
             &wasm_bindgen::JsValue::from_str("uploads"),
@@ -1333,7 +1320,7 @@ impl WebRuntime {
         }
         js_sys::Reflect::set(&model, &wasm_bindgen::JsValue::from_str("audio"), &audio)?;
         let videos = js_sys::Array::new();
-        for video in self.session.engine().video_overlay_snapshots() {
+        for video in self.session.engine_mut().video_overlay_snapshots() {
             let item = js_sys::Object::new();
             set_str(&item, "kind", "video")?;
             if let Some(storage) = video.storage {
@@ -1345,6 +1332,11 @@ impl WebRuntime {
             set_num(&item, "width", video.width as f64)?;
             set_num(&item, "height", video.height as f64)?;
             set_num(&item, "visible", f64::from(video.visible as u8))?;
+            set_num(&item, "looping", f64::from(video.looping as u8))?;
+            set_num(&item, "position", video.position_ms as f64)?;
+            set_num(&item, "playRate", video.play_rate)?;
+            set_num(&item, "audioVolume", video.audio_volume as f64)?;
+            set_num(&item, "audioBalance", video.audio_balance as f64)?;
             videos.push(&item);
         }
         js_sys::Reflect::set(&model, &wasm_bindgen::JsValue::from_str("videos"), &videos)?;
@@ -1353,6 +1345,78 @@ impl WebRuntime {
         }
         Ok(model)
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn draw_commands_to_js(
+    commands: &[krkr_core::DrawCommand],
+) -> Result<js_sys::Array, wasm_bindgen::JsValue> {
+    let draw_list = js_sys::Array::new();
+    for command in commands {
+        let item = js_sys::Object::new();
+        match command {
+            krkr_core::DrawCommand::Rect(rect) => {
+                set_str(&item, "kind", "rect")?;
+                set_rect(&item, rect.rect)?;
+                set_color(&item, rect.color)?;
+            }
+            krkr_core::DrawCommand::Text(text) => {
+                set_str(&item, "kind", "text")?;
+                set_num(&item, "x", text.position.x as f64)?;
+                set_num(&item, "y", text.position.y as f64)?;
+                set_num(&item, "size", text.size as f64)?;
+                set_str(&item, "text", &text.text)?;
+                set_color(&item, text.color)?;
+                set_str(&item, "fontFace", &text.font.face)?;
+                set_num(&item, "bold", f64::from(text.font.bold as u8))?;
+                set_num(&item, "italic", f64::from(text.font.italic as u8))?;
+                set_num(&item, "underline", f64::from(text.font.underline as u8))?;
+                set_num(&item, "antiAlias", f64::from(text.style.anti_alias as u8))?;
+                if let Some(shadow) = text.style.shadow {
+                    set_num(&item, "shadowX", shadow.offset_x as f64)?;
+                    set_num(&item, "shadowY", shadow.offset_y as f64)?;
+                    set_color_prefixed(&item, "shadow", shadow.color)?;
+                }
+            }
+            krkr_core::DrawCommand::Image(image) => {
+                set_str(&item, "kind", "image")?;
+                set_num(&item, "textureId", image.texture_id as f64)?;
+                set_rect(&item, image.rect)?;
+                // Preserve atlas sampling coordinates for browser renderers.
+                set_rect_prefixed(&item, "source", image.source_rect)?;
+                set_rect_prefixed(
+                    &item,
+                    "texture",
+                    krkr_core::Rect::new(
+                        0.0,
+                        0.0,
+                        image.texture_size.width,
+                        image.texture_size.height,
+                    ),
+                )?;
+                set_num(&item, "opacity", image.opacity as f64)?;
+            }
+        }
+        draw_list.push(&item);
+    }
+    Ok(draw_list)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn image_uploads_to_js(
+    uploads: &[krkr_core::ImageUpload],
+) -> Result<js_sys::Array, wasm_bindgen::JsValue> {
+    let result = js_sys::Array::new();
+    for upload in uploads {
+        let item = js_sys::Object::new();
+        set_num(&item, "textureId", upload.texture_id as f64)?;
+        set_num(&item, "width", upload.width as f64)?;
+        set_num(&item, "height", upload.height as f64)?;
+        let bytes = js_sys::Uint8Array::from(upload.rgba.as_ref());
+        js_sys::Reflect::set(&item, &wasm_bindgen::JsValue::from_str("rgba"), &bytes)?;
+        result.push(&item);
+    }
+    Ok(result)
 }
 
 #[cfg(target_arch = "wasm32")]

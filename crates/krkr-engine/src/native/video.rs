@@ -82,15 +82,15 @@ pub(crate) struct VideoOverlayState {
     pub(crate) height: i64,
     pub(crate) visible: bool,
     mode: i64,
-    looping: bool,
-    play_rate: f64,
+    pub(crate) looping: bool,
+    pub(crate) play_rate: f64,
     /// Playback position at the clock anchor (or the frozen position while
     /// paused / stopped).
-    position_ms: i64,
+    pub(crate) position_ms: i64,
     clock_anchor_ms: Option<i64>,
     audio_id: Option<AudioInstanceId>,
-    audio_volume: i64,
-    audio_balance: i64,
+    pub(crate) audio_volume: i64,
+    pub(crate) audio_balance: i64,
     enabled_audio_stream: i64,
     enabled_video_stream: i64,
     period_event_frame: i64,
@@ -201,7 +201,7 @@ impl Clone for VideoOverlayState {
 }
 
 impl VideoOverlayState {
-    fn elapsed_ms(&self, now_ms: i64) -> i64 {
+    pub(crate) fn elapsed_ms(&self, now_ms: i64) -> i64 {
         match self.clock_anchor_ms {
             Some(anchor) => {
                 self.position_ms + ((now_ms - anchor) as f64 * self.play_rate.max(0.0)) as i64
