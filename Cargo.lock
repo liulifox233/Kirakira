@@ -989,6 +989,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1119,6 +1125,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "krkr-assets"
+version = "0.1.0"
+dependencies = [
+ "krkr-core",
+ "krkr-xp3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "krkr-audio"
 version = "0.1.0"
 dependencies = [
@@ -1133,52 +1149,34 @@ dependencies = [
 [[package]]
 name = "krkr-core"
 version = "0.1.0"
-dependencies = [
- "krkr-font",
-]
 
 [[package]]
 name = "krkr-debug"
 version = "0.1.0"
 dependencies = [
+ "krkr-assets",
+ "krkr-audio",
  "krkr-core",
  "krkr-engine",
  "krkr-plugins",
  "krkr-tjs2",
-]
-
-[[package]]
-name = "krkr-decomp"
-version = "0.1.0"
-dependencies = [
- "encoding_rs",
- "krkr-tjs2",
- "krkr-xp3",
 ]
 
 [[package]]
 name = "krkr-desktop"
 version = "0.1.0"
 dependencies = [
+ "krkr-assets",
  "krkr-audio",
  "krkr-core",
  "krkr-engine",
- "krkr-platform",
  "krkr-plugins",
  "krkr-render",
  "krkr-tjs2",
  "krkr-xp3",
  "pollster",
+ "rfd",
  "winit",
-]
-
-[[package]]
-name = "krkr-disasm"
-version = "0.1.0"
-dependencies = [
- "encoding_rs",
- "krkr-tjs2",
- "krkr-xp3",
 ]
 
 [[package]]
@@ -1203,6 +1201,7 @@ name = "krkr-font"
 version = "0.1.0"
 dependencies = [
  "fontdb",
+ "krkr-core",
  "swash",
 ]
 
@@ -1211,11 +1210,10 @@ name = "krkr-kag"
 version = "0.1.0"
 
 [[package]]
-name = "krkr-platform"
+name = "krkr-pack"
 version = "0.1.0"
 dependencies = [
- "krkr-core",
- "rfd",
+ "krkr-assets",
 ]
 
 [[package]]
@@ -1247,6 +1245,7 @@ dependencies = [
  "crossterm",
  "icy_sixel",
  "image",
+ "krkr-assets",
  "krkr-audio",
  "krkr-core",
  "krkr-engine",
@@ -1254,6 +1253,15 @@ dependencies = [
  "krkr-plugins",
  "krkr-tjs2",
  "terminal_size",
+]
+
+[[package]]
+name = "krkr-tjs-tools"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "krkr-tjs2",
+ "krkr-xp3",
 ]
 
 [[package]]
@@ -1274,6 +1282,22 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "krkr-web"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "krkr-assets",
+ "krkr-core",
+ "krkr-engine",
+ "krkr-plugins",
+ "krkr-render",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
 ]
 
 [[package]]
@@ -2573,6 +2597,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -3925,6 +3962,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zune-core"

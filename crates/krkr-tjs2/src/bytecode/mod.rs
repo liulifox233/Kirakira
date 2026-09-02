@@ -7,8 +7,8 @@ mod parse;
 mod verify;
 
 pub use self::disasm::DisasmOptions;
-pub use self::instruction::{CallArgs, ExpandedArg, Instruction};
 pub(crate) use self::instruction::{BinaryForm, binary_form};
+pub use self::instruction::{CallArgs, ExpandedArg, Instruction};
 
 use self::disasm::{disassemble_file, disassemble_instruction, render_object_full};
 use self::instruction::decode_instructions;

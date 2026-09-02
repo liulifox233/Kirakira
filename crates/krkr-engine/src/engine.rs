@@ -8,7 +8,7 @@ use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, ButtonState, Color,
     Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput,
     FrameOutput, ImageUpload, LayerId, MessageLayerModel, Point, PointerButton, Size,
-    TransitionMethod, TransitionParams, TransitionScrollFrom, TransitionScrollStay,
+    TextInputEvent, TransitionMethod, TransitionParams, TransitionScrollFrom, TransitionScrollStay,
 };
 use krkr_kag::{KagError, KagParser, ParserSnapshot, Tag};
 use krkr_tjs2::{
@@ -27,7 +27,7 @@ use crate::{
         finish_completed_native_transitions, register_kag_layer_slots_from_tjs,
     },
     native::{
-        create_kag_parser_object, refresh_kag_parser_object, tick_video_overlays,
+        create_kag_parser_object, kag_to_tjs, refresh_kag_parser_object, tick_video_overlays,
         video_overlay_frame_quads,
     },
     plugin::KrkrPlugin,
@@ -40,6 +40,40 @@ use crate::{
         execute_script_on_runtime,
     },
 };
+
+/// Resource waits can be wrapped in a TJS runtime stack trace while crossing
+/// a suspended native call. Keep one predicate for all host/update boundaries
+/// so those waits never escape as fatal frame errors.
+fn is_resource_pending_error(error: &TjsError) -> bool {
+    error.kind == krkr_tjs2::TjsErrorKind::ResourcePending
+        || error.to_string().contains("KAG resource is pending:")
+}
+
+/// Wall-clock budget timer that remains safe on browser WASM targets. The
+/// standard library's `Instant` is unavailable there; the browser host still
+/// supplies frame pacing through `EngineInput.delta`, so a zero elapsed value
+/// simply disables the optional per-tick wall-time guard.
+#[derive(Clone, Copy, Debug)]
+struct BudgetTimer(Option<Instant>);
+
+impl BudgetTimer {
+    fn start() -> Self {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self(None)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self(Some(Instant::now()))
+        }
+    }
+
+    fn elapsed(self) -> Duration {
+        self.0
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KagRunBudget {
@@ -56,9 +90,12 @@ impl Default for KagRunBudget {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct EngineConfig {
     pub project_root: Option<PathBuf>,
+    /// Optional preloaded storage (used by browser hosts without a native
+    /// filesystem). When set, this takes precedence over `project_root`.
+    pub project_storage: Option<crate::ProjectStorage>,
     pub kag_budget: KagRunBudget,
     pub system_metrics: SystemMetrics,
 }
@@ -125,11 +162,33 @@ pub struct EngineInputResult {
 pub struct EngineInput {
     pub frame: FrameInput,
     pub events: Vec<EngineEvent>,
+    /// Text committed/composed by an IME. Kept separate from pointer/key
+    /// events because composition payloads are owned UTF-8 strings rather than
+    /// small copyable key codes.
+    pub text: Vec<TextInputEvent>,
+    /// Host clock sample for deterministic cross-platform scheduling. `None`
+    /// keeps the legacy host-owned clock behavior for direct engine callers.
+    pub now_millis: Option<i64>,
 }
 
 impl EngineInput {
     pub fn new(frame: FrameInput, events: Vec<EngineEvent>) -> Self {
-        Self { frame, events }
+        Self {
+            frame,
+            events,
+            text: Vec::new(),
+            now_millis: None,
+        }
+    }
+
+    pub fn with_text(mut self, text: Vec<TextInputEvent>) -> Self {
+        self.text = text;
+        self
+    }
+
+    pub fn with_now_millis(mut self, now_millis: i64) -> Self {
+        self.now_millis = Some(now_millis);
+        self
     }
 }
 
@@ -150,6 +209,28 @@ pub struct EngineFrame {
     pub location: KagLocation,
 }
 
+/// Typed host-facing resource request emitted at a frame boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalResourceRequest {
+    pub path: String,
+    pub kind: krkr_core::AssetKind,
+}
+
+/// A frame is either ready for presentation or waiting on one or more
+/// external resources. Waiting is normal scheduling state, not an exception
+/// that a host must detect by parsing an error string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EngineStep {
+    Ready {
+        frame: EngineFrame,
+        requests: Vec<ExternalResourceRequest>,
+    },
+    Waiting {
+        frame: EngineFrame,
+        requests: Vec<ExternalResourceRequest>,
+    },
+}
+
 pub struct KrkrEngine {
     tjs_runtime: Runtime<KrkrHost>,
     kag_session: KagSession,
@@ -165,9 +246,10 @@ pub struct KrkrEngine {
 
 impl KrkrEngine {
     pub fn new(config: EngineConfig) -> Result<Self> {
-        let host = match config.project_root {
-            Some(root) => KrkrHost::for_project(root)?,
-            None => KrkrHost::default(),
+        let host = match (config.project_storage, config.project_root) {
+            (Some(storage), _) => KrkrHost::from_storage(storage)?,
+            (None, Some(root)) => KrkrHost::for_project(root)?,
+            (None, None) => KrkrHost::default(),
         };
         let mut tjs_runtime = Runtime::with_host(host);
         install_tvp_globals(&mut tjs_runtime);
@@ -207,6 +289,10 @@ impl KrkrEngine {
 
     pub fn host_mut(&mut self) -> &mut KrkrHost {
         self.tjs_runtime.host_mut()
+    }
+
+    pub fn video_overlay_snapshots(&self) -> Vec<crate::VideoOverlaySnapshot> {
+        self.tjs_runtime.host().video_overlay_snapshots()
     }
 
     pub fn preferred_viewport_size(&self) -> Option<Size> {
@@ -453,25 +539,25 @@ impl KrkrEngine {
     }
 
     pub fn execute_storage(&mut self, name: &str) -> Result<Variant> {
-        let bytes = self.tjs_runtime.host().read_binary_storage(name)?;
+        let bytes = self.tjs_runtime.host_mut().read_binary_storage(name)?;
         if let Some(result) =
             execute_bytecode_if_present_on_runtime(&mut self.tjs_runtime, name, &bytes)?
         {
             return self.sync_kag_slots_after_ok(Ok(result));
         }
-        let source = self.tjs_runtime.host().read_text_storage(name)?;
+        let source = self.tjs_runtime.host_mut().read_text_storage(name)?;
         let result = execute_script_on_runtime(&mut self.tjs_runtime, name, &source);
         self.sync_kag_slots_after_ok(result)
     }
 
     pub fn eval_storage(&mut self, name: &str) -> Result<Variant> {
-        let bytes = self.tjs_runtime.host().read_binary_storage(name)?;
+        let bytes = self.tjs_runtime.host_mut().read_binary_storage(name)?;
         if let Some(result) =
             execute_bytecode_if_present_on_runtime(&mut self.tjs_runtime, name, &bytes)?
         {
             return self.sync_kag_slots_after_ok(Ok(result));
         }
-        let source = self.tjs_runtime.host().read_text_storage(name)?;
+        let source = self.tjs_runtime.host_mut().read_text_storage(name)?;
         let result = execute_expression_on_runtime(&mut self.tjs_runtime, name, &source);
         self.sync_kag_slots_after_ok(result)
     }
@@ -487,6 +573,31 @@ impl KrkrEngine {
         self.execute_storage("startup.tjs")
     }
 
+    /// Starts a project using the same contract on every host.
+    ///
+    /// A KRKR project owns its opening flow: `startup.tjs` may construct a
+    /// KAG window/parser and dispatch first-run/logo/title scripts.  The
+    /// engine only provides the conventional `startup.ks` fallback when no
+    /// parser was created.  Hosts must call this method instead of guessing
+    /// scenario names such as `first.ks` or `title.ks`.
+    pub fn start_project(&mut self) -> Result<()> {
+        let has_startup_tjs = self.tjs_runtime.host().storage_exists("startup.tjs");
+        let has_startup_ks = self.tjs_runtime.host().storage_exists("startup.ks");
+        if has_startup_tjs || !has_startup_ks {
+            self.tjs_runtime
+                .host_mut()
+                .log("project startup: executing startup.tjs dispatcher");
+            self.execute_startup()?;
+        }
+        if !self.has_kag_scenario() && has_startup_ks {
+            self.tjs_runtime
+                .host_mut()
+                .log("project startup: falling back to startup.ks scenario");
+            self.load_kag_scenario("startup.ks").map_err(kag_to_tjs)?;
+        }
+        Ok(())
+    }
+
     pub fn load_kag_scenario(&mut self, storage: &str) -> krkr_kag::Result<()> {
         self.kag_session
             .load_scenario(storage, &mut self.tjs_runtime)
@@ -500,8 +611,64 @@ impl KrkrEngine {
         self.kag_session.state()
     }
 
+    /// Marks the scenario as blocked on an asynchronous resource.  Platform
+    /// sessions use this as a final safety net when a nested TJS callback
+    /// still returns a wrapped pending error at the frame boundary; the next
+    /// frame will collect the outstanding external request and resume once it
+    /// is supplied.
+    pub fn mark_resource_waiting(&mut self) {
+        self.kag_session.state = KagTaskState::WaitingResource;
+    }
+
     pub fn has_kag_scenario(&self) -> bool {
         self.kag_session.loaded()
+    }
+
+    pub fn is_script_suspended(&self) -> bool {
+        self.tjs_runtime.is_suspended()
+    }
+
+    /// Returns scheduler queues useful to platform diagnostics: continuous
+    /// handlers, queued script events, and idle async triggers.
+    pub fn scheduler_diagnostics(&self) -> (usize, usize, usize, usize, usize) {
+        self.tjs_runtime.host().scheduler_diagnostics()
+    }
+
+    pub fn scheduler_timer_diagnostics(&mut self) -> (usize, usize, usize, usize, i64) {
+        let now = self.tjs_runtime.host_mut().now_millis();
+        let handles = self.tjs_runtime.host().scheduler().timer_handles();
+        let mut enabled = 0;
+        let mut scheduled = 0;
+        let mut due = 0;
+        for handle in handles.iter().copied() {
+            if !self
+                .tjs_runtime
+                .object_member(handle, "enabled")
+                .is_truthy()
+            {
+                continue;
+            }
+            enabled += 1;
+            let interval = self
+                .tjs_runtime
+                .object_member(handle, "interval")
+                .to_integer()
+                .unwrap_or_default();
+            if interval == 0 {
+                continue;
+            }
+            scheduled += 1;
+            if self
+                .tjs_runtime
+                .host()
+                .scheduler()
+                .timer_next_fire_millis(handle)
+                .is_some_and(|next| next <= now)
+            {
+                due += 1;
+            }
+        }
+        (handles.len(), enabled, scheduled, due, now)
     }
 
     pub fn message_layer(&self) -> &MessageLayerModel {
@@ -522,6 +689,62 @@ impl KrkrEngine {
 
     pub fn signal_kag_click(&mut self) {
         self.kag_session.signal_click();
+    }
+
+    pub fn set_external_resource_catalog<I, S>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tjs_runtime
+            .host_mut()
+            .set_external_resource_catalog(paths);
+    }
+
+    pub fn take_external_resource_requests(&mut self) -> Vec<(String, krkr_core::AssetKind)> {
+        self.tjs_runtime
+            .host_mut()
+            .take_external_resource_requests()
+    }
+
+    pub fn has_external_resource_request(&self, path: &str) -> bool {
+        self.tjs_runtime.host().has_external_resource_request(path)
+    }
+
+    pub fn provide_external_resource(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        self.tjs_runtime.host_mut().log(&format!(
+            "external resource provided `{path}` ({} bytes)",
+            bytes.len()
+        ));
+        self.tjs_runtime
+            .host_mut()
+            .provide_external_resource(path, bytes)?;
+        if self.tjs_runtime.is_suspended() {
+            // Resuming a suspended KAG/TJS call can immediately request the
+            // next resource (for example custom.ks -> title.ks).  That is a
+            // normal asynchronous boundary, not a fatal engine error: leave
+            // the VM suspended and let the next asset event resume it.
+            match self.tjs_runtime.resume_suspended() {
+                Ok(_) => {}
+                Err(error) if is_resource_pending_error(&error) => {
+                    self.tjs_runtime.host_mut().log(&format!(
+                        "external resource resume deferred for `{path}`: {error}"
+                    ));
+                    self.kag_session.state = KagTaskState::WaitingResource;
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.tjs_runtime.host_mut().log(&format!(
+                        "external resource resume failed for `{path}`: {error}"
+                    ));
+                    return Err(error);
+                }
+            }
+        }
+        if self.kag_session.state == KagTaskState::WaitingResource {
+            self.kag_session.state = KagTaskState::Running;
+        }
+        Ok(())
     }
 
     pub fn notify_audio_stopped(&mut self, id: AudioInstanceId) -> Result<()> {
@@ -546,12 +769,93 @@ impl KrkrEngine {
         self.sync_kag_slots_after_ok(result)
     }
 
+    /// Completes a browser-owned media element and mirrors its `ended` event
+    /// into the native overlay conductor. Desktop decoders reach the same
+    /// path from `tick_video_overlays`; Web media elements call this hook.
+    pub fn notify_video_ended(&mut self, storage: &str) -> Result<()> {
+        let handles = self.tjs_runtime.host().video_overlay_handles();
+        for handle in handles {
+            let matches_storage = self
+                .tjs_runtime
+                .host()
+                .video_overlay_state(handle)
+                .and_then(|state| state.storage.as_deref())
+                .is_some_and(|value| value.eq_ignore_ascii_case(storage));
+            if matches_storage && self.tjs_runtime.object_valid(handle) {
+                self.tjs_runtime
+                    .call_object_method(handle, "stop", Vec::new())?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn tick(&mut self) -> Result<EngineTickResult> {
         self.advance(Duration::ZERO)
     }
 
+    /// Returns a human-readable hit-test trace for browser/host diagnostics.
+    ///
+    /// KRKR controls often layer a script-backed button below transparent
+    /// image children. Keeping this inspection on the engine makes it
+    /// possible for a browser driver to explain why a click was routed to a
+    /// decorative layer instead of guessing from pixels alone.
+    pub fn inspect_pointer(&mut self, position: Point) -> Result<Vec<String>> {
+        let candidates = self.hit_tested_layers_at_position(position)?;
+        Ok(candidates
+            .into_iter()
+            .filter_map(|layer_id| {
+                let node = self.tjs_runtime.host().layer_tree().layer(layer_id)?.clone();
+                let object = self.tjs_runtime.host().native_object_for_layer(layer_id)?;
+                let classes = self.tjs_runtime.object_class_infos(object).join("/");
+                let class_name = match self.tjs_runtime.object_member(object, "__className") {
+                    Variant::String(value) => value,
+                    _ => String::new(),
+                };
+                let handler_state = |method: &str| match self.tjs_runtime.object_member(object, method)
+                {
+                    Variant::Void => "none",
+                    handler if self.tjs_runtime.variant_is_native_function(&handler) => "native",
+                    _ => "script",
+                };
+                let link_num = self.tjs_runtime.object_member(object, "linkNum");
+                let link = !matches!(link_num, Variant::Void);
+                let event_transparent = self
+                    .tjs_runtime
+                    .object_member(object, "eventTransparent")
+                    .is_truthy();
+                Some(format!(
+                    "id={} name={:?} class={}/{} rect=({},{} {}x{}) z={} hitType={} threshold={} transparent={} handlers=down:{} up:{} hit:{} click:{} link={} linkNum={:?}",
+                    layer_id,
+                    node.name,
+                    classes,
+                    class_name,
+                    node.left,
+                    node.top,
+                    node.width,
+                    node.height,
+                    node.z_order,
+                    node.hit_type,
+                    node.hit_threshold,
+                    event_transparent,
+                    handler_state("onMouseDown"),
+                    handler_state("onMouseUp"),
+                    handler_state("onHitTest"),
+                    handler_state("onClick"),
+                    link,
+                    link_num,
+                ))
+            })
+            .collect())
+    }
+
     pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
         self.input_result = EngineInputResult::default();
+        if let Some(now_millis) = input.now_millis {
+            self.tjs_runtime.host_mut().set_clock_millis(now_millis);
+        } else {
+            #[cfg(target_arch = "wasm32")]
+            self.tjs_runtime.host_mut().advance_clock(delta);
+        }
         {
             let scheduler = self.tjs_runtime.host_mut().scheduler_mut();
             scheduler.begin_frame();
@@ -559,16 +863,48 @@ impl KrkrEngine {
                 scheduler.post_input_event(event);
             }
         }
-        self.pump_runtime_scheduler(RuntimeSchedulerPump::Full)?;
-        self.resume_modal_call_if_ready()?;
+        for text in input.text {
+            self.tjs_runtime.host_mut().push_text_input(text);
+        }
+        // Do not dispatch script/idle callbacks while a previous callback is
+        // blocked on an external resource. Such a callback can immediately
+        // retry the same nested KAG jump and recreate the pending error before
+        // the platform session has had a chance to start the fetch. Input is
+        // retained in the scheduler and delivered after the resource arrives.
+        let waiting_for_resource = self.kag_session.state == KagTaskState::WaitingResource
+            && (self.tjs_runtime.host().has_pending_external_resources()
+                || self.tjs_runtime.host().has_pending_resource_loads());
+        if !waiting_for_resource
+            && let Err(error) = self.pump_runtime_scheduler(RuntimeSchedulerPump::Full)
+            && !(error.to_string().contains("KAG resource is pending:") && {
+                self.kag_session.state = KagTaskState::WaitingResource;
+                true
+            })
+        {
+            return Err(error);
+        }
+        if !waiting_for_resource
+            && let Err(error) = self.resume_modal_call_if_ready()
+            && !(error.to_string().contains("KAG resource is pending:") && {
+                self.kag_session.state = KagTaskState::WaitingResource;
+                true
+            })
+        {
+            return Err(error);
+        }
         let tick = self.advance(delta)?;
         // Video overlays advance on the same clock; status events fired here
         // (notably the end-of-stream `stop` KAG movie conductors wait for)
         // wake the scenario on the next advance.
         let video_tick = tick_video_overlays(&mut self.tjs_runtime);
         self.sync_kag_slots_after_ok(video_tick)?;
-        self.pump_runtime_scheduler(RuntimeSchedulerPump::WindowUpdatesOnly)?;
-        complete_pending_layer_paints(&mut self.tjs_runtime)?;
+        let resource_waiting_after_tick = self.kag_session.state == KagTaskState::WaitingResource
+            && (self.tjs_runtime.host().has_pending_external_resources()
+                || self.tjs_runtime.host().has_pending_resource_loads());
+        if !waiting_for_resource && !resource_waiting_after_tick {
+            self.pump_runtime_scheduler(RuntimeSchedulerPump::WindowUpdatesOnly)?;
+            complete_pending_layer_paints(&mut self.tjs_runtime)?;
+        }
         self.tjs_runtime
             .host_mut()
             .reapply_transition_live_layer_overrides();
@@ -599,6 +935,25 @@ impl KrkrEngine {
         Ok(frame)
     }
 
+    /// Advances one host frame and transfers external resource requests along
+    /// with the frame result. Runtime hosts should prefer this method over
+    /// calling `update` and then inspecting host state separately.
+    pub fn step(&mut self, input: EngineInput, delta: Duration) -> Result<EngineStep> {
+        let frame = self.update(input, delta)?;
+        let requests = self
+            .take_external_resource_requests()
+            .into_iter()
+            .map(|(path, kind)| ExternalResourceRequest { path, kind })
+            .collect::<Vec<_>>();
+        let waiting =
+            !requests.is_empty() || matches!(frame.tick.state, KagTaskState::WaitingResource);
+        Ok(if waiting {
+            EngineStep::Waiting { frame, requests }
+        } else {
+            EngineStep::Ready { frame, requests }
+        })
+    }
+
     fn resume_modal_call_if_ready(&mut self) -> Result<()> {
         while let Some(window) = self.tjs_runtime.host().current_modal_window() {
             if !self.modal_window_is_closed(window) {
@@ -613,18 +968,49 @@ impl KrkrEngine {
                 self.kag_session.state = KagTaskState::Running;
             }
         }
+        // A host may invalidate a modal window while resuming a suspended
+        // callback (for example when a browser-side window has no native DOM
+        // peer). In that case the modal stack is already empty, but the KAG
+        // state still needs to leave `WaitingModal` once the VM is running.
+        if self.kag_session.state == KagTaskState::WaitingModal
+            && !self.tjs_runtime.is_suspended()
+            && self.tjs_runtime.host().current_modal_window().is_none()
+        {
+            self.tjs_runtime
+                .host_mut()
+                .log("KAG modal wait cleared without active modal");
+            self.kag_session.state = KagTaskState::Running;
+        }
         Ok(())
     }
 
     fn modal_window_is_closed(&self, window: ObjectHandle) -> bool {
-        !self.tjs_runtime.object_valid(window)
-            || self.tjs_runtime.host().native_window_closed(window)
-            || !self
+        #[cfg(target_arch = "wasm32")]
+        {
+            // The Web shell has no native modal-window peer yet. Keeping the
+            // VM suspended here makes title/startup scripts wait forever on
+            // an invisible dialog, so treat browser-side modal helpers as
+            // immediately dismissed until a DOM dialog bridge is provided.
+            let _ = window;
+            return true;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let visible = self
                 .tjs_runtime
                 .host()
-                .native_window_property(window, "visible")
+                .native_window_property(window, "visible");
+            !self.tjs_runtime.object_valid(window)
+            || self.tjs_runtime.host().native_window_closed(window)
+            // Browser hosts do not create a native DOM peer for every KRKR
+            // modal helper. If no host-side window state exists, there is no
+            // modal surface to keep the VM blocked on, so resume it.
+            || (visible.is_none()
+                && !self.tjs_runtime.host().modal_window_snapshot().is_some())
+            || !visible
                 .unwrap_or_else(|| self.tjs_runtime.object_member(window, "visible"))
                 .is_truthy()
+        }
     }
 
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
@@ -635,8 +1021,28 @@ impl KrkrEngine {
         let resource_pending = self.tjs_runtime.host().has_pending_resource_loads();
         self.kag_session
             .update_wait(delta, transition_active, resource_pending);
-        self.kag_session
+        match self
+            .kag_session
             .run_until_yield(&mut self.tjs_runtime, self.kag_budget)
+        {
+            Ok(tick) => Ok(tick),
+            Err(error)
+                if error.kind == krkr_tjs2::TjsErrorKind::ResourcePending
+                    || error.to_string().contains("KAG resource is pending:") =>
+            {
+                // Nested parser jumps can wrap ResourcePending in a runtime
+                // stack trace. Keep the session resumable at the frame
+                // boundary so the asset store can fetch and wake it.
+                self.kag_session.state = KagTaskState::WaitingResource;
+                Ok(EngineTickResult {
+                    state: self.kag_session.state.clone(),
+                    reason: KagYieldReason::Waiting(self.kag_session.state.clone()),
+                    tags_processed: 0,
+                    elapsed: Duration::ZERO,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn runtime_window_object(&self) -> Option<ObjectHandle> {
@@ -1047,7 +1453,13 @@ impl KrkrEngine {
                 } => {
                     let modal_active = self.active_modal_window().is_some();
                     self.dispatch_window_pointer_event("onMouseDown", 0)?;
-                    let raw_target = self.layer_at_cursor()?;
+                    // A KRKR control is commonly composed of a script-backed
+                    // parent and one or more decorative/image children. The
+                    // visual child is the topmost hit-test result, but it is
+                    // not the object that owns onClick/onMouseUp. Prefer the
+                    // first script-backed candidate and fall back to the raw
+                    // visual target for linkNum/KAG click handling.
+                    let raw_target = self.interactive_layer_at_cursor()?;
                     let handled_by_script = raw_target.is_some_and(|layer_id| {
                         self.layer_has_script_handler(layer_id, "onMouseDown")
                     });
@@ -1067,7 +1479,7 @@ impl KrkrEngine {
                 } => {
                     let modal_active = self.active_modal_window().is_some();
                     self.dispatch_window_pointer_event("onMouseUp", 0)?;
-                    let release_hit = self.layer_at_cursor()?;
+                    let release_hit = self.interactive_layer_at_cursor()?;
                     // The click handler can invalidate/rebuild its layer
                     // (GINKA's title Start does exactly that). Determine
                     // ownership while the original target is still alive;
@@ -1083,14 +1495,19 @@ impl KrkrEngine {
                                 .chain(["onClick"].iter())
                                 .any(|method| self.layer_has_script_handler(layer_id, method))
                         });
+                    self.tjs_runtime.host_mut().log(&format!(
+                        "input primary release pressed={:?} captured={:?} release={:?} handled_by_script={handled_by_script}",
+                        self.pressed_layer, self.captured_layer, release_hit
+                    ));
                     self.dispatch_layer_pointer_event(
                         "onMouseUp",
                         0,
                         self.captured_layer.or(release_hit),
                     )?;
-                    if let (Some(pressed), Some(release_hit)) = (self.pressed_layer, release_hit)
-                        && pressed == release_hit
-                    {
+                    let click_target = self.pressed_layer.filter(|pressed| {
+                        release_hit == Some(*pressed) || self.layer_contains_cursor(*pressed)
+                    });
+                    if let Some(pressed) = click_target {
                         self.dispatch_window_click()?;
                         self.dispatch_layer_click(pressed)?;
                     }
@@ -1106,7 +1523,7 @@ impl KrkrEngine {
                 } => {
                     let modal_active = self.active_modal_window().is_some();
                     let handled_by_window = self.dispatch_window_pointer_event("onMouseDown", 1)?;
-                    let raw_target = self.layer_at_cursor()?;
+                    let raw_target = self.interactive_layer_at_cursor()?;
                     let handled_by_layer = raw_target.is_some_and(|layer_id| {
                         self.layer_has_script_handler(layer_id, "onMouseDown")
                     });
@@ -1121,7 +1538,7 @@ impl KrkrEngine {
                     state: ButtonState::Released,
                 } => {
                     self.dispatch_window_pointer_event("onMouseUp", 1)?;
-                    let release_hit = self.layer_at_cursor()?;
+                    let release_hit = self.interactive_layer_at_cursor()?;
                     self.dispatch_layer_pointer_event(
                         "onMouseUp",
                         1,
@@ -1166,6 +1583,43 @@ impl KrkrEngine {
                         self.input_result.unhandled_escape_pressed = true;
                     }
                 }
+                EngineEvent::TouchInput {
+                    id: _,
+                    position,
+                    phase,
+                } => {
+                    // Touch uses the same KRKR pointer callbacks as a primary
+                    // mouse button. The contact id is retained by the host
+                    // protocol so mobile gesture adapters can track multiple
+                    // contacts; the legacy KRKR API itself exposes one active
+                    // pointer, therefore the first contact drives it here.
+                    self.cursor_position = Some(*position);
+                    self.tjs_runtime.host_mut().set_cursor_position(*position);
+                    match phase {
+                        krkr_core::TouchPhase::Started => {
+                            self.handle_input_event(EngineEvent::PointerInput {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Pressed,
+                            })?;
+                        }
+                        krkr_core::TouchPhase::Moved => {
+                            self.dispatch_layer_cursor_move(*position)?;
+                        }
+                        krkr_core::TouchPhase::Ended => {
+                            self.handle_input_event(EngineEvent::PointerInput {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Released,
+                            })?;
+                        }
+                        krkr_core::TouchPhase::Cancelled => {
+                            self.pressed_layer = None;
+                            self.captured_layer = None;
+                        }
+                    }
+                }
+                EngineEvent::Lifecycle { state } => {
+                    self.tjs_runtime.host_mut().set_lifecycle_state(*state);
+                }
                 EngineEvent::PointerInput { .. } => {}
             }
         }
@@ -1176,13 +1630,19 @@ impl KrkrEngine {
         let key = match event {
             EngineEvent::KeyboardInput { key, .. } => engine_key_vk_code(*key),
             EngineEvent::PointerInput { button, .. } => pointer_button_vk_code(*button),
-            EngineEvent::CursorMoved { .. } | EngineEvent::MouseWheel { .. } => None,
+            EngineEvent::CursorMoved { .. }
+            | EngineEvent::MouseWheel { .. }
+            | EngineEvent::TouchInput { .. }
+            | EngineEvent::Lifecycle { .. } => None,
         };
         let state = match event {
             EngineEvent::KeyboardInput { state, .. } | EngineEvent::PointerInput { state, .. } => {
                 *state
             }
-            EngineEvent::CursorMoved { .. } | EngineEvent::MouseWheel { .. } => return,
+            EngineEvent::CursorMoved { .. }
+            | EngineEvent::MouseWheel { .. }
+            | EngineEvent::TouchInput { .. }
+            | EngineEvent::Lifecycle { .. } => return,
         };
         if let Some(key) = key {
             self.tjs_runtime
@@ -1303,18 +1763,31 @@ impl KrkrEngine {
             return Ok(false);
         }
         let handled_by_script = !self.tjs_runtime.variant_is_native_function(&handler);
-        self.tjs_runtime
-            .call_object_method(
-                window,
-                method,
-                vec![
-                    Variant::Integer(position.x.round() as i64),
-                    Variant::Integer(position.y.round() as i64),
-                    Variant::Integer(button),
-                    Variant::Integer(shift),
-                ],
-            )
-            .map(|_| handled_by_script)
+        self.call_event_method(
+            window,
+            method,
+            vec![
+                Variant::Integer(position.x.round() as i64),
+                Variant::Integer(position.y.round() as i64),
+                Variant::Integer(button),
+                Variant::Integer(shift),
+            ],
+        )
+        .map(|_| handled_by_script)
+    }
+
+    fn call_event_method(
+        &mut self,
+        object: ObjectHandle,
+        method: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        if self.tjs_runtime.is_suspended() {
+            self.tjs_runtime
+                .call_object_method_during_suspend(object, method, args)
+        } else {
+            self.tjs_runtime.call_object_method(object, method, args)
+        }
     }
 
     fn dispatch_window_mouse_wheel(&mut self, delta: i32) -> Result<()> {
@@ -1357,16 +1830,15 @@ impl KrkrEngine {
         ) {
             return Ok(());
         }
-        self.tjs_runtime
-            .call_object_method(
-                window,
-                "onClick",
-                vec![
-                    Variant::Integer(position.x.round() as i64),
-                    Variant::Integer(position.y.round() as i64),
-                ],
-            )
-            .map(|_| ())
+        self.call_event_method(
+            window,
+            "onClick",
+            vec![
+                Variant::Integer(position.x.round() as i64),
+                Variant::Integer(position.y.round() as i64),
+            ],
+        )
+        .map(|_| ())
     }
 
     fn dispatch_layer_pointer_event(
@@ -1401,18 +1873,17 @@ impl KrkrEngine {
         let x = (position.x - origin.x).round() as i64;
         let y = (position.y - origin.y).round() as i64;
         let shift = self.current_shift_state(false);
-        self.tjs_runtime
-            .call_object_method(
-                object,
-                method,
-                vec![
-                    Variant::Integer(x),
-                    Variant::Integer(y),
-                    Variant::Integer(button),
-                    Variant::Integer(shift),
-                ],
-            )
-            .map(|_| Some(LayerEventTarget { layer_id, object }))
+        self.call_event_method(
+            object,
+            method,
+            vec![
+                Variant::Integer(x),
+                Variant::Integer(y),
+                Variant::Integer(button),
+                Variant::Integer(shift),
+            ],
+        )
+        .map(|_| Some(LayerEventTarget { layer_id, object }))
     }
 
     fn should_fire_primary_click(&self, target: Option<LayerId>) -> bool {
@@ -1563,6 +2034,15 @@ impl KrkrEngine {
         self.layer_at_position(position)
     }
 
+    fn interactive_layer_at_cursor(&mut self) -> Result<Option<LayerId>> {
+        let Some(position) = self.cursor_position else {
+            return Ok(None);
+        };
+        let scripted = self
+            .script_pointer_layer_at_position(position, &["onMouseDown", "onMouseUp", "onClick"])?;
+        Ok(scripted.or(self.layer_at_cursor()?))
+    }
+
     fn script_pointer_layer_at_position(
         &mut self,
         position: Point,
@@ -1585,6 +2065,31 @@ impl KrkrEngine {
             .hit_tested_layers_at_position(position)?
             .into_iter()
             .next())
+    }
+
+    /// Pointer capture keeps a press target alive while a control redraws or
+    /// replaces its child layers between down and up.  Use the target's live
+    /// bounds as a release fallback when the normal topmost hit changed; this
+    /// prevents an asynchronous asset/UI refresh from swallowing onClick.
+    fn layer_contains_cursor(&self, layer_id: LayerId) -> bool {
+        let Some(position) = self.cursor_position else {
+            return false;
+        };
+        let Some(origin) = self
+            .tjs_runtime
+            .host()
+            .layer_tree()
+            .absolute_position(layer_id)
+        else {
+            return false;
+        };
+        let Some(node) = self.tjs_runtime.host().layer_tree().layer(layer_id) else {
+            return false;
+        };
+        position.x >= origin.x
+            && position.y >= origin.y
+            && position.x < origin.x + node.width
+            && position.y < origin.y + node.height
     }
 
     fn hit_tested_layers_at_position(&mut self, position: Point) -> Result<Vec<LayerId>> {
@@ -1685,6 +2190,10 @@ impl KrkrEngine {
         }) else {
             return Ok(());
         };
+        self.tjs_runtime.host_mut().log(&format!(
+            "input dispatch layer onClick id={:?} local=({x},{y})",
+            layer_id
+        ));
         self.call_layer_event(
             layer_id,
             "onClick",
@@ -1707,10 +2216,7 @@ impl KrkrEngine {
         ) {
             return Ok(());
         }
-        let result = self
-            .tjs_runtime
-            .call_object_method(object, method, args)
-            .map(|_| ());
+        let result = self.call_event_method(object, method, args).map(|_| ());
         self.sync_kag_slots_after_ok(result)
     }
 
@@ -1795,6 +2301,7 @@ struct KagSession {
     pending_tags: VecDeque<Tag>,
     temp_snapshots: BTreeMap<i64, KagTempSnapshot>,
     right_click: RightClickAction,
+    system_hooks: BTreeMap<String, SystemHook>,
     loaded: bool,
     clear_page_on_click: bool,
     clear_page_on_timer: bool,
@@ -1821,6 +2328,13 @@ struct RightClickAction {
     target: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct SystemHook {
+    storage: Option<String>,
+    target: Option<String>,
+    call: bool,
+}
+
 impl KagSession {
     fn new() -> Self {
         Self {
@@ -1831,6 +2345,7 @@ impl KagSession {
             pending_tags: VecDeque::new(),
             temp_snapshots: BTreeMap::new(),
             right_click: RightClickAction::default(),
+            system_hooks: BTreeMap::new(),
             loaded: false,
             clear_page_on_click: false,
             clear_page_on_timer: false,
@@ -1956,7 +2471,18 @@ impl KagSession {
 
         let result = (|| {
             runtime.host_mut().insert_kag_parser(handle, parser.clone());
+            let revision_before_callback = runtime.host().kag_parser_revision(handle);
             let result = f(&mut parser, self, runtime, handle);
+            // Engine-side callbacks may re-enter the native KAGParser (for
+            // example while onScenarioLoaded is running).  Reconcile the
+            // parser that the callback mutated before putting the outer
+            // snapshot back in the host map.
+            let revision_after_callback = runtime.host().kag_parser_revision(handle);
+            if let Some(updated) = runtime.host_mut().take_kag_parser(handle)
+                && revision_after_callback != revision_before_callback
+            {
+                parser = updated;
+            }
             refresh_kag_parser_object(runtime, handle, &parser).map_err(tjs_to_kag)?;
             result
         })();
@@ -1986,7 +2512,19 @@ impl KagSession {
 
         let result = (|| {
             runtime.host_mut().insert_kag_parser(handle, parser.clone());
+            let revision_before_callback = runtime.host().kag_parser_revision(handle);
             let result = f(&mut parser, self, runtime, handle);
+            // TJS callbacks may call KAGParser.loadScenario/goToLabel through
+            // the host map while this outer parser is borrowed. Pull the
+            // callback's mutated parser back before refreshing/reinserting;
+            // otherwise a nested jump is silently overwritten by the stale
+            // outer clone when the callback returns.
+            let revision_after_callback = runtime.host().kag_parser_revision(handle);
+            if let Some(updated) = runtime.host_mut().take_kag_parser(handle)
+                && revision_after_callback != revision_before_callback
+            {
+                parser = updated;
+            }
             refresh_kag_parser_object(runtime, handle, &parser)?;
             result
         })();
@@ -2059,7 +2597,7 @@ impl KagSession {
     ) -> Result<EngineTickResult> {
         self.observe_external_parser_changes(runtime);
         if self.parser.is_none() {
-            let started = Instant::now();
+            let started = BudgetTimer::start();
             return Ok(EngineTickResult {
                 state: self.state.clone(),
                 reason: KagYieldReason::Finished,
@@ -2079,7 +2617,7 @@ impl KagSession {
         owner: ObjectHandle,
         budget: KagRunBudget,
     ) -> Result<EngineTickResult> {
-        let started = Instant::now();
+        let started = BudgetTimer::start();
         let mut tags_processed = 0;
 
         if self.state != KagTaskState::Running {
@@ -2097,6 +2635,44 @@ impl KagSession {
 
         loop {
             if runtime.is_suspended() {
+                let modal = runtime.host().current_modal_window();
+                let pending_resources = runtime.host().has_pending_resource_loads();
+                let pending_external = runtime.host().has_pending_external_resources();
+                runtime.host_mut().log(&format!(
+                    "KAG VM suspended: modal={:?} pendingResources={} pendingExternal={}",
+                    modal, pending_resources, pending_external
+                ));
+                if pending_resources || pending_external {
+                    self.state = KagTaskState::WaitingResource;
+                    return Ok(EngineTickResult {
+                        state: self.state.clone(),
+                        reason: KagYieldReason::Waiting(self.state.clone()),
+                        tags_processed,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                // Some hosts can tear down the modal object while its TJS
+                // callback is suspended. There is then no user-visible
+                // modal left to wait for; resume the VM so KAG does not stay
+                // permanently in WaitingModal with an empty modal stack.
+                if runtime.host().current_modal_window().is_none() {
+                    let resumed = runtime.resume_suspended();
+                    let still_suspended = runtime.is_suspended();
+                    runtime.host_mut().log(&format!(
+                        "KAG resume without modal: result={:?} stillSuspended={}",
+                        resumed
+                            .as_ref()
+                            .map(|value| value.as_ref().map(|_| "value")),
+                        still_suspended
+                    ));
+                    resumed?;
+                    if !runtime.is_suspended() {
+                        runtime
+                            .host_mut()
+                            .log("KAG resumed suspended VM without active modal");
+                        continue;
+                    }
+                }
                 self.state = KagTaskState::WaitingModal;
                 return Ok(EngineTickResult {
                     state: self.state.clone(),
@@ -2123,6 +2699,15 @@ impl KagSession {
                     let mut host = EngineKagHost::for_owner(runtime, owner);
                     match parser.next_tag_with(&mut host) {
                         Ok(tag) => tag,
+                        Err(KagError::ResourcePending { storage: _ }) => {
+                            self.state = KagTaskState::WaitingResource;
+                            return Ok(EngineTickResult {
+                                state: self.state.clone(),
+                                reason: KagYieldReason::Waiting(self.state.clone()),
+                                tags_processed,
+                                elapsed: started.elapsed(),
+                            });
+                        }
                         Err(error) => {
                             let message = error.to_string();
                             self.state = KagTaskState::Error {
@@ -2146,7 +2731,24 @@ impl KagSession {
 
             tags_processed += 1;
             debug_check_kag_tag(parser, runtime, &tag)?;
-            let action = self.process_tag(parser, runtime, owner, tag)?;
+            let action = match self.process_tag(parser, runtime, owner, tag.clone()) {
+                Ok(action) => action,
+                Err(error) if error.kind == krkr_tjs2::TjsErrorKind::ResourcePending => {
+                    // Native tag handlers (notably image/audio/video loads)
+                    // can suspend while resolving a remote storage. Requeue
+                    // the tag so the exact operation is retried after the
+                    // asset provider resumes the VM.
+                    self.pending_tags.push_front(tag);
+                    self.state = KagTaskState::WaitingResource;
+                    return Ok(EngineTickResult {
+                        state: self.state.clone(),
+                        reason: KagYieldReason::Waiting(self.state.clone()),
+                        tags_processed: tags_processed.saturating_sub(1),
+                        elapsed: started.elapsed(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             match action {
                 TagAction::Continue => {}
                 TagAction::Yield(reason) => {
@@ -2168,15 +2770,81 @@ impl KagSession {
         owner: ObjectHandle,
         tag: Tag,
     ) -> Result<TagAction> {
+        if matches!(
+            tag.tagname.as_str(),
+            "syshook" | "sysjump" | "addSysHook" | "addSysScript"
+        ) {
+            runtime.host_mut().log(&format!(
+                "KAG control tag `{}` attrs={:?}",
+                tag.tagname, tag.attributes
+            ));
+        }
+        // The title screen uses a small set of KRKR-specific tags which are
+        // normally implemented by the system KAG conductor.  A game's
+        // generic `onTag` hook is intentionally permissive and may report an
+        // unknown tag as handled without doing any rendering work.  Dispatch
+        // these visual tags natively first so the background/logo/effect are
+        // always materialized as real KAG layers.
+        if matches!(
+            tag.tagname.as_str(),
+            "title_image" | "title_logo" | "title_effect"
+        ) {
+            // A title jump can leave the previous scenario's message wait
+            // state alive while the system UI is being rebuilt.  The stock
+            // title conductors hide that layer; clear the portable fallback
+            // overlay at the same boundary so it cannot cover the menu.
+            if tag.tagname == "title_image" {
+                self.message_layer.clear();
+            }
+            return self.process_native_fallback_tag(parser, runtime, owner, &tag);
+        }
+        if matches!(tag.tagname.as_str(), "syspage" | "uiload") {
+            runtime.host_mut().log(&format!(
+                "KAG UI tag `{}` attrs={:?}",
+                tag.tagname, tag.attributes
+            ));
+        }
+        // System hook declarations/dispatch are engine control-flow tags.
+        // They must not be consumed by a generic game `onTag` callback that
+        // returns success for every unknown tag.
+        if matches!(
+            tag.tagname.as_str(),
+            "syshook" | "addSysHook" | "addSysScript"
+        ) {
+            return self.process_native_fallback_tag(parser, runtime, owner, &tag);
+        }
+        if tag.tagname == "sysjump" {
+            // Let the game's TJS hook run first (it commonly installs title
+            // hooks or performs bookkeeping), then apply the parser jump on
+            // the session-owned parser when the callback did not mutate this
+            // parser instance. TJS callbacks can operate on a cloned parser
+            // object, so relying on that mutation alone loses the jump when
+            // control returns to the KAG frame loop.
+            let before = parser.cur_storage().map(str::to_string);
+            if let Some(action) = self.try_tjs_tag_handler(runtime, owner, &tag)? {
+                if matches!(action, TjsTagAction::Handled(_))
+                    && parser.cur_storage().map(str::to_string) == before
+                {
+                    self.process_native_fallback_tag(parser, runtime, owner, &tag)?;
+                }
+                return Ok(match action {
+                    TjsTagAction::Handled(action) => action,
+                    TjsTagAction::NativeFallback => {
+                        self.process_native_fallback_tag(parser, runtime, owner, &tag)?
+                    }
+                });
+            }
+            return self.process_native_fallback_tag(parser, runtime, owner, &tag);
+        }
         if let Some(action) = self.try_tjs_tag_handler(runtime, owner, &tag)? {
             match action {
                 TjsTagAction::Handled(action) => Ok(action),
                 TjsTagAction::NativeFallback => {
-                    self.process_native_fallback_tag(parser, runtime, &tag)
+                    self.process_native_fallback_tag(parser, runtime, owner, &tag)
                 }
             }
         } else {
-            self.process_native_fallback_tag(parser, runtime, &tag)
+            self.process_native_fallback_tag(parser, runtime, owner, &tag)
         }
     }
 
@@ -2204,6 +2872,15 @@ impl KagSession {
                     Variant::Void
                 )
             {
+                if matches!(
+                    tag.tagname.as_str(),
+                    "syshook" | "addSysHook" | "addSysScript"
+                ) {
+                    runtime.host_mut().log(&format!(
+                        "KAG unknown handler dispatch tag={} handler={:?}",
+                        tag.tagname, handler
+                    ));
+                }
                 runtime.host_mut().trace(
                     TraceCategory::Kag,
                     &format!("kag: tag `{}` -> onUnknownTag", tag.tagname),
@@ -2218,6 +2895,15 @@ impl KagSession {
                         Variant::Object(tag_object),
                     ],
                 )?;
+                if matches!(
+                    tag.tagname.as_str(),
+                    "syshook" | "addSysHook" | "addSysScript"
+                ) {
+                    runtime.host_mut().log(&format!(
+                        "KAG unknown handler result tag={} value={:?}",
+                        tag.tagname, value
+                    ));
+                }
                 return self.apply_tjs_handler_step(tag.clone(), value).map(Some);
             }
         }
@@ -2255,9 +2941,11 @@ impl KagSession {
         args: Vec<Variant>,
     ) -> Result<Variant> {
         call_tag_handler(runtime, handler, name, args).inspect_err(|error| {
-            self.state = KagTaskState::Error {
-                message: error.to_string(),
-            };
+            if error.kind != krkr_tjs2::TjsErrorKind::ResourcePending {
+                self.state = KagTaskState::Error {
+                    message: error.to_string(),
+                };
+            }
         })
     }
 
@@ -2265,6 +2953,7 @@ impl KagSession {
         &mut self,
         parser: &mut KagParser,
         runtime: &mut Runtime<KrkrHost>,
+        owner: ObjectHandle,
         tag: &Tag,
     ) -> Result<TagAction> {
         let Some(native_tag) = NativeFallbackTag::from_name(&tag.tagname) else {
@@ -2355,6 +3044,15 @@ impl KagSession {
                     Ok(TagAction::Continue)
                 }
             }
+            NativeFallbackTag::TitleImage
+            | NativeFallbackTag::TitleLogo
+            | NativeFallbackTag::TitleEffect => {
+                if apply_title_image_tag(runtime, tag)? {
+                    Ok(self.wait(KagTaskState::WaitingResource))
+                } else {
+                    Ok(TagAction::Continue)
+                }
+            }
             NativeFallbackTag::LayerOptions => {
                 apply_layer_options_tag(runtime, tag)?;
                 Ok(TagAction::Continue)
@@ -2404,6 +3102,107 @@ impl KagSession {
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::Noop => Ok(TagAction::Continue),
+            NativeFallbackTag::AddSysHook | NativeFallbackTag::AddSysScript => {
+                let Some(name) = tag.literal_attr("name").map(str::to_string) else {
+                    return Ok(TagAction::Continue);
+                };
+                let hook = SystemHook {
+                    storage: tag.literal_attr("storage").and_then(non_empty_string),
+                    target: tag.literal_attr("target").and_then(non_empty_string),
+                    call: match native_tag {
+                        NativeFallbackTag::AddSysHook => {
+                            kag_bool_attr(tag, "call").unwrap_or(false)
+                        }
+                        NativeFallbackTag::AddSysScript => false,
+                        _ => false,
+                    },
+                };
+                self.system_hooks.insert(name.clone(), hook);
+                runtime
+                    .host_mut()
+                    .log(&format!("KAG registered system hook `{name}`"));
+                Ok(TagAction::Continue)
+            }
+            NativeFallbackTag::SysHook => {
+                let Some(name) = tag.literal_attr("name") else {
+                    return Ok(TagAction::Continue);
+                };
+                if self.system_hooks.is_empty() {
+                    if let Ok(text) = runtime.host_mut().read_text_storage_for_tjs("custom.ks") {
+                        for line in text.lines() {
+                            let Some(start) = line
+                                .find("[addSysHook")
+                                .or_else(|| line.find("[addSysScript"))
+                            else {
+                                continue;
+                            };
+                            let command = &line[start..];
+                            let Some(hook_name) = hook_attr(command, "name") else {
+                                continue;
+                            };
+                            self.system_hooks.insert(
+                                hook_name,
+                                SystemHook {
+                                    storage: hook_attr(command, "storage"),
+                                    target: hook_attr(command, "target"),
+                                    call: command.starts_with("[addSysHook")
+                                        && command.contains(" call"),
+                                },
+                            );
+                        }
+                        runtime.host_mut().log(&format!(
+                            "KAG loaded {} system hook declarations",
+                            self.system_hooks.len()
+                        ));
+                    }
+                }
+                let hook = self.system_hooks.get(name).cloned().or_else(|| {
+                    runtime.host().system_hook(name).map(|hook| SystemHook {
+                        storage: hook.storage,
+                        target: hook.target,
+                        call: hook.call,
+                    })
+                });
+                let Some(hook) = hook else {
+                    return Ok(TagAction::Continue);
+                };
+                let mut host = EngineKagHost::for_owner(runtime, owner);
+                if hook.call {
+                    parser
+                        .call_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
+                        .map_err(|error| TjsError::runtime(error.to_string()))?;
+                } else {
+                    parser
+                        .go_to_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
+                        .map_err(|error| TjsError::runtime(error.to_string()))?;
+                }
+                self.pending_tags.clear();
+                self.state = KagTaskState::Running;
+                Ok(TagAction::Continue)
+            }
+            NativeFallbackTag::SysJump => {
+                let target = tag
+                    .literal_attr("to")
+                    .ok_or_else(|| TjsError::runtime("sysjump requires `to`"))?;
+                let storage = if target.ends_with(".ks") {
+                    target.to_string()
+                } else {
+                    format!("{target}.ks")
+                };
+                let mut host = EngineKagHost::for_owner(runtime, owner);
+                parser
+                    .load_scenario_with(storage, &mut host)
+                    .map_err(|error| match error {
+                        krkr_kag::KagError::ResourcePending { storage } => {
+                            TjsError::resource_pending(storage)
+                        }
+                        error => TjsError::runtime(error.to_string()),
+                    })?;
+                self.pending_tags.clear();
+                self.message_layer.clear();
+                self.state = KagTaskState::Running;
+                Ok(TagAction::Continue)
+            }
             NativeFallbackTag::GotoStart => {
                 if let Some(storage) = parser.cur_storage().map(str::to_string) {
                     parser
@@ -2579,13 +3378,16 @@ impl KagSession {
 
     fn apply_tjs_handler_step(&mut self, tag: Tag, value: Variant) -> Result<TjsTagAction> {
         if matches!(value, Variant::Void) {
-            self.state = KagTaskState::Error {
-                message: format!("KAG handler returned void for tag `{}`", tag.tagname),
-            };
-            return Err(TjsError::runtime(match &self.state {
-                KagTaskState::Error { message } => message.clone(),
-                _ => unreachable!(),
-            }));
+            // KRKR's built-in dispatcher uses void in both directions: for a
+            // built-in tag it asks the native KAG implementation to continue,
+            // while a script-defined unknown tag commonly performs all work
+            // in `onUnknownTag` and falls off the end without returning a
+            // numeric conductor step.  The latter is a successful, immediate
+            // handler completion (not an engine error).
+            if NativeFallbackTag::from_name(&tag.tagname).is_some() {
+                return Ok(TjsTagAction::NativeFallback);
+            }
+            return Ok(TjsTagAction::Handled(TagAction::Continue));
         }
 
         let step = value.to_integer()?;
@@ -2649,6 +3451,18 @@ impl KagSession {
     }
 }
 
+fn hook_attr(command: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=");
+    let start = command.find(&marker)? + marker.len();
+    let rest = command[start..].trim_start();
+    if let Some(quote) = rest.chars().next().filter(|ch| *ch == '\"' || *ch == '\'') {
+        let body = &rest[quote.len_utf8()..];
+        let end = body.find(quote).unwrap_or(body.len());
+        return Some(body[..end].to_string());
+    }
+    non_empty_string(rest.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ']' || ch == ';'))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TagAction {
     Continue,
@@ -2676,8 +3490,14 @@ enum NativeFallbackTag {
     Wait,
     Eval,
     Trace,
+    AddSysHook,
+    AddSysScript,
+    SysHook,
     ClearText,
     Image,
+    TitleImage,
+    TitleLogo,
+    TitleEffect,
     LayerOptions,
     FreeImage,
     Backlay,
@@ -2685,6 +3505,7 @@ enum NativeFallbackTag {
     TempSave,
     TempLoad,
     Noop,
+    SysJump,
     GotoStart,
     LayCount,
     Current,
@@ -2718,8 +3539,14 @@ impl NativeFallbackTag {
             "wait" => Self::Wait,
             "eval" => Self::Eval,
             "trace" => Self::Trace,
+            "addSysHook" => Self::AddSysHook,
+            "addSysScript" => Self::AddSysScript,
+            "syshook" => Self::SysHook,
             "cm" | "ct" | "er" => Self::ClearText,
             "image" => Self::Image,
+            "title_image" => Self::TitleImage,
+            "title_logo" => Self::TitleLogo,
+            "title_effect" => Self::TitleEffect,
             "layopt" | "position" => Self::LayerOptions,
             "freeimage" => Self::FreeImage,
             "backlay" => Self::Backlay,
@@ -2727,6 +3554,7 @@ impl NativeFallbackTag {
             "tempsave" => Self::TempSave,
             "tempload" => Self::TempLoad,
             "commit" | "history" | "defstyle" | "resetstyle" | "ruby" => Self::Noop,
+            "sysjump" => Self::SysJump,
             "gotostart" => Self::GotoStart,
             "laycount" => Self::LayCount,
             "current" => Self::Current,
@@ -2764,7 +3592,22 @@ fn call_tag_handler(
     name: &str,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    runtime.call_object_method(handler, name, args)
+    runtime
+        .call_object_method(handler, name, args)
+        .map_err(|error| {
+            if error.to_string().contains("KAG resource is pending:") {
+                let storage = error
+                    .to_string()
+                    .split_once("KAG resource is pending:")
+                    .and_then(|(_, value)| value.lines().next())
+                    .unwrap_or("resource")
+                    .trim()
+                    .to_string();
+                TjsError::resource_pending(storage)
+            } else {
+                error
+            }
+        })
 }
 
 fn tjs_to_kag(error: TjsError) -> KagError {
@@ -3217,6 +4060,71 @@ fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<bool> {
             if has_explicit_height {
                 completion.request.height = request.height;
             }
+            apply_completed_image_load(runtime, *completion)?;
+            Ok(false)
+        }
+        ImageLoadState::Pending => Ok(true),
+    }
+}
+
+/// Materialize KRKR's title-screen image tags as ordinary KAG layers.
+///
+/// `title_image`, `title_logo` and `title_effect` are supplied by the stock
+/// system conductor rather than the generic KAG tag set.  They use `file`
+/// instead of `storage` and express the layer order through `zorder`; the
+/// web/native host can render them with the same image upload path as a normal
+/// `[image]` tag.  Keeping the request asynchronous also preserves the
+/// resource-pending/yield semantics used by remote web packages.
+fn apply_title_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<bool> {
+    let storage = tag
+        .literal_attr("file")
+        .or_else(|| tag.literal_attr("storage"))
+        .ok_or_else(|| TjsError::runtime("KAG title image tag requires file"))?;
+    let (page, _) = kag_target(runtime, tag);
+    let default_zorder = match tag.tagname.as_str() {
+        "title_logo" => 120,
+        "title_effect" => 110,
+        _ => 100,
+    };
+    // Keep stable layer identities so a title redraw replaces the previous
+    // image instead of accumulating roots.  The host gives these special
+    // names explicit z-orders: the opaque background must be below the
+    // native `syspage` UI, while the logo/effect can sit above it.
+    let zorder = tag_i64(tag, "zorder")?.unwrap_or(default_zorder);
+    let layer_name = match tag.tagname.as_str() {
+        "title_logo" => "__title_logo",
+        "title_effect" => "__title_effect",
+        _ => "__title_image",
+    }
+    .to_string();
+    let left = match tag_i64(tag, "xpos")? {
+        Some(value) => Some(value),
+        None => tag_i64(tag, "left")?,
+    };
+    let top = match tag_i64(tag, "ypos")? {
+        Some(value) => Some(value),
+        None => tag_i64(tag, "top")?,
+    };
+    let request = ImageLoadRequest {
+        owner: None,
+        target: ImageLoadTarget::Kag {
+            page: page.clone(),
+            layer: layer_name.clone(),
+        },
+        storage: storage.to_string(),
+        visible: kag_bool_attr(tag, "visible").unwrap_or(true),
+        left,
+        top,
+        width: tag_i64(tag, "width")?,
+        height: tag_i64(tag, "height")?,
+        opacity: tag_i64(tag, "opacity")?,
+    };
+    runtime.host_mut().log(&format!(
+        "KAG title image request tag={} storage={} page={} layer={} zorder={}",
+        tag.tagname, request.storage, page, layer_name, zorder
+    ));
+    match runtime.host_mut().request_image_load(request.clone())? {
+        ImageLoadState::Ready(completion) => {
             apply_completed_image_load(runtime, *completion)?;
             Ok(false)
         }
@@ -3945,6 +4853,43 @@ mod tests {
     }
 
     #[test]
+    fn start_project_uses_startup_dispatcher_without_guessing_kag_names() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("startup.tjs"),
+            "global.startupMarker = 1; return 0;",
+        )
+        .expect("write startup");
+        fs::write(root.join("first.ks"), b"*first\n[test]").expect("write decoy");
+        fs::write(root.join("title.ks"), b"*title\n[test]").expect("write decoy");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.start_project().expect("start project");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("startupMarker"),
+            Variant::Integer(1)
+        );
+        assert!(!engine.has_kag_scenario());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn start_project_falls_back_to_startup_ks_only_when_no_tjs_exists() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("startup.ks"), b"*start\n[test]").expect("write startup");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.start_project().expect("start project");
+
+        assert!(engine.has_kag_scenario());
+        assert_eq!(engine.kag_location().storage.as_deref(), Some("startup.ks"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn storage_executes_bytecode_startup_from_project_root() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -4242,6 +5187,347 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::Integer(11));
+    }
+
+    #[test]
+    fn external_resource_pending_suspends_and_resumes_tjs_instruction() {
+        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["lazy.ks"]);
+
+        let result = engine.execute_script(
+            "lazy-loader.tjs",
+            r#"
+                var lines = new Array();
+                lines.load("lazy.ks");
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "resource suspension is not a script error: {result:?}"
+        );
+        assert!(engine.is_script_suspended());
+        assert_eq!(
+            engine.take_external_resource_requests(),
+            vec![("lazy.ks".to_string(), krkr_core::AssetKind::Text)]
+        );
+
+        engine
+            .provide_external_resource("lazy.ks", b"first\nsecond\n".to_vec())
+            .expect("resume resource");
+        assert!(!engine.is_script_suspended());
+        assert!(engine.take_external_resource_requests().is_empty());
+    }
+
+    #[test]
+    fn kag_parser_retries_expanded_call_after_remote_storage_arrives() {
+        let storage = crate::ProjectStorage::from_memory([(
+            "first.ks",
+            b"[emb escape=false exp=global.generated]\n".to_vec(),
+        )]);
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["custom.ks"]);
+
+        engine
+            .execute_script(
+                "kag-lazy-call.tjs",
+                r#"
+                    global.generated = "[call storage='custom.ks']";
+                    global.parser = new KAGParser();
+                    parser.loadScenario("first.ks");
+                    global.tag = parser.getNextTag();
+                "#,
+            )
+            .expect("initial parser call suspends on custom.ks");
+        assert!(engine.is_script_suspended());
+        assert_eq!(
+            engine.take_external_resource_requests(),
+            vec![("custom.ks".to_string(), krkr_core::AssetKind::Text)]
+        );
+
+        engine
+            .provide_external_resource("custom.ks", b"[opening]\n".to_vec())
+            .expect("resume parser call");
+        assert!(!engine.is_script_suspended());
+        let tag = match engine.tjs_runtime().global_member("tag") {
+            Variant::Object(handle) => handle,
+            value => panic!("unexpected tag value: {value:?}"),
+        };
+        assert_eq!(
+            engine.tjs_runtime().object_member(tag, "tagname"),
+            Variant::String("opening".to_string())
+        );
+    }
+
+    #[test]
+    fn external_image_pending_resumes_native_layer_call_continuation() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        let image_path = root.join("sprite.png");
+        write_png(image_path.clone(), 1, 1, &[255, 0, 0, 255]);
+        let bytes = fs::read(&image_path).expect("read image");
+        fs::remove_file(image_path).expect("remove image");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.set_external_resource_catalog(["sprite.png"]);
+        engine
+            .execute_script(
+                "image-loader.tjs",
+                r#"
+                    var window = new Window();
+                    global.layer = new Layer(window, null);
+                    layer.visible = true;
+                    layer.loadImages("sprite.png");
+                    global.afterImage = 1;
+                "#,
+            )
+            .expect("initial script");
+        assert!(engine.is_script_suspended());
+        assert_eq!(
+            engine.take_external_resource_requests(),
+            vec![("sprite.png".to_string(), krkr_core::AssetKind::Binary)]
+        );
+        engine
+            .provide_external_resource("sprite.png", bytes)
+            .expect("resume image");
+        assert!(!engine.is_script_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("afterImage"),
+            Variant::Integer(1)
+        );
+        let layer = match engine.tjs_runtime().global_member("layer") {
+            Variant::Object(layer) => layer,
+            value => panic!("unexpected layer value: {value:?}"),
+        };
+        let layer_id = engine.host().native_layer(layer).expect("native layer");
+        let node = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .expect("layer node");
+        assert!(node.image.is_some());
+        assert!(node.visible);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn nested_exec_storage_resumes_outer_script_after_remote_child() {
+        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["child.tjs"]);
+        engine
+            .execute_script(
+                "outer.tjs",
+                r#"Scripts.execStorage("child.tjs"); global.afterChild = 7;"#,
+            )
+            .expect("initial script");
+        assert!(engine.is_script_suspended());
+        assert_eq!(
+            engine.take_external_resource_requests(),
+            vec![("child.tjs".to_string(), krkr_core::AssetKind::Binary)]
+        );
+
+        engine
+            .provide_external_resource("child.tjs", b"global.childLoaded = 1;".to_vec())
+            .expect("resume child");
+        assert!(!engine.is_script_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("afterChild"),
+            Variant::Integer(7)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("childLoaded"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn deeply_nested_exec_storage_preserves_all_callers() {
+        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["child.tjs", "grand.tjs"]);
+        engine
+            .execute_script(
+                "outer.tjs",
+                r#"Scripts.execStorage("child.tjs"); global.outerDone = 1;"#,
+            )
+            .expect("outer script");
+        engine
+            .provide_external_resource(
+                "child.tjs",
+                b"Scripts.execStorage(\"grand.tjs\"); global.childDone = 1;".to_vec(),
+            )
+            .expect("child script");
+        assert!(engine.is_script_suspended());
+        engine
+            .provide_external_resource("grand.tjs", b"global.grandDone = 1;".to_vec())
+            .expect("grand script");
+        assert!(!engine.is_script_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("grandDone"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("childDone"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("outerDone"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn nested_exec_storage_inside_helper_preserves_helper_callers() {
+        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["child.tjs"]);
+        engine
+            .execute_script(
+                "outer.tjs",
+                r#"
+                    function loadChild() { Scripts.execStorage("child.tjs"); global.helperDone = 1; }
+                    loadChild();
+                    global.outerDone = 1;
+                "#,
+            )
+            .expect("outer script");
+        assert!(engine.is_script_suspended());
+        engine
+            .provide_external_resource("child.tjs", b"global.childLoaded = 1;".to_vec())
+            .expect("resume child");
+        assert!(!engine.is_script_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("childLoaded"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("helperDone"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("outerDone"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn async_lazy_property_getter_retries_after_remote_script_load() {
+        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["child.tjs"]);
+
+        engine
+            .execute_script(
+                "lazy-property.tjs",
+                r#"
+                    property LazyChild {
+                        getter() {
+                            Scripts.execStorage("child.tjs");
+                            return global.Child;
+                        }
+                    }
+                    property LazyCall {
+                        getter() {
+                            Scripts.execStorage("child.tjs");
+                            return global.childFn;
+                        }
+                    }
+                    global.lazyType = typeof LazyChild;
+                    global.lazyCallResult = LazyCall();
+                "#,
+            )
+            .expect("initial script suspends at lazy getter");
+        assert!(engine.is_script_suspended());
+        assert_eq!(
+            engine.take_external_resource_requests(),
+            vec![("child.tjs".to_string(), krkr_core::AssetKind::Binary)]
+        );
+
+        engine
+            .provide_external_resource(
+                "child.tjs",
+                b"class Child {} function childFn() { return 9; }".to_vec(),
+            )
+            .expect("resume lazy getter");
+        assert!(!engine.is_script_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("lazyType"),
+            Variant::String("Object".to_string())
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("lazyCallResult"),
+            Variant::Integer(9)
+        );
+    }
+
+    #[test]
+    fn kag_scenario_jump_waits_for_remote_storage() {
+        let storage = crate::ProjectStorage::from_memory([(
+            "startup.ks",
+            b"*start\n[jump storage=lazy.ks target=*start]".to_vec(),
+        )]);
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["lazy.ks"]);
+        engine.load_kag_scenario("startup.ks").expect("scenario");
+
+        let input = EngineInput::new(
+            FrameInput::new(Size::new(320.0, 200.0), 1.0 / 60.0),
+            Vec::new(),
+        );
+        let frame = engine
+            .update(input, Duration::from_millis(16))
+            .expect("tick");
+        assert_eq!(frame.tick.state, KagTaskState::WaitingResource);
+        assert_eq!(
+            engine.take_external_resource_requests(),
+            vec![("lazy.ks".to_string(), krkr_core::AssetKind::Text)]
+        );
+
+        engine
+            .provide_external_resource("lazy.ks", b"*start\n".to_vec())
+            .expect("provide scenario");
+        let input = EngineInput::new(
+            FrameInput::new(Size::new(320.0, 200.0), 1.0 / 60.0),
+            Vec::new(),
+        );
+        let frame = engine
+            .update(input, Duration::from_millis(16))
+            .expect("resume tick");
+        assert_ne!(
+            frame.tick.state,
+            KagTaskState::Error {
+                message: String::new()
+            }
+        );
     }
 
     #[test]
@@ -5558,9 +6844,12 @@ mod tests {
         let tempsave = test_tag("tempsave", &[("place", "9")]);
         engine
             .kag_session
-            .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
-                session.process_native_fallback_tag(parser, runtime, &tempsave)
-            })
+            .with_parser_for_tjs(
+                &mut engine.tjs_runtime,
+                |parser, session, runtime, owner| {
+                    session.process_native_fallback_tag(parser, runtime, owner, &tempsave)
+                },
+            )
             .expect("tempsave");
 
         engine.kag_session.message_layer.clear();
@@ -5571,9 +6860,12 @@ mod tests {
         let tempload = test_tag("tempload", &[("place", "9")]);
         engine
             .kag_session
-            .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
-                session.process_native_fallback_tag(parser, runtime, &tempload)
-            })
+            .with_parser_for_tjs(
+                &mut engine.tjs_runtime,
+                |parser, session, runtime, owner| {
+                    session.process_native_fallback_tag(parser, runtime, owner, &tempload)
+                },
+            )
             .expect("tempload");
 
         assert_eq!(engine.kag_session.state, KagTaskState::WaitingClick);
@@ -5743,9 +7035,12 @@ mod tests {
         let tag = test_tag("tempload", &[("place", "1")]);
         let action = engine
             .kag_session
-            .with_parser_for_tjs(&mut engine.tjs_runtime, |parser, session, runtime, _| {
-                session.process_native_fallback_tag(parser, runtime, &tag)
-            })
+            .with_parser_for_tjs(
+                &mut engine.tjs_runtime,
+                |parser, session, runtime, owner| {
+                    session.process_native_fallback_tag(parser, runtime, owner, &tag)
+                },
+            )
             .expect("tempload");
         assert_eq!(action, TagAction::Continue);
         assert_eq!(engine.message_layer().lines, vec!["AB".to_string()]);
@@ -5965,6 +7260,44 @@ mod tests {
                 .execute_expression("inline.tjs", "f.value")
                 .expect("f value"),
             Variant::Integer(7)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_unknown_tag_handler_may_complete_with_void() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[syspage storage=title][s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var handler = new Dictionary();
+                handler.seen = "";
+                handler.onUnknownTag = function(name, elm) {
+                    this.seen = name + ":" + elm.storage;
+                };
+                return handler;
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("tick");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "seen"),
+            Variant::String("syspage:title".to_string())
         );
 
         fs::remove_dir_all(root).expect("cleanup");
@@ -6451,6 +7784,58 @@ mod tests {
                         && image.rect.height == 1.0
                         && (image.opacity - (200.0 / 255.0)).abs() < 0.001
             )
+        }));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn kag_title_image_tags_create_ordered_render_layers() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("bg.png"), 2, 1, &[255, 0, 0, 255, 0, 0, 255, 255]);
+        write_png(
+            root.join("logo.png"),
+            2,
+            1,
+            &[0, 255, 0, 255, 0, 255, 0, 255],
+        );
+        fs::write(
+            root.join("first.ks"),
+            "[title_image file=bg.png zorder=100][title_logo file=logo.png zorder=120][s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+
+        assert_eq!(frame.tick.state, KagTaskState::Finished);
+        let layers = engine.host().layer_tree().layers().collect::<Vec<_>>();
+        let background = layers
+            .iter()
+            .find(|layer| layer.name == "kag:__title_image")
+            .expect("title background layer");
+        let logo = layers
+            .iter()
+            .find(|layer| layer.name == "kag:__title_logo")
+            .expect("title logo layer");
+        assert!(background.z_order < logo.z_order);
+        assert_eq!(
+            background.image.as_ref().map(|image| image.upload.width),
+            Some(2)
+        );
+        assert_eq!(
+            logo.image.as_ref().map(|image| image.upload.height),
+            Some(1)
+        );
+        assert!(frame.output.draw_commands.iter().any(|command| {
+            matches!(command, krkr_core::DrawCommand::Image(image) if image.texture_id == background.image.as_ref().expect("background image").upload.texture_id)
         }));
 
         fs::remove_dir_all(root).expect("cleanup");

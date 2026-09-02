@@ -2,7 +2,7 @@
 //!
 //! krkr2/krkrz play movies through the OS media framework (DirectShow /
 //! Media Foundation); kirakira follows the same architecture through
-//! krkr-video's pluggable `VideoDecoder` backends (AVFoundation on macOS).
+//! krkr-video's pluggable `VideoPort` backends (AVFoundation on macOS).
 //!
 //! Decoding runs on a dedicated thread per playing overlay with a bounded
 //! frame queue for back-pressure. The engine tick consumes frames against a
@@ -14,24 +14,27 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::JoinHandle,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use krkr_core::AudioBus;
 use krkr_core::{
-    AudioBus, AudioCommand, AudioInstanceId, DrawCommand, ImageCommand, ImageUpload, PcmAudioChunk,
+    AudioCommand, AudioInstanceId, DrawCommand, ImageCommand, ImageUpload, PcmAudioChunk,
     PcmAudioSpec, Rect, Size,
 };
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{Closure, ObjectHandle, Runtime, Variant},
 };
-use krkr_video::{VideoDecoder, VideoFrame, VideoMetadata};
+#[cfg(not(target_arch = "wasm32"))]
+use krkr_video::VideoSource;
+use krkr_video::{VideoFrame, VideoMetadata, VideoPort};
 
 use crate::host::KrkrHost;
 
@@ -47,6 +50,7 @@ const PER_LOOP: i64 = 0;
 const PER_PERIOD: i64 = 1;
 const PER_SEG_LOOP: i64 = 3;
 
+#[cfg(not(target_arch = "wasm32"))]
 const VIDEO_MODE_LAYER: i64 = 1;
 
 /// How many decoded frames may queue up before the decode thread blocks.
@@ -55,28 +59,28 @@ const DECODE_QUEUE_DEPTH: usize = 4;
 /// How many decoded movie-audio chunks may queue up before the decode
 /// thread blocks. AVFoundation hands out LPCM in large buffers, so a handful
 /// of chunks already covers several seconds of audio.
+#[cfg(not(target_arch = "wasm32"))]
 const AUDIO_QUEUE_DEPTH: usize = 8;
 
 /// Mutable per-object state for one `VideoOverlay` instance. Keyed by object
 /// handle on the host and created lazily on first native interaction so the
 /// exact script construction order does not matter.
 pub(crate) struct VideoOverlayState {
-    status: &'static str,
-    storage: Option<String>,
-    temp_path: Option<PathBuf>,
+    pub(crate) status: &'static str,
+    pub(crate) storage: Option<String>,
     metadata: Option<VideoMetadata>,
     /// Opened but not yet playing; moved into the decode session on `play`.
-    decoder: Option<Box<dyn VideoDecoder>>,
+    decoder: Option<Box<dyn VideoPort>>,
     session: Option<DecodeSession>,
     /// Soundtrack layout reported by the video backend; `play` feeds this
     /// PCM stream to the audio system instead of loading the movie file
     /// through the audio loaders.
     audio_spec: Option<PcmAudioSpec>,
-    left: i64,
-    top: i64,
-    width: i64,
-    height: i64,
-    visible: bool,
+    pub(crate) left: i64,
+    pub(crate) top: i64,
+    pub(crate) width: i64,
+    pub(crate) height: i64,
+    pub(crate) visible: bool,
     mode: i64,
     looping: bool,
     play_rate: f64,
@@ -115,7 +119,6 @@ impl Default for VideoOverlayState {
         Self {
             status: VIDEO_STATUS_UNLOAD,
             storage: None,
-            temp_path: None,
             metadata: None,
             decoder: None,
             session: None,
@@ -160,9 +163,6 @@ impl Clone for VideoOverlayState {
         Self {
             status: VIDEO_STATUS_UNLOAD,
             storage: None,
-            // The temp file belongs to the original state; the clone must not
-            // delete it on drop.
-            temp_path: None,
             metadata: None,
             decoder: None,
             session: None,
@@ -196,14 +196,6 @@ impl Clone for VideoOverlayState {
             layer1: self.layer1.clone(),
             layer2: self.layer2.clone(),
             extra: self.extra.clone(),
-        }
-    }
-}
-
-impl Drop for VideoOverlayState {
-    fn drop(&mut self) {
-        if let Some(path) = self.temp_path.take() {
-            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -266,7 +258,7 @@ struct DecodeSession {
 
 impl DecodeSession {
     fn start(
-        mut decoder: Box<dyn VideoDecoder>,
+        mut decoder: Box<dyn VideoPort>,
         audio_tx: Option<SyncSender<PcmAudioChunk>>,
     ) -> std::io::Result<Self> {
         let (command_tx, command_rx) = mpsc::sync_channel::<DecodeCommand>(DECODE_QUEUE_DEPTH);
@@ -441,37 +433,6 @@ fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
         .transpose()
 }
 
-/// AVFoundation (like most system frameworks) keys container parsing off the
-/// file extension, while game archives rename files freely — GINKA's
-/// `op.wmv` is really an MP4. Sniff the magic bytes and stage the temp file
-/// with an extension that matches the content.
-fn sniff_video_extension(bytes: &[u8], storage: &str) -> String {
-    const ASF_GUID: &[u8] = &[
-        0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE,
-        0x6C,
-    ];
-    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-        return ".mp4".to_string();
-    }
-    if bytes.starts_with(ASF_GUID) {
-        return ".wmv".to_string();
-    }
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"AVI " {
-        return ".avi".to_string();
-    }
-    if bytes.starts_with(&[0x00, 0x00, 0x01, 0xBA]) {
-        return ".mpg".to_string();
-    }
-    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
-        return ".webm".to_string();
-    }
-    Path::new(storage)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| format!(".{extension}"))
-        .unwrap_or_else(|| ".mp4".to_string())
-}
-
 /// krkr2 leaves extension probing to each subsystem, but our generic storage
 /// lookup guesses extensions and can land on a same-named *audio* file
 /// (GINKA: `OP` resolves to `bgm/op.ogg`, which short-circuits the game's
@@ -491,22 +452,6 @@ fn resolve_video_storage_name(host: &KrkrHost, storage: &str) -> String {
     storage.to_string()
 }
 
-fn write_temp_video_file(bytes: &[u8], extension: &str) -> Result<PathBuf> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "krkr-video-{}-{}{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-        extension
-    ));
-    std::fs::write(&path, bytes).map_err(|error| {
-        TjsError::runtime(format!(
-            "VideoOverlay.open: cannot stage video for decoding: {error}"
-        ))
-    })?;
-    Ok(path)
-}
-
 /// Tears down any open decode state without firing events. Returns the audio
 /// instance to stop, if one is playing.
 fn video_teardown(state: &mut VideoOverlayState) -> Option<AudioInstanceId> {
@@ -515,9 +460,6 @@ fn video_teardown(state: &mut VideoOverlayState) -> Option<AudioInstanceId> {
     state.metadata = None;
     state.audio_spec = None;
     state.storage = None;
-    if let Some(path) = state.temp_path.take() {
-        let _ = std::fs::remove_file(path);
-    }
     state.clock_anchor_ms = None;
     state.position_ms = 0;
     state.current_frame = None;
@@ -545,44 +487,65 @@ fn video_open_storage(
     }
     let resolved_storage = resolve_video_storage_name(runtime.host(), storage);
     let storage = resolved_storage.as_str();
-    let bytes = runtime.host().read_binary_storage(storage)?;
-    let extension = sniff_video_extension(&bytes, storage);
-    let temp_path = write_temp_video_file(&bytes, &extension)?;
-    let decoder = match krkr_video::create_decoder(&temp_path) {
-        Ok(decoder) => decoder,
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp_path);
-            // GINKA's Movie.open rethrows only plugin-style failures whose
-            // message contains ".dll"; a plain decode error takes its
-            // graceful fallback path instead of deadlocking the scenario.
-            return Err(TjsError::runtime(format!(
-                "VideoOverlay.open: {storage}: {error}"
-            )));
-        }
-    };
-    let metadata = decoder.metadata().clone();
-    let audio_spec = decoder.audio_spec().map(|spec| PcmAudioSpec {
-        sample_rate: spec.sample_rate,
-        channels: spec.channels,
-    });
-    runtime.host_mut().log(&format!(
-        "VideoOverlay.open: {storage} ({}x{}, {:.2} fps, {} ms, audio={})",
-        metadata.width, metadata.height, metadata.fps, metadata.duration_ms, metadata.has_audio
-    ));
+    #[cfg(not(target_arch = "wasm32"))]
+    let bytes = runtime.host_mut().read_binary_storage_for_tjs(storage)?;
+    #[cfg(target_arch = "wasm32")]
     {
+        // Browser media elements own decoding and audio output. Keep the
+        // engine-side conductor state alive and let the Web shell present the
+        // storage as a native `<video>` overlay (no temp files or decode
+        // threads exist on wasm).
         let state = runtime.host_mut().video_overlay_state_mut(this);
         state.storage = Some(storage.to_string());
-        state.temp_path = Some(temp_path);
-        state.metadata = Some(metadata);
-        state.audio_spec = audio_spec;
-        state.decoder = Some(decoder);
+        state.metadata = None;
+        state.audio_spec = None;
+        state.decoder = None;
         state.status = VIDEO_STATUS_READY;
         state.position_ms = 0;
         state.clock_anchor_ms = None;
         state.stop_fired = false;
         state.period_event_fired = false;
+        runtime.host_mut().log(&format!(
+            "VideoOverlay.open: {storage} (browser media element)"
+        ));
+        return call_video_status_changed(runtime, this, VIDEO_STATUS_READY);
     }
-    call_video_status_changed(runtime, this, VIDEO_STATUS_READY)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let decoder = match krkr_video::create_decoder(VideoSource::bytes(bytes, Some(storage))) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                // GINKA's Movie.open rethrows only plugin-style failures whose
+                // message contains ".dll"; a plain decode error takes its
+                // graceful fallback path instead of deadlocking the scenario.
+                return Err(TjsError::runtime(format!(
+                    "VideoOverlay.open: {storage}: {error}"
+                )));
+            }
+        };
+        let metadata = decoder.metadata().clone();
+        let audio_spec = decoder.audio_spec().map(|spec| PcmAudioSpec {
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+        });
+        runtime.host_mut().log(&format!(
+            "VideoOverlay.open: {storage} ({}x{}, {:.2} fps, {} ms, audio={})",
+            metadata.width, metadata.height, metadata.fps, metadata.duration_ms, metadata.has_audio
+        ));
+        {
+            let state = runtime.host_mut().video_overlay_state_mut(this);
+            state.storage = Some(storage.to_string());
+            state.metadata = Some(metadata);
+            state.audio_spec = audio_spec;
+            state.decoder = Some(decoder);
+            state.status = VIDEO_STATUS_READY;
+            state.position_ms = 0;
+            state.clock_anchor_ms = None;
+            state.stop_fired = false;
+            state.period_event_fired = false;
+        }
+        call_video_status_changed(runtime, this, VIDEO_STATUS_READY)
+    }
 }
 
 /// Makes sure the overlay holds an open decoder, transparently (re-)opening
@@ -595,7 +558,9 @@ fn video_ensure_open(
     let (has_decoder, stored_storage) = {
         let state = runtime.host().video_overlay_state(this);
         (
-            state.is_some_and(|state| state.decoder.is_some()),
+            state.is_some_and(|state| {
+                state.decoder.is_some() || (cfg!(target_arch = "wasm32") && state.storage.is_some())
+            }),
             state.and_then(|state| state.storage.clone()),
         )
     };
@@ -655,114 +620,130 @@ fn video_overlay_play(
         .filter(|storage| !storage.is_empty());
     video_ensure_open(runtime, this, storage_arg)?;
 
-    enum AudioAction {
-        Start,
-        Resume,
-    }
-    struct PcmStreamStart {
-        spec: PcmAudioSpec,
-        total_frames: u64,
-        rx: Receiver<PcmAudioChunk>,
-    }
-    let (audio_action, audio_id, pcm_stream, audio_storage, volume, mode_notice) = {
+    #[cfg(target_arch = "wasm32")]
+    {
         let now = runtime.host_mut().now_millis();
         let state = runtime.host_mut().video_overlay_state_mut(this);
-        let resume = state.status == VIDEO_STATUS_PAUSE && state.session.is_some();
-        let mut pcm_stream = None;
-        if state.session.is_none() {
-            let decoder = state
-                .decoder
-                .take()
-                .ok_or_else(|| TjsError::runtime("VideoOverlay.play: no opened storage"))?;
-            let audio_tx = state.audio_spec.map(|spec| {
-                let (tx, rx) = mpsc::sync_channel::<PcmAudioChunk>(AUDIO_QUEUE_DEPTH);
-                let total_frames = state
-                    .metadata
-                    .as_ref()
-                    .map(|meta| {
-                        (meta.duration_ms.max(0) as u64).saturating_mul(u64::from(spec.sample_rate))
-                            / 1000
-                    })
-                    .unwrap_or(0);
-                pcm_stream = Some(PcmStreamStart {
-                    spec,
-                    total_frames,
-                    rx,
-                });
-                tx
-            });
-            let session = DecodeSession::start(decoder, audio_tx)
-                .map_err(|error| TjsError::runtime(format!("VideoOverlay.play: {error}")))?;
-            state.session = Some(session);
-        } else if !resume {
-            // Play while already playing restarts from the beginning (krkrz
-            // reruns the graph); rewind the decode thread with the clock.
-            if let Some(session) = &mut state.session {
-                session.seek(0);
-            }
-        }
-        if !resume {
-            state.position_ms = 0;
-        }
+        state.position_ms = 0;
         state.clock_anchor_ms = Some(now);
         state.status = VIDEO_STATUS_PLAY;
         state.stop_fired = false;
-        let has_audio = state.audio_spec.is_some();
-        let action = if resume && state.audio_id.is_some() {
-            Some(AudioAction::Resume)
-        } else if has_audio {
-            Some(AudioAction::Start)
-        } else {
-            None
-        };
-        let notice = (state.mode == VIDEO_MODE_LAYER && !state.vom_layer_notice_logged).then(|| {
+        state.period_event_fired = false;
+        return call_video_status_changed(runtime, this, VIDEO_STATUS_PLAY).map(|_| Variant::Void);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        enum AudioAction {
+            Start,
+            Resume,
+        }
+        struct PcmStreamStart {
+            spec: PcmAudioSpec,
+            total_frames: u64,
+            rx: Receiver<PcmAudioChunk>,
+        }
+        let (audio_action, audio_id, pcm_stream, audio_storage, volume, mode_notice) = {
+            let now = runtime.host_mut().now_millis();
+            let state = runtime.host_mut().video_overlay_state_mut(this);
+            let resume = state.status == VIDEO_STATUS_PAUSE && state.session.is_some();
+            let mut pcm_stream = None;
+            if state.session.is_none() {
+                let decoder = state
+                    .decoder
+                    .take()
+                    .ok_or_else(|| TjsError::runtime("VideoOverlay.play: no opened storage"))?;
+                let audio_tx = state.audio_spec.map(|spec| {
+                    let (tx, rx) = mpsc::sync_channel::<PcmAudioChunk>(AUDIO_QUEUE_DEPTH);
+                    let total_frames = state
+                        .metadata
+                        .as_ref()
+                        .map(|meta| {
+                            (meta.duration_ms.max(0) as u64)
+                                .saturating_mul(u64::from(spec.sample_rate))
+                                / 1000
+                        })
+                        .unwrap_or(0);
+                    pcm_stream = Some(PcmStreamStart {
+                        spec,
+                        total_frames,
+                        rx,
+                    });
+                    tx
+                });
+                let session = DecodeSession::start(decoder, audio_tx)
+                    .map_err(|error| TjsError::runtime(format!("VideoOverlay.play: {error}")))?;
+                state.session = Some(session);
+            } else if !resume {
+                // Play while already playing restarts from the beginning (krkrz
+                // reruns the graph); rewind the decode thread with the clock.
+                if let Some(session) = &mut state.session {
+                    session.seek(0);
+                }
+            }
+            if !resume {
+                state.position_ms = 0;
+            }
+            state.clock_anchor_ms = Some(now);
+            state.status = VIDEO_STATUS_PLAY;
+            state.stop_fired = false;
+            let has_audio = state.audio_spec.is_some();
+            let action = if resume && state.audio_id.is_some() {
+                Some(AudioAction::Resume)
+            } else if has_audio {
+                Some(AudioAction::Start)
+            } else {
+                None
+            };
+            let notice = (state.mode == VIDEO_MODE_LAYER && !state.vom_layer_notice_logged).then(|| {
             state.vom_layer_notice_logged = true;
             "VideoOverlay mode=vomLayer currently renders through the overlay quad; layer mixing is not implemented"
         });
-        (
-            action,
-            state.audio_id,
-            pcm_stream,
-            state.storage.clone(),
-            state.audio_volume,
-            notice,
-        )
-    };
-    if let Some(notice) = mode_notice {
-        runtime.host_mut().log(notice);
-    }
-    if let Some(storage) = &audio_storage {
-        runtime
-            .host_mut()
-            .log(&format!("VideoOverlay.play: {storage}"));
-    }
-    match audio_action {
-        Some(AudioAction::Start) => {
-            if let Some(start) = pcm_stream {
-                let id = runtime.host_mut().queue_pcm_stream_play(
-                    AudioBus::Bgm,
-                    start.spec,
-                    start.total_frames,
-                    start.rx,
-                    volume as f32 / 100000.0,
-                );
-                runtime.host_mut().video_overlay_state_mut(this).audio_id = Some(id);
-            }
+            (
+                action,
+                state.audio_id,
+                pcm_stream,
+                state.storage.clone(),
+                state.audio_volume,
+                notice,
+            )
+        };
+        if let Some(notice) = mode_notice {
+            runtime.host_mut().log(notice);
         }
-        Some(AudioAction::Resume) => {
-            if let Some(id) = audio_id {
-                runtime
-                    .host_mut()
-                    .queue_audio_command(AudioCommand::Resume {
-                        id,
-                        fade_seconds: 0.0,
-                    });
-            }
+        if let Some(storage) = &audio_storage {
+            runtime
+                .host_mut()
+                .log(&format!("VideoOverlay.play: {storage}"));
         }
-        None => {}
+        match audio_action {
+            Some(AudioAction::Start) => {
+                if let Some(start) = pcm_stream {
+                    let id = runtime.host_mut().queue_pcm_stream_play(
+                        AudioBus::Bgm,
+                        start.spec,
+                        start.total_frames,
+                        start.rx,
+                        volume as f32 / 100000.0,
+                    );
+                    runtime.host_mut().video_overlay_state_mut(this).audio_id = Some(id);
+                }
+            }
+            Some(AudioAction::Resume) => {
+                if let Some(id) = audio_id {
+                    runtime
+                        .host_mut()
+                        .queue_audio_command(AudioCommand::Resume {
+                            id,
+                            fade_seconds: 0.0,
+                        });
+                }
+            }
+            None => {}
+        }
+        call_video_status_changed(runtime, this, VIDEO_STATUS_PLAY)?;
+        Ok(Variant::Void)
     }
-    call_video_status_changed(runtime, this, VIDEO_STATUS_PLAY)?;
-    Ok(Variant::Void)
 }
 
 /// Shared stop/EOF teardown: drops the decode session, stops the audio track

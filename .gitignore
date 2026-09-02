@@ -2,3 +2,6 @@
 *.log
 .DS_Store
 .cargo
+node_modules/
+dist/
+apps/web/public/pkg/

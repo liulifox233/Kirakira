@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 fontdb.workspace = true
+krkr-core.workspace = true
 swash.workspace = true

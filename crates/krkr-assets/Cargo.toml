@@ -1,10 +1,11 @@
 [package]
-name = "krkr-decomp"
+name = "krkr-assets"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-encoding_rs.workspace = true
-krkr-tjs2.workspace = true
+krkr-core.workspace = true
 krkr-xp3.workspace = true
+serde.workspace = true
+serde_json.workspace = true

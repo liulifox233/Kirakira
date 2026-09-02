@@ -27,7 +27,7 @@ use crate::bytecode::BytecodeFile;
 use crate::error::{Result, TjsError};
 use crate::frontend::syntax::Program;
 
-pub use emit::{DecompiledSource, DecompileOutput, DecompileStats};
+pub use emit::{DecompileOutput, DecompileStats, DecompiledSource};
 
 thread_local! {
     /// Object indices whose bodies are currently being decompiled (the
@@ -135,9 +135,8 @@ pub fn decompile_and_parse(file: &BytecodeFile, options: &DecompileOptions) -> R
         .next()
         .map(|source| source.text)
         .unwrap_or_default();
-    crate::compiler::parse_source(&text).map_err(|error| {
-        TjsError::bytecode(format!("decompiled output does not reparse: {error}"))
-    })
+    crate::compiler::parse_source(&text)
+        .map_err(|error| TjsError::bytecode(format!("decompiled output does not reparse: {error}")))
 }
 
 #[cfg(test)]
@@ -158,11 +157,18 @@ mod tests {
         let text = output.sources[0].text.clone();
         // The output must reparse and recompile.
         let reparsed = crate::compiler::parse_source(&text).expect("decompiled output reparse");
-        assert!(!reparsed.statements.is_empty(), "empty program from {source:?}");
-        let file2 =
-            crate::compiler::compile_source_to_bytecode("round_trip.tjs", &text).expect("recompile");
+        assert!(
+            !reparsed.statements.is_empty(),
+            "empty program from {source:?}"
+        );
+        let file2 = crate::compiler::compile_source_to_bytecode("round_trip.tjs", &text)
+            .expect("recompile");
         // And behave identically in the VM.
-        assert_eq!(execute(&file), execute(&file2), "semantic mismatch for {source:?}\n{text}");
+        assert_eq!(
+            execute(&file),
+            execute(&file2),
+            "semantic mismatch for {source:?}\n{text}"
+        );
         text
     }
 
@@ -170,7 +176,9 @@ mod tests {
     fn round_trips_linear_scripts() {
         round_trip("return 1 + 2 * 3;");
         round_trip("var x = 5; x = x + 1; return x;");
-        round_trip("function inc(x) { return x + 1; } var a = %[\"b\" => %[\"c\" => inc]]; var d = %[\"e\" => 2]; return a.b.c(1, 2) + d.e;");
+        round_trip(
+            "function inc(x) { return x + 1; } var a = %[\"b\" => %[\"c\" => inc]]; var d = %[\"e\" => 2]; return a.b.c(1, 2) + d.e;",
+        );
         round_trip("return \"hello \" + \"world\";");
         round_trip("var d = %[\"a\" => 1, 2 => 3]; return d.a;");
         round_trip("return [1, 2, 3];");
@@ -193,13 +201,19 @@ mod tests {
         round_trip("var i = 3; do { i--; } while (i > 0); return i;");
         round_trip("var s = 0; for (var j = 0; j < 4; j++) { s += j; } return s;");
         round_trip("var i = 0; while (i < 9) { i++; if (i > 3) { break; } } return i;");
-        round_trip("var s = 0; for (var j = 0; j < 5; j++) { if (j == 2) { continue; } s += j; } return s;");
+        round_trip(
+            "var s = 0; for (var j = 0; j < 5; j++) { if (j == 2) { continue; } s += j; } return s;",
+        );
         round_trip("var a = 1; var b = 0; var x = a && b; var y = a || b; return x + y;");
         round_trip("var a = 1; if (a && 2) { return 1; } if (0 || a) { return 2; } return 3;");
         round_trip("try { return 1; } catch (e) { return 2; }");
         round_trip("var t = a ? 1 : 2; return t;");
-        round_trip("var x = 2; var r = 0; switch (x) { case 1: r = 1; case 2: r = 2; break; default: r = 3; } return r;");
-        round_trip("var x = 9; var r = 0; switch (x) { case 1: r = 1; break; case 9: r = 9; break; } return r;");
+        round_trip(
+            "var x = 2; var r = 0; switch (x) { case 1: r = 1; case 2: r = 2; break; default: r = 3; } return r;",
+        );
+        round_trip(
+            "var x = 9; var r = 0; switch (x) { case 1: r = 1; break; case 9: r = 9; break; } return r;",
+        );
         round_trip("function f(a, b = 2) { return a + b; } return f(1) + f(1, 3);");
     }
 

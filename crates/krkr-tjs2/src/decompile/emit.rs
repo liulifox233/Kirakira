@@ -36,7 +36,9 @@ pub(crate) fn render_program(program: &Program, name: &str) -> String {
             .and_then(|rest| rest.strip_suffix(';'))
         {
             let indent = &line[..line.len() - trimmed.len()];
-            out.push_str(&format!("{indent}// <unhandled: code object {index} body>\n"));
+            out.push_str(&format!(
+                "{indent}// <unhandled: code object {index} body>\n"
+            ));
         } else if let Some(marker) = trimmed
             .strip_prefix("__krkr_decomp_unhandled_")
             .and_then(|rest| rest.strip_suffix(';'))
@@ -67,12 +69,14 @@ mod tests {
 
     #[test]
     fn replaces_markers_with_comments() {
-        let program = crate::compiler::parse_source(
-            "__krkr_decomp_unhandled_abcd; __krkr_decomp_object_3;",
-        )
-        .expect("parse");
+        let program =
+            crate::compiler::parse_source("__krkr_decomp_unhandled_abcd; __krkr_decomp_object_3;")
+                .expect("parse");
         let text = render_program(&program, "test.tjs");
         assert!(text.contains("// <unhandled: bytecode fragment>"), "{text}");
-        assert!(text.contains("// <unhandled: code object 3 body>"), "{text}");
+        assert!(
+            text.contains("// <unhandled: code object 3 body>"),
+            "{text}"
+        );
     }
 }

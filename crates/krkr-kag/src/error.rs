@@ -36,6 +36,12 @@ pub enum KagError {
     EvalUnsupported {
         expression: String,
     },
+    /// The host needs to fetch a scenario before parsing can continue.
+    /// Platform shells may suspend their scheduler and retry the same parser
+    /// operation once the resource is available.
+    ResourcePending {
+        storage: String,
+    },
     Host {
         message: String,
     },
@@ -116,6 +122,9 @@ impl fmt::Display for KagError {
                     f,
                     "KAG expression evaluation is not available: {expression:?}"
                 )
+            }
+            Self::ResourcePending { storage } => {
+                write!(f, "KAG resource is pending: {storage}")
             }
             Self::Host { message } => write!(f, "{message}"),
         }

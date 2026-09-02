@@ -13,7 +13,23 @@ use krkr_core::{
 };
 use krkr_font::FontSystem;
 use wgpu::util::DeviceExt;
-use winit::{dpi::PhysicalSize, window::Window};
+#[cfg(feature = "winit-surface")]
+pub use winit::dpi::PhysicalSize;
+#[cfg(feature = "winit-surface")]
+use winit::window::Window;
+#[cfg(not(feature = "winit-surface"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalSize<T> {
+    pub width: T,
+    pub height: T,
+}
+
+#[cfg(not(feature = "winit-surface"))]
+impl<T> PhysicalSize<T> {
+    pub const fn new(width: T, height: T) -> Self {
+        Self { width, height }
+    }
+}
 
 #[derive(Debug)]
 pub enum RendererInitError {
@@ -73,6 +89,7 @@ pub struct Renderer {
     /// Whether capture support is enabled (adds COPY_SRC usage to surfaces and
     /// uploaded textures). Enabled via the KRKR_CAPTURE_* environment variables.
     capture_enabled: bool,
+    suspended: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +112,7 @@ pub struct RenderViewport {
 }
 
 impl Renderer {
+    #[cfg(feature = "winit-surface")]
     pub async fn new(window: Arc<Window>) -> Result<Self, RendererInitError> {
         let physical_size = window.inner_size();
         let scale_factor = window.scale_factor();
@@ -105,6 +123,18 @@ impl Renderer {
         let surface = instance
             .create_surface(window)
             .map_err(RendererInitError::CreateSurface)?;
+        Self::new_with_surface(instance, surface, physical_size, scale_factor).await
+    }
+
+    /// Initializes a renderer from an application-owned surface.  Desktop and
+    /// Web shells can now create their own winit/canvas target and keep window
+    /// lifecycle concerns out of the renderer itself.
+    pub async fn new_with_surface(
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        physical_size: PhysicalSize<u32>,
+        scale_factor: f64,
+    ) -> Result<Self, RendererInitError> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -144,8 +174,11 @@ impl Renderer {
         let alpha_mode = capabilities.alpha_modes[0];
         // Surface capture (KRKR_CAPTURE_FRAME at the desktop app) copies the
         // presented texture for headless render diagnostics.
+        #[cfg(not(target_arch = "wasm32"))]
         let capture_enabled = std::env::var_os("KRKR_CAPTURE_FRAME").is_some()
             || std::env::var_os("KRKR_CAPTURE_VIDEO").is_some();
+        #[cfg(target_arch = "wasm32")]
+        let capture_enabled = false;
         let config = wgpu::SurfaceConfiguration {
             usage: if capture_enabled {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
@@ -184,6 +217,7 @@ impl Renderer {
             capture_path: None,
             capture_texture: None,
             capture_enabled,
+            suspended: physical_size.width == 0 || physical_size.height == 0,
         })
     }
 
@@ -202,6 +236,7 @@ impl Renderer {
     pub fn resize(&mut self, physical_size: PhysicalSize<u32>, scale_factor: f64) {
         self.physical_size = physical_size;
         self.scale_factor = scale_factor.max(1.0);
+        self.suspended = physical_size.width == 0 || physical_size.height == 0;
 
         if physical_size.width == 0 || physical_size.height == 0 {
             return;
@@ -210,6 +245,17 @@ impl Renderer {
         self.config.width = physical_size.width;
         self.config.height = physical_size.height;
         self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Suspends presentation while a mobile/window surface is detached. The
+    /// engine keeps running and its draw list/textures remain valid; a later
+    /// `resume`/`resize` simply reconfigures the existing device surface.
+    pub fn suspend(&mut self) {
+        self.suspended = true;
+    }
+
+    pub fn resume(&mut self, physical_size: PhysicalSize<u32>, scale_factor: f64) {
+        self.resize(physical_size, scale_factor);
     }
 
     pub fn logical_size(&self) -> Size {
@@ -243,7 +289,7 @@ impl Renderer {
         let prepared = self.prepare_frame(frame);
         self.upload_frame_images(&prepared);
         self.retain_frame_textures(&prepared);
-        if self.physical_size.width == 0 || self.physical_size.height == 0 {
+        if self.suspended || self.physical_size.width == 0 || self.physical_size.height == 0 {
             return Ok(());
         }
 
@@ -444,6 +490,9 @@ impl Renderer {
         for texture_id in std::mem::take(&mut self.frame_text_textures) {
             self.textures.remove(&texture_id);
         }
+        for texture_id in &frame.image_releases {
+            self.textures.remove(texture_id);
+        }
 
         let (draw_commands, mut image_uploads) = self.prepare_commands(&frame.draw_commands);
         image_uploads.extend(frame.image_uploads.iter().cloned());
@@ -467,6 +516,7 @@ impl Renderer {
             clip: frame.clip,
             draw_commands,
             image_uploads,
+            image_releases: frame.image_releases.clone(),
             transition,
         }
     }
@@ -934,12 +984,12 @@ struct RenderTransform {
     y_offset: f32,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "winit-surface", target_os = "macos"))]
 fn preferred_backends() -> wgpu::Backends {
     wgpu::Backends::METAL
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(feature = "winit-surface", not(target_os = "macos")))]
 fn preferred_backends() -> wgpu::Backends {
     wgpu::Backends::PRIMARY
 }

@@ -1,71 +1,13 @@
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 use fontdb::{Database, Family, Query, Source, Stretch, Style as FontStyle, Weight};
+pub use krkr_core::{FontSpec, ShadowStyle, TextStyle};
 use swash::{
     FontRef,
     scale::{Render, ScaleContext, Source as GlyphSource, StrikeWith, image::Content},
     shape::ShapeContext,
     zeno::{Format, Vector},
 };
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct FontSpec {
-    pub face: String,
-    pub height: f32,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub strikeout: bool,
-    pub angle: i32,
-    pub face_is_file_name: bool,
-    pub rasterizer: String,
-}
-
-impl Default for FontSpec {
-    fn default() -> Self {
-        Self {
-            face: String::new(),
-            height: 24.0,
-            bold: false,
-            italic: false,
-            underline: false,
-            strikeout: false,
-            angle: 0,
-            face_is_file_name: false,
-            rasterizer: String::new(),
-        }
-    }
-}
-
-impl FontSpec {
-    pub fn resolved_height(&self) -> f32 {
-        self.height.abs().max(1.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextStyle {
-    pub color: [u8; 4],
-    pub anti_alias: bool,
-    pub shadow: Option<ShadowStyle>,
-}
-
-impl Default for TextStyle {
-    fn default() -> Self {
-        Self {
-            color: [255, 255, 255, 255],
-            anti_alias: true,
-            shadow: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShadowStyle {
-    pub offset_x: i32,
-    pub offset_y: i32,
-    pub color: [u8; 4],
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TextMetrics {
@@ -304,7 +246,15 @@ impl Clone for FontSystem {
 
 impl FontSystem {
     pub fn new() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let mut db = Database::new();
+        #[cfg(target_arch = "wasm32")]
+        let db = Database::new();
+        // Browsers do not expose a process-wide system font directory to WASM.
+        // `fontdb::Database::load_system_fonts` may panic through unsupported
+        // filesystem APIs on wasm targets, so defer font discovery there until
+        // game-provided font data is loaded explicitly.
+        #[cfg(not(target_arch = "wasm32"))]
         db.load_system_fonts();
         Self {
             db,

@@ -2,8 +2,6 @@
 //! Usage: decode_probe <file> [frame_count] [seek_ms]
 //! With `--audio` it also drains the soundtrack and reports chunk stats.
 
-use std::path::Path;
-
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let audio_mode = if let Some(index) = args.iter().position(|arg| arg == "--audio") {
@@ -18,7 +16,8 @@ fn main() {
         .expect("usage: decode_probe <file> [frame_count] [seek_ms] [--audio]");
     let wanted: u32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(5);
     let seek_ms: i64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut decoder = krkr_video::create_decoder(Path::new(&path)).expect("create_decoder");
+    let mut decoder =
+        krkr_video::create_decoder(krkr_video::VideoSource::path(&path)).expect("create_decoder");
     let meta = decoder.metadata().clone();
     println!(
         "meta: {}x{} @ {:.3} fps, {} frames, {} ms, audio={}",

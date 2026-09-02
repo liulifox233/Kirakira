@@ -19,10 +19,7 @@ fn main() {
         let archive = krkr_xp3::Xp3Archive::open_file(&args[1]).expect("open archive");
         let needle = args[2].as_str();
         let utf8 = needle.as_bytes().to_vec();
-        let utf16: Vec<u8> = needle
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
+        let utf16: Vec<u8> = needle.encode_utf16().flat_map(u16::to_le_bytes).collect();
         for index in 0..archive.entries().len() {
             let name = archive.entries()[index].name.clone();
             let mut stream = match archive.open_by_index(index) {
@@ -33,12 +30,8 @@ fn main() {
             if std::io::Read::read_to_end(&mut stream, &mut data).is_err() {
                 continue;
             }
-            let hit = |pat: &[u8]| {
-                !pat.is_empty()
-                    && data
-                        .windows(pat.len())
-                        .any(|window| window == pat)
-            };
+            let hit =
+                |pat: &[u8]| !pat.is_empty() && data.windows(pat.len()).any(|window| window == pat);
             if hit(&utf8) || hit(&utf16) {
                 println!("{name}");
             }

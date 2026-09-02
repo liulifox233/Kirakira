@@ -16,6 +16,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use image::{ImageBuffer, ImageFormat, Rgba};
+use krkr_assets::NativeAssetStore;
 use krkr_audio::{AudioEvent, AudioSystem};
 use krkr_core::{
     ButtonState, Color, DrawCommand, EngineEvent, EngineKey, FrameInput, ImageCommand, ImageUpload,
@@ -23,7 +24,7 @@ use krkr_core::{
 };
 use krkr_engine::{
     EngineConfig, EngineFrame, EngineInput, KrkrEngine, KrkrHost, NativeTextDrawEvent,
-    TransitionPolicy,
+    RuntimeSession, RuntimeSessionError, TransitionPolicy,
 };
 use krkr_plugins::register_reference_plugins;
 use terminal_size::{Height, Width, terminal_size};
@@ -99,8 +100,7 @@ struct TerminalApp {
     project_root: PathBuf,
     protocol: ImageProtocol,
     debug_interaction: bool,
-    engine: KrkrEngine,
-    audio: AudioSystem,
+    runtime: RuntimeSession,
     presentation: TerminalRenderer,
     interaction: TerminalInteraction,
     debug_log: DebugInteractionLog,
@@ -154,8 +154,6 @@ impl TerminalApp {
             .set_transition_policy(TransitionPolicy::Immediate);
         register_reference_plugins(&mut engine)
             .map_err(|error| format!("reference plugin registration failed: {error}"))?;
-        run_project_startup(&mut engine).map_err(|error| error.to_string())?;
-
         let viewport_size = engine
             .preferred_viewport_size()
             .filter(|size| !size.is_empty())
@@ -168,13 +166,19 @@ impl TerminalApp {
         audio
             .set_resource_provider(engine.host().resource_provider())
             .map_err(|error| format!("audio resource provider failed: {error}"))?;
+        let mut runtime = RuntimeSession::new(
+            engine,
+            Box::new(NativeAssetStore::new(project_root.clone())),
+            Box::new(audio),
+            Box::new(krkr_core::VirtualClock::default()),
+        );
+        run_project_startup(&mut runtime).map_err(|error| error.to_string())?;
 
         Ok(Self {
             project_root,
             protocol,
             debug_interaction,
-            engine,
-            audio,
+            runtime,
             presentation: TerminalRenderer::new(protocol),
             interaction: TerminalInteraction::new(viewport_size),
             debug_log: DebugInteractionLog::new(),
@@ -199,20 +203,24 @@ impl TerminalApp {
             let delta = now.duration_since(last_frame);
             last_frame = now;
             let frame_input = FrameInput::new(self.viewport_size, delta.as_secs_f32());
-            let mut frame = self.engine.update(
+            let runtime_frame = self.runtime.update(
                 EngineInput::new(frame_input, std::mem::take(&mut self.pending_events)),
                 delta,
             )?;
-            prepare_terminal_frame(self.engine.host(), &mut frame);
+            let mut frame = runtime_frame.engine;
+            prepare_terminal_frame(self.runtime.engine().host(), &mut frame);
 
-            self.interaction
-                .refresh_candidates(self.engine.host().layer_tree(), self.viewport_size);
+            self.interaction.refresh_candidates(
+                self.runtime.engine().host().layer_tree(),
+                self.viewport_size,
+            );
 
             if self.debug_interaction {
                 self.debug_log.write_if_changed(
                     &mut ui.stdout,
                     &self.interaction,
-                    self.engine
+                    self.runtime
+                        .engine()
                         .host()
                         .layer_tree()
                         .hit_test(self.interaction.cursor),
@@ -226,22 +234,26 @@ impl TerminalApp {
                 write_terminal_text(&mut ui.stdout, &transcript)?;
                 ui.stdout.flush()?;
             }
-            let native_text_events = self.engine.host_mut().take_native_text_draw_events();
+            let native_text_events = self
+                .runtime
+                .engine_mut()
+                .host_mut()
+                .take_native_text_draw_events();
             let native_transcript = self
                 .native_transcript
-                .diff(&native_text_events, self.engine.host());
+                .diff(&native_text_events, self.runtime.engine().host());
             if !native_transcript.is_empty() {
                 write_terminal_text(&mut ui.stdout, &native_transcript)?;
                 ui.stdout.flush()?;
             }
 
-            let commands = self.engine.host_mut().take_audio_commands();
-            self.audio.submit_commands(commands)?;
-            if frame.input.unhandled_escape_pressed && !self.engine.host().termination_requested() {
-                let _ = self.engine.request_runtime_close();
+            if frame.input.unhandled_escape_pressed
+                && !self.runtime.engine().host().termination_requested()
+            {
+                let _ = self.runtime.engine_mut().request_runtime_close();
             }
             ui.status(&self.status_text(&format!("{:?}", frame.tick.state)))?;
-            if self.quit_requested || self.engine.host().termination_requested() {
+            if self.quit_requested || self.runtime.engine().host().termination_requested() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(16));
@@ -336,10 +348,11 @@ impl TerminalApp {
     }
 
     fn drain_audio_events(&mut self) {
-        for event in self.audio.drain_events() {
+        let events = self.runtime.audio_mut().poll_events();
+        for event in events {
             match event {
                 AudioEvent::PlaybackStopped { id } => {
-                    let _ = self.engine.notify_audio_stopped(id);
+                    let _ = self.runtime.engine_mut().notify_audio_stopped(id);
                 }
                 AudioEvent::Status(status) => {
                     eprintln!("audio: {}", status.message);
@@ -594,15 +607,8 @@ fn format_candidate_short(candidate: &InteractionCandidate) -> String {
     )
 }
 
-fn run_project_startup(engine: &mut KrkrEngine) -> Result<(), Box<dyn std::error::Error>> {
-    let has_startup_tjs = engine.host().storage_exists("startup.tjs");
-    let has_startup_ks = engine.host().storage_exists("startup.ks");
-    if has_startup_tjs || !has_startup_ks {
-        engine.execute_startup()?;
-    }
-    if !engine.has_kag_scenario() && has_startup_ks {
-        engine.load_kag_scenario("startup.ks")?;
-    }
+fn run_project_startup(runtime: &mut RuntimeSession) -> Result<(), Box<dyn std::error::Error>> {
+    runtime.start_project()?;
     Ok(())
 }
 
@@ -1237,6 +1243,15 @@ impl From<krkr_kag::KagError> for AppError {
 impl From<krkr_audio::AudioError> for AppError {
     fn from(error: krkr_audio::AudioError) -> Self {
         Self::Audio(error)
+    }
+}
+
+impl From<RuntimeSessionError> for AppError {
+    fn from(error: RuntimeSessionError) -> Self {
+        match error {
+            RuntimeSessionError::Engine(error) => Self::Engine(error),
+            RuntimeSessionError::Audio(error) => Self::Audio(error),
+        }
     }
 }
 

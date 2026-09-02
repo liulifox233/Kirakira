@@ -592,6 +592,24 @@ impl<H: TjsHost + 'static> Runtime<H> {
         vm.call_object_method(object, name, args)
     }
 
+    /// Dispatches a host callback while a VM call is suspended. The callback
+    /// must be allowed to mutate host state (for example, closing a modal
+    /// window) without consuming the suspended caller; the caller is resumed
+    /// by the engine after the event returns.
+    pub fn call_object_method_during_suspend(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        let suspended = self.suspended_call.take();
+        let result = self.call_object_method(object, name, args);
+        if self.suspended_call.is_none() {
+            self.suspended_call = suspended;
+        }
+        result
+    }
+
     /// Invoke a method declared by a secondary TJS class extender, if one
     /// exists. TJS keeps every extender's class name on the instance even
     /// though the ordinary superclass link can represent only one chain.

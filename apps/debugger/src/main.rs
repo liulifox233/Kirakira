@@ -11,8 +11,9 @@
 //!   --break-on-exception    stop when a TJS runtime error is raised
 //!   --pause-at-start        stop at the first executed instruction
 //!   --commands <file>       read debugger commands from a file, then stdin
-//!   --scenario <name>       load a KAG scenario after startup if the game
-//!                           did not start one itself (e.g. first.ks)
+//!   --scenario <name>       explicit probe override: load a KAG scenario
+//!                           after startup if the game did not start one
+//!                           itself
 //!
 //! Probe options:
 //!   --before-script <tjs>   execute TJS source before the frame loop
@@ -63,11 +64,13 @@ mod snapshot;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use krkr_assets::NativeAssetStore;
+use krkr_audio::VirtualAudioSink;
 use krkr_core::{
     AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, Point,
     PointerButton, Size,
 };
-use krkr_engine::{EngineInput, KagTaskState, KrkrEngine, TransitionPolicy};
+use krkr_engine::{EngineInput, KagTaskState, KrkrEngine, RuntimeSession, TransitionPolicy};
 use krkr_tjs2::runtime::Variant;
 use snapshot::TextureCache;
 
@@ -255,35 +258,46 @@ fn main() {
         runtime.set_debug_ui(Box::new(CliDebugger::new(config.commands_file.clone())));
     }
 
-    match engine.execute_startup() {
-        Ok(startup) => println!("startup=ok {startup}"),
+    let mut runtime = RuntimeSession::new(
+        engine,
+        Box::new(NativeAssetStore::new(root.clone())),
+        Box::new(VirtualAudioSink::default()),
+        Box::new(krkr_core::VirtualClock::default()),
+    );
+
+    match runtime.start_project() {
+        Ok(()) => println!("startup=ok (project dispatcher)"),
         Err(error) if error.is_debug_quit() => {
             println!("debug session terminated during startup");
-            dump_stub_calls(&engine);
+            dump_stub_calls(runtime.engine());
             return;
         }
         Err(error) => {
             println!("startup=error\n{error}\n---debug---\n{error:?}");
-            dump_logs(&engine);
-            dump_stub_calls(&engine);
+            dump_logs(runtime.engine());
+            dump_stub_calls(runtime.engine());
             std::process::exit(1);
         }
     }
     println!(
         "preferred_viewport={:?} has_kag_scenario={} state={:?}",
-        engine.preferred_viewport_size(),
-        engine.has_kag_scenario(),
-        engine.kag_state()
+        runtime.engine().preferred_viewport_size(),
+        runtime.engine().has_kag_scenario(),
+        runtime.engine().kag_state()
     );
     if let Some(scenario) = &config.scenario
-        && !engine.has_kag_scenario()
+        && !runtime.engine().has_kag_scenario()
     {
-        engine.load_kag_scenario(scenario).expect("load scenario");
+        runtime
+            .engine_mut()
+            .load_kag_scenario(scenario)
+            .expect("load scenario");
         println!("loaded scenario {scenario}");
     }
 
     for storage in &config.dump_storages {
-        let bytes = engine
+        let bytes = runtime
+            .engine()
             .host()
             .read_binary_storage(storage)
             .expect("storage dump");
@@ -292,12 +306,14 @@ fn main() {
     }
 
     if let Some(script) = &config.before_script {
-        engine
+        runtime
+            .engine_mut()
             .execute_script("krkr_debug_before.tjs", script)
             .expect("before script");
     }
     if let Some(expression) = &config.before_expr {
-        engine
+        runtime
+            .engine_mut()
             .execute_expression("krkr_debug_before.tjs", expression)
             .expect("before expression");
     }
@@ -314,22 +330,25 @@ fn main() {
             if *at_frame == frame_index {
                 let script = script.as_deref().expect("checked in parse_args");
                 println!("executing at frame={frame_index}");
-                engine
+                runtime
+                    .engine_mut()
                     .execute_script("krkr_debug_at_frame.tjs", script)
                     .expect("at-frame script");
             }
         }
         for id in pending_audio_stops.drain(..) {
-            if let Err(error) = engine.notify_audio_stopped(id) {
+            if let Err(error) = runtime.engine_mut().notify_audio_stopped(id) {
                 println!("audio completion error: {error}");
             }
         }
         if !config.realtime {
-            engine
+            runtime
+                .engine_mut()
                 .host_mut()
                 .advance_clock(delta.mul_f64(config.time_scale));
         } else if config.time_scale > 1.0 {
-            engine
+            runtime
+                .engine_mut()
                 .host_mut()
                 .advance_clock(delta.mul_f64(config.time_scale - 1.0));
         }
@@ -355,17 +374,18 @@ fn main() {
                 });
             }
         }
-        if config.auto_click && matches!(engine.kag_state(), KagTaskState::WaitingClick) {
-            engine.signal_kag_click();
+        if config.auto_click && matches!(runtime.engine().kag_state(), KagTaskState::WaitingClick) {
+            runtime.engine_mut().signal_kag_click();
         }
-        match engine.update(
+        match runtime.update(
             EngineInput::new(
                 FrameInput::new(Size::new(1280.0, 720.0), 1.0 / 60.0),
                 events,
             ),
             delta,
         ) {
-            Ok(frame) => {
+            Ok(runtime_frame) => {
+                let frame = runtime_frame.engine;
                 for upload in &frame.output.image_uploads {
                     textures.insert(
                         upload.texture_id,
@@ -375,7 +395,7 @@ fn main() {
                 if config.shot.is_some() && frame_index == shot_frame {
                     shot_commands = Some(frame.output.draw_commands.clone());
                 }
-                let commands = engine.host_mut().take_audio_commands();
+                let commands = runtime.take_audio_commands();
                 if config.virtual_audio {
                     queue_virtual_audio_completions(&commands, &mut pending_audio_stops);
                 }
@@ -394,9 +414,17 @@ fn main() {
                         .count();
                     println!(
                         "frame={frame_index} images={images} texts={texts} kag={:?} location={:?}",
-                        engine.kag_state(),
-                        engine.kag_location()
+                        runtime.engine().kag_state(),
+                        runtime.engine().kag_location()
                     );
+                    if frame_index % 100 == 0 {
+                        let timer_diagnostics = runtime.engine_mut().scheduler_timer_diagnostics();
+                        println!(
+                            "scheduler={:?} timers={:?}",
+                            runtime.engine().scheduler_diagnostics(),
+                            timer_diagnostics
+                        );
+                    }
                 }
                 if config.pixels
                     && (frame_index % 20 == 0
@@ -418,7 +446,7 @@ fn main() {
                             snapshot::print_image_pixels(
                                 image,
                                 &frame.output.image_uploads,
-                                &engine,
+                                runtime.engine(),
                             );
                         }
                     }
@@ -426,13 +454,13 @@ fn main() {
             }
             Err(error) if error.is_debug_quit() => {
                 println!("debug session terminated at frame={frame_index}");
-                dump_stub_calls(&engine);
+                dump_stub_calls(runtime.engine());
                 return;
             }
             Err(error) => {
                 println!("frame={frame_index} error\n{error}\n---debug---\n{error:?}");
-                dump_logs(&engine);
-                dump_stub_calls(&engine);
+                dump_logs(runtime.engine());
+                dump_stub_calls(runtime.engine());
                 std::process::exit(1);
             }
         }
@@ -442,18 +470,21 @@ fn main() {
     }
 
     if let Some(expression) = &config.expr {
-        match engine.execute_expression("krkr_debug_inline.tjs", expression) {
+        match runtime
+            .engine_mut()
+            .execute_expression("krkr_debug_inline.tjs", expression)
+        {
             Ok(value) => println!("expression={value}"),
             Err(error) => println!("expression_error={error}\n---debug---\n{error:?}"),
         }
     }
     if config.logs {
-        dump_logs(&engine);
+        dump_logs(runtime.engine());
     }
-    dump_stub_calls(&engine);
+    dump_stub_calls(runtime.engine());
     if config.layers {
         println!("---layers---");
-        for layer in engine.host().layer_tree().layers() {
+        for layer in runtime.engine().host().layer_tree().layers() {
             println!(
                 "layer id={} name={:?} parent={:?} z={} rect=({},{},{},{}) visible={} renderable={} opacity={} image={} storage={:?}",
                 layer.id,
@@ -468,13 +499,13 @@ fn main() {
                 layer.renderable,
                 layer.opacity,
                 layer.image.is_some(),
-                engine.host().layer_image_storage(layer.id),
+                runtime.engine().host().layer_image_storage(layer.id),
             );
         }
     }
     if config.pixels {
         println!("---layer pixels---");
-        for layer in engine.host().layer_tree().layers() {
+        for layer in runtime.engine().host().layer_tree().layers() {
             if let Some(image) = &layer.image {
                 println!(
                     "layer id={} name={:?} visible={} texture={} size={}x{} stats={:?} storage={:?}",
@@ -489,27 +520,30 @@ fn main() {
                         image.upload.height,
                         &image.upload.rgba
                     ),
-                    engine.host().layer_image_storage(layer.id),
+                    runtime.engine().host().layer_image_storage(layer.id),
                 );
             }
         }
     }
     for name in &config.dump_globals {
         println!("---global {name}---");
-        let mut current = engine.tjs_runtime().global_member(name);
+        let mut current = runtime.engine().tjs_runtime().global_member(name);
         if name.contains('.') {
             let mut parts = name.split('.');
-            current = engine.tjs_runtime().global_member(parts.next().unwrap());
+            current = runtime
+                .engine()
+                .tjs_runtime()
+                .global_member(parts.next().unwrap());
             for part in parts {
                 let Variant::Object(object) = current else {
                     break;
                 };
-                current = engine.tjs_runtime().object_member(object, part);
+                current = runtime.engine().tjs_runtime().object_member(object, part);
             }
         }
         match current {
             Variant::Object(object) => {
-                for (member, value) in engine.tjs_runtime().object_members(object) {
+                for (member, value) in runtime.engine().tjs_runtime().object_members(object) {
                     match &value {
                         Variant::Integer(_) | Variant::Real(_) | Variant::String(_) => {
                             println!("{member}={value}")
@@ -523,7 +557,7 @@ fn main() {
     }
     println!("done frames={}", config.max_frames);
     if let Some(dir) = &config.dump_layer_images {
-        for layer in engine.host().layer_tree().layers() {
+        for layer in runtime.engine().host().layer_tree().layers() {
             if let Some(image) = &layer.image {
                 let path = format!(
                     "{dir}/layer_{}_{}x{}.png",
@@ -543,7 +577,7 @@ fn main() {
         // Live layer images take priority over cached uploads: a layer image
         // can be updated in place without a new upload, which would leave the
         // cached copy stale (e.g. an opaque black texture turned transparent).
-        for layer in engine.host().layer_tree().layers() {
+        for layer in runtime.engine().host().layer_tree().layers() {
             if let Some(image) = &layer.image {
                 textures.insert(
                     image.upload.texture_id,

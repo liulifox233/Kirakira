@@ -1,6 +1,6 @@
 use std::{fs::File, io, path::Path, sync::Arc};
 
-use krkr_core::{ResourceProvider, ResourceStream};
+use krkr_core::{ResourceStream, StoragePort};
 
 use crate::{Result, Xp3Archive, Xp3Entry, Xp3Error, Xp3OpenOptions, normalize_entry_name};
 
@@ -79,7 +79,7 @@ impl Xp3ResourceProvider {
     }
 }
 
-impl ResourceProvider for Xp3ResourceProvider {
+impl StoragePort for Xp3ResourceProvider {
     fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>> {
         let normalized = normalize_entry_name(path).map_err(xp3_error_to_io)?;
         for archive in self.archives.iter().rev() {

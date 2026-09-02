@@ -6,8 +6,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub use krkr_font::{FontSpec, TextStyle};
-
 pub trait ResourceStream: Read + Seek + Send {}
 
 impl<T> ResourceStream for T where T: Read + Seek + Send {}
@@ -84,7 +82,71 @@ impl ResourceDataSource for SharedBytesResourceData {
     }
 }
 
-pub trait ResourceProvider: Send + Sync {
+/// Backend-neutral description of a KRKR font.  The core protocol carries
+/// this value through draw and message-layer commands; font discovery and
+/// rasterisation live in `krkr-font` (or a platform font backend).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontSpec {
+    pub face: String,
+    pub height: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikeout: bool,
+    pub angle: i32,
+    pub face_is_file_name: bool,
+    pub rasterizer: String,
+}
+
+impl Default for FontSpec {
+    fn default() -> Self {
+        Self {
+            face: String::new(),
+            height: 24.0,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikeout: false,
+            angle: 0,
+            face_is_file_name: false,
+            rasterizer: String::new(),
+        }
+    }
+}
+
+impl FontSpec {
+    pub fn resolved_height(&self) -> f32 {
+        self.height.abs().max(1.0)
+    }
+}
+
+/// Backend-neutral style applied to a text draw command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextStyle {
+    pub color: [u8; 4],
+    pub anti_alias: bool,
+    pub shadow: Option<ShadowStyle>,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            color: [255, 255, 255, 255],
+            anti_alias: true,
+            shadow: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShadowStyle {
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub color: [u8; 4],
+}
+
+/// Canonical read-only package boundary used by every host backend.
+pub trait StoragePort: Send + Sync {
     fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>>;
 
     fn exists(&self, path: &str) -> bool;
@@ -108,6 +170,260 @@ pub trait ResourceProvider: Send + Sync {
 
     fn revision(&self) -> u64 {
         0
+    }
+}
+
+/// Opaque identifier for a resource request that may complete after a frame.
+///
+/// The runtime deliberately uses a small polling protocol instead of an
+/// `async fn` in the core API. Native hosts can complete requests from a worker
+/// thread while browser hosts can feed completions produced by `fetch` without
+/// making the TJS VM depend on a particular executor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct AssetRequestId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetKind {
+    Binary,
+    Text,
+    Image,
+    Font,
+    Media,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetRequest {
+    pub id: AssetRequestId,
+    pub path: String,
+    pub kind: AssetKind,
+}
+
+impl AssetRequest {
+    pub fn new(id: AssetRequestId, path: impl Into<String>, kind: AssetKind) -> Self {
+        Self {
+            id,
+            path: path.into(),
+            kind,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AssetEvent {
+    Ready {
+        id: AssetRequestId,
+        path: String,
+        kind: AssetKind,
+        data: Arc<[u8]>,
+    },
+    Failed {
+        id: AssetRequestId,
+        path: String,
+        kind: AssetKind,
+        message: String,
+    },
+}
+
+/// Platform-neutral asynchronous resource scheduler.
+pub trait AssetScheduler {
+    fn request(&mut self, path: &str, kind: AssetKind) -> AssetRequestId;
+
+    fn poll(&mut self) -> Vec<AssetEvent>;
+
+    /// Cancels delivery to a waiter. A backend may keep a shared network
+    /// fetch alive for other waiters, but the cancelled request must never
+    /// produce a completion event for the caller.
+    fn cancel(&mut self, _id: AssetRequestId) -> bool {
+        false
+    }
+
+    fn retry(&mut self, path: &str, kind: AssetKind) -> AssetRequestId {
+        self.request(path, kind)
+    }
+
+    fn revision(&self) -> u64 {
+        0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SaveRequestId(pub u64);
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SaveEvent {
+    Loaded {
+        id: SaveRequestId,
+        profile: String,
+        key: String,
+        data: Option<Arc<[u8]>>,
+    },
+    Saved {
+        id: SaveRequestId,
+        profile: String,
+        key: String,
+    },
+    Failed {
+        id: SaveRequestId,
+        profile: String,
+        key: String,
+        message: String,
+    },
+}
+
+/// Host-owned asynchronous profile storage.  Game packages remain read-only;
+/// save implementations may use files, IndexedDB, Room or an iOS profile
+/// database without exposing those APIs to the engine.
+pub trait SaveStore {
+    fn load(&mut self, profile: &str, key: &str) -> SaveRequestId;
+    fn save(&mut self, profile: &str, key: &str, data: Arc<[u8]>) -> SaveRequestId;
+    fn poll(&mut self) -> Vec<SaveEvent>;
+}
+
+/// Deterministic save backend for probes and host conformance tests.
+#[derive(Clone, Debug, Default)]
+pub struct MemorySaveStore {
+    entries: BTreeMap<(String, String), Arc<[u8]>>,
+    events: Vec<SaveEvent>,
+    next_id: u64,
+}
+
+impl MemorySaveStore {
+    pub fn insert(&mut self, profile: impl Into<String>, key: impl Into<String>, data: Arc<[u8]>) {
+        self.entries.insert((profile.into(), key.into()), data);
+    }
+}
+
+impl SaveStore for MemorySaveStore {
+    fn load(&mut self, profile: &str, key: &str) -> SaveRequestId {
+        let id = SaveRequestId(self.next_id.saturating_add(1));
+        self.next_id = id.0;
+        self.events.push(SaveEvent::Loaded {
+            id,
+            profile: profile.to_string(),
+            key: key.to_string(),
+            data: self
+                .entries
+                .get(&(profile.to_string(), key.to_string()))
+                .cloned(),
+        });
+        id
+    }
+
+    fn save(&mut self, profile: &str, key: &str, data: Arc<[u8]>) -> SaveRequestId {
+        let id = SaveRequestId(self.next_id.saturating_add(1));
+        self.next_id = id.0;
+        self.entries
+            .insert((profile.to_string(), key.to_string()), data);
+        self.events.push(SaveEvent::Saved {
+            id,
+            profile: profile.to_string(),
+            key: key.to_string(),
+        });
+        id
+    }
+
+    fn poll(&mut self) -> Vec<SaveEvent> {
+        std::mem::take(&mut self.events)
+    }
+}
+
+/// Monotonic host clock used by timers and frame budgets. Keeping this trait
+/// in the core lets Web (performance.now), desktop and deterministic probes
+/// share the same runtime without importing platform time APIs.
+pub trait Clock {
+    fn now_millis(&mut self) -> i64;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VirtualClock {
+    now_millis: i64,
+}
+
+impl VirtualClock {
+    pub const fn new(now_millis: i64) -> Self {
+        Self { now_millis }
+    }
+
+    pub fn advance_millis(&mut self, delta: i64) {
+        self.now_millis = self.now_millis.saturating_add(delta.max(0));
+    }
+}
+
+impl Clock for VirtualClock {
+    fn now_millis(&mut self) -> i64 {
+        self.now_millis
+    }
+}
+
+/// Deterministic in-memory implementation used by tests, debugger probes and
+/// hosts that have already fetched a static web package.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryAssetStore {
+    entries: BTreeMap<String, Arc<[u8]>>,
+    pending: Vec<AssetEvent>,
+    next_request_id: u64,
+    revision: u64,
+}
+
+impl MemoryAssetStore {
+    pub fn insert(&mut self, path: impl Into<String>, data: impl Into<Arc<[u8]>>) {
+        self.entries.insert(path.into(), data.into());
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub fn queue_failure(
+        &mut self,
+        path: impl Into<String>,
+        kind: AssetKind,
+        message: impl Into<String>,
+    ) {
+        self.pending.push(AssetEvent::Failed {
+            id: AssetRequestId(0),
+            path: path.into(),
+            kind,
+            message: message.into(),
+        });
+    }
+}
+
+impl AssetScheduler for MemoryAssetStore {
+    fn request(&mut self, path: &str, kind: AssetKind) -> AssetRequestId {
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        let id = AssetRequestId(self.next_request_id);
+        let event = match self.entries.get(path) {
+            Some(data) => AssetEvent::Ready {
+                id,
+                path: path.to_string(),
+                kind,
+                data: Arc::clone(data),
+            },
+            None => AssetEvent::Failed {
+                id,
+                path: path.to_string(),
+                kind,
+                message: "asset was not found".to_string(),
+            },
+        };
+        self.pending.push(event);
+        id
+    }
+
+    fn poll(&mut self) -> Vec<AssetEvent> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn cancel(&mut self, id: AssetRequestId) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|event| match event {
+            AssetEvent::Ready { id: event_id, .. } | AssetEvent::Failed { id: event_id, .. } => {
+                *event_id != id
+            }
+        });
+        before != self.pending.len()
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision
     }
 }
 
@@ -144,16 +460,33 @@ pub struct PcmAudioChunk {
     pub samples: Arc<[f32]>,
 }
 
+/// Host-owned pull interface for a live PCM source. The concrete transport may
+/// be a bounded channel, platform callback or browser queue; the protocol does
+/// not expose `std::sync::mpsc` (or any other platform threading primitive).
+pub trait PcmStream: Send {
+    fn next_chunk(&mut self) -> Option<PcmAudioChunk>;
+}
+
 /// A live PCM source fed by an external decoder (krkr-video decodes movie
-/// soundtracks; the audio system pulls chunks from the channel). Clones share
-/// the same receiver, so there is still only one consumer.
+/// soundtracks). Clones share the same host-owned stream handle, so there is
+/// still only one consumer.
 #[derive(Clone)]
 pub struct PcmStreamSource {
     pub spec: PcmAudioSpec,
     /// Approximate total frames per channel; used for end-of-stream
     /// detection only.
     pub total_frames: u64,
-    pub receiver: Arc<Mutex<std::sync::mpsc::Receiver<PcmAudioChunk>>>,
+    pub stream: Arc<Mutex<Box<dyn PcmStream>>>,
+}
+
+impl PcmStreamSource {
+    pub fn new(spec: PcmAudioSpec, total_frames: u64, stream: Box<dyn PcmStream>) -> Self {
+        Self {
+            spec,
+            total_frames,
+            stream: Arc::new(Mutex::new(stream)),
+        }
+    }
 }
 
 impl fmt::Debug for PcmStreamSource {
@@ -169,7 +502,7 @@ impl PartialEq for PcmStreamSource {
     fn eq(&self, other: &Self) -> bool {
         self.spec == other.spec
             && self.total_frames == other.total_frames
-            && Arc::ptr_eq(&self.receiver, &other.receiver)
+            && Arc::ptr_eq(&self.stream, &other.stream)
     }
 }
 
@@ -239,6 +572,73 @@ pub enum AudioCommand {
         volume: f32,
         fade_seconds: f32,
     },
+}
+
+/// Lifecycle state reported by an audio backend.  These protocol types live
+/// in core so the engine does not depend on the native Kira/CPAL crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioState {
+    Stopped,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioStatusLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioStatusEvent {
+    pub level: AudioStatusLevel,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioEvent {
+    Status(AudioStatusEvent),
+    PlaybackStopped { id: AudioInstanceId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioError {
+    BackendUnavailable(String),
+    WorkerUnavailable(String),
+    CommandFailed(String),
+    PlaybackFailed { storage: String, message: String },
+}
+
+impl fmt::Display for AudioError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BackendUnavailable(message) => {
+                write!(formatter, "audio backend is unavailable: {message}")
+            }
+            Self::WorkerUnavailable(message) => {
+                write!(formatter, "audio worker stopped: {message}")
+            }
+            Self::CommandFailed(message) => write!(formatter, "audio command failed: {message}"),
+            Self::PlaybackFailed { storage, message } => {
+                write!(formatter, "failed to play audio `{storage}`: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AudioError {}
+
+/// Backend-neutral audio surface implemented by Kira, WebAudio and mobile
+/// audio adapters.
+pub trait AudioSink {
+    fn prepare(&mut self) -> Result<(), AudioError>;
+    fn submit(&mut self, commands: &[AudioCommand]) -> Result<(), AudioError>;
+    fn poll_events(&mut self) -> Vec<AudioEvent>;
+
+    /// Commands for host-owned media APIs such as WebAudio. Native sinks
+    /// execute commands directly and return an empty queue.
+    fn take_commands(&mut self) -> Vec<AudioCommand> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -546,6 +946,10 @@ pub struct FrameOutput {
     pub clip: Option<Rect>,
     pub draw_commands: Vec<DrawCommand>,
     pub image_uploads: Vec<ImageUpload>,
+    /// Texture ids no longer referenced by this frame. Presentation backends
+    /// can release their GPU/Canvas resources immediately instead of keeping
+    /// every image ever seen by a long-running game.
+    pub image_releases: Vec<TextureId>,
     pub transition: Option<FrameTransition>,
 }
 
@@ -556,6 +960,7 @@ impl FrameOutput {
             clip: None,
             draw_commands,
             image_uploads: Vec::new(),
+            image_releases: Vec::new(),
             transition: None,
         }
     }
@@ -1050,10 +1455,27 @@ impl MessageLayerModel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SafeAreaInsets {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Orientation {
+    #[default]
+    Landscape,
+    Portrait,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameInput {
     pub viewport_size: Size,
     pub delta_seconds: f32,
+    pub safe_area: SafeAreaInsets,
+    pub orientation: Orientation,
 }
 
 impl FrameInput {
@@ -1061,7 +1483,24 @@ impl FrameInput {
         Self {
             viewport_size,
             delta_seconds,
+            safe_area: SafeAreaInsets {
+                left: 0.0,
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+            },
+            orientation: Orientation::Landscape,
         }
+    }
+
+    pub const fn with_safe_area(mut self, safe_area: SafeAreaInsets) -> Self {
+        self.safe_area = safe_area;
+        self
+    }
+
+    pub const fn with_orientation(mut self, orientation: Orientation) -> Self {
+        self.orientation = orientation;
+        self
     }
 }
 
@@ -1130,6 +1569,43 @@ pub enum EngineEvent {
         state: ButtonState,
         repeat: bool,
     },
+    /// Touch/pointer input with a stable contact id.  Mouse adapters can keep
+    /// using `PointerInput`; mobile adapters should preserve ids across move
+    /// events so gesture recognisers do not have to infer them from position.
+    TouchInput {
+        id: u64,
+        position: Point,
+        phase: TouchPhase,
+    },
+    /// Application/surface state transition delivered by the host.
+    Lifecycle {
+        state: LifecycleState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TouchPhase {
+    Started,
+    Moved,
+    Ended,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextInputEvent {
+    pub text: String,
+    pub composing: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleState {
+    Foreground,
+    Background,
+    SurfaceSuspended,
+    SurfaceResumed,
+    MemoryPressure,
+    AudioInterrupted,
+    AudioResumed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1338,7 +1814,9 @@ impl Engine {
             }
             EngineEvent::PointerInput { .. }
             | EngineEvent::MouseWheel { .. }
-            | EngineEvent::KeyboardInput { .. } => {}
+            | EngineEvent::KeyboardInput { .. }
+            | EngineEvent::TouchInput { .. }
+            | EngineEvent::Lifecycle { .. } => {}
         }
     }
 
@@ -1480,8 +1958,16 @@ impl Engine {
                 referenced_textures.insert(texture_id);
             }
         }
-        self.uploaded_images
-            .retain(|texture_id, _| referenced_textures.contains(texture_id));
+        let released = self
+            .uploaded_images
+            .keys()
+            .copied()
+            .filter(|texture_id| !referenced_textures.contains(texture_id))
+            .collect::<Vec<_>>();
+        for texture_id in &released {
+            self.uploaded_images.remove(texture_id);
+        }
+        output.image_releases = released;
         output
     }
 
@@ -2224,6 +2710,7 @@ mod tests {
 
         assert_eq!(first.image_uploads.len(), 1);
         assert!(hidden.image_uploads.is_empty());
+        assert_eq!(hidden.image_releases, vec![42]);
         assert_eq!(visible_again.image_uploads.len(), 1);
         assert_eq!(visible_again.image_uploads[0].texture_id, 42);
     }
@@ -2412,5 +2899,46 @@ mod tests {
         assert!(fitted.width <= bounds.width);
         assert!(fitted.height <= bounds.height);
         assert!((fitted.width / fitted.height - 16.0 / 9.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn memory_asset_store_completes_requests_on_poll() {
+        let mut store = MemoryAssetStore::default();
+        store.insert("startup.tjs", Arc::<[u8]>::from(&b"var ready = 1;"[..]));
+        let id = store.request("startup.tjs", AssetKind::Text);
+        assert!(store.poll().iter().any(|event| matches!(
+            event,
+            AssetEvent::Ready { id: event_id, path, kind: AssetKind::Text, data }
+                if *event_id == id && path == "startup.tjs" && data.as_ref() == b"var ready = 1;"
+        )));
+    }
+
+    #[test]
+    fn virtual_clock_never_moves_backwards() {
+        let mut clock = VirtualClock::new(100);
+        clock.advance_millis(25);
+        clock.advance_millis(-10);
+        assert_eq!(clock.now_millis(), 125);
+    }
+
+    #[test]
+    fn memory_save_store_is_profile_scoped_and_pollable() {
+        let mut store = MemorySaveStore::default();
+        let save_id = store.save("player-a", "slot-1", Arc::from(&b"save"[..]));
+        assert!(
+            matches!(store.poll().as_slice(), [SaveEvent::Saved { id, profile, key }]
+            if *id == save_id && profile == "player-a" && key == "slot-1")
+        );
+
+        let load_id = store.load("player-a", "slot-1");
+        assert!(
+            matches!(store.poll().as_slice(), [SaveEvent::Loaded { id, data: Some(data), .. }]
+            if *id == load_id && data.as_ref() == b"save")
+        );
+        let missing_id = store.load("player-b", "slot-1");
+        assert!(
+            matches!(store.poll().as_slice(), [SaveEvent::Loaded { id, data: None, .. }]
+            if *id == missing_id)
+        );
     }
 }

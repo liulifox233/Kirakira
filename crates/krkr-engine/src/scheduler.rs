@@ -302,6 +302,26 @@ impl TvpScheduler {
         }
     }
 
+    pub(crate) fn continuous_handler_count(&self) -> usize {
+        self.continuous_handlers.len()
+    }
+
+    pub(crate) fn script_event_count(&self) -> usize {
+        self.script_events.len()
+    }
+
+    pub(crate) fn idle_event_count(&self) -> usize {
+        self.idle_async_triggers.len()
+    }
+
+    pub(crate) fn timer_count(&self) -> usize {
+        self.timers.len()
+    }
+
+    pub(crate) fn window_update_count(&self) -> usize {
+        self.window_update_events.len()
+    }
+
     pub(crate) fn remove_continuous_handler(&mut self, handler: &Variant) -> bool {
         let before = self.continuous_handlers.len();
         self.continuous_handlers.retain(|item| item != handler);

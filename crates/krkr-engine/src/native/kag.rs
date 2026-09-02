@@ -3,13 +3,13 @@ use krkr_kag::{
     LabelEvent, ParserSnapshot, ScenarioLoadEvent, ScriptEvent, Tag,
 };
 use krkr_tjs2::{
-    Result, TjsError,
+    Result, TjsError, TjsErrorKind,
     runtime::{NativeFunction, ObjectHandle, Runtime, Variant, VmNativeFunction},
     vm::Vm,
 };
 
 use crate::{
-    host::KrkrHost,
+    host::{KrkrHost, SystemHookRegistration},
     kag::{attributes_to_dictionary, tag_to_dictionary},
     script::{execute_expression_on_runtime, execute_script_on_runtime},
 };
@@ -143,6 +143,31 @@ fn kag_load_scenario(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let storage = required_arg_string(&args, 0, "KAGParser.loadScenario")?;
+    vm.runtime_mut()
+        .host_mut()
+        .log(&format!("KAG loadScenario native `{storage}`"));
+    // Configuration scenarios register system hooks through KAG tags. They
+    // are often loaded by a nested TJS call (outside the main engine tag
+    // loop), so collect these declarations when the scenario is loaded.
+    match vm
+        .runtime_mut()
+        .host_mut()
+        .read_text_storage_for_tjs(&storage)
+    {
+        Ok(text) => {
+            vm.runtime_mut().host_mut().log(&format!(
+                "KAG loadScenario scan `{storage}` {} bytes",
+                text.len()
+            ));
+            register_system_hooks(vm.runtime_mut().host_mut(), &text)
+        }
+        Err(error) if error.kind != TjsErrorKind::ResourcePending => {
+            vm.runtime_mut().host_mut().log(&format!(
+                "KAG system hook scan skipped `{storage}`: {error}"
+            ))
+        }
+        Err(_) => {}
+    }
     with_parser(
         vm,
         this_obj,
@@ -155,6 +180,46 @@ fn kag_load_scenario(
                 .map_err(kag_to_tjs)?;
             Ok(Variant::Void)
         },
+    )
+}
+
+fn register_system_hooks(host: &mut KrkrHost, text: &str) {
+    for line in text.lines() {
+        let Some(start) = line
+            .find("[addSysHook")
+            .or_else(|| line.find("[addSysScript"))
+        else {
+            continue;
+        };
+        let is_script = line[start..].starts_with("[addSysScript");
+        let command = &line[start..];
+        let Some(name) = kag_decl_attr(command, "name") else {
+            continue;
+        };
+        host.log(&format!("KAG system hook declaration found `{name}`"));
+        host.register_system_hook(
+            name,
+            SystemHookRegistration {
+                storage: kag_decl_attr(command, "storage"),
+                target: kag_decl_attr(command, "target"),
+                call: !is_script && command.contains(" call"),
+            },
+        );
+    }
+}
+
+fn kag_decl_attr(command: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=");
+    let start = command.find(&marker)? + marker.len();
+    let rest = command[start..].trim_start();
+    if let Some(quote) = rest.chars().next().filter(|ch| *ch == '\"' || *ch == '\'') {
+        let body = &rest[quote.len_utf8()..];
+        let end = body.find(quote).unwrap_or(body.len());
+        return Some(body[..end].to_string());
+    }
+    Some(
+        rest.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ']' || ch == ';')
+            .to_string(),
     )
 }
 
@@ -194,9 +259,43 @@ fn kag_get_next_tag(
         true,
         |parser, vm, owner| {
             let mut host = TjsKagHost::new(vm, owner);
-            let Some(tag) = parser.next_tag_with(&mut host).map_err(kag_to_tjs)? else {
+            // `next_tag_with` may execute an expanded `[call]`/`[jump]` while
+            // resolving an on-demand scenario.  If that storage is remote,
+            // the parser has already advanced (for example by pushing a call
+            // frame) when it reports ResourcePending.  The VM retries this
+            // native call after the asset arrives, so restore the exact
+            // pre-read snapshot first; otherwise the expanded control tag is
+            // consumed and the retry silently skips startup hooks such as
+            // GINKA's `first.logo` opening sequence.
+            let snapshot = parser.store();
+            let next = parser.next_tag_with(&mut host);
+            let Some(tag) = (match next {
+                Ok(tag) => tag,
+                Err(error @ krkr_kag::KagError::ResourcePending { .. }) => {
+                    parser.restore(snapshot).map_err(kag_to_tjs)?;
+                    return Err(kag_to_tjs(error));
+                }
+                Err(error) => return Err(kag_to_tjs(error)),
+            }) else {
+                host.vm
+                    .runtime_mut()
+                    .host_mut()
+                    .log("KAG getNextTag -> EOF");
                 return Ok(Variant::Void);
             };
+            host.vm
+                .runtime_mut()
+                .host_mut()
+                .log(&format!("KAG getNextTag -> `{}`", tag.tagname));
+            if matches!(
+                tag.tagname.as_str(),
+                "syshook" | "sysjump" | "addSysHook" | "addSysScript"
+            ) {
+                host.vm.runtime_mut().host_mut().log(&format!(
+                    "KAG getNextTag -> `{}` attrs={:?}",
+                    tag.tagname, tag.attributes
+                ));
+            }
             Ok(Variant::Object(tag_to_dictionary(
                 host.vm.runtime_mut(),
                 &tag,
@@ -518,7 +617,19 @@ where
         vm.runtime_mut()
             .host_mut()
             .insert_kag_parser(handle, parser.clone());
+        let revision_before_callback = vm.runtime().host().kag_parser_revision(handle);
         let result = f(&mut parser, vm, handle);
+        // The callback can re-enter KAGParser (for example, a scenario load
+        // invokes onScenarioLoaded, which in turn jumps or loads another
+        // scenario).  Those calls operate on the clone stored in the host
+        // map and mark the parser revision.  Keep their state instead of
+        // blindly restoring this stale outer copy when the callback returns.
+        let revision_after_callback = vm.runtime().host().kag_parser_revision(handle);
+        if let Some(updated) = vm.runtime_mut().host_mut().take_kag_parser(handle)
+            && revision_after_callback != revision_before_callback
+        {
+            parser = updated;
+        }
         refresh_kag_parser_members_from_parser(vm.runtime_mut(), handle, &parser)?;
         if mutation && result.is_ok() {
             vm.runtime_mut().host_mut().mark_kag_parser_changed(handle);
@@ -678,7 +789,7 @@ impl<'a, 'bc, 'rt> TjsKagHost<'a, 'bc, 'rt> {
         self.vm
             .call_object_method(self.owner, name, args)
             .map(Some)
-            .map_err(kag_host_error)
+            .map_err(kag_tjs_error)
     }
 
     fn call_process_event(&mut self, name: &str, tag: &Tag) -> krkr_kag::Result<bool> {
@@ -701,10 +812,15 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
 
     fn load_scenario(&mut self, storage: &str) -> krkr_kag::Result<String> {
         self.vm
-            .runtime()
-            .host()
-            .read_text_storage(storage)
-            .map_err(kag_host_error)
+            .runtime_mut()
+            .host_mut()
+            .read_text_storage_for_tjs(storage)
+            .map_err(|error| match error.kind {
+                TjsErrorKind::ResourcePending => krkr_kag::KagError::ResourcePending {
+                    storage: storage.to_string(),
+                },
+                _ => kag_tjs_error(error),
+            })
     }
 
     fn on_scenario_load(
@@ -775,7 +891,7 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
         {
             execute_script_on_runtime(self.vm.runtime_mut(), event.storage, event.script)
                 .map(|_| ())
-                .map_err(kag_host_error)?;
+                .map_err(kag_tjs_error)?;
         }
         Ok(())
     }
@@ -1106,14 +1222,42 @@ fn debug_level_to_integer(level: DebugLevel) -> i64 {
     }
 }
 
-fn kag_to_tjs(error: krkr_kag::KagError) -> TjsError {
-    TjsError::runtime(error.to_string())
+pub(crate) fn kag_to_tjs(error: krkr_kag::KagError) -> TjsError {
+    match error {
+        krkr_kag::KagError::ResourcePending { storage } => TjsError::resource_pending(storage),
+        krkr_kag::KagError::Host { message } if message.contains("KAG resource is pending:") => {
+            let storage = message
+                .split_once("KAG resource is pending:")
+                .and_then(|(_, value)| value.lines().next())
+                .unwrap_or("resource")
+                .trim();
+            TjsError::resource_pending(storage)
+        }
+        error => TjsError::runtime(error.to_string()),
+    }
 }
 
 fn eval_expression(runtime: &mut Runtime<KrkrHost>, expression: &str) -> krkr_kag::Result<Variant> {
-    execute_expression_on_runtime(runtime, expression, expression).map_err(kag_host_error)
+    execute_expression_on_runtime(runtime, expression, expression).map_err(kag_tjs_error)
 }
 
 fn kag_host_error(error: impl std::fmt::Display) -> KagError {
     KagError::host(error.to_string())
+}
+
+fn kag_tjs_error(error: TjsError) -> KagError {
+    if error.kind == TjsErrorKind::ResourcePending
+        || error.to_string().contains("KAG resource is pending:")
+    {
+        let storage = error
+            .to_string()
+            .split_once("KAG resource is pending:")
+            .and_then(|(_, value)| value.lines().next())
+            .unwrap_or(error.message.as_str())
+            .trim()
+            .to_string();
+        KagError::ResourcePending { storage }
+    } else {
+        kag_host_error(error)
+    }
 }

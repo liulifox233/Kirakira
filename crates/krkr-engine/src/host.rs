@@ -2,13 +2,16 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque, btree_map::Entry},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use krkr_core::{
-    AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, DrawCommand,
-    FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree, Point, ResourceData,
-    ResourceProvider, TextureId, TransitionParams,
+    AssetKind, AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef,
+    DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
+    LifecycleState, Point, ResourceData, StoragePort, TextInputEvent, TextureId, TransitionParams,
 };
 use krkr_font::FontSystem;
 use krkr_kag::KagParser;
@@ -35,6 +38,18 @@ const IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
 /// oldest half is dropped in one drain.
 const MAX_LOG_LINES: usize = 200_000;
 
+#[cfg(not(target_arch = "wasm32"))]
+struct ReceiverPcmStream {
+    receiver: std::sync::mpsc::Receiver<krkr_core::PcmAudioChunk>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl krkr_core::PcmStream for ReceiverPcmStream {
+    fn next_chunk(&mut self) -> Option<krkr_core::PcmAudioChunk> {
+        self.receiver.recv_timeout(Duration::from_secs(2)).ok()
+    }
+}
+
 /// High-frequency diagnostic categories, enabled through the `KRKR_TRACE`
 /// environment variable (comma-separated, case-insensitive; `all` enables
 /// everything). Trace lines are tagged `[<category>]` in the host log.
@@ -44,6 +59,8 @@ pub enum TraceCategory {
     Audio,
     /// KAG tag dispatch (unknown-tag routing, unhandled tags).
     Kag,
+    /// Pointer/keyboard routing and native control activation.
+    Input,
 }
 
 impl TraceCategory {
@@ -51,6 +68,7 @@ impl TraceCategory {
         match self {
             TraceCategory::Audio => TRACE_AUDIO,
             TraceCategory::Kag => TRACE_KAG,
+            TraceCategory::Input => TRACE_INPUT,
         }
     }
 
@@ -58,13 +76,15 @@ impl TraceCategory {
         match self {
             TraceCategory::Audio => "audio",
             TraceCategory::Kag => "kag",
+            TraceCategory::Input => "input",
         }
     }
 }
 
 const TRACE_AUDIO: u8 = 1 << 0;
 const TRACE_KAG: u8 = 1 << 1;
-const TRACE_ALL: u8 = TRACE_AUDIO | TRACE_KAG;
+const TRACE_INPUT: u8 = 1 << 2;
+const TRACE_ALL: u8 = TRACE_AUDIO | TRACE_KAG | TRACE_INPUT;
 
 /// Parses a `KRKR_TRACE`-style category list; unknown names are ignored.
 fn parse_trace_mask(value: &str) -> u8 {
@@ -77,6 +97,7 @@ fn parse_trace_mask(value: &str) -> u8 {
             "all" => TRACE_ALL,
             "audio" => TRACE_AUDIO,
             "kag" => TRACE_KAG,
+            "input" => TRACE_INPUT,
             _ => continue,
         };
     }
@@ -102,6 +123,17 @@ pub struct NativeTextDrawEvent {
     pub text: String,
     pub x: i64,
     pub y: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoOverlaySnapshot {
+    pub storage: Option<String>,
+    pub status: String,
+    pub left: i64,
+    pub top: i64,
+    pub width: i64,
+    pub height: i64,
+    pub visible: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,6 +293,8 @@ pub struct KrkrHost {
     image_cache: LayerImageCache,
     image_cache_revision: u64,
     pending_image_loads: BTreeMap<ResourceTaskId, PendingImageLoad>,
+    pending_script_image_loads: BTreeMap<ResourceTaskId, (String, u64)>,
+    script_image_errors: BTreeMap<String, String>,
     completed_image_loads: Vec<CompletedImageLoad>,
     image_target_generations: BTreeMap<ImageLoadTarget, u64>,
     #[cfg_attr(test, allow(dead_code))]
@@ -275,9 +309,21 @@ pub struct KrkrHost {
     text_encoding: String,
     pressed_keys: BTreeSet<i64>,
     cursor_position: Option<Point>,
+    lifecycle_state: LifecycleState,
+    pending_text_input: Vec<TextInputEvent>,
     clock_offset_millis: i64,
     termination_requested: bool,
     modal_windows: Vec<ObjectHandle>,
+    external_resource_catalog: BTreeSet<String>,
+    pending_external_resources: BTreeMap<String, AssetKind>,
+    system_hooks: BTreeMap<String, SystemHookRegistration>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SystemHookRegistration {
+    pub storage: Option<String>,
+    pub target: Option<String>,
+    pub call: bool,
 }
 
 impl Default for KrkrHost {
@@ -313,6 +359,8 @@ impl Default for KrkrHost {
             ),
             image_cache_revision: 0,
             pending_image_loads: BTreeMap::new(),
+            pending_script_image_loads: BTreeMap::new(),
+            script_image_errors: BTreeMap::new(),
             completed_image_loads: Vec::new(),
             image_target_generations: BTreeMap::new(),
             next_resource_generation: 1,
@@ -326,14 +374,36 @@ impl Default for KrkrHost {
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             cursor_position: None,
+            lifecycle_state: LifecycleState::Foreground,
+            pending_text_input: Vec::new(),
             clock_offset_millis: 0,
             termination_requested: false,
             modal_windows: Vec::new(),
+            external_resource_catalog: BTreeSet::new(),
+            pending_external_resources: BTreeMap::new(),
+            system_hooks: BTreeMap::new(),
         }
     }
 }
 
 impl KrkrHost {
+    /// Builds a host over an already materialized storage view (for example a
+    /// browser package downloaded into memory). Resource workers are only
+    /// started on native targets; WASM performs image/resource work on the
+    /// browser thread.
+    pub fn from_storage(storage: ProjectStorage) -> Result<Self> {
+        let mut host = Self::default();
+        host.image_cache_revision = storage.revision();
+        host.project_storage = Some(storage.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            host.resource_manager = Some(ResourceManager::new(storage).map_err(|error| {
+                TjsError::runtime(format!("failed to start resource worker: {error}"))
+            })?);
+        }
+        Ok(host)
+    }
+
     pub fn for_project(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let project_storage = ProjectStorage::for_root(&root)?;
@@ -372,6 +442,8 @@ impl KrkrHost {
             ),
             image_cache_revision,
             pending_image_loads: BTreeMap::new(),
+            pending_script_image_loads: BTreeMap::new(),
+            script_image_errors: BTreeMap::new(),
             completed_image_loads: Vec::new(),
             image_target_generations: BTreeMap::new(),
             next_resource_generation: 1,
@@ -385,18 +457,36 @@ impl KrkrHost {
             text_encoding: "UTF-8".to_string(),
             pressed_keys: BTreeSet::new(),
             cursor_position: None,
+            lifecycle_state: LifecycleState::Foreground,
+            pending_text_input: Vec::new(),
             clock_offset_millis: 0,
             termination_requested: false,
             modal_windows: Vec::new(),
+            external_resource_catalog: BTreeSet::new(),
+            pending_external_resources: BTreeMap::new(),
+            system_hooks: BTreeMap::new(),
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn push_modal_window(&mut self, window: ObjectHandle) {
         self.modal_windows.push(window);
     }
 
     pub(crate) fn current_modal_window(&self) -> Option<ObjectHandle> {
         self.modal_windows.last().copied()
+    }
+
+    /// Returns the current modal window's host state for platform diagnostics.
+    pub fn modal_window_snapshot(&self) -> Option<(bool, bool, bool, Option<ObjectHandle>)> {
+        let handle = self.current_modal_window()?;
+        let window = self.native_windows.get(&handle)?;
+        Some((
+            window.visible,
+            window.closed,
+            window.modal,
+            window.primary_layer,
+        ))
     }
 
     pub(crate) fn pop_modal_window(&mut self, window: ObjectHandle) {
@@ -411,6 +501,21 @@ impl KrkrHost {
         self.project_root.as_deref()
     }
 
+    pub fn video_overlay_snapshots(&self) -> Vec<VideoOverlaySnapshot> {
+        self.video_overlays
+            .values()
+            .map(|state| VideoOverlaySnapshot {
+                storage: state.storage.clone(),
+                status: state.status.to_string(),
+                left: state.left,
+                top: state.top,
+                width: state.width,
+                height: state.height,
+                visible: state.visible,
+            })
+            .collect()
+    }
+
     pub fn data_path(&self) -> Option<PathBuf> {
         self.project_root.as_ref().map(|root| root.join("savedata"))
     }
@@ -421,10 +526,148 @@ impl KrkrHost {
             .ok_or_else(|| TjsError::runtime("project storage is not configured"))
     }
 
-    pub fn resource_provider(&self) -> Option<Arc<dyn ResourceProvider>> {
+    /// Returns browser-memory storage writes accumulated by the engine. Native
+    /// filesystem projects return an empty journal; Web hosts can persist the
+    /// returned entries without coupling the engine to a browser database.
+    pub fn drain_memory_storage_writes(&self) -> Vec<(String, Vec<u8>)> {
         self.project_storage
             .as_ref()
-            .map(|storage| Arc::new(storage.clone()) as Arc<dyn ResourceProvider>)
+            .map(ProjectStorage::drain_memory_writes)
+            .unwrap_or_default()
+    }
+
+    /// Registers logical resources known by a remote package. They may not be
+    /// present in the local storage overlay yet, but reads can now yield a
+    /// resumable `ResourcePending` request instead of failing permanently.
+    pub fn set_external_resource_catalog<I, S>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let paths: Vec<String> = paths.into_iter().map(Into::into).collect();
+        self.external_resource_catalog = paths.iter().cloned().collect();
+        // KRKR resolves relative storage names through configured auto paths.
+        // A remote manifest has no filesystem directories to search, so expose
+        // an unambiguous basename alias as well (e.g. `Config.tjs` for
+        // `main/Config.tjs`). Ambiguous basenames remain path-qualified.
+        let mut basenames = BTreeMap::<String, Option<String>>::new();
+        let mut stems = BTreeMap::<String, Option<String>>::new();
+        for path in paths {
+            let basename = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&path)
+                .to_ascii_lowercase();
+            match basenames.get_mut(&basename) {
+                // The Web host supplies both the manifest key and the
+                // physical entry path. They are often identical, and that
+                // duplicate must not make an otherwise unique basename look
+                // ambiguous (e.g. `main/config.tjs` -> `Config.tjs`).
+                Some(value) if value.as_deref() == Some(path.as_str()) => {}
+                Some(value) => *value = None,
+                None => {
+                    basenames.insert(basename, Some(path.clone()));
+                }
+            }
+            if let Some((stem, extension)) =
+                path.rsplit('/').next().unwrap_or(&path).rsplit_once('.')
+                && matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "tlg" | "png" | "jpg" | "jpeg" | "bmp" | "webp"
+                )
+            {
+                let key = stem.to_ascii_lowercase();
+                match stems.get_mut(&key) {
+                    Some(value) if value.as_deref() == Some(path.as_str()) => {}
+                    Some(value)
+                        if value.as_ref().is_some_and(|candidate| {
+                            candidate
+                                .get(..6)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("uipsd/"))
+                        }) => {}
+                    Some(value)
+                        if path
+                            .get(..6)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("uipsd/")) =>
+                    {
+                        *value = Some(path.clone())
+                    }
+                    Some(value) => *value = None,
+                    None => {
+                        stems.insert(key, Some(path.clone()));
+                    }
+                }
+            }
+        }
+        for path in basenames.into_values().flatten() {
+            let basename = path.rsplit('/').next().unwrap_or(&path).to_string();
+            self.external_resource_catalog.insert(basename);
+        }
+        for path in stems.into_values().flatten() {
+            let basename = path.rsplit('/').next().unwrap_or(&path);
+            if let Some((stem, _)) = basename.rsplit_once('.') {
+                self.external_resource_catalog.insert(stem.to_string());
+            }
+        }
+    }
+
+    pub fn take_external_resource_requests(&mut self) -> Vec<(String, AssetKind)> {
+        std::mem::take(&mut self.pending_external_resources)
+            .into_iter()
+            .collect()
+    }
+
+    pub fn has_external_resource_request(&self, path: &str) -> bool {
+        self.pending_external_resources.contains_key(path)
+    }
+
+    pub fn has_pending_external_resources(&self) -> bool {
+        !self.pending_external_resources.is_empty()
+    }
+
+    pub(crate) fn register_system_hook(
+        &mut self,
+        name: impl Into<String>,
+        hook: SystemHookRegistration,
+    ) {
+        self.system_hooks.insert(name.into(), hook);
+    }
+
+    pub(crate) fn system_hook(&self, name: &str) -> Option<SystemHookRegistration> {
+        self.system_hooks.get(name).cloned()
+    }
+
+    pub fn provide_external_resource(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        self.project_storage()?
+            .insert_memory(path.to_string(), bytes);
+        if let Some(key) = self
+            .pending_external_resources
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(path))
+            .cloned()
+        {
+            self.pending_external_resources.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn request_external_resource(&mut self, path: &str, kind: AssetKind) -> TjsError {
+        self.pending_external_resources
+            .entry(path.to_string())
+            .or_insert(kind);
+        TjsError::resource_pending(path.to_string())
+    }
+
+    fn is_external_resource(&self, path: &str) -> bool {
+        self.external_resource_catalog
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(path))
+    }
+
+    pub fn resource_provider(&self) -> Option<Arc<dyn StoragePort>> {
+        self.project_storage
+            .as_ref()
+            .map(|storage| Arc::new(storage.package_mount()) as Arc<dyn StoragePort>)
     }
 
     pub fn logs(&self) -> &[String] {
@@ -483,6 +726,26 @@ impl KrkrHost {
         self.cursor_position
     }
 
+    pub fn lifecycle_state(&self) -> LifecycleState {
+        self.lifecycle_state
+    }
+
+    pub(crate) fn set_lifecycle_state(&mut self, state: LifecycleState) {
+        self.lifecycle_state = state;
+        self.logs.push(format!("lifecycle state: {state:?}"));
+    }
+
+    pub(crate) fn push_text_input(&mut self, event: TextInputEvent) {
+        self.pending_text_input.push(event);
+    }
+
+    /// Drains text input delivered by the host. A platform shell can expose
+    /// this to an IME-aware UI without making the engine depend on DOM/IME
+    /// types.
+    pub fn take_text_input(&mut self) -> Vec<TextInputEvent> {
+        std::mem::take(&mut self.pending_text_input)
+    }
+
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
         let path = storage_normalize_separators(&path.into());
         if !self.auto_paths.iter().any(|item| item == &path) {
@@ -518,6 +781,7 @@ impl KrkrHost {
         self.project_storage
             .as_ref()
             .is_some_and(|storage| storage.storage_exists(name))
+            || self.is_external_resource(name)
     }
 
     pub fn placed_path(&self, name: &str) -> Option<PathBuf> {
@@ -543,6 +807,26 @@ impl KrkrHost {
         data.as_bytes()
             .map(|bytes| bytes.into_owned())
             .map_err(storage_io_error)
+    }
+
+    pub(crate) fn read_text_storage_for_tjs(&mut self, name: &str) -> Result<String> {
+        match self.read_text_storage(name) {
+            Ok(text) => Ok(text),
+            Err(_) if self.is_external_resource(name) => {
+                Err(self.request_external_resource(name, AssetKind::Text))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn read_binary_storage_for_tjs(&mut self, name: &str) -> Result<Vec<u8>> {
+        match self.read_binary_storage(name) {
+            Ok(bytes) => Ok(bytes),
+            Err(_) if self.is_external_resource(name) => {
+                Err(self.request_external_resource(name, AssetKind::Binary))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn read_resource_storage(&self, name: &str) -> Result<ResourceData> {
@@ -611,11 +895,37 @@ impl KrkrHost {
     }
 
     pub(crate) fn now_millis(&mut self) -> i64 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Browser WASM has no std::time wall clock. The engine advances
+            // this virtual clock once per frame from the host-provided delta.
+            return self.clock_offset_millis;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(0)
             .saturating_add(self.clock_offset_millis)
+    }
+
+    /// Installs an absolute host clock sample. Native hosts keep their wall
+    /// clock as the base and store only the offset; Web/virtual hosts use the
+    /// supplied value directly. RuntimeSession calls this once per frame so
+    /// all scheduling code observes the same timestamp.
+    pub(crate) fn set_clock_millis(&mut self, timestamp: i64) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.clock_offset_millis = timestamp.max(0);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+            self.clock_offset_millis = timestamp.saturating_sub(wall);
+        }
     }
 
     /// Advances the engine clock without sleeping. This is intended for
@@ -834,6 +1144,10 @@ impl KrkrHost {
         self.native_windows
             .get(&handle)
             .map(|window| window.closed)
+            // A Layer.window property may temporarily hold a script object
+            // (for example while a transition is being configured).  Such an
+            // object is not a closed native window and must not hide the
+            // layer. Modal waits handle missing native peers separately.
             .unwrap_or(false)
     }
 
@@ -929,7 +1243,14 @@ impl KrkrHost {
                     instance.parent = parent;
                     instance.children_array = children_array.or(instance.children_array);
                 }
-                let render_parent = self.native_layer_render_parent(handle, parent);
+                let render_parent = self
+                    .native_layer_render_parent(handle, parent)
+                    .filter(|parent_id| *parent_id != layer_id);
+                // A few KRKR constructors pass their own layer as the
+                // temporary parent while the native object is being wired.
+                // Never materialize that as a tree edge: it makes the layer
+                // disappear from root traversal (and therefore from draw
+                // lists) until a later reparent happens.
                 self.layer_tree.set_parent(layer_id, render_parent);
                 if parent.is_some() {
                     let z_order = self.next_sibling_z_order(render_parent);
@@ -952,7 +1273,9 @@ impl KrkrHost {
         let mut instance = LayerInstance::new(id, window, parent, children_array);
         instance.set_property("isPrimary", Variant::Integer(i64::from(primary)));
         self.native_layers.insert(handle, instance);
-        let render_parent = self.native_layer_render_parent(handle, parent);
+        let render_parent = self
+            .native_layer_render_parent(handle, parent)
+            .filter(|parent_id| *parent_id != id);
         let z_order = if primary {
             0
         } else {
@@ -1136,7 +1459,9 @@ impl KrkrHost {
             .is_some_and(|window| self.native_window_closed(window));
         match instance.render_target.clone() {
             LayerRenderTarget::Native(layer_id) => {
-                let render_parent = self.native_layer_render_parent(handle, instance.parent);
+                let render_parent = self
+                    .native_layer_render_parent(handle, instance.parent)
+                    .filter(|parent_id| *parent_id != layer_id);
                 self.layer_tree.set_parent(layer_id, render_parent);
                 if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
                     apply_layer_properties_to_node(layer, &instance.properties, window_closed);
@@ -1351,6 +1676,16 @@ impl KrkrHost {
         &mut self.scheduler
     }
 
+    pub(crate) fn scheduler_diagnostics(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.scheduler.continuous_handler_count(),
+            self.scheduler.script_event_count(),
+            self.scheduler.idle_event_count(),
+            self.scheduler.timer_count(),
+            self.scheduler.window_update_count(),
+        )
+    }
+
     pub(crate) fn ensure_kag_layer(&mut self, page: &str, layer: &str) -> LayerId {
         let _ = normalize_kag_page(page);
         let key = layer.to_string();
@@ -1401,13 +1736,14 @@ impl KrkrHost {
     }
 
     pub(crate) fn load_image_storage(&mut self, name: &str) -> Result<LayerImage> {
+        self.logs
+            .push(format!("image load decode started `{name}`"));
         self.sync_image_cache_revision();
         if let Some(image) = self.image_cache.get(name) {
             return Ok(image.clone());
         }
 
-        let data = self.project_storage()?.read_binary_storage(name)?;
-        let bytes = data.as_bytes().map_err(storage_io_error)?;
+        let bytes = self.read_binary_storage_for_tjs(name)?;
         let decoded = decode_image_bytes(&bytes, name).map_err(TjsError::runtime)?;
         let texture_id = self.next_texture_id;
         self.next_texture_id = self.next_texture_id.saturating_add(1);
@@ -1417,6 +1753,8 @@ impl KrkrHost {
     }
 
     pub(crate) fn load_image_storage_for_script(&mut self, name: &str) -> Result<LayerImage> {
+        self.logs
+            .push(format!("script image load requested `{name}`"));
         self.sync_image_cache_revision();
         if let Some(image) = self.image_cache.get(name) {
             return Ok(image.clone());
@@ -1432,20 +1770,29 @@ impl KrkrHost {
             let Some(manager) = self.resource_manager.as_ref() else {
                 return self.load_image_storage(name);
             };
-            let revision = self.storage_revision();
-            let decoded = manager
-                .decode_image_blocking(name.to_string(), revision)
-                .map_err(|error| {
-                    TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
-                })?;
-            if revision != self.storage_revision() {
+            if let Some(error) = self.script_image_errors.get(name) {
                 return Err(TjsError::runtime(format!(
-                    "discarded stale image `{name}` after storage revision changed"
+                    "failed to decode image `{name}`: {error}"
                 )));
             }
-            let image = self.layer_image_from_decoded(decoded);
-            self.image_cache.insert(name.to_string(), image.clone());
-            Ok(image)
+            let revision = self.storage_revision();
+            if self
+                .pending_script_image_loads
+                .values()
+                .any(|(storage, _)| storage.eq_ignore_ascii_case(name))
+            {
+                return Err(TjsError::resource_pending(name.to_string()));
+            }
+            let id = manager.request_image_decode(name.to_string(), revision);
+            self.pending_script_image_loads
+                .insert(id, (name.to_string(), revision));
+            self.logs.push(format!(
+                "script image decode queued `{name}` (request {})",
+                id.0
+            ));
+            // TJS/KAG resumes this native call after the worker completion is
+            // applied to the image cache; no frame is blocked on decode.
+            Err(TjsError::resource_pending(name.to_string()))
         }
     }
 
@@ -1459,6 +1806,21 @@ impl KrkrHost {
                 request,
                 image,
             })));
+        }
+
+        // Browser/web packages keep non-bootstrap images outside the initial
+        // ProjectStorage overlay. Let the normal external-resource scheduler
+        // fetch the image before asking the decode worker to read it.
+        let local_storage_exists = self
+            .project_storage
+            .as_ref()
+            .is_some_and(|storage| storage.storage_exists(&request.storage));
+        if !local_storage_exists && self.is_external_resource(&request.storage) {
+            self.logs.push(format!(
+                "image load waiting for external resource `{}`",
+                request.storage
+            ));
+            return Err(self.request_external_resource(&request.storage, AssetKind::Image));
         }
 
         #[cfg(test)]
@@ -1575,22 +1937,10 @@ impl KrkrHost {
 
         #[cfg(not(test))]
         {
-            if let Some(manager) = self.resource_manager.as_ref() {
-                let revision = self.storage_revision();
-                let decoded = manager
-                    .decode_image_blocking(name.to_string(), revision)
-                    .map_err(|error| {
-                        TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
-                    })?;
-                if revision != self.storage_revision() {
-                    return Err(TjsError::runtime(format!(
-                        "discarded stale image `{name}` after storage revision changed"
-                    )));
-                }
-                return Ok(decoded.rgba.len());
-            }
-
-            let image = self.load_image_storage(name)?;
+            // Cache warming is a hint, not a reason to block the VM. Reuse
+            // the same queued decode path as Layer.loadImages; the completion
+            // will populate the bounded decoded-image cache on a later frame.
+            let image = self.load_image_storage_for_script(name)?;
             Ok(image.upload.rgba.len())
         }
     }
@@ -1600,7 +1950,7 @@ impl KrkrHost {
         std::mem::take(&mut self.completed_image_loads)
     }
 
-    pub(crate) fn has_pending_resource_loads(&self) -> bool {
+    pub fn has_pending_resource_loads(&self) -> bool {
         !self.pending_image_loads.is_empty()
     }
 
@@ -1610,6 +1960,38 @@ impl KrkrHost {
         };
         let completions = manager.drain_completions();
         for completion in completions {
+            if let Some((storage, expected_revision)) =
+                self.pending_script_image_loads.remove(&completion.id)
+            {
+                if expected_revision != completion.revision
+                    || completion.revision != self.storage_revision()
+                {
+                    self.logs.push(format!(
+                        "discarded stale script image `{storage}` after storage revision changed"
+                    ));
+                    continue;
+                }
+                match completion.result {
+                    Ok(decoded) => {
+                        let image = self.layer_image_from_decoded(decoded);
+                        self.logs.push(format!(
+                            "script image decoded `{storage}` ({}x{}, {} bytes)",
+                            image.upload.width,
+                            image.upload.height,
+                            image.upload.rgba.len()
+                        ));
+                        self.script_image_errors.remove(&storage);
+                        self.image_cache.insert(storage, image);
+                    }
+                    Err(error) => {
+                        self.script_image_errors
+                            .insert(storage.clone(), error.clone());
+                        self.logs
+                            .push(format!("script image decode failed `{storage}`: {error}"));
+                    }
+                }
+                continue;
+            }
             self.complete_image_load(
                 completion.id,
                 completion.revision,
@@ -1643,6 +2025,12 @@ impl KrkrHost {
             .remove(&pending.request.target);
         match result {
             Ok(decoded) => {
+                self.logs.push(format!(
+                    "image decoded `{storage}` ({}x{}, {} bytes)",
+                    decoded.width,
+                    decoded.height,
+                    decoded.rgba.len()
+                ));
                 let image = self.layer_image_from_decoded(decoded);
                 self.image_cache.insert(storage.to_string(), image.clone());
                 self.completed_image_loads.push(CompletedImageLoad {
@@ -1673,6 +2061,7 @@ impl KrkrHost {
     fn sync_image_cache_revision(&mut self) {
         let revision = self.storage_revision();
         if self.image_cache_revision != revision {
+            self.cancel_pending_resource_tasks();
             self.image_cache.clear();
             self.completed_image_loads.clear();
             self.pending_image_loads.clear();
@@ -1682,11 +2071,26 @@ impl KrkrHost {
     }
 
     fn invalidate_resource_state(&mut self) {
+        self.cancel_pending_resource_tasks();
         self.image_cache_revision = self.storage_revision();
         self.image_cache.clear();
         self.pending_image_loads.clear();
         self.completed_image_loads.clear();
         self.image_target_generations.clear();
+    }
+
+    fn cancel_pending_resource_tasks(&self) {
+        let Some(manager) = self.resource_manager.as_ref() else {
+            return;
+        };
+        for id in self
+            .pending_image_loads
+            .keys()
+            .chain(self.pending_script_image_loads.keys())
+            .copied()
+        {
+            manager.cancel(id);
+        }
     }
 
     pub(crate) fn register_native_audio_buffer(&mut self, handle: ObjectHandle) -> AudioInstanceId {
@@ -1903,6 +2307,7 @@ impl KrkrHost {
 
     /// Queues playback of a live PCM stream (movie soundtrack decoded by
     /// krkr-video) and returns its audio instance id.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn queue_pcm_stream_play(
         &mut self,
         bus: AudioBus,
@@ -1916,11 +2321,11 @@ impl KrkrHost {
             .push(AudioCommand::PlayPcmStream {
                 id,
                 bus,
-                source: krkr_core::PcmStreamSource {
+                source: krkr_core::PcmStreamSource::new(
                     spec,
                     total_frames,
-                    receiver: std::sync::Arc::new(std::sync::Mutex::new(rx)),
-                },
+                    Box::new(ReceiverPcmStream { receiver: rx }),
+                ),
                 volume,
             });
         id
@@ -2288,6 +2693,15 @@ fn copy_layer_node_render_content(dest: &mut LayerNode, source: &LayerNode) {
 }
 
 fn kag_layer_z_order(layer: &str) -> i32 {
+    // Proprietary title-screen layers are roots beside the native system UI.
+    // Their background/effect must be visited before that UI; the logo is
+    // intentionally above it so the artwork can overlap the title panel.
+    match layer {
+        "__title_image" => return -100,
+        "__title_effect" => return -90,
+        "__title_logo" => return 100,
+        _ => {}
+    }
     if layer == "base" || layer == "background" {
         return 0;
     }
@@ -2488,11 +2902,11 @@ impl TjsHost for KrkrHost {
             let bytes = self.read_binary(name, mode)?;
             return decode_text_storage(name, &bytes, None, &self.text_encoding);
         }
-        self.read_text_storage(name)
+        self.read_text_storage_for_tjs(name)
     }
 
     fn read_binary(&mut self, name: &str, mode: &str) -> Result<Vec<u8>> {
-        let bytes = self.read_binary_storage(name)?;
+        let bytes = self.read_binary_storage_for_tjs(name)?;
         if let Some(offset) = storage_mode_offset(mode) {
             let offset = offset as usize;
             if offset >= bytes.len() {
@@ -2521,6 +2935,12 @@ impl TjsHost for KrkrHost {
 
     fn invalidate_object(&mut self, handle: ObjectHandle) {
         self.invalidate_native_object(handle);
+    }
+}
+
+impl krkr_core::Clock for KrkrHost {
+    fn now_millis(&mut self) -> i64 {
+        KrkrHost::now_millis(self)
     }
 }
 
@@ -2560,6 +2980,25 @@ mod tests {
         host.set_trace_categories("ALL");
         assert!(host.trace_enabled(TraceCategory::Audio));
         assert!(host.trace_enabled(TraceCategory::Kag));
+    }
+
+    #[test]
+    fn external_catalog_keeps_unique_basename_when_manifest_lists_key_twice() {
+        let mut host = KrkrHost::default();
+        // Web manifests pass both the logical key and physical URL path. If
+        // they are the same file, this must remain a unique auto-path alias.
+        host.set_external_resource_catalog(["main/config.tjs", "main/config.tjs"]);
+        assert!(host.storage_exists("Config.tjs"));
+
+        // A genuinely ambiguous basename must still be rejected so that a
+        // typo cannot silently select an arbitrary resource.
+        host.set_external_resource_catalog([
+            "main/config.tjs",
+            "locale/config.tjs",
+            "main/config.tjs",
+            "locale/config.tjs",
+        ]);
+        assert!(!host.storage_exists("Config.tjs"));
     }
 
     #[test]

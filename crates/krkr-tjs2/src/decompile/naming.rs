@@ -57,12 +57,7 @@ impl Names {
     /// `at_top_level` rewrites `%-1` accesses to bare identifiers too, since
     /// at the top level `this` *is* the global object and original source
     /// refers to globals by bare name.
-    pub fn member_target(
-        &self,
-        object_reg: i16,
-        name: &str,
-        at_top_level: bool,
-    ) -> Expr {
+    pub fn member_target(&self, object_reg: i16, name: &str, at_top_level: bool) -> Expr {
         match object_reg {
             -2 => self.ident_expr_name(name),
             -1 if at_top_level => self.ident_expr_name(name),

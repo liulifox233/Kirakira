@@ -1118,12 +1118,9 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
         for _round in 0..8 {
             let mut chains: Vec<(usize, Vec<usize>)> = Vec::new();
             for (index, patch) in self.patches.iter().enumerate() {
-                let target = *self
-                    .block_offsets
-                    .get(&patch.target)
-                    .ok_or_else(|| {
-                        TjsError::codegen(format!("missing block {}", patch.target.0))
-                    })?;
+                let target = *self.block_offsets.get(&patch.target).ok_or_else(|| {
+                    TjsError::codegen(format!("missing block {}", patch.target.0))
+                })?;
                 let delta = target as isize - patch.inst_offset as isize;
                 if i16::try_from(delta).is_ok() {
                     continue;
