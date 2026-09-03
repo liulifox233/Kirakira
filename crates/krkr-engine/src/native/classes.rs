@@ -612,13 +612,17 @@ fn alloc_menu_item_object(
 }
 
 fn install_menu_item_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    runtime.register_object_native(handle, "add", menu_item_add);
-    runtime.register_object_native(handle, "insert", menu_item_insert);
-    runtime.register_object_native(handle, "remove", menu_item_remove);
-    runtime.register_object_native(handle, "clear", menu_item_clear);
-    runtime.register_object_native(handle, "click", menu_item_noop);
-    runtime.register_object_native(handle, "onClick", menu_item_noop);
-    runtime.register_object_native(handle, "popup", menu_item_noop);
+    // Native constructors can be invoked on an already initialized script
+    // subclass instance (`super.MenuItem(...)`).  KRKR keeps native methods
+    // on the native class, so that constructor must not replace overrides
+    // such as KAGMenuItem.click/onClick on the leaf instance.
+    register_native_method_preserving_script(runtime, handle, "add", menu_item_add);
+    register_native_method_preserving_script(runtime, handle, "insert", menu_item_insert);
+    register_native_method_preserving_script(runtime, handle, "remove", menu_item_remove);
+    register_native_method_preserving_script(runtime, handle, "clear", menu_item_clear);
+    register_native_method_preserving_script(runtime, handle, "click", menu_item_noop);
+    register_native_method_preserving_script(runtime, handle, "onClick", menu_item_noop);
+    register_native_method_preserving_script(runtime, handle, "popup", menu_item_noop);
 }
 
 fn menu_item_children(
@@ -4614,30 +4618,15 @@ fn layer_on_click(
     else {
         return Ok(Variant::Void);
     };
-    runtime.host_mut().log(&format!(
-        "input native Layer.onClick layer={:?} window={:?}",
-        this, window
-    ));
     if matches!(runtime.object_member(window, "action"), Variant::Void) {
-        runtime
-            .host_mut()
-            .log("input Layer.onClick skipped: window.action is void");
         return Ok(Variant::Void);
     }
-    let action = runtime.object_member(window, "action");
-    runtime.host_mut().log(&format!(
-        "input Layer.onClick invoking window.action={action:?}"
-    ));
 
     let event = runtime.alloc_ordinary_object();
     runtime.add_object_class_info(event, "Dictionary");
     runtime.set_object_member(event, "target", Variant::Object(this));
     runtime.set_object_member(event, "type", Variant::String("onClick".to_string()));
-    let result = runtime.call_object_method(window, "action", vec![Variant::Object(event)]);
-    runtime
-        .host_mut()
-        .log(&format!("input Layer.onClick action result={result:?}"));
-    result
+    runtime.call_object_method(window, "action", vec![Variant::Object(event)])
 }
 
 fn layer_on_hit_test(

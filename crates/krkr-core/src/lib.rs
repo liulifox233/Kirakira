@@ -184,6 +184,13 @@ pub trait ProjectStoragePort: StoragePort {
         self.exists(name)
     }
 
+    /// Checks the logical name without the resource loader's convenience
+    /// extension probing. Script-facing `Storages.isExistentStorage` uses
+    /// this exact operation so a stem cannot match an unrelated file type.
+    fn storage_exists_exact(&self, name: &str) -> bool {
+        self.exists(name)
+    }
+
     fn is_directory(&self, name: &str) -> bool;
 
     fn list_directory(&self, name: &str) -> io::Result<Vec<String>>;
