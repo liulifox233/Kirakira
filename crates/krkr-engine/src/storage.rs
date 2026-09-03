@@ -41,6 +41,11 @@ struct ProjectStorageInner {
     raw_cache: Mutex<RawDataCache>,
     xp3_provider: Option<Xp3ResourceProvider>,
     memory_files: RwLock<BTreeMap<String, Arc<[u8]>>>,
+    /// Logical files known to a publication even when their bytes have not
+    /// been fetched yet.  Browser packages populate this from manifest.json;
+    /// native views also keep memory writes here so directory enumeration has
+    /// one backend-neutral source of truth.
+    catalog_paths: RwLock<BTreeMap<String, String>>,
     /// Files written through a memory-backed storage view since the last
     /// drain. Browser hosts persist this journal in their own origin storage;
     /// native filesystem-backed views never use it.
@@ -144,6 +149,10 @@ impl ProjectStorage {
         auto_paths: Vec<String>,
         memory_files: BTreeMap<String, Arc<[u8]>>,
     ) -> Self {
+        let catalog_paths = memory_files
+            .keys()
+            .filter_map(|path| catalog_path(path).map(|key| (key, path.clone())))
+            .collect();
         Self {
             inner: Arc::new(ProjectStorageInner {
                 root,
@@ -156,6 +165,7 @@ impl ProjectStorage {
                 )),
                 xp3_provider,
                 memory_files: RwLock::new(memory_files),
+                catalog_paths: RwLock::new(catalog_paths),
                 memory_writes: Mutex::new(BTreeMap::new()),
                 auto_paths: RwLock::new(auto_paths),
                 revision: AtomicU64::new(1),
@@ -197,14 +207,110 @@ impl ProjectStorage {
         )
     }
 
+    /// Creates a memory-backed view and records a complete logical catalogue.
+    /// Catalogue entries do not download or allocate file bytes; they only
+    /// make `isExistentDirectory`/`dirlist` work for a static Web package.
+    pub fn from_memory_with_catalog<I, K, V, P, S>(entries: I, catalog_paths: P) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Vec<u8>>,
+        P: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let files = entries
+            .into_iter()
+            .map(|(path, bytes)| {
+                (
+                    normalize_storage_separators(&path.into()),
+                    Arc::from(bytes.into()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let storage = Self::new_with_memory(
+            None,
+            Vec::new(),
+            None,
+            vec![
+                "data".to_string(),
+                "sys".to_string(),
+                "patch".to_string(),
+                "patch2".to_string(),
+                "patch3".to_string(),
+                "special".to_string(),
+            ],
+            files,
+        );
+        storage.set_catalog_paths(catalog_paths);
+        storage
+    }
+
+    /// Replaces the logical file catalogue without touching the byte cache.
+    /// Paths are normalized and compared case-insensitively, matching KRKR
+    /// storage lookup rules. This is deliberately a generic virtual-FS API;
+    /// it contains no knowledge of append volumes or any particular game.
+    pub fn set_catalog_paths<I, S>(&self, paths: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut catalog = self
+            .inner
+            .memory_files
+            .read()
+            .map(|files| {
+                files
+                    .keys()
+                    .filter_map(|path| catalog_path(path).map(|key| (key, path.clone())))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        for path in paths {
+            let path = path.into();
+            if let Some(key) = catalog_path(&path) {
+                catalog
+                    .entry(key)
+                    .or_insert_with(|| normalize_storage_separators(&path));
+            }
+        }
+        if let Ok(mut target) = self.inner.catalog_paths.write() {
+            *target = catalog;
+        }
+    }
+
+    /// Adds logical files to the catalogue. Existing entries retain their
+    /// first-seen spelling so directory listings remain deterministic.
+    pub fn add_catalog_paths<I, S>(&self, paths: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        if let Ok(mut catalog) = self.inner.catalog_paths.write() {
+            for path in paths {
+                let path = path.into();
+                if let Some(key) = catalog_path(&path) {
+                    catalog
+                        .entry(key)
+                        .or_insert_with(|| normalize_storage_separators(&path));
+                }
+            }
+        }
+    }
+
     /// Adds a file to a memory-backed storage view. Web resource schedulers
     /// use this after an asynchronous fetch completes; native storage views
     /// simply reject the mutation because they have no memory overlay.
     pub fn insert_memory(&self, path: impl Into<String>, bytes: impl Into<Vec<u8>>) {
         let path = normalize_storage_separators(&path.into());
+        let catalog_entry = catalog_path(&path);
         if let Ok(mut files) = self.inner.memory_files.write() {
-            files.insert(path, Arc::from(bytes.into()));
+            files.insert(path.clone(), Arc::from(bytes.into()));
             self.invalidate_caches();
+        }
+        if let Some(path) = catalog_entry
+            && let Ok(mut catalog) = self.inner.catalog_paths.write()
+        {
+            catalog.entry(path.clone()).or_insert(path);
         }
     }
 
@@ -265,6 +371,180 @@ impl ProjectStorage {
 
     pub fn storage_exists(&self, name: &str) -> bool {
         self.resolve_storage(name).is_ok()
+    }
+
+    /// Returns whether a logical directory exists in the filesystem, XP3
+    /// provider, or deferred publication catalogue.
+    pub fn is_directory(&self, name: &str) -> bool {
+        self.list_directory(name).is_ok()
+    }
+
+    /// Lists immediate children using KRKR/fstat semantics: directory names
+    /// have a trailing `/`, files do not. The result is sorted and de-duped
+    /// case-insensitively across filesystem, XP3 and manifest layers.
+    pub fn list_directory(&self, name: &str) -> io::Result<Vec<String>> {
+        let (relative, absolute) = self.directory_paths(name)?;
+        let prefix = if relative.is_empty() {
+            String::new()
+        } else {
+            format!("{relative}/")
+        };
+        let prefix_lower = prefix.to_ascii_lowercase();
+        let mut children = BTreeMap::<String, String>::new();
+        let mut found_directory = false;
+
+        if let Ok(catalog) = self.inner.catalog_paths.read() {
+            for path in catalog.values() {
+                let normalized = normalize_storage_separators(path);
+                let normalized_lower = normalized.to_ascii_lowercase();
+                let Some(rest) = normalized
+                    .get(prefix.len()..)
+                    .filter(|_| normalized_lower.starts_with(&prefix_lower))
+                else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                found_directory = true;
+                let (child, is_directory) = match rest.split_once('/') {
+                    Some((child, _)) => (child, true),
+                    None => (rest, false),
+                };
+                let display = if is_directory {
+                    format!("{child}/")
+                } else {
+                    child.to_string()
+                };
+                children
+                    .entry(display.to_ascii_lowercase())
+                    .or_insert(display);
+            }
+        }
+
+        for layer in &self.inner.fs_layers {
+            let Some(path) = self.layer_directory_path(layer, &relative, absolute.as_deref())?
+            else {
+                continue;
+            };
+            if !path.is_dir() {
+                continue;
+            }
+            found_directory = true;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                let display = if entry.path().is_dir() {
+                    format!("{file_name}/")
+                } else {
+                    file_name
+                };
+                children
+                    .entry(display.to_ascii_lowercase())
+                    .or_insert(display);
+            }
+        }
+
+        if let Some(provider) = &self.inner.xp3_provider {
+            for path in provider.entry_names() {
+                let normalized = normalize_storage_separators(&path);
+                let normalized_lower = normalized.to_ascii_lowercase();
+                let Some(rest) = normalized
+                    .get(prefix.len()..)
+                    .filter(|_| normalized_lower.starts_with(&prefix_lower))
+                else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                found_directory = true;
+                let (child, is_directory) = match rest.split_once('/') {
+                    Some((child, _)) => (child, true),
+                    None => (rest, false),
+                };
+                let display = if is_directory {
+                    format!("{child}/")
+                } else {
+                    child.to_string()
+                };
+                children
+                    .entry(display.to_ascii_lowercase())
+                    .or_insert(display);
+            }
+        }
+
+        if !found_directory {
+            return Err(storage_not_found(name));
+        }
+        Ok(children.into_values().collect())
+    }
+
+    fn layer_directory_path(
+        &self,
+        layer: &ProjectLayer,
+        logical_relative: &str,
+        absolute: Option<&Path>,
+    ) -> io::Result<Option<PathBuf>> {
+        if let Some(absolute) = absolute {
+            return Ok(absolute
+                .starts_with(&layer.root)
+                .then(|| absolute.to_path_buf()));
+        }
+        let Some(project_root) = self.inner.root.as_deref() else {
+            return Ok(None);
+        };
+        let layer_prefix = layer
+            .root
+            .strip_prefix(project_root)
+            .ok()
+            .map(path_to_storage_name)
+            .unwrap_or_default();
+        let relative = if layer_prefix.is_empty() {
+            logical_relative.to_string()
+        } else if logical_relative.is_empty() {
+            return Ok(None);
+        } else if logical_relative.eq_ignore_ascii_case(&layer_prefix) {
+            String::new()
+        } else if let Some(rest) = logical_relative
+            .strip_prefix(&format!("{layer_prefix}/"))
+            .or_else(|| {
+                let prefix_lower = format!("{layer_prefix}/").to_ascii_lowercase();
+                logical_relative.get(prefix_lower.len()..).filter(|_| {
+                    logical_relative
+                        .to_ascii_lowercase()
+                        .starts_with(&prefix_lower)
+                })
+            })
+        {
+            rest.to_string()
+        } else {
+            return Ok(None);
+        };
+        let path = if relative.is_empty() {
+            layer.root.clone()
+        } else {
+            self.resolve_case_insensitive_path(&layer.root, Path::new(&relative))?
+                .unwrap_or_else(|| layer.root.join(&relative))
+        };
+        Ok(Some(path))
+    }
+
+    fn directory_paths(&self, name: &str) -> io::Result<(String, Option<PathBuf>)> {
+        let normalized = normalize_storage_separators(name);
+        let path = Path::new(&normalized);
+        if path.is_absolute() {
+            let absolute = path.to_path_buf();
+            for layer in &self.inner.fs_layers {
+                if let Ok(relative) = absolute.strip_prefix(&layer.root) {
+                    return Ok((path_to_storage_name(relative), Some(absolute)));
+                }
+            }
+            return Ok((String::new(), Some(absolute)));
+        }
+        let trimmed = normalized.trim_matches('/');
+        let relative = clean_relative_path(trimmed).map_err(tjs_error_to_io)?;
+        Ok((path_to_storage_name(&relative), None))
     }
 
     pub fn placed_path(&self, name: &str) -> Option<PathBuf> {
@@ -1181,6 +1461,20 @@ pub(crate) fn normalize_storage_separators(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+fn catalog_path(path: &str) -> Option<String> {
+    let normalized = normalize_storage_separators(path);
+    if normalized.ends_with('/') {
+        return None;
+    }
+    let trimmed = normalized.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let relative = clean_relative_path(trimmed).ok()?;
+    let value = path_to_storage_name(&relative);
+    (!value.is_empty()).then_some(value.to_ascii_lowercase())
+}
+
 fn is_safe_absolute_storage_path(path: &Path) -> bool {
     path.components()
         .all(|component| !matches!(component, Component::ParentDir))
@@ -1412,6 +1706,38 @@ mod tests {
         assert_eq!(
             storage.read_binary_vec("startup.ks").expect("memory data"),
             b"WEB"
+        );
+    }
+
+    #[test]
+    fn memory_catalog_lists_deferred_files_and_directories() {
+        let storage = ProjectStorage::from_memory_with_catalog(
+            [("startup.tjs", b"WEB".to_vec())],
+            [
+                "append/vol1/start.ks",
+                "append/vol1/voice.ogg",
+                "main/title.ks",
+            ],
+        );
+        assert!(storage.is_directory("append/"));
+        assert!(storage.is_directory("APPEND/VOL1/"));
+        assert_eq!(
+            storage.list_directory("append/").expect("append directory"),
+            vec!["vol1/".to_string()]
+        );
+        assert_eq!(
+            storage
+                .list_directory("append/vol1/")
+                .expect("volume directory"),
+            vec!["start.ks".to_string(), "voice.ogg".to_string()]
+        );
+        assert_eq!(
+            storage.list_directory("/").expect("root directory"),
+            vec![
+                "append/".to_string(),
+                "main/".to_string(),
+                "startup.tjs".to_string()
+            ]
         );
     }
 

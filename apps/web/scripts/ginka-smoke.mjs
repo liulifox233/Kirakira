@@ -113,6 +113,15 @@ if (!sawBrandLogo) throw new Error("GINKA startup did not execute the Desktop op
 if (!sawFirstScenario || !sawTitleScenario) {
   throw new Error("GINKA startup did not reach both first.ks and title.ks through startup.tjs");
 }
+const mainDirectory = runtime.debug_eval('Storages.isExistentDirectory("main/")');
+const mainEntries = runtime.debug_eval('Storages.dirlist("main/").count');
+if (!mainDirectory.includes("Integer(1)")) {
+  throw new Error(`manifest-backed directory lookup failed: ${mainDirectory}`);
+}
+if (!mainEntries.includes("Integer(")) {
+  throw new Error(`manifest-backed directory listing failed: ${mainEntries}`);
+}
+console.log(`ginka wasm smoke: manifest virtual directory ok (${mainEntries})`);
 if (hasInitialSystemSave && sawDisplaySetting) {
   throw new Error("GINKA startup entered first-run language/display settings despite savedata/datasu.ksd");
 }

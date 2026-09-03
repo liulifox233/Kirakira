@@ -564,6 +564,9 @@ impl KrkrHost {
         S: Into<String>,
     {
         let paths: Vec<String> = paths.into_iter().map(Into::into).collect();
+        if let Some(storage) = &self.project_storage {
+            storage.add_catalog_paths(paths.iter().cloned());
+        }
         self.external_resource_catalog = paths.iter().cloned().collect();
         // KRKR resolves relative storage names through configured auto paths.
         // A remote manifest has no filesystem directories to search, so expose
@@ -801,6 +804,25 @@ impl KrkrHost {
             .as_ref()
             .is_some_and(|storage| storage.storage_exists(name))
             || self.is_external_resource(name)
+    }
+
+    /// Returns whether a logical directory exists in the mounted project or
+    /// in the deferred Web manifest catalogue.
+    pub fn storage_is_directory(&self, name: &str) -> bool {
+        self.project_storage
+            .as_ref()
+            .is_some_and(|storage| storage.is_directory(name))
+    }
+
+    /// Lists immediate logical children using KRKR/fstat semantics. Static
+    /// Web packages use the manifest catalogue; native projects merge the
+    /// filesystem and XP3 provider views in `ProjectStorage`.
+    pub fn storage_dirlist(&self, name: &str) -> Result<Vec<String>> {
+        self.project_storage
+            .as_ref()
+            .ok_or_else(|| TjsError::runtime("project storage is not configured"))?
+            .list_directory(name)
+            .map_err(storage_io_error)
     }
 
     pub fn placed_path(&self, name: &str) -> Option<PathBuf> {

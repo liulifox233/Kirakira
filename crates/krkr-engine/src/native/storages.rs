@@ -15,6 +15,8 @@ pub(crate) fn install_storages(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(storages, "getFullPath", storages_get_full_path);
     runtime.register_object_native(storages, "getPlacedPath", storages_get_placed_path);
     runtime.register_object_native(storages, "isExistentStorage", storages_exists);
+    runtime.register_object_native(storages, "isExistentDirectory", storages_is_directory);
+    runtime.register_object_native(storages, "dirlist", storages_dirlist);
     runtime.register_object_native(storages, "extractStorageExt", storages_extract_ext);
     runtime.register_object_native(storages, "extractStorageName", storages_extract_name);
     runtime.register_object_native(storages, "extractStoragePath", storages_extract_path);
@@ -94,6 +96,31 @@ fn storages_exists(
 ) -> Result<Variant> {
     let exists = arg_string(&args, 0)?.is_some_and(|name| runtime.host().storage_exists(&name));
     Ok(Variant::Integer(i64::from(exists)))
+}
+
+fn storages_is_directory(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let exists =
+        arg_string(&args, 0)?.is_some_and(|name| runtime.host().storage_is_directory(&name));
+    Ok(Variant::Integer(i64::from(exists)))
+}
+
+fn storages_dirlist(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(name) = arg_string(&args, 0)? else {
+        return Err(krkr_tjs2::TjsError::runtime(
+            "Storages.dirlist requires a directory",
+        ));
+    };
+    let entries = runtime.host().storage_dirlist(&name)?;
+    let values = entries.into_iter().map(Variant::String).collect();
+    Ok(Variant::Object(runtime.alloc_array_object(values)))
 }
 
 fn storages_extract_ext(
