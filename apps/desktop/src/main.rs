@@ -149,6 +149,7 @@ struct DesktopApp {
     status: Option<DesktopStatus>,
     last_frame: Instant,
     rendered_frames: u64,
+    last_frame_diagnostics: Option<String>,
     video_present_frame: Option<u64>,
     video_texture_id: Option<u64>,
 }
@@ -169,6 +170,7 @@ impl DesktopApp {
             status: None,
             last_frame: Instant::now(),
             rendered_frames: 0,
+            last_frame_diagnostics: None,
             video_present_frame: None,
             video_texture_id: None,
         }
@@ -312,6 +314,55 @@ impl DesktopApp {
         };
 
         renderer.set_content_size(Some(content_size));
+        {
+            let mut rects = 0usize;
+            let mut images = 0usize;
+            let mut texts = 0usize;
+            for command in &frame.draw_commands {
+                match command {
+                    krkr_core::DrawCommand::Rect(_) => rects += 1,
+                    krkr_core::DrawCommand::Image(_) => images += 1,
+                    krkr_core::DrawCommand::Text(_) => texts += 1,
+                }
+            }
+            let transition = frame
+                .transition
+                .as_ref()
+                .map(|value| (value.method.clone(), value.frozen_draw_commands.len()));
+            let runtime_state = self.runtime.as_ref().map(|runtime| {
+                (
+                    format!("{:?}", runtime.engine().kag_state()),
+                    runtime.engine().kag_location().storage,
+                    runtime.pending_asset_count(),
+                )
+            });
+            let diagnostics = format!(
+                "draws={} (rects={} images={} texts={}) uploads={} releases={} transition={:?} clear={:?} content={:?} surface={:?} runtime={:?}",
+                frame.draw_commands.len(),
+                rects,
+                images,
+                texts,
+                frame.image_uploads.len(),
+                frame.image_releases.len(),
+                transition,
+                frame.clear_color,
+                content_size,
+                renderer.viewport(),
+                runtime_state,
+            );
+            if self.rendered_frames < 10
+                || self
+                    .last_frame_diagnostics
+                    .as_deref()
+                    .is_none_or(|previous| previous != diagnostics)
+            {
+                log_info(&format!(
+                    "frame {} output: {diagnostics}",
+                    self.rendered_frames
+                ));
+                self.last_frame_diagnostics = Some(diagnostics);
+            }
+        }
         if let Some(target) = capture_frame_target(self.rendered_frames) {
             let path = std::env::var("KRKR_CAPTURE_PATH")
                 .unwrap_or_else(|_| "/tmp/krkr_capture.png".to_string());
