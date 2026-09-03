@@ -3105,6 +3105,9 @@ impl KagSession {
     ) -> Result<Variant> {
         call_tag_handler(runtime, handler, name, args).inspect_err(|error| {
             if error.kind != krkr_tjs2::TjsErrorKind::ResourcePending {
+                runtime
+                    .host_mut()
+                    .log(&format!("KAG handler `{name}` failed:\n{error}"));
                 self.state = KagTaskState::Error {
                     message: error.to_string(),
                 };
@@ -5785,6 +5788,31 @@ mod tests {
                 var win = new DialogWindow();
                 invalidate win;
                 return global.trace + ":" + (isvalid win);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("DF:0".to_string()));
+    }
+
+    #[test]
+    fn native_timer_empty_finalize_is_visible_to_script_subclasses() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "timer_finalize.tjs",
+                r#"
+                global.trace = "";
+                class ConductorTimer extends Timer {
+                    function ConductorTimer() { super.Timer(function() {}, ""); }
+                    function finalize() {
+                        global.trace += "D";
+                        super.finalize(...);
+                        global.trace += "F";
+                    }
+                }
+                var timer = new ConductorTimer();
+                invalidate timer;
+                return global.trace + ":" + (isvalid timer);
                 "#,
             )
             .expect("script");

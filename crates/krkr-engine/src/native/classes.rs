@@ -1744,6 +1744,11 @@ fn install_async_trigger_methods(runtime: &mut Runtime<KrkrHost>, handle: Object
 }
 
 fn install_timer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    // Timer subclasses in the stock KAG scripts call `super.finalize(...)`.
+    // KRKR's native Timer has a no-op finalizer; leaving the member absent
+    // turns that compatibility call into `void is not callable` and aborts
+    // layer cleanup halfway through a scene transition.
+    register_native_method_preserving_script(runtime, handle, "finalize", native_void);
     register_native_method_preserving_script(runtime, handle, "onTimer", timer_on_timer);
 }
 

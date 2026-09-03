@@ -653,6 +653,13 @@ impl<H: TjsHost + 'static> Runtime<H> {
     /// missing/void handler is not an error and returns `false`; callers can
     /// then propagate the original host error.
     pub fn process_unhandled_exception(&mut self, error: &TjsError) -> Result<bool> {
+        // Keep a host-visible diagnostic even when the project's own
+        // System.exceptionHandler elects to swallow the failure.  KRKR games
+        // commonly do exactly that for UI callbacks, which otherwise leaves
+        // the host with only a blank screen and no indication of the failed
+        // call site.  `Display` includes member/call and stack contexts.
+        self.host_mut()
+            .log(&format!("TJS exception at event boundary:\n{error}"));
         let handler = match self.global_member("System") {
             Variant::Object(system) => self.object_member(system, "exceptionHandler"),
             _ => Variant::Void,
@@ -692,6 +699,12 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.set_object_member(exception, "trace", Variant::String(trace));
         if let Some(class) = &error.exception_class {
             self.add_object_class_info(exception, class.clone());
+        } else {
+            // Native/runtime failures are represented by the standard TJS
+            // Exception class so stock KAG error reporters include the
+            // message and trace instead of reducing the log to a bare script
+            // location.
+            self.add_object_class_info(exception, "Exception".to_string());
         }
 
         let result = self.call_function(handler, vec![Variant::Object(exception)])?;

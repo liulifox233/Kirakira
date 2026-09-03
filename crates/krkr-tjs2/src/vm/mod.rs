@@ -363,7 +363,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                             || stack.iter().any(|frame| !frame.frame.entries.is_empty());
                         let reason = StopReason::Exception {
                             caught,
-                            message: error.message.clone(),
+                            // Keep the structured call/member and stack
+                            // context in debugger output. Printing only the
+                            // leaf message (`void is not callable`) hides
+                            // which callback or method supplied the bad
+                            // callee.
+                            message: error.to_string(),
                         };
                         let object_index = match self.runtime.heap.get(call_frame.object_handle.0) {
                             Some(object) => match object.kind {
@@ -433,6 +438,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     fn make_runtime_exception(&mut self, error: &TjsError) -> Variant {
         let handle = self.runtime.alloc_object(Default::default());
         self.runtime.heap[handle.0].set("message", Variant::String(error.message.clone()));
+        // KRKR exposes VM-generated failures to script catch blocks as an
+        // `Exception` object, not as an untyped dictionary.  Keeping the
+        // class marker and the unwound context on that object is important
+        // for compatibility with system exception reporters: they use
+        // `instanceof "Exception"` before printing `trace`.
+        self.runtime
+            .add_object_class_info(handle, "Exception".to_string());
+        let trace = error
+            .contexts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.runtime.heap[handle.0].set("trace", Variant::String(trace));
         Variant::Object(handle)
     }
 
@@ -1167,10 +1186,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let Some(object) = self.runtime.heap.get(handle.0) else {
             return text;
         };
+        if !object.class_infos.is_empty() {
+            text.push_str(" class=");
+            text.push_str(&object.class_infos.join("|"));
+        }
         let details = ["name", "message", "trace"]
             .into_iter()
             .filter_map(|name| {
-                let value = object.get_raw(name)?;
+                let value = self.raw_object_member(handle, name)?;
                 let value = value.to_tjs_string().ok()?;
                 if value.is_empty() {
                     None
@@ -1185,6 +1208,49 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             text.push(')');
         }
         text
+    }
+
+    /// Looks up diagnostic fields on an exception object without entering the
+    /// VM again.  Thrown objects can be proxies or script instances whose
+    /// `message`/`trace` members live on a superclass; inspecting only the
+    /// object's own map used to reduce those failures to `<object #N>`.
+    fn raw_object_member(&self, handle: ObjectHandle, name: &str) -> Option<Variant> {
+        fn visit<H: TjsHost + 'static>(
+            runtime: &Runtime<H>,
+            handle: ObjectHandle,
+            name: &str,
+            seen: &mut Vec<usize>,
+        ) -> Option<Variant> {
+            if seen.contains(&handle.0) {
+                return None;
+            }
+            seen.push(handle.0);
+            let object = runtime.heap.get(handle.0)?;
+            if let Some(value) = object.get_raw(name) {
+                return Some(value);
+            }
+            if let ObjectKind::Proxy {
+                primary, fallback, ..
+            } = object.kind
+            {
+                if let Some(primary) = primary
+                    && let Some(value) = visit(runtime, primary, name, seen)
+                {
+                    return Some(value);
+                }
+                if let Some(value) = visit(runtime, fallback, name, seen) {
+                    return Some(value);
+                }
+            }
+            object
+                .super_class
+                .and_then(|parent| visit(runtime, parent, name, seen))
+        }
+
+        // Keep the helper allocation-free in the common case.  The tiny
+        // visited list only grows for proxy/superclass chains.
+        let mut seen = Vec::new();
+        visit(&self.runtime, handle, name, &mut seen)
     }
 
     fn uncaught_exception_error(&mut self, value: &Variant) -> TjsError {
