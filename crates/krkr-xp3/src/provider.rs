@@ -54,6 +54,20 @@ impl Xp3ResourceProvider {
             .sum()
     }
 
+    /// Returns logical member names from all mounted archives. Publication
+    /// hosts use this to build a virtual directory index without opening any
+    /// compressed payloads.
+    pub fn entry_names(&self) -> Vec<String> {
+        let mut names = self
+            .archives
+            .iter()
+            .flat_map(|archive| archive.entries().iter().map(|entry| entry.name.clone()))
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        names
+    }
+
     pub fn is_empty(&self) -> bool {
         self.archives.is_empty()
     }

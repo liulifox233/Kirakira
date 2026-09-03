@@ -28,6 +28,7 @@ pub const WEB_PACKAGE_FORMAT: u32 = 1;
 /// carries metadata needed for lookup and bootstrap; CDN cache keys and
 /// compression are deliberately outside this format.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebManifest {
     pub format: u32,
     pub game: String,
@@ -416,7 +417,6 @@ pub fn pack_web_directory_with_entry(
             assets.insert(normalize_path(&relative.to_string_lossy()), fs::read(path)?);
         }
     }
-
     // A publish directory is an artifact, so stale files from an earlier
     // package must not survive and be served by a static host.  Clear only
     // the validated output directory after all source bytes have been read;
@@ -706,6 +706,19 @@ mod tests {
             pack_web_directory_with_entry(&root, root.join("missing"), false, Some("no.ks"));
         assert!(missing.is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn web_manifest_rejects_game_specific_append_metadata() {
+        let json = r#"{
+            "format": 1,
+            "game": "fixture",
+            "engine": "krkrz",
+            "bootstrap": [],
+            "append_volumes": [],
+            "entries": {}
+        }"#;
+        assert!(WebManifest::from_json(json).is_err());
     }
 
     #[test]

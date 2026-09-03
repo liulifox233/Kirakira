@@ -566,7 +566,12 @@ impl WebRuntime {
             ));
             files.extend(persisted);
         }
-        let storage = krkr_engine::ProjectStorage::from_memory(files.clone());
+        let catalog_paths = manifest
+            .entries
+            .iter()
+            .flat_map(|(key, entry)| [key.clone(), entry.path.clone()]);
+        let storage =
+            krkr_engine::ProjectStorage::from_memory_with_catalog(files.clone(), catalog_paths);
         let mut engine = KrkrEngine::new(krkr_engine::EngineConfig {
             project_storage: Some(storage),
             ..krkr_engine::EngineConfig::default()
