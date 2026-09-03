@@ -323,10 +323,17 @@ impl<'a> PsbDocument<'a> {
             .bytes
             .get(size_type_pos)
             .ok_or_else(|| "PSB array element width is out of bounds".to_string())?;
-        if !(0x0d..=0x14).contains(&size_kind) {
+        // 0x0c represents a zero-byte element width.  The reference
+        // psbfile.dll uses it for empty packed arrays (notably the resource
+        // offset/length tables in scenarios without embedded resources).
+        // A non-empty array cannot carry useful values at that width.
+        if !(0x0c..=0x14).contains(&size_kind) {
             return Err("invalid PSB packed-array element width".to_string());
         }
         let entry_size = (size_kind - 0x0c) as usize;
+        if entry_size == 0 && count != 0 {
+            return Err("non-empty PSB packed-array has zero element width".to_string());
+        }
         let data_offset = size_type_pos + 1;
         let data_length = count
             .checked_mul(entry_size)
@@ -576,6 +583,43 @@ fn native_void(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_packed_array_accepts_zero_byte_elements() {
+        let bytes = [0x0d, 0x00, 0x0c];
+        let document = PsbDocument {
+            bytes: &bytes,
+            names_offset: 0,
+            strings_offset: 0,
+            strings_data_offset: 0,
+            chunk_offsets_offset: 0,
+            chunk_lengths_offset: 0,
+            chunk_data_offset: 0,
+            root_offset: 0,
+            names: BTreeMap::new(),
+        };
+        let array = document.array_at(0).expect("empty PSB array");
+        assert_eq!(array.count, 0);
+        assert_eq!(array.entry_size, 0);
+        assert_eq!(array.serialized_size, 3);
+    }
+
+    #[test]
+    fn non_empty_packed_array_rejects_zero_byte_elements() {
+        let bytes = [0x0d, 0x01, 0x0c];
+        let document = PsbDocument {
+            bytes: &bytes,
+            names_offset: 0,
+            strings_offset: 0,
+            strings_data_offset: 0,
+            chunk_offsets_offset: 0,
+            chunk_lengths_offset: 0,
+            chunk_data_offset: 0,
+            root_offset: 0,
+            names: BTreeMap::new(),
+        };
+        assert!(document.array_at(0).is_err());
+    }
 
     #[test]
     fn psb_null_is_tjs_void_and_nested_maps_are_real_dictionaries() {

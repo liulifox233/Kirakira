@@ -985,6 +985,25 @@ mod tests {
     }
 
     #[test]
+    fn class_qualified_typeof_does_not_fall_back_to_instance_override() {
+        assert_eq!(
+            execute_source(
+                "class_qualified_typeof.tjs",
+                r#"
+                class Base {}
+                class Child extends Base {
+                    function finalize() {}
+                    function probe() { return typeof Base.finalize; }
+                }
+                return (new Child()).probe();
+                "#
+            )
+            .expect("execute"),
+            Variant::String("undefined".to_string())
+        );
+    }
+
+    #[test]
     fn native_class_object_method_call_uses_current_instance_this() {
         let mut runtime = Runtime::new();
         install_native_base(&mut runtime);
