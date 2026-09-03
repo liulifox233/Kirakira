@@ -837,6 +837,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         dest_reg: i16,
     ) -> Result<Variant> {
         let base_depth = self.runtime.call_depth;
+        let receiver_type = self.value_debug_type(&object_value);
         match self.call_member_direct_cont(object_value, name, args, None, Continuation::Root)? {
             CallOutcome::Immediate(value, Continuation::Root) => {
                 Ok(if dest_reg == 0 { Variant::Void } else { value })
@@ -845,7 +846,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 "unexpected immediate member call continuation {continuation:?}"
             ))),
             CallOutcome::Frame(frame) => {
-                let value = self.run_call_stack(vec![*frame], base_depth)?;
+                let value = self
+                    .run_call_stack(vec![*frame], base_depth)
+                    .map_err(|error| {
+                        error.with_member_access(TjsMemberAccess {
+                            operation: TjsMemberOperation::Calling,
+                            receiver_type: receiver_type.clone(),
+                            member_name: name.to_string(),
+                            callee_type: None,
+                        })
+                    })?;
                 Ok(if dest_reg == 0 { Variant::Void } else { value })
             }
         }
@@ -1186,18 +1196,29 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
 
         self.runtime.heap[handle.0].invalidating = true;
+        let receiver_type = self.object_debug_type(handle, "object");
         let result = (|| {
             let finalize =
                 self.prop_get_handle(handle, "finalize", DispatchFlags::default(), Some(handle))?;
             if !matches!(finalize, Variant::Void) {
                 let base_depth = self.runtime.call_depth;
-                match self.call_value(
-                    finalize,
-                    Some(handle),
-                    Vec::new(),
-                    false,
-                    Continuation::Root,
-                )? {
+                let outcome = self
+                    .call_value(
+                        finalize,
+                        Some(handle),
+                        Vec::new(),
+                        false,
+                        Continuation::Root,
+                    )
+                    .map_err(|error| {
+                        error.with_member_access(TjsMemberAccess {
+                            operation: TjsMemberOperation::Calling,
+                            receiver_type: receiver_type.clone(),
+                            member_name: "finalize".to_string(),
+                            callee_type: None,
+                        })
+                    })?;
+                match outcome {
                     CallOutcome::Immediate(_, Continuation::Root) => {}
                     CallOutcome::Immediate(_, continuation) => {
                         return Err(TjsError::runtime(format!(
@@ -1205,7 +1226,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         )));
                     }
                     CallOutcome::Frame(frame) => {
-                        self.run_call_stack(vec![*frame], base_depth)?;
+                        self.run_call_stack(vec![*frame], base_depth)
+                            .map_err(|error| {
+                                error.with_member_access(TjsMemberAccess {
+                                    operation: TjsMemberOperation::Calling,
+                                    receiver_type: receiver_type.clone(),
+                                    member_name: "finalize".to_string(),
+                                    callee_type: None,
+                                })
+                            })?;
                     }
                 }
             }
