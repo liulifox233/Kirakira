@@ -44,6 +44,9 @@ fn output_to_result<T>(output: FrontendOutput<T>) -> Result<T> {
             span: diagnostic.span,
             message: diagnostic.message,
             contexts: Vec::new(),
+            exception_object: None,
+            exception_class: None,
+            exception_message: None,
         });
     }
     output

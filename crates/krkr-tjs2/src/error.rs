@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::runtime::ObjectHandle;
+
 pub type Result<T> = std::result::Result<T, TjsError>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -50,6 +52,20 @@ pub struct TjsError {
     pub span: Option<Span>,
     pub message: String,
     pub contexts: Vec<TjsErrorContext>,
+    /// Handle of the original thrown object while it is still alive.  Event
+    /// boundaries can pass that object directly to `System.exceptionHandler`
+    /// instead of approximating it with a host error wrapper.
+    pub exception_object: Option<ObjectHandle>,
+    /// Name of the TJS class of an exception that escaped a `throw`.
+    ///
+    /// The native KRKR event loop passes the original exception object to
+    /// `System.exceptionHandler`, so handlers can distinguish framework
+    /// exceptions such as `ConductorException`.  Keep that bit of identity
+    /// alongside the host error while the VM unwinds its call stack.
+    pub exception_class: Option<String>,
+    /// Message carried by the original thrown object, when it differs from
+    /// the host-facing diagnostic assembled during VM unwinding.
+    pub exception_message: Option<String>,
 }
 
 impl TjsError {
@@ -59,6 +75,9 @@ impl TjsError {
             span: None,
             message: message.into(),
             contexts: Vec::new(),
+            exception_object: None,
+            exception_class: None,
+            exception_message: None,
         }
     }
 
@@ -68,6 +87,9 @@ impl TjsError {
             span: Some(span),
             message: message.into(),
             contexts: Vec::new(),
+            exception_object: None,
+            exception_class: None,
+            exception_message: None,
         }
     }
 
@@ -115,6 +137,19 @@ impl TjsError {
 
     pub fn with_context(mut self, context: TjsErrorContext) -> Self {
         self.contexts.push(context);
+        self
+    }
+
+    pub fn with_exception_class(mut self, class: impl Into<String>) -> Self {
+        let class = class.into();
+        if self.exception_class.is_none() {
+            self.exception_class = Some(class);
+        }
+        self
+    }
+
+    pub fn with_exception_message(mut self, message: impl Into<String>) -> Self {
+        self.exception_message = Some(message.into());
         self
     }
 

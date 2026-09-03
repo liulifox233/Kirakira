@@ -18,7 +18,12 @@ pub(crate) fn install<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
     install_dictionary_methods(runtime, dictionary);
     runtime.register_global_native("RegExp", native_regexp::<H>);
     runtime.register_global_native("Date", native_date::<H>);
-    runtime.register_global_native("Exception", native_exception::<H>);
+    let exception = runtime.register_global_native("Exception", native_exception::<H>);
+    // TJS superclass constructors are called as `super.Exception(...)`.
+    // Native constructors therefore expose their own named member, just as
+    // script class objects do, so the superclass lookup resolves to the
+    // constructor instead of a missing/void value.
+    runtime.set_object_member(exception, "Exception", Variant::Object(exception));
     install_math(runtime);
 }
 
@@ -95,10 +100,14 @@ fn native_date<H: TjsHost + 'static>(
 
 fn native_exception<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
-    _this_obj: Option<ObjectHandle>,
+    this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let handle = runtime.alloc_object(Object::default());
+    let handle = this_obj
+        .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+        .filter(|handle| *handle != runtime.global_handle())
+        .unwrap_or_else(|| runtime.alloc_object(Object::default()));
+    runtime.add_object_class_info(handle, "Exception");
     let message = args
         .first()
         .map(Variant::to_tjs_string)
@@ -343,10 +352,8 @@ fn array_push<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.add")?;
-    for value in args {
-        if !runtime.heap[handle.0].array_push(value) {
-            return Err(TjsError::runtime("Array.add called on a non-array object"));
-        }
+    if !runtime.heap[handle.0].array_extend(args) {
+        return Err(TjsError::runtime("Array.add called on a non-array object"));
     }
     Ok(Variant::Integer(
         runtime.heap[handle.0]
@@ -370,12 +377,10 @@ fn array_insert<H: TjsHost + 'static>(
         .map(|items| items.len())
         .ok_or_else(|| TjsError::runtime("Array.insert called on a non-array object"))?;
     let index = index.to_integer()?.clamp(0, len as i64) as usize;
-    for (offset, value) in args.into_iter().skip(1).enumerate() {
-        if !runtime.heap[handle.0].array_insert(index + offset, value) {
-            return Err(TjsError::runtime(
-                "Array.insert called on a non-array object",
-            ));
-        }
+    if !runtime.heap[handle.0].array_insert_values(index, args.into_iter().skip(1)) {
+        return Err(TjsError::runtime(
+            "Array.insert called on a non-array object",
+        ));
     }
     Ok(Variant::Void)
 }
@@ -459,12 +464,10 @@ fn array_unshift<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.unshift")?;
-    for (index, value) in args.into_iter().enumerate() {
-        if !runtime.heap[handle.0].array_insert(index, value) {
-            return Err(TjsError::runtime(
-                "Array.unshift called on a non-array object",
-            ));
-        }
+    if !runtime.heap[handle.0].array_prepend(args) {
+        return Err(TjsError::runtime(
+            "Array.unshift called on a non-array object",
+        ));
     }
     Ok(Variant::Integer(
         runtime.heap[handle.0]

@@ -629,13 +629,26 @@ impl KrkrEngine {
     pub fn start_project(&mut self) -> Result<()> {
         let has_startup_tjs = self.tjs_runtime.host().storage_exists("startup.tjs");
         let has_startup_ks = self.tjs_runtime.host().storage_exists("startup.ks");
+        let mut startup_exception_handled = false;
         if has_startup_tjs || !has_startup_ks {
             self.tjs_runtime
                 .host_mut()
                 .log("project startup: executing startup.tjs dispatcher");
-            self.execute_startup()?;
+            if let Err(error) = self.execute_startup() {
+                if is_resource_pending_error(&error) || error.is_debug_quit() {
+                    return Err(error);
+                }
+                if self.tjs_runtime.process_unhandled_exception(&error)? {
+                    startup_exception_handled = true;
+                    self.tjs_runtime
+                        .host_mut()
+                        .log(&format!("handled startup exception: {}", error.message));
+                } else {
+                    return Err(error);
+                }
+            }
         }
-        if !self.has_kag_scenario() && has_startup_ks {
+        if !startup_exception_handled && !self.has_kag_scenario() && has_startup_ks {
             self.tjs_runtime
                 .host_mut()
                 .log("project startup: falling back to startup.ks scenario");
@@ -811,8 +824,13 @@ impl KrkrEngine {
             .set_object_member(handle, "status", Variant::String("stop".to_string()));
         self.tjs_runtime
             .set_object_member(handle, "paused", Variant::Integer(0));
-        let result = call_wave_status_changed(&mut self.tjs_runtime, handle);
-        self.sync_kag_slots_after_ok(result)
+        match call_wave_status_changed(&mut self.tjs_runtime, handle) {
+            Ok(()) => self.sync_kag_slots_after_ok(Ok(())),
+            Err(error) => {
+                self.handle_callback_error("audio status callback", error)?;
+                self.sync_kag_slots_after_ok(Ok(()))
+            }
+        }
     }
 
     /// Completes a browser-owned media element and mirrors its `ended` event
@@ -822,8 +840,12 @@ impl KrkrEngine {
         let handles = self.tjs_runtime.host().video_overlay_handles();
         for handle in handles {
             if handle.0 as u64 == id && self.tjs_runtime.object_valid(handle) {
-                self.tjs_runtime
-                    .call_object_method(handle, "stop", Vec::new())?;
+                if let Err(error) = self
+                    .tjs_runtime
+                    .call_object_method(handle, "stop", Vec::new())
+                {
+                    self.handle_callback_error("video stop callback", error)?;
+                }
             }
         }
         Ok(())
@@ -937,13 +959,27 @@ impl KrkrEngine {
         // (notably the end-of-stream `stop` KAG movie conductors wait for)
         // wake the scenario on the next advance.
         let video_tick = tick_video_overlays(&mut self.tjs_runtime);
-        self.sync_kag_slots_after_ok(video_tick)?;
+        match video_tick {
+            Ok(()) => self.sync_kag_slots_after_ok(Ok(()))?,
+            Err(error) => self.handle_callback_error("video status callback", error)?,
+        }
         let resource_waiting_after_tick = self.kag_session.state == KagTaskState::WaitingResource
             && (self.tjs_runtime.host().has_pending_external_resources()
                 || self.tjs_runtime.host().has_pending_resource_loads());
         if !waiting_for_resource && !resource_waiting_after_tick {
             self.pump_runtime_scheduler(RuntimeSchedulerPump::WindowUpdatesOnly)?;
-            complete_pending_layer_paints(&mut self.tjs_runtime)?;
+            if let Err(error) = complete_pending_layer_paints(&mut self.tjs_runtime) {
+                if is_resource_pending_error(&error) || error.is_debug_quit() {
+                    return Err(error);
+                }
+                if self.tjs_runtime.process_unhandled_exception(&error)? {
+                    self.tjs_runtime
+                        .host_mut()
+                        .log(&format!("handled layer onPaint error: {}", error.message));
+                } else {
+                    return Err(error);
+                }
+            }
         }
         self.tjs_runtime
             .host_mut()
@@ -1067,7 +1103,9 @@ impl KrkrEngine {
             return Err(error);
         }
         self.tjs_runtime.host_mut().advance_transition(delta);
-        finish_completed_native_transitions(&mut self.tjs_runtime)?;
+        if let Err(error) = finish_completed_native_transitions(&mut self.tjs_runtime) {
+            self.handle_callback_error("transition completion callback", error)?;
+        }
         let transition_active = self.tjs_runtime.host().has_active_transition();
         let resource_pending = self.tjs_runtime.host().has_pending_resource_loads();
         self.kag_session
@@ -1400,7 +1438,18 @@ impl KrkrEngine {
 
     fn fire_layer_paint_event(&mut self, layer: ObjectHandle) -> Result<()> {
         if self.tjs_runtime.object_valid(layer) {
-            complete_layer_before_draw(&mut self.tjs_runtime, layer)?;
+            if let Err(error) = complete_layer_before_draw(&mut self.tjs_runtime, layer) {
+                if is_resource_pending_error(&error) || error.is_debug_quit() {
+                    return Err(error);
+                }
+                if self.tjs_runtime.process_unhandled_exception(&error)? {
+                    self.tjs_runtime
+                        .host_mut()
+                        .log(&format!("handled layer onPaint error: {}", error.message));
+                } else {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
@@ -1424,13 +1473,24 @@ impl KrkrEngine {
                     if matches!(handler, Variant::Void) {
                         continue;
                     }
-                    self.tjs_runtime
+                    if let Err(mut error) = self
+                        .tjs_runtime
                         .call_function(handler.clone(), vec![Variant::Integer(tick)])
-                        .map_err(|error| {
-                            TjsError::runtime(format!(
-                                "continuous handler {handler:?} failed: {error}"
-                            ))
-                        })?;
+                    {
+                        if is_resource_pending_error(&error) || error.is_debug_quit() {
+                            return Err(error);
+                        }
+                        if self.tjs_runtime.process_unhandled_exception(&error)? {
+                            self.tjs_runtime.host_mut().log(&format!(
+                                "handled continuous handler error: {}",
+                                error.message
+                            ));
+                        } else {
+                            error.message =
+                                format!("continuous handler {handler:?} failed: {}", error.message);
+                            return Err(error);
+                        }
+                    }
                     if self.tjs_runtime.is_suspended()
                         || self
                             .tjs_runtime
@@ -1475,14 +1535,37 @@ impl KrkrEngine {
         let result = self
             .tjs_runtime
             .call_object_method(event.target, method, event.args)
-            .map_err(|error| {
-                TjsError::runtime(format!(
-                    "{:?} event `{method}` on object#{} failed: {error}",
-                    event.kind, event.target.0
-                ))
-            })
             .map(|_| ());
-        self.sync_kag_slots_after_ok(result)
+        match result {
+            Ok(()) => self.sync_kag_slots_after_ok(Ok(())),
+            Err(mut error) => {
+                // KRKR2/KRKRZ process errors only after the event callback
+                // has unwound.  Preserve the original exception identity
+                // while adding the event site to its message; this lets a
+                // project's System.exceptionHandler recognize framework
+                // exceptions such as ConductorException.
+                if is_resource_pending_error(&error) || error.is_debug_quit() {
+                    return Err(error);
+                }
+                match self.tjs_runtime.process_unhandled_exception(&error) {
+                    Ok(true) => {
+                        self.tjs_runtime.host_mut().log(&format!(
+                            "handled {:?} event `{method}` error: {}",
+                            event.kind, error.message
+                        ));
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        error.message = format!(
+                            "{:?} event `{method}` on object#{} failed: {}",
+                            event.kind, event.target.0, error.message
+                        );
+                        Err(error)
+                    }
+                    Err(handler_error) => Err(handler_error),
+                }
+            }
+        }
     }
 
     fn handle_input_event(&mut self, event: EngineEvent) -> Result<()> {
@@ -1762,17 +1845,16 @@ impl KrkrEngine {
             return Ok(false);
         }
         let handled_by_script = !self.tjs_runtime.variant_is_native_function(&handler);
-        self.tjs_runtime
-            .call_object_method(
-                focused_layer,
-                method,
-                vec![
-                    Variant::Integer(key_code),
-                    Variant::Integer(shift),
-                    Variant::Integer(1),
-                ],
-            )
-            .map(|_| handled_by_script)
+        self.call_event_method(
+            focused_layer,
+            method,
+            vec![
+                Variant::Integer(key_code),
+                Variant::Integer(shift),
+                Variant::Integer(1),
+            ],
+        )
+        .map(|_| handled_by_script)
     }
 
     fn dispatch_window_key_event(
@@ -1792,13 +1874,12 @@ impl KrkrEngine {
             return Ok(false);
         }
         let handled_by_script = !self.tjs_runtime.variant_is_native_function(&handler);
-        self.tjs_runtime
-            .call_object_method(
-                window,
-                method,
-                vec![Variant::Integer(key_code), Variant::Integer(shift)],
-            )
-            .map(|_| handled_by_script)
+        self.call_event_method(
+            window,
+            method,
+            vec![Variant::Integer(key_code), Variant::Integer(shift)],
+        )
+        .map(|_| handled_by_script)
     }
 
     fn dispatch_window_pointer_event(&mut self, method: &str, button: i64) -> Result<bool> {
@@ -1833,11 +1914,47 @@ impl KrkrEngine {
         method: &str,
         args: Vec<Variant>,
     ) -> Result<Variant> {
-        if self.tjs_runtime.is_suspended() {
+        let result = if self.tjs_runtime.is_suspended() {
             self.tjs_runtime
                 .call_object_method_during_suspend(object, method, args)
         } else {
             self.tjs_runtime.call_object_method(object, method, args)
+        };
+        match result {
+            Ok(value) => Ok(value),
+            Err(mut error) => {
+                if is_resource_pending_error(&error) || error.is_debug_quit() {
+                    return Err(error);
+                }
+                if self.tjs_runtime.process_unhandled_exception(&error)? {
+                    self.tjs_runtime.host_mut().log(&format!(
+                        "handled event `{method}` error: {}",
+                        error.message
+                    ));
+                    Ok(Variant::Void)
+                } else {
+                    error.message = format!(
+                        "event `{method}` on object#{} failed: {}",
+                        object.0, error.message
+                    );
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn handle_callback_error(&mut self, context: &str, mut error: TjsError) -> Result<()> {
+        if is_resource_pending_error(&error) || error.is_debug_quit() {
+            return Err(error);
+        }
+        if self.tjs_runtime.process_unhandled_exception(&error)? {
+            self.tjs_runtime
+                .host_mut()
+                .log(&format!("handled {context}: {}", error.message));
+            Ok(())
+        } else {
+            error.message = format!("{context}: {}", error.message);
+            Err(error)
         }
     }
 
@@ -1854,18 +1971,17 @@ impl KrkrEngine {
         ) {
             return Ok(());
         }
-        self.tjs_runtime
-            .call_object_method(
-                window,
-                "onMouseWheel",
-                vec![
-                    Variant::Integer(self.current_shift_state(false)),
-                    Variant::Integer(delta as i64),
-                    Variant::Integer(position.x.round() as i64),
-                    Variant::Integer(position.y.round() as i64),
-                ],
-            )
-            .map(|_| ())
+        self.call_event_method(
+            window,
+            "onMouseWheel",
+            vec![
+                Variant::Integer(self.current_shift_state(false)),
+                Variant::Integer(delta as i64),
+                Variant::Integer(position.x.round() as i64),
+                Variant::Integer(position.y.round() as i64),
+            ],
+        )
+        .map(|_| ())
     }
 
     fn dispatch_window_click(&mut self) -> Result<()> {
@@ -1967,9 +2083,7 @@ impl KrkrEngine {
         if matches!(self.tjs_runtime.object_member(kag, method), Variant::Void) {
             return Ok(());
         }
-        self.tjs_runtime
-            .call_object_method(kag, method, Vec::new())
-            .map(|_| ())
+        self.call_event_method(kag, method, Vec::new()).map(|_| ())
     }
 
     fn fire_kag_secondary_click(&mut self) -> Result<()> {
@@ -1980,8 +2094,7 @@ impl KrkrEngine {
             )
         {
             return self
-                .tjs_runtime
-                .call_object_method(kag, "onPrimaryRightClick", Vec::new())
+                .call_event_method(kag, "onPrimaryRightClick", Vec::new())
                 .map(|_| ());
         }
 
@@ -2064,18 +2177,17 @@ impl KrkrEngine {
         {
             return Ok(());
         }
-        self.tjs_runtime
-            .call_object_method(
-                focused_layer,
-                "onMouseWheel",
-                vec![
-                    Variant::Integer(self.current_shift_state(false)),
-                    Variant::Integer(delta as i64),
-                    Variant::Integer(position.x.round() as i64),
-                    Variant::Integer(position.y.round() as i64),
-                ],
-            )
-            .map(|_| ())
+        self.call_event_method(
+            focused_layer,
+            "onMouseWheel",
+            vec![
+                Variant::Integer(self.current_shift_state(false)),
+                Variant::Integer(delta as i64),
+                Variant::Integer(position.x.round() as i64),
+                Variant::Integer(position.y.round() as i64),
+            ],
+        )
+        .map(|_| ())
     }
 
     fn layer_at_cursor(&mut self) -> Result<Option<LayerId>> {
@@ -2210,7 +2322,7 @@ impl KrkrEngine {
             self.tjs_runtime.object_member(object, "onHitTest"),
             Variant::Void
         ) {
-            self.tjs_runtime.call_object_method(
+            self.call_event_method(
                 object,
                 "onHitTest",
                 vec![
@@ -14025,6 +14137,61 @@ mod tests {
             engine.tjs_runtime().global_member("asyncProbeCount"),
             Variant::Integer(1)
         );
+    }
+
+    #[test]
+    fn event_exception_handler_receives_escaped_tjs_exception() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "exception-handler.tjs",
+                r#"
+                    class ConductorException extends Exception {
+                        function ConductorException() { super.Exception(...); }
+                    }
+                    global.handled = 0;
+                    global.classSeen = false;
+                    global.baseClassSeen = false;
+                    global.errorMessage = "";
+                    System.exceptionHandler = function(e) {
+                        global.handled++;
+                        global.classSeen = e instanceof "ConductorException";
+                        global.baseClassSeen = e instanceof "Exception";
+                        global.errorMessage = e.message;
+                        return true;
+                    };
+                    global.exc = new ConductorException("boom");
+                    global.trigger = new AsyncTrigger(function() {
+                        throw global.exc;
+                    }, "");
+                    trigger.trigger();
+                "#,
+            )
+            .expect("install exception handler");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("handled event error");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("baseClassSeen"),
+            Variant::Integer(1)
+        );
+        let Variant::String(error_message) = engine.tjs_runtime().global_member("errorMessage")
+        else {
+            panic!("exception handler did not receive a string message");
+        };
+        assert_eq!(error_message, "boom");
     }
 
     #[test]

@@ -68,6 +68,10 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
             Variant::String(runtime.host().system_paths().app_data_path.clone()),
         ),
         ("eventDisabled", Variant::Integer(0)),
+        // KRKR invokes this callback at the outer script/event boundary when
+        // an exception escaped the VM.  Startup.tjs may replace the default
+        // void value with the project's handler.
+        ("exceptionHandler", Variant::Void),
         ("graphicCacheLimit", Variant::Integer(0)),
         ("exitOnWindowClose", Variant::Integer(1)),
         ("drawThreadNum", Variant::Integer(0)),

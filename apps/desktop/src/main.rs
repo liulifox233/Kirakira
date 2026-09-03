@@ -301,6 +301,12 @@ impl DesktopApp {
                             }
                             self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
                             self.engine.set_status_level(Some(StatusLevel::Error));
+                            // A runtime error is terminal for this project.
+                            // Keep one final error frame for diagnostics, then
+                            // leave the event loop instead of polling the same
+                            // failed callback forever.
+                            self.state = DesktopState::FatalError;
+                            exit_after_render = true;
                             self.engine.tick_running(frame_input)
                         }
                     }

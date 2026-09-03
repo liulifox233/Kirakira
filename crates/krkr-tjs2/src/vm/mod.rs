@@ -993,8 +993,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             122 => {
                 let thrown = frame.get(inst.operands[0])?;
                 let Some(entry) = frame.entries.pop() else {
-                    let thrown = self.format_uncaught_exception(&thrown);
-                    return Err(TjsError::runtime(format!("uncaught exception {thrown}")));
+                    return Err(self.uncaught_exception_error(&thrown));
                 };
                 frame.set(entry.exception_reg, thrown)?;
                 pc = entry.catch_pc;
@@ -1186,6 +1185,32 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             text.push(')');
         }
         text
+    }
+
+    fn uncaught_exception_error(&mut self, value: &Variant) -> TjsError {
+        let text = self.format_uncaught_exception(value);
+        let mut error = TjsError::runtime(format!("uncaught exception {text}"));
+        let handle = match value {
+            Variant::Object(handle) => Some(*handle),
+            Variant::Closure(closure) => Some(closure.object),
+            _ => None,
+        };
+        if let Some(handle) = handle {
+            error.exception_object = Some(handle);
+            if let Some(class) = self.runtime.heap.get(handle.0) {
+                if let Some(class_name) = class.class_infos.first() {
+                    error = error.with_exception_class(class_name.clone());
+                }
+                if let Some(message) = class
+                    .get_raw("message")
+                    .and_then(|value| value.to_tjs_string().ok())
+                    .filter(|message| !message.is_empty())
+                {
+                    error = error.with_exception_message(message);
+                }
+            }
+        }
+        error
     }
 
     fn stack_frame_for(
