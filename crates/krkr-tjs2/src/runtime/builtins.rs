@@ -513,6 +513,15 @@ fn array_assign<H: TjsHost + 'static>(
         }
     } else {
         for (key, value) in runtime.heap[src.0].members.clone() {
+            // Native helper members are hidden from TJS dictionary
+            // enumeration.  They are stored as ordinary members in this
+            // lightweight runtime, so filter the compatibility surface here
+            // as well; otherwise Array.assign(Dictionary) leaks `assign`,
+            // `clear`, etc. into data arrays (UILoader's filename map relies
+            // on the reference pair count).
+            if is_native_member_name(&key) {
+                continue;
+            }
             runtime.heap[dest.0].array_push(Variant::String(key));
             runtime.heap[dest.0].array_push(value);
         }

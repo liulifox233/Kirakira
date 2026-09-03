@@ -282,7 +282,13 @@ fn scripts_get_class_names(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let Some(Variant::Object(handle)) = args.first().cloned() else {
+    // TJS class definitions are normally exposed as closures, even though
+    // `typeof`/`instanceof "Class"` reports them as objects.  The reference
+    // Scripts.getClassNames accepts that class value; only accepting the
+    // Object variant makes mixinclass.tjs fall back to its temporary
+    // `__missing` probe, which then fails while finalizing the probe and can
+    // prevent UI classes from being built.
+    let Some(handle) = args.first().and_then(variant_object_handle) else {
         return Ok(Variant::Void);
     };
     let values = runtime

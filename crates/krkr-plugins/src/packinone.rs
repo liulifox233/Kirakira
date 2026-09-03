@@ -120,12 +120,19 @@ fn ignore_property_set(
 fn install_csv_parser(runtime: &mut Runtime<KrkrHost>) {
     let handle = runtime.alloc_native_constructor(
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
+            let called_as_super_constructor = this_obj.is_some();
             let instance = this_obj
                 .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
                 .filter(|handle| *handle != runtime.global_handle())
                 .unwrap_or_else(|| runtime.alloc_ordinary_object());
             runtime.add_object_class_info(instance, "CSVParser");
-            install_csv_parser_members(runtime, instance);
+            // Keep native methods on the CSVParser class object.  Installing
+            // them directly on a subclass instance would shadow a script
+            // override such as UIListParser.parseStorage; the reference TJS
+            // native class participates in the normal superclass chain.
+            if !called_as_super_constructor {
+                install_csv_parser_members(runtime, instance);
+            }
             set_csv_text(runtime, instance, String::new());
             runtime.set_object_member(instance, "__csvFile", Variant::String(String::new()));
             // new CSVParser(target?, separator?, newline?): only the callback
@@ -276,7 +283,10 @@ fn csv_fire_do_line(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) {
         Variant::Object(handle) => handle,
         _ => this,
     };
-    if matches!(runtime.object_member(target, "doLine"), Variant::Void) {
+    let has_do_line = runtime
+        .resolve_object_member(target, "doLine")
+        .is_ok_and(|value| !matches!(value, Variant::Void));
+    if !has_do_line {
         return;
     }
     let text = match runtime.object_member(this, "__csvText") {

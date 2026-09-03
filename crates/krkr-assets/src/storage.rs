@@ -424,7 +424,7 @@ impl ProjectStorage {
         bytes: impl Into<Vec<u8>>,
         external: bool,
     ) {
-        let path = normalize_storage_separators(&path.into());
+        let path = canonical_memory_path(&path.into());
         let catalog_entry = catalog_path(&path);
         let bytes: Arc<[u8]> = Arc::from(bytes.into());
         // Keep cache/file lock ordering consistent for persistent and
@@ -518,6 +518,47 @@ impl ProjectStorage {
 
     pub fn storage_exists(&self, name: &str) -> bool {
         self.resolve_storage(name).is_ok()
+    }
+
+    /// Checks a storage name without the engine's convenience extension
+    /// probing.  KRKR's `Storages.isExistentStorage` uses the exact logical
+    /// name (plus configured auto paths); probing `title.ks` for `title`
+    /// would make UILoader mistake a scenario for its companion `title.ini`.
+    pub fn storage_exists_exact(&self, name: &str) -> bool {
+        let Ok(candidates) = exact_storage_candidates_with_auto_paths(name, &self.auto_paths())
+        else {
+            return false;
+        };
+
+        for candidate in candidates {
+            let Ok(relative) = clean_relative_path(&candidate) else {
+                continue;
+            };
+            if self
+                .find_fs_candidate(&candidate, &relative)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return true;
+            }
+            if self
+                .inner
+                .xp3_provider
+                .as_ref()
+                .is_some_and(|provider| provider.get_entry(&candidate).is_some())
+            {
+                return true;
+            }
+            if let Ok(memory_files) = self.inner.memory_files.read()
+                && memory_files
+                    .keys()
+                    .any(|stored| stored.eq_ignore_ascii_case(&candidate))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Returns whether a deferred publication catalogue can satisfy a logical
@@ -1189,7 +1230,7 @@ impl StoragePort for ProjectStorage {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.storage_exists(path)
+        self.storage_exists_exact(path)
     }
 
     fn data(&self, path: &str) -> io::Result<ResourceData> {
@@ -1275,6 +1316,10 @@ impl krkr_core::ProjectStoragePort for ProjectStorage {
 
     fn set_catalog_paths(&self, paths: &[String]) {
         ProjectStorage::set_catalog_paths(self, paths.iter().cloned());
+    }
+
+    fn insert_memory(&self, path: &str, bytes: Vec<u8>) {
+        ProjectStorage::insert_memory(self, path.to_string(), bytes);
     }
 
     fn insert_external_memory(&self, path: &str, bytes: Vec<u8>) {
@@ -1505,6 +1550,22 @@ fn storage_candidates_with_auto_paths(name: &str, auto_paths: &[String]) -> Resu
             for candidate in auto_path_candidates(auto_path, &clean) {
                 push_unique_storage_candidate(&mut candidates, &candidate);
             }
+        }
+    }
+    Ok(candidates)
+}
+
+fn exact_storage_candidates_with_auto_paths(
+    name: &str,
+    auto_paths: &[String],
+) -> Result<Vec<String>> {
+    let normalized = normalize_storage_separators(name);
+    let clean = clean_relative_path(&normalized)?;
+    let mut candidates = Vec::with_capacity(auto_paths.len() + 1);
+    push_unique_storage_candidate(&mut candidates, &clean);
+    for auto_path in auto_paths.iter().rev() {
+        for candidate in auto_path_candidates(auto_path, &clean) {
+            push_unique_storage_candidate(&mut candidates, &candidate);
         }
     }
     Ok(candidates)
@@ -1758,6 +1819,13 @@ fn swap_adjacent_bits(value: u16) -> u16 {
 
 pub fn normalize_storage_separators(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+fn canonical_memory_path(path: &str) -> String {
+    let normalized = normalize_storage_separators(path);
+    clean_relative_path(&normalized)
+        .map(|path| path_to_storage_name(&path))
+        .unwrap_or(normalized)
 }
 
 fn catalog_path(path: &str) -> Option<String> {

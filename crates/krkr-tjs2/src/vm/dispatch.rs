@@ -275,7 +275,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 current = self.super_class_handle(class_handle)?;
             }
         }
-        if !member_exists && self.call_set_missing(handle, name, value.clone())? {
+        // Class field initializers run before the mixin constructors finish.
+        // A preceding `__missing` module may already have enabled missing
+        // dispatch on the shared instance, but declared fields must still be
+        // installed locally instead of being routed to that hook.
+        if !member_exists
+            && !self.is_class_initializing(handle)
+            && self.call_set_missing(handle, name, value.clone())?
+        {
             return Ok(());
         }
         if let Some(this_obj) = self.bound_super_this(handle, caller_this)? {
@@ -1196,7 +1203,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
 
         self.runtime.heap[handle.0].invalidating = true;
-        let receiver_type = self.object_debug_type(handle, "object");
         let result = (|| {
             let finalize =
                 self.prop_get_handle(handle, "finalize", DispatchFlags::default(), Some(handle))?;
@@ -1409,6 +1415,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if context == BytecodeContextType::Class {
             self.add_class_info(instance, name.clone());
             let class_handle = code_handles[object_index];
+            self.begin_class_initialization(instance);
             let frame = self.create_call_frame(
                 file_id,
                 object_index,
@@ -1457,6 +1464,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.add_class_info(instance, name.clone());
         }
         let class_handle = code_handles[object_index];
+        self.begin_class_initialization(instance);
         // The superclass link is only attached once the class body has run
         // (see Continuation::ClassBody): while the body is executing, member
         // lookups on the under-construction instance must miss so that they

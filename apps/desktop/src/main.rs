@@ -500,12 +500,13 @@ impl DesktopApp {
         ));
 
         let preferred_size = runtime.engine().preferred_viewport_size();
+        let content_size = runtime.engine().content_viewport_size().or(preferred_size);
         if let Some(size) = preferred_size {
             self.resize_window_for_runtime(window, size);
         }
         apply_window_fullscreen(window, runtime.engine().window_fullscreen());
         self.runtime = Some(runtime);
-        self.runtime_viewport_size = preferred_size
+        self.runtime_viewport_size = content_size
             .filter(|size| !size.is_empty())
             .or_else(|| self.renderer.as_ref().map(Renderer::logical_size));
         self.project_root = Some(root.clone());

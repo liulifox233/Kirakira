@@ -34,6 +34,12 @@ pub struct Vm<'bc, 'rt, H: TjsHost = NoHost> {
     file: Arc<BytecodeFile>,
     runtime: &'rt mut Runtime<H>,
     code_handles: Vec<ObjectHandle>,
+    // A mixin class initializes its members by executing several class bodies
+    // against the same instance.  Some of those bodies (notably the
+    // `__missing` mixin) enable missing-member dispatch before a later body
+    // has declared its own fields.  Keep a nesting count so field
+    // initializers can still create members while any class body is active.
+    class_initialization_depth: BTreeMap<usize, usize>,
     _file_lifetime: PhantomData<&'bc BytecodeFile>,
 }
 
@@ -46,6 +52,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             file,
             runtime,
             code_handles,
+            class_initialization_depth: BTreeMap::new(),
             _file_lifetime: PhantomData,
         };
         Ok(vm)
@@ -70,6 +77,30 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
 
     pub fn global_member(&self, name: &str) -> Variant {
         self.runtime.heap[self.runtime.global.0].get(name)
+    }
+
+    pub(super) fn begin_class_initialization(&mut self, instance: ObjectHandle) {
+        *self
+            .class_initialization_depth
+            .entry(instance.0)
+            .or_default() += 1;
+    }
+
+    pub(super) fn end_class_initialization(&mut self, instance: ObjectHandle) {
+        let Some(depth) = self.class_initialization_depth.get_mut(&instance.0) else {
+            return;
+        };
+        if *depth <= 1 {
+            self.class_initialization_depth.remove(&instance.0);
+        } else {
+            *depth -= 1;
+        }
+    }
+
+    pub(super) fn is_class_initializing(&self, instance: ObjectHandle) -> bool {
+        self.class_initialization_depth
+            .get(&instance.0)
+            .is_some_and(|depth| *depth != 0)
     }
 
     pub fn runtime(&self) -> &Runtime<H> {
@@ -482,13 +513,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 run_constructor,
                 target,
             } => {
+                self.end_class_initialization(instance);
                 for info in self.runtime.heap[class_handle.0].class_infos.clone() {
                     self.add_class_info(instance, info);
                 }
-                // Attach the superclass link only after the class body has
-                // run, so member lookups during construction missed and fell
-                // back to the global object (krkrz regmember semantics).
-                self.runtime.heap[instance.0].super_class = Some(class_handle);
+                // A plain class-body call is how KRKR initializes a parent
+                // class (and how mixinclass.tjs probes a class on its
+                // temporary __missing object).  That call must not replace
+                // the instance's existing superclass link: doing so makes
+                // the probe's deleted `finalize` resolve to the dynamic
+                // wrapper finalizer.  The `new` entry point owns the leaf
+                // instance link, while native constructors may install
+                // their own native superclass instance as they run.
+                if run_constructor {
+                    self.runtime.heap[instance.0].super_class = Some(class_handle);
+                }
                 let object_value = Variant::Object(instance);
                 if run_constructor
                     && !class_name.is_empty()

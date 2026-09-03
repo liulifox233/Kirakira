@@ -343,6 +343,22 @@ impl KrkrEngine {
         Some(Size::new(width as f32, height as f32))
     }
 
+    /// Returns the logical scene size used by layers and hit testing.
+    ///
+    /// KRKR keeps the script window size (`innerWidth`/`innerHeight`) separate
+    /// from the scene/design size (`scWidth`/`scHeight`).  A desktop window may
+    /// be 1440x810 while a game still lays out its 1920x1080 scene; shells must
+    /// render and translate pointer coordinates in the latter coordinate
+    /// system so the same scale transform is applied in both directions.
+    pub fn content_viewport_size(&self) -> Option<Size> {
+        let window = self.runtime_window_object()?;
+        let width = object_positive_i64(&self.tjs_runtime, window, "scWidth")
+            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "width"))?;
+        let height = object_positive_i64(&self.tjs_runtime, window, "scHeight")
+            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "height"))?;
+        Some(Size::new(width as f32, height as f32))
+    }
+
     /// Updates the host-provided System screen metrics after a window/canvas
     /// resize. Platform shells own the actual viewport; scripts only observe
     /// this synchronized snapshot.
