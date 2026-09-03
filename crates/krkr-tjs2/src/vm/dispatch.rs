@@ -130,7 +130,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     return Ok(self.bind_proxy_value(value, receiver));
                 }
             }
+            // TYPEOFD/TYPEOFI pass MEMBERMUSTEXIST in KRKR2/Z.  A qualified
+            // lookup such as `typeof Base.finalize` must stop at the class
+            // chain and report undefined; falling back to the current
+            // instance would mistake a child's override for Base's member.
             if let Some(this_obj) = bind_this
+                && !flags.must_exist
                 && !flags.no_bound_instance_fallback
                 && let Some(value) = self.runtime.heap[this_obj.0].get_raw(name)
                 && !self.runtime.variant_is_property(&value)
@@ -1203,6 +1208,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
 
         self.runtime.heap[handle.0].invalidating = true;
+        let receiver_type = self.object_debug_type(handle, "object");
         let result = (|| {
             let finalize =
                 self.prop_get_handle(handle, "finalize", DispatchFlags::default(), Some(handle))?;
