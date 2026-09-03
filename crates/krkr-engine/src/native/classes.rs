@@ -2460,9 +2460,17 @@ fn layer_save_layer_image(
 }
 
 pub(crate) fn apply_completed_resource_loads(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
-    let completions = runtime.host_mut().take_completed_image_loads();
+    let (completions, script_image_completions) = runtime.host_mut().take_completed_image_loads();
     for completion in completions {
         apply_completed_image_load(runtime, completion)?;
+    }
+    // `Layer.loadImages` carries an explicit target continuation, but image
+    // loads initiated by script helpers (for example the packed quick-menu
+    // loader) suspend the TJS VM while the decode worker runs.  Once the
+    // decoded bytes are in the cache, retry that native call so startup can
+    // continue and the following scenario can be loaded.
+    if script_image_completions > 0 && runtime.is_suspended() {
+        runtime.resume_suspended()?;
     }
     Ok(())
 }

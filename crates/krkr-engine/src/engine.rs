@@ -1014,7 +1014,18 @@ impl KrkrEngine {
     }
 
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
-        apply_completed_resource_loads(&mut self.tjs_runtime)?;
+        if let Err(error) = apply_completed_resource_loads(&mut self.tjs_runtime) {
+            if is_resource_pending_error(&error) {
+                self.kag_session.state = KagTaskState::WaitingResource;
+                return Ok(EngineTickResult {
+                    state: self.kag_session.state.clone(),
+                    reason: KagYieldReason::Waiting(self.kag_session.state.clone()),
+                    tags_processed: 0,
+                    elapsed: Duration::ZERO,
+                });
+            }
+            return Err(error);
+        }
         self.tjs_runtime.host_mut().advance_transition(delta);
         finish_completed_native_transitions(&mut self.tjs_runtime)?;
         let transition_active = self.tjs_runtime.host().has_active_transition();

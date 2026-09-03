@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-krkr-audio.workspace = true
+# GINKA and many KRKR titles ship Ogg Opus BGM/voice.  Keep Opus optional for
+# wasm/headless consumers, but enable the native decoder in the desktop shell.
+krkr-audio = { workspace = true, features = ["opus"] }
 krkr-assets.workspace = true
 krkr-core.workspace = true
 krkr-plugins.workspace = true

@@ -36,7 +36,8 @@
           # pkg-config. Keeping them in the shell makes tests reproducible on
           # NixOS and macOS without changing Cargo manifests per host.
           buildInputs =
-            (with pkgs; lib.optionals stdenv.hostPlatform.isLinux [
+            (with pkgs; [ libopus ])
+            ++ (with pkgs; lib.optionals stdenv.hostPlatform.isLinux [
               alsa-lib
               libpulseaudio
             ])

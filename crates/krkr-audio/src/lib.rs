@@ -36,9 +36,7 @@ pub use krkr_core::{
 use symphonia::core::io::MediaSource;
 #[cfg(feature = "opus")]
 use symphonia::core::{
-    codecs::CODEC_TYPE_OPUS,
-    errors::Error as SymphoniaError,
-    io::{MediaSource, MediaSourceStream},
+    codecs::CODEC_TYPE_OPUS, errors::Error as SymphoniaError, io::MediaSourceStream,
 };
 
 const STATIC_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;

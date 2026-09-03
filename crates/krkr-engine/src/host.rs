@@ -299,6 +299,12 @@ pub struct KrkrHost {
     image_cache_revision: u64,
     pending_image_loads: BTreeMap<ResourceTaskId, PendingImageLoad>,
     pending_script_image_loads: BTreeMap<ResourceTaskId, (String, u64)>,
+    /// Number of script-driven image decode completions observed since the
+    /// last resource poll.  Script image loads suspend the TJS VM directly
+    /// (unlike Layer.loadImages, which has an explicit continuation), so the
+    /// engine uses this signal to resume that native call after the decoded
+    /// image has been placed in the cache.
+    completed_script_image_loads: usize,
     script_image_errors: BTreeMap<String, String>,
     completed_image_loads: Vec<CompletedImageLoad>,
     image_target_generations: BTreeMap<ImageLoadTarget, u64>,
@@ -365,6 +371,7 @@ impl Default for KrkrHost {
             image_cache_revision: 0,
             pending_image_loads: BTreeMap::new(),
             pending_script_image_loads: BTreeMap::new(),
+            completed_script_image_loads: 0,
             script_image_errors: BTreeMap::new(),
             completed_image_loads: Vec::new(),
             image_target_generations: BTreeMap::new(),
@@ -448,6 +455,7 @@ impl KrkrHost {
             image_cache_revision,
             pending_image_loads: BTreeMap::new(),
             pending_script_image_loads: BTreeMap::new(),
+            completed_script_image_loads: 0,
             script_image_errors: BTreeMap::new(),
             completed_image_loads: Vec::new(),
             image_target_generations: BTreeMap::new(),
@@ -1956,13 +1964,16 @@ impl KrkrHost {
         }
     }
 
-    pub(crate) fn take_completed_image_loads(&mut self) -> Vec<CompletedImageLoad> {
+    pub(crate) fn take_completed_image_loads(&mut self) -> (Vec<CompletedImageLoad>, usize) {
         self.poll_resource_completions();
-        std::mem::take(&mut self.completed_image_loads)
+        (
+            std::mem::take(&mut self.completed_image_loads),
+            std::mem::take(&mut self.completed_script_image_loads),
+        )
     }
 
     pub fn has_pending_resource_loads(&self) -> bool {
-        !self.pending_image_loads.is_empty()
+        !self.pending_image_loads.is_empty() || !self.pending_script_image_loads.is_empty()
     }
 
     fn poll_resource_completions(&mut self) {
@@ -1993,12 +2004,16 @@ impl KrkrHost {
                         ));
                         self.script_image_errors.remove(&storage);
                         self.image_cache.insert(storage, image);
+                        self.completed_script_image_loads =
+                            self.completed_script_image_loads.saturating_add(1);
                     }
                     Err(error) => {
                         self.script_image_errors
                             .insert(storage.clone(), error.clone());
                         self.logs
                             .push(format!("script image decode failed `{storage}`: {error}"));
+                        self.completed_script_image_loads =
+                            self.completed_script_image_loads.saturating_add(1);
                     }
                 }
                 continue;
