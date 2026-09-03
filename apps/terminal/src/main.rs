@@ -24,7 +24,7 @@ use krkr_core::{
 };
 use krkr_engine::{
     EngineConfig, EngineFrame, EngineInput, KrkrEngine, KrkrHost, NativeTextDrawEvent,
-    RuntimeSession, RuntimeSessionError, TransitionPolicy,
+    ProjectStorage, RuntimeSession, RuntimeSessionError, SystemPaths, TransitionPolicy,
 };
 use krkr_plugins::register_reference_plugins;
 use terminal_size::{Height, Width, terminal_size};
@@ -144,8 +144,11 @@ impl TerminalApp {
             ));
         }
 
+        let storage = ProjectStorage::for_root(project_root.clone())
+            .map_err(|error| format!("storage initialization failed: {error}"))?;
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_root: Some(project_root.clone()),
+            project_storage: Some(storage),
+            system_paths: system_paths_for_project(&project_root),
             ..EngineConfig::default()
         })
         .map_err(|error| format!("engine initialization failed: {error}"))?;
@@ -624,6 +627,22 @@ fn initial_project_root() -> Option<PathBuf> {
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))
         .or_else(|| env::current_dir().ok())
+}
+
+fn system_paths_for_project(root: &Path) -> SystemPaths {
+    let root_display = root.display().to_string();
+    let temp_display = env::temp_dir().display().to_string();
+    SystemPaths {
+        exe_path: format!("{}/", root_display.trim_end_matches(['/', '\\'])),
+        data_path: if cfg!(windows) {
+            let data = root.join("savedata").display().to_string();
+            format!("{}\\", data.trim_end_matches(['/', '\\']))
+        } else {
+            "savedata/".to_string()
+        },
+        personal_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
+        app_data_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
+    }
 }
 
 fn looks_like_project_root(path: &Path) -> bool {

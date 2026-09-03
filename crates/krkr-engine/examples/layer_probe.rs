@@ -4,7 +4,7 @@ use krkr_core::{
     ButtonState, DrawCommand, EngineEvent, EngineKey, FrameInput, ImageCommand, ImageUpload, Point,
     PointerButton, Size,
 };
-use krkr_engine::{EngineInput, KrkrEngine};
+use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, ProjectStorage, SystemPaths};
 
 type AlphaBounds = (u32, u32, u32, u32);
 type RgbaStats = (usize, u64, usize, Option<AlphaBounds>);
@@ -32,7 +32,16 @@ fn main() {
         .map(|value| parse_probe_events(&value))
         .unwrap_or_default();
 
-    let mut engine = KrkrEngine::for_project(&root).expect("engine");
+    let storage = ProjectStorage::for_root(&root).expect("storage");
+    let mut engine = KrkrEngine::new(EngineConfig {
+        project_storage: Some(storage),
+        system_paths: SystemPaths {
+            exe_path: format!("{}/", root.display()),
+            ..SystemPaths::default()
+        },
+        ..EngineConfig::default()
+    })
+    .expect("engine");
     let startup = engine.execute_startup().expect("startup");
     println!("startup={startup}");
     if std::env::var("KRKR_PROBE_IGNORE_UNKNOWN").is_ok() {

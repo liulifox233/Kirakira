@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use krkr_engine::{EngineConfig, KrkrEngine, SystemMetrics};
+use krkr_engine::{EngineConfig, KrkrEngine, ProjectStorage, SystemMetrics, SystemPaths};
 use krkr_plugins::register_reference_plugins;
 
 fn main() {
@@ -12,8 +12,20 @@ fn main() {
     let requested_names = args.iter().skip(2).cloned().collect::<Vec<_>>();
 
     eprintln!("[probe] opening project: {game_dir}");
+    let game_path = Path::new(&game_dir);
+    let storage = match ProjectStorage::for_root(game_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            eprintln!("[probe] storage initialization failed: {err}");
+            std::process::exit(1);
+        }
+    };
     let mut engine = match KrkrEngine::new(EngineConfig {
-        project_root: Some(game_dir.clone().into()),
+        project_storage: Some(storage),
+        system_paths: SystemPaths {
+            exe_path: format!("{}/", game_path.display()),
+            ..SystemPaths::default()
+        },
         system_metrics: SystemMetrics {
             screen_width: 1920,
             screen_height: 1080,

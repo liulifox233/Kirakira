@@ -15,7 +15,9 @@ pub use engine::{
     EngineConfig, EngineFrame, EngineInput, EngineStep, EngineTickResult, ExternalResourceRequest,
     KagLocation, KagRunBudget, KagTaskState, KagYieldReason, KrkrEngine, SystemMetrics,
 };
-pub use host::{KrkrHost, NativeTextDrawEvent, TransitionPolicy, VideoOverlaySnapshot};
+pub use host::{
+    KrkrHost, NativeTextDrawEvent, SystemPaths, TransitionPolicy, VideoOverlaySnapshot,
+};
 pub use plugin::KrkrPlugin;
 pub use resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId};
 pub use session::{RuntimeFrame, RuntimeSession, RuntimeSessionError};

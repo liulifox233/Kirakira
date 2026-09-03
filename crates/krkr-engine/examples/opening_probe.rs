@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use krkr_core::{DrawCommand, FrameInput, Size};
-use krkr_engine::{EngineInput, KrkrEngine};
+use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, ProjectStorage, SystemPaths};
 
 fn main() {
     let root = std::env::args_os()
@@ -19,7 +19,16 @@ fn main() {
         .map(Duration::from_millis);
     let compact = std::env::var("KRKR_PROBE_COMPACT").is_ok();
 
-    let mut engine = KrkrEngine::for_project(&root).expect("engine");
+    let storage = ProjectStorage::for_root(&root).expect("storage");
+    let mut engine = KrkrEngine::new(EngineConfig {
+        project_storage: Some(storage),
+        system_paths: SystemPaths {
+            exe_path: format!("{}/", root.display()),
+            ..SystemPaths::default()
+        },
+        ..EngineConfig::default()
+    })
+    .expect("engine");
     let startup = engine.execute_startup().expect("startup");
     println!("startup={startup}");
     println!(

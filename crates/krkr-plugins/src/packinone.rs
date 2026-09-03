@@ -925,10 +925,10 @@ fn install_misc_class_members(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::SystemTime};
+    use std::{fs, path::Path, time::SystemTime};
 
     use krkr_core::{FrameInput, Size};
-    use krkr_engine::KrkrEngine;
+    use krkr_engine::{EngineConfig, KrkrEngine, ProjectStorage, SystemPaths};
     use krkr_tjs2::runtime::Closure;
 
     use super::*;
@@ -952,7 +952,7 @@ mod tests {
         bytes.push(42);
         fs::write(root.join("probe.pbd"), bytes).expect("write data pack");
 
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let mut engine = test_engine(&root);
         engine.register_plugin(PackinOnePlugin).expect("plugin");
         let value = engine
             .execute_expression("inline.tjs", "Scripts.loadDataPack(\"probe.pbd\").answer")
@@ -974,7 +974,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create project root");
 
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let mut engine = test_engine(&root);
         engine.register_plugin(PackinOnePlugin).expect("plugin");
         engine.set_external_resource_catalog(["title_first.func"]);
 
@@ -1029,7 +1029,7 @@ mod tests {
         )
         .expect("write system state");
 
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let mut engine = test_engine(&root);
         engine.register_plugin(PackinOnePlugin).expect("plugin");
         let value = engine
             .execute_expression(
@@ -1054,7 +1054,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create project root");
 
-        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let mut engine = test_engine(&root);
         engine.register_plugin(PackinOnePlugin).expect("plugin");
         let value = engine
             .execute_expression(
@@ -1097,5 +1097,18 @@ mod tests {
             .expect("bound closure"),
             Variant::Integer(0)
         );
+    }
+
+    fn test_engine(root: &Path) -> KrkrEngine {
+        let storage = ProjectStorage::for_root(root).expect("storage");
+        KrkrEngine::new(EngineConfig {
+            project_storage: Some(storage),
+            system_paths: SystemPaths {
+                exe_path: format!("{}/", root.display()),
+                ..SystemPaths::default()
+            },
+            ..EngineConfig::default()
+        })
+        .expect("engine")
     }
 }

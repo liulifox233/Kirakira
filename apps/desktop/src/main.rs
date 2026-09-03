@@ -7,8 +7,8 @@ use krkr_core::{
     FrameInput, Point, PointerButton, Size, StatusLevel,
 };
 use krkr_engine::{
-    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, RuntimeSession,
-    SystemMetrics,
+    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, ProjectStorage,
+    RuntimeSession, SystemMetrics, SystemPaths,
 };
 use krkr_plugins::register_reference_plugins;
 use krkr_render::{RenderError, Renderer};
@@ -430,8 +430,19 @@ impl DesktopApp {
             return false;
         }
 
+        let storage = match ProjectStorage::for_root(root.clone()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                let message = format!("storage initialization failed: {error}");
+                self.set_status(StatusLevel::Error, message.clone(), Some(window));
+                show_error("Storage initialization failed", &message);
+                self.state = DesktopState::FatalError;
+                return false;
+            }
+        };
         let mut krkr_engine = match KrkrEngine::new(KrkrEngineConfig {
-            project_root: Some(root.clone()),
+            project_storage: Some(storage),
+            system_paths: system_paths_for_project(&root),
             system_metrics: system_metrics_for_window(window),
             ..KrkrEngineConfig::default()
         }) {
@@ -642,6 +653,22 @@ impl DesktopApp {
         self.state = DesktopState::FatalError;
         self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
         event_loop.exit();
+    }
+}
+
+fn system_paths_for_project(root: &std::path::Path) -> SystemPaths {
+    let root_display = root.display().to_string();
+    let temp_display = std::env::temp_dir().display().to_string();
+    SystemPaths {
+        exe_path: format!("{}/", root_display.trim_end_matches(['/', '\\'])),
+        data_path: if cfg!(windows) {
+            let data = root.join("savedata").display().to_string();
+            format!("{}\\", data.trim_end_matches(['/', '\\']))
+        } else {
+            "savedata/".to_string()
+        },
+        personal_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
+        app_data_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
     }
 }
 

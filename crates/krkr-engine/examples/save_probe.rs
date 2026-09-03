@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use krkr_engine::{KrkrEngine, host::KrkrHost};
+use krkr_engine::{EngineConfig, KrkrEngine, ProjectStorage, SystemPaths, host::KrkrHost};
 use krkr_tjs2::runtime::{ObjectHandle, Runtime, Variant};
 
 fn main() {
@@ -20,7 +20,16 @@ fn main() {
             .unwrap_or_default()
     });
 
-    let mut engine = KrkrEngine::for_project(&root).expect("engine");
+    let storage_view = ProjectStorage::for_root(&root).expect("storage");
+    let mut engine = KrkrEngine::new(EngineConfig {
+        project_storage: Some(storage_view),
+        system_paths: SystemPaths {
+            exe_path: format!("{}/", root.display()),
+            ..SystemPaths::default()
+        },
+        ..EngineConfig::default()
+    })
+    .expect("engine");
     let load_script = format!(
         "global.__save_probe_data = Scripts.evalStorage({}, {}); return true;",
         tjs_quote(&storage),
