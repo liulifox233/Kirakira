@@ -1,17 +1,18 @@
 use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
 
-use krkr_assets::NativeAssetStore;
+use krkr_assets::{NativeAssetStore, ProjectStorage};
 use krkr_audio::AudioSystem;
 use krkr_core::{
     AudioEvent, AudioStatusLevel, ButtonState, Clock, Engine, EngineConfig, EngineEvent, EngineKey,
     FrameInput, Point, PointerButton, Size, StatusLevel,
 };
 use krkr_engine::{
-    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, ProjectStorage,
-    RuntimeSession, SystemMetrics, SystemPaths,
+    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, RuntimeSession,
+    SystemMetrics, SystemPaths,
 };
 use krkr_plugins::register_reference_plugins;
 use krkr_render::{RenderError, Renderer};
+use krkr_video::PlatformVideoFactory;
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use winit::{
     application::ApplicationHandler,
@@ -441,9 +442,10 @@ impl DesktopApp {
             }
         };
         let mut krkr_engine = match KrkrEngine::new(KrkrEngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             system_paths: system_paths_for_project(&root),
             system_metrics: system_metrics_for_window(window),
+            video_factory: Arc::new(PlatformVideoFactory),
             ..KrkrEngineConfig::default()
         }) {
             Ok(engine) => engine,

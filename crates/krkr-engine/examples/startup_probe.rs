@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-use krkr_engine::storage::ProjectStorage;
+use krkr_assets::ProjectStorage;
 use krkr_tjs2::{
     bytecode::{BYTECODE_SIGNATURE, BytecodeFile},
     compile_source_to_bytecode,

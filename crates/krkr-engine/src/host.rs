@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque, btree_map::Entry},
+    io,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use krkr_core::{
     AssetKind, AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef,
     DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
-    LifecycleState, Point, ResourceData, StoragePort, TextInputEvent, TextureId, TransitionParams,
+    LifecycleState, Point, ProjectStoragePort, ResourceData, StoragePort, TextInputEvent,
+    TextureId, TransitionParams,
 };
 use krkr_font::FontSystem;
 use krkr_kag::KagParser;
@@ -19,15 +21,12 @@ use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, TjsHost, Variant},
 };
+use krkr_video::{UnavailableVideoFactory, VideoDecoderFactory};
 
 use crate::{
     native::video::VideoOverlayState,
     resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId, decode_image_bytes},
     scheduler::{AsyncTriggerMode, TvpScheduler},
-    storage::{
-        ProjectStorage, decode_text_storage, io_error as storage_io_error,
-        normalize_storage_separators as storage_normalize_separators, storage_mode_offset,
-    },
 };
 
 const IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
@@ -152,6 +151,9 @@ pub struct NativeTextDrawEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoOverlaySnapshot {
+    /// Stable identity of the native VideoOverlay object. Storage names are
+    /// not unique: KRKR permits several overlays to play the same file.
+    pub id: u64,
     pub storage: Option<String>,
     pub status: String,
     pub left: i64,
@@ -295,8 +297,9 @@ impl WindowInstance {
 
 #[derive(Clone)]
 pub struct KrkrHost {
-    project_storage: Option<ProjectStorage>,
+    project_storage: Option<Arc<dyn ProjectStoragePort>>,
     system_paths: SystemPaths,
+    video_factory: Arc<dyn VideoDecoderFactory>,
     resource_manager: Option<ResourceManager>,
     auto_paths: Vec<String>,
     logs: Vec<String>,
@@ -351,7 +354,7 @@ pub struct KrkrHost {
     termination_requested: bool,
     modal_windows: Vec<ObjectHandle>,
     external_resource_catalog: BTreeSet<String>,
-    pending_external_resources: BTreeMap<String, AssetKind>,
+    pending_external_resources: BTreeMap<(String, AssetKind), ()>,
     system_hooks: BTreeMap<String, SystemHookRegistration>,
 }
 
@@ -365,8 +368,9 @@ pub(crate) struct SystemHookRegistration {
 impl Default for KrkrHost {
     fn default() -> Self {
         Self {
-            project_storage: Some(ProjectStorage::new(None, Vec::new(), None, Vec::new())),
+            project_storage: None,
             system_paths: SystemPaths::default(),
+            video_factory: Arc::new(UnavailableVideoFactory),
             resource_manager: None,
             auto_paths: Vec::new(),
             logs: Vec::new(),
@@ -430,15 +434,51 @@ impl KrkrHost {
         host
     }
 
+    pub fn with_system_paths_and_video_factory(
+        system_paths: SystemPaths,
+        video_factory: Arc<dyn VideoDecoderFactory>,
+    ) -> Self {
+        let mut host = Self::with_system_paths(system_paths);
+        host.video_factory = video_factory;
+        host
+    }
+
     /// Builds a host over an already materialized storage view (for example a
     /// browser package downloaded into memory). Resource workers are only
     /// started on native targets; WASM performs image/resource work on the
     /// browser thread.
-    pub fn from_storage(storage: ProjectStorage, system_paths: SystemPaths) -> Result<Self> {
+    pub fn from_storage<S>(storage: S, system_paths: SystemPaths) -> Result<Self>
+    where
+        S: ProjectStoragePort + 'static,
+    {
+        Self::from_storage_port(
+            Arc::new(storage),
+            system_paths,
+            Arc::new(UnavailableVideoFactory),
+        )
+    }
+
+    pub fn from_storage_with_video_factory<S>(
+        storage: S,
+        system_paths: SystemPaths,
+        video_factory: Arc<dyn VideoDecoderFactory>,
+    ) -> Result<Self>
+    where
+        S: ProjectStoragePort + 'static,
+    {
+        Self::from_storage_port(Arc::new(storage), system_paths, video_factory)
+    }
+
+    pub fn from_storage_port(
+        storage: Arc<dyn ProjectStoragePort>,
+        system_paths: SystemPaths,
+        video_factory: Arc<dyn VideoDecoderFactory>,
+    ) -> Result<Self> {
         let mut host = Self::default();
         host.image_cache_revision = storage.revision();
         host.project_storage = Some(storage.clone());
         host.system_paths = system_paths;
+        host.video_factory = video_factory;
         #[cfg(not(target_arch = "wasm32"))]
         {
             host.resource_manager = Some(ResourceManager::new(storage).map_err(|error| {
@@ -446,6 +486,10 @@ impl KrkrHost {
             })?);
         }
         Ok(host)
+    }
+
+    pub fn video_factory(&self) -> Arc<dyn VideoDecoderFactory> {
+        Arc::clone(&self.video_factory)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -484,8 +528,9 @@ impl KrkrHost {
     pub fn video_overlay_snapshots(&mut self) -> Vec<VideoOverlaySnapshot> {
         let now = self.now_millis();
         self.video_overlays
-            .values()
-            .map(|state| VideoOverlaySnapshot {
+            .iter()
+            .map(|(handle, state)| VideoOverlaySnapshot {
+                id: handle.0 as u64,
                 storage: state.storage.clone(),
                 status: state.status.to_string(),
                 left: state.left,
@@ -502,9 +547,10 @@ impl KrkrHost {
             .collect()
     }
 
-    pub fn project_storage(&self) -> Result<&ProjectStorage> {
+    pub fn project_storage(&self) -> Result<&dyn ProjectStoragePort> {
         self.project_storage
             .as_ref()
+            .map(|storage| storage.as_ref())
             .ok_or_else(|| TjsError::runtime("project storage is not configured"))
     }
 
@@ -514,7 +560,7 @@ impl KrkrHost {
     pub fn drain_memory_storage_writes(&self) -> Vec<(String, Vec<u8>)> {
         self.project_storage
             .as_ref()
-            .map(ProjectStorage::drain_memory_writes)
+            .map(|storage| storage.drain_memory_writes())
             .unwrap_or_default()
     }
 
@@ -528,7 +574,10 @@ impl KrkrHost {
     {
         let paths: Vec<String> = paths.into_iter().map(Into::into).collect();
         if let Some(storage) = &self.project_storage {
-            storage.add_catalog_paths(paths.iter().cloned());
+            // A package switch replaces the remote catalogue. Retaining a
+            // previous game's names would make an ambiguous basename appear
+            // resolvable after the old package had been discarded.
+            storage.set_catalog_paths(&paths);
         }
         self.external_resource_catalog = paths.iter().cloned().collect();
         // KRKR resolves relative storage names through configured auto paths.
@@ -564,19 +613,6 @@ impl KrkrHost {
                 let key = stem.to_ascii_lowercase();
                 match stems.get_mut(&key) {
                     Some(value) if value.as_deref() == Some(path.as_str()) => {}
-                    Some(value)
-                        if value.as_ref().is_some_and(|candidate| {
-                            candidate
-                                .get(..6)
-                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("uipsd/"))
-                        }) => {}
-                    Some(value)
-                        if path
-                            .get(..6)
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("uipsd/")) =>
-                    {
-                        *value = Some(path.clone())
-                    }
                     Some(value) => *value = None,
                     None => {
                         stems.insert(key, Some(path.clone()));
@@ -599,11 +635,14 @@ impl KrkrHost {
     pub fn take_external_resource_requests(&mut self) -> Vec<(String, AssetKind)> {
         std::mem::take(&mut self.pending_external_resources)
             .into_iter()
+            .map(|((path, kind), ())| (path, kind))
             .collect()
     }
 
     pub fn has_external_resource_request(&self, path: &str) -> bool {
-        self.pending_external_resources.contains_key(path)
+        self.pending_external_resources
+            .keys()
+            .any(|(pending, _)| pending.eq_ignore_ascii_case(path))
     }
 
     pub fn has_pending_external_resources(&self) -> bool {
@@ -623,23 +662,16 @@ impl KrkrHost {
     }
 
     pub fn provide_external_resource(&mut self, path: &str, bytes: Vec<u8>) -> Result<()> {
-        self.project_storage()?
-            .insert_memory(path.to_string(), bytes);
-        if let Some(key) = self
-            .pending_external_resources
-            .keys()
-            .find(|key| key.eq_ignore_ascii_case(path))
-            .cloned()
-        {
-            self.pending_external_resources.remove(&key);
-        }
+        self.project_storage()?.insert_external_memory(path, bytes);
+        self.pending_external_resources
+            .retain(|(pending, _), _| !pending.eq_ignore_ascii_case(path));
         Ok(())
     }
 
     fn request_external_resource(&mut self, path: &str, kind: AssetKind) -> TjsError {
         self.pending_external_resources
-            .entry(path.to_string())
-            .or_insert(kind);
+            .entry((path.to_string(), kind))
+            .or_insert(());
         TjsError::resource_pending(path.to_string())
     }
 
@@ -647,12 +679,16 @@ impl KrkrHost {
         self.external_resource_catalog
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(path))
+            || self
+                .project_storage
+                .as_ref()
+                .is_some_and(|storage| storage.catalog_contains(path))
     }
 
     pub fn resource_provider(&self) -> Option<Arc<dyn StoragePort>> {
         self.project_storage
             .as_ref()
-            .map(|storage| Arc::new(storage.package_mount()) as Arc<dyn StoragePort>)
+            .map(|storage| Arc::clone(storage) as Arc<dyn StoragePort>)
     }
 
     pub fn logs(&self) -> &[String] {
@@ -732,7 +768,7 @@ impl KrkrHost {
     }
 
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
-        let path = storage_normalize_separators(&path.into());
+        let path = path.into().replace('\\', "/");
         if !self.auto_paths.iter().any(|item| item == &path) {
             self.auto_paths.push(path);
             if let Some(storage) = &self.project_storage {
@@ -757,7 +793,7 @@ impl KrkrHost {
 
     pub fn clear_archive_cache(&self) -> Result<()> {
         if let Some(storage) = &self.project_storage {
-            storage.clear_archive_cache()?;
+            storage.clear_archive_cache().map_err(storage_error)?;
         }
         Ok(())
     }
@@ -785,13 +821,14 @@ impl KrkrHost {
             .as_ref()
             .ok_or_else(|| TjsError::runtime("project storage is not configured"))?
             .list_directory(name)
-            .map_err(storage_io_error)
+            .map_err(storage_error)
     }
 
     pub fn placed_path(&self, name: &str) -> Option<PathBuf> {
         self.project_storage
             .as_ref()
             .and_then(|storage| storage.placed_path(name))
+            .map(PathBuf::from)
     }
 
     pub(crate) fn read_text_storage(&self, name: &str) -> Result<String> {
@@ -804,17 +841,35 @@ impl KrkrHost {
         }
         self.project_storage()?
             .read_text_storage(name, &self.text_encoding)
+            .map_err(storage_error)
     }
 
     pub fn read_binary_storage(&self, name: &str) -> Result<Vec<u8>> {
         let data = self.read_resource_storage(name)?;
         data.as_bytes()
             .map(|bytes| bytes.into_owned())
-            .map_err(storage_io_error)
+            .map_err(storage_error)
     }
 
     pub(crate) fn read_text_storage_for_tjs(&mut self, name: &str) -> Result<String> {
         match self.read_text_storage(name) {
+            Ok(text) => Ok(text),
+            Err(_) if self.is_external_resource(name) => {
+                Err(self.request_external_resource(name, AssetKind::Text))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_text_storage_for_tjs_mode(&mut self, name: &str, mode: &str) -> Result<String> {
+        if mode.is_empty() {
+            return self.read_text_storage_for_tjs(name);
+        }
+        match self
+            .project_storage()?
+            .read_text_storage_mode(name, mode, &self.text_encoding)
+            .map_err(storage_error)
+        {
             Ok(text) => Ok(text),
             Err(_) if self.is_external_resource(name) => {
                 Err(self.request_external_resource(name, AssetKind::Text))
@@ -841,11 +896,16 @@ impl KrkrHost {
                     TjsError::runtime(format!("failed to read binary storage `{name}`: {error}"))
                 });
         }
-        self.project_storage()?.read_binary_storage(name)
+        self.project_storage()?
+            .read_binary_storage(name)
+            .map_err(storage_error)
     }
 
     pub fn write_text_storage(&mut self, name: &str, mode: &str, text: &str) -> Result<()> {
-        let result = self.project_storage()?.write_text_storage(name, mode, text);
+        let result = self
+            .project_storage()?
+            .write_text_storage(name, mode, text)
+            .map_err(storage_error);
         if result.is_ok() {
             self.invalidate_resource_state();
         }
@@ -855,7 +915,8 @@ impl KrkrHost {
     pub fn write_binary_storage(&mut self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
         let result = self
             .project_storage()?
-            .write_binary_storage(name, mode, bytes);
+            .write_binary_storage(name, mode, bytes)
+            .map_err(storage_error);
         if result.is_ok() {
             self.invalidate_resource_state();
         }
@@ -2065,7 +2126,7 @@ impl KrkrHost {
     fn storage_revision(&self) -> u64 {
         self.project_storage
             .as_ref()
-            .map(ProjectStorage::revision)
+            .map(|storage| storage.revision())
             .unwrap_or(0)
     }
 
@@ -2784,6 +2845,7 @@ pub(crate) struct ImageLoadRequest {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub opacity: Option<i64>,
+    pub z_order: Option<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -2879,6 +2941,16 @@ fn clamp_krkr_volume(volume: i64) -> i64 {
     volume.clamp(0, 100000)
 }
 
+fn storage_error(error: io::Error) -> TjsError {
+    TjsError::runtime(error.to_string())
+}
+
+fn storage_mode_offset(mode: &str) -> Option<u64> {
+    let offset = mode.split('o').nth(1)?;
+    let offset = offset.split(|ch: char| !ch.is_ascii_digit()).next()?;
+    (!offset.is_empty()).then(|| offset.parse().ok()).flatten()
+}
+
 fn krkr_volume_product_to_linear(volume: i64, volume2: i64, global_volume: i64) -> f32 {
     let volume = clamp_krkr_volume(volume) as f32 / 100000.0;
     let volume2 = clamp_krkr_volume(volume2) as f32 / 100000.0;
@@ -2909,11 +2981,7 @@ pub(crate) struct NativeTransitionCompletion {
 
 impl TjsHost for KrkrHost {
     fn read_text(&mut self, name: &str, mode: &str) -> Result<String> {
-        if storage_mode_offset(mode).is_some() {
-            let bytes = self.read_binary(name, mode)?;
-            return decode_text_storage(name, &bytes, None, &self.text_encoding);
-        }
-        self.read_text_storage_for_tjs(name)
+        self.read_text_storage_for_tjs_mode(name, mode)
     }
 
     fn read_binary(&mut self, name: &str, mode: &str) -> Result<Vec<u8>> {
@@ -2958,6 +3026,7 @@ impl krkr_core::Clock for KrkrHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use krkr_assets::ProjectStorage;
     use std::fs;
 
     #[test]

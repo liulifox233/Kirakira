@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
     hash::Hash,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
@@ -20,6 +20,7 @@ use memmap2::{Mmap, MmapOptions};
 
 const RAW_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const RAW_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+const EXTERNAL_MEMORY_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ProjectStorage {
@@ -41,6 +42,10 @@ struct ProjectStorageInner {
     raw_cache: Mutex<RawDataCache>,
     xp3_provider: Option<Xp3ResourceProvider>,
     memory_files: RwLock<BTreeMap<String, Arc<[u8]>>>,
+    /// Bytes supplied by an asynchronous host fetch. Unlike bootstrap files
+    /// and save writes these entries are evictable; the manifest catalogue
+    /// remains intact so a later read simply schedules another fetch.
+    external_memory_cache: Mutex<ExternalMemoryCache>,
     /// Logical files known to a publication even when their bytes have not
     /// been fetched yet.  Browser packages populate this from manifest.json;
     /// native views also keep memory writes here so directory enumeration has
@@ -55,7 +60,7 @@ struct ProjectStorageInner {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProjectLayer {
+pub struct ProjectLayer {
     root: PathBuf,
     encoding_hint: Option<&'static Encoding>,
 }
@@ -82,6 +87,7 @@ enum LocatedResource {
     },
     Memory {
         storage_name: String,
+        source_path: String,
         data: Arc<[u8]>,
         encoding_hint: Option<&'static Encoding>,
     },
@@ -113,6 +119,77 @@ struct RawDataCache {
     max_entry_bytes: usize,
 }
 
+struct ExternalMemoryCache {
+    entries: BTreeMap<String, usize>,
+    lru: VecDeque<String>,
+    oversized_unread: BTreeSet<String>,
+    bytes: usize,
+    capacity_bytes: usize,
+}
+
+impl ExternalMemoryCache {
+    fn new() -> Self {
+        Self::with_capacity(EXTERNAL_MEMORY_CACHE_CAPACITY_BYTES)
+    }
+
+    fn with_capacity(capacity_bytes: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            lru: VecDeque::new(),
+            oversized_unread: BTreeSet::new(),
+            bytes: 0,
+            capacity_bytes,
+        }
+    }
+
+    fn touch(&mut self, path: &str, bytes: usize) {
+        if let Some(previous) = self.entries.insert(path.to_string(), bytes) {
+            self.bytes = self.bytes.saturating_sub(previous);
+            self.lru.retain(|entry| entry != path);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.lru.push_back(path.to_string());
+        if bytes > self.capacity_bytes {
+            self.oversized_unread.insert(path.to_string());
+        } else {
+            self.oversized_unread.remove(path);
+        }
+    }
+
+    fn pop_lru_if_over_capacity(&mut self) -> Option<String> {
+        if self.bytes <= self.capacity_bytes {
+            return None;
+        }
+        let index = self
+            .lru
+            .iter()
+            .position(|path| !self.oversized_unread.contains(path))?;
+        let path = self.lru.remove(index)?;
+        let Some(bytes) = self.entries.remove(&path) else {
+            return self.pop_lru_if_over_capacity();
+        };
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Some(path)
+    }
+
+    fn finish_read(&mut self, path: &str) -> bool {
+        let Some(stored_path) = self
+            .oversized_unread
+            .iter()
+            .find(|stored| stored.eq_ignore_ascii_case(path))
+            .cloned()
+        else {
+            return false;
+        };
+        self.oversized_unread.remove(&stored_path);
+        self.lru.retain(|entry| entry != &stored_path);
+        if let Some(bytes) = self.entries.remove(&stored_path) {
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+        true
+    }
+}
+
 struct MmapResourceData {
     mmap: Arc<Mmap>,
 }
@@ -123,6 +200,35 @@ struct MmapResourceStream {
 }
 
 impl ProjectStorage {
+    fn touch_external_memory(&self, path: &str) {
+        // `resolve_storage` may hold the memory_files read lock while calling
+        // this helper. A non-blocking cache touch avoids inverting the
+        // insert/eviction lock order under concurrent native reads.
+        let Ok(mut cache) = self.inner.external_memory_cache.try_lock() else {
+            return;
+        };
+        if !cache.entries.contains_key(path) {
+            return;
+        }
+        cache.lru.retain(|entry| entry != path);
+        cache.lru.push_back(path.to_string());
+    }
+
+    fn finish_external_read(&self, path: &str) {
+        let should_remove = self
+            .inner
+            .external_memory_cache
+            .lock()
+            .map(|mut cache| cache.finish_read(path))
+            .unwrap_or(false);
+        if should_remove {
+            if let Ok(mut files) = self.inner.memory_files.write() {
+                files.remove(path);
+            }
+            self.invalidate_caches();
+        }
+    }
+
     pub fn package_mount(&self) -> PackageMount {
         PackageMount(self.clone())
     }
@@ -133,7 +239,7 @@ impl ProjectStorage {
         Ok(Self::new(Some(root), fs_layers, xp3_provider, Vec::new()))
     }
 
-    pub(crate) fn new(
+    pub fn new(
         root: Option<PathBuf>,
         fs_layers: Vec<ProjectLayer>,
         xp3_provider: Option<Xp3ResourceProvider>,
@@ -165,6 +271,7 @@ impl ProjectStorage {
                 )),
                 xp3_provider,
                 memory_files: RwLock::new(memory_files),
+                external_memory_cache: Mutex::new(ExternalMemoryCache::new()),
                 catalog_paths: RwLock::new(catalog_paths),
                 memory_writes: Mutex::new(BTreeMap::new()),
                 auto_paths: RwLock::new(auto_paths),
@@ -301,11 +408,51 @@ impl ProjectStorage {
     /// use this after an asynchronous fetch completes; native storage views
     /// simply reject the mutation because they have no memory overlay.
     pub fn insert_memory(&self, path: impl Into<String>, bytes: impl Into<Vec<u8>>) {
+        self.insert_memory_with_policy(path, bytes, false);
+    }
+
+    /// Inserts a resource delivered by an asynchronous scheduler. These bytes
+    /// participate in a bounded LRU and may be dropped under memory pressure;
+    /// the logical catalogue is deliberately retained for future refetches.
+    pub fn insert_external_memory(&self, path: impl Into<String>, bytes: impl Into<Vec<u8>>) {
+        self.insert_memory_with_policy(path, bytes, true);
+    }
+
+    fn insert_memory_with_policy(
+        &self,
+        path: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+        external: bool,
+    ) {
         let path = normalize_storage_separators(&path.into());
         let catalog_entry = catalog_path(&path);
+        let bytes: Arc<[u8]> = Arc::from(bytes.into());
+        // Keep cache/file lock ordering consistent for persistent and
+        // external inserts. This prevents an eviction racing a save write.
+        let mut external_cache = self.inner.external_memory_cache.lock().ok();
         if let Ok(mut files) = self.inner.memory_files.write() {
-            files.insert(path.clone(), Arc::from(bytes.into()));
+            files.insert(path.clone(), Arc::clone(&bytes));
+            if !external {
+                if let Some(cache) = external_cache.as_mut()
+                    && let Some(previous) = cache.entries.remove(&path)
+                {
+                    cache.bytes = cache.bytes.saturating_sub(previous);
+                    cache.lru.retain(|entry| entry != &path);
+                    cache.oversized_unread.remove(&path);
+                }
+            }
             self.invalidate_caches();
+        }
+        if external {
+            if let Some(cache) = external_cache.as_mut() {
+                cache.touch(&path, bytes.len());
+                while let Some(evicted) = cache.pop_lru_if_over_capacity() {
+                    if let Ok(mut files) = self.inner.memory_files.write() {
+                        files.remove(&evicted);
+                        self.invalidate_caches();
+                    }
+                }
+            }
         }
         if let Some(path) = catalog_entry
             && let Ok(mut catalog) = self.inner.catalog_paths.write()
@@ -371,6 +518,46 @@ impl ProjectStorage {
 
     pub fn storage_exists(&self, name: &str) -> bool {
         self.resolve_storage(name).is_ok()
+    }
+
+    /// Returns whether a deferred publication catalogue can satisfy a logical
+    /// name even though its bytes have not been fetched. This mirrors the
+    /// ordinary root/basename lookup without claiming that the resource is
+    /// already resident in memory.
+    pub fn catalog_contains(&self, name: &str) -> bool {
+        let normalized = normalize_storage_separators(name);
+        let Ok(catalog) = self.inner.catalog_paths.read() else {
+            return false;
+        };
+        if catalog
+            .values()
+            .any(|path| path.eq_ignore_ascii_case(&normalized))
+        {
+            return true;
+        }
+        let Some((_stem, _extension)) = normalized.rsplit_once('.') else {
+            let matches = catalog.values().filter(|path| {
+                path.rsplit('/')
+                    .next()
+                    .and_then(|file| file.rsplit_once('.'))
+                    .map(|(candidate, _)| candidate.eq_ignore_ascii_case(&normalized))
+                    .unwrap_or(false)
+            });
+            return matches.clone().any(|path| !path.contains('/')) || matches.count() == 1;
+        };
+        // An explicitly extended bare name may use a unique auto-path
+        // basename. Ambiguous basenames remain unresolved; an explicitly
+        // qualified path was already checked above. Do not let `startup.ks`
+        // make `startup.tjs` appear present merely because both share a stem.
+        if normalized.contains('/') {
+            return false;
+        }
+        let mut matches = catalog.values().filter(|path| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|file| file.eq_ignore_ascii_case(&normalized))
+        });
+        matches.next().is_some() && matches.next().is_none()
     }
 
     /// Returns whether a logical directory exists in the filesystem, XP3
@@ -558,7 +745,19 @@ impl ProjectStorage {
         let located = self.resolve_storage(name)?;
         let storage_name = located.storage_name().to_string();
         let encoding_hint = located.encoding_hint();
-        let data = self.load_located_data(&located).map_err(io_error)?;
+        let external_source = located.memory_source_path().map(str::to_owned);
+        let data = match self.load_located_data(&located).map_err(io_error) {
+            Ok(data) => data,
+            Err(error) => {
+                if let Some(path) = external_source.as_deref() {
+                    self.finish_external_read(path);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(path) = external_source {
+            self.finish_external_read(&path);
+        }
         Ok(StorageData {
             storage_name,
             data,
@@ -652,7 +851,13 @@ impl ProjectStorage {
                 })?;
                 provider.open(&entry_name)
             }
-            LocatedResource::Memory { data, .. } => Ok(Box::new(Cursor::new(data.to_vec()))),
+            LocatedResource::Memory {
+                source_path, data, ..
+            } => {
+                let stream = Box::new(Cursor::new(data.to_vec())) as Box<dyn ResourceStream>;
+                self.finish_external_read(&source_path);
+                Ok(stream)
+            }
         }
     }
 
@@ -709,8 +914,10 @@ impl ProjectStorage {
                 continue;
             };
             if let Some(data) = memory_files.get(&normalized) {
+                self.touch_external_memory(&normalized);
                 let storage = LocatedResource::Memory {
                     storage_name: candidate.clone(),
+                    source_path: normalized.clone(),
                     encoding_hint: infer_encoding_from_path(Path::new(candidate)),
                     data: Arc::clone(data),
                 };
@@ -721,8 +928,10 @@ impl ProjectStorage {
                 .iter()
                 .find(|(stored, _)| stored.eq_ignore_ascii_case(&normalized))
             {
+                self.touch_external_memory(stored_path);
                 let storage = LocatedResource::Memory {
                     storage_name: candidate.clone(),
+                    source_path: stored_path.clone(),
                     encoding_hint: infer_encoding_from_path(Path::new(stored_path)),
                     data: Arc::clone(data),
                 };
@@ -759,8 +968,10 @@ impl ProjectStorage {
                 }
             }
             if !ambiguous && let Some((stored_path, data)) = matched {
+                self.touch_external_memory(stored_path);
                 let storage = LocatedResource::Memory {
                     storage_name: candidate.clone(),
+                    source_path: stored_path.clone(),
                     encoding_hint: infer_encoding_from_path(Path::new(stored_path)),
                     data: Arc::clone(data),
                 };
@@ -994,6 +1205,87 @@ impl StoragePort for ProjectStorage {
     }
 }
 
+impl krkr_core::ProjectStoragePort for ProjectStorage {
+    fn storage_exists(&self, name: &str) -> bool {
+        ProjectStorage::storage_exists(self, name)
+    }
+
+    fn is_directory(&self, name: &str) -> bool {
+        ProjectStorage::is_directory(self, name)
+    }
+
+    fn list_directory(&self, name: &str) -> io::Result<Vec<String>> {
+        ProjectStorage::list_directory(self, name)
+    }
+
+    fn placed_path(&self, name: &str) -> Option<String> {
+        ProjectStorage::placed_path(self, name).map(|path| path.display().to_string())
+    }
+
+    fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData> {
+        ProjectStorage::read_binary_storage(self, name).map_err(tjs_error_to_io)
+    }
+
+    fn read_text_storage(&self, name: &str, configured_encoding: &str) -> io::Result<String> {
+        ProjectStorage::read_text_storage(self, name, configured_encoding).map_err(tjs_error_to_io)
+    }
+
+    fn read_text_storage_mode(
+        &self,
+        name: &str,
+        mode: &str,
+        configured_encoding: &str,
+    ) -> io::Result<String> {
+        if let Some(offset) = storage_mode_offset(mode) {
+            let bytes = ProjectStorage::read_binary_vec(self, name).map_err(tjs_error_to_io)?;
+            let offset = usize::try_from(offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "storage offset is too large")
+            })?;
+            let bytes = bytes.get(offset..).unwrap_or_default();
+            decode_text_storage(name, bytes, None, configured_encoding).map_err(tjs_error_to_io)
+        } else {
+            ProjectStorage::read_text_storage(self, name, configured_encoding)
+                .map_err(tjs_error_to_io)
+        }
+    }
+
+    fn write_text_storage(&self, name: &str, mode: &str, text: &str) -> io::Result<()> {
+        ProjectStorage::write_text_storage(self, name, mode, text).map_err(tjs_error_to_io)
+    }
+
+    fn write_binary_storage(&self, name: &str, mode: &str, bytes: &[u8]) -> io::Result<()> {
+        ProjectStorage::write_binary_storage(self, name, mode, bytes).map_err(tjs_error_to_io)
+    }
+
+    fn add_auto_path(&self, path: &str) {
+        ProjectStorage::add_auto_path(self, path);
+    }
+
+    fn remove_auto_path(&self, path: &str) -> bool {
+        ProjectStorage::remove_auto_path(self, path)
+    }
+
+    fn clear_archive_cache(&self) -> io::Result<()> {
+        ProjectStorage::clear_archive_cache(self).map_err(tjs_error_to_io)
+    }
+
+    fn catalog_contains(&self, name: &str) -> bool {
+        ProjectStorage::catalog_contains(self, name)
+    }
+
+    fn set_catalog_paths(&self, paths: &[String]) {
+        ProjectStorage::set_catalog_paths(self, paths.iter().cloned());
+    }
+
+    fn insert_external_memory(&self, path: &str, bytes: Vec<u8>) {
+        ProjectStorage::insert_external_memory(self, path.to_string(), bytes);
+    }
+
+    fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)> {
+        ProjectStorage::drain_memory_writes(self)
+    }
+}
+
 impl LocatedResource {
     fn storage_name(&self) -> &str {
         match self {
@@ -1023,6 +1315,13 @@ impl LocatedResource {
             Self::Fs { path, .. } => RawCacheSource::Fs(path.clone()),
             Self::Xp3 { entry_name, .. } => RawCacheSource::Xp3(entry_name.clone()),
             Self::Memory { storage_name, .. } => RawCacheSource::Memory(storage_name.clone()),
+        }
+    }
+
+    fn memory_source_path(&self) -> Option<&str> {
+        match self {
+            Self::Memory { source_path, .. } => Some(source_path),
+            Self::Fs { .. } | Self::Xp3 { .. } => None,
         }
     }
 }
@@ -1147,7 +1446,7 @@ fn load_fs_resource_data(path: &Path, byte_len: u64) -> io::Result<ResourceData>
     })))
 }
 
-pub(crate) fn project_layers(root: &Path) -> Vec<ProjectLayer> {
+pub fn project_layers(root: &Path) -> Vec<ProjectLayer> {
     let mut layers = Vec::new();
     push_project_layer(
         &mut layers,
@@ -1301,7 +1600,7 @@ pub(crate) fn normalize_auto_path(path: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn decode_text_storage(
+pub fn decode_text_storage(
     _name: &str,
     bytes: &[u8],
     encoding_hint: Option<&'static Encoding>,
@@ -1457,7 +1756,7 @@ fn swap_adjacent_bits(value: u16) -> u16 {
     ((value & 0xaaaa) >> 1) | ((value & 0x5555) << 1)
 }
 
-pub(crate) fn normalize_storage_separators(path: &str) -> String {
+pub fn normalize_storage_separators(path: &str) -> String {
     path.replace('\\', "/")
 }
 
@@ -1506,7 +1805,7 @@ pub(crate) fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(root.join(clean_relative_path(name)?))
 }
 
-pub(crate) fn storage_mode_offset(mode: &str) -> Option<u64> {
+pub fn storage_mode_offset(mode: &str) -> Option<u64> {
     let offset = mode
         .split('o')
         .nth(1)?
@@ -1575,7 +1874,7 @@ pub(crate) fn clean_relative_path(path: &str) -> Result<PathBuf> {
     Ok(clean)
 }
 
-pub(crate) fn io_error(error: io::Error) -> TjsError {
+pub fn io_error(error: io::Error) -> TjsError {
     TjsError::runtime(error.to_string())
 }
 
@@ -1759,6 +2058,45 @@ mod tests {
             vec![("savedata/state.bin".to_string(), b"oXd".to_vec())]
         );
         assert!(storage.drain_memory_writes().is_empty());
+    }
+
+    #[test]
+    fn external_memory_cache_evicts_oldest_entry_and_tracks_bytes() {
+        let mut cache = ExternalMemoryCache::with_capacity(5);
+        cache.touch("first.bin", 3);
+        cache.touch("second.bin", 2);
+        assert_eq!(cache.bytes, 5);
+        cache.touch("third.bin", 2);
+        assert_eq!(cache.bytes, 7);
+        assert_eq!(
+            cache.pop_lru_if_over_capacity().as_deref(),
+            Some("first.bin")
+        );
+        assert_eq!(cache.bytes, 4);
+        assert!(!cache.entries.contains_key("first.bin"));
+        assert_eq!(cache.lru, vec!["second.bin", "third.bin"]);
+
+        // Reads move a resident resource to the MRU end before the next
+        // eviction, preserving useful assets under a bounded cache.
+        cache.lru.retain(|path| path != "second.bin");
+        cache.lru.push_back("second.bin".to_string());
+        cache.touch("fourth.bin", 3);
+        assert_eq!(
+            cache.pop_lru_if_over_capacity().as_deref(),
+            Some("third.bin")
+        );
+        assert_eq!(cache.bytes, 5);
+        assert!(cache.entries.contains_key("second.bin"));
+        assert!(cache.entries.contains_key("fourth.bin"));
+
+        // An individual resource larger than the budget is retained only
+        // until its first read, then released without blocking the retry.
+        let mut large = ExternalMemoryCache::with_capacity(5);
+        large.touch("movie.bin", 8);
+        assert!(large.pop_lru_if_over_capacity().is_none());
+        assert!(large.finish_read("MOVIE.BIN"));
+        assert_eq!(large.bytes, 0);
+        assert!(large.entries.is_empty());
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

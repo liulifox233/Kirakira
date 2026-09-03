@@ -74,7 +74,7 @@ fn construct_native_instance(
         runtime.set_object_super_class(handle, class_handle);
     }
     // WaveSoundBuffer and VideoOverlay keep their native methods on the class
-    // object only: script subclasses override `open`/`play`/`stop` (GINKA's
+    // object only: script subclasses override `open`/`play`/`stop` (a game's
     // Movie extends VideoOverlay) and forward with `SUPER.*()`, so installing
     // the natives directly on each instance would shadow those overrides.
     if !matches!(spec.name, "WaveSoundBuffer" | "VideoOverlay") {
@@ -83,7 +83,7 @@ fn construct_native_instance(
     }
     // These are native events, not instance method implementations. Keeping
     // Layer's placeholders on the instance shadows overrides supplied by
-    // script base classes (notably MessageLayer.onPaint, which drives GINKA's
+    // script base classes (notably MessageLayer.onPaint, which drives a game's
     // message renderer). Leave the no-op declarations on the Layer class for
     // `SUPER.*()` calls, but let normal member lookup reach script overrides
     // on each instance.
@@ -2540,6 +2540,9 @@ fn apply_layer_load_geometry(
     }
     if let Some(opacity) = request.opacity {
         layer.opacity = opacity.clamp(0, 255) as u8;
+    }
+    if let Some(z_order) = request.z_order {
+        layer.z_order = z_order;
     }
 }
 
@@ -5354,10 +5357,10 @@ fn layer_font_spec(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Resu
     }
 }
 
-/// Read a font attribute through the TJS dispatch path.  GINKA wraps the
+/// Read a font attribute through the TJS dispatch path. A game may wrap the
 /// layer font in a script `FontHook` whose `face`/`height`/style members are
 /// TJS properties forwarding to the real native font; a raw member read would
-/// see the property object itself and fall back to defaults (GINKA's ruby was
+/// see the property object itself and fall back to defaults (script ruby was
 /// drawn at the base font height because of this).
 fn resolve_font_member(
     runtime: &mut Runtime<KrkrHost>,

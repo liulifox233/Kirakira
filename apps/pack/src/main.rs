@@ -2,7 +2,7 @@ use std::{env, io, path::PathBuf};
 
 use krkr_assets::pack_web_directory_with_entry;
 
-const USAGE: &str = "usage: krkr-pack <input> <output> [--entry <scenario>] [--extract-xp3]";
+const USAGE: &str = "usage: krkr-pack <input> <output> [--entry <scenario>]";
 
 fn main() -> io::Result<()> {
     let mut args = env::args_os().skip(1);
@@ -14,11 +14,9 @@ fn main() -> io::Result<()> {
         .next()
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, USAGE))?;
-    let mut extract_xp3 = false;
     let mut entry = None;
     while let Some(flag) = args.next() {
         match flag.to_string_lossy().as_ref() {
-            "--extract-xp3" => extract_xp3 = true,
             "--entry" => {
                 let value = args.next().ok_or_else(|| {
                     io::Error::new(
@@ -34,7 +32,10 @@ fn main() -> io::Result<()> {
         }
     }
     let entry = entry.as_deref().map(|value| value.to_string_lossy());
-    let manifest = pack_web_directory_with_entry(input, output, extract_xp3, entry.as_deref())?;
+    // Static Web deployments cannot seek into native XP3 archives. Always
+    // materialize their members as semantic files; the CDN remains
+    // responsible for compression and caching.
+    let manifest = pack_web_directory_with_entry(input, output, entry.as_deref())?;
     println!(
         "published Web v1 semantic package with {} assets{}",
         manifest.entries.len(),

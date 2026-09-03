@@ -436,8 +436,8 @@ impl WebRuntime {
         // still be suspended while one of its lazy scripts is being fetched.
         // Do not inject a host-selected scenario into that suspended VM: the
         // desktop host would finish startup first, and game scripts (such as
-        // GINKA's KAGWindow) may create and drive their own KAG parser during
-        // that continuation.
+        // game scripts may create and drive their own KAG parser during that
+        // continuation.
         if self.session.engine().is_script_suspended()
             || self
                 .session
@@ -519,6 +519,13 @@ impl WebRuntime {
         base_url: String,
         manifest: WebManifest,
     ) -> Result<(), wasm_bindgen::JsValue> {
+        // A package switch is a new runtime session. Do not deliver input or
+        // deferred scenario commands queued for the previous game into the
+        // replacement engine.
+        self.pending_events.clear();
+        self.pending_text.clear();
+        self.pending_scenario = None;
+        self.last_timestamp_ms = None;
         let manifest_entry_count = manifest.entries.len();
         let mut files = Vec::new();
         web_log(format!(
@@ -571,9 +578,31 @@ impl WebRuntime {
             .iter()
             .flat_map(|(key, entry)| [key.clone(), entry.path.clone()]);
         let storage =
-            krkr_engine::ProjectStorage::from_memory_with_catalog(files.clone(), catalog_paths);
+            krkr_assets::ProjectStorage::from_memory_with_catalog(files.clone(), catalog_paths);
+        let viewport_width = self.viewport_width.round().max(1.0) as i64;
+        let viewport_height = self.viewport_height.round().max(1.0) as i64;
         let mut engine = KrkrEngine::new(krkr_engine::EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(std::sync::Arc::new(storage)),
+            system_paths: krkr_engine::SystemPaths {
+                // These are logical virtual paths, never host filesystem
+                // paths. Save writes are routed through WebSaveStore.
+                exe_path: "./".to_string(),
+                data_path: "savedata/".to_string(),
+                personal_path: "savedata/".to_string(),
+                app_data_path: "savedata/".to_string(),
+            },
+            system_metrics: krkr_engine::SystemMetrics {
+                screen_width: viewport_width,
+                screen_height: viewport_height,
+                desktop_left: 0,
+                desktop_top: 0,
+                desktop_width: viewport_width,
+                desktop_height: viewport_height,
+            },
+            // The browser shell owns presentation through HTMLVideoElement;
+            // injecting the Web capability profile keeps backend selection
+            // outside krkr-engine even though decoder creation is bypassed.
+            video_factory: std::sync::Arc::new(krkr_video::PlatformVideoFactory),
             ..krkr_engine::EngineConfig::default()
         })
         .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
@@ -678,10 +707,13 @@ impl WebRuntime {
         })
     }
 
-    pub fn notify_video_ended(&mut self, storage: String) -> Result<(), wasm_bindgen::JsValue> {
+    pub fn notify_video_ended(&mut self, id: String) -> Result<(), wasm_bindgen::JsValue> {
+        let id = id.parse::<u64>().map_err(|_| {
+            wasm_bindgen::JsValue::from_str(&format!("invalid video overlay id: {id}"))
+        })?;
         self.session
             .engine_mut()
-            .notify_video_ended(&storage)
+            .notify_video_ended(id)
             .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))
     }
 
@@ -737,6 +769,18 @@ impl WebRuntime {
     pub fn resize(&mut self, width: f32, height: f32) {
         self.viewport_width = width.max(1.0);
         self.viewport_height = height.max(1.0);
+        let width = self.viewport_width.round() as i64;
+        let height = self.viewport_height.round() as i64;
+        self.session
+            .engine_mut()
+            .set_system_metrics(krkr_engine::SystemMetrics {
+                screen_width: width,
+                screen_height: height,
+                desktop_left: 0,
+                desktop_top: 0,
+                desktop_width: width,
+                desktop_height: height,
+            });
         let physical_size = self.physical_viewport_size();
         if let Some(renderer) = &mut self.renderer {
             renderer.resize(physical_size, self.device_pixel_ratio);
@@ -973,6 +1017,11 @@ impl WebRuntime {
             }
         }
         let output = &frame.engine.output;
+        // FrameInput is the authoritative logical canvas for the Web shell.
+        // Script-created Window sizes describe application state, not a DOM
+        // surface; using them here would letterbox layers against a stale
+        // 960x600 default.
+        let content_size = krkr_core::Size::new(self.viewport_width, self.viewport_height);
         let tree_draw_count = self
             .session
             .engine()
@@ -982,6 +1031,7 @@ impl WebRuntime {
             .0
             .len();
         if let Some(renderer) = &mut self.renderer {
+            renderer.set_content_size(Some(content_size));
             renderer
                 .render(output)
                 .map_err(|error| wasm_bindgen::JsValue::from_str(&error.to_string()))?;
@@ -996,6 +1046,8 @@ impl WebRuntime {
         )
         .map_err(|error| error)?;
         set_num(&model, "treeDrawCommands", tree_draw_count as f64)?;
+        set_num(&model, "contentWidth", content_size.width as f64)?;
+        set_num(&model, "contentHeight", content_size.height as f64)?;
         js_sys::Reflect::set(
             &model,
             &wasm_bindgen::JsValue::from_str("imageUploads"),
@@ -1328,6 +1380,9 @@ impl WebRuntime {
         for video in self.session.engine_mut().video_overlay_snapshots() {
             let item = js_sys::Object::new();
             set_str(&item, "kind", "video")?;
+            // Preserve exact object identity even after a long-running
+            // session crosses JavaScript Number's safe-integer range.
+            set_str(&item, "id", &video.id.to_string())?;
             if let Some(storage) = video.storage {
                 set_str(&item, "storage", &storage)?;
             }
@@ -1785,18 +1840,8 @@ impl AssetScheduler for WebResourceStore {
             AssetKind::Text => "script",
             AssetKind::Font | AssetKind::Media | AssetKind::Binary => "binary",
         };
-        // A Layer image load first probes the logical storage through the
-        // binary reader before asking the decoder for an Image request. If an
-        // extensionless stem has both a sidecar (`.asd`) and an image
-        // (`.png`), prefer the image for that ambiguous probe; otherwise the
-        // sidecar bytes get cached under the shared logical name and the
-        // decoder can never recover.
         let kind_entry = self.manifest.entry_for_kind(&normalized, manifest_kind);
-        let image_fallback = (kind == AssetKind::Binary)
-            .then(|| self.manifest.entry_for_kind(&normalized, "image"))
-            .flatten();
-        let fallback = image_fallback.or(kind_entry);
-        let Some(entry) = fallback
+        let Some(entry) = kind_entry
             .or_else(|| self.manifest.entry(&normalized))
             .cloned()
         else {

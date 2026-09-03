@@ -15,5 +15,6 @@ krkr-engine.workspace = true
 krkr-kag.workspace = true
 krkr-plugins.workspace = true
 krkr-tjs2.workspace = true
+krkr-video.workspace = true
 terminal_size.workspace = true
 icy_sixel.workspace = true

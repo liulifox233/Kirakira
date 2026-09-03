@@ -13,6 +13,7 @@ krkr-core.workspace = true
 krkr-engine.workspace = true
 krkr-plugins.workspace = true
 krkr-render = { workspace = true, default-features = false }
+krkr-video.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys.workspace = true

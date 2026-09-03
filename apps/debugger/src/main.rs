@@ -64,15 +64,15 @@ mod snapshot;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use krkr_assets::NativeAssetStore;
+use krkr_assets::{NativeAssetStore, ProjectStorage};
 use krkr_audio::VirtualAudioSink;
 use krkr_core::{
     AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, Point,
     PointerButton, Size,
 };
 use krkr_engine::{
-    EngineConfig, EngineInput, KagTaskState, KrkrEngine, ProjectStorage, RuntimeSession,
-    SystemPaths, TransitionPolicy,
+    EngineConfig, EngineInput, KagTaskState, KrkrEngine, RuntimeSession, SystemPaths,
+    TransitionPolicy,
 };
 use krkr_tjs2::runtime::Variant;
 use snapshot::TextureCache;
@@ -225,8 +225,9 @@ fn main() {
 
     let storage = ProjectStorage::for_root(&root).expect("storage");
     let mut engine = KrkrEngine::new(EngineConfig {
-        project_storage: Some(storage),
+        project_storage: Some(Arc::new(storage)),
         system_paths: system_paths_for_project(&root),
+        video_factory: std::sync::Arc::new(krkr_video::PlatformVideoFactory),
         ..EngineConfig::default()
     })
     .expect("engine");
@@ -350,17 +351,11 @@ fn main() {
                 println!("audio completion error: {error}");
             }
         }
-        if !config.realtime {
-            runtime
-                .engine_mut()
-                .host_mut()
-                .advance_clock(delta.mul_f64(config.time_scale));
-        } else if config.time_scale > 1.0 {
-            runtime
-                .engine_mut()
-                .host_mut()
-                .advance_clock(delta.mul_f64(config.time_scale - 1.0));
-        }
+        // RuntimeSession advances its injected VirtualClock at the frame
+        // boundary. Keeping clock ownership there avoids the old split-brain
+        // behavior where this host advanced one clock and RuntimeSession then
+        // overwrote it with a stale zero timestamp.
+        let frame_delta = delta.mul_f64(config.time_scale.max(0.0));
         let mut events = Vec::new();
         for (click_frame, position) in &config.clicks {
             if frame_index == *click_frame {
@@ -388,10 +383,10 @@ fn main() {
         }
         match runtime.update(
             EngineInput::new(
-                FrameInput::new(Size::new(1280.0, 720.0), 1.0 / 60.0),
+                FrameInput::new(Size::new(1280.0, 720.0), frame_delta.as_secs_f32()),
                 events,
             ),
-            delta,
+            frame_delta,
         ) {
             Ok(runtime_frame) => {
                 let frame = runtime_frame.engine;

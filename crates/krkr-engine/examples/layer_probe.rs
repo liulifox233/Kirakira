@@ -1,10 +1,11 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use krkr_assets::ProjectStorage;
 use krkr_core::{
     ButtonState, DrawCommand, EngineEvent, EngineKey, FrameInput, ImageCommand, ImageUpload, Point,
     PointerButton, Size,
 };
-use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, ProjectStorage, SystemPaths};
+use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, SystemPaths};
 
 type AlphaBounds = (u32, u32, u32, u32);
 type RgbaStats = (usize, u64, usize, Option<AlphaBounds>);
@@ -34,7 +35,7 @@ fn main() {
 
     let storage = ProjectStorage::for_root(&root).expect("storage");
     let mut engine = KrkrEngine::new(EngineConfig {
-        project_storage: Some(storage),
+        project_storage: Some(Arc::new(storage)),
         system_paths: SystemPaths {
             exe_path: format!("{}/", root.display()),
             ..SystemPaths::default()

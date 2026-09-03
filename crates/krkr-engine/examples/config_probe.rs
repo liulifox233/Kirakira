@@ -1,10 +1,12 @@
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use krkr_assets::ProjectStorage;
 use krkr_core::{FrameInput, Size};
-use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, ProjectStorage, SystemPaths};
+use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, SystemPaths};
 use krkr_tjs2::runtime::Variant;
 
 fn main() {
@@ -21,7 +23,7 @@ fn main() {
 
     let storage = ProjectStorage::for_root(&root).expect("storage");
     let mut engine = KrkrEngine::new(EngineConfig {
-        project_storage: Some(storage),
+        project_storage: Some(Arc::new(storage)),
         system_paths: SystemPaths {
             exe_path: format!("{}/", root.display()),
             ..SystemPaths::default()

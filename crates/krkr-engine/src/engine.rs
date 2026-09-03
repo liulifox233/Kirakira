@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use krkr_core::ProjectStoragePort;
 use krkr_core::{
     AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, ButtonState, Color,
     Engine as CoreEngine, EngineConfig as CoreEngineConfig, EngineEvent, EngineKey, FrameInput,
@@ -15,6 +17,10 @@ use krkr_tjs2::{
     debug::Pause,
     runtime::{ObjectHandle, Runtime, Variant},
 };
+use krkr_video::{UnavailableVideoFactory, VideoDecoderFactory};
+
+#[cfg(test)]
+use krkr_assets::ProjectStorage;
 
 use crate::{
     globals::install_tvp_globals,
@@ -91,16 +97,31 @@ impl Default for KagRunBudget {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Storage is created by the platform shell and injected into the engine.
     /// The engine never discovers a project path or opens the process current
     /// directory itself.
-    pub project_storage: Option<crate::ProjectStorage>,
+    pub project_storage: Option<Arc<dyn ProjectStoragePort>>,
     /// Host-provided logical paths exposed through the KRKR `System` object.
     pub system_paths: SystemPaths,
     pub kag_budget: KagRunBudget,
     pub system_metrics: SystemMetrics,
+    /// Host-owned video decoder capability. Web supplies a DOM overlay and
+    /// native shells select their OS framework without engine-side cfg paths.
+    pub video_factory: Arc<dyn VideoDecoderFactory>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            project_storage: None,
+            system_paths: SystemPaths::default(),
+            kag_budget: KagRunBudget::default(),
+            system_metrics: SystemMetrics::default(),
+            video_factory: Arc::new(UnavailableVideoFactory),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,8 +271,15 @@ pub struct KrkrEngine {
 impl KrkrEngine {
     pub fn new(config: EngineConfig) -> Result<Self> {
         let host = match config.project_storage {
-            Some(storage) => KrkrHost::from_storage(storage, config.system_paths)?,
-            None => KrkrHost::with_system_paths(config.system_paths),
+            Some(storage) => KrkrHost::from_storage_port(
+                storage,
+                config.system_paths,
+                Arc::clone(&config.video_factory),
+            )?,
+            None => KrkrHost::with_system_paths_and_video_factory(
+                config.system_paths,
+                Arc::clone(&config.video_factory),
+            ),
         };
         let mut tjs_runtime = Runtime::with_host(host);
         install_tvp_globals(&mut tjs_runtime);
@@ -272,13 +300,16 @@ impl KrkrEngine {
 
     #[cfg(test)]
     fn for_project(root: &std::path::Path) -> Result<Self> {
-        let storage = crate::ProjectStorage::for_root(root)?;
+        let storage = ProjectStorage::for_root(root)?;
         Self::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             system_paths: SystemPaths {
                 exe_path: format!("{}/", root.display()),
                 ..SystemPaths::default()
             },
+            // Test projects exercise the same host-selected native backend as
+            // the desktop shell; production engine defaults stay inert.
+            video_factory: Arc::new(krkr_video::PlatformVideoFactory),
             ..EngineConfig::default()
         })
     }
@@ -310,6 +341,13 @@ impl KrkrEngine {
         let height = object_positive_i64(&self.tjs_runtime, window, "innerHeight")
             .or_else(|| object_positive_i64(&self.tjs_runtime, window, "height"))?;
         Some(Size::new(width as f32, height as f32))
+    }
+
+    /// Updates the host-provided System screen metrics after a window/canvas
+    /// resize. Platform shells own the actual viewport; scripts only observe
+    /// this synchronized snapshot.
+    pub fn set_system_metrics(&mut self, metrics: SystemMetrics) {
+        install_system_metrics(&mut self.tjs_runtime, metrics);
     }
 
     pub fn persist_runtime_state(&mut self) -> Result<()> {
@@ -780,16 +818,10 @@ impl KrkrEngine {
     /// Completes a browser-owned media element and mirrors its `ended` event
     /// into the native overlay conductor. Desktop decoders reach the same
     /// path from `tick_video_overlays`; Web media elements call this hook.
-    pub fn notify_video_ended(&mut self, storage: &str) -> Result<()> {
+    pub fn notify_video_ended(&mut self, id: u64) -> Result<()> {
         let handles = self.tjs_runtime.host().video_overlay_handles();
         for handle in handles {
-            let matches_storage = self
-                .tjs_runtime
-                .host()
-                .video_overlay_state(handle)
-                .and_then(|state| state.storage.as_deref())
-                .is_some_and(|value| value.eq_ignore_ascii_case(storage));
-            if matches_storage && self.tjs_runtime.object_valid(handle) {
+            if handle.0 as u64 == id && self.tjs_runtime.object_valid(handle) {
                 self.tjs_runtime
                     .call_object_method(handle, "stop", Vec::new())?;
             }
@@ -1500,7 +1532,7 @@ impl KrkrEngine {
                     self.dispatch_window_pointer_event("onMouseUp", 0)?;
                     let release_hit = self.interactive_layer_at_cursor()?;
                     // The click handler can invalidate/rebuild its layer
-                    // (GINKA's title Start does exactly that). Determine
+                    // (many title Start handlers do exactly that). Determine
                     // ownership while the original target is still alive;
                     // querying afterwards turns a handled click into an
                     // erroneous KAG click-through.
@@ -4070,6 +4102,8 @@ fn apply_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<bool> {
         width: tag_i64(tag, "width")?,
         height: tag_i64(tag, "height")?,
         opacity: tag_i64(tag, "opacity")?,
+        z_order: tag_i64(tag, "zorder")?
+            .map(|value| value.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
     };
     match runtime.host_mut().request_image_load(request.clone())? {
         ImageLoadState::Ready(mut completion) => {
@@ -4137,6 +4171,7 @@ fn apply_title_image_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<b
         width: tag_i64(tag, "width")?,
         height: tag_i64(tag, "height")?,
         opacity: tag_i64(tag, "opacity")?,
+        z_order: Some(zorder.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
     };
     runtime.host_mut().log(&format!(
         "KAG title image request tag={} storage={} page={} layer={} zorder={}",
@@ -4287,6 +4322,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use krkr_assets::ProjectStorage;
     use krkr_core::Size;
     use krkr_kag::{Attribute, AttributeValue};
     use krkr_tjs2::{
@@ -5239,9 +5275,9 @@ mod tests {
 
     #[test]
     fn external_resource_pending_suspends_and_resumes_tjs_instruction() {
-        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let storage = ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             ..EngineConfig::default()
         })
         .expect("engine");
@@ -5273,12 +5309,12 @@ mod tests {
 
     #[test]
     fn kag_parser_retries_expanded_call_after_remote_storage_arrives() {
-        let storage = crate::ProjectStorage::from_memory([(
+        let storage = ProjectStorage::from_memory([(
             "first.ks",
             b"[emb escape=false exp=global.generated]\n".to_vec(),
         )]);
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             ..EngineConfig::default()
         })
         .expect("engine");
@@ -5368,9 +5404,9 @@ mod tests {
 
     #[test]
     fn nested_exec_storage_resumes_outer_script_after_remote_child() {
-        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let storage = ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             ..EngineConfig::default()
         })
         .expect("engine");
@@ -5403,9 +5439,9 @@ mod tests {
 
     #[test]
     fn deeply_nested_exec_storage_preserves_all_callers() {
-        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let storage = ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             ..EngineConfig::default()
         })
         .expect("engine");
@@ -5443,9 +5479,9 @@ mod tests {
 
     #[test]
     fn nested_exec_storage_inside_helper_preserves_helper_callers() {
-        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let storage = ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             ..EngineConfig::default()
         })
         .expect("engine");
@@ -5481,9 +5517,9 @@ mod tests {
 
     #[test]
     fn async_lazy_property_getter_retries_after_remote_script_load() {
-        let storage = crate::ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let storage = ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             ..EngineConfig::default()
         })
         .expect("engine");
@@ -5535,12 +5571,12 @@ mod tests {
 
     #[test]
     fn kag_scenario_jump_waits_for_remote_storage() {
-        let storage = crate::ProjectStorage::from_memory([(
+        let storage = ProjectStorage::from_memory([(
             "startup.ks",
             b"*start\n[jump storage=lazy.ks target=*start]".to_vec(),
         )]);
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             ..EngineConfig::default()
         })
         .expect("engine");
@@ -6000,7 +6036,7 @@ mod tests {
         // KRKR2 semantics: a script subclass overriding a Layer property with
         // a TJS property getter/setter only shadows it for script access; the
         // native render/hit-test node keeps the value set through the native
-        // setter.  GINKA's world system (AffineLayer) overrides left/top/width/
+        // setter.  A game's world system (AffineLayer) may override left/top/width/
         // height with world-space computed values that must never move the
         // native layer, while its ButtonLayer overrides hitThreshold with a
         // script-side value that likewise stays script-side.
@@ -7223,9 +7259,9 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         fs::write(root.join("first.ks"), "ABC[p]").expect("write scenario");
 
-        let storage = crate::ProjectStorage::for_root(&root).expect("storage");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             system_paths: SystemPaths {
                 exe_path: format!("{}/", root.display()),
                 ..SystemPaths::default()
@@ -14484,9 +14520,9 @@ mod tests {
     }
 
     fn image_test_engine(root: &Path) -> KrkrEngine {
-        let storage = crate::ProjectStorage::for_root(root).expect("storage");
+        let storage = ProjectStorage::for_root(root).expect("storage");
         KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(Arc::new(storage)),
             system_paths: SystemPaths {
                 exe_path: format!("{}/", root.display()),
                 ..SystemPaths::default()

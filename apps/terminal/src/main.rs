@@ -16,7 +16,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use image::{ImageBuffer, ImageFormat, Rgba};
-use krkr_assets::NativeAssetStore;
+use krkr_assets::{NativeAssetStore, ProjectStorage};
 use krkr_audio::{AudioEvent, AudioSystem};
 use krkr_core::{
     ButtonState, Color, DrawCommand, EngineEvent, EngineKey, FrameInput, ImageCommand, ImageUpload,
@@ -24,7 +24,7 @@ use krkr_core::{
 };
 use krkr_engine::{
     EngineConfig, EngineFrame, EngineInput, KrkrEngine, KrkrHost, NativeTextDrawEvent,
-    ProjectStorage, RuntimeSession, RuntimeSessionError, SystemPaths, TransitionPolicy,
+    RuntimeSession, RuntimeSessionError, SystemPaths, TransitionPolicy,
 };
 use krkr_plugins::register_reference_plugins;
 use terminal_size::{Height, Width, terminal_size};
@@ -147,8 +147,9 @@ impl TerminalApp {
         let storage = ProjectStorage::for_root(project_root.clone())
             .map_err(|error| format!("storage initialization failed: {error}"))?;
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(std::sync::Arc::new(storage)),
             system_paths: system_paths_for_project(&project_root),
+            video_factory: std::sync::Arc::new(krkr_video::PlatformVideoFactory),
             ..EngineConfig::default()
         })
         .map_err(|error| format!("engine initialization failed: {error}"))?;
