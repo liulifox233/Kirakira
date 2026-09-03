@@ -255,10 +255,22 @@ impl ProjectStorage {
         auto_paths: Vec<String>,
         memory_files: BTreeMap<String, Arc<[u8]>>,
     ) -> Self {
-        let catalog_paths = memory_files
+        let mut catalog_paths = memory_files
             .keys()
             .filter_map(|path| catalog_path(path).map(|key| (key, path.clone())))
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        // The native XP3 provider is also a virtual filesystem.  Keep its
+        // complete logical index beside the Web manifest catalogue so KRKR's
+        // auto-path lookup can resolve an unqualified, explicitly named file
+        // (for example `face_0.txt`) without inventing an extension or
+        // choosing an arbitrary duplicate basename.
+        if let Some(provider) = &xp3_provider {
+            for path in provider.entry_names() {
+                if let Some(key) = catalog_path(&path) {
+                    catalog_paths.entry(key).or_insert(path);
+                }
+            }
+        }
         Self {
             inner: Arc::new(ProjectStorageInner {
                 root,
@@ -558,7 +570,7 @@ impl ProjectStorage {
                 return true;
             }
         }
-        false
+        self.catalog_contains(name)
     }
 
     /// Returns whether a deferred publication catalogue can satisfy a logical
@@ -576,21 +588,11 @@ impl ProjectStorage {
         {
             return true;
         }
-        let Some((_stem, _extension)) = normalized.rsplit_once('.') else {
-            let matches = catalog.values().filter(|path| {
-                path.rsplit('/')
-                    .next()
-                    .and_then(|file| file.rsplit_once('.'))
-                    .map(|(candidate, _)| candidate.eq_ignore_ascii_case(&normalized))
-                    .unwrap_or(false)
-            });
-            return matches.clone().any(|path| !path.contains('/')) || matches.count() == 1;
-        };
         // An explicitly extended bare name may use a unique auto-path
         // basename. Ambiguous basenames remain unresolved; an explicitly
         // qualified path was already checked above. Do not let `startup.ks`
         // make `startup.tjs` appear present merely because both share a stem.
-        if normalized.contains('/') {
+        if normalized.contains('/') || !normalized.contains('.') {
             return false;
         }
         let mut matches = catalog.values().filter(|path| {
@@ -981,6 +983,20 @@ impl ProjectStorage {
             }
         }
 
+        // XP3 entries (and deferred manifest entries) are indexed by their
+        // full logical names, but KRKR's auto-path table also exposes a
+        // unique basename.  Resolve only an explicitly named candidate here:
+        // extension selection remains the caller's responsibility.
+        for candidate in &candidates {
+            let Some(alias) = self.catalog_alias(candidate) else {
+                continue;
+            };
+            if let Some(storage) = self.find_catalog_resource(candidate, &alias)? {
+                self.cache_lookup(name, Some(storage.clone()));
+                return Ok(storage);
+            }
+        }
+
         // Remote Web manifests expose unambiguous basename aliases for KRKR's
         // auto-path lookup. Mirror that behavior in the memory overlay so a
         // preloaded `main/Config.tjs` also satisfies `Config.tjs` without a
@@ -1023,6 +1039,64 @@ impl ProjectStorage {
 
         self.cache_lookup(name, None);
         Err(storage_not_found(name))
+    }
+
+    fn catalog_alias(&self, name: &str) -> Option<String> {
+        let normalized = normalize_storage_separators(name);
+        if normalized.contains('/') || !normalized.contains('.') {
+            return None;
+        }
+        let catalog = self.inner.catalog_paths.read().ok()?;
+        let mut matched = None;
+        for path in catalog.values() {
+            if path
+                .rsplit('/')
+                .next()
+                .is_some_and(|basename| basename.eq_ignore_ascii_case(&normalized))
+            {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(path.clone());
+            }
+        }
+        matched
+    }
+
+    fn find_catalog_resource(
+        &self,
+        storage_name: &str,
+        catalog_path: &str,
+    ) -> io::Result<Option<LocatedResource>> {
+        let relative = clean_relative_path(catalog_path).map_err(tjs_error_to_io)?;
+        if let Some(storage) = self.find_fs_candidate(storage_name, &relative)? {
+            return Ok(Some(storage));
+        }
+        if let Some(provider) = &self.inner.xp3_provider
+            && let Some(entry) = provider.get_entry(catalog_path)
+        {
+            return Ok(Some(LocatedResource::Xp3 {
+                storage_name: storage_name.to_string(),
+                entry_name: entry.name.clone(),
+                byte_len: entry.original_size,
+            }));
+        }
+        let Ok(memory_files) = self.inner.memory_files.read() else {
+            return Ok(None);
+        };
+        let Some((stored_path, data)) = memory_files
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(catalog_path))
+        else {
+            return Ok(None);
+        };
+        self.touch_external_memory(stored_path);
+        Ok(Some(LocatedResource::Memory {
+            storage_name: storage_name.to_string(),
+            source_path: stored_path.clone(),
+            encoding_hint: infer_encoding_from_path(Path::new(catalog_path)),
+            data: Arc::clone(data),
+        }))
     }
 
     fn find_fs_candidate(
@@ -1230,7 +1304,7 @@ impl StoragePort for ProjectStorage {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.storage_exists_exact(path)
+        self.storage_exists(path)
     }
 
     fn data(&self, path: &str) -> io::Result<ResourceData> {
@@ -1249,6 +1323,10 @@ impl StoragePort for ProjectStorage {
 impl krkr_core::ProjectStoragePort for ProjectStorage {
     fn storage_exists(&self, name: &str) -> bool {
         ProjectStorage::storage_exists(self, name)
+    }
+
+    fn storage_exists_exact(&self, name: &str) -> bool {
+        ProjectStorage::storage_exists_exact(self, name)
     }
 
     fn is_directory(&self, name: &str) -> bool {
@@ -2106,6 +2184,33 @@ mod tests {
                 "startup.tjs".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn catalog_resolves_unique_explicit_basename_without_stem_guessing() {
+        let storage = ProjectStorage::from_memory_with_catalog(
+            [("fgimage/portrait.txt", b"portrait".to_vec())],
+            ["fgimage/portrait.txt", "fgimage/other.bin"],
+        );
+
+        assert!(storage.storage_exists_exact("portrait.txt"));
+        assert_eq!(
+            storage
+                .read_binary_vec("portrait.txt")
+                .expect("catalog alias"),
+            b"portrait"
+        );
+        assert!(!storage.storage_exists_exact("portrait"));
+
+        let ambiguous = ProjectStorage::from_memory_with_catalog(
+            [
+                ("fgimage/portrait.txt", b"one".to_vec()),
+                ("bgimage/portrait.txt", b"two".to_vec()),
+            ],
+            ["fgimage/portrait.txt", "bgimage/portrait.txt"],
+        );
+        assert!(!ambiguous.storage_exists_exact("portrait.txt"));
+        assert!(ambiguous.read_binary_vec("portrait.txt").is_err());
     }
 
     #[test]

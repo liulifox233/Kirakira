@@ -818,7 +818,7 @@ impl KrkrHost {
     /// arbitrary media/script extension from a stem.
     pub fn storage_exists_exact(&self, name: &str) -> bool {
         self.project_storage.as_ref().is_some_and(|storage| {
-            storage.exists(name)
+            storage.storage_exists_exact(name)
                 || (name.contains(['/', '\\', '>']) && storage.catalog_contains(name))
         }) || self
             .external_resource_catalog

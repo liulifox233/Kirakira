@@ -135,12 +135,22 @@ fn install_csv_parser(runtime: &mut Runtime<KrkrHost>) {
             }
             set_csv_text(runtime, instance, String::new());
             runtime.set_object_member(instance, "__csvFile", Variant::String(String::new()));
-            // new CSVParser(target?, separator?, newline?): only the callback
-            // target is honored; separator/newline stay accepted-but-ignored.
+            // new CSVParser(target?, separator?, newline?): the native KRKR
+            // parser accepts the separator as a character code (the standard
+            // config loaders pass `asc("\t")`).
+            let mut args = args.into_iter();
+            let target = args.next().unwrap_or_default();
+            runtime.set_object_member(instance, "target", target);
+            let separator = args
+                .next()
+                .and_then(|value| value.to_integer().ok())
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|value| *value != 0)
+                .unwrap_or(b',');
             runtime.set_object_member(
                 instance,
-                "target",
-                args.into_iter().next().unwrap_or_default(),
+                "__csvSeparator",
+                Variant::Integer(i64::from(separator)),
             );
             Ok(Variant::Object(instance))
         },
@@ -177,6 +187,14 @@ fn csv_state_integer(runtime: &Runtime<KrkrHost>, this: ObjectHandle, name: &str
         Variant::Integer(value) => value,
         _ => 0,
     }
+}
+
+fn csv_separator(runtime: &Runtime<KrkrHost>, this: ObjectHandle) -> u8 {
+    csv_state_integer(runtime, this, "__csvSeparator")
+        .try_into()
+        .ok()
+        .filter(|value| *value != 0)
+        .unwrap_or(b',')
 }
 
 fn set_csv_text(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle, text: String) {
@@ -232,7 +250,7 @@ fn csv_get_next_line(
     if pos >= text.len() {
         return Ok(Variant::Void);
     }
-    let (fields, next_pos) = parse_csv_record(text.as_bytes(), pos);
+    let (fields, next_pos) = parse_csv_record(text.as_bytes(), pos, csv_separator(runtime, this));
     let line_no = csv_state_integer(runtime, this, "__csvLineNo") + 1;
     runtime.set_object_member(this, "__csvPos", Variant::Integer(next_pos as i64));
     runtime.set_object_member(this, "__csvLineNo", Variant::Integer(line_no));
@@ -297,7 +315,7 @@ fn csv_fire_do_line(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) {
     let mut pos = csv_state_integer(runtime, this, "__csvPos") as usize;
     let mut line_no = csv_state_integer(runtime, this, "__csvLineNo");
     while pos < bytes.len() {
-        let (fields, next_pos) = parse_csv_record(bytes, pos);
+        let (fields, next_pos) = parse_csv_record(bytes, pos, csv_separator(runtime, this));
         pos = next_pos;
         line_no += 1;
         runtime.set_object_member(this, "__csvLineNo", Variant::Integer(line_no));
@@ -363,16 +381,16 @@ fn decode_csv_text(bytes: &[u8]) -> String {
 /// of the next record. All structural characters are ASCII, so byte-level
 /// scanning never splits a UTF-8 sequence. Blank lines yield zero fields and a
 /// trailing newline does not produce an extra record (wtnbgo behavior).
-fn parse_csv_record(bytes: &[u8], mut pos: usize) -> (Vec<String>, usize) {
+fn parse_csv_record(bytes: &[u8], mut pos: usize, separator: u8) -> (Vec<String>, usize) {
     let mut fields = Vec::new();
     if is_eol(bytes, pos) {
         return (fields, skip_eol(bytes, pos));
     }
     loop {
-        let (field, next_pos) = parse_csv_field(bytes, pos);
+        let (field, next_pos) = parse_csv_field(bytes, pos, separator);
         fields.push(field);
         pos = next_pos;
-        if pos < bytes.len() && bytes[pos] == b',' {
+        if pos < bytes.len() && bytes[pos] == separator {
             pos += 1;
         } else {
             return (fields, skip_eol(bytes, pos));
@@ -380,7 +398,7 @@ fn parse_csv_record(bytes: &[u8], mut pos: usize) -> (Vec<String>, usize) {
     }
 }
 
-fn parse_csv_field(bytes: &[u8], mut pos: usize) -> (String, usize) {
+fn parse_csv_field(bytes: &[u8], mut pos: usize, separator: u8) -> (String, usize) {
     if pos < bytes.len() && bytes[pos] == b'"' {
         pos += 1;
         let mut field = Vec::new();
@@ -393,7 +411,7 @@ fn parse_csv_field(bytes: &[u8], mut pos: usize) -> (String, usize) {
                     // wtnbgo: characters after the closing quote up to the
                     // separator are still appended to the field.
                     pos += 1;
-                    while pos < bytes.len() && bytes[pos] != b',' && !is_eol(bytes, pos) {
+                    while pos < bytes.len() && bytes[pos] != separator && !is_eol(bytes, pos) {
                         field.push(bytes[pos]);
                         pos += 1;
                     }
@@ -407,7 +425,7 @@ fn parse_csv_field(bytes: &[u8], mut pos: usize) -> (String, usize) {
         (String::from_utf8_lossy(&field).into_owned(), pos)
     } else {
         let start = pos;
-        while pos < bytes.len() && bytes[pos] != b',' && !is_eol(bytes, pos) {
+        while pos < bytes.len() && bytes[pos] != separator && !is_eol(bytes, pos) {
             pos += 1;
         }
         (
@@ -1019,6 +1037,41 @@ mod tests {
             .expect("CSV parser state should be visible after resume");
         assert_eq!(file, Variant::String("title_first.func".to_owned()));
 
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn csv_parser_honors_constructor_separator() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kirakira-packinone-csv-separator-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create project root");
+
+        let mut engine = test_engine(&root);
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var parser = new CSVParser(void, 9);
+                    parser.init("name\tvalue\r\nsoldier\tfront");
+                    var first = parser.getNextLine();
+                    var second = parser.getNextLine();
+                    return first.count + ":" + first[0] + ":" + first[1] + ":" +
+                        second.count + ":" + second[0] + ":" + second[1];
+                })()"#,
+            )
+            .expect("parse tab-separated records");
+
+        assert_eq!(
+            value,
+            Variant::String("2:name:value:2:soldier:front".to_owned())
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -5811,6 +5811,35 @@ mod tests {
     }
 
     #[test]
+    fn native_menu_item_constructor_preserves_script_click_handlers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "menu_item_override.tjs",
+                r#"
+                global.trace = "";
+                class KAGMenuItem extends MenuItem {
+                    function KAGMenuItem(owner, caption) {
+                        super.MenuItem(owner, caption);
+                    }
+                    function click() { global.trace += "C"; }
+                    function onClick() {
+                        super.onClick(...);
+                        global.trace += "O";
+                        click();
+                    }
+                }
+                var item = new KAGMenuItem(global, "History");
+                item.click();
+                item.onClick();
+                return global.trace;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("COC".to_string()));
+    }
+
+    #[test]
     fn native_timer_empty_finalize_is_visible_to_script_subclasses() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let value = engine
