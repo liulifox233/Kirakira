@@ -94,7 +94,8 @@ fn storages_exists(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let exists = arg_string(&args, 0)?.is_some_and(|name| runtime.host().storage_exists(&name));
+    let exists =
+        arg_string(&args, 0)?.is_some_and(|name| runtime.host().storage_exists_exact(&name));
     Ok(Variant::Integer(i64::from(exists)))
 }
 

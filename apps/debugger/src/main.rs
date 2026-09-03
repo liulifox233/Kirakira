@@ -383,7 +383,13 @@ fn main() {
         }
         match runtime.update(
             EngineInput::new(
-                FrameInput::new(Size::new(1280.0, 720.0), frame_delta.as_secs_f32()),
+                FrameInput::new(
+                    runtime
+                        .engine()
+                        .content_viewport_size()
+                        .unwrap_or(Size::new(1280.0, 720.0)),
+                    frame_delta.as_secs_f32(),
+                ),
                 events,
             ),
             frame_delta,

@@ -121,11 +121,34 @@ fn load_psb_storage(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle, storage
                     return false;
                 }
             };
+            mount_psb_resources(runtime, storage, &root);
             let root = psb_value_to_variant(runtime, &root, true);
             runtime.set_object_member(this, "root", root);
             true
         }
         Err(_) => false,
+    }
+}
+
+fn mount_psb_resources(runtime: &mut Runtime<KrkrHost>, storage: &str, root: &PsbValue) {
+    let PsbValue::Object(entries) = root else {
+        return;
+    };
+    let basename = storage
+        .rsplit(['/', '\\', '>'])
+        .next()
+        .unwrap_or(storage)
+        .to_lowercase();
+    for (name, value) in entries {
+        let PsbValue::Octet(bytes) = value else {
+            continue;
+        };
+        let path = format!("psb://{basename}/{name}");
+        if let Err(error) = runtime.host().mount_virtual_resource(&path, bytes.clone()) {
+            runtime
+                .host_mut()
+                .log(&format!("psbfile: failed to mount `{path}`: {error}"));
+        }
     }
 }
 

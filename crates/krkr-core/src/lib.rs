@@ -225,6 +225,11 @@ pub trait ProjectStoragePort: StoragePort {
     /// resident memory files owned by this storage view.
     fn set_catalog_paths(&self, paths: &[String]);
 
+    /// Mounts a resident virtual file in the project namespace. Unlike an
+    /// externally fetched resource, these bytes stay available until they are
+    /// replaced or the storage view is discarded.
+    fn insert_memory(&self, path: &str, bytes: Vec<u8>);
+
     fn insert_external_memory(&self, path: &str, bytes: Vec<u8>);
 
     fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)>;
