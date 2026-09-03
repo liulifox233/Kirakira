@@ -51,10 +51,22 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
         ("versionString", Variant::String("Kirakira".to_string())),
         ("platformName", Variant::String("Kirakira".to_string())),
         ("osName", Variant::String(std::env::consts::OS.to_string())),
-        ("exePath", Variant::String(exe_path(runtime))),
-        ("dataPath", Variant::String(data_path(runtime))),
-        ("personalPath", Variant::String(temp_path())),
-        ("appDataPath", Variant::String(temp_path())),
+        (
+            "exePath",
+            Variant::String(runtime.host().system_paths().exe_path.clone()),
+        ),
+        (
+            "dataPath",
+            Variant::String(runtime.host().system_paths().data_path.clone()),
+        ),
+        (
+            "personalPath",
+            Variant::String(runtime.host().system_paths().personal_path.clone()),
+        ),
+        (
+            "appDataPath",
+            Variant::String(runtime.host().system_paths().app_data_path.clone()),
+        ),
         ("eventDisabled", Variant::Integer(0)),
         ("graphicCacheLimit", Variant::Integer(0)),
         ("exitOnWindowClose", Variant::Integer(1)),
@@ -76,58 +88,6 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     }
     let version_info = runtime.alloc_ordinary_object();
     runtime.set_object_member(system, "versionInformation", Variant::Object(version_info));
-}
-
-fn exe_path(runtime: &Runtime<KrkrHost>) -> String {
-    runtime
-        .host()
-        .project_root()
-        .map(|path| {
-            let display = path.display().to_string();
-            format!("{}/", display.trim_end_matches('/'))
-        })
-        .unwrap_or_default()
-}
-
-fn data_path(runtime: &Runtime<KrkrHost>) -> String {
-    // krkr2 exposes an absolute Windows path here (containing a drive colon),
-    // and KAGWindow's setup only prepends `System.exePath` when the value has
-    // no colon.  An absolute POSIX path never contains a colon, so the script
-    // would mangle it into `<root>/<root>/savedata/...`.  Returning the
-    // project-relative form keeps that heuristic working.
-    let Some(path) = runtime.host().data_path() else {
-        // Browser projects have no native root, but their persistent storage
-        // still lives under the same relative KRKR data path. Keeping this
-        // relative is what lets ProjectStorage's memory overlay capture
-        // `datasu.ksd` instead of attempting to write `/datasu.ksd`.
-        #[cfg(target_arch = "wasm32")]
-        return "savedata/".to_string();
-        #[cfg(not(target_arch = "wasm32"))]
-        return temp_path();
-    };
-
-    // Preserve the native Windows contract: KRKR2 exposes an absolute path
-    // there, and its drive colon already prevents KAGWindow from prepending
-    // `exePath`.  POSIX absolute paths need the relative spelling above for
-    // that Windows-oriented script heuristic to work.
-    if cfg!(windows) {
-        let display = path.display().to_string();
-        format!("{}\\", display.trim_end_matches(['/', '\\']))
-    } else {
-        "savedata/".to_string()
-    }
-}
-
-fn temp_path() -> String {
-    #[cfg(target_arch = "wasm32")]
-    {
-        // WASM has no process filesystem. Keep the TVP path contract stable
-        // with a virtual root; browser hosts can map writes to IndexedDB or a
-        // downloaded save package later.
-        return "/".to_string();
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    format!("{}/", std::env::temp_dir().display())
 }
 
 fn system_exit(

@@ -4,7 +4,7 @@ use std::{
 };
 
 use krkr_core::{FrameInput, Size};
-use krkr_engine::{EngineInput, KrkrEngine};
+use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, ProjectStorage, SystemPaths};
 use krkr_tjs2::runtime::Variant;
 
 fn main() {
@@ -19,7 +19,16 @@ fn main() {
     let repeats = env_usize("KRKR_CONFIG_PROBE_REPEATS").unwrap_or(1);
     let delta = Duration::from_millis(1000 / 60);
 
-    let mut engine = KrkrEngine::for_project(&root).expect("engine");
+    let storage = ProjectStorage::for_root(&root).expect("storage");
+    let mut engine = KrkrEngine::new(EngineConfig {
+        project_storage: Some(storage),
+        system_paths: SystemPaths {
+            exe_path: format!("{}/", root.display()),
+            ..SystemPaths::default()
+        },
+        ..EngineConfig::default()
+    })
+    .expect("engine");
     let startup = engine.execute_startup().expect("startup");
     println!("startup={startup}");
 

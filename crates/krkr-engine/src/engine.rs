@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -19,7 +18,9 @@ use krkr_tjs2::{
 
 use crate::{
     globals::install_tvp_globals,
-    host::{ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost, TraceCategory},
+    host::{
+        ImageLoadRequest, ImageLoadState, ImageLoadTarget, KrkrHost, SystemPaths, TraceCategory,
+    },
     kag::{EngineKagHost, tag_to_dictionary},
     native::classes::{
         apply_completed_image_load, apply_completed_resource_loads, call_wave_status_changed,
@@ -92,10 +93,12 @@ impl Default for KagRunBudget {
 
 #[derive(Clone, Default)]
 pub struct EngineConfig {
-    pub project_root: Option<PathBuf>,
-    /// Optional preloaded storage (used by browser hosts without a native
-    /// filesystem). When set, this takes precedence over `project_root`.
+    /// Storage is created by the platform shell and injected into the engine.
+    /// The engine never discovers a project path or opens the process current
+    /// directory itself.
     pub project_storage: Option<crate::ProjectStorage>,
+    /// Host-provided logical paths exposed through the KRKR `System` object.
+    pub system_paths: SystemPaths,
     pub kag_budget: KagRunBudget,
     pub system_metrics: SystemMetrics,
 }
@@ -246,10 +249,9 @@ pub struct KrkrEngine {
 
 impl KrkrEngine {
     pub fn new(config: EngineConfig) -> Result<Self> {
-        let host = match (config.project_storage, config.project_root) {
-            (Some(storage), _) => KrkrHost::from_storage(storage)?,
-            (None, Some(root)) => KrkrHost::for_project(root)?,
-            (None, None) => KrkrHost::default(),
+        let host = match config.project_storage {
+            Some(storage) => KrkrHost::from_storage(storage, config.system_paths)?,
+            None => KrkrHost::with_system_paths(config.system_paths),
         };
         let mut tjs_runtime = Runtime::with_host(host);
         install_tvp_globals(&mut tjs_runtime);
@@ -268,9 +270,15 @@ impl KrkrEngine {
         })
     }
 
-    pub fn for_project(root: impl Into<PathBuf>) -> Result<Self> {
+    #[cfg(test)]
+    fn for_project(root: &std::path::Path) -> Result<Self> {
+        let storage = crate::ProjectStorage::for_root(root)?;
         Self::new(EngineConfig {
-            project_root: Some(root.into()),
+            project_storage: Some(storage),
+            system_paths: SystemPaths {
+                exe_path: format!("{}/", root.display()),
+                ..SystemPaths::default()
+            },
             ..EngineConfig::default()
         })
     }
@@ -4409,6 +4417,35 @@ mod tests {
     }
 
     #[test]
+    fn system_paths_are_injected_by_the_platform_host() {
+        let mut engine = KrkrEngine::new(EngineConfig {
+            system_paths: SystemPaths {
+                exe_path: "game://root/".to_string(),
+                data_path: "save://profile/".to_string(),
+                personal_path: "user://".to_string(),
+                app_data_path: "app://".to_string(),
+            },
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+
+        let paths = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                return System.exePath + "|" + System.dataPath + "|" +
+                    System.personalPath + "|" + System.appDataPath;
+                "#,
+            )
+            .expect("system paths");
+
+        assert_eq!(
+            paths,
+            Variant::String("game://root/|save://profile/|user://|app://".to_string())
+        );
+    }
+
+    #[test]
     fn scripts_eval_and_exec_honor_the_optional_context_argument() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
 
@@ -7186,8 +7223,13 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         fs::write(root.join("first.ks"), "ABC[p]").expect("write scenario");
 
+        let storage = crate::ProjectStorage::for_root(&root).expect("storage");
         let mut engine = KrkrEngine::new(EngineConfig {
-            project_root: Some(root.clone()),
+            project_storage: Some(storage),
+            system_paths: SystemPaths {
+                exe_path: format!("{}/", root.display()),
+                ..SystemPaths::default()
+            },
             kag_budget: KagRunBudget {
                 max_tags_per_tick: 2,
                 max_wall_time: Duration::from_secs(1),
@@ -14442,8 +14484,13 @@ mod tests {
     }
 
     fn image_test_engine(root: &Path) -> KrkrEngine {
+        let storage = crate::ProjectStorage::for_root(root).expect("storage");
         KrkrEngine::new(EngineConfig {
-            project_root: Some(root.to_path_buf()),
+            project_storage: Some(storage),
+            system_paths: SystemPaths {
+                exe_path: format!("{}/", root.display()),
+                ..SystemPaths::default()
+            },
             kag_budget: KagRunBudget {
                 max_tags_per_tick: 1000,
                 max_wall_time: Duration::from_secs(1),

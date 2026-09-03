@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque, btree_map::Entry},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -115,6 +115,31 @@ pub enum TransitionPolicy {
     #[default]
     Animated,
     Immediate,
+}
+
+/// Host-provided paths exposed through the KRKR `System` object.
+///
+/// These are deliberately strings rather than filesystem paths: desktop
+/// supplies native paths, while Web/mobile hosts provide virtual paths or
+/// application-specific save namespaces. The engine never discovers paths
+/// from the process environment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemPaths {
+    pub exe_path: String,
+    pub data_path: String,
+    pub personal_path: String,
+    pub app_data_path: String,
+}
+
+impl Default for SystemPaths {
+    fn default() -> Self {
+        Self {
+            exe_path: String::new(),
+            data_path: "savedata/".to_string(),
+            personal_path: "/".to_string(),
+            app_data_path: "/".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,8 +295,8 @@ impl WindowInstance {
 
 #[derive(Clone)]
 pub struct KrkrHost {
-    project_root: Option<PathBuf>,
     project_storage: Option<ProjectStorage>,
+    system_paths: SystemPaths,
     resource_manager: Option<ResourceManager>,
     auto_paths: Vec<String>,
     logs: Vec<String>,
@@ -340,8 +365,8 @@ pub(crate) struct SystemHookRegistration {
 impl Default for KrkrHost {
     fn default() -> Self {
         Self {
-            project_root: None,
             project_storage: Some(ProjectStorage::new(None, Vec::new(), None, Vec::new())),
+            system_paths: SystemPaths::default(),
             resource_manager: None,
             auto_paths: Vec::new(),
             logs: Vec::new(),
@@ -399,14 +424,21 @@ impl Default for KrkrHost {
 }
 
 impl KrkrHost {
+    pub fn with_system_paths(system_paths: SystemPaths) -> Self {
+        let mut host = Self::default();
+        host.system_paths = system_paths;
+        host
+    }
+
     /// Builds a host over an already materialized storage view (for example a
     /// browser package downloaded into memory). Resource workers are only
     /// started on native targets; WASM performs image/resource work on the
     /// browser thread.
-    pub fn from_storage(storage: ProjectStorage) -> Result<Self> {
+    pub fn from_storage(storage: ProjectStorage, system_paths: SystemPaths) -> Result<Self> {
         let mut host = Self::default();
         host.image_cache_revision = storage.revision();
         host.project_storage = Some(storage.clone());
+        host.system_paths = system_paths;
         #[cfg(not(target_arch = "wasm32"))]
         {
             host.resource_manager = Some(ResourceManager::new(storage).map_err(|error| {
@@ -414,71 +446,6 @@ impl KrkrHost {
             })?);
         }
         Ok(host)
-    }
-
-    pub fn for_project(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        let project_storage = ProjectStorage::for_root(&root)?;
-        let resource_manager = ResourceManager::new(project_storage.clone()).map_err(|error| {
-            TjsError::runtime(format!("failed to start resource worker: {error}"))
-        })?;
-        let image_cache_revision = project_storage.revision();
-        Ok(Self {
-            project_root: Some(root),
-            project_storage: Some(project_storage),
-            resource_manager: Some(resource_manager),
-            auto_paths: Vec::new(),
-            logs: Vec::new(),
-            trace_mask: trace_mask_from_env(),
-            stub_calls: BTreeMap::new(),
-            linked_plugins: BTreeSet::new(),
-            kag_parsers: BTreeMap::new(),
-            kag_parser_revisions: BTreeMap::new(),
-            layer_tree: LayerTree::new(),
-            native_layers: BTreeMap::new(),
-            native_windows: BTreeMap::new(),
-            kag_layer_slots: BTreeMap::new(),
-            native_text_draw_events: Vec::new(),
-            layer_image_storages: BTreeMap::new(),
-            scheduler: TvpScheduler::default(),
-            kag_layers: BTreeMap::new(),
-            pending_kag_layers: BTreeMap::new(),
-            transition_policy: TransitionPolicy::Animated,
-            active_transition: None,
-            completed_native_transitions: Vec::new(),
-            current_kag_page: "fore".to_string(),
-            current_kag_layer: "base".to_string(),
-            image_cache: LayerImageCache::new(
-                IMAGE_CACHE_CAPACITY_BYTES,
-                IMAGE_CACHE_MAX_ENTRY_BYTES,
-            ),
-            image_cache_revision,
-            pending_image_loads: BTreeMap::new(),
-            pending_script_image_loads: BTreeMap::new(),
-            completed_script_image_loads: 0,
-            script_image_errors: BTreeMap::new(),
-            completed_image_loads: Vec::new(),
-            image_target_generations: BTreeMap::new(),
-            next_resource_generation: 1,
-            font_system: FontSystem::new(),
-            next_texture_id: 1,
-            next_audio_instance_id: 1,
-            native_audio_buffers: BTreeMap::new(),
-            native_audio_global_volume: 100000,
-            pending_audio_commands: Vec::new(),
-            video_overlays: BTreeMap::new(),
-            text_encoding: "UTF-8".to_string(),
-            pressed_keys: BTreeSet::new(),
-            cursor_position: None,
-            lifecycle_state: LifecycleState::Foreground,
-            pending_text_input: Vec::new(),
-            clock_offset_millis: 0,
-            termination_requested: false,
-            modal_windows: Vec::new(),
-            external_resource_catalog: BTreeSet::new(),
-            pending_external_resources: BTreeMap::new(),
-            system_hooks: BTreeMap::new(),
-        })
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -510,8 +477,8 @@ impl KrkrHost {
         }
     }
 
-    pub fn project_root(&self) -> Option<&Path> {
-        self.project_root.as_deref()
+    pub fn system_paths(&self) -> &SystemPaths {
+        &self.system_paths
     }
 
     pub fn video_overlay_snapshots(&mut self) -> Vec<VideoOverlaySnapshot> {
@@ -533,10 +500,6 @@ impl KrkrHost {
                 audio_balance: state.audio_balance,
             })
             .collect()
-    }
-
-    pub fn data_path(&self) -> Option<PathBuf> {
-        self.project_root.as_ref().map(|root| root.join("savedata"))
     }
 
     pub fn project_storage(&self) -> Result<&ProjectStorage> {
@@ -3086,7 +3049,8 @@ mod tests {
     fn storage_mode_offset_reads_and_writes_struct_tail() {
         let root = temp_root("offset");
         fs::create_dir_all(&root).expect("create root");
-        let mut host = KrkrHost::for_project(&root).expect("host");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        let mut host = KrkrHost::from_storage(storage, SystemPaths::default()).expect("host");
 
         host.write_binary("savedata/bookmark.bmp", "", b"thumbnail")
             .expect("write thumbnail");

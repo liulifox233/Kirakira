@@ -70,7 +70,10 @@ use krkr_core::{
     AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, Point,
     PointerButton, Size,
 };
-use krkr_engine::{EngineInput, KagTaskState, KrkrEngine, RuntimeSession, TransitionPolicy};
+use krkr_engine::{
+    EngineConfig, EngineInput, KagTaskState, KrkrEngine, ProjectStorage, RuntimeSession,
+    SystemPaths, TransitionPolicy,
+};
 use krkr_tjs2::runtime::Variant;
 use snapshot::TextureCache;
 
@@ -220,7 +223,13 @@ fn main() {
         .clone()
         .expect("usage: krkr-debug <game_dir> [-b spec]... [options]");
 
-    let mut engine = KrkrEngine::for_project(&root).expect("engine");
+    let storage = ProjectStorage::for_root(&root).expect("storage");
+    let mut engine = KrkrEngine::new(EngineConfig {
+        project_storage: Some(storage),
+        system_paths: system_paths_for_project(&root),
+        ..EngineConfig::default()
+    })
+    .expect("engine");
     if let Some(categories) = &config.trace {
         engine.host_mut().set_trace_categories(categories);
     }
@@ -593,6 +602,22 @@ fn main() {
         let (width, height, rgba) = snapshot::composite_frame(1280, 720, &commands, &textures);
         snapshot::write_png(path, width, height, &rgba).expect("write screenshot");
         println!("screenshot={path} commands={}", commands.len());
+    }
+}
+
+fn system_paths_for_project(root: &std::path::Path) -> SystemPaths {
+    let root_display = root.display().to_string();
+    let temp_display = std::env::temp_dir().display().to_string();
+    SystemPaths {
+        exe_path: format!("{}/", root_display.trim_end_matches(['/', '\\'])),
+        data_path: if cfg!(windows) {
+            let data = root.join("savedata").display().to_string();
+            format!("{}\\", data.trim_end_matches(['/', '\\']))
+        } else {
+            "savedata/".to_string()
+        },
+        personal_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
+        app_data_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
     }
 }
 
