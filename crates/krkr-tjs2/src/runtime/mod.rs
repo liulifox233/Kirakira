@@ -641,6 +641,63 @@ impl<H: TjsHost + 'static> Runtime<H> {
         vm.call_function(callee, args)
     }
 
+    /// Gives an exception that escaped a VM call to the TJS
+    /// `System.exceptionHandler`, matching KRKR2/KRKRZ's event boundary.
+    ///
+    /// The handler receives a normal TJS object with `message` and `trace`
+    /// members.  When the VM retained the class of an escaped `throw`, that
+    /// class is attached to the object as well, so script code such as
+    /// `e instanceof "ConductorException"` keeps working.
+    ///
+    /// Returns `true` when the handler exists and returns a truthy value.  A
+    /// missing/void handler is not an error and returns `false`; callers can
+    /// then propagate the original host error.
+    pub fn process_unhandled_exception(&mut self, error: &TjsError) -> Result<bool> {
+        let handler = match self.global_member("System") {
+            Variant::Object(system) => self.object_member(system, "exceptionHandler"),
+            _ => Variant::Void,
+        };
+        if matches!(handler, Variant::Void | Variant::Null) {
+            return Ok(false);
+        }
+
+        // The VM keeps the original thrown object alive through the event
+        // boundary.  Passing it through preserves custom members and the
+        // complete superclass chain exactly as KRKR does.
+        if let Some(exception) = error
+            .exception_object
+            .filter(|handle| self.object_valid(*handle))
+        {
+            let result = self.call_function(handler, vec![Variant::Object(exception)])?;
+            return Ok(result.is_truthy());
+        }
+
+        let exception = self.alloc_ordinary_object();
+        self.set_object_member(
+            exception,
+            "message",
+            Variant::String(
+                error
+                    .exception_message
+                    .clone()
+                    .unwrap_or_else(|| error.message.clone()),
+            ),
+        );
+        let trace = error
+            .contexts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.set_object_member(exception, "trace", Variant::String(trace));
+        if let Some(class) = &error.exception_class {
+            self.add_object_class_info(exception, class.clone());
+        }
+
+        let result = self.call_function(handler, vec![Variant::Object(exception)])?;
+        Ok(result.is_truthy())
+    }
+
     pub fn host(&self) -> &H {
         &self.host
     }

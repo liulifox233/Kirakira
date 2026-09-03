@@ -68,7 +68,28 @@ impl Object {
 
     pub fn set(&mut self, name: impl Into<String>, value: Variant) {
         let name = name.into();
-        let mut sync_array = false;
+        if let ObjectKind::Array { elements } = &mut self.kind
+            && let Ok(index) = name.parse::<usize>()
+        {
+            let old_len = elements.len();
+            if index >= old_len {
+                elements.resize(index + 1, Variant::Void);
+                for (offset, item) in elements[old_len..].iter().enumerate() {
+                    self.members
+                        .insert((old_len + offset).to_string(), item.clone());
+                }
+            }
+            elements[index] = value.clone();
+            let canonical_name = index.to_string();
+            if name != canonical_name {
+                // Full array synchronization canonicalizes numeric member
+                // names, so do not leave aliases such as `01` behind.
+                self.members.remove(&name);
+            }
+            self.members.insert(canonical_name, value);
+            self.sync_array_length_members();
+            return;
+        }
         if let ObjectKind::Array { elements } = &mut self.kind {
             if name == "count" || name == "length" {
                 let len = value.to_integer().unwrap_or(0).max(0) as usize;
@@ -76,18 +97,8 @@ impl Object {
                 self.sync_array_members();
                 return;
             }
-            if let Ok(index) = name.parse::<usize>() {
-                if index >= elements.len() {
-                    elements.resize(index + 1, Variant::Void);
-                }
-                elements[index] = value.clone();
-                sync_array = true;
-            }
         }
         self.members.insert(name, value);
-        if sync_array {
-            self.sync_array_members();
-        }
     }
 
     pub fn delete(&mut self, name: &str) -> bool {
@@ -97,7 +108,7 @@ impl Object {
             && index < elements.len()
         {
             elements[index] = Variant::Void;
-            self.sync_array_members();
+            self.members.insert(index.to_string(), Variant::Void);
             return true;
         }
         removed
@@ -111,20 +122,63 @@ impl Object {
     }
 
     pub fn array_push(&mut self, value: Variant) -> bool {
+        self.array_extend(std::iter::once(value))
+    }
+
+    /// Appends a batch of values without rebuilding every existing numeric
+    /// member for each element.  Array construction and binary-struct decode
+    /// commonly append thousands of values in a tight loop; doing a full
+    /// `sync_array_members` per value made those paths quadratic.
+    pub fn array_extend<I>(&mut self, values: I) -> bool
+    where
+        I: IntoIterator<Item = Variant>,
+    {
         let ObjectKind::Array { elements } = &mut self.kind else {
             return false;
         };
-        elements.push(value);
-        self.sync_array_members();
+        let start = elements.len();
+        elements.extend(values);
+        for (index, value) in elements[start..].iter().enumerate() {
+            self.members
+                .insert((start + index).to_string(), value.clone());
+        }
+        self.sync_array_length_members();
         true
     }
 
     pub fn array_insert(&mut self, index: usize, value: Variant) -> bool {
+        self.array_insert_values(index, std::iter::once(value))
+    }
+
+    pub fn array_insert_values<I>(&mut self, index: usize, values: I) -> bool
+    where
+        I: IntoIterator<Item = Variant>,
+    {
         let ObjectKind::Array { elements } = &mut self.kind else {
             return false;
         };
         let index = index.min(elements.len());
-        elements.insert(index, value);
+        let values = values.into_iter().collect::<Vec<_>>();
+        if values.is_empty() {
+            return true;
+        }
+        elements.splice(index..index, values);
+        self.sync_array_members();
+        true
+    }
+
+    pub fn array_prepend<I>(&mut self, values: I) -> bool
+    where
+        I: IntoIterator<Item = Variant>,
+    {
+        let ObjectKind::Array { elements } = &mut self.kind else {
+            return false;
+        };
+        let values = values.into_iter().collect::<Vec<_>>();
+        if values.is_empty() {
+            return true;
+        }
+        elements.splice(0..0, values);
         self.sync_array_members();
         true
     }
@@ -191,8 +245,12 @@ impl Object {
         let ObjectKind::Array { elements } = &mut self.kind else {
             return None;
         };
-        let value = elements.pop().unwrap_or_default();
-        self.sync_array_members();
+        let Some(index) = elements.len().checked_sub(1) else {
+            return Some(Variant::Void);
+        };
+        let value = elements.pop().expect("array length checked above");
+        self.members.remove(&index.to_string());
+        self.sync_array_length_members();
         Some(value)
     }
 
@@ -201,7 +259,8 @@ impl Object {
             return false;
         };
         elements.clear();
-        self.sync_array_members();
+        self.members.retain(|key, _| key.parse::<usize>().is_err());
+        self.sync_array_length_members();
         true
     }
 
@@ -211,13 +270,43 @@ impl Object {
             for (index, value) in elements.iter().enumerate() {
                 self.members.insert(index.to_string(), value.clone());
             }
-            self.members
-                .insert("count".to_string(), Variant::Integer(elements.len() as i64));
-            self.members.insert(
-                "length".to_string(),
-                Variant::Integer(elements.len() as i64),
-            );
+            self.sync_array_length_members();
         }
+    }
+
+    fn sync_array_length_members(&mut self) {
+        let ObjectKind::Array { elements } = &self.kind else {
+            return;
+        };
+        let length = Variant::Integer(elements.len() as i64);
+        self.members.insert("count".to_string(), length.clone());
+        self.members.insert("length".to_string(), length);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_bulk_append_and_index_assignment_keep_visible_members_in_sync() {
+        let mut array = Object::array(Vec::new());
+        assert!(array.array_extend((0..4096).map(Variant::Integer)));
+        assert_eq!(array.array_elements().unwrap().len(), 4096);
+        assert_eq!(array.get("0"), Variant::Integer(0));
+        assert_eq!(array.get("4095"), Variant::Integer(4095));
+        assert_eq!(array.get("count"), Variant::Integer(4096));
+        assert_eq!(array.get("length"), Variant::Integer(4096));
+
+        array.set("8191", Variant::Integer(8191));
+        assert_eq!(array.array_elements().unwrap().len(), 8192);
+        assert_eq!(array.get("4096"), Variant::Void);
+        assert_eq!(array.get("8191"), Variant::Integer(8191));
+        assert_eq!(array.get("count"), Variant::Integer(8192));
+
+        array.set("01", Variant::Integer(1));
+        assert_eq!(array.get("1"), Variant::Integer(1));
+        assert!(!array.members.contains_key("01"));
     }
 }
 

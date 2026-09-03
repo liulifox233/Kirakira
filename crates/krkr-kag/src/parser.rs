@@ -2626,9 +2626,14 @@ impl AttributeParser<'_> {
             self.bump();
             self.skip_space();
             if self.is_eof() {
-                return Err(self.error_here("attribute value is empty"));
+                // KRKR/KAG uses an empty unquoted value to clear a property,
+                // e.g. `clip=` in a macro.  The closing `]` is not part of
+                // `content`, so reaching EOF here is a valid empty literal,
+                // not a malformed attribute.
+                AttributeValue::Literal(String::new())
+            } else {
+                self.parse_value()?
             }
-            self.parse_value()?
         } else {
             AttributeValue::Literal("true".to_owned())
         };
@@ -2910,6 +2915,23 @@ mod tests {
         assert_eq!(lit(&tag, "bold"), Some("true"));
         assert_eq!(lit(&tag, "flag"), Some("true"));
         assert_eq!(lit(&tag, "size"), Some("24"));
+    }
+
+    #[test]
+    fn accepts_empty_unquoted_attribute_values() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text("first.ks", "[object name=x hide clip=][allchar clip=]")
+            .unwrap();
+
+        let object = next(&mut parser);
+        assert_eq!(object.tagname, "object");
+        assert_eq!(lit(&object, "clip"), Some(""));
+
+        let allchar = next(&mut parser);
+        assert_eq!(allchar.tagname, "allchar");
+        assert_eq!(lit(&allchar, "clip"), Some(""));
+        assert_eq!(parser.next_tag().unwrap(), None);
     }
 
     #[test]
