@@ -212,15 +212,54 @@ pub trait VideoDecoder: Send {
 ///
 /// Keeping this as a separate protocol lets mobile and browser shells provide
 /// native media-element/framework implementations without changing the
-/// engine's decode-session code. The blanket implementation makes existing
-/// decoders source-compatible while the factory returns the protocol type.
+/// engine's decode-session code. Decoder implementations opt in explicitly,
+/// so an adapter can override port behavior without a conflicting blanket
+/// implementation.
 pub trait VideoPort: VideoDecoder {
     fn capabilities(&self) -> VideoCapabilities {
         platform_capabilities()
     }
 }
 
-impl<T: VideoDecoder + ?Sized> VideoPort for T {}
+/// Host-injected decoder factory. The engine asks this capability to open
+/// bytes and never selects an OS backend itself; mobile shells can provide a
+/// MediaCodec/AVFoundation implementation while Web uses its DOM bridge.
+pub trait VideoDecoderFactory: Send + Sync {
+    fn capabilities(&self) -> VideoCapabilities;
+    fn create(&self, source: VideoSource) -> Result<Box<dyn VideoPort>, VideoError>;
+}
+
+/// Engine-safe default used when a host has not injected media capabilities.
+/// Platform shells opt into [`PlatformVideoFactory`] explicitly; this keeps
+/// backend selection out of the engine's default construction path.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnavailableVideoFactory;
+
+impl VideoDecoderFactory for UnavailableVideoFactory {
+    fn capabilities(&self) -> VideoCapabilities {
+        VideoCapabilities::unavailable()
+    }
+
+    fn create(&self, _source: VideoSource) -> Result<Box<dyn VideoPort>, VideoError> {
+        Err(VideoError::Unsupported(
+            "the platform host did not install a video backend".to_string(),
+        ))
+    }
+}
+
+/// Default native-system backend selected explicitly by a platform shell.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlatformVideoFactory;
+
+impl VideoDecoderFactory for PlatformVideoFactory {
+    fn capabilities(&self) -> VideoCapabilities {
+        platform_capabilities()
+    }
+
+    fn create(&self, source: VideoSource) -> Result<Box<dyn VideoPort>, VideoError> {
+        create_decoder(source)
+    }
+}
 
 /// Errors a backend can report.
 #[derive(Debug)]

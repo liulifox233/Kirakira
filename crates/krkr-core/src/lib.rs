@@ -173,6 +173,63 @@ pub trait StoragePort: Send + Sync {
     }
 }
 
+/// Mutable project-storage capability consumed by the engine.
+///
+/// The engine only depends on this platform-neutral contract. Filesystem,
+/// XP3, memory-overlay and browser-manifest implementations live in host
+/// crates (currently `krkr-assets`); a mobile or remote host can provide a
+/// different implementation without linking those backends into the engine.
+pub trait ProjectStoragePort: StoragePort {
+    fn storage_exists(&self, name: &str) -> bool {
+        self.exists(name)
+    }
+
+    fn is_directory(&self, name: &str) -> bool;
+
+    fn list_directory(&self, name: &str) -> io::Result<Vec<String>>;
+
+    /// Returns a native path only when the adapter has one. Virtual/archive
+    /// stores return `None`; the string avoids leaking a platform `Path` into
+    /// the engine/core boundary.
+    fn placed_path(&self, name: &str) -> Option<String>;
+
+    fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData>;
+
+    fn read_text_storage(&self, name: &str, configured_encoding: &str) -> io::Result<String>;
+
+    /// Reads text with an optional KRKR offset mode. Adapters can preserve
+    /// their native encoding hints while applying the mode before decoding.
+    fn read_text_storage_mode(
+        &self,
+        name: &str,
+        mode: &str,
+        configured_encoding: &str,
+    ) -> io::Result<String> {
+        let _ = mode;
+        self.read_text_storage(name, configured_encoding)
+    }
+
+    fn write_text_storage(&self, name: &str, mode: &str, text: &str) -> io::Result<()>;
+
+    fn write_binary_storage(&self, name: &str, mode: &str, bytes: &[u8]) -> io::Result<()>;
+
+    fn add_auto_path(&self, path: &str);
+
+    fn remove_auto_path(&self, path: &str) -> bool;
+
+    fn clear_archive_cache(&self) -> io::Result<()>;
+
+    fn catalog_contains(&self, name: &str) -> bool;
+
+    /// Replaces deferred logical names for a new package while retaining
+    /// resident memory files owned by this storage view.
+    fn set_catalog_paths(&self, paths: &[String]);
+
+    fn insert_external_memory(&self, path: &str, bytes: Vec<u8>);
+
+    fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)>;
+}
+
 /// Opaque identifier for a resource request that may complete after a frame.
 ///
 /// The runtime deliberately uses a small polling protocol instead of an
@@ -182,7 +239,7 @@ pub trait StoragePort: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AssetRequestId(pub u64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AssetKind {
     Binary,
     Text,
@@ -332,6 +389,11 @@ impl SaveStore for MemorySaveStore {
 /// share the same runtime without importing platform time APIs.
 pub trait Clock {
     fn now_millis(&mut self) -> i64;
+
+    /// Advances deterministic clocks at the runtime boundary. Wall-clock
+    /// implementations leave this as a no-op; VirtualClock uses it so
+    /// terminal/debugger sessions cannot remain frozen at zero.
+    fn advance(&mut self, _delta: std::time::Duration) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -352,6 +414,11 @@ impl VirtualClock {
 impl Clock for VirtualClock {
     fn now_millis(&mut self) -> i64 {
         self.now_millis
+    }
+
+    fn advance(&mut self, delta: std::time::Duration) {
+        let millis = delta.as_millis().min(i64::MAX as u128) as i64;
+        self.advance_millis(millis);
     }
 }
 

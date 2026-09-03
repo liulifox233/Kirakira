@@ -10,9 +10,10 @@ use std::{
     thread,
 };
 
-use krkr_core::ResourceData;
+use krkr_core::{ProjectStoragePort, ResourceData};
 
-use crate::storage::ProjectStorage;
+#[cfg(test)]
+use krkr_assets::ProjectStorage;
 
 const DECODED_IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
@@ -83,7 +84,7 @@ struct DecodedImageCache {
 }
 
 impl ResourceManager {
-    pub fn new(storage: ProjectStorage) -> std::io::Result<Self> {
+    pub fn new(storage: Arc<dyn ProjectStoragePort>) -> std::io::Result<Self> {
         let (task_tx, task_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
         let cancelled = Arc::new(Mutex::new(BTreeSet::new()));
@@ -187,7 +188,7 @@ impl ResourceManager {
 }
 
 fn resource_worker(
-    storage: ProjectStorage,
+    storage: Arc<dyn ProjectStoragePort>,
     task_rx: mpsc::Receiver<ResourceTask>,
     completion_tx: mpsc::Sender<ResourceCompletion>,
     cancelled: Arc<Mutex<BTreeSet<ResourceTaskId>>>,
@@ -207,7 +208,7 @@ fn resource_worker(
                 if take_cancelled(&cancelled, id) {
                     continue;
                 }
-                let result = decode_image(&storage, &mut image_cache, revision, &name);
+                let result = decode_image(storage.as_ref(), &mut image_cache, revision, &name);
                 if take_cancelled(&cancelled, id) {
                     continue;
                 }
@@ -261,7 +262,7 @@ fn take_cancelled(cancelled: &Mutex<BTreeSet<ResourceTaskId>>, id: ResourceTaskI
 }
 
 fn decode_image(
-    storage: &ProjectStorage,
+    storage: &dyn ProjectStoragePort,
     cache: &mut DecodedImageCache,
     revision: u64,
     name: &str,
@@ -509,7 +510,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("payload.bin"), b"payload").expect("write payload");
         let storage = ProjectStorage::for_root(&root).expect("storage");
-        let manager = ResourceManager::new(storage.clone()).expect("manager");
+        let manager = ResourceManager::new(Arc::new(storage.clone())).expect("manager");
 
         drop(manager.clone());
 

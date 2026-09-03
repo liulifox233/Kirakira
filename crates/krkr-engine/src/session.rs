@@ -28,8 +28,8 @@ pub struct RuntimeSession {
     audio: Box<dyn AudioSink>,
     clock: Box<dyn Clock>,
     save: Option<Box<dyn SaveStore>>,
-    pending_assets: BTreeSet<String>,
-    pending_asset_requests: BTreeMap<krkr_core::AssetRequestId, String>,
+    pending_assets: BTreeSet<(String, krkr_core::AssetKind)>,
+    pending_asset_requests: BTreeMap<krkr_core::AssetRequestId, (String, krkr_core::AssetKind)>,
 }
 
 impl RuntimeSession {
@@ -110,17 +110,19 @@ impl RuntimeSession {
     }
 
     pub fn pending_asset_paths(&self) -> impl Iterator<Item = &str> {
-        self.pending_assets.iter().map(String::as_str)
+        self.pending_assets.iter().map(|(path, _)| path.as_str())
     }
 
     pub fn cancel_asset(&mut self, id: krkr_core::AssetRequestId) -> bool {
         let cancelled = self.assets.cancel(id);
         if cancelled {
-            if let Some(path) = self.pending_asset_requests.remove(&id) {
+            if let Some((path, kind)) = self.pending_asset_requests.remove(&id) {
                 if let Some(pending) = self
                     .pending_assets
                     .iter()
-                    .find(|pending| pending.eq_ignore_ascii_case(&path))
+                    .find(|(pending_path, pending_kind)| {
+                        *pending_kind == kind && pending_path.eq_ignore_ascii_case(&path)
+                    })
                     .cloned()
                 {
                     self.pending_assets.remove(&pending);
@@ -136,6 +138,11 @@ impl RuntimeSession {
         input: EngineInput,
         delta: Duration,
     ) -> Result<RuntimeFrame, RuntimeSessionError> {
+        // Advance deterministic clocks at the boundary, then sample the host
+        // clock and pass it into the engine. Wall clocks implement advance as
+        // a no-op, while VirtualClock now progresses in terminal/debugger
+        // sessions instead of being overwritten with zero every frame.
+        self.clock.advance(delta);
         // Sample the host clock at the boundary and pass it into the engine;
         // this keeps timers/video/audio waits deterministic across wall-clock,
         // virtual-clock and browser performance.now implementations.
@@ -148,17 +155,22 @@ impl RuntimeSession {
             };
             self.pending_asset_requests.remove(&event_id);
             let was_pending = match event {
-                AssetEvent::Ready { path, .. } | AssetEvent::Failed { path, .. } => self
-                    .pending_assets
-                    .iter()
-                    .any(|pending| pending.eq_ignore_ascii_case(path)),
+                AssetEvent::Ready { path, kind, .. } | AssetEvent::Failed { path, kind, .. } => {
+                    self.pending_assets
+                        .iter()
+                        .any(|(pending_path, pending_kind)| {
+                            *pending_kind == *kind && pending_path.eq_ignore_ascii_case(path)
+                        })
+                }
             };
             match event {
-                AssetEvent::Ready { path, .. } | AssetEvent::Failed { path, .. } => {
+                AssetEvent::Ready { path, kind, .. } | AssetEvent::Failed { path, kind, .. } => {
                     if let Some(pending) = self
                         .pending_assets
                         .iter()
-                        .find(|pending| pending.eq_ignore_ascii_case(path))
+                        .find(|(pending_path, pending_kind)| {
+                            *pending_kind == *kind && pending_path.eq_ignore_ascii_case(path)
+                        })
                         .cloned()
                     {
                         self.pending_assets.remove(&pending);
@@ -202,13 +214,18 @@ impl RuntimeSession {
                     if self
                         .pending_assets
                         .iter()
-                        .any(|pending| pending.eq_ignore_ascii_case(&request.path))
+                        .any(|(pending_path, pending_kind)| {
+                            *pending_kind == request.kind
+                                && pending_path.eq_ignore_ascii_case(&request.path)
+                        })
                     {
                         continue;
                     }
-                    self.pending_assets.insert(request.path.clone());
+                    self.pending_assets
+                        .insert((request.path.clone(), request.kind));
                     let id = self.assets.request(&request.path, request.kind);
-                    self.pending_asset_requests.insert(id, request.path);
+                    self.pending_asset_requests
+                        .insert(id, (request.path, request.kind));
                 }
                 frame
             }
@@ -305,6 +322,7 @@ mod tests {
         assert!(frame.assets.is_empty());
         assert!(frame.audio.is_empty());
         assert!(frame.engine.output.image_uploads.is_empty());
+        assert_eq!(session.clock_mut().now_millis(), 16);
     }
 
     struct NullAudioSink;

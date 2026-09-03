@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-use krkr_engine::{EngineConfig, KrkrEngine, ProjectStorage, SystemMetrics, SystemPaths};
+use krkr_assets::ProjectStorage;
+use krkr_engine::{EngineConfig, KrkrEngine, SystemMetrics, SystemPaths};
 use krkr_plugins::register_reference_plugins;
 
 fn main() {
@@ -21,7 +22,7 @@ fn main() {
         }
     };
     let mut engine = match KrkrEngine::new(EngineConfig {
-        project_storage: Some(storage),
+        project_storage: Some(Arc::new(storage)),
         system_paths: SystemPaths {
             exe_path: format!("{}/", game_path.display()),
             ..SystemPaths::default()

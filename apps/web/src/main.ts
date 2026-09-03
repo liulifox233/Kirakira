@@ -154,8 +154,8 @@ if (wasmUrl) {
           throw error;
         }
       } else {
-        // A normal KRKR game owns scenario selection inside startup.tjs. In
-        // particular, GINKA creates its KAGWindow and dispatches first.ks
+        // A normal KRKR game owns scenario selection inside startup.tjs. The
+        // script may create its KAG window and dispatch a scenario
         // asynchronously after bootstrap resources arrive.
         document.body.dataset.status = "Game startup owns scenario selection";
         log("no host scenario; continuing startup.tjs dispatch");
@@ -201,6 +201,11 @@ if (wasmUrl) {
   log("renderer ready", { renderer: gpuRenderer ? "webgpu" : "canvas2d", elapsedMs: Math.round(performance.now() - bootStartedAt) });
   const context = gpuRenderer ? null : canvas.getContext("2d");
   if (!gpuRenderer && !context) throw new Error("2D canvas is unavailable");
+  let contentWidth = canvas.clientWidth || canvas.width;
+  let contentHeight = canvas.clientHeight || canvas.height;
+  let contentScale = 1;
+  let contentOffsetX = 0;
+  let contentOffsetY = 0;
   const textures = new Map<number, HTMLCanvasElement>();
   if (debugMode) (window as any).__kirakiraTextures = textures;
   let audioContext: AudioContext | undefined;
@@ -228,22 +233,61 @@ if (wasmUrl) {
   // Keep an epoch for every KRKR channel. A stop/replace arriving while an
   // asset is being fetched must invalidate that request before it can start.
   const audioEpochs = new Map<number, number>();
-  const audioPending = new Map<number, { bus: string; epoch: number }>();
+  const audioPending = new Map<number, { bus: string; epoch: number; source: string; looping: boolean }>();
   const audioBusVolumes = new Map<string, number>([["master", 1], ["bgm", 1], ["sound-effect", 1]]);
   const pendingGestureAudio = new Map<number, any>();
   const pendingPaused = new Set<number>();
-  let audioQueue: Promise<void> = Promise.resolve();
   const videoElements = new Map<string, HTMLVideoElement>();
   const videoLoads = new Map<string, Promise<void>>();
   const videoPlayRequests = new Map<string, Promise<void>>();
   const videoDesiredStatus = new Map<string, string>();
   const videoObjectUrls = new Map<string, string>();
   const videoAudioNodes = new Map<string, { source: MediaElementAudioSourceNode; panner: StereoPannerNode }>();
-  const endedVideos = new Set<string>();
   let userGesture = false;
+  let mediaGeneration = 0;
+
+  // `WebRuntime.load_package` replaces the Rust session, but the browser owns
+  // WebAudio nodes and DOM video elements outside that session. Tear those
+  // resources down at the package boundary so an old game's media cannot
+  // continue playing or be resumed by a stale async fetch.
+  const resetMedia = () => {
+    mediaGeneration += 1;
+    for (const [id, state] of audioNodes) {
+      audioEpochs.set(id, (audioEpochs.get(id) ?? 0) + 1);
+      try { state.source.stop(); } catch { /* already ended */ }
+      audioNodes.delete(id);
+    }
+    for (const id of audioPending.keys()) {
+      audioEpochs.set(id, (audioEpochs.get(id) ?? 0) + 1);
+    }
+    audioPending.clear();
+    pendingGestureAudio.clear();
+    pendingPaused.clear();
+    audioChannels.clear();
+    for (const [overlayId, video] of videoElements) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      video.remove();
+      videoElements.delete(overlayId);
+      videoDesiredStatus.delete(overlayId);
+      videoPlayRequests.delete(overlayId);
+      videoLoads.delete(overlayId);
+      const objectUrl = videoObjectUrls.get(overlayId);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      videoObjectUrls.delete(overlayId);
+      const audio = videoAudioNodes.get(overlayId);
+      audio?.source.disconnect();
+      audio?.panner.disconnect();
+      videoAudioNodes.delete(overlayId);
+    }
+  };
 
   const requestVideoPlay = (storage: string, video: HTMLVideoElement) => {
-    if (videoDesiredStatus.get(storage) !== "play" || !video.src || !video.paused) return;
+    if (videoElements.get(storage) !== video
+      || videoDesiredStatus.get(storage) !== "play"
+      || !video.src
+      || !video.paused) return;
     if (videoPlayRequests.has(storage)) return;
     // Muted autoplay is allowed by browsers and lets the opening animation
     // remain visible even before the first pointer/key gesture. Once the user
@@ -251,14 +295,22 @@ if (wasmUrl) {
     video.muted = !userGesture;
     const request = video.play()
       .then(() => {
+        if (videoElements.get(storage) !== video || videoDesiredStatus.get(storage) !== "play") {
+          video.pause();
+          return;
+        }
         log("video playing", { storage, muted: video.muted });
       })
       .catch((error) => {
+        if (videoElements.get(storage) !== video) return;
         if (!video.muted) {
           warn("video autoplay with audio blocked; retrying muted", storage, error);
           video.muted = true;
           return video.play()
-            .then(() => log("video playing muted", { storage }))
+            .then(() => {
+              if (videoElements.get(storage) !== video || videoDesiredStatus.get(storage) !== "play") video.pause();
+              else log("video playing muted", { storage });
+            })
             .catch((mutedError) => warn("video autoplay blocked", storage, mutedError));
         }
         warn("video autoplay blocked", storage, error);
@@ -281,9 +333,7 @@ if (wasmUrl) {
     if (pendingGestureAudio.size) {
       const commands = [...pendingGestureAudio.values()];
       pendingGestureAudio.clear();
-      audioQueue = audioQueue
-        .then(() => handleAudio(commands))
-        .catch((error) => warn("deferred WebAudio batch failed", error));
+      handleAudio(commands);
       log("deferred audio activated", { count: commands.length });
     }
   };
@@ -292,12 +342,13 @@ if (wasmUrl) {
     const active = new Set<string>();
     for (const item of videos ?? []) {
       if (!item.storage || item.visible === 0 || item.status === "unload" || item.status === "stop") continue;
-      if (endedVideos.has(item.storage)) continue;
+      const overlayId = String(item.id ?? item.storage);
       const storage = String(item.storage);
-      active.add(storage);
-      videoDesiredStatus.set(storage, String(item.status ?? "ready"));
-      let video = videoElements.get(storage);
+      active.add(overlayId);
+      videoDesiredStatus.set(overlayId, String(item.status ?? "ready"));
+      let video = videoElements.get(overlayId);
       if (!video) {
+        const generation = mediaGeneration;
         log("video requested", { storage, status: item.status });
         video = document.createElement("video");
         video.muted = !userGesture;
@@ -307,43 +358,46 @@ if (wasmUrl) {
         video.style.pointerEvents = "none";
         video.style.zIndex = "2";
         document.body.appendChild(video);
-        videoElements.set(storage, video);
+        videoElements.set(overlayId, video);
         try {
           const videoContext = getAudioContext();
           const source = videoContext.createMediaElementSource(video);
           const panner = videoContext.createStereoPanner();
           source.connect(panner).connect(videoContext.destination);
-          videoAudioNodes.set(storage, { source, panner });
+          videoAudioNodes.set(overlayId, { source, panner });
         } catch (error) {
           // Older browsers may not expose MediaElementSource/StereoPanner;
           // the element still plays with its native volume path in that case.
           warn("video balance bridge unavailable", { storage, error });
         }
         video.addEventListener("ended", () => {
+          // A stale element can finish after a package switch and after the
+          // same native object id has been reused. It must not notify or
+          // clean up the replacement element.
+          if (generation !== mediaGeneration || videoElements.get(overlayId) !== video) return;
           try {
-            runtime.notify_video_ended(storage);
+            runtime.notify_video_ended(overlayId);
           } catch (error) {
             console.warn("Web video end notification failed", storage, error);
           }
-          endedVideos.add(storage);
-          videoElements.delete(storage);
-          videoDesiredStatus.delete(storage);
-          videoPlayRequests.delete(storage);
-          videoLoads.delete(storage);
-          const objectUrl = videoObjectUrls.get(storage);
+          videoElements.delete(overlayId);
+          videoDesiredStatus.delete(overlayId);
+          videoPlayRequests.delete(overlayId);
+          videoLoads.delete(overlayId);
+          const objectUrl = videoObjectUrls.get(overlayId);
           if (objectUrl) URL.revokeObjectURL(objectUrl);
-          videoObjectUrls.delete(storage);
-          const audioNodes = videoAudioNodes.get(storage);
+          videoObjectUrls.delete(overlayId);
+          const audioNodes = videoAudioNodes.get(overlayId);
           audioNodes?.source.disconnect();
           audioNodes?.panner.disconnect();
-          videoAudioNodes.delete(storage);
+          videoAudioNodes.delete(overlayId);
           video.remove();
         }, { once: true });
         const load = (async () => {
           try {
             const bytes = await runtime.load_video(storage);
             log("video bytes ready", { storage, bytes: bytes.byteLength });
-            if (videoElements.get(storage) !== video) return;
+            if (videoElements.get(overlayId) !== video) return;
             // Prefer the container signature over the semantic extension: a
             // number of KRKR projects keep MPEG-4 data under a `.wmv` name.
             // Supplying the right MIME lets browsers select the decoder and
@@ -366,25 +420,38 @@ if (wasmUrl) {
               ? "video/mp4"
               : (extensionMime[extension] ?? "application/octet-stream");
             const objectUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
-            videoObjectUrls.set(storage, objectUrl);
+            videoObjectUrls.set(overlayId, objectUrl);
             video.src = objectUrl;
             // `play()` used to run on the frame immediately after element
             // creation, before this async fetch completed. Start only after
             // the source is attached, and keep retrying on later frames if a
             // browser rejects the first autoplay attempt.
-            requestVideoPlay(storage, video);
+            requestVideoPlay(overlayId, video);
           } catch (error) {
             warn("video load failed", storage, error);
+            // A failed element must not leave KAG waiting forever for its
+            // conductor to receive an ended/stop notification.
+            // The element may have been removed and the native overlay object
+            // reused for a newer play request while this fetch was in flight;
+            // never let a stale failure stop that newer playback.
+            if (videoElements.get(overlayId) === video) {
+              try { runtime.notify_video_ended(overlayId); } catch (notifyError) {
+                warn("Web video failure notification failed", { overlayId, notifyError });
+              }
+            }
           } finally {
-            videoLoads.delete(storage);
+            videoLoads.delete(overlayId);
           }
         })();
-        videoLoads.set(storage, load);
+        videoLoads.set(overlayId, load);
       }
-      video.style.left = `${item.left}px`;
-      video.style.top = `${item.top}px`;
-      video.style.width = `${item.width || canvas.width}px`;
-      video.style.height = `${item.height || canvas.height}px`;
+      // Video DOM overlays share the renderer's letterboxed content space.
+      // Without this transform a 1280x720 game is pinned to the top-left of
+      // a differently shaped browser canvas.
+      video.style.left = `${contentOffsetX + Number(item.left ?? 0) * contentScale}px`;
+      video.style.top = `${contentOffsetY + Number(item.top ?? 0) * contentScale}px`;
+      video.style.width = `${Number(item.width || contentWidth) * contentScale}px`;
+      video.style.height = `${Number(item.height || contentHeight) * contentScale}px`;
       video.loop = Boolean(item.looping);
       if (Number.isFinite(item.playRate) && item.playRate > 0) {
         video.playbackRate = Number(item.playRate);
@@ -392,7 +459,7 @@ if (wasmUrl) {
       if (Number.isFinite(item.audioVolume)) {
         video.volume = Math.max(0, Math.min(1, Number(item.audioVolume) / 100000));
       }
-      const videoAudio = videoAudioNodes.get(storage);
+      const videoAudio = videoAudioNodes.get(overlayId);
       if (videoAudio && Number.isFinite(item.audioBalance)) {
         videoAudio.panner.pan.value = Math.max(-1, Math.min(1, Number(item.audioBalance) / 100000));
       }
@@ -404,28 +471,28 @@ if (wasmUrl) {
           try { video.currentTime = target; } catch { /* metadata not ready */ }
         }
       }
-      if (item.status === "play") requestVideoPlay(storage, video);
+      if (item.status === "play") requestVideoPlay(overlayId, video);
       else if (item.status === "pause") video.pause();
     }
-    for (const [storage, video] of videoElements) {
-      if (!active.has(storage)) {
-        videoDesiredStatus.delete(storage);
-        videoPlayRequests.delete(storage);
-        videoLoads.delete(storage);
-        const objectUrl = videoObjectUrls.get(storage);
+    for (const [overlayId, video] of videoElements) {
+      if (!active.has(overlayId)) {
+        videoDesiredStatus.delete(overlayId);
+        videoPlayRequests.delete(overlayId);
+        videoLoads.delete(overlayId);
+        const objectUrl = videoObjectUrls.get(overlayId);
         if (objectUrl) URL.revokeObjectURL(objectUrl);
-        videoObjectUrls.delete(storage);
-        const audioNodes = videoAudioNodes.get(storage);
+        videoObjectUrls.delete(overlayId);
+        const audioNodes = videoAudioNodes.get(overlayId);
         audioNodes?.source.disconnect();
         audioNodes?.panner.disconnect();
-        videoAudioNodes.delete(storage);
+        videoAudioNodes.delete(overlayId);
         video.remove();
-        videoElements.delete(storage);
+        videoElements.delete(overlayId);
       }
     }
   };
 
-  const handleAudio = async (commands: any[]) => {
+  const handleAudio = (commands: any[]) => {
     const effectiveGain = (state: { bus: string; volume: number }) =>
       state.volume
       * (audioBusVolumes.get(state.bus) ?? 1)
@@ -459,8 +526,8 @@ if (wasmUrl) {
       source.addEventListener("ended", () => {
         const state = audioNodes.get(id);
         if (state?.source !== source) return;
-        audioNodes.delete(id);
         if (!state.paused) {
+          audioNodes.delete(id);
           try {
             runtime.notify_audio_stopped(id);
           } catch (error) {
@@ -486,8 +553,12 @@ if (wasmUrl) {
     const resumeNode = async (id: number) => {
       const state = audioNodes.get(id);
       if (!state?.paused) return;
+      const resumeEpoch = audioEpochs.get(id) ?? 0;
       const context = getAudioContext();
       await context.resume();
+      if (audioEpochs.get(id) !== resumeEpoch || audioNodes.get(id) !== state || !state.paused) {
+        return;
+      }
       const source = context.createBufferSource();
       source.buffer = state.buffer;
       source.loop = state.looping;
@@ -534,9 +605,13 @@ if (wasmUrl) {
         // frames while its bytes are fetched/decoded. Do not start duplicate
         // WebAudio sources for the same KRKR channel during that window;
         // completed playback on that channel is replaced explicitly below.
-        if (audioPending.has(command.id)) continue;
         const bus = command.bus ?? "master";
+        const pending = audioPending.get(command.id);
+        if (pending && pending.source === command.source && pending.looping === Boolean(command.looping)) continue;
+        const deferred = pendingGestureAudio.get(command.id);
+        if (deferred && deferred.source === command.source && Boolean(deferred.looping) === Boolean(command.looping)) continue;
         const epoch = nextEpoch(command.id);
+        pendingPaused.delete(command.id);
         if (command.looping && bus === "bgm") {
           const previousId = audioChannels.get(bus);
           if (previousId !== undefined && previousId !== command.id) {
@@ -556,8 +631,9 @@ if (wasmUrl) {
           log("audio deferred until user gesture", { source: command.source, id: command.id });
           continue;
         }
-        audioPending.set(command.id, { bus, epoch });
-        try {
+        audioPending.set(command.id, { bus, epoch, source: command.source, looping: Boolean(command.looping) });
+        void (async () => {
+          try {
           const context = getAudioContext();
           log("audio requested", { source: command.source, id: command.id, looping: command.looping });
           await context.resume();
@@ -576,7 +652,7 @@ if (wasmUrl) {
             // A stop-bus/stop command invalidated this request while it was
             // waiting on fetch/decode. Do not resurrect the cancelled sound.
             try { source.stop(); } catch { /* not started */ }
-            continue;
+            return;
           }
           audioNodes.set(command.id, {
             source,
@@ -596,13 +672,19 @@ if (wasmUrl) {
             pauseNode(command.id);
           }
           log("audio playing", { source: command.source, id: command.id });
-        } catch (error) {
+          } catch (error) {
           // A game may request codecs unavailable in the current browser.
           // Keep the frame loop alive and leave the diagnostic in the console.
           warn("WebAudio could not play command", command.source, error);
-        } finally {
-          if (audioPending.get(command.id)?.epoch === epoch) audioPending.delete(command.id);
-        }
+            if (audioEpochs.get(command.id) === epoch) {
+              try { runtime.notify_audio_stopped(command.id); } catch (notifyError) {
+                warn("audio failure callback failed", { id: command.id, notifyError });
+              }
+            }
+          } finally {
+            if (audioPending.get(command.id)?.epoch === epoch) audioPending.delete(command.id);
+          }
+        })();
       } else if (command.kind === "stop") {
         nextEpoch(command.id);
         audioPending.delete(command.id);
@@ -641,9 +723,10 @@ if (wasmUrl) {
       } else if (command.kind === "pause") {
         if (audioNodes.has(command.id)) pauseNode(command.id);
         else if (audioPending.has(command.id)) pendingPaused.add(command.id);
+        else if (pendingGestureAudio.has(command.id)) pendingPaused.add(command.id);
       } else if (command.kind === "resume") {
         pendingPaused.delete(command.id);
-        await resumeNode(command.id);
+        void resumeNode(command.id).catch((error) => warn("audio resume failed", { id: command.id, error }));
       }
     }
   };
@@ -671,14 +754,23 @@ if (wasmUrl) {
     const logicalHeight = Math.max(1, canvas.clientHeight || canvas.height);
     const scaleX = canvas.width / logicalWidth;
     const scaleY = canvas.height / logicalHeight;
+    contentWidth = Math.max(1, Number(model.contentWidth ?? logicalWidth));
+    contentHeight = Math.max(1, Number(model.contentHeight ?? logicalHeight));
+    contentScale = Math.min(logicalWidth / contentWidth, logicalHeight / contentHeight);
+    contentOffsetX = (logicalWidth - contentWidth * contentScale) / 2;
+    contentOffsetY = (logicalHeight - contentHeight * contentScale) / 2;
     context.save();
     // The engine works in CSS/logical pixels while the backing canvas may be
     // device-pixel-ratio scaled. Keep both paths aligned with the native
     // renderer instead of drawing the 1280x720 scene into the top-left
     // quarter of a Retina/HiDPI canvas.
     context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
-    context.fillStyle = color(model);
+    context.fillStyle = "#000";
     context.fillRect(0, 0, logicalWidth, logicalHeight);
+    context.translate(contentOffsetX, contentOffsetY);
+    context.scale(contentScale, contentScale);
+    context.fillStyle = color(model);
+    context.fillRect(0, 0, contentWidth, contentHeight);
     uploadTextures(model.uploads, textures);
     for (const textureId of model.imageReleases ?? []) {
       textures.delete(Number(textureId));
@@ -746,8 +838,8 @@ if (wasmUrl) {
   const toCanvasPoint = (event: PointerEvent) => {
     const rect = canvas.getBoundingClientRect();
     return {
-      x: (event.clientX - rect.left) * ((canvas.clientWidth || rect.width) / Math.max(1, rect.width)),
-      y: (event.clientY - rect.top) * ((canvas.clientHeight || rect.height) / Math.max(1, rect.height)),
+      x: ((event.clientX - rect.left) * ((canvas.clientWidth || rect.width) / Math.max(1, rect.width)) - contentOffsetX) / Math.max(0.0001, contentScale),
+      y: ((event.clientY - rect.top) * ((canvas.clientHeight || rect.height) / Math.max(1, rect.height)) - contentOffsetY) / Math.max(0.0001, contentScale),
     };
   };
   canvas.addEventListener("pointermove", (event) => {
@@ -799,12 +891,21 @@ if (wasmUrl) {
   let intervalFrames = 0;
   let lastFrameLog = performance.now();
   let lastPendingSignature = "";
+  let activePackageBase: string | undefined;
   const frame = (timestamp: number) => {
     const frameNumber = totalFrames + 1;
     const tickStartedAt = performance.now();
     if (debugMode) log("frame tick started", { frame: frameNumber, timestamp: Math.round(timestamp) });
     runtime.resize(canvas.clientWidth || canvas.width, canvas.clientHeight || canvas.height);
     const model = runtime.tick(timestamp);
+    const packageBase = model.packageBase ? String(model.packageBase) : undefined;
+    if (packageBase !== activePackageBase) {
+      if (activePackageBase !== undefined || packageBase !== undefined) {
+        resetMedia();
+        log("media state reset for package switch", { from: activePackageBase, to: packageBase });
+      }
+      activePackageBase = packageBase;
+    }
     persistStorageWrites(runtime, runtime.package_game());
     const tickElapsedMs = performance.now() - tickStartedAt;
     if (debugMode || tickElapsedMs >= 50) {
@@ -852,12 +953,10 @@ if (wasmUrl) {
     if (debugMode || renderElapsedMs >= 50) {
       log("frame render complete", { frame: frameNumber, elapsedMs: Math.round(renderElapsedMs) });
     }
-    // Keep command batches serialized.  A frame can arrive while a previous
-    // decode/fetch is still pending; running both handlers concurrently was
-    // the source of duplicate BGM/voice sources and overlapping fades.
-    audioQueue = audioQueue
-      .then(() => handleAudio(model.audio))
-      .catch((error) => warn("audio command batch failed", error));
+    // Audio commands are dispatched immediately. Each channel has an epoch,
+    // so a later stop/replace can cancel an in-flight fetch or decode without
+    // waiting behind an unrelated sound.
+    handleAudio(model.audio);
     void handleVideos(model.videos);
     window.requestAnimationFrame(frame);
   };

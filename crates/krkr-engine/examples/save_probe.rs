@@ -1,9 +1,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use krkr_engine::{EngineConfig, KrkrEngine, ProjectStorage, SystemPaths, host::KrkrHost};
+use krkr_assets::ProjectStorage;
+use krkr_engine::{EngineConfig, KrkrEngine, SystemPaths, host::KrkrHost};
 use krkr_tjs2::runtime::{ObjectHandle, Runtime, Variant};
 
 fn main() {
@@ -22,7 +24,7 @@ fn main() {
 
     let storage_view = ProjectStorage::for_root(&root).expect("storage");
     let mut engine = KrkrEngine::new(EngineConfig {
-        project_storage: Some(storage_view),
+        project_storage: Some(Arc::new(storage_view)),
         system_paths: SystemPaths {
             exe_path: format!("{}/", root.display()),
             ..SystemPaths::default()

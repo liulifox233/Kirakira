@@ -19,6 +19,9 @@ use std::{
 use krkr_core::{AssetEvent, AssetKind, AssetRequestId, AssetScheduler};
 use serde::{Deserialize, Serialize};
 
+pub mod storage;
+pub use storage::{PackageMount, ProjectStorage};
+
 /// Version of the semantic-path Web manifest. This deliberately remains v1;
 /// there is no local CAS/bundle format for Web publications.
 pub const WEB_PACKAGE_FORMAT: u32 = 1;
@@ -100,19 +103,12 @@ impl WebManifest {
 
 fn build_web_aliases(entries: &BTreeMap<String, WebManifestEntry>) -> BTreeMap<String, String> {
     let mut candidates = BTreeMap::<String, Option<String>>::new();
-    let mut ui_candidates = BTreeMap::<String, Option<String>>::new();
+    let mut root_aliases = BTreeMap::<String, Option<String>>::new();
     // A bare KRKR storage name first addresses a file at the project root;
     // configured auto paths are only searched after that direct candidate.
     // Preserve the same deterministic precedence in the published alias
     // index when a package contains both `mainwindow.tjs` and
     // `system/mainwindow.tjs`.
-    let root_paths = entries
-        .iter()
-        .flat_map(|(key, entry)| [key.as_str(), entry.path.as_str()])
-        .map(normalize_path)
-        .filter(|path| !path.is_empty() && !path.contains('/'))
-        .map(|path| path.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
     for (key, entry) in entries {
         let key_path = normalize_path(key);
         let entry_path = normalize_path(&entry.path);
@@ -132,6 +128,15 @@ fn build_web_aliases(entries: &BTreeMap<String, WebManifestEntry>) -> BTreeMap<S
             }) else {
                 continue;
             };
+            if !path.contains('/') {
+                for alias in [
+                    stem.to_string(),
+                    path.clone(),
+                    format!("{}|{}", entry.kind.to_ascii_lowercase(), stem),
+                ] {
+                    insert_unique_alias(&mut root_aliases, alias, key);
+                }
+            }
             insert_unique_alias(
                 &mut candidates,
                 format!("{}|{}", entry.kind.to_ascii_lowercase(), stem),
@@ -139,41 +144,24 @@ fn build_web_aliases(entries: &BTreeMap<String, WebManifestEntry>) -> BTreeMap<S
             );
             let basename = stem.rsplit('/').next().unwrap_or(stem);
             let basename_with_extension = path.rsplit('/').next().unwrap_or(&path);
-            let root_basename = root_paths.contains(&basename_with_extension.to_ascii_lowercase());
-            let root_stem = root_paths.contains(&basename.to_ascii_lowercase());
-            let is_preferred_ui_image =
-                path.starts_with("uipsd/") && entry.kind.eq_ignore_ascii_case("image");
-            if !root_basename || is_preferred_ui_image {
-                insert_unique_alias(
-                    &mut candidates,
-                    format!("{}|{}", entry.kind.to_ascii_lowercase(), basename),
-                    key,
-                );
-                insert_unique_alias(&mut candidates, basename_with_extension.to_string(), key);
-            }
-            if !root_stem || is_preferred_ui_image {
-                insert_unique_alias(&mut candidates, stem.to_string(), key);
-                insert_unique_alias(&mut candidates, basename.to_string(), key);
-            }
-            if path.starts_with("uipsd/") {
-                for alias in [
-                    path.clone(),
-                    format!("{}|{}", entry.kind.to_ascii_lowercase(), path),
-                    format!("{}|{}", entry.kind.to_ascii_lowercase(), stem),
-                    format!("{}|{}", entry.kind.to_ascii_lowercase(), basename),
-                    basename_with_extension.to_string(),
-                    stem.to_string(),
-                    basename.to_string(),
-                ] {
-                    insert_unique_alias(&mut ui_candidates, alias, key);
-                }
-            }
+            // Bare aliases are generated only when they are unambiguous. A
+            // caller that needs to distinguish `foo.png` from `foo.asd`
+            // uses the kind-qualified alias above; no directory name is
+            // treated as a game-specific priority signal.
+            insert_unique_alias(
+                &mut candidates,
+                format!("{}|{}", entry.kind.to_ascii_lowercase(), basename),
+                key,
+            );
+            insert_unique_alias(&mut candidates, basename_with_extension.to_string(), key);
+            insert_unique_alias(&mut candidates, stem.to_string(), key);
+            insert_unique_alias(&mut candidates, basename.to_string(), key);
         }
     }
     candidates
         .into_iter()
         .filter_map(|(alias, key)| {
-            key.or_else(|| ui_candidates.get(&alias).cloned().flatten())
+            key.or_else(|| root_aliases.get(&alias).cloned().flatten())
                 .map(|key| (alias, key))
         })
         .collect()
@@ -344,15 +332,14 @@ fn take_cancelled(cancelled: &Mutex<BTreeSet<AssetRequestId>>, id: AssetRequestI
 ///
 /// Files are copied to the output using their original relative names. No
 /// chunks, content hashes, bundles or archive indexes are generated; those
-/// concerns belong to the CDN/object store. With `extract_xp3`, archive
-/// members are materialized as normal files because a browser cannot use the
-/// native seekable XP3 provider over a static URL.
+/// concerns belong to the CDN/object store. XP3 members are always
+/// materialized as normal files because a browser cannot use the native
+/// seekable XP3 provider over a static URL.
 pub fn pack_web_directory(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
-    extract_xp3: bool,
 ) -> io::Result<WebManifest> {
-    pack_web_directory_with_entry(input, output, extract_xp3, None)
+    pack_web_directory_with_entry(input, output, None)
 }
 
 /// Publishes a semantic-path Web package and records its explicit KAG entry.
@@ -361,7 +348,6 @@ pub fn pack_web_directory(
 pub fn pack_web_directory_with_entry(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
-    extract_xp3: bool,
     entry: Option<&str>,
 ) -> io::Result<WebManifest> {
     let input = fs::canonicalize(input.as_ref())?;
@@ -388,34 +374,57 @@ pub fn pack_web_directory_with_entry(
     collect_files(&input, &input, &mut files, excluded.as_deref())?;
     files.sort();
     let mut assets = BTreeMap::<String, Vec<u8>>::new();
+    let mut archives = Vec::new();
+    let mut loose_files = Vec::new();
     for relative in files {
         let path = input.join(&relative);
-        if extract_xp3
-            && path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("xp3"))
         {
-            let archive = krkr_xp3::Xp3Archive::open_file(&path)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-            for index in 0..archive.entries().len() {
-                let entry = archive.entries().get(index).expect("entry index");
-                let mut stream = archive.open_by_index(index).map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                })?;
-                let mut bytes = Vec::with_capacity(entry.original_size as usize);
-                stream.read_to_end(&mut bytes)?;
-                let member = normalize_path(&entry.name);
-                if member.is_empty() || member.split('/').any(|part| part == "..") {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("XP3 member escapes package root: {}", entry.name),
-                    ));
-                }
-                assets.insert(member, bytes);
-            }
+            archives.push(relative);
         } else {
-            assets.insert(normalize_path(&relative.to_string_lossy()), fs::read(path)?);
+            loose_files.push(relative);
         }
+    }
+    // Match ProjectStorage's archive order: system archives are searched
+    // before root archives, and later (lexicographically higher) archives
+    // override earlier ones. Loose layer files are applied afterwards and
+    // therefore always win over archive members.
+    archives.sort_by(|left, right| {
+        let rank = |path: &PathBuf| {
+            (path
+                .components()
+                .next()
+                .and_then(|component| component.as_os_str().to_str())
+                != Some("sys")) as u8
+        };
+        rank(left).cmp(&rank(right)).then_with(|| left.cmp(right))
+    });
+    for relative in archives {
+        let path = input.join(&relative);
+        let archive = krkr_xp3::Xp3Archive::open_file(&path)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        for index in 0..archive.entries().len() {
+            let entry = archive.entries().get(index).expect("entry index");
+            let mut stream = archive
+                .open_by_index(index)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            let mut bytes = Vec::with_capacity(entry.original_size as usize);
+            stream.read_to_end(&mut bytes)?;
+            let member = normalize_path(&entry.name);
+            if member.is_empty() || member.split('/').any(|part| part == "..") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("XP3 member escapes package root: {}", entry.name),
+                ));
+            }
+            assets.insert(member, bytes);
+        }
+    }
+    for relative in loose_files {
+        let path = input.join(&relative);
+        assets.insert(normalize_path(&relative.to_string_lossy()), fs::read(path)?);
     }
     // A publish directory is an artifact, so stale files from an earlier
     // package must not survive and be served by a static host.  Clear only
@@ -428,24 +437,13 @@ pub fn pack_web_directory_with_entry(
         let mime = mime_for_path(&path).to_string();
         let kind = asset_kind_for_path(&path).to_string();
         let lower_path = path.to_ascii_lowercase();
-        // Keep the initial request bounded to the conventional startup
-        // files. Every other script, UI resource and media file is fetched
-        // through the lazy AssetScheduler when the engine first touches it.
-        // The engine must see its persisted system flags while executing the
-        // startup script.  Keep these tiny metadata files in the synchronous
-        // bootstrap set; all game media, UI and scenario resources remain
-        // lazy.  In particular, `datasu.ksd` carries flags such as GINKA's
-        // `sf.notFirst`, which decides whether the opening flow shows the
-        // first-run language/configuration screen.
+        // Only the engine's generic bootstrap entry points are fetched before
+        // the first frame. Save data and game-specific setup files stay lazy;
+        // the complete manifest catalogue lets a suspended startup script
+        // request them without any filename-specific guesswork.
         let preload = matches!(
             lower_path.as_str(),
-            "startup.tjs"
-                | "startup.ks"
-                | "enginerev.ini"
-                | "savedata/datasu.ksd"
-                | "savedata/datasc.ksd"
-                | "savedata/data_anchor.ksd"
-                | "savedata/savecheck"
+            "startup.tjs" | "startup.ks" | "enginerev.ini"
         );
         let destination = output.join(&path);
         if let Some(parent) = destination.parent() {
@@ -637,7 +635,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create fixture");
         fs::write(root.join("startup.tjs"), b"System.init();").expect("write script");
         fs::write(root.join("large.bin"), vec![7u8; 128]).expect("write large fixture");
-        let manifest = pack_web_directory(&root, &output, false).expect("pack web fixture");
+        let manifest = pack_web_directory(&root, &output).expect("pack web fixture");
         assert_eq!(manifest.format, WEB_PACKAGE_FORMAT);
         assert_eq!(manifest.entry, None);
         assert_eq!(manifest.bootstrap, vec!["startup.tjs"]);
@@ -660,14 +658,14 @@ mod tests {
         fs::write(output.join("stale/nested/old.bin"), b"old").expect("write stale output");
         fs::write(root.join("startup.tjs"), b"System.init();").expect("write script");
 
-        pack_web_directory(&root, &output, false).expect("pack web fixture");
+        pack_web_directory(&root, &output).expect("pack web fixture");
         assert!(!output.join("stale").exists());
         assert!(output.join("startup.tjs").is_file());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn web_manifest_bootstraps_system_save_metadata() {
+    fn web_manifest_keeps_game_save_metadata_lazy() {
         let root = temp_root();
         let output = root.join("out");
         fs::create_dir_all(root.join("savedata")).expect("create save directory");
@@ -675,10 +673,10 @@ mod tests {
         fs::write(root.join("savedata/datasu.ksd"), b"(const) %[]").expect("write system save");
         fs::write(root.join("savedata/bookmark.ksd"), b"(const) %[]").expect("write bookmark");
 
-        let manifest = pack_web_directory(&root, &output, false).expect("pack web fixture");
+        let manifest = pack_web_directory(&root, &output).expect("pack web fixture");
         assert!(manifest.bootstrap.contains(&"startup.tjs".to_string()));
         assert!(
-            manifest
+            !manifest
                 .bootstrap
                 .contains(&"savedata/datasu.ksd".to_string())
         );
@@ -697,13 +695,11 @@ mod tests {
         fs::write(root.join("sysscn/first.ks"), b"[s]").expect_err("parent is absent");
         fs::create_dir_all(root.join("sysscn")).expect("create scenario directory");
         fs::write(root.join("sysscn/first.ks"), b"[s]").expect("write scenario");
-        let manifest =
-            pack_web_directory_with_entry(&root, &output, false, Some("SYSSCN/FIRST.KS"))
-                .expect("pack web fixture");
+        let manifest = pack_web_directory_with_entry(&root, &output, Some("SYSSCN/FIRST.KS"))
+            .expect("pack web fixture");
         assert_eq!(manifest.entry.as_deref(), Some("sysscn/first.ks"));
 
-        let missing =
-            pack_web_directory_with_entry(&root, root.join("missing"), false, Some("no.ks"));
+        let missing = pack_web_directory_with_entry(&root, root.join("missing"), Some("no.ks"));
         assert!(missing.is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -785,7 +781,35 @@ mod tests {
     }
 
     #[test]
-    fn web_manifest_kind_prefers_ui_auto_path_for_duplicate_images() {
+    fn web_manifest_does_not_resolve_ambiguous_root_stems() {
+        let entry = |path: &str, kind: &str| WebManifestEntry {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            size: 1,
+            mime: "application/octet-stream".to_string(),
+            preload: false,
+        };
+        let mut manifest = WebManifest {
+            format: WEB_PACKAGE_FORMAT,
+            game: "fixture".to_string(),
+            engine: "krkrz".to_string(),
+            bootstrap: Vec::new(),
+            entry: None,
+            entries: [
+                ("foo.png".to_string(), entry("foo.png", "image")),
+                ("foo.tlg".to_string(), entry("foo.tlg", "image")),
+            ]
+            .into_iter()
+            .collect(),
+            aliases: BTreeMap::new(),
+        };
+        manifest.aliases = build_web_aliases(&manifest.entries);
+        assert!(manifest.entry("foo").is_none());
+        assert!(manifest.entry_for_kind("foo", "image").is_none());
+    }
+
+    #[test]
+    fn web_manifest_kind_prefers_project_root_for_duplicate_images() {
         let entry = |path: &str| WebManifestEntry {
             path: path.to_string(),
             kind: "image".to_string(),
@@ -814,9 +838,9 @@ mod tests {
         assert_eq!(
             manifest
                 .entry_for_kind("title__pack", "image")
-                .expect("UI image alias")
+                .expect("root image")
                 .path,
-            "uipsd/title__pack.tlg"
+            "title__pack.tlg"
         );
     }
 

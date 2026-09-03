@@ -27,7 +27,8 @@ use objc2_core_video::{
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 
 use crate::{
-    AudioChunk, AudioSpec, VideoDecoder, VideoError, VideoFrame, VideoMetadata, VideoSource,
+    AudioChunk, AudioSpec, VideoDecoder, VideoError, VideoFrame, VideoMetadata, VideoPort,
+    VideoSource,
 };
 
 pub struct AvfDecoder {
@@ -428,3 +429,5 @@ impl VideoDecoder for AvfDecoder {
         }))
     }
 }
+
+impl VideoPort for AvfDecoder {}

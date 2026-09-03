@@ -698,9 +698,8 @@ fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
 }
 
 /// Evaluates a persisted TJS/KSD value while preserving PackinOne's
-/// error-tolerant contract. GINKA calls this for `datasc.ksd` and
-/// `datasu.ksd` during `Initialize.tjs`; returning void unconditionally makes
-/// every launch look like a first run. ResourcePending must still escape so a
+/// error-tolerant contract. Returning void unconditionally makes a first-run
+/// check appear true on every launch. ResourcePending must still escape so a
 /// Web asset scheduler can fetch a lazy save file.
 fn safe_eval_storage(
     runtime: &mut Runtime<KrkrHost>,
@@ -927,8 +926,9 @@ fn install_misc_class_members(
 mod tests {
     use std::{fs, path::Path, time::SystemTime};
 
+    use krkr_assets::ProjectStorage;
     use krkr_core::{FrameInput, Size};
-    use krkr_engine::{EngineConfig, KrkrEngine, ProjectStorage, SystemPaths};
+    use krkr_engine::{EngineConfig, KrkrEngine, SystemPaths};
     use krkr_tjs2::runtime::Closure;
 
     use super::*;
@@ -1102,7 +1102,7 @@ mod tests {
     fn test_engine(root: &Path) -> KrkrEngine {
         let storage = ProjectStorage::for_root(root).expect("storage");
         KrkrEngine::new(EngineConfig {
-            project_storage: Some(storage),
+            project_storage: Some(std::sync::Arc::new(storage)),
             system_paths: SystemPaths {
                 exe_path: format!("{}/", root.display()),
                 ..SystemPaths::default()

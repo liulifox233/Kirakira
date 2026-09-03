@@ -9,5 +9,6 @@ krkr-engine.workspace = true
 krkr-tjs2.workspace = true
 
 [dev-dependencies]
+krkr-assets.workspace = true
 krkr-audio.workspace = true
 krkr-core.workspace = true

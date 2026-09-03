@@ -11,3 +11,4 @@ krkr-core.workspace = true
 krkr-engine.workspace = true
 krkr-plugins.workspace = true
 krkr-tjs2.workspace = true
+krkr-video.workspace = true

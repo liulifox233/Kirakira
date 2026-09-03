@@ -433,12 +433,9 @@ fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
         .transpose()
 }
 
-/// krkr2 leaves extension probing to each subsystem, but our generic storage
-/// lookup guesses extensions and can land on a same-named *audio* file
-/// (GINKA: `OP` resolves to `bgm/op.ogg`, which short-circuits the game's
-/// own `isExistentStorage` probing). Probe video extensions first, in the
-/// order GINKA's sysmovie handler uses, before falling back to the name as
-/// given.
+/// KRKR callers may omit a movie extension. Probe the formats supported by
+/// the video subsystem before falling back to the name as given; this keeps a
+/// same-named audio asset from winning the generic storage lookup.
 fn resolve_video_storage_name(host: &KrkrHost, storage: &str) -> String {
     if Path::new(storage).extension().is_some() {
         return storage.to_string();
@@ -512,10 +509,11 @@ fn video_open_storage(
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let decoder = match krkr_video::create_decoder(VideoSource::bytes(bytes, Some(storage))) {
+        let factory = runtime.host().video_factory();
+        let decoder = match factory.create(VideoSource::bytes(bytes, Some(storage))) {
             Ok(decoder) => decoder,
             Err(error) => {
-                // GINKA's Movie.open rethrows only plugin-style failures whose
+                // Some script Movie.open implementations rethrow only plugin-style failures whose
                 // message contains ".dll"; a plain decode error takes its
                 // graceful fallback path instead of deadlocking the scenario.
                 return Err(TjsError::runtime(format!(
@@ -995,7 +993,7 @@ fn video_overlay_reset_mixing_layer(
 
 /// `prepare` is only meaningful for `vomLayer` in krkrz (it pre-renders the
 /// mixing frame and later fires `onPeriod(perPrepare)`); for overlay/mixer
-/// modes it is a no-op, which covers GINKA's usage.
+/// modes it is a no-op, which covers script usage.
 fn video_overlay_prepare(
     _runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -1038,7 +1036,7 @@ pub(crate) fn install_video_overlay_methods(runtime: &mut Runtime<KrkrHost>, han
 
 /// True when a class in the object's super chain declares a script (not
 /// native) property with this name. Installing a native property of the same
-/// name directly on the instance would shadow that script property — GINKA's
+/// name directly on the instance would shadow that script property — a
 /// `Movie` class overrides `left`/`top`/`audioVolume`/`audioBalance`/
 /// `layer1`/`layer2` this way and forwards explicitly through
 /// `global.VideoOverlay.<name> = value`.
@@ -1352,7 +1350,7 @@ fn video_native_property_set(
 /// `onCallbackCommand`) to script code. Script overrides take priority: an
 /// own member (assigned handler), then secondary class extenders, then the
 /// first script implementation found along the super chain (script class
-/// methods such as GINKA's `Movie.onStatusChanged` live on the class object,
+/// methods such as a script's `Movie.onStatusChanged` live on the class object,
 /// not the instance). Native fallback stubs stay silent.
 fn call_video_event(
     runtime: &mut Runtime<KrkrHost>,

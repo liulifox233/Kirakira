@@ -266,7 +266,7 @@ fn kag_get_next_tag(
             // native call after the asset arrives, so restore the exact
             // pre-read snapshot first; otherwise the expanded control tag is
             // consumed and the retry silently skips startup hooks such as
-            // GINKA's `first.logo` opening sequence.
+            // A game's opening/logo sequence.
             let snapshot = parser.store();
             let next = parser.next_tag_with(&mut host);
             let Some(tag) = (match next {

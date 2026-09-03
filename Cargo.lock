@@ -1128,8 +1128,12 @@ dependencies = [
 name = "krkr-assets"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
+ "flate2",
  "krkr-core",
+ "krkr-tjs2",
  "krkr-xp3",
+ "memmap2",
  "serde",
  "serde_json",
 ]
@@ -1160,6 +1164,7 @@ dependencies = [
  "krkr-engine",
  "krkr-plugins",
  "krkr-tjs2",
+ "krkr-video",
 ]
 
 [[package]]
@@ -1173,6 +1178,7 @@ dependencies = [
  "krkr-plugins",
  "krkr-render",
  "krkr-tjs2",
+ "krkr-video",
  "krkr-xp3",
  "pollster",
  "rfd",
@@ -1183,17 +1189,14 @@ dependencies = [
 name = "krkr-engine"
 version = "0.1.0"
 dependencies = [
- "encoding_rs",
- "flate2",
  "image",
+ "krkr-assets",
  "krkr-core",
  "krkr-font",
  "krkr-kag",
  "krkr-tjs2",
  "krkr-video",
- "krkr-xp3",
  "libtlg-rs",
- "memmap2",
 ]
 
 [[package]]
@@ -1220,6 +1223,7 @@ dependencies = [
 name = "krkr-plugins"
 version = "0.1.0"
 dependencies = [
+ "krkr-assets",
  "krkr-audio",
  "krkr-core",
  "krkr-engine",
@@ -1252,6 +1256,7 @@ dependencies = [
  "krkr-kag",
  "krkr-plugins",
  "krkr-tjs2",
+ "krkr-video",
  "terminal_size",
 ]
 
@@ -1294,6 +1299,7 @@ dependencies = [
  "krkr-engine",
  "krkr-plugins",
  "krkr-render",
+ "krkr-video",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
