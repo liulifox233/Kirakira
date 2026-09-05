@@ -537,6 +537,13 @@ impl ProjectStorage {
     /// name (plus configured auto paths); probing `title.ks` for `title`
     /// would make UILoader mistake a scenario for its companion `title.ini`.
     pub fn storage_exists_exact(&self, name: &str) -> bool {
+        // KRKR scripts commonly construct an archive path from
+        // `System.arcPath` before adding it as an auto path.  Preserve that
+        // absolute-file probe instead of rejecting it while building logical
+        // VFS candidates.
+        if self.find_absolute_storage(name).ok().flatten().is_some() {
+            return true;
+        }
         let Ok(candidates) = exact_storage_candidates_with_auto_paths(name, &self.auto_paths())
         else {
             return false;
@@ -2123,6 +2130,26 @@ mod tests {
                 .expect("read mixed-case resource"),
             b"gallery"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn exact_storage_lookup_accepts_safe_absolute_project_files() {
+        let root = temp_root("absolute");
+        fs::create_dir_all(&root).expect("create root");
+        let archive = root.join("patch_append1.xp3");
+        fs::write(&archive, b"archive").expect("write archive");
+        let storage =
+            ProjectStorage::new(Some(root.clone()), project_layers(&root), None, Vec::new());
+
+        assert!(
+            storage.storage_exists_exact(
+                archive
+                    .to_str()
+                    .expect("temporary path must be valid UTF-8")
+            )
+        );
+
         fs::remove_dir_all(root).expect("cleanup");
     }
 
