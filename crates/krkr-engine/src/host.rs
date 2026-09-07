@@ -1383,7 +1383,10 @@ impl KrkrHost {
             .map(|instance| instance.layer_id)
     }
 
-    pub(crate) fn native_object_for_layer(&self, layer_id: LayerId) -> Option<ObjectHandle> {
+    /// The TJS object that owns a rendered layer. The layer tree only carries
+    /// ids, so this is what lets an inspector get from a wrong rectangle on
+    /// screen back to the script object that produced it.
+    pub fn native_object_for_layer(&self, layer_id: LayerId) -> Option<ObjectHandle> {
         self.native_layers
             .iter()
             .find_map(|(handle, instance)| (instance.layer_id == layer_id).then_some(*handle))
@@ -2041,6 +2044,42 @@ impl KrkrHost {
 
     pub fn has_pending_resource_loads(&self) -> bool {
         !self.pending_image_loads.is_empty() || !self.pending_script_image_loads.is_empty()
+    }
+
+    /// Returns human-readable pending resource entries for headless debugger
+    /// and host diagnostics.  Keeping the request path and target together is
+    /// important when a script suspends in `loadImages`: the KAG layer name
+    /// identifies the sprite while the storage identifies the asset that is
+    /// actually blocking the VM.
+    pub fn pending_resource_diagnostics(&self) -> Vec<String> {
+        let mut entries = Vec::new();
+        for load in self.pending_image_loads.values() {
+            let target = match &load.request.target {
+                ImageLoadTarget::Kag { page, layer } => format!("kag:{page}:{layer}"),
+            };
+            entries.push(format!(
+                "image storage={:?} target={target} owner={:?} visible={} rect=({:?},{:?},{:?},{:?}) generation={} revision={}",
+                load.request.storage,
+                load.request.owner,
+                load.request.visible,
+                load.request.left,
+                load.request.top,
+                load.request.width,
+                load.request.height,
+                load.generation,
+                load.revision,
+            ));
+        }
+        for (id, (storage, revision)) in &self.pending_script_image_loads {
+            entries.push(format!(
+                "script-image storage={storage:?} task={id:?} revision={revision}"
+            ));
+        }
+        for ((storage, kind), ()) in &self.pending_external_resources {
+            entries.push(format!("external storage={storage:?} kind={kind:?}"));
+        }
+        entries.sort();
+        entries
     }
 
     fn poll_resource_completions(&mut self) {

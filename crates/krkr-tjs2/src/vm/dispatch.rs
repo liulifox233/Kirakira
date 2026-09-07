@@ -1415,6 +1415,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 } else {
                     this_obj
                 };
+                if let Some(name) = self.runtime.native_call_name(id, false).map(str::to_string) {
+                    self.runtime.trace_native_call(&name, native_this, &args);
+                }
                 Ok(CallOutcome::Immediate(
                     function.call(self.runtime, native_this, args)?,
                     continuation,
@@ -1427,6 +1430,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     .get(id)
                     .cloned()
                     .ok_or_else(|| TjsError::runtime(format!("VM native function {id} missing")))?;
+                if let Some(name) = self.runtime.native_call_name(id, true).map(str::to_string) {
+                    self.runtime.trace_native_call(&name, this_obj, &args);
+                }
                 Ok(CallOutcome::Immediate(
                     function.call(self, this_obj, args)?,
                     continuation,

@@ -196,6 +196,40 @@ where
     }
 }
 
+/// Runtime-armable tracing of calls into native (Rust) methods.
+///
+/// Native methods are the boundary where a script's intent becomes engine
+/// geometry, so they are where a wrong value first becomes visible.  Hunting
+/// such a bug used to mean adding `eprintln!`s to the engine and rebuilding,
+/// which throws away a live session — expensive when reaching the repro takes
+/// tens of thousands of frames.  Keeping the filter in the runtime instead lets
+/// a debugger console arm and disarm traces on a running game.
+#[derive(Debug, Default)]
+pub(crate) struct NativeCallTrace {
+    /// Qualified `Class.method` names, indexed by native function id.
+    native_names: Vec<Option<String>>,
+    /// Same, indexed by VM-native function id.
+    vm_native_names: Vec<Option<String>>,
+    /// Lowercased patterns; empty means tracing is off.
+    patterns: Vec<String>,
+}
+
+impl NativeCallTrace {
+    fn matches(&self, name: &str) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let lowered = name.to_ascii_lowercase();
+        self.patterns.iter().any(|pattern| {
+            // `copyRect` matches `Layer.copyRect`, `Layer.` matches every
+            // Layer method, and `Layer.copyRect` matches exactly.
+            lowered == *pattern
+                || lowered.ends_with(&format!(".{pattern}"))
+                || lowered.starts_with(pattern)
+        })
+    }
+}
+
 pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) heap: Vec<Object>,
     pub(crate) global: ObjectHandle,
@@ -203,6 +237,7 @@ pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) native_functions: Vec<Arc<dyn NativeFunction<H>>>,
     pub(crate) vm_native_functions: Vec<Arc<dyn VmNativeFunction<H>>>,
     pub(crate) native_properties: Vec<Arc<dyn NativeProperty<H>>>,
+    pub(crate) native_call_trace: NativeCallTrace,
     pub(crate) call_depth: usize,
     pub(crate) max_call_depth: usize,
     pub(crate) suspend_requested: bool,
@@ -247,6 +282,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
             native_functions: Vec::new(),
             vm_native_functions: Vec::new(),
             native_properties: Vec::new(),
+            native_call_trace: NativeCallTrace::default(),
             call_depth: 0,
             max_call_depth: 1024,
             suspend_requested: false,
@@ -336,6 +372,8 @@ impl<H: TjsHost + 'static> Runtime<H> {
         F: NativeFunction<H> + 'static,
     {
         let handle = self.alloc_native(function, false);
+        let name = name.into();
+        self.name_native_call(handle, self.global, &name);
         self.heap[self.global.0].set(name, Variant::Object(handle));
         handle
     }
@@ -350,6 +388,8 @@ impl<H: TjsHost + 'static> Runtime<H> {
         F: NativeFunction<H> + 'static,
     {
         let handle = self.alloc_native(function, false);
+        let name = name.into();
+        self.name_native_call(handle, object, &name);
         self.heap[object.0].set(name, Variant::Object(handle));
         handle
     }
@@ -364,8 +404,117 @@ impl<H: TjsHost + 'static> Runtime<H> {
         F: VmNativeFunction<H> + 'static,
     {
         let handle = self.alloc_vm_native(function);
+        let name = name.into();
+        self.name_native_call(handle, object, &name);
         self.heap[object.0].set(name, Variant::Object(handle));
         handle
+    }
+
+    /// Records the `Class.method` name a freshly allocated native function is
+    /// about to be bound to, so [`set_native_call_traces`] can address it.
+    fn name_native_call(&mut self, function: ObjectHandle, owner: ObjectHandle, name: &str) {
+        let qualified = match self.heap[owner.0].class_infos.last() {
+            Some(class) if owner != self.global => format!("{class}.{name}"),
+            _ => name.to_string(),
+        };
+        match self.heap[function.0].kind {
+            ObjectKind::NativeFunction { id, .. } => {
+                if let Some(slot) = self.native_call_trace.native_names.get_mut(id) {
+                    *slot = Some(qualified);
+                }
+            }
+            ObjectKind::VmNativeFunction { id } => {
+                if let Some(slot) = self.native_call_trace.vm_native_names.get_mut(id) {
+                    *slot = Some(qualified);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Arms native call tracing. Each pattern is matched case-insensitively
+    /// against a native method's `Class.method` name: `copyRect` traces the
+    /// method on every class, `Layer.` traces all of `Layer`, and
+    /// `Layer.copyRect` traces exactly one. An empty list disables tracing.
+    pub fn set_native_call_traces<I, S>(&mut self, patterns: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.native_call_trace.patterns = patterns
+            .into_iter()
+            .map(|pattern| pattern.as_ref().trim().to_ascii_lowercase())
+            .filter(|pattern| !pattern.is_empty())
+            .collect();
+    }
+
+    pub fn native_call_traces(&self) -> &[String] {
+        &self.native_call_trace.patterns
+    }
+
+    /// Every `Class.method` name that [`set_native_call_traces`] can address,
+    /// so a console can offer completion or check a pattern for typos.
+    pub fn traceable_native_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .native_call_trace
+            .native_names
+            .iter()
+            .chain(self.native_call_trace.vm_native_names.iter())
+            .flatten()
+            .cloned()
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Logs one traced native call through the host log, where the debugger's
+    /// `logs` command can find it.
+    pub(crate) fn trace_native_call(
+        &mut self,
+        name: &str,
+        this_obj: Option<ObjectHandle>,
+        args: &[Variant],
+    ) {
+        let this = this_obj
+            .map(|handle| self.describe_traced_object(handle))
+            .unwrap_or_else(|| "void".to_string());
+        let args = args
+            .iter()
+            .map(|value| self.describe_traced_value(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.host
+            .log(&format!("native call {name} this={this} args=[{args}]"));
+    }
+
+    fn describe_traced_value(&self, value: &Variant) -> String {
+        match value {
+            Variant::Object(handle) => self.describe_traced_object(*handle),
+            Variant::Closure(closure) => format!("closure#{}", closure.object.0),
+            Variant::String(text) if text.chars().count() > 48 => {
+                let head: String = text.chars().take(48).collect();
+                format!("{head:?}…")
+            }
+            other => other.to_string(),
+        }
+    }
+
+    fn describe_traced_object(&self, handle: ObjectHandle) -> String {
+        match self.heap[handle.0].class_infos.last() {
+            Some(class) => format!("{class}#{}", handle.0),
+            None => format!("#{}", handle.0),
+        }
+    }
+
+    pub(crate) fn native_call_name(&self, id: usize, vm_native: bool) -> Option<&str> {
+        let names = if vm_native {
+            &self.native_call_trace.vm_native_names
+        } else {
+            &self.native_call_trace.native_names
+        };
+        let name = names.get(id)?.as_deref()?;
+        self.native_call_trace.matches(name).then_some(name)
     }
 
     pub fn register_object_native_property<G, S>(
@@ -408,6 +557,20 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     pub fn has_object_member(&self, object: ObjectHandle, name: &str) -> bool {
         self.heap[object.0].get_raw(name).is_some()
+    }
+
+    /// Whether calling this object would dispatch to code. Lets an inspector
+    /// separate an object's methods from the data members that describe its
+    /// state.
+    pub fn object_is_callable(&self, object: ObjectHandle) -> bool {
+        self.heap.get(object.0).is_some_and(|object| {
+            matches!(
+                object.kind,
+                ObjectKind::InterCode { .. }
+                    | ObjectKind::NativeFunction { .. }
+                    | ObjectKind::VmNativeFunction { .. }
+            )
+        })
     }
 
     pub fn object_valid(&self, object: ObjectHandle) -> bool {
@@ -769,7 +932,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
         })
     }
 
-    fn object_is_native_property(&self, handle: ObjectHandle) -> bool {
+    /// Whether reading this member goes through a native getter. Such a member
+    /// stores an accessor rather than the value, so an inspector has to resolve
+    /// it to show anything meaningful.
+    pub fn object_is_native_property(&self, handle: ObjectHandle) -> bool {
         self.heap
             .get(handle.0)
             .is_some_and(|object| matches!(object.kind, ObjectKind::NativeProperty { .. }))
@@ -927,6 +1093,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
     {
         let id = self.native_functions.len();
         self.native_functions.push(Arc::new(function));
+        self.native_call_trace.native_names.push(None);
         self.alloc_object(Object::new(ObjectKind::NativeFunction {
             id,
             constructable,
@@ -939,6 +1106,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
     {
         let id = self.vm_native_functions.len();
         self.vm_native_functions.push(Arc::new(function));
+        self.native_call_trace.vm_native_names.push(None);
         self.alloc_object(Object::new(ObjectKind::VmNativeFunction { id }))
     }
 

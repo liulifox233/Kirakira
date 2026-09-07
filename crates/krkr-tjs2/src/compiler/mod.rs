@@ -486,6 +486,67 @@ mod tests {
         );
     }
 
+    /// Host that keeps the lines a traced native call writes.
+    #[derive(Default)]
+    struct RecordingHost {
+        logs: Vec<String>,
+    }
+
+    impl crate::runtime::TjsHost for RecordingHost {
+        fn log(&mut self, message: &str) {
+            self.logs.push(message.to_string());
+        }
+    }
+
+    #[test]
+    fn native_call_traces_match_by_class_and_method() {
+        let mut runtime = Runtime::with_host(RecordingHost::default());
+        let class = runtime.alloc_ordinary_object();
+        runtime.add_object_class_info(class, "Layer");
+        runtime.register_object_native(
+            class,
+            "copyRect",
+            |_: &mut Runtime<RecordingHost>, _, _| Ok(Variant::Integer(1)),
+        );
+        runtime.register_object_native(class, "update", |_: &mut Runtime<RecordingHost>, _, _| {
+            Ok(Variant::Void)
+        });
+        runtime.set_global_member("layer", Variant::Object(class));
+
+        let file = compile_source_to_bytecode(
+            "native_trace.tjs",
+            "layer.copyRect(0, 0, 1397, 2227); layer.update();",
+        )
+        .expect("bytecode");
+
+        // Nothing is armed, so nothing is logged.
+        runtime.execute_file(&file).expect("execute");
+        assert!(runtime.host().logs.is_empty());
+
+        // The bare method name addresses it on whatever class it lives on.
+        runtime.set_native_call_traces(["copyrect"]);
+        runtime.execute_file(&file).expect("execute");
+        assert_eq!(runtime.host().logs.len(), 1);
+        assert!(
+            runtime.host().logs[0].starts_with("native call Layer.copyRect this=Layer#"),
+            "unexpected trace line {:?}",
+            runtime.host().logs[0]
+        );
+        assert!(runtime.host().logs[0].ends_with("args=[0, 0, 1397, 2227]"));
+
+        // A class prefix arms every method of that class.
+        runtime.set_native_call_traces(["Layer."]);
+        runtime.host_mut().logs.clear();
+        runtime.execute_file(&file).expect("execute");
+        assert_eq!(runtime.host().logs.len(), 2);
+
+        assert!(
+            runtime
+                .traceable_native_names()
+                .contains(&"Layer.copyRect".to_string())
+        );
+    }
+
     #[test]
     fn string_methods_cover_krkr2_char_trim_reverse_repeat() {
         assert_eq!(
