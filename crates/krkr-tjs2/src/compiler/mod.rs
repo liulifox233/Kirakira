@@ -458,6 +458,35 @@ mod tests {
     }
 
     #[test]
+    fn primary_class_method_prefers_first_script_extender() {
+        let mut runtime = Runtime::new();
+        let file = compile_source_to_bytecode(
+            "mi_primary_event.tjs",
+            r#"
+                class A { function onPaint() { global.trace = "A"; } }
+                class B { function onPaint() { global.trace = "B"; } }
+                class C extends A, B {}
+                var c = new C();
+            "#,
+        )
+        .expect("bytecode");
+        runtime.execute_file(&file).expect("execute");
+        let c = match runtime.global_member("c") {
+            Variant::Object(handle) => handle,
+            value => panic!("expected C instance, got {value:?}"),
+        };
+        assert!(
+            runtime
+                .call_primary_class_method(c, "onPaint", Vec::new())
+                .expect("primary class method")
+        );
+        assert_eq!(
+            runtime.global_member("trace"),
+            Variant::String("A".to_string())
+        );
+    }
+
+    #[test]
     fn string_methods_cover_krkr2_char_trim_reverse_repeat() {
         assert_eq!(
             execute_source(

@@ -1179,6 +1179,55 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         Ok(false)
     }
 
+    pub(crate) fn call_primary_class_method(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<bool> {
+        let class_infos = self.runtime.heap[object.0].class_infos.clone();
+        for class_name in class_infos {
+            let class_handle = match self.runtime.global_member(&class_name) {
+                Variant::Object(handle) => handle,
+                Variant::Closure(closure) => closure.object,
+                _ => continue,
+            };
+            if !matches!(
+                self.runtime.heap[class_handle.0].kind,
+                ObjectKind::InterCode {
+                    context: BytecodeContextType::Class,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            let Some(member) = self.runtime.heap[class_handle.0].get_raw(name) else {
+                continue;
+            };
+            let member = self.bind_proxy_value(member, Some(object));
+            let base_depth = self.runtime.call_depth;
+            match self.call_value(
+                member,
+                Some(object),
+                args.clone(),
+                false,
+                Continuation::Root,
+            )? {
+                CallOutcome::Immediate(_, Continuation::Root) => {}
+                CallOutcome::Immediate(_, continuation) => {
+                    return Err(TjsError::runtime(format!(
+                        "unexpected immediate class method continuation {continuation:?}"
+                    )));
+                }
+                CallOutcome::Frame(frame) => {
+                    self.run_call_stack(vec![*frame], base_depth)?;
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn call_variant_method(
         &mut self,
         object: Variant,

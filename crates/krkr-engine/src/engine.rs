@@ -4499,6 +4499,43 @@ mod tests {
     }
 
     #[test]
+    fn layer_paint_dispatches_script_extender_before_native_placeholder() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class PaintExtender extends Layer {
+                    function onPaint() {
+                        global.paintCalls++;
+                        super.onPaint(...);
+                    }
+                }
+                global.paintCalls = 0;
+                global.window = new Window();
+                global.layer = new Layer(window, null);
+                (PaintExtender incontextof layer)();
+                layer.callOnPaint = 1;
+                "#,
+            )
+            .expect("install paint extender");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("dispatch layer paint");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "paintCalls")
+                .expect("paint call count"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
     fn transition_policy_immediate_applies_kag_transition_synchronously() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -6322,6 +6359,11 @@ mod tests {
                 global.dest = new Layer();
                 dest.setImageSize(1, 1);
                 dest.affineCopy(source, 1, 0, 1, 1, false, 0, 0, 1, 0, 0, 1);
+
+                global.identity = new Layer();
+                identity.setImageSize(2, 1);
+                identity.affineCopy(source, 0, 0, 2, 1, false,
+                    -0.5, -0.5, 1.5, -0.5, -0.5, 0.5);
                 "#,
             )
             .expect("script");
@@ -6330,6 +6372,9 @@ mod tests {
         };
         let Variant::Object(dest) = engine.tjs_runtime().global_member("dest") else {
             panic!("destination missing");
+        };
+        let Variant::Object(identity) = engine.tjs_runtime().global_member("identity") else {
+            panic!("identity destination missing");
         };
         let source_id = engine.host().native_layer(source).expect("native source");
         let dest_id = engine
@@ -6351,6 +6396,20 @@ mod tests {
         assert_eq!(
             &dest_image.upload.rgba[..4],
             &source_image.upload.rgba[4..8]
+        );
+        let identity_id = engine
+            .host()
+            .native_layer(identity)
+            .expect("native identity destination");
+        let identity_image = engine
+            .host()
+            .layer_tree()
+            .layer(identity_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("identity image");
+        assert_eq!(
+            &identity_image.upload.rgba[..8],
+            &source_image.upload.rgba[..8]
         );
     }
 

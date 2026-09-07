@@ -221,15 +221,10 @@ fn csv_init_storage(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-    // Go through the TJS host read path instead of the synchronous storage
-    // helper.  Browser packages materialize non-bootstrap assets lazily; the
-    // host path turns a cache miss for a manifest-known file into a resumable
-    // ResourcePending request.  Calling read_binary_storage directly made
-    // packed UI `.func` files look permanently missing on Web.
-    let bytes = TjsHost::read_binary(runtime.host_mut(), &name, "")?;
+    let text = read_csv_storage_text(runtime, &name)?;
     if let Some(this) = csv_this(runtime, this_obj) {
         runtime.set_object_member(this, "__csvFile", Variant::String(name));
-        set_csv_text(runtime, this, decode_csv_text(&bytes));
+        set_csv_text(runtime, this, text);
     }
     Ok(Variant::Void)
 }
@@ -280,10 +275,10 @@ fn csv_parse_storage(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-    let bytes = TjsHost::read_binary(runtime.host_mut(), &name, "")?;
+    let text = read_csv_storage_text(runtime, &name)?;
     if let Some(this) = csv_this(runtime, this_obj) {
         runtime.set_object_member(this, "__csvFile", Variant::String(name));
-        set_csv_text(runtime, this, decode_csv_text(&bytes));
+        set_csv_text(runtime, this, text);
         csv_fire_do_line(runtime, this);
     }
     Ok(Variant::Void)
@@ -362,19 +357,21 @@ fn csv_offset_get(
     Ok(Variant::Integer(0))
 }
 
-/// UTF-8 (lossy), or UTF-16LE when a BOM is present; a UTF-8 BOM is stripped.
-fn decode_csv_text(bytes: &[u8]) -> String {
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        String::from_utf16_lossy(&units)
-    } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        String::from_utf8_lossy(rest).into_owned()
-    } else {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
+/// Reads a CSV/TSV storage as text.
+///
+/// The reference `csvParser.dll` opens the file with `TVPCreateTextStreamForRead`,
+/// so it sees whatever the engine's text reader produces: plain UTF-16LE with a
+/// BOM, one of the KiriKiri ciphered stream modes (`FE FE <mode> FF FE`), or a
+/// legacy single-byte encoding.  Going through the host text path instead of
+/// decoding the raw bytes here keeps all of those working — `fgimage/standposition.txt`
+/// in particular is a mode 1 (bit-swapped UTF-16) stream, and decoding it as raw
+/// bytes turned every row into a single garbage field.
+///
+/// The host read path is also what makes lazily materialized Web packages work:
+/// a cache miss for a manifest-known file becomes a resumable ResourcePending
+/// request rather than a permanent "missing file".
+fn read_csv_storage_text(runtime: &mut Runtime<KrkrHost>, name: &str) -> Result<String> {
+    TjsHost::read_text(runtime.host_mut(), name, "")
 }
 
 /// Parses one record starting at `pos`, returning the fields and the position
@@ -1014,9 +1011,13 @@ mod tests {
             .execute_script("inline.tjs", "csvProbe.parseStorage(\"title_first.func\");")
             .expect("resource-pending VM execution parks and returns void");
         assert_eq!(result, Variant::Void);
+        // The reference `csvParser.dll` opens the storage with
+        // `TVPCreateTextStreamForRead`, so a lazily materialized package fetches
+        // it as text — the same path that decodes KiriKiri's ciphered text
+        // streams.
         assert_eq!(
             engine.take_external_resource_requests(),
-            vec![("title_first.func".to_owned(), krkr_core::AssetKind::Binary)]
+            vec![("title_first.func".to_owned(), krkr_core::AssetKind::Text)]
         );
 
         engine

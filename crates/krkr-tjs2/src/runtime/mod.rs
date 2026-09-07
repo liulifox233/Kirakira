@@ -624,6 +624,23 @@ impl<H: TjsHost + 'static> Runtime<H> {
         vm.call_secondary_class_method(object, name, args)
     }
 
+    /// Invoke the first script class body in an instance's recorded
+    /// construction order.  This is used for native events which are
+    /// delivered to the owning object (for example Layer.onPaint): normal
+    /// member lookup must give the most-derived script extender first refusal,
+    /// while the secondary-class helper intentionally walks from the base for
+    /// `SUPER`-style fallbacks.
+    pub fn call_primary_class_method(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+        args: Vec<Variant>,
+    ) -> Result<bool> {
+        let file_id = self.call_context_file_id();
+        let mut vm = Vm::new(file_id, self)?;
+        vm.call_primary_class_method(object, name, args)
+    }
+
     pub fn call_variant_method(
         &mut self,
         object: Variant,

@@ -1376,9 +1376,27 @@ pub(crate) fn complete_layer_before_draw(
     // immediately dispatching onPaint, so an update issued by onPaint itself
     // remains pending for the next completion.
     set_layer_call_on_paint(runtime, handle, false);
-    runtime
-        .call_object_method(handle, "onPaint", Vec::new())
-        .map(|_| ())
+
+    // `Layer.onPaint` is a native no-op placeholder kept on the native class
+    // so `SUPER.onPaint(...)` remains callable.  Event delivery itself must
+    // give the most-derived script class first refusal: KRKR's
+    // TVP_ACTION_INVOKE sends the event to Owner, so a multiple-inheritance
+    // extender such as EnvGraphicLayer must run before the base fallback.
+    let callback = runtime.object_member(handle, "onPaint");
+    let callback_is_native = runtime.variant_is_native_function(&callback);
+    let primary_called = if matches!(callback, Variant::Void) || callback_is_native {
+        runtime.call_primary_class_method(handle, "onPaint", Vec::new())?
+    } else {
+        false
+    };
+
+    if primary_called {
+        Ok(())
+    } else {
+        runtime
+            .call_object_method(handle, "onPaint", Vec::new())
+            .map(|_| ())
+    }
 }
 
 fn complete_layer_subtree_before_draw(
@@ -3030,6 +3048,19 @@ fn layer_set_image_size(
     let image = resize_layer_image(runtime, existing_image, width as u32, height as u32);
     if let Some(target) = target {
         mutate_render_layer(runtime, &target, |layer| {
+            // KRKR2/KRKRZ InternalSetImageSize keeps the image inside the
+            // layer rectangle. Merely replacing the texture leaves a stale
+            // image offset for subsequent affine clipping.
+            if width as f32 >= layer.width {
+                layer.image_left = 0.0;
+            } else if width as f32 + layer.image_left < layer.width {
+                layer.image_left = layer.width - width as f32;
+            }
+            if height as f32 >= layer.height {
+                layer.image_top = 0.0;
+            } else if height as f32 + layer.image_top < layer.height {
+                layer.image_top = layer.height - height as f32;
+            }
             layer.image_width = width as f32;
             layer.image_height = height as f32;
             layer.image = image;
@@ -3798,6 +3829,11 @@ fn layer_affine_copy(
         .iter()
         .map(Variant::to_real)
         .collect::<Result<Vec<_>>>()?;
+    let clear = args.get(13).is_some_and(Variant::is_truthy);
+    let clear_color = layer_property_value(runtime, this, "neutralColor")
+        .to_integer()
+        .map(packed_color_to_rgba)
+        .unwrap_or([0, 0, 0, 0]);
     let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
@@ -3830,6 +3866,9 @@ fn layer_affine_copy(
         ]
     };
     mutate_layer_pixels(runtime, &dest_target, |pixels, dest_width, dest_height| {
+        if clear {
+            clear_affine_destination(pixels, dest_width, dest_height, points, clear_color);
+        }
         affine_copy_pixels(
             pixels,
             dest_width,
@@ -5706,8 +5745,14 @@ fn affine_copy_pixels(
     let max_y = y0.max(y1).max(y2).max(y3).ceil().min(dest_height as f64) as i64;
     for dy in min_y..max_y {
         for dx in min_x..max_x {
-            let px = dx as f64 + 0.5 - x0;
-            let py = dy as f64 + 0.5 - y0;
+            // KRKR's AffineBlt receives points in pixel coordinates.  The
+            // point at (0, 0) is the centre of the first destination pixel,
+            // not the left edge of its cell.  AffineSourceBMPBase also
+            // subtracts 0.5 from transformed corners to preserve this
+            // convention, so adding 0.5 here shifts every sample by one
+            // source pixel and drops the last row/column.
+            let px = dx as f64 - x0;
+            let py = dy as f64 - y0;
             let u = (px * vy - py * vx) / determinant;
             let v = (ux * py - uy * px) / determinant;
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
@@ -5726,6 +5771,46 @@ fn affine_copy_pixels(
             let dest_offset = ((dy as u32 * dest_width + dx as u32) * 4) as usize;
             dest[dest_offset..dest_offset + 4]
                 .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clear_affine_destination(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    points: [(f64, f64); 3],
+    clear_color: [u8; 4],
+) {
+    let [(x0, y0), (x1, y1), (x2, y2)] = points;
+    let ux = x1 - x0;
+    let uy = y1 - y0;
+    let vx = x2 - x0;
+    let vy = y2 - y0;
+    let determinant = ux * vy - uy * vx;
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        fill_pixel_buffer(dest, clear_color);
+        return;
+    }
+
+    let x3 = x1 + x2 - x0;
+    let y3 = y1 + y2 - y0;
+    let min_x = x0.min(x1).min(x2).min(x3).floor().max(0.0) as i64;
+    let max_x = x0.max(x1).max(x2).max(x3).ceil().min(dest_width as f64) as i64;
+    let min_y = y0.min(y1).min(y2).min(y3).floor().max(0.0) as i64;
+    let max_y = y0.max(y1).max(y2).max(y3).ceil().min(dest_height as f64) as i64;
+    for dy in min_y..max_y {
+        for dx in min_x..max_x {
+            let px = dx as f64 - x0;
+            let py = dy as f64 - y0;
+            let u = (px * vy - py * vx) / determinant;
+            let v = (ux * py - uy * px) / determinant;
+            if (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
+                continue;
+            }
+            let dest_offset = ((dy as u32 * dest_width + dx as u32) * 4) as usize;
+            dest[dest_offset..dest_offset + 4].copy_from_slice(&clear_color);
         }
     }
 }
