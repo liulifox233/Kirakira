@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use krkr_core::EngineEvent;
 use krkr_tjs2::runtime::{ObjectHandle, Variant};
@@ -13,14 +13,20 @@ pub(crate) struct TvpScheduler {
     input_events: VecDeque<EngineEvent>,
     window_update_events: VecDeque<ObjectHandle>,
     timers: BTreeMap<ObjectHandle, TimerState>,
+    idle_timers: VecDeque<(ObjectHandle, u32)>,
     idle_async_triggers: BTreeMap<ObjectHandle, usize>,
+    idle_async_order: VecDeque<ObjectHandle>,
     audio_fade_completions: BTreeMap<ObjectHandle, i64>,
     continuous_handlers: Vec<Variant>,
     next_sequence: u64,
     sequence_to_process: u64,
     event_disabled: bool,
     frame_continuous_delivered: bool,
-    frame_idle_async_delivered: BTreeSet<ObjectHandle>,
+    // Number of AtIdle deliveries captured at begin_frame. Triggers posted
+    // by an idle callback are left out of this snapshot and therefore wait
+    // for the next frame, while multiple triggers already queued are all
+    // delivered in the current idle phase (KRKR event queue semantics).
+    frame_idle_async_budget: BTreeMap<ObjectHandle, usize>,
     window_updates_delivering: bool,
     active_window_update: Option<ObjectHandle>,
     delivered_window_update_counts: BTreeMap<ObjectHandle, usize>,
@@ -29,7 +35,11 @@ pub(crate) struct TvpScheduler {
 impl TvpScheduler {
     pub(crate) fn begin_frame(&mut self) {
         self.frame_continuous_delivered = false;
-        self.frame_idle_async_delivered.clear();
+        self.frame_idle_async_budget = self
+            .idle_async_triggers
+            .iter()
+            .map(|(handle, count)| (*handle, *count))
+            .collect();
     }
 
     pub(crate) fn event_disabled(&self) -> bool {
@@ -66,7 +76,16 @@ impl TvpScheduler {
         ScriptPostResult::Queued
     }
 
-    pub(crate) fn post_timer_event(&mut self, handle: ObjectHandle, tag: u32) {
+    pub(crate) fn post_timer_event(&mut self, handle: ObjectHandle, tag: u32, mode: i64) {
+        if mode == 2 {
+            if self.event_disabled {
+                // At-idle timers are posted as discardable events in KRKR;
+                // expiration while event delivery is disabled is dropped.
+                return;
+            }
+            self.idle_timers.push_back((handle, tag));
+            return;
+        }
         let _ = self.post_script_event(
             ScriptEventRequest::new(
                 handle,
@@ -75,8 +94,38 @@ impl TvpScheduler {
                 tag,
                 ScriptEventKind::Timer,
             )
+            .exclusive(mode == 1)
             .discardable(true),
         );
+    }
+
+    pub(crate) fn post_current_timer_event(&mut self, handle: ObjectHandle, tag: u32) {
+        let mut event = self.script_event_from_request(ScriptEventRequest::new(
+            handle,
+            handle,
+            TIMER_EVENT_NAME,
+            tag,
+            ScriptEventKind::Timer,
+        ));
+        event.sequence = self.sequence_to_process;
+        self.script_events.push_back(event);
+    }
+
+    pub(crate) fn post_current_async_event(&mut self, handle: ObjectHandle) {
+        let mut event = self.script_event_from_request(ScriptEventRequest::new(
+            handle,
+            handle,
+            ASYNC_TRIGGER_EVENT_NAME,
+            0,
+            ScriptEventKind::AsyncTrigger,
+        ));
+        event.sequence = self.sequence_to_process;
+        self.script_events.push_back(event);
+    }
+
+    pub(crate) fn cancel_timer_events(&mut self, handle: ObjectHandle) {
+        self.cancel_source_events(handle);
+        self.idle_timers.retain(|(source, _)| *source != handle);
     }
 
     pub(crate) fn trigger_async(
@@ -102,6 +151,9 @@ impl TvpScheduler {
                 );
             }
             AsyncTriggerMode::AtIdle => {
+                if !self.idle_async_triggers.contains_key(&handle) {
+                    self.idle_async_order.push_back(handle);
+                }
                 let entry = self.idle_async_triggers.entry(handle).or_insert(0);
                 if cached {
                     *entry = 1;
@@ -115,6 +167,8 @@ impl TvpScheduler {
     pub(crate) fn cancel_async(&mut self, handle: ObjectHandle) {
         self.cancel_source_events(handle);
         self.idle_async_triggers.remove(&handle);
+        self.idle_async_order.retain(|entry| *entry != handle);
+        self.frame_idle_async_budget.remove(&handle);
     }
 
     pub(crate) fn pop_script_event(
@@ -177,6 +231,12 @@ impl TvpScheduler {
     }
 
     pub(crate) fn post_input_event(&mut self, event: EngineEvent) {
+        // Mouse-move input is posted by KRKR as a discardable event; while
+        // event delivery is disabled it is dropped, avoiding stale hover
+        // updates when a modal/script-critical section completes.
+        if self.event_disabled && matches!(event, EngineEvent::CursorMoved { .. }) {
+            return;
+        }
         self.input_events.push_back(event);
     }
 
@@ -265,6 +325,18 @@ impl TvpScheduler {
         self.timers.entry(handle).or_default().next_fire_millis = next_fire_millis;
     }
 
+    /// Records a timer's current interval and reports whether it changed.
+    /// KRKR cancels the old cadence and starts a fresh interval immediately
+    /// when an enabled timer's `interval` property is modified.
+    pub(crate) fn set_timer_interval(&mut self, handle: ObjectHandle, interval: i64) -> bool {
+        let timer = self.timers.entry(handle).or_default();
+        let changed = timer
+            .interval_millis
+            .is_some_and(|previous| previous != interval);
+        timer.interval_millis = Some(interval);
+        changed
+    }
+
     pub(crate) fn next_timer_tag(&mut self, handle: ObjectHandle) -> u32 {
         let timer = self.timers.entry(handle).or_default();
         let tag = 1u32.saturating_add(timer.counter << 1);
@@ -274,6 +346,11 @@ impl TvpScheduler {
 
     pub(crate) fn schedule_audio_fade_completion(&mut self, handle: ObjectHandle, due: i64) {
         self.audio_fade_completions.insert(handle, due);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn has_audio_fade_completion(&self, handle: ObjectHandle) -> bool {
+        self.audio_fade_completions.contains_key(&handle)
     }
 
     pub(crate) fn cancel_audio_fade_completion(&mut self, handle: ObjectHandle) {
@@ -310,12 +387,23 @@ impl TvpScheduler {
         self.continuous_handlers.len()
     }
 
+    pub(crate) fn has_continuous_handler(&self, handler: &Variant) -> bool {
+        self.continuous_handlers.iter().any(|item| item == handler)
+    }
+
     pub(crate) fn script_event_count(&self) -> usize {
         self.script_events.len()
     }
 
     pub(crate) fn idle_event_count(&self) -> usize {
-        self.idle_async_triggers.len()
+        self.idle_async_triggers.len() + self.idle_timers.len()
+    }
+
+    pub(crate) fn count_idle_timer_events(&self, handle: ObjectHandle) -> usize {
+        self.idle_timers
+            .iter()
+            .filter(|(source, _)| *source == handle)
+            .count()
     }
 
     pub(crate) fn timer_count(&self) -> usize {
@@ -333,13 +421,21 @@ impl TvpScheduler {
     }
 
     pub(crate) fn pop_idle_event(&mut self) -> Option<IdleEvent> {
-        if let Some(handle) = self
-            .idle_async_triggers
-            .keys()
-            .copied()
-            .find(|handle| !self.frame_idle_async_delivered.contains(handle))
-        {
-            self.frame_idle_async_delivered.insert(handle);
+        if let Some((handle, tag)) = self.idle_timers.pop_front() {
+            return Some(IdleEvent::Timer(handle, tag));
+        }
+        if let Some(handle) = self.idle_async_order.iter().copied().find(|handle| {
+            self.frame_idle_async_budget
+                .get(handle)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        }) {
+            let budget = self
+                .frame_idle_async_budget
+                .get_mut(&handle)
+                .expect("idle trigger budget key came from order");
+            *budget = budget.saturating_sub(1);
             let remove = {
                 let count = self
                     .idle_async_triggers
@@ -350,6 +446,8 @@ impl TvpScheduler {
             };
             if remove {
                 self.idle_async_triggers.remove(&handle);
+                self.idle_async_order.retain(|entry| *entry != handle);
+                self.frame_idle_async_budget.remove(&handle);
             }
             return Some(IdleEvent::AsyncTrigger(handle));
         }
@@ -366,6 +464,7 @@ impl TvpScheduler {
 
     pub(crate) fn invalidate_object(&mut self, handle: ObjectHandle) {
         self.timers.remove(&handle);
+        self.cancel_timer_events(handle);
         self.cancel_async(handle);
         self.window_update_events.retain(|event| *event != handle);
         self.audio_fade_completions.remove(&handle);
@@ -451,6 +550,7 @@ pub(crate) enum AsyncTriggerMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IdleEvent {
+    Timer(ObjectHandle, u32),
     AsyncTrigger(ObjectHandle),
     ContinuousHandlers(Vec<Variant>),
 }
@@ -523,6 +623,7 @@ impl ScriptEventRequest {
 struct TimerState {
     next_fire_millis: Option<i64>,
     counter: u32,
+    interval_millis: Option<i64>,
 }
 
 #[cfg(test)]
@@ -634,5 +735,90 @@ mod tests {
                 .pop_script_event(ScriptEventSelection::Any)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn timer_mode_routes_exclusive_idle_and_normal_queues() {
+        let mut scheduler = TvpScheduler::default();
+        let exclusive = ObjectHandle(1);
+        let idle = ObjectHandle(2);
+        let normal = ObjectHandle(3);
+
+        scheduler.post_timer_event(exclusive, 1, 1);
+        scheduler.post_timer_event(idle, 2, 2);
+        scheduler.post_timer_event(normal, 3, 0);
+        scheduler.begin_script_delivery_turn();
+
+        let exclusive_event = scheduler
+            .pop_script_event(ScriptEventSelection::Exclusive)
+            .expect("exclusive timer");
+        assert_eq!(exclusive_event.source, exclusive);
+        assert!(exclusive_event.exclusive);
+
+        let normal_event = scheduler
+            .pop_script_event(ScriptEventSelection::Any)
+            .expect("normal timer");
+        assert_eq!(normal_event.source, normal);
+        assert!(!normal_event.exclusive);
+
+        match scheduler.pop_idle_event() {
+            Some(IdleEvent::Timer(handle, tag)) => {
+                assert_eq!(handle, idle);
+                assert_eq!(tag, 2);
+            }
+            other => panic!("expected idle timer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disabled_event_system_drops_idle_timers_and_cursor_moves() {
+        let mut scheduler = TvpScheduler::default();
+        scheduler.set_event_disabled(true);
+        scheduler.post_timer_event(ObjectHandle(1), 1, 2);
+        scheduler.post_input_event(EngineEvent::CursorMoved {
+            position: krkr_core::Point::new(1.0, 2.0),
+        });
+        assert_eq!(scheduler.idle_event_count(), 0);
+        assert!(scheduler.pop_input_event().is_none());
+    }
+
+    #[test]
+    fn at_idle_budget_drains_queued_counts_but_defers_self_retrigger() {
+        let mut scheduler = TvpScheduler::default();
+        let handle = ObjectHandle(4);
+        scheduler.trigger_async(handle, AsyncTriggerMode::AtIdle, false);
+        scheduler.trigger_async(handle, AsyncTriggerMode::AtIdle, false);
+        scheduler.begin_frame();
+        scheduler.trigger_async(handle, AsyncTriggerMode::AtIdle, false);
+
+        assert!(matches!(
+            scheduler.pop_idle_event(),
+            Some(IdleEvent::AsyncTrigger(inner)) if inner == handle
+        ));
+        assert!(matches!(
+            scheduler.pop_idle_event(),
+            Some(IdleEvent::AsyncTrigger(inner)) if inner == handle
+        ));
+        assert!(!matches!(
+            scheduler.pop_idle_event(),
+            Some(IdleEvent::AsyncTrigger(_))
+        ));
+        assert_eq!(scheduler.idle_event_count(), 1);
+    }
+
+    #[test]
+    fn cancel_timer_events_clears_script_and_idle_queues() {
+        let mut scheduler = TvpScheduler::default();
+        let handle = ObjectHandle(5);
+        scheduler.post_timer_event(handle, 1, 0);
+        scheduler.post_timer_event(handle, 2, 2);
+        scheduler.cancel_timer_events(handle);
+        scheduler.begin_script_delivery_turn();
+        assert!(
+            scheduler
+                .pop_script_event(ScriptEventSelection::Any)
+                .is_none()
+        );
+        assert_eq!(scheduler.count_idle_timer_events(handle), 0);
     }
 }

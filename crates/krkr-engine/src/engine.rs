@@ -31,7 +31,8 @@ use crate::{
     native::classes::{
         apply_completed_image_load, apply_completed_resource_loads, call_wave_status_changed,
         complete_layer_before_draw, complete_pending_layer_paints,
-        finish_completed_native_transitions, register_kag_layer_slots_from_tjs,
+        finish_completed_native_transitions, register_kag_layer_slots_from_tjs, set_wave_paused,
+        set_wave_status,
     },
     native::{
         create_kag_parser_object, kag_to_tjs, refresh_kag_parser_object, tick_video_overlays,
@@ -39,8 +40,8 @@ use crate::{
     },
     plugin::KrkrPlugin,
     scheduler::{
-        ASYNC_TRIGGER_EVENT_NAME, AUDIO_FADE_COMPLETED_EVENT_NAME, AsyncTriggerMode, IdleEvent,
-        ScriptEvent, ScriptEventKind, ScriptEventSelection, TIMER_EVENT_NAME,
+        ASYNC_TRIGGER_EVENT_NAME, AUDIO_FADE_COMPLETED_EVENT_NAME, IdleEvent, ScriptEvent,
+        ScriptEventKind, ScriptEventSelection, TIMER_EVENT_NAME,
     },
     script::{
         execute_bytecode_if_present_on_runtime, execute_expression_on_runtime,
@@ -266,6 +267,7 @@ pub struct KrkrEngine {
     pressed_layer: Option<LayerId>,
     captured_layer: Option<LayerId>,
     input_result: EngineInputResult,
+    scheduler_turn_started: bool,
 }
 
 impl KrkrEngine {
@@ -295,6 +297,7 @@ impl KrkrEngine {
             pressed_layer: None,
             captured_layer: None,
             input_result: EngineInputResult::default(),
+            scheduler_turn_started: false,
         })
     }
 
@@ -836,10 +839,11 @@ impl KrkrEngine {
             return Ok(());
         }
 
-        self.tjs_runtime
-            .set_object_member(handle, "status", Variant::String("stop".to_string()));
-        self.tjs_runtime
-            .set_object_member(handle, "paused", Variant::Integer(0));
+        let status_changed = set_wave_status(&mut self.tjs_runtime, handle, "stop");
+        let paused_changed = set_wave_paused(&mut self.tjs_runtime, handle, false);
+        if !status_changed && !paused_changed {
+            return self.sync_kag_slots_after_ok(Ok(()));
+        }
         match call_wave_status_changed(&mut self.tjs_runtime, handle) {
             Ok(()) => self.sync_kag_slots_after_ok(Ok(())),
             Err(error) => {
@@ -934,6 +938,7 @@ impl KrkrEngine {
             #[cfg(target_arch = "wasm32")]
             self.tjs_runtime.host_mut().advance_clock(delta);
         }
+        self.sync_scheduler_event_disabled();
         {
             let scheduler = self.tjs_runtime.host_mut().scheduler_mut();
             scheduler.begin_frame();
@@ -1181,10 +1186,17 @@ impl KrkrEngine {
 
         if matches!(mode, RuntimeSchedulerPump::Full) {
             self.sync_scheduler_event_disabled();
+            // KRKR snapshots the event sequence once per external delivery
+            // turn. The first delivery pass starts it after due timers/fades
+            // have been posted; later native passes retain the same snapshot.
+            self.scheduler_turn_started = false;
         }
 
         if self.tjs_runtime.is_suspended() {
             if matches!(mode, RuntimeSchedulerPump::Full) {
+                if self.tjs_runtime.host().scheduler().event_disabled() {
+                    return Ok(());
+                }
                 while let Some(event) = self
                     .tjs_runtime
                     .host_mut()
@@ -1214,19 +1226,22 @@ impl KrkrEngine {
                 }
             }
 
+            if matches!(mode, RuntimeSchedulerPump::Full)
+                && !self.tjs_runtime.host().scheduler().event_disabled()
+                && self.deliver_idle_scheduler_event()?
+            {
+                if self.tjs_runtime.is_suspended() {
+                    return Ok(());
+                }
+                continue;
+            }
+
             let delivered_window_update = self.deliver_window_update_events()?;
             if delivered_window_update && self.tjs_runtime.is_suspended() {
                 return Ok(());
             }
 
             if delivered_script_or_input || delivered_window_update {
-                continue;
-            }
-
-            if matches!(mode, RuntimeSchedulerPump::Full) && self.deliver_idle_scheduler_event()? {
-                if self.tjs_runtime.is_suspended() {
-                    return Ok(());
-                }
                 continue;
             }
 
@@ -1241,10 +1256,16 @@ impl KrkrEngine {
 
     fn deliver_script_and_input_turn(&mut self) -> Result<bool> {
         self.post_due_scheduler_events()?;
-        self.tjs_runtime
-            .host_mut()
-            .scheduler_mut()
-            .begin_script_delivery_turn();
+        if self.tjs_runtime.host().scheduler().event_disabled() {
+            return Ok(false);
+        }
+        if !self.scheduler_turn_started {
+            self.tjs_runtime
+                .host_mut()
+                .scheduler_mut()
+                .begin_script_delivery_turn();
+            self.scheduler_turn_started = true;
+        }
 
         let mut delivered = false;
         let mut delivered_exclusive = false;
@@ -1272,12 +1293,15 @@ impl KrkrEngine {
             return Ok(delivered);
         }
 
-        while let Some(event) = self
-            .tjs_runtime
-            .host_mut()
-            .scheduler_mut()
-            .pop_input_event()
-        {
+        while !self.tjs_runtime.host().scheduler().event_disabled() {
+            let Some(event) = self
+                .tjs_runtime
+                .host_mut()
+                .scheduler_mut()
+                .pop_input_event()
+            else {
+                break;
+            };
             delivered = true;
             self.handle_input_event(event)?;
             if self.tjs_runtime.is_suspended()
@@ -1299,13 +1323,7 @@ impl KrkrEngine {
         {
             delivered = true;
             self.fire_script_event(event)?;
-            if self.tjs_runtime.is_suspended()
-                || self
-                    .tjs_runtime
-                    .host()
-                    .scheduler()
-                    .has_exclusive_script_event()
-            {
+            if self.tjs_runtime.is_suspended() {
                 return Ok(true);
             }
         }
@@ -1345,6 +1363,10 @@ impl KrkrEngine {
                 self.tjs_runtime
                     .host_mut()
                     .scheduler_mut()
+                    .cancel_timer_events(handle);
+                self.tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
                     .set_timer_next_fire_millis(handle, None);
                 continue;
             }
@@ -1352,8 +1374,9 @@ impl KrkrEngine {
             let interval = self
                 .tjs_runtime
                 .object_member(handle, "interval")
-                .to_integer()?
-                .max(0);
+                .to_real()?
+                .round()
+                .max(0.0) as i64;
             // KRKR2/KRKRZ skip enabled Timers whose interval is zero.  A
             // zero interval is therefore a disabled schedule, rather than an
             // idle continuation; KAG continuations use the event queue.
@@ -1361,7 +1384,28 @@ impl KrkrEngine {
                 self.tjs_runtime
                     .host_mut()
                     .scheduler_mut()
+                    .cancel_timer_events(handle);
+                self.tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
                     .set_timer_next_fire_millis(handle, None);
+                continue;
+            }
+
+            let interval_changed = self
+                .tjs_runtime
+                .host_mut()
+                .scheduler_mut()
+                .set_timer_interval(handle, interval);
+            if interval_changed {
+                self.tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
+                    .cancel_timer_events(handle);
+                self.tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
+                    .set_timer_next_fire_millis(handle, Some(now.saturating_add(interval)));
                 continue;
             }
 
@@ -1390,27 +1434,58 @@ impl KrkrEngine {
                 .tjs_runtime
                 .object_member(handle, "capacity")
                 .to_integer()
-                .unwrap_or(1);
+                .unwrap_or(6);
             let capacity = if capacity == 0 {
                 usize::MAX
+            } else if capacity < 0 {
+                // A negative Capacity cannot queue timer events in KRKR;
+                // treating it as one would spuriously fire callbacks.
+                0
             } else {
-                capacity.max(1) as usize
+                capacity as usize
             };
-            let queued = self.tjs_runtime.host().scheduler().count_script_events(
+            let queued_script = self.tjs_runtime.host().scheduler().count_script_events(
                 handle,
                 handle,
                 TIMER_EVENT_NAME,
                 0,
             );
-            if queued < capacity {
-                let scheduler = self.tjs_runtime.host_mut().scheduler_mut();
-                let tag = scheduler.next_timer_tag(handle);
-                scheduler.post_timer_event(handle, tag);
+            let queued_idle = self
+                .tjs_runtime
+                .host()
+                .scheduler()
+                .count_idle_timer_events(handle);
+            let mut queued = queued_script.saturating_add(queued_idle);
+            // Preserve KRKR's cadence when a frame/update arrives late.  The
+            // native timer drops excessive catch-up work after forty periods
+            // and restarts from the current clock; shorter stalls retain the
+            // original cadence.
+            let elapsed_periods = ((now.saturating_sub(next_fire)) / interval).saturating_add(1);
+            let due_periods = if elapsed_periods > 40 {
+                1
+            } else {
+                elapsed_periods as usize
+            };
+            let timer_mode = self
+                .tjs_runtime
+                .object_member(handle, "mode")
+                .to_integer()
+                .unwrap_or(0);
+            let scheduler = self.tjs_runtime.host_mut().scheduler_mut();
+            let tag = scheduler.next_timer_tag(handle);
+            for _ in 0..due_periods {
+                if queued >= capacity {
+                    break;
+                }
+                scheduler.post_timer_event(handle, tag, timer_mode);
+                queued = queued.saturating_add(1);
             }
-            self.tjs_runtime
-                .host_mut()
-                .scheduler_mut()
-                .set_timer_next_fire_millis(handle, None);
+            let next_fire = if elapsed_periods > 40 {
+                now.saturating_add(interval)
+            } else {
+                next_fire.saturating_add(interval.saturating_mul(elapsed_periods))
+            };
+            scheduler.set_timer_next_fire_millis(handle, Some(next_fire));
         }
 
         Ok(())
@@ -1477,17 +1552,33 @@ impl KrkrEngine {
         };
 
         match event {
+            IdleEvent::Timer(handle, tag) => {
+                self.tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
+                    .post_current_timer_event(handle, tag);
+            }
             IdleEvent::AsyncTrigger(handle) => {
-                self.tjs_runtime.host_mut().scheduler_mut().trigger_async(
-                    handle,
-                    AsyncTriggerMode::Normal,
-                    false,
-                );
+                self.tjs_runtime
+                    .host_mut()
+                    .scheduler_mut()
+                    .post_current_async_event(handle);
             }
             IdleEvent::ContinuousHandlers(handlers) => {
                 let tick = self.tjs_runtime.host_mut().now_millis();
                 for handler in handlers {
                     if matches!(handler, Variant::Void) {
+                        continue;
+                    }
+                    // The native continuous vector is live during a pass:
+                    // removing a later handler from an earlier callback
+                    // suppresses that callback immediately.
+                    if !self
+                        .tjs_runtime
+                        .host()
+                        .scheduler()
+                        .has_continuous_handler(&handler)
+                    {
                         continue;
                     }
                     if let Err(mut error) = self
@@ -1502,9 +1593,15 @@ impl KrkrEngine {
                                 "handled continuous handler error: {}",
                                 error.message
                             ));
+                            self.tjs_runtime
+                                .host_mut()
+                                .remove_continuous_handler(&handler);
                         } else {
                             error.message =
                                 format!("continuous handler {handler:?} failed: {}", error.message);
+                            self.tjs_runtime
+                                .host_mut()
+                                .remove_continuous_handler(&handler);
                             return Err(error);
                         }
                     }
@@ -5155,6 +5252,24 @@ mod tests {
             Variant::Integer(42)
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn scripts_eval_assigns_through_star_of_a_property_proxy_call() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    r#"
+                    global.box = %[];
+                    Scripts.eval("(*box) = 4");
+                    return *box;
+                    "#,
+                )
+                .expect("eval"),
+            Variant::Integer(4)
+        );
     }
 
     #[test]
@@ -9487,6 +9602,100 @@ mod tests {
     }
 
     #[test]
+    fn native_sourced_transition_exchanges_tree_so_children_follow_their_layer() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                global.win = new Window();
+                kag.fore = %[base: new Layer(win), layers: [], messages: []];
+                kag.back = %[base: new Layer(win, kag.fore.base), layers: [], messages: []];
+                kag.fore.base.comp = kag.back.base;
+                kag.back.base.comp = kag.fore.base;
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(100, 100);
+                kag.back.base.visible = false;
+                kag.back.base.setSize(100, 100);
+                kag.fore.messages[0] = new Layer(null, kag.fore.base);
+                kag.back.messages[0] = new Layer(null, kag.back.base);
+                kag.fore.messages[0].visible = true;
+                kag.fore.messages[0].setSize(20, 20);
+                kag.back.messages[0].visible = true;
+                kag.back.messages[0].setSize(20, 20);
+                kag.back.messages[0].setImageSize(20, 20);
+                kag.back.messages[0].colorRect(0, 0, 20, 20, 0xffffff, 255);
+                kag.back.messages[0].focusable = true;
+                kag.back.messages[0].focus();
+                kag.clicks = 0;
+                kag.back.messages[0].onMouseDown = function(x, y, shift) {
+                    kag.clicks++;
+                };
+                kag.fore.base.onTransitionCompleted = function(dest, src) {
+                    var tmp = kag.fore;
+                    kag.fore = kag.back;
+                    kag.back = tmp;
+                };
+                "#,
+            )
+            .expect("setup");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"kag.fore.base.beginTransition("crossfade", true, kag.back.base, %[time: 1]);"#,
+            )
+            .expect("begin transition");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(1),
+            )
+            .expect("complete transition");
+        assert_eq!(image_command_count(&frame), 1);
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "kag.fore.messages[0].parent === kag.fore.base && kag.fore.base.visible && win.focusedLayer === null"
+                )
+                .expect("message stays with its base and exchange blurs the old focus"),
+            Variant::Integer(1)
+        );
+
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![
+                        EngineEvent::CursorMoved {
+                            position: Point::new(5.0, 5.0),
+                        },
+                        EngineEvent::PointerInput {
+                            button: PointerButton::Primary,
+                            state: ButtonState::Pressed,
+                        },
+                    ],
+                ),
+                Duration::ZERO,
+            )
+            .expect("click");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.clicks")
+                .expect("clicks"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
     fn native_kag_base_transition_uses_back_children_as_live_tree() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
@@ -9900,7 +10109,6 @@ mod tests {
                 kag.fore.base.setImageSize(2, 1);
                 kag.back.base.loadImages("new.png");
                 kag.fore.base.beginTransition("crossfade", true, kag.back.base, %[]);
-                kag.fore.base.exchangeInfo();
                 var tmp = kag.fore;
                 kag.fore = kag.back;
                 kag.back = tmp;
@@ -13127,11 +13335,12 @@ mod tests {
                 buffer.open("music.ogg");
                 buffer.looping = 1;
                 buffer.play();
-                buffer.fadeOutAndStop(0);
+                buffer.fadeOutAndStop(1);
                 "#,
             )
             .expect("script");
 
+        engine.host_mut().advance_clock(Duration::from_millis(1));
         engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
@@ -14665,6 +14874,16 @@ mod tests {
 
         assert_eq!(
             engine.tjs_runtime().global_member("trace"),
+            Variant::String("AP".to_string())
+        );
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("next delivery turn");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
             Variant::String("APB".to_string())
         );
     }
@@ -14732,6 +14951,317 @@ mod tests {
             engine.tjs_runtime().global_member("trace"),
             Variant::String("ARB".to_string())
         );
+    }
+
+    #[test]
+    fn timer_and_async_trigger_require_an_action_owner() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let timer_error = engine
+            .execute_script("new_timer.tjs", "new Timer();")
+            .expect_err("Timer requires an owner");
+        assert!(
+            timer_error.message.contains("requires an action owner"),
+            "{timer_error:?}"
+        );
+        let trigger_error = engine
+            .execute_script("new_async.tjs", "new AsyncTrigger();")
+            .expect_err("AsyncTrigger requires an owner");
+        assert!(
+            trigger_error.message.contains("requires an action owner"),
+            "{trigger_error:?}"
+        );
+        engine
+            .execute_script("async_owner.tjs", "new AsyncTrigger(function() {}, \"\");")
+            .expect("AsyncTrigger with owner stays valid");
+    }
+
+    #[test]
+    fn timer_modes_route_exclusive_and_idle_callbacks() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer_modes.tjs",
+                r#"
+                global.trace = "";
+                global.exclusiveTimer = new Timer(function() {
+                    global.trace += "E";
+                    exclusiveTimer.enabled = false;
+                }, "");
+                global.idleTimer = new Timer(function() {
+                    global.trace += "I";
+                    idleTimer.enabled = false;
+                }, "");
+                exclusiveTimer.mode = 1;
+                idleTimer.mode = 2;
+                exclusiveTimer.interval = 10;
+                idleTimer.interval = 10;
+                exclusiveTimer.enabled = true;
+                idleTimer.enabled = true;
+                "#,
+            )
+            .expect("script");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("arm timers");
+        engine.host_mut().advance_clock(Duration::from_millis(10));
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("EI".to_string())
+        );
+    }
+
+    #[test]
+    fn event_disabled_drops_idle_timer_and_cursor_move() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "event_disabled.tjs",
+                r#"
+                global.trace = "";
+                global.idleTimer = new Timer(function() {
+                    global.trace += "T";
+                    idleTimer.enabled = false;
+                }, "");
+                idleTimer.mode = 2;
+                idleTimer.interval = 10;
+                idleTimer.enabled = true;
+                System.eventDisabled = true;
+                "#,
+            )
+            .expect("script");
+        engine.host_mut().advance_clock(Duration::from_millis(10));
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::CursorMoved {
+                        position: Point::new(12.0, 8.0),
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("disabled frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("".to_string())
+        );
+        assert_eq!(engine.host().cursor_position(), None);
+
+        engine
+            .execute_script("enable.tjs", "System.eventDisabled = false;")
+            .expect("enable events");
+        engine.host_mut().advance_clock(Duration::from_millis(10));
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("enabled frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("T".to_string())
+        );
+    }
+
+    #[test]
+    fn timer_interval_change_restarts_cadence() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer_interval.tjs",
+                r#"
+                global.fires = 0;
+                global.timerProbe = new Timer(function() {
+                    global.fires++;
+                    timerProbe.enabled = false;
+                }, "");
+                timerProbe.interval = 50;
+                timerProbe.enabled = true;
+                "#,
+            )
+            .expect("script");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("arm timer");
+        engine.host_mut().advance_clock(Duration::from_millis(50));
+        engine
+            .execute_script("change_interval.tjs", "timerProbe.interval = 1000;")
+            .expect("change interval");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("after interval change");
+        assert_eq!(
+            engine.tjs_runtime().global_member("fires"),
+            Variant::Integer(0)
+        );
+        engine.host_mut().advance_clock(Duration::from_millis(1000));
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("after new interval");
+        assert_eq!(
+            engine.tjs_runtime().global_member("fires"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn timer_catch_up_caps_late_periods_and_honors_capacity() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer_catchup.tjs",
+                r#"
+                global.fires = 0;
+                global.timerProbe = new Timer(function() {
+                    global.fires++;
+                }, "");
+                timerProbe.interval = 10;
+                timerProbe.capacity = 2;
+                timerProbe.enabled = true;
+                "#,
+            )
+            .expect("script");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("arm timer");
+        engine.host_mut().advance_clock(Duration::from_millis(80));
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("catch-up frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("fires"),
+            Variant::Integer(2)
+        );
+    }
+
+    #[test]
+    fn continuous_handler_removed_mid_pass_is_skipped() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "continuous_live.tjs",
+                r#"
+                global.trace = "";
+                function first() {
+                    global.trace += "A";
+                    System.removeContinuousHandler(second);
+                }
+                function second() {
+                    global.trace += "B";
+                }
+                System.addContinuousHandler(first);
+                System.addContinuousHandler(second);
+                "#,
+            )
+            .expect("script");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(
+            engine.tjs_runtime().global_member("trace"),
+            Variant::String("A".to_string())
+        );
+    }
+
+    #[test]
+    fn wave_pause_status_fade_delay_and_set_pos_match_krkr() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "wave_compat.tjs",
+                r#"
+                global.statusChanges = 0;
+                global.buffer = new WaveSoundBuffer();
+                buffer.onStatusChanged = function() { global.statusChanges++; };
+                buffer.open("voice.ogg");
+                buffer.play();
+                buffer.play();
+                buffer.paused = true;
+                buffer.setPos(1, 2, 3);
+                buffer.fade(10000, 50, 25);
+                global.status = buffer.status;
+                global.paused = buffer.paused;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            engine.tjs_runtime().global_member("statusChanges"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("status"),
+            Variant::String("play".to_string())
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("paused"),
+            Variant::Integer(1)
+        );
+        let Variant::Object(buffer) = engine.tjs_runtime().global_member("buffer") else {
+            panic!("buffer missing");
+        };
+        assert_eq!(
+            engine.tjs_runtime().object_member(buffer, "posX"),
+            Variant::Real(1.0)
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(buffer, "posY"),
+            Variant::Real(2.0)
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(buffer, "posZ"),
+            Variant::Real(3.0)
+        );
+        let commands = engine.host_mut().take_audio_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, AudioCommand::Pause { .. })),
+            "expected a pause command, got {commands:?}"
+        );
+        assert!(engine.host().scheduler().has_audio_fade_completion(buffer));
+        engine.host_mut().advance_clock(Duration::from_millis(74));
+        let now = engine.tjs_runtime.host_mut().now_millis();
+        engine
+            .tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .post_due_audio_fade_completions(now);
+        assert!(engine.host().scheduler().has_audio_fade_completion(buffer));
+        engine.host_mut().advance_clock(Duration::from_millis(1));
+        let now = engine.tjs_runtime.host_mut().now_millis();
+        engine
+            .tjs_runtime
+            .host_mut()
+            .scheduler_mut()
+            .post_due_audio_fade_completions(now);
+        assert!(!engine.host().scheduler().has_audio_fade_completion(buffer));
     }
 
     fn test_tag(name: &str, attrs: &[(&str, &str)]) -> Tag {

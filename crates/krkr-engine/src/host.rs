@@ -2392,7 +2392,32 @@ impl KrkrHost {
     pub(crate) fn mark_native_audio_stopped(&mut self, handle: ObjectHandle) {
         if let Some(buffer) = self.native_audio_buffers.get_mut(&handle) {
             buffer.playing = false;
+            buffer.paused = false;
         }
+    }
+
+    pub(crate) fn set_native_audio_paused(&mut self, handle: ObjectHandle, paused: bool) {
+        let Some(buffer) = self.native_audio_buffers.get_mut(&handle) else {
+            return;
+        };
+        if buffer.paused == paused {
+            return;
+        }
+        buffer.paused = paused;
+        if !buffer.playing {
+            return;
+        }
+        self.pending_audio_commands.push(if paused {
+            AudioCommand::Pause {
+                id: buffer.id,
+                fade_seconds: 0.0,
+            }
+        } else {
+            AudioCommand::Resume {
+                id: buffer.id,
+                fade_seconds: 0.0,
+            }
+        });
     }
 
     pub(crate) fn mark_native_audio_instance_stopped(
@@ -2404,6 +2429,7 @@ impl KrkrHost {
             .find_map(|(handle, buffer)| {
                 (buffer.id == id).then(|| {
                     buffer.playing = false;
+                    buffer.paused = false;
                     *handle
                 })
             })
@@ -2450,6 +2476,7 @@ impl KrkrHost {
         let looping = buffer.looping;
         let volume = buffer.effective_volume(self.native_audio_global_volume);
         buffer.playing = true;
+        buffer.paused = false;
         self.pending_audio_commands.push(AudioCommand::Play {
             id,
             bus,
@@ -2957,6 +2984,7 @@ pub(crate) struct NativeAudioBuffer {
     pub volume2: i64,
     pub pan: i64,
     pub playing: bool,
+    pub paused: bool,
 }
 
 impl NativeAudioBuffer {
@@ -2969,6 +2997,7 @@ impl NativeAudioBuffer {
             volume2: 100000,
             pan: 0,
             playing: false,
+            paused: false,
         }
     }
 
@@ -3125,6 +3154,7 @@ pub(crate) struct NativeTransitionCompletion {
     pub dest: ObjectHandle,
     pub source: Option<ObjectHandle>,
     pub paired_comp: bool,
+    pub with_children: bool,
 }
 
 impl TjsHost for KrkrHost {

@@ -58,6 +58,22 @@ fn construct_native_instance(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
+    // KRKR's BaseTimer/AsyncTrigger native constructors require an action
+    // owner as their first argument.  Apart from matching the native
+    // BADPARAMCOUNT contract, rejecting an omitted owner prevents a timer
+    // that can never dispatch its callback from being registered in the
+    // scheduler.
+    // `new Timer()` / `new AsyncTrigger()` require an owner. Subclass
+    // construction (`new ConductorTimer()`) first invokes the native parent
+    // initializer with the instance bound and no args; `super.Timer(owner)`
+    // then supplies the action. Reject only the bare `new` path.
+    if matches!(spec.name, "Timer" | "AsyncTrigger") && args.is_empty() && this_obj.is_none() {
+        return Err(TjsError::runtime(format!(
+            "{} requires an action owner",
+            spec.name
+        )));
+    }
+
     let existing_this = this_obj
         .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
         .filter(|handle| *handle != runtime.global_handle());
@@ -157,6 +173,7 @@ fn install_native_properties(
         "Window" => install_window_native_properties(runtime, handle, false),
         "WaveSoundBuffer" => install_wave_native_properties(runtime, handle, false),
         "VideoOverlay" => install_video_native_properties(runtime, handle, false),
+        "AsyncTrigger" => install_async_trigger_native_properties(runtime, handle, false),
         _ => {}
     }
 }
@@ -171,6 +188,7 @@ fn install_instance_native_properties(
         "Window" => install_window_native_properties(runtime, handle, true),
         "WaveSoundBuffer" => install_wave_native_properties(runtime, handle, true),
         "VideoOverlay" => install_video_native_properties(runtime, handle, true),
+        "AsyncTrigger" => install_async_trigger_native_properties(runtime, handle, true),
         _ => {}
     }
 }
@@ -235,6 +253,90 @@ fn install_window_native_properties(
             );
         }
     }
+}
+
+fn install_async_trigger_native_properties(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    preserve_script_properties: bool,
+) {
+    for property in ["cached", "mode"] {
+        if preserve_script_properties && runtime.object_member_is_property(handle, property) {
+            continue;
+        }
+        let existing = runtime.object_member(handle, property);
+        let property_handle = runtime.register_object_native_property(
+            handle,
+            property,
+            move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
+                let this = this_obj.unwrap_or(handle);
+                let backing =
+                    runtime.object_member(this, &async_trigger_property_backing_key(property));
+                Ok(if matches!(backing, Variant::Void) {
+                    runtime.object_member(this, property)
+                } else {
+                    backing
+                })
+            },
+            move |runtime: &mut Runtime<KrkrHost>,
+                  this_obj: Option<ObjectHandle>,
+                  value: Variant| {
+                let this = this_obj.unwrap_or(handle);
+                let previous =
+                    runtime.object_member(this, &async_trigger_property_backing_key(property));
+                let changed = match property {
+                    // SetCached receives a bool in KRKR, so compare the
+                    // converted truth value rather than the raw Variant
+                    // representation (e.g. integer 1 vs string "1").
+                    "cached" => {
+                        let previous = if matches!(previous, Variant::Void) {
+                            Variant::Integer(1)
+                        } else {
+                            previous
+                        };
+                        previous.is_truthy() != value.is_truthy()
+                    }
+                    // SetMode casts to an integer enum before comparing.
+                    "mode" => {
+                        let previous = if matches!(previous, Variant::Void) {
+                            Variant::Integer(0)
+                        } else {
+                            previous
+                        };
+                        previous.to_integer().unwrap_or(0) != value.to_integer().unwrap_or(0)
+                    }
+                    _ => true,
+                };
+                runtime.set_object_member(
+                    this,
+                    async_trigger_property_backing_key(property),
+                    value,
+                );
+                if changed {
+                    runtime.host_mut().cancel_async(this);
+                }
+                Ok(())
+            },
+        );
+        if !matches!(existing, Variant::Void) {
+            runtime.set_object_member(
+                handle,
+                async_trigger_property_backing_key(property),
+                existing,
+            );
+        }
+        if preserve_script_properties {
+            runtime.set_object_member(
+                handle,
+                property,
+                Variant::Closure(Closure::new(property_handle, Some(handle))),
+            );
+        }
+    }
+}
+
+fn async_trigger_property_backing_key(name: &str) -> String {
+    format!("__nativeAsyncTriggerProperty${name}")
 }
 
 fn install_wave_native_properties(
@@ -306,7 +408,8 @@ fn apply_constructor_defaults(
         "Timer" => {
             runtime.set_object_member(handle, "enabled", Variant::Integer(0));
             runtime.set_object_member(handle, "interval", Variant::Integer(1000));
-            runtime.set_object_member(handle, "capacity", Variant::Integer(1));
+            // KRKR's default timer queue capacity is six events per timer.
+            runtime.set_object_member(handle, "capacity", Variant::Integer(6));
             runtime.set_object_member(handle, "mode", Variant::Integer(0));
             runtime.set_object_member(
                 handle,
@@ -518,10 +621,11 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "preferredDrawer", Variant::Integer(0));
         }
         "WaveSoundBuffer" => {
-            runtime.set_object_member(handle, "status", Variant::String("unload".to_string()));
+            set_wave_status(runtime, handle, "unload");
             runtime.set_object_member(handle, "volume", Variant::Integer(100000));
             runtime.set_object_member(handle, "pan", Variant::Integer(0));
             runtime.set_object_member(handle, "looping", Variant::Integer(0));
+            set_wave_property_storage(runtime, handle, "paused", Variant::Integer(0));
             // KRKR's BGM helper records the effective loop mode in flags[0].
             // It assumes this mutable array exists on every sound buffer.
             let flags = runtime.alloc_array_object(vec![Variant::Integer(0)]);
@@ -1588,10 +1692,12 @@ fn layer_property_backing_key(name: &str) -> Cow<'static, str> {
 }
 
 const WAVE_NATIVE_PROPERTIES: &[&str] = &[
+    "status",
     "looping",
     "volume",
     "volume2",
     "pan",
+    "paused",
     "sampleValue",
     "sampleCount",
     "sampleAhead",
@@ -1622,6 +1728,9 @@ fn wave_native_property_get(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
+    if name == "status" {
+        return Ok(runtime.object_member(this, &wave_property_backing_key("status")));
+    }
     if matches!(name, "sampleCount" | "sampleAhead") {
         let value = runtime.object_member(this, &wave_property_backing_key(name));
         return Ok(match value {
@@ -1637,6 +1746,7 @@ fn wave_native_property_get(
             "volume" => Variant::Integer(buffer.volume),
             "volume2" => Variant::Integer(buffer.volume2),
             "pan" => Variant::Integer(buffer.pan),
+            "paused" => Variant::Integer(i64::from(buffer.paused)),
             _ => Variant::Void,
         })
         .unwrap_or_else(|| runtime.object_member(this, &wave_property_backing_key(name)));
@@ -1670,6 +1780,10 @@ fn wave_native_property_set(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(());
     };
+    if name == "status" {
+        // Native status is read-only; transitions update it internally.
+        return Ok(());
+    }
     match name {
         "sampleValue" => {}
         "sampleCount" | "sampleAhead" => {
@@ -1696,6 +1810,11 @@ fn wave_native_property_set(
             runtime.host_mut().set_native_audio_pan(this, pan);
             set_wave_property_storage(runtime, this, name, Variant::Integer(pan));
         }
+        "paused" => {
+            let paused = value.is_truthy();
+            runtime.host_mut().set_native_audio_paused(this, paused);
+            set_wave_paused(runtime, this, paused);
+        }
         _ => {}
     }
     Ok(())
@@ -1709,6 +1828,44 @@ fn set_wave_property_storage(
 ) {
     let handle = runtime.bound_this(handle).unwrap_or(handle);
     runtime.set_object_member(handle, wave_property_backing_key(name), value);
+}
+
+pub(crate) fn set_wave_status(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    status: &str,
+) -> bool {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    let current = runtime.object_member(handle, &wave_property_backing_key("status"));
+    if matches!(&current, Variant::String(value) if value == status) {
+        return false;
+    }
+    set_wave_property_storage(
+        runtime,
+        handle,
+        "status",
+        Variant::String(status.to_string()),
+    );
+    true
+}
+
+pub(crate) fn set_wave_paused(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    paused: bool,
+) -> bool {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    let current = runtime.object_member(handle, &wave_property_backing_key("paused"));
+    if current.is_truthy() == paused && !matches!(current, Variant::Void) {
+        return false;
+    }
+    set_wave_property_storage(
+        runtime,
+        handle,
+        "paused",
+        Variant::Integer(i64::from(paused)),
+    );
+    true
 }
 
 fn wave_property_backing_key(name: &str) -> String {
@@ -1804,7 +1961,7 @@ fn wave_sound_buffer_open(
         TraceCategory::Audio,
         &format!("WaveSoundBuffer.open: {opened_storage}"),
     );
-    runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
+    set_wave_status(runtime, this, "stop");
     runtime.set_object_member(this, "position", Variant::Integer(0));
     runtime.set_object_member(this, "samplePosition", Variant::Integer(0));
     Ok(Variant::Void)
@@ -1816,6 +1973,15 @@ fn wave_sound_buffer_play(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.play")?;
+    if runtime
+        .host()
+        .native_audio_buffer(this)
+        .is_some_and(|buffer| buffer.playing)
+    {
+        // BaseSoundBuffer::Play is idempotent while already playing; do not
+        // enqueue a second backend voice or emit a duplicate status event.
+        return Ok(Variant::Void);
+    }
     sync_wave_buffer_settings(runtime, this)?;
     let bus = if runtime
         .host()
@@ -1838,9 +2004,11 @@ fn wave_sound_buffer_play(
     runtime
         .host_mut()
         .queue_native_audio_play(this, bus, AudioLoadPolicy::Auto)?;
-    runtime.set_object_member(this, "status", Variant::String("play".to_string()));
-    runtime.set_object_member(this, "paused", Variant::Integer(0));
-    call_wave_status_changed(runtime, this)?;
+    let status_changed = set_wave_status(runtime, this, "play");
+    let paused_changed = set_wave_paused(runtime, this, false);
+    if status_changed || paused_changed {
+        call_wave_status_changed(runtime, this)?;
+    }
     Ok(Variant::Void)
 }
 
@@ -1850,6 +2018,16 @@ fn wave_sound_buffer_stop(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.stop")?;
+    let previous_status = runtime.object_member(this, &wave_property_backing_key("status"));
+    let was_playing = runtime
+        .host()
+        .native_audio_buffer(this)
+        .is_some_and(|buffer| buffer.playing);
+    if !was_playing
+        && matches!(&previous_status, Variant::String(status) if status == "unload" || status == "stop")
+    {
+        return Ok(Variant::Void);
+    }
     let stop_storage = runtime
         .host()
         .native_audio_buffer(this)
@@ -1871,9 +2049,11 @@ fn wave_sound_buffer_stop(
         });
     }
     runtime.host_mut().mark_native_audio_stopped(this);
-    runtime.set_object_member(this, "status", Variant::String("stop".to_string()));
-    runtime.set_object_member(this, "paused", Variant::Integer(0));
-    call_wave_status_changed(runtime, this)?;
+    let status_changed = set_wave_status(runtime, this, "stop");
+    let paused_changed = set_wave_paused(runtime, this, false);
+    if status_changed || paused_changed {
+        call_wave_status_changed(runtime, this)?;
+    }
     Ok(Variant::Void)
 }
 
@@ -1914,20 +2094,41 @@ fn wave_sound_buffer_fade(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.fade")?;
+    if runtime.host().native_audio_buffer(this).is_none() {
+        return Ok(Variant::Void);
+    }
+    let delay_millis = match args.get(2) {
+        Some(Variant::Void) | None => 0,
+        Some(value) => value.to_integer()?,
+    };
+    if delay_millis < 0 {
+        return Err(TjsError::runtime(
+            "WaveSoundBuffer.fade delay must be non-negative",
+        ));
+    }
     let (target, millis) = if let Some(options) = args.first().and_then(variant_object) {
         let target = object_member_i64(runtime, options, "volume")?.unwrap_or(0);
         let millis = match object_member_i64(runtime, options, "time")? {
             Some(value) => value,
             None => object_member_i64(runtime, options, "period")?.unwrap_or(0),
-        }
-        .max(0);
-        (target.saturating_mul(1000), millis)
+        };
+        (target, millis)
     } else {
+        if args.len() < 2 {
+            return Err(TjsError::runtime(
+                "WaveSoundBuffer.fade requires target and time",
+            ));
+        }
         (
             optional_integer(&args, 0)?.unwrap_or(0),
-            optional_integer(&args, 1)?.unwrap_or(0).max(0),
+            optional_integer(&args, 1)?.unwrap_or(0),
         )
     };
+    if millis <= 0 {
+        return Err(TjsError::runtime(
+            "WaveSoundBuffer.fade time must be positive",
+        ));
+    }
     set_wave_property_storage(runtime, this, "volume", Variant::Integer(target));
     let fade_seconds = millis as f32 / 1000.0;
     let fade_storage = runtime
@@ -1942,11 +2143,9 @@ fn wave_sound_buffer_fade(
     runtime
         .host_mut()
         .set_native_audio_volume_with_fade(this, target, fade_seconds);
-    if runtime.host().native_audio_buffer(this).is_some() {
-        runtime
-            .host_mut()
-            .schedule_audio_fade_completion(this, millis);
-    }
+    runtime
+        .host_mut()
+        .schedule_audio_fade_completion(this, millis.saturating_add(delay_millis));
     Ok(Variant::Void)
 }
 
@@ -1956,9 +2155,14 @@ fn wave_sound_buffer_set_pos(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.setPos")?;
-    let position = optional_integer(&args, 0)?.unwrap_or(0).max(0);
-    runtime.set_object_member(this, "position", Variant::Integer(position));
-    runtime.set_object_member(this, "samplePosition", Variant::Integer(position));
+    if args.len() < 3 {
+        return Err(TjsError::runtime(
+            "WaveSoundBuffer.setPos requires x, y and z coordinates",
+        ));
+    }
+    for (name, index) in [("posX", 0), ("posY", 1), ("posZ", 2)] {
+        runtime.set_object_member(this, name, Variant::Real(args[index].to_real()?));
+    }
     Ok(Variant::Void)
 }
 
@@ -2020,12 +2224,12 @@ fn async_trigger_trigger(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("AsyncTrigger.trigger requires this"))?;
-    let mode = match runtime.object_member(this, "mode").to_integer()? {
+    let mode = match runtime.resolve_object_member(this, "mode")?.to_integer()? {
         1 => AsyncTriggerMode::Exclusive,
         2 => AsyncTriggerMode::AtIdle,
         _ => AsyncTriggerMode::Normal,
     };
-    let cached = runtime.object_member(this, "cached").is_truthy();
+    let cached = runtime.resolve_object_member(this, "cached")?.is_truthy();
     runtime
         .host_mut()
         .trigger_async_with_mode(this, mode, cached);
@@ -3298,7 +3502,7 @@ fn layer_begin_transition(
         {
             source_layer.renderable = false;
         }
-        finish_immediate_transition(runtime, this, source)?;
+        finish_immediate_transition(runtime, this, source, with_children)?;
     } else {
         runtime.host_mut().begin_native_transition(
             Duration::from_millis(duration),
@@ -3311,6 +3515,7 @@ fn layer_begin_transition(
                 dest: this,
                 source,
                 paired_comp,
+                with_children,
             },
         );
     }
@@ -5155,11 +5360,296 @@ fn variant_object(value: &Variant) -> Option<ObjectHandle> {
     }
 }
 
+fn complete_sourced_transition_exchange(
+    runtime: &mut Runtime<KrkrHost>,
+    dest: ObjectHandle,
+    source: ObjectHandle,
+    with_children: bool,
+) -> Result<()> {
+    let dest = runtime.bound_this(dest).unwrap_or(dest);
+    let source = runtime.bound_this(source).unwrap_or(source);
+    if dest == source {
+        return Ok(());
+    }
+
+    let dest_left = layer_property_i64(runtime, dest, "left", 0)?;
+    let dest_top = layer_property_i64(runtime, dest, "top", 0)?;
+    let dest_visible = layer_property_value(runtime, dest, "visible").is_truthy();
+    let source_left = layer_property_i64(runtime, source, "left", 0)?;
+    let source_top = layer_property_i64(runtime, source, "top", 0)?;
+    let source_visible = layer_property_value(runtime, source, "visible").is_truthy();
+
+    exchange_layer_tree(runtime, dest, source, !with_children)?;
+
+    set_layer_int_property(runtime, dest, "left", source_left)?;
+    set_layer_int_property(runtime, dest, "top", source_top)?;
+    set_layer_int_property(runtime, dest, "visible", i64::from(source_visible))?;
+    set_layer_int_property(runtime, source, "left", dest_left)?;
+    set_layer_int_property(runtime, source, "top", dest_top)?;
+    set_layer_int_property(runtime, source, "visible", i64::from(dest_visible))?;
+    Ok(())
+}
+
+fn exchange_layer_tree(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    target: ObjectHandle,
+    keep_children: bool,
+) -> Result<()> {
+    let this_parent = runtime.host().native_layer_parent(this);
+    let target_parent = runtime.host().native_layer_parent(target);
+    let this_primary = layer_property_value(runtime, this, "isPrimary").is_truthy();
+    let target_primary = layer_property_value(runtime, target, "isPrimary").is_truthy();
+    let this_z = native_layer_z_order(runtime, this);
+    let target_z = native_layer_z_order(runtime, target);
+    let this_under_target = ancestor_child_layer(runtime, this, target);
+    let target_under_this = ancestor_child_layer(runtime, target, this);
+
+    join_native_layer(runtime, this, None)?;
+    join_native_layer(runtime, target, None)?;
+
+    if let Some(this_ancestor_child) = this_under_target {
+        if this_ancestor_child != this {
+            join_native_layer(runtime, this_ancestor_child, None)?;
+        }
+        let this_children = keep_children
+            .then(|| take_native_layer_children(runtime, this))
+            .unwrap_or_default();
+        let target_children = keep_children
+            .then(|| take_native_layer_children(runtime, target))
+            .unwrap_or_default();
+        join_native_layer(runtime, this, target_parent)?;
+        if Some(target) == this_parent {
+            join_native_layer(runtime, target, Some(this))?;
+        } else {
+            join_native_layer(runtime, target, this_parent)?;
+        }
+        if keep_children {
+            for child in this_children {
+                join_native_layer(runtime, child, Some(target))?;
+            }
+            for child in target_children {
+                join_native_layer(runtime, child, Some(this))?;
+            }
+        }
+        if this_ancestor_child != this {
+            join_native_layer(runtime, this_ancestor_child, Some(this))?;
+        }
+    } else if let Some(target_ancestor_child) = target_under_this {
+        if target_ancestor_child != target {
+            join_native_layer(runtime, target_ancestor_child, None)?;
+        }
+        let this_children = keep_children
+            .then(|| take_native_layer_children(runtime, this))
+            .unwrap_or_default();
+        let target_children = keep_children
+            .then(|| take_native_layer_children(runtime, target))
+            .unwrap_or_default();
+        if Some(this) == target_parent {
+            join_native_layer(runtime, this, Some(target))?;
+        } else {
+            join_native_layer(runtime, this, target_parent)?;
+        }
+        join_native_layer(runtime, target, this_parent)?;
+        if keep_children {
+            for child in this_children {
+                join_native_layer(runtime, child, Some(target))?;
+            }
+            for child in target_children {
+                join_native_layer(runtime, child, Some(this))?;
+            }
+        }
+        if target_ancestor_child != target {
+            join_native_layer(runtime, target_ancestor_child, Some(target))?;
+        }
+    } else {
+        let this_children = keep_children
+            .then(|| take_native_layer_children(runtime, this))
+            .unwrap_or_default();
+        let target_children = keep_children
+            .then(|| take_native_layer_children(runtime, target))
+            .unwrap_or_default();
+        join_native_layer(runtime, this, target_parent)?;
+        join_native_layer(runtime, target, this_parent)?;
+        if keep_children {
+            for child in this_children {
+                join_native_layer(runtime, child, Some(target))?;
+            }
+            for child in target_children {
+                join_native_layer(runtime, child, Some(this))?;
+            }
+        }
+    }
+
+    set_layer_property_storage(
+        runtime,
+        this,
+        "isPrimary",
+        Variant::Integer(i64::from(target_primary)),
+    );
+    set_layer_property_storage(
+        runtime,
+        target,
+        "isPrimary",
+        Variant::Integer(i64::from(this_primary)),
+    );
+    if this_primary || target_primary {
+        let window = variant_object(&layer_property_value(runtime, this, "window"))
+            .or_else(|| variant_object(&layer_property_value(runtime, target, "window")))
+            .map(|window| runtime.bound_this(window).unwrap_or(window));
+        if let Some(window) = window {
+            // DetachPrimary: official LayerManager clears keyboard focus and
+            // capture before the new primary is attached.  KAGEX only routes
+            // Ctrl-skip through Window.processKeys when focusedLayer is null.
+            blur_window_focus(runtime, window)?;
+            let primary = if this_primary { target } else { this };
+            set_window_property_storage(runtime, window, "primaryLayer", Variant::Object(primary));
+            set_layer_int_property(runtime, primary, "visible", 1)?;
+            set_layer_int_property(runtime, primary, "opacity", 255)?;
+        }
+    }
+
+    let same_parent = this_parent == target_parent;
+    if same_parent {
+        set_native_layer_z_order(runtime, this, target_z);
+        set_native_layer_z_order(runtime, target, this_z);
+    } else {
+        set_native_layer_z_order(runtime, this, this_z);
+        set_native_layer_z_order(runtime, target, target_z);
+    }
+    Ok(())
+}
+
+fn ancestor_child_layer(
+    runtime: &Runtime<KrkrHost>,
+    descendant: ObjectHandle,
+    ancestor: ObjectHandle,
+) -> Option<ObjectHandle> {
+    let mut previous = descendant;
+    let mut current = runtime.host().native_layer_parent(descendant);
+    while let Some(parent) = current {
+        if parent == ancestor {
+            return Some(previous);
+        }
+        previous = parent;
+        current = runtime.host().native_layer_parent(parent);
+    }
+    None
+}
+
+fn take_native_layer_children(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Vec<ObjectHandle> {
+    let children = runtime.host().native_layer_children(handle);
+    for child in &children {
+        let _ = join_native_layer(runtime, *child, None);
+    }
+    children
+}
+
+fn join_native_layer(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    parent: Option<ObjectHandle>,
+) -> Result<()> {
+    if parent.is_none() {
+        // SeverChild / NotifyPart: BlurTree(child) before the node leaves.
+        blur_tree(runtime, handle)?;
+    }
+    let value = parent.map(Variant::Object).unwrap_or(Variant::Void);
+    set_layer_property_storage(runtime, handle, "parent", value.clone());
+    apply_layer_property_to_render(runtime, handle, "parent", &value)
+}
+
+fn blur_tree(runtime: &mut Runtime<KrkrHost>, root: ObjectHandle) -> Result<()> {
+    let Some(window) = layer_window_object(runtime, root) else {
+        return Ok(());
+    };
+    let Some(focused) = focused_layer(runtime, window) else {
+        return Ok(());
+    };
+    if !layer_is_ancestor_or_self(runtime, root, focused) {
+        return Ok(());
+    }
+    blur_window_focus(runtime, window)
+}
+
+fn blur_window_focus(runtime: &mut Runtime<KrkrHost>, window: ObjectHandle) -> Result<()> {
+    if let Some(previous) = focused_layer(runtime, window) {
+        runtime.set_object_member(previous, "focused", Variant::Integer(0));
+        if !matches!(runtime.object_member(previous, "onBlur"), Variant::Void) {
+            runtime.call_object_method(previous, "onBlur", vec![Variant::Null])?;
+        }
+    }
+    set_window_property_storage(runtime, window, "focusedLayer", Variant::Null);
+    Ok(())
+}
+
+fn layer_is_ancestor_or_self(
+    runtime: &Runtime<KrkrHost>,
+    ancestor: ObjectHandle,
+    node: ObjectHandle,
+) -> bool {
+    if ancestor == node {
+        return true;
+    }
+    let mut current = runtime.host().native_layer_parent(node);
+    while let Some(parent) = current {
+        if parent == ancestor {
+            return true;
+        }
+        current = runtime.host().native_layer_parent(parent);
+    }
+    false
+}
+
+fn native_layer_z_order(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> i32 {
+    runtime
+        .host()
+        .native_layer(handle)
+        .and_then(|layer_id| runtime.host().layer_tree().layer(layer_id))
+        .map(|layer| layer.z_order)
+        .unwrap_or(0)
+}
+
+fn set_native_layer_z_order(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle, z_order: i32) {
+    if let Some(layer_id) = runtime.host().native_layer(handle)
+        && let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id)
+    {
+        layer.z_order = z_order;
+    }
+    set_layer_property_storage(
+        runtime,
+        handle,
+        "absolute",
+        Variant::Integer(i64::from(z_order)),
+    );
+}
+
+fn set_layer_int_property(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &str,
+    value: i64,
+) -> Result<()> {
+    if name == "visible" && value == 0 {
+        blur_tree(runtime, handle)?;
+    }
+    let variant = Variant::Integer(value);
+    set_layer_property_storage(runtime, handle, name, variant.clone());
+    apply_layer_property_to_render(runtime, handle, name, &variant)
+}
+
 fn finish_immediate_transition(
     runtime: &mut Runtime<KrkrHost>,
     layer: ObjectHandle,
     source: Option<ObjectHandle>,
+    with_children: bool,
 ) -> Result<()> {
+    if let Some(source) = source.filter(|source| runtime.object_valid(*source)) {
+        complete_sourced_transition_exchange(runtime, layer, source, with_children)?;
+    }
     let Some(window) = variant_object(&layer_property_value(runtime, layer, "window"))
         .map(|window| runtime.bound_this(window).unwrap_or(window))
     else {
@@ -5210,11 +5700,16 @@ pub(crate) fn finish_native_transition(
     if !runtime.object_valid(completion.dest) {
         return Ok(());
     }
-    if completion.paired_comp
-        && let Some(source) = completion.source
-        && runtime.object_valid(source)
+    if let Some(source) = completion
+        .source
+        .filter(|source| runtime.object_valid(*source))
     {
-        exchange_native_layer_info(runtime, completion.dest, source)?;
+        complete_sourced_transition_exchange(
+            runtime,
+            completion.dest,
+            source,
+            completion.with_children,
+        )?;
     }
 
     let window = variant_object(&layer_property_value(runtime, completion.dest, "window"))
@@ -5228,14 +5723,6 @@ pub(crate) fn finish_native_transition(
 
     notify_transition_completed(runtime, completion.dest, completion.source)?;
     finish_kag_window_transition_if_pending(runtime, completion.dest)?;
-    if completion.paired_comp
-        && let Some(source) = completion.source
-        && runtime.object_valid(source)
-    {
-        let visible = Variant::Integer(1);
-        set_layer_property_storage(runtime, source, "visible", visible.clone());
-        apply_layer_property_to_render(runtime, source, "visible", &visible)?;
-    }
 
     let callback_consumed_transition =
         window
