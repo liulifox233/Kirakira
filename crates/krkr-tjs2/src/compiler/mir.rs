@@ -238,6 +238,10 @@ pub struct MirObject {
     pub properties: Vec<PropertyRegistration>,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
+    /// Additional entry points besides `entry`. A superclass getter has one
+    /// per `extends` operand after the first; their code offsets become the
+    /// bytecode object's superclass getter pointers.
+    pub extra_entries: Vec<BlockId>,
     pub exception_regions: Vec<ExceptionRegion>,
     pub source_span: Option<SpanId>,
 }
@@ -250,6 +254,14 @@ impl MirObject {
                 "object {} entry block is missing",
                 self.id.0
             )));
+        }
+        for entry in &self.extra_entries {
+            if !block_ids.contains(entry) {
+                return Err(TjsError::mir(format!(
+                    "object {} extra entry block {} is missing",
+                    self.id.0, entry.0
+                )));
+            }
         }
 
         let region_ids: BTreeSet<_> = self
@@ -430,13 +442,6 @@ impl MirObject {
                     self.validate_value(module, *value)?;
                 }
                 Ok(())
-            }
-            MirInst::ApplyClassExtender {
-                class_object,
-                getter,
-            } => {
-                module.require_object(*class_object)?;
-                module.require_object(*getter)
             }
             MirInst::BuildArray { dst, elements } => {
                 self.validate_slot(*dst)?;
@@ -946,10 +951,6 @@ pub enum MirInst {
         change_this: bool,
     },
     RegisterMembers,
-    ApplyClassExtender {
-        class_object: ObjectId,
-        getter: ObjectId,
-    },
     BuildArray {
         dst: SlotId,
         elements: Vec<ArrayElement>,
@@ -1182,7 +1183,8 @@ enum ObjectJob {
         id: ObjectId,
         name: StringId,
         parent: ObjectId,
-        expr: syntax::Expr,
+        /// One `extends` operand per entry point, in declaration order.
+        exprs: Vec<syntax::Expr>,
     },
 }
 
@@ -1196,6 +1198,11 @@ struct Lowerer {
     object_contexts: BTreeMap<ObjectId, ContextType>,
     class_primary_extenders: BTreeMap<ObjectId, syntax::Expr>,
     object_jobs: VecDeque<ObjectJob>,
+    /// Objects that publish themselves on their parent class through their
+    /// own `properties` table, the layout the official compiler emits
+    /// (`tTJSInterCodeContext::RegisterFunction` records `(Name, this)` on
+    /// the child; the loader then registers it on the parent context).
+    class_members: BTreeSet<ObjectId>,
 }
 
 impl Lowerer {
@@ -1241,6 +1248,7 @@ impl Lowerer {
             object_contexts: BTreeMap::new(),
             class_primary_extenders: BTreeMap::new(),
             object_jobs: VecDeque::new(),
+            class_members: BTreeSet::new(),
         }
     }
 
@@ -1377,14 +1385,14 @@ impl Lowerer {
         &mut self,
         name: StringId,
         parent: ObjectId,
-        expr: &syntax::Expr,
+        exprs: &[syntax::Expr],
     ) -> Result<ObjectId> {
         let id = self.next_object_id();
         self.object_jobs.push_back(ObjectJob::SuperClassGetter {
             id,
             name,
             parent,
-            expr: expr.clone(),
+            exprs: exprs.to_vec(),
         });
         Ok(id)
     }
@@ -1407,6 +1415,12 @@ impl Lowerer {
                     self.record_object(id, context, parent);
                     let mut object =
                         ObjectBuilder::new(id, name, context, parent, self.add_span(decl.span));
+                    if self.class_members.contains(&id) {
+                        object
+                            .object
+                            .properties
+                            .push(PropertyRegistration { name, object: id });
+                    }
                     object.bind_params(self, &decl)?;
                     object.lower_stmt(self, &decl.body)?;
                     self.module.objects.push(object.finish());
@@ -1428,17 +1442,52 @@ impl Lowerer {
                         Some(parent),
                         self.add_span(decl.span),
                     );
-
-                    for (index, extender) in decl.extends.iter().enumerate() {
-                        let getter = self.lower_super_class_getter(name, id, extender)?;
-                        class_object.emit(MirInst::ApplyClassExtender {
-                            class_object: id,
-                            getter,
-                        });
-                        if index == 0 {
-                            class_object.object.super_class_getter = Some(getter);
-                        }
+                    // A nested class is a member of the enclosing class, and
+                    // the official compiler publishes it the same way as a
+                    // method: through the child's own `properties` entry.
+                    if self.class_members.contains(&id) {
+                        class_object
+                            .object
+                            .properties
+                            .push(PropertyRegistration { name, object: id });
                     }
+
+                    // The class body follows tTJSInterCodeContext::Commit for
+                    // ctClass: `addci %-1, "Name"` records the class on the
+                    // instance, each `extends` operand is evaluated in the
+                    // body's own context and called with the instance bound
+                    // (running the superclass body on it), and one superclass
+                    // getter object with an entry per operand backs `super`
+                    // and the class object's superclass proxies.
+                    let class_name = Value::Const(self.add_const(MirConst::String(name)));
+                    class_object.emit(MirInst::AddClassInfo {
+                        object: Value::Slot(SlotId::This),
+                        info: class_name,
+                    });
+                    if !decl.extends.is_empty() {
+                        let getter = self.lower_super_class_getter(name, id, &decl.extends)?;
+                        class_object.object.super_class_getter = Some(getter);
+                    }
+                    for extender in &decl.extends {
+                        let super_class = class_object.lower_expr(self, extender)?;
+                        let bound = class_object.temp();
+                        class_object.emit(MirInst::ChangeThis {
+                            dst: bound,
+                            closure: super_class,
+                            this_obj: Value::Slot(SlotId::This),
+                        });
+                        class_object.emit(MirInst::Call {
+                            dst: None,
+                            target: CallTarget::Value(Value::Slot(bound)),
+                            args: ArgList::Normal(Vec::new()),
+                        });
+                    }
+                    // The official compiler inserts `regmember` at
+                    // FunctionRegisterCodePoint, i.e. right after the last
+                    // extender: methods and properties are already on the
+                    // instance when field initialisers run (`var x = f();`),
+                    // and an initialiser sharing a method's name wins.
+                    class_object.emit(MirInst::RegisterMembers);
 
                     for member in &decl.body {
                         match &member.kind {
@@ -1448,12 +1497,7 @@ impl Lowerer {
                                     ContextType::Function,
                                     Some(id),
                                 )?;
-                                let member_name = self
-                                    .intern_string(function.name.as_ref().map_or("", |n| &n.name));
-                                class_object.object.properties.push(PropertyRegistration {
-                                    name: member_name,
-                                    object: member_id,
-                                });
+                                self.class_members.insert(member_id);
                             }
                             syntax::StmtKind::PropertyDecl(property) => {
                                 let property_id = self.next_object_id();
@@ -1466,39 +1510,60 @@ impl Lowerer {
                                     Some(id),
                                     self.add_span(property.span),
                                 );
+                                property_object
+                                    .object
+                                    .properties
+                                    .push(PropertyRegistration {
+                                        name: property_name,
+                                        object: property_id,
+                                    });
                                 class_object.populate_property_accessors(
                                     self,
                                     &mut property_object,
                                     property,
                                 )?;
                                 self.module.objects.push(property_object.finish());
-                                class_object.object.properties.push(PropertyRegistration {
-                                    name: property_name,
-                                    object: property_id,
-                                });
+                            }
+                            syntax::StmtKind::ClassDecl(nested) => {
+                                let nested_id = class_object.lower_class_decl(self, nested)?;
+                                self.class_members.insert(nested_id);
                             }
                             _ => class_object.lower_stmt(self, member)?,
                         }
                     }
-                    class_object.emit(MirInst::RegisterMembers);
                     self.module.objects.push(class_object.finish());
                 }
                 ObjectJob::SuperClassGetter {
                     id,
                     name,
                     parent,
-                    expr,
+                    exprs,
                 } => {
                     self.record_object(id, ContextType::SuperClassGetter, Some(parent));
+                    let span = exprs
+                        .first()
+                        .map(|expr| expr.span)
+                        .unwrap_or(Span::empty(0));
                     let mut object = ObjectBuilder::new(
                         id,
                         name,
                         ContextType::SuperClassGetter,
                         Some(parent),
-                        self.add_span(expr.span),
+                        self.add_span(span),
                     );
-                    let value = object.lower_expr(self, &expr)?;
-                    object.terminate_return_through_regions(self, Some(value));
+                    // One entry point per `extends` operand, each returning
+                    // its superclass; the entry block is operand 0 and the
+                    // rest are recorded so codegen can publish their offsets
+                    // as SuperClassGetterPointer.
+                    for (index, expr) in exprs.iter().enumerate() {
+                        if index > 0 {
+                            let block = object.new_block(Some(self.add_span(expr.span)));
+                            object.start_block(block);
+                            object.object.extra_entries.push(block);
+                        }
+                        let value = object.lower_expr(self, expr)?;
+                        object.terminate_return_through_regions(self, Some(value));
+                    }
                     self.module.objects.push(object.finish());
                 }
             }
@@ -1834,6 +1899,7 @@ impl ObjectBuilder {
                 properties: Vec::new(),
                 blocks: vec![entry],
                 entry: BlockId(0),
+                extra_entries: Vec::new(),
                 exception_regions: Vec::new(),
                 source_span: Some(source_span),
             },
@@ -2467,6 +2533,17 @@ impl ObjectBuilder {
         Ok(())
     }
 
+    /// Whether declarations nested in this object are also published as its
+    /// members. `tTJSInterCodeContext::RegisterFunction` does so for a
+    /// function or class parent (`f.Inner`, `Outer.Inner`); top-level
+    /// declarations reach the global object through the top-level code.
+    fn registers_children_as_members(&self) -> bool {
+        matches!(
+            self.object.context,
+            ContextType::Function | ContextType::Class
+        )
+    }
+
     fn lower_function_decl(
         &mut self,
         lowerer: &mut Lowerer,
@@ -2474,6 +2551,9 @@ impl ObjectBuilder {
     ) -> Result<()> {
         let id =
             lowerer.lower_function_object(decl, ContextType::Function, Some(self.object.id))?;
+        if self.registers_children_as_members() {
+            lowerer.class_members.insert(id);
+        }
         let value = Value::Const(lowerer.add_const(MirConst::CodeObject(id)));
         if let Some(name) = &decl.name {
             let name_id = lowerer.intern_string(&name.name);
@@ -2499,8 +2579,15 @@ impl ObjectBuilder {
         Ok(())
     }
 
-    fn lower_class_decl(&mut self, lowerer: &mut Lowerer, decl: &syntax::ClassDecl) -> Result<()> {
+    fn lower_class_decl(
+        &mut self,
+        lowerer: &mut Lowerer,
+        decl: &syntax::ClassDecl,
+    ) -> Result<ObjectId> {
         let class_id = lowerer.lower_class_object(decl, self.object.id);
+        if self.registers_children_as_members() {
+            lowerer.class_members.insert(class_id);
+        }
         let class_name = lowerer.intern_string(&decl.name.name);
 
         let value = Value::Const(lowerer.add_const(MirConst::CodeObject(class_id)));
@@ -2522,7 +2609,7 @@ impl ObjectBuilder {
             value: Some(value),
             change_this: false,
         });
-        Ok(())
+        Ok(class_id)
     }
 
     fn lower_property_decl(
@@ -2540,6 +2627,15 @@ impl ObjectBuilder {
             Some(self.object.id),
             lowerer.add_span(decl.span),
         );
+        if self.registers_children_as_members() {
+            property_object
+                .object
+                .properties
+                .push(PropertyRegistration {
+                    name: property_name,
+                    object: property_id,
+                });
+        }
         self.populate_property_accessors(lowerer, &mut property_object, decl)?;
         lowerer.module.objects.push(property_object.finish());
 
@@ -4008,6 +4104,7 @@ fn rewrite_terminator_targets(term: &mut Terminator, redirects: &BTreeMap<BlockI
 fn remove_unreachable_blocks(object: &mut MirObject) {
     let mut reachable = BTreeSet::new();
     let mut stack = vec![object.entry];
+    stack.extend(object.extra_entries.iter().copied());
     while let Some(id) = stack.pop() {
         if !reachable.insert(id) {
             continue;
@@ -4278,7 +4375,8 @@ mod tests {
         assert!(snapshot.contains("Function"));
         assert!(snapshot.contains("PropertyGetter"));
         assert!(snapshot.contains("Class"));
-        assert!(snapshot.contains("ApplyClassExtender"));
+        assert!(snapshot.contains("AddClassInfo"));
+        assert!(snapshot.contains("RegisterMembers"));
         assert!(snapshot.contains("Expanded"));
     }
 

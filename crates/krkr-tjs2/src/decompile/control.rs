@@ -13,6 +13,7 @@
 //! Constructs without a pattern yet degrade to `// <unhandled: ...>`
 //! comments.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bytecode::{BytecodeFile, CodeObject, Instruction};
@@ -234,6 +235,9 @@ struct BodyDecompiler<'f> {
     /// Blocks consumed by condition fusion (dead after decompilation).
     dead: BTreeSet<usize>,
     unhandled: usize,
+    /// Recursion depth of `seq`. Pathological try/if matching can re-enter
+    /// the same region; degrade instead of overflowing the native stack.
+    seq_depth: usize,
 }
 
 impl<'f> BodyDecompiler<'f> {
@@ -269,6 +273,7 @@ impl<'f> BodyDecompiler<'f> {
             back_edges,
             dead: BTreeSet::new(),
             unhandled: 0,
+            seq_depth: 0,
         }
     }
 
@@ -369,6 +374,22 @@ impl<'f> BodyDecompiler<'f> {
     }
 
     fn seq(&mut self, entry: usize, ctx: &SeqCtx) -> (Vec<Stmt>, SeqEnd) {
+        let mut stmts = Vec::new();
+        const MAX_SEQ_DEPTH: usize = 256;
+        if self.seq_depth >= MAX_SEQ_DEPTH {
+            self.unhandled += 1;
+            stmts.push(self.marker(&format!(
+                "control-flow nest limit exceeded at block {entry}"
+            )));
+            return (stmts, SeqEnd::Returned);
+        }
+        self.seq_depth += 1;
+        let result = self.seq_inner(entry, ctx);
+        self.seq_depth -= 1;
+        result
+    }
+
+    fn seq_inner(&mut self, entry: usize, ctx: &SeqCtx) -> (Vec<Stmt>, SeqEnd) {
         let mut stmts = Vec::new();
         // Safety bound: pathological control flow must degrade instead of
         // looping forever. The bound is generous (each iteration consumes
@@ -1889,7 +1910,40 @@ fn negate_condition(cond: Expr) -> Expr {
     }
 }
 
+thread_local! {
+    static BODY_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+const MAX_BODY_DEPTH: usize = 64;
+
 pub(crate) fn decompile_body(file: &BytecodeFile, object: &CodeObject) -> BodyOutput {
+    let depth = BODY_DEPTH.with(|depth| {
+        let next = depth.get().saturating_add(1);
+        depth.set(next);
+        next
+    });
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            BODY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    let _guard = DepthGuard;
+    if depth > MAX_BODY_DEPTH {
+        let marker = Stmt::new(
+            StmtKind::Expr(Expr::new(
+                ExprKind::Identifier(Ident::new(super::stmt::unhandled_marker(
+                    "decompile nest limit exceeded",
+                ))),
+                Span::empty(0),
+            )),
+            Span::empty(0),
+        );
+        return BodyOutput {
+            statements: vec![marker],
+            unhandled: 1,
+        };
+    }
     let instructions = match object.decode_instructions() {
         Ok(instructions) => instructions,
         Err(error) => {

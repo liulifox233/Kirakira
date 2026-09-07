@@ -8799,6 +8799,30 @@ mod tests {
     }
 
     #[test]
+    fn script_class_can_call_grandparent_native_constructor() {
+        let mut engine = KrkrEngine::for_project(&temp_root()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class KAGLayer extends Layer { var moveObject; }
+                class SliderLayer extends KAGLayer {
+                    function SliderLayer(win, par) { super.Layer(win, par); width = 5; }
+                }
+                class SliderLayer2 extends KAGLayer {
+                    function SliderLayer2(win, par) { global.KAGLayer.Layer(win, par); width = 6; }
+                }
+                var window = new Window();
+                var a = new SliderLayer(window, null);
+                var b = new SliderLayer2(window, null);
+                return a.width + ":" + b.width;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result, Variant::String("5:6".to_string()));
+    }
+
+    #[test]
     fn nested_class_reusing_native_class_name_calls_the_native_constructor() {
         // Same shadowing pattern as the bytecode-class case, but against a
         // native base: `super.Layer()` must run the native initializer rather

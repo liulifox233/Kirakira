@@ -221,6 +221,26 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
 
         self.patch_branches()?;
 
+        // A superclass getter publishes one entry offset per `extends`
+        // operand (tTJSInterCodeContext::SuperClassGetterPointer): the entry
+        // block for the first operand, then each extra entry block.
+        let super_class_getter_pointers =
+            if self.object.context != super::mir::ContextType::SuperClassGetter {
+                Vec::new()
+            } else {
+                std::iter::once(self.object.entry)
+                    .chain(self.object.extra_entries.iter().copied())
+                    .map(|block| {
+                        self.block_offsets
+                            .get(&block)
+                            .map(|offset| *offset as i32)
+                            .ok_or_else(|| {
+                                TjsError::codegen(format!("missing entry block {}", block.0))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+
         let name = self.module_codegen.string_index(self.object.name)?;
         let parent = self
             .object
@@ -271,7 +291,7 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
             source_positions: self.source_positions,
             code_words: self.code,
             data_slots: self.data_slots,
-            super_class_getter_pointers: Vec::new(),
+            super_class_getter_pointers,
             properties,
         })
     }
@@ -399,18 +419,6 @@ impl<'a, 'm> ObjectCodegen<'a, 'm> {
                 }
             }
             MirInst::RegisterMembers => self.emit_op(126),
-            MirInst::ApplyClassExtender {
-                class_object,
-                getter,
-            } => {
-                let class = self.alloc_reg();
-                let class_data = self.data_for_const_value(&MirConst::CodeObject(*class_object))?;
-                self.emit(&[1, class, class_data]);
-                let getter_reg = self.alloc_reg();
-                let getter_data = self.data_for_const_value(&MirConst::CodeObject(*getter))?;
-                self.emit(&[1, getter_reg, getter_data]);
-                self.emit(&[125, class, getter_reg]);
-            }
             MirInst::BuildArray { dst, elements } => self.emit_build_array(*dst, elements)?,
             MirInst::BuildDictionary { dst, entries } => {
                 self.emit_build_dictionary(*dst, entries)?

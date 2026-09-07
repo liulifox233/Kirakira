@@ -976,30 +976,43 @@ impl<H: TjsHost + 'static> Runtime<H> {
         file_id
     }
 
+    /// Publishes each code object's `properties` table the way
+    /// `tTJSByteCodeLoader` does: every entry is registered on the object's
+    /// *parent* context. The official compiler records `(Name, this)` on a
+    /// method, property, or nested class whose parent is a function or class,
+    /// so this is what turns a class object into a member table its
+    /// `regmember` can copy onto instances, and what makes
+    /// `Outer.Inner` resolve on the class object itself.
+    ///
+    /// Nothing else is registered here: top-level declarations reach the
+    /// global object through the top-level code (`spds`), expression
+    /// functions and superclass getters are anonymous, and property accessors
+    /// hang off their property object. Registering every child by name used
+    /// to leave a class object carrying its own superclass getter under the
+    /// class name, and `(anonymous)` members that `regmember` then copied onto
+    /// every instance.
     fn register_code_object_properties(
         &mut self,
         file: &BytecodeFile,
         code_handles: &[ObjectHandle],
     ) {
-        for (object_index, object) in file.objects.iter().enumerate() {
-            if let Some(parent_index) = object.parent {
-                let parent_handle = code_handles[parent_index];
-                let object_handle = code_handles[object_index];
-                let Some(name) = object.name(file).map(str::to_string) else {
-                    continue;
-                };
-                let closure = Variant::Closure(Closure::new(object_handle, Some(parent_handle)));
-                self.heap[parent_handle.0].set(name, closure);
+        for object in &file.objects {
+            if object.properties.is_empty() {
+                continue;
             }
-
-            let owner_handle = code_handles[object_index];
+            let Some(parent_index) = object.parent else {
+                continue;
+            };
+            let parent_handle = code_handles[parent_index];
             for property in &object.properties {
                 let Some(name) = file.data.strings.get(property.name).cloned() else {
                     continue;
                 };
-                let property_handle = code_handles[property.object];
-                let closure = Variant::Closure(Closure::new(property_handle, Some(owner_handle)));
-                self.heap[owner_handle.0].set(name, closure);
+                let Some(member_handle) = code_handles.get(property.object).copied() else {
+                    continue;
+                };
+                let closure = Variant::Closure(Closure::new(member_handle, Some(parent_handle)));
+                self.heap[parent_handle.0].set(name, closure);
             }
         }
     }

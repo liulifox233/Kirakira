@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject};
 use crate::error::{Result, Span, TjsError};
+use crate::frontend::printer::print_expression;
 use crate::frontend::syntax::{
     self, Expr, ExprKind, FunctionDecl, Ident, ParamDecl, Stmt, StmtKind,
 };
@@ -236,97 +237,179 @@ fn lift_registration(
     let object = &file.objects[object_index];
     let stmt = match object.context_type {
         BytecodeContextType::Class => {
-            let body = stmt::decompile_body(file, object);
-            let statements = class_body_statements(body);
-            // Class members arrive through the `properties` table (the body
-            // itself is just `regmember; ret`).
-            let mut members = Vec::new();
-            for property in &object.properties {
-                let Some(member) = file.objects.get(property.object) else {
-                    continue;
-                };
-                let Some(name) = file.data.strings.get(property.name) else {
-                    continue;
-                };
-                match member.context_type {
-                    BytecodeContextType::Function | BytecodeContextType::ExprFunction => {
-                        let decl = function_decl(file, member, Some(name.clone()))?;
-                        members.push(Stmt::new(StmtKind::FunctionDecl(decl), Span::empty(0)));
-                    }
-                    BytecodeContextType::Property => {
-                        let getter = member
-                            .prop_getter
-                            .map(|index| file.objects.get(index))
-                            .flatten()
-                            .map(|getter| function_decl(file, getter, None))
-                            .transpose()?;
-                        let setter = member
-                            .prop_setter
-                            .map(|index| file.objects.get(index))
-                            .flatten()
-                            .map(|setter| function_decl(file, setter, None))
-                            .transpose()?;
-                        let decl = syntax::PropertyDecl {
-                            name: Ident::new(name.clone()),
-                            getter,
-                            setter,
-                            span: Span::empty(0),
-                        };
-                        members.push(Stmt::new(StmtKind::PropertyDecl(decl), Span::empty(0)));
-                    }
-                    _ => {}
-                }
-            }
-            members.extend(statements);
-            // `extends` comes from the super-class getter object: its body
-            // evaluates the superclass expression and returns it.
-            let mut extends = Vec::new();
-            if let Some(getter_index) = object.super_class_getter
-                && let Some(getter) = file.objects.get(getter_index)
-            {
-                let getter_body = stmt::decompile_body(file, getter);
-                if let [
-                    Stmt {
-                        kind: StmtKind::Return(Some(expr)),
-                        ..
-                    },
-                ] = getter_body.statements.as_slice()
-                {
-                    extends.push(expr.clone());
-                }
-            }
-            let decl = syntax::ClassDecl {
-                name: Ident::new(name.clone()),
-                extends,
-                body: members,
-                span: Span::empty(0),
-            };
+            let decl = class_decl(file, object_index, name.clone())?;
             Stmt::new(StmtKind::ClassDecl(decl), Span::empty(0))
         }
         BytecodeContextType::Property => {
-            let getter = object
-                .prop_getter
-                .map(|index| file.objects.get(index))
-                .flatten()
-                .map(|getter| function_decl(file, getter, None))
-                .transpose()?;
-            let setter = object
-                .prop_setter
-                .map(|index| file.objects.get(index))
-                .flatten()
-                .map(|setter| function_decl(file, setter, None))
-                .transpose()?;
-            let decl = syntax::PropertyDecl {
-                name: Ident::new(name.clone()),
-                getter,
-                setter,
-                span: Span::empty(0),
-            };
+            let decl = property_decl(file, object, name.clone())?;
             Stmt::new(StmtKind::PropertyDecl(decl), Span::empty(0))
         }
         _ => return Ok(None),
     };
     Ok(Some(LiftedDeclaration { stmt, name }))
+}
+
+/// Rebuilds a `property` declaration from its object (getter/setter bodies
+/// hang off the property object).
+fn property_decl(
+    file: &BytecodeFile,
+    object: &CodeObject,
+    name: String,
+) -> Result<syntax::PropertyDecl> {
+    let getter = object
+        .prop_getter
+        .and_then(|index| file.objects.get(index))
+        .map(|getter| function_decl(file, getter, None))
+        .transpose()?;
+    let setter = object
+        .prop_setter
+        .and_then(|index| file.objects.get(index))
+        .map(|setter| function_decl(file, setter, None))
+        .transpose()?;
+    Ok(syntax::PropertyDecl {
+        name: Ident::new(name),
+        getter,
+        setter,
+        span: Span::empty(0),
+    })
+}
+
+/// Rebuilds a `class` declaration from the object table. Members arrive
+/// through the `properties` tables: each method, property, or nested class
+/// records `(name, itself)` and the loader registers it on the parent class,
+/// so the body itself only carries `regmember`, the extender calls, and field
+/// initialisers. Nested classes recurse.
+fn class_decl(file: &BytecodeFile, object_index: usize, name: String) -> Result<syntax::ClassDecl> {
+    let object = &file.objects[object_index];
+    let body = stmt::decompile_body(file, object);
+    let mut statements = class_body_statements(body);
+    let mut members = Vec::new();
+    for (member_name, member_index) in class_member_registrations(file, object_index) {
+        let Some(member) = file.objects.get(member_index) else {
+            continue;
+        };
+        // Official methods can name themselves in a data slot. Enter the
+        // chain here so inlining that slot degrades to a placeholder
+        // instead of decompiling the same object again.
+        let Some(_guard) = super::DecompileChainGuard::enter(member_index) else {
+            continue;
+        };
+        match member.context_type {
+            BytecodeContextType::Function | BytecodeContextType::ExprFunction => {
+                let decl = function_decl(file, member, Some(member_name))?;
+                members.push(Stmt::new(StmtKind::FunctionDecl(decl), Span::empty(0)));
+            }
+            BytecodeContextType::Property => {
+                let decl = property_decl(file, member, member_name)?;
+                members.push(Stmt::new(StmtKind::PropertyDecl(decl), Span::empty(0)));
+            }
+            BytecodeContextType::Class => {
+                // krkr's own compiler additionally registers the nested class
+                // on the instance from the class body; that statement is the
+                // declaration itself, so drop it rather than emit it twice.
+                statements.retain(|stmt| {
+                    registration_target(stmt).is_none_or(|(target, value)| {
+                        target != member_name || object_placeholder(&value) != Some(member_index)
+                    })
+                });
+                let decl = class_decl(file, member_index, member_name)?;
+                members.push(Stmt::new(StmtKind::ClassDecl(decl), Span::empty(0)));
+            }
+            _ => {}
+        }
+    }
+    // `extends` comes from the super-class getter object: one entry point per
+    // operand, each evaluating its superclass expression and returning it.
+    let extends = class_extenders(file, object);
+    // The class body calls every superclass body on the new instance
+    // (`(Base incontextof this)();`); that is the `extends` clause, not a
+    // statement, and recompiling it would initialise the base twice.
+    let extender_texts = extends.iter().map(print_expression).collect::<Vec<_>>();
+    statements.retain(|stmt| {
+        !extender_call_target(stmt)
+            .is_some_and(|target| extender_texts.contains(&print_expression(target)))
+    });
+    members.extend(statements);
+    Ok(syntax::ClassDecl {
+        name: Ident::new(name),
+        extends,
+        body: members,
+        span: Span::empty(0),
+    })
+}
+
+/// The superclass expressions of a class, read from its superclass getter.
+/// The official compiler gives the getter one entry point per `extends`
+/// operand (`SuperClassGetterPointer`); each entry is decompiled on its own
+/// by slicing the code from that offset. A getter without entry offsets is
+/// a single-operand getter starting at 0.
+fn class_extenders(file: &BytecodeFile, object: &CodeObject) -> Vec<Expr> {
+    let Some(getter) = object
+        .super_class_getter
+        .and_then(|index| file.objects.get(index))
+    else {
+        return Vec::new();
+    };
+    let entries = if getter.super_class_getter_pointers.is_empty() {
+        vec![0usize]
+    } else {
+        getter
+            .super_class_getter_pointers
+            .iter()
+            .filter_map(|offset| usize::try_from(*offset).ok())
+            .collect()
+    };
+    let mut extends = Vec::new();
+    for offset in entries {
+        if offset >= getter.code_words.len() {
+            continue;
+        }
+        let entry = CodeObject {
+            code_words: getter.code_words[offset..].to_vec(),
+            source_positions: Vec::new(),
+            ..getter.clone()
+        };
+        let body = stmt::decompile_body(file, &entry);
+        if let Some(Stmt {
+            kind: StmtKind::Return(Some(expr)),
+            ..
+        }) = body.statements.first()
+        {
+            extends.push(expr.clone());
+        }
+    }
+    extends
+}
+
+/// The superclass expression of a `(Base incontextof this)();` statement,
+/// the form the class body uses to run a superclass body on the instance.
+fn extender_call_target(stmt: &Stmt) -> Option<&Expr> {
+    let StmtKind::Expr(Expr {
+        kind: ExprKind::Call { callee, args },
+        ..
+    }) = &stmt.kind
+    else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    match &callee.kind {
+        ExprKind::Binary {
+            op: syntax::BinaryOp::InContextOf,
+            lhs,
+            rhs,
+        } if is_this_expr(rhs) => Some(lhs),
+        _ => None,
+    }
+}
+
+fn is_this_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::This => true,
+        ExprKind::Identifier(ident) => ident.name == "this",
+        _ => false,
+    }
 }
 
 /// The `FunctionDecl` of a real function-literal value, unwrapping an
@@ -379,8 +462,9 @@ fn registration_target(stmt: &Stmt) -> Option<(String, Expr)> {
             ..
         }) => match &target.kind {
             ExprKind::Identifier(target) => Some((target.name.clone(), (**value).clone())),
-            // Class-body method registrations render as `this.name = ...`.
-            ExprKind::Member { object, property } if matches!(object.kind, ExprKind::This) => {
+            // Class-body registrations store on `%-1`, which renders as
+            // `this.name = ...` (the receiver is the `this` identifier).
+            ExprKind::Member { object, property } if is_this_expr(object) => {
                 Some((property.clone(), (**value).clone()))
             }
             _ => None,
@@ -439,6 +523,30 @@ pub(crate) fn function_decl(
 /// Drops the class bookkeeping preamble (the class-name constant statement)
 /// and the constructor's implicit trailing `return;` from a decompiled
 /// class body.
+/// Members a class object receives from the bytecode loader, in object
+/// order: every `(name, target)` entry in the `properties` table of an object
+/// whose parent is `class_index`. This is the official layout
+/// (`tTJSByteCodeLoader` registers each object's table on its parent), and
+/// it is also what krkr's own compiler emits.
+pub(crate) fn class_member_registrations(
+    file: &BytecodeFile,
+    class_index: usize,
+) -> Vec<(String, usize)> {
+    let mut members = Vec::new();
+    for object in &file.objects {
+        if object.parent != Some(class_index) {
+            continue;
+        }
+        for property in &object.properties {
+            let Some(name) = file.data.strings.get(property.name) else {
+                continue;
+            };
+            members.push((name.clone(), property.object));
+        }
+    }
+    members
+}
+
 fn class_body_statements(body: BodyOutput) -> Vec<Stmt> {
     let mut statements = body.statements;
     if let Some(Stmt {

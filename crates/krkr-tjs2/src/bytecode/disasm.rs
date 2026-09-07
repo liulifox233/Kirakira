@@ -92,6 +92,15 @@ pub(super) fn render_object_full(
         opt_index(object.prop_getter),
         opt_index(object.super_class_getter)
     );
+    if !object.super_class_getter_pointers.is_empty() {
+        let entries = object
+            .super_class_getter_pointers
+            .iter()
+            .map(|offset| format!("{offset:08}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "  super entries: {entries}");
+    }
     if !object.data_slots.is_empty() {
         let _ = writeln!(out, "  data slots:");
         for (slot_index, slot) in object.data_slots.iter().enumerate() {

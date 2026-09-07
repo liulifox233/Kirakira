@@ -1422,6 +1422,175 @@ mod tests {
     }
 
     #[test]
+    fn class_members_are_registered_before_field_initializers_run() {
+        // The official compiler emits `regmember` right after the extenders
+        // (FunctionRegisterCodePoint), so a field initialiser may call a
+        // method, and an initialiser sharing a method's name wins.
+        assert_eq!(
+            execute_source(
+                "field_init.tjs",
+                r#"
+                    class Foo {
+                        var x = tag();
+                        var tag2 = 5;
+                        function tag() { return 7; }
+                        function tag2() { return 1; }
+                    }
+                    var f = new Foo();
+                    return f.x + ":" + f.tag2;
+                "#
+            )
+            .expect("execute"),
+            Variant::String("7:5".to_string())
+        );
+    }
+
+    #[test]
+    fn thrown_object_keeps_its_identity_across_call_frames() {
+        // A `throw` in a callee must hand the very same object to the
+        // caller's catch (krkrz rethrows the tTJSVariant); wrapping it in a
+        // fresh Exception broke `instanceof` and custom members.
+        assert_eq!(
+            execute_source(
+                "cross_throw.tjs",
+                r#"
+                    class E extends Exception {
+                        var code = 42;
+                        function E(m) { super.Exception(m); }
+                    }
+                    function f() { throw new E("x"); }
+                    function g() { try { f(); } catch (e) { throw e; } }
+                    var r = "";
+                    try { g(); } catch (e) {
+                        r = (e instanceof "E") + ":" + e.message + ":" + e.code;
+                    }
+                    // A VM failure still arrives as an Exception object.
+                    try { f2(); } catch (e) { r += ":" + (e instanceof "Exception"); }
+                    return r;
+                "#
+            )
+            .expect("execute"),
+            Variant::String("1:x:42:1".to_string())
+        );
+    }
+
+    #[test]
+    fn regmember_stores_through_the_destination_missing_hook() {
+        // mixinclass.tjs probes a class by running its body against an
+        // object whose `missing` throws on every store and swallows reads.
+        // RegisterObjectMember goes through PropSet in krkrz, so the first
+        // member copy hits the hook and aborts the body before any field
+        // initialiser runs; the thrown object must reach the probe's catch.
+        let mut runtime = Runtime::new();
+        runtime.register_global_native(
+            "setCallMissing",
+            |runtime: &mut Runtime, _this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
+                let handle = match args.first() {
+                    Some(Variant::Object(handle)) => *handle,
+                    Some(Variant::Closure(closure)) => closure.object,
+                    _ => return Err(TjsError::runtime("setCallMissing requires object")),
+                };
+                runtime.set_object_call_missing(handle, "missing");
+                Ok(Variant::Void)
+            },
+        );
+        let file = compile_source_to_bytecode(
+            "mixin_probe.tjs",
+            r#"
+                var initialised = 0;
+                class WorkerException extends Exception {
+                    function WorkerException(msg) { super.Exception(msg); }
+                }
+                class Worker {
+                    var __get; var __err;
+                    function Worker(get, err) {
+                        __get = get; __err = err;
+                        setCallMissing(this);
+                    }
+                    function missing(set, name, value) {
+                        if (set) throw new __err(name);
+                        *value = __get;
+                        return true;
+                    }
+                }
+                function Module() {}
+                class Foo extends Module {
+                    var flags = ++initialised;
+                    function tag() {}
+                }
+                var w = new Worker(function {}, WorkerException);
+                var caught = "";
+                try { (Foo incontextof w)(); } catch (e) {
+                    if (!(e instanceof "WorkerException")) throw e;
+                    caught = e.message;
+                }
+                return caught + ":" + initialised;
+            "#,
+        )
+        .expect("bytecode");
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("tag:0".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_declarations_are_members_of_their_function_or_class() {
+        // tTJSInterCodeContext::RegisterFunction publishes a declaration on a
+        // function or class parent through the `properties` table; KAGEX
+        // reaches helpers as `BuildMixinClass.__work__` and nested classes as
+        // `_.classNamesWorkerException`.
+        assert_eq!(
+            execute_source(
+                "nested_members.tjs",
+                r#"
+                    function f() {
+                        function g() { return 1; }
+                        class K { function K() { } function v() { return 2; } }
+                        property p { getter { return 3; } }
+                        return 0;
+                    }
+                    class Outer {
+                        function Outer() {}
+                        class Inner { function Inner() {} function v() { return 4; } }
+                    }
+                    var inner = new Outer.Inner();
+                    var inner2 = new (new Outer()).Inner();
+                    return f.g() + ":" + (new f.K()).v() + ":" + f.p + ":" + inner.v()
+                        + ":" + inner2.v();
+                "#
+            )
+            .expect("execute"),
+            Variant::String("1:2:3:4:4".to_string())
+        );
+    }
+
+    #[test]
+    fn class_object_members_resolve_through_every_extender() {
+        // tTJSInterCodeContext::PropGet/PropSet on a class object fall back
+        // along all superclass getter entries (TJS_DO_SUPERCLASS_PROXY), and
+        // a write to an inherited member lands on the class that owns it.
+        assert_eq!(
+            execute_source(
+                "class_chain.tjs",
+                r#"
+                    class A { function A() {} function fromA() { return "a"; } }
+                    class B { function B() {} function fromB() { return "b"; } }
+                    class C extends A, B { function C() {} }
+                    A.count = 1;
+                    C.count = 2;
+                    var r = C.fromA() + C.fromB() + ":" + A.count + ":" + C.count;
+                    C.own = 3;
+                    r += ":" + typeof A.own + ":" + C.own;
+                    return r;
+                "#
+            )
+            .expect("execute"),
+            Variant::String("ab:2:2:undefined:3".to_string())
+        );
+    }
+
+    #[test]
     fn set_call_missing_routes_absent_gets_and_sets_through_missing() {
         let mut runtime = Runtime::new();
         runtime.register_global_native(

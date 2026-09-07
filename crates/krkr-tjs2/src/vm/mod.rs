@@ -442,7 +442,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         // exception objects and execution resumes at the catch address.
         loop {
             if let Some(entry) = call_frame.frame.entries.pop() {
-                let exception = self.make_runtime_exception(&error);
+                // A script `throw` that crossed a frame boundary (or a native
+                // boundary such as a `missing` hook) still carries the thrown
+                // object. Hand that very object to the catch so
+                // `e instanceof "MyException"` and custom members keep
+                // working; only VM-generated failures are wrapped.
+                let exception = match error
+                    .exception_object
+                    .filter(|handle| self.runtime.heap.get(handle.0).is_some_and(|o| o.valid))
+                {
+                    Some(handle) => Variant::Object(handle),
+                    None => self.make_runtime_exception(&error),
+                };
                 call_frame.frame.set(entry.exception_reg, exception)?;
                 call_frame.pc = entry.catch_pc;
                 stack.push(call_frame);
@@ -1116,7 +1127,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         "regmember has no destination this object",
                     ));
                 };
-                self.register_object_members(object_handle, dest);
+                self.register_object_members(object_handle, dest)?;
             }
             _ => {
                 return Err(TjsError::runtime(format!(

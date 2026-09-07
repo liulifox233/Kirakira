@@ -130,6 +130,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     return Ok(self.bind_proxy_value(value, receiver));
                 }
             }
+            // tTJSInterCodeContext::PropGet on a class object consults every
+            // superclass getter entry, not only the primary parent followed
+            // above: `class C extends A, B` reads `C.fromB` through B.
+            if self.has_secondary_extenders(handle)?
+                && let Some(owner) = self.class_member_owner(handle, name, true)?
+                && owner != handle
+            {
+                let receiver = caller_this.or(Some(handle));
+                let value = self.prop_get_handle(owner, name, flags, receiver)?;
+                if !matches!(value, Variant::Void) {
+                    return Ok(self.bind_proxy_value(value, receiver));
+                }
+            }
             // TYPEOFD/TYPEOFI pass MEMBERMUSTEXIST in KRKR2/Z.  A qualified
             // lookup such as `typeof Base.finalize` must stop at the class
             // chain and report undefined; falling back to the current
@@ -279,6 +292,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 }
                 current = self.super_class_handle(class_handle)?;
             }
+        }
+        // tTJSInterCodeContext::PropSet on a class object: the write is
+        // first attempted without MEMBERENSURE on the class and then along
+        // its superclass proxies, so an inherited member is updated on the
+        // class that owns it (`Derived.count = 1` writes `Base.count`); only
+        // a name nobody in the chain has is ensured on the class itself.
+        // IGNOREPROP|MEMBERENSURE (regmember-style stores) skips the chain.
+        let regmember_store = flags.ignore_prop && flags.ensure;
+        if !member_exists
+            && !regmember_store
+            && self.is_bytecode_class(handle)
+            && let Some(owner) = self.class_chain_owner(handle, name)?
+            && owner != handle
+        {
+            return self.prop_set_handle(owner, name, value, flags, caller_this);
         }
         // Class field initializers run before the mixin constructors finish.
         // A preceding `__missing` module may already have enabled missing
@@ -927,11 +955,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .flatten()
             .unwrap_or_else(|| Variant::Closure(Closure::new(handle, Some(this_obj))))
         } else {
+            // VM_CALLD dispatches with `clo.ObjThis ? clo.ObjThis : ra[-1]`.
+            // Class objects carry no ObjThis of their own in krkrz, so a
+            // class-qualified call from one of the class's instances looks
+            // the member up on behalf of that instance: property getters run
+            // against it and the inherited-constructor emulation sees it.
+            let lookup_this = self
+                .bound_super_this(handle, caller_this)?
+                .or(closure_this)
+                .or(Some(handle));
             self.prop_get_handle(
                 handle,
                 name,
                 DispatchFlags::no_bound_instance_fallback(),
-                closure_this.or(Some(handle)),
+                lookup_this,
             )
             .map_err(|error| {
                 error.with_member_access(TjsMemberAccess {
@@ -1083,6 +1120,136 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         Ok(None)
     }
 
+    /// The class object in `class_handle`'s extender chain that holds `name`
+    /// as a raw member, searching the way tTJSInterCodeContext's
+    /// TJS_DO_SUPERCLASS_PROXY does: the class itself, then every superclass
+    /// getter entry in reverse declaration order, recursively. Only bytecode
+    /// classes have extender entries; a native class ends the walk.
+    fn class_member_owner(
+        &mut self,
+        class_handle: ObjectHandle,
+        name: &str,
+        skip_primary: bool,
+    ) -> Result<Option<ObjectHandle>> {
+        if self.runtime.heap[class_handle.0].get_raw(name).is_some() {
+            return Ok(Some(class_handle));
+        }
+        let Some(pointers) = self.class_extender_pointers(class_handle)? else {
+            return Ok(None);
+        };
+        let ObjectKind::InterCode {
+            file_id,
+            object_index,
+            ..
+        } = self.runtime.heap[class_handle.0].kind
+        else {
+            return Ok(None);
+        };
+        let file = self.runtime.script_file(file_id)?;
+        let Some(getter_index) = file.objects[object_index].super_class_getter else {
+            return Ok(None);
+        };
+        // Entry 0 is the primary parent, which `super_class_handle` callers
+        // have already searched (and cached).
+        let first = usize::from(skip_primary);
+        for pointer in pointers.into_iter().skip(first).rev() {
+            let code_offset = usize::try_from(pointer)
+                .map_err(|_| TjsError::runtime("negative superclass getter entry offset"))?;
+            let value = self.execute_file_object_with_this_preserving_active_at(
+                file_id,
+                getter_index,
+                code_offset,
+                Vec::new(),
+                Some(self.runtime.global),
+            )?;
+            if matches!(value, Variant::Void | Variant::Null) {
+                continue;
+            }
+            let super_handle = self.resolve_object(value)?;
+            if super_handle == class_handle {
+                continue;
+            }
+            if let Some(owner) = self.class_member_owner(super_handle, name, false)? {
+                return Ok(Some(owner));
+            }
+        }
+        Ok(None)
+    }
+
+    fn is_bytecode_class(&self, handle: ObjectHandle) -> bool {
+        matches!(
+            self.runtime.heap[handle.0].kind,
+            ObjectKind::InterCode {
+                context: BytecodeContextType::Class,
+                ..
+            }
+        )
+    }
+
+    /// Superclass getter entry offsets of a bytecode class (one per
+    /// `extends` operand, in declaration order), or `None` for anything that
+    /// is not a bytecode class or extends nothing.
+    fn class_extender_pointers(&mut self, handle: ObjectHandle) -> Result<Option<Vec<i32>>> {
+        let ObjectKind::InterCode {
+            file_id,
+            object_index,
+            context: BytecodeContextType::Class,
+        } = self.runtime.heap[handle.0].kind
+        else {
+            return Ok(None);
+        };
+        let file = self.runtime.script_file(file_id)?;
+        let Some(getter_index) = file.objects[object_index].super_class_getter else {
+            return Ok(None);
+        };
+        let pointers = &file.objects[getter_index].super_class_getter_pointers;
+        if pointers.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(pointers.clone()))
+    }
+
+    /// Whether `handle` is a bytecode class with more than one `extends`
+    /// operand, i.e. members may live behind a superclass getter entry that
+    /// the primary `super_class_handle` chain never visits.
+    fn has_secondary_extenders(&mut self, handle: ObjectHandle) -> Result<bool> {
+        Ok(self
+            .class_extender_pointers(handle)?
+            .is_some_and(|pointers| pointers.len() > 1))
+    }
+
+    /// The class object that a write through class object `handle` lands on
+    /// in tTJSInterCodeContext::PropSet: the class itself when it already
+    /// holds `name`, otherwise the nearest class in its extender chain that
+    /// does. `None` when no class in the chain has the member (the caller
+    /// then ensures it on `handle`). The cached primary chain is walked
+    /// first; superclass getter code only runs for classes with several
+    /// `extends` operands.
+    fn class_chain_owner(
+        &mut self,
+        handle: ObjectHandle,
+        name: &str,
+    ) -> Result<Option<ObjectHandle>> {
+        let mut seen = Vec::new();
+        let mut current = Some(handle);
+        while let Some(class_handle) = current {
+            if seen.contains(&class_handle.0) {
+                break;
+            }
+            seen.push(class_handle.0);
+            if self.runtime.heap[class_handle.0].get_raw(name).is_some() {
+                return Ok(Some(class_handle));
+            }
+            if self.has_secondary_extenders(class_handle)?
+                && let Some(owner) = self.class_member_owner(class_handle, name, true)?
+            {
+                return Ok(Some(owner));
+            }
+            current = self.super_class_handle(class_handle)?;
+        }
+        Ok(None)
+    }
+
     fn class_member_for_call(
         &mut self,
         class_handle: ObjectHandle,
@@ -1091,6 +1258,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Option<Variant>> {
         if let Some(member) = self.runtime.heap[class_handle.0].get_raw(name) {
             return Ok(Some(self.bind_proxy_value(member, Some(instance))));
+        }
+        // krkrz native classes publish their constructor as a member named
+        // after the class, so `KAGLayer.Layer(win, par)` from a class that
+        // never declared its own constructor reaches Layer's initializer via
+        // KAGLayer's superclass proxy. Kirakira runs a native initializer by
+        // calling the class object with the instance bound.
+        if self.handle_class_name_matches(class_handle, name) {
+            return Ok(Some(Variant::Closure(Closure::new(
+                class_handle,
+                Some(instance),
+            ))));
         }
         self.superclass_getter_member_for_call(class_handle, instance, name)
     }
@@ -2119,7 +2297,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.runtime.heap[handle.0].class_infos.push(info);
     }
 
-    pub(super) fn register_object_members(&mut self, source: ObjectHandle, dest: ObjectHandle) {
+    pub(super) fn register_object_members(
+        &mut self,
+        source: ObjectHandle,
+        dest: ObjectHandle,
+    ) -> Result<()> {
         let members = self.runtime.heap[source.0].members.clone();
         for (name, value) in members {
             let mut value = self.materialize_code_object(value);
@@ -2130,8 +2312,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 }
                 _ => {}
             }
+            // tTJSInterCodeContext::RegisterObjectMember stores through
+            // PropSet, so a destination with `missing` enabled sees every
+            // member it does not already hold. KAGEX's class-name probe runs
+            // a class body against such an object and relies on the hook
+            // throwing here to stop the body before its field initialisers
+            // run.
+            if self.runtime.heap[dest.0].call_missing
+                && self.runtime.heap[dest.0].get_raw(&name).is_none()
+                && self.call_set_missing(dest, &name, value.clone())?
+            {
+                continue;
+            }
             self.runtime.heap[dest.0].set(name, value);
         }
+        Ok(())
     }
 }
 
