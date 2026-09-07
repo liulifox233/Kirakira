@@ -814,33 +814,7 @@ impl ProjectStorage {
     /// resources, matching KRKR's `TVPGetPlacedPath` contract (which returns a
     /// logical `archive.xp3>entry` name rather than an OS path for archives).
     pub fn resolved_storage_name(&self, name: &str) -> Option<String> {
-        let candidates = exact_storage_candidates_with_auto_paths(name, &self.auto_paths()).ok()?;
-        for candidate in &candidates {
-            let relative = clean_relative_path(candidate).ok()?;
-            if let Some(storage) = self.find_fs_candidate(candidate, &relative).ok()? {
-                return Some(storage.storage_name().to_string());
-            }
-        }
-        if let Some(provider) = &self.inner.xp3_provider {
-            for candidate in &candidates {
-                if let Some(entry) = provider.get_entry(candidate) {
-                    return Some(entry.name.clone());
-                }
-            }
-        }
-        let memory_files = self.inner.memory_files.read().ok()?;
-        for candidate in candidates {
-            if memory_files.contains_key(&candidate) {
-                return Some(candidate);
-            }
-            if let Some(stored) = memory_files
-                .keys()
-                .find(|stored| stored.eq_ignore_ascii_case(&candidate))
-            {
-                return Some(stored.clone());
-            }
-        }
-        None
+        Some(self.resolve_storage(name).ok()?.storage_name().to_string())
     }
 
     pub fn read_data(&self, name: &str) -> Result<StorageData> {
@@ -2403,6 +2377,47 @@ mod tests {
         );
         assert!(!ambiguous.storage_exists_exact("portrait.txt"));
         assert!(ambiguous.read_binary_vec("portrait.txt").is_err());
+    }
+
+    #[test]
+    fn resolved_storage_name_follows_the_normal_resolver() {
+        let catalog = ProjectStorage::from_memory_with_catalog(
+            [("fgimage/portrait.txt", b"portrait".to_vec())],
+            ["fgimage/portrait.txt", "fgimage/other.bin"],
+        );
+        assert_eq!(
+            catalog.resolved_storage_name("portrait.txt").as_deref(),
+            Some("portrait.txt")
+        );
+        assert!(catalog.resolved_storage_name("portrait").is_none());
+
+        let memory = ProjectStorage::from_memory([("main/Config.tjs", b"cfg".to_vec())]);
+        assert_eq!(
+            memory.resolved_storage_name("Config.tjs").as_deref(),
+            Some("Config.tjs")
+        );
+        assert_eq!(
+            memory
+                .read_binary_vec("Config.tjs")
+                .expect("unique basename"),
+            b"cfg"
+        );
+
+        let root = temp_root("placed");
+        fs::create_dir_all(root.join("bgimage")).expect("create dir");
+        fs::write(root.join("bgimage/sky.jpg"), b"sky").expect("write image");
+        let fs_storage = ProjectStorage::new(
+            Some(root.clone()),
+            project_layers(&root),
+            None,
+            vec!["bgimage/".to_string()],
+        );
+        assert_eq!(
+            fs_storage.resolved_storage_name("sky").as_deref(),
+            Some("bgimage/sky.jpg")
+        );
+        assert!(fs_storage.read_binary_vec("sky").is_ok());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
