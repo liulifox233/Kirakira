@@ -673,8 +673,15 @@ fn is_lvalue(expr: &syntax::Expr) -> bool {
             | syntax::ExprKind::Member { .. }
             | syntax::ExprKind::WithMember { .. }
             | syntax::ExprKind::Index { .. } => return true,
+            // `*expr` writes the operand's default property. The operand is an
+            // rvalue — KAGEX emits `(*Current.prop("skipSpeed")) = ...` where
+            // the call returns a property proxy.
             syntax::ExprKind::Unary {
-                op: syntax::UnaryOp::IgnoreProp | syntax::UnaryOp::PropAccess,
+                op: syntax::UnaryOp::PropAccess,
+                ..
+            } => return true,
+            syntax::ExprKind::Unary {
+                op: syntax::UnaryOp::IgnoreProp,
                 expr,
             } => current = expr,
             _ => return false,
@@ -711,6 +718,17 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("not assignable"))
         );
+    }
+
+    #[test]
+    fn analyze_script_allows_assignment_through_star_of_a_call() {
+        let output = analyze_script(
+            "inline.tjs",
+            r#"(*Current.prop("skipSpeed")) = 1;"#,
+            FrontendOptions::default(),
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(output.value.is_some());
     }
 
     #[test]

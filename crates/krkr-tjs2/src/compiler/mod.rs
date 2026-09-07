@@ -1728,6 +1728,23 @@ mod tests {
     }
 
     #[test]
+    fn star_of_call_is_assignable_as_default_property() {
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                r#"
+                var o = %[];
+                function prop(name) { return o; }
+                (*prop("skipSpeed")) = 9;
+                return *o;
+                "#
+            )
+            .expect("execute"),
+            Variant::Integer(9)
+        );
+    }
+
+    #[test]
     fn ignore_prop_member_update_uses_raw_member_access() {
         let direct = disassemble_top_level("var o = %[]; o.p = 1; (&o.p)++; return o.p;");
         assert!(direct.iter().any(|line| line.contains("gpds")));
