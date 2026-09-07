@@ -906,9 +906,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let mut member = if let Some(this_obj) = self.bound_super_this(handle, caller_this)?
             && self.handle_class_name_matches(handle, name)
         {
-            self.runtime.heap[this_obj.0]
-                .get_raw(name)
-                .unwrap_or_else(|| Variant::Closure(Closure::new(handle, Some(this_obj))))
+            // A class-qualified constructor call (`super.Foo()`) resolves the
+            // constructor on the class object itself, as
+            // tTJSInterCodeContext::FuncCall does. Reading it off the instance
+            // instead would pick the *derived* constructor whenever a subclass
+            // reuses its base class name -- KAGEX does exactly that (`class
+            // OptionSpeedSampleRender extends OptionSpeedSampleRender`) --
+            // because regmember has already copied the derived member over the
+            // inherited one, so the call recurses until the stack overflows.
+            // Native classes hold no bytecode constructor; calling the class
+            // object itself with the bound instance runs their initializer.
+            matches!(
+                self.runtime.heap[handle.0].kind,
+                ObjectKind::InterCode {
+                    context: BytecodeContextType::Class,
+                    ..
+                }
+            )
+            .then(|| self.runtime.heap[handle.0].get_raw(name))
+            .flatten()
+            .unwrap_or_else(|| Variant::Closure(Closure::new(handle, Some(this_obj))))
         } else {
             self.prop_get_handle(
                 handle,

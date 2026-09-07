@@ -8799,6 +8799,32 @@ mod tests {
     }
 
     #[test]
+    fn nested_class_reusing_native_class_name_calls_the_native_constructor() {
+        // Same shadowing pattern as the bytecode-class case, but against a
+        // native base: `super.Layer()` must run the native initializer rather
+        // than the derived constructor regmember copied onto the instance.
+        let mut engine = KrkrEngine::for_project(&temp_root()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Outer {
+                    function Outer() {}
+                    class Layer extends Layer {
+                        function Layer(win, par) { super.Layer(win, par); width = 7; }
+                    }
+                    function make(win) { return new this.Layer(win, null); }
+                }
+                var window = new Window();
+                var layer = (new Outer()).make(window);
+                return layer.width;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result, Variant::Integer(7));
+    }
+
+    #[test]
     fn native_layer_load_images_keeps_native_this_through_nested_super_calls() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");

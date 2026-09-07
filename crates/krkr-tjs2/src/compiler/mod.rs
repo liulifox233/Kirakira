@@ -1303,6 +1303,37 @@ mod tests {
     }
 
     #[test]
+    fn nested_class_reusing_base_class_name_calls_the_base_constructor() {
+        // KAGEX specialises a system class by re-declaring it inside a derived
+        // dialog class under the same name. `super.Render()` must reach the
+        // global base constructor even though regmember has already installed
+        // the derived one on the instance.
+        assert_eq!(
+            execute_source(
+                "nested_class_shadow.tjs",
+                r#"
+                    class Render {
+                        function Render() { trace = "base"; }
+                        function tag() { return "base:" + trace; }
+                    }
+                    class Outer {
+                        function Outer() { }
+                        class Render extends Render {
+                            function Render() { super.Render(); }
+                            function tag() { return "inner:" + trace; }
+                        }
+                        function make() { return new this.Render(); }
+                    }
+                    var made = (new Outer()).make();
+                    return (new global.Render()).tag() + "/" + made.tag();
+                "#
+            )
+            .expect("execute"),
+            Variant::String("base:base/inner:base".to_string())
+        );
+    }
+
+    #[test]
     fn class_regmember_copies_child_methods_to_instance() {
         assert_eq!(
             execute_source(
