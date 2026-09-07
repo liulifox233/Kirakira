@@ -9,6 +9,7 @@ use std::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use krkr_assets::storage::normalize_storage_name;
 use krkr_core::{
     AssetKind, AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef,
     DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
@@ -101,6 +102,31 @@ fn parse_trace_mask(value: &str) -> u8 {
         };
     }
     mask
+}
+
+fn parse_process_arguments() -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        let Some(mut key) = arg.strip_prefix('-') else {
+            continue;
+        };
+        key = key.trim_start_matches('-');
+        if key.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = key.split_once('=') {
+            result.insert(name.to_ascii_lowercase(), value.to_string());
+        } else if args.peek().is_some_and(|next| !next.starts_with('-')) {
+            result.insert(
+                key.to_ascii_lowercase(),
+                args.next().expect("peeked process argument"),
+            );
+        } else {
+            result.insert(key.to_ascii_lowercase(), "1".to_string());
+        }
+    }
+    result
 }
 
 fn trace_mask_from_env() -> u8 {
@@ -346,6 +372,8 @@ pub struct KrkrHost {
     pending_audio_commands: Vec<AudioCommand>,
     video_overlays: BTreeMap<ObjectHandle, VideoOverlayState>,
     text_encoding: String,
+    command_line: BTreeMap<String, String>,
+    system_messages: BTreeMap<String, String>,
     pressed_keys: BTreeSet<i64>,
     cursor_position: Option<Point>,
     lifecycle_state: LifecycleState,
@@ -356,6 +384,7 @@ pub struct KrkrHost {
     external_resource_catalog: BTreeSet<String>,
     pending_external_resources: BTreeMap<(String, AssetKind), ()>,
     system_hooks: BTreeMap<String, SystemHookRegistration>,
+    tick_start: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +442,8 @@ impl Default for KrkrHost {
             pending_audio_commands: Vec::new(),
             video_overlays: BTreeMap::new(),
             text_encoding: "UTF-8".to_string(),
+            command_line: parse_process_arguments(),
+            system_messages: BTreeMap::new(),
             pressed_keys: BTreeSet::new(),
             cursor_position: None,
             lifecycle_state: LifecycleState::Foreground,
@@ -423,6 +454,7 @@ impl Default for KrkrHost {
             external_resource_catalog: BTreeSet::new(),
             pending_external_resources: BTreeMap::new(),
             system_hooks: BTreeMap::new(),
+            tick_start: Instant::now(),
         }
     }
 }
@@ -723,6 +755,21 @@ impl KrkrHost {
         &self.text_encoding
     }
 
+    pub(crate) fn command_argument(&self, name: &str) -> Option<String> {
+        self.command_line.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    pub(crate) fn set_command_argument(&mut self, name: &str, value: &str) {
+        self.command_line
+            .insert(name.to_ascii_lowercase(), value.to_string());
+    }
+
+    pub(crate) fn assign_system_message(&mut self, id: &str, message: &str) -> bool {
+        self.system_messages
+            .insert(id.to_string(), message.to_string())
+            .is_none()
+    }
+
     pub fn set_text_encoding(&mut self, encoding: impl Into<String>) {
         self.text_encoding = encoding.into();
     }
@@ -776,7 +823,10 @@ impl KrkrHost {
     }
 
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
-        let path = path.into().replace('\\', "/");
+        let path = normalize_storage_name(&path.into())
+            .unwrap_or_else(|_| String::new())
+            .trim_end_matches('/')
+            .to_string();
         if !self.auto_paths.iter().any(|item| item == &path) {
             self.auto_paths.push(path);
             if let Some(storage) = &self.project_storage {
@@ -787,12 +837,17 @@ impl KrkrHost {
     }
 
     pub fn remove_auto_path(&mut self, path: &str) -> bool {
+        let normalized = normalize_storage_name(path)
+            .unwrap_or_else(|_| path.replace('\\', "/"))
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
         let before = self.auto_paths.len();
-        self.auto_paths.retain(|item| item != path);
+        self.auto_paths
+            .retain(|item| item.trim_end_matches('/').to_ascii_lowercase() != normalized);
         let removed = before != self.auto_paths.len();
         if removed {
             if let Some(storage) = &self.project_storage {
-                storage.remove_auto_path(path);
+                storage.remove_auto_path(&normalized);
             }
             self.invalidate_resource_state();
         }
@@ -850,6 +905,26 @@ impl KrkrHost {
             .as_ref()
             .and_then(|storage| storage.placed_path(name))
             .map(PathBuf::from)
+    }
+
+    /// Returns the logical path selected by storage lookup, including XP3 and
+    /// memory-backed resources. `Storages.getPlacedPath` exposes this value;
+    /// `getLocalName` continues to use [`Self::placed_path`] for filesystem
+    /// access only.
+    pub fn placed_storage_name(&self, name: &str) -> Option<String> {
+        self.project_storage
+            .as_ref()
+            .and_then(|storage| storage.resolved_storage_name(name))
+            .or_else(|| {
+                self.external_resource_catalog
+                    .iter()
+                    .find(|candidate| candidate.eq_ignore_ascii_case(name))
+                    .cloned()
+            })
+    }
+
+    pub(crate) fn normalize_storage_name(&self, name: &str) -> Result<String> {
+        normalize_storage_name(name)
     }
 
     pub(crate) fn read_text_storage(&self, name: &str) -> Result<String> {
@@ -993,6 +1068,19 @@ impl KrkrHost {
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(0)
             .saturating_add(self.clock_offset_millis)
+    }
+
+    /// Process-relative monotonic tick used by `System.getTickCount`.
+    /// KRKR exposes elapsed milliseconds, not Unix epoch wall-clock time.
+    pub(crate) fn tick_count_millis(&self) -> i64 {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return self.clock_offset_millis.max(0);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.tick_start.elapsed().as_millis().min(i64::MAX as u128) as i64
+        }
     }
 
     /// Installs an absolute host clock sample. Native hosts keep their wall

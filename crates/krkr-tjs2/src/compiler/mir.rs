@@ -4031,7 +4031,10 @@ fn const_truthy(constants: &[MirConst], value: Value) -> Option<bool> {
     match constants.get(id.0 as usize)? {
         MirConst::Void | MirConst::NullObject => Some(false),
         MirConst::Integer(value) => Some(*value != 0),
-        MirConst::Real(value) if *value == 0.0 || value.is_nan() => Some(false),
+        // TJS follows the usual numeric truthiness rule: every non-zero Real,
+        // including NaN, is truthy. Rust's `f64::is_nan` must therefore not
+        // be treated as a falsy special case during constant folding.
+        MirConst::Real(value) if *value == 0.0 => Some(false),
         MirConst::Real(_) => Some(true),
         _ => None,
     }

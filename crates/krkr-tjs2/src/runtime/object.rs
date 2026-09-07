@@ -52,7 +52,7 @@ impl Object {
             ObjectKind::Array { elements } => {
                 if name == "count" || name == "length" {
                     Some(Variant::Integer(elements.len() as i64))
-                } else if let Ok(index) = name.parse::<usize>() {
+                } else if let Some(index) = array_index(name, elements.len()) {
                     elements.get(index).cloned()
                 } else {
                     self.members.get(name).cloned()
@@ -69,7 +69,7 @@ impl Object {
     pub fn set(&mut self, name: impl Into<String>, value: Variant) {
         let name = name.into();
         if let ObjectKind::Array { elements } = &mut self.kind
-            && let Ok(index) = name.parse::<usize>()
+            && let Some(index) = array_index_for_set(&name, elements.len())
         {
             let old_len = elements.len();
             if index >= old_len {
@@ -104,11 +104,14 @@ impl Object {
     pub fn delete(&mut self, name: &str) -> bool {
         let removed = self.members.remove(name).is_some();
         if let ObjectKind::Array { elements } = &mut self.kind
-            && let Ok(index) = name.parse::<usize>()
+            && let Some(index) = array_index(name, elements.len())
             && index < elements.len()
         {
-            elements[index] = Variant::Void;
-            self.members.insert(index.to_string(), Variant::Void);
+            // KRKR's Array.delete is an erase operation: subsequent elements
+            // shift left and the array length decreases. This intentionally
+            // differs from JavaScript's sparse-array delete semantics.
+            elements.remove(index);
+            self.sync_array_members();
             return true;
         }
         removed
@@ -282,6 +285,32 @@ impl Object {
         self.members.insert("count".to_string(), length.clone());
         self.members.insert("length".to_string(), length);
     }
+}
+
+fn array_index(name: &str, len: usize) -> Option<usize> {
+    let index = parse_array_index_name(name)?;
+    let index = if index < 0 { len as i64 + index } else { index };
+    (index >= 0 && index < len as i64).then_some(index as usize)
+}
+
+fn array_index_for_set(name: &str, len: usize) -> Option<usize> {
+    let index = parse_array_index_name(name)?;
+    if index < 0 {
+        return array_index(name, len);
+    }
+    usize::try_from(index).ok()
+}
+
+fn parse_array_index_name(name: &str) -> Option<i64> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if let Ok(index) = name.parse::<i64>() {
+        return Some(index);
+    }
+    let value = name.parse::<f64>().ok()?;
+    value.is_finite().then_some(value as i64)
 }
 
 #[cfg(test)]

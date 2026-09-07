@@ -909,21 +909,6 @@ fn window_set_pos(
     let top = optional_integer(&args, 1)?.unwrap_or(0);
     set_window_property_storage(runtime, this, "left", Variant::Integer(left));
     set_window_property_storage(runtime, this, "top", Variant::Integer(top));
-
-    let primary_layer = runtime.host().native_window_primary_layer(this);
-    if let Some(layer) = primary_layer
-        && runtime.host().native_layer(layer).is_some()
-    {
-        set_layer_property_storage(runtime, layer, "left", Variant::Integer(left));
-        set_layer_property_storage(runtime, layer, "top", Variant::Integer(top));
-        if let Some(layer_id) = runtime.host().native_layer(layer)
-            && let Some(node) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id)
-        {
-            node.left = left as f32;
-            node.top = top as f32;
-        }
-    }
-
     Ok(Variant::Void)
 }
 

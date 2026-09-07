@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 image.workspace = true
+krkr-assets.workspace = true
 krkr-core.workspace = true
 krkr-font.workspace = true
 krkr-kag.workspace = true

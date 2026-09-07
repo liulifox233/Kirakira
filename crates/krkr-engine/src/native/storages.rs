@@ -22,7 +22,7 @@ pub(crate) fn install_storages(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(storages, "extractStoragePath", storages_extract_path);
     runtime.register_object_native(storages, "chopStorageExt", storages_chop_ext);
     runtime.register_object_native(storages, "clearArchiveCache", storages_clear_archive_cache);
-    runtime.register_object_native(storages, "getLocalName", storages_get_placed_path);
+    runtime.register_object_native(storages, "getLocalName", storages_get_local_name);
     runtime.register_object_native(storages, "selectFile", native_void);
     runtime.register_object_native(storages, "searchCD", native_void);
 }
@@ -32,9 +32,12 @@ fn storages_add_auto_path(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    if let Some(value) = args.first() {
-        runtime.host_mut().add_auto_path(value.to_tjs_string()?);
-    }
+    let path = args
+        .first()
+        .ok_or_else(|| krkr_tjs2::TjsError::runtime("Storages.addAutoPath requires a path"))?
+        .to_tjs_string()?;
+    validate_auto_path(&path, "Storages.addAutoPath")?;
+    runtime.host_mut().add_auto_path(path);
     Ok(Variant::Void)
 }
 
@@ -43,12 +46,13 @@ fn storages_remove_auto_path(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let removed = args
+    let path = args
         .first()
-        .map(Variant::to_tjs_string)
-        .transpose()?
-        .is_some_and(|path| runtime.host_mut().remove_auto_path(&path));
-    Ok(Variant::Integer(i64::from(removed)))
+        .ok_or_else(|| krkr_tjs2::TjsError::runtime("Storages.removeAutoPath requires a path"))?
+        .to_tjs_string()?;
+    validate_auto_path(&path, "Storages.removeAutoPath")?;
+    runtime.host_mut().remove_auto_path(&path);
+    Ok(Variant::Void)
 }
 
 fn storages_set_text_encoding(
@@ -66,11 +70,16 @@ fn storages_set_text_encoding(
 }
 
 fn storages_get_full_path(
-    _runtime: &mut Runtime<KrkrHost>,
+    runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    Ok(Variant::String(arg_string(&args, 0)?.unwrap_or_default()))
+    let name = arg_string(&args, 0)?.ok_or_else(|| {
+        krkr_tjs2::TjsError::runtime("Storages.getFullPath requires a storage name")
+    })?;
+    Ok(Variant::String(
+        runtime.host().normalize_storage_name(&name)?,
+    ))
 }
 
 fn storages_get_placed_path(
@@ -78,15 +87,45 @@ fn storages_get_placed_path(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let Some(name) = arg_string(&args, 0)? else {
-        return Ok(Variant::String(String::new()));
-    };
+    let name = arg_string(&args, 0)?.ok_or_else(|| {
+        krkr_tjs2::TjsError::runtime("Storages.getPlacedPath requires a storage name")
+    })?;
     let path = runtime
         .host()
-        .placed_path(&name)
-        .map(|path| path.display().to_string())
+        .placed_storage_name(&name)
         .unwrap_or_default();
     Ok(Variant::String(path))
+}
+
+fn storages_get_local_name(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = arg_string(&args, 0)?.ok_or_else(|| {
+        krkr_tjs2::TjsError::runtime("Storages.getLocalName requires a storage name")
+    })?;
+    Ok(Variant::String(
+        runtime
+            .host()
+            .placed_path(&name)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    ))
+}
+
+fn validate_auto_path(path: &str, method: &str) -> Result<()> {
+    if path.is_empty()
+        || !path
+            .chars()
+            .last()
+            .is_some_and(|ch| matches!(ch, '/' | '\\' | '>'))
+    {
+        return Err(krkr_tjs2::TjsError::runtime(format!(
+            "{method} requires a path ending in '/', '\\' or '>'"
+        )));
+    }
+    Ok(())
 }
 
 fn storages_exists(

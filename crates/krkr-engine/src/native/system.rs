@@ -2,21 +2,23 @@ use krkr_tjs2::{
     Result, TjsError,
     runtime::{ObjectHandle, Runtime, Variant},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::host::KrkrHost;
 
-use super::{first_arg_or_void, install_static_object, register_stub_method};
+use super::{install_static_object, register_stub_method};
+
+static UUID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     let system = install_static_object(runtime, "System");
     for method in [
-        "assignMessage",
+        // Implemented below with a portable message table.
         // addFont is implemented below; keep the remaining legacy methods as
         // observable stubs for compatibility diagnostics.
-        "doCompact",
         "system",
         "readRegValue",
-        "setArgument",
         "dumpHeap",
         "nullpo",
         "showVersion",
@@ -42,7 +44,10 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(system, "shellExecute", system_shell_execute);
     runtime.register_object_native(system, "createAppLock", system_create_app_lock);
     runtime.register_object_native(system, "getTickCount", system_get_tick_count);
-    runtime.register_object_native(system, "toActualColor", first_arg_or_void);
+    runtime.register_object_native(system, "toActualColor", system_to_actual_color);
+    runtime.register_object_native(system, "assignMessage", system_assign_message);
+    runtime.register_object_native(system, "doCompact", system_do_compact);
+    runtime.register_object_native(system, "setArgument", system_set_argument);
     runtime.register_object_native(system, "createUUID", system_create_uuid);
     runtime.register_object_native(system, "getArgument", system_get_argument);
     runtime.register_object_native(system, "addFont", system_add_font);
@@ -67,7 +72,6 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
             "appDataPath",
             Variant::String(runtime.host().system_paths().app_data_path.clone()),
         ),
-        ("eventDisabled", Variant::Integer(0)),
         // KRKR invokes this callback at the outer script/event boundary when
         // an exception escaped the VM.  Startup.tjs may replace the default
         // void value with the project's handler.
@@ -90,8 +94,35 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     ] {
         runtime.set_object_member(system, name, value);
     }
+    runtime.register_object_native_property(
+        system,
+        "eventDisabled",
+        system_event_disabled_get,
+        system_event_disabled_set,
+    );
     let version_info = runtime.alloc_ordinary_object();
     runtime.set_object_member(system, "versionInformation", Variant::Object(version_info));
+}
+
+fn system_event_disabled_get(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+) -> Result<Variant> {
+    Ok(Variant::Integer(i64::from(
+        runtime.host().scheduler().event_disabled(),
+    )))
+}
+
+fn system_event_disabled_set(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    value: Variant,
+) -> Result<()> {
+    runtime
+        .host_mut()
+        .scheduler_mut()
+        .set_event_disabled(value.is_truthy());
+    Ok(())
 }
 
 fn system_exit(
@@ -166,9 +197,15 @@ fn system_add_continuous_handler(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    if let Some(handler) = args.first() {
-        runtime.host_mut().add_continuous_handler(handler.clone());
+    let handler = args
+        .first()
+        .ok_or_else(|| TjsError::runtime("System.addContinuousHandler requires a handler"))?;
+    if !matches!(handler, Variant::Object(_) | Variant::Closure(_)) {
+        return Err(TjsError::runtime(
+            "System.addContinuousHandler requires an object closure",
+        ));
     }
+    runtime.host_mut().add_continuous_handler(handler.clone());
     Ok(Variant::Void)
 }
 
@@ -177,9 +214,15 @@ fn system_remove_continuous_handler(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let removed = args
+    let handler = args
         .first()
-        .is_some_and(|handler| runtime.host_mut().remove_continuous_handler(handler));
+        .ok_or_else(|| TjsError::runtime("System.removeContinuousHandler requires a handler"))?;
+    if !matches!(handler, Variant::Object(_) | Variant::Closure(_)) {
+        return Err(TjsError::runtime(
+            "System.removeContinuousHandler requires an object closure",
+        ));
+    }
+    let removed = runtime.host_mut().remove_continuous_handler(handler);
     Ok(Variant::Integer(i64::from(removed)))
 }
 
@@ -246,7 +289,77 @@ fn system_get_tick_count(
     _this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    Ok(Variant::Integer(runtime.host_mut().now_millis()))
+    Ok(Variant::Integer(runtime.host().tick_count_millis()))
+}
+
+fn system_to_actual_color(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let color = args
+        .first()
+        .ok_or_else(|| TjsError::runtime("System.toActualColor requires a color"))?
+        .to_integer()? as u32;
+    // KRKR uses Win32 system-color identifiers (0x80000000 | index). Keep a
+    // stable portable palette for those identifiers while ordinary RGB values
+    // pass through unchanged.
+    const PALETTE: [u32; 25] = [
+        0x00c0_c0c0, 0x00ff_ffff, 0x0080_8080, 0x0000_0080, 0x00c0_c0c0, 0x00ff_ffff, 0x0000_0000,
+        0x0000_0000, 0x00ff_ffff, 0x0000_0000, 0x00c0_c0c0, 0x00c0_c0c0, 0x00e0_e0e0, 0x0000_007f,
+        0x00ff_ffff, 0x00f0_f0f0, 0x0080_8080, 0x0080_8080, 0x0000_0000, 0x00c0_c0c0, 0x00ff_ffff,
+        0x00ff_ffff, 0x0000_0000, 0x00ff_ffff, 0x00ff_ffff,
+    ];
+    let rgb = if color & 0xff00_0000 != 0 {
+        PALETTE.get((color & 0xff) as usize).copied().unwrap_or(0)
+    } else {
+        color & 0x00ff_ffff
+    };
+    Ok(Variant::Integer(rgb as i64))
+}
+
+fn system_assign_message(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let id = args
+        .first()
+        .ok_or_else(|| TjsError::runtime("System.assignMessage requires an id"))?
+        .to_tjs_string()?;
+    let message = args
+        .get(1)
+        .ok_or_else(|| TjsError::runtime("System.assignMessage requires a message"))?
+        .to_tjs_string()?;
+    Ok(Variant::Integer(i64::from(
+        runtime.host_mut().assign_system_message(&id, &message),
+    )))
+}
+
+fn system_do_compact(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    runtime.host().clear_archive_cache()?;
+    Ok(Variant::Void)
+}
+
+fn system_set_argument(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let name = args
+        .first()
+        .ok_or_else(|| TjsError::runtime("System.setArgument requires a name"))?
+        .to_tjs_string()?;
+    let value = args
+        .get(1)
+        .ok_or_else(|| TjsError::runtime("System.setArgument requires a value"))?
+        .to_tjs_string()?;
+    runtime.host_mut().set_command_argument(&name, &value);
+    Ok(Variant::Void)
 }
 
 fn system_create_uuid(
@@ -254,18 +367,56 @@ fn system_create_uuid(
     _this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    let ticks = runtime.host_mut().now_millis();
+    let ticks = runtime.host_mut().now_millis() as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(ticks);
+    let mut state = nanos ^ ticks.rotate_left(17) ^ UUID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_exact_mut(8) {
+        state ^= state << 7;
+        state ^= state >> 9;
+        state ^= state << 8;
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(Variant::String(format!(
-        "00000000-0000-4000-8000-{ticks:012x}"
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     )))
 }
 
 fn system_get_argument(
-    _runtime: &mut Runtime<KrkrHost>,
+    runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
+    args: Vec<Variant>,
 ) -> Result<Variant> {
-    Ok(Variant::Void)
+    let name = args
+        .first()
+        .ok_or_else(|| TjsError::runtime("System.getArgument requires a name"))?
+        .to_tjs_string()?;
+    Ok(runtime
+        .host()
+        .command_argument(&name)
+        .map(Variant::String)
+        .unwrap_or(Variant::Void))
 }
 
 fn system_add_font(

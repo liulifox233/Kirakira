@@ -32,6 +32,10 @@ impl TvpScheduler {
         self.frame_idle_async_delivered.clear();
     }
 
+    pub(crate) fn event_disabled(&self) -> bool {
+        self.event_disabled
+    }
+
     pub(crate) fn set_event_disabled(&mut self, disabled: bool) {
         self.event_disabled = disabled;
     }

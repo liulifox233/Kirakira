@@ -181,6 +181,35 @@ mod tests {
     }
 
     #[test]
+    fn execute_source_increment_coerces_numeric_strings() {
+        assert_eq!(
+            execute_source("increment.tjs", "var value = '5'; ++value; return value;")
+                .expect("execute"),
+            Variant::Integer(6)
+        );
+    }
+
+    #[test]
+    fn constant_nan_condition_is_truthy_like_runtime_numeric_values() {
+        assert_eq!(
+            execute_source("nan-branch.tjs", "if (NaN) return 1; else return 2;").expect("execute"),
+            Variant::Integer(1)
+        );
+    }
+
+    #[test]
+    fn execute_source_array_delete_shifts_later_elements() {
+        assert_eq!(
+            execute_source(
+                "array_delete.tjs",
+                "var a = [1, 2, 3]; delete a[1]; return a.count + ':' + a.join(',');"
+            )
+            .expect("execute"),
+            Variant::String("2:1,3".to_string())
+        );
+    }
+
+    #[test]
     fn execute_source_builds_and_indexes_array() {
         assert_eq!(
             execute_source("inline.tjs", "var a = [1, 4, 9]; return a[1];").expect("execute"),

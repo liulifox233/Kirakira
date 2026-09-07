@@ -395,6 +395,10 @@ impl ProjectStorage {
         if let Ok(mut target) = self.inner.catalog_paths.write() {
             *target = catalog;
         }
+        // A catalogue replacement changes both positive and negative lookup
+        // results. Drop the resolver/raw caches so a newly announced Web
+        // resource is not hidden behind an earlier miss.
+        self.invalidate_caches();
     }
 
     /// Adds logical files to the catalogue. Existing entries retain their
@@ -404,15 +408,20 @@ impl ProjectStorage {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let mut changed = false;
         if let Ok(mut catalog) = self.inner.catalog_paths.write() {
             for path in paths {
                 let path = path.into();
                 if let Some(key) = catalog_path(&path) {
-                    catalog
-                        .entry(key)
-                        .or_insert_with(|| normalize_storage_separators(&path));
+                    if let std::collections::btree_map::Entry::Vacant(entry) = catalog.entry(key) {
+                        entry.insert(normalize_storage_separators(&path));
+                        changed = true;
+                    }
                 }
             }
+        }
+        if changed {
+            self.invalidate_caches();
         }
     }
 
@@ -506,11 +515,17 @@ impl ProjectStorage {
     }
 
     pub fn remove_auto_path(&self, path: &str) -> bool {
+        let normalized = normalize_storage_separators(path)
+            .trim_matches('/')
+            .to_ascii_lowercase();
         let Ok(mut auto_paths) = self.inner.auto_paths.write() else {
             return false;
         };
         let before = auto_paths.len();
-        auto_paths.retain(|item| item != path);
+        auto_paths.retain(|item| {
+            let item_normalized = item.trim_matches('/').to_ascii_lowercase();
+            item_normalized != normalized
+        });
         let removed = before != auto_paths.len();
         if removed {
             self.invalidate_caches();
@@ -524,7 +539,10 @@ impl ProjectStorage {
                 .clear_segment_cache()
                 .map_err(|error| TjsError::runtime(error.to_string()))?;
         }
-        self.clear_raw_cache();
+        // Clearing an archive also invalidates located-resource decisions;
+        // otherwise lookup_cache can continue returning a stale XP3 member
+        // (or a previous miss) after the archive has been replaced.
+        self.invalidate_caches();
         Ok(())
     }
 
@@ -791,6 +809,40 @@ impl ProjectStorage {
         }
     }
 
+    /// Returns the normalized logical storage name selected by the resolver.
+    /// Unlike [`Self::placed_path`], this also works for XP3 and memory-backed
+    /// resources, matching KRKR's `TVPGetPlacedPath` contract (which returns a
+    /// logical `archive.xp3>entry` name rather than an OS path for archives).
+    pub fn resolved_storage_name(&self, name: &str) -> Option<String> {
+        let candidates = exact_storage_candidates_with_auto_paths(name, &self.auto_paths()).ok()?;
+        for candidate in &candidates {
+            let relative = clean_relative_path(candidate).ok()?;
+            if let Some(storage) = self.find_fs_candidate(candidate, &relative).ok()? {
+                return Some(storage.storage_name().to_string());
+            }
+        }
+        if let Some(provider) = &self.inner.xp3_provider {
+            for candidate in &candidates {
+                if let Some(entry) = provider.get_entry(candidate) {
+                    return Some(entry.name.clone());
+                }
+            }
+        }
+        let memory_files = self.inner.memory_files.read().ok()?;
+        for candidate in candidates {
+            if memory_files.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            if let Some(stored) = memory_files
+                .keys()
+                .find(|stored| stored.eq_ignore_ascii_case(&candidate))
+            {
+                return Some(stored.clone());
+            }
+        }
+        None
+    }
+
     pub fn read_data(&self, name: &str) -> Result<StorageData> {
         let located = self.resolve_storage(name)?;
         let storage_name = located.storage_name().to_string();
@@ -842,7 +894,9 @@ impl ProjectStorage {
             let key = memory_write_key(name)?;
             let mut output = bytes.to_vec();
             if let Some(offset) = storage_mode_offset(mode) {
-                let mut current = self.read_binary_vec(&key).unwrap_or_default();
+                let mut current = self.read_binary_vec(&key).map_err(|_| {
+                    TjsError::runtime(format!("cannot update missing storage: {name}"))
+                })?;
                 let offset = usize::try_from(offset).map_err(|_| {
                     TjsError::runtime(format!("storage offset is too large: {offset}"))
                 })?;
@@ -874,7 +928,6 @@ impl ProjectStorage {
         }
         let result = if let Some(offset) = storage_mode_offset(mode) {
             let mut file = fs::OpenOptions::new()
-                .create(true)
                 .write(true)
                 .truncate(false)
                 .open(&path)
@@ -932,6 +985,12 @@ impl ProjectStorage {
         if let Ok(cache) = self.inner.lookup_cache.lock()
             && let Some(storage) = cache.get(name).cloned()
         {
+            // A lookup-cache hit must still refresh the external-memory LRU;
+            // otherwise repeatedly reading a hot fetched asset can be evicted
+            // by an unrelated insertion.
+            if let Some(LocatedResource::Memory { source_path, .. }) = storage.as_ref() {
+                self.touch_external_memory(source_path);
+            }
             return storage.ok_or_else(|| storage_not_found(name));
         }
 
@@ -1257,7 +1316,7 @@ impl ProjectStorage {
         }
     }
 
-    fn auto_paths(&self) -> Vec<String> {
+    pub fn auto_paths(&self) -> Vec<String> {
         self.inner
             .auto_paths
             .read()
@@ -1346,6 +1405,10 @@ impl krkr_core::ProjectStoragePort for ProjectStorage {
 
     fn placed_path(&self, name: &str) -> Option<String> {
         ProjectStorage::placed_path(self, name).map(|path| path.display().to_string())
+    }
+
+    fn resolved_storage_name(&self, name: &str) -> Option<String> {
+        ProjectStorage::resolved_storage_name(self, name)
     }
 
     fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData> {
@@ -1752,6 +1815,14 @@ pub fn decode_text_storage(
     encoding_hint: Option<&'static Encoding>,
     configured_encoding: &str,
 ) -> Result<String> {
+    // KRKR strips an UTF-8 BOM before handing text to the configured
+    // decoder. Treat it as an encoding declaration rather than exposing
+    // U+FEFF to scripts or scenario parsers.
+    let bytes = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        &bytes[3..]
+    } else {
+        bytes
+    };
     if let Some(text) = decode_tjs_text_stream(bytes)? {
         return Ok(text);
     }
@@ -1906,6 +1977,56 @@ pub fn normalize_storage_separators(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// Normalizes a logical KRKR storage name for APIs such as
+/// `Storages.getFullPath`. This is deliberately independent of the host OS:
+/// separators are `/`, duplicate and `.` segments collapse, and `..` may
+/// remove a prior segment but cannot escape the logical project root. XP3's
+/// `>` delimiter is preserved while its in-archive path receives the same
+/// normalization and KRKR's case-insensitive spelling.
+pub fn normalize_storage_name(path: &str) -> Result<String> {
+    let path = normalize_storage_separators(path);
+    let (outer, inner) = path
+        .split_once('>')
+        .map_or((path.as_str(), None), |(outer, inner)| (outer, Some(inner)));
+    let outer = normalize_logical_path(outer, false)?;
+    let Some(inner) = inner else {
+        return Ok(outer);
+    };
+    let inner = normalize_logical_path(inner, true)?;
+    Ok(format!("{outer}>{inner}"))
+}
+
+fn normalize_logical_path(path: &str, lower_case: bool) -> Result<String> {
+    let absolute = path.starts_with('/');
+    let mut parts = Vec::new();
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            if parts.pop().is_none() {
+                return Err(TjsError::runtime(format!(
+                    "storage path must stay inside project root: {path}"
+                )));
+            }
+            continue;
+        }
+        parts.push(if lower_case {
+            component.to_ascii_lowercase()
+        } else {
+            component.to_string()
+        });
+    }
+    let mut result = parts.join("/");
+    if absolute {
+        result.insert(0, '/');
+    }
+    if result.is_empty() && absolute {
+        result.push('/');
+    }
+    Ok(result)
+}
+
 fn canonical_memory_path(path: &str) -> String {
     let normalized = normalize_storage_separators(path);
     clean_relative_path(&normalized)
@@ -1933,19 +2054,33 @@ fn is_safe_absolute_storage_path(path: &Path) -> bool {
 }
 
 fn memory_write_key(name: &str) -> Result<String> {
-    let path = Path::new(name);
+    if name.contains('>') {
+        return Err(TjsError::runtime(format!(
+            "cannot write to archive-qualified storage: {name}"
+        )));
+    }
+    let normalized = normalize_storage_separators(name);
+    let path = Path::new(&normalized);
     if path.is_absolute() {
         return Err(TjsError::runtime(format!(
             "memory storage path must be relative: {name}"
         )));
     }
     Ok(normalize_storage_separators(
-        clean_relative_path(name)?.to_str().unwrap_or_default(),
+        clean_relative_path(&normalized)?
+            .to_str()
+            .unwrap_or_default(),
     ))
 }
 
 pub(crate) fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
-    let path = Path::new(name);
+    if name.contains('>') {
+        return Err(TjsError::runtime(format!(
+            "cannot write to archive-qualified storage: {name}"
+        )));
+    }
+    let normalized = normalize_storage_separators(name);
+    let path = Path::new(&normalized);
     if path.is_absolute() {
         if is_safe_absolute_storage_path(path) {
             return Ok(path.to_path_buf());
@@ -1955,7 +2090,7 @@ pub(crate) fn storage_write_path(root: &Path, name: &str) -> Result<PathBuf> {
             path.display()
         )));
     }
-    Ok(root.join(clean_relative_path(name)?))
+    Ok(root.join(clean_relative_path(&normalized)?))
 }
 
 pub fn storage_mode_offset(mode: &str) -> Option<u64> {
@@ -2049,6 +2184,36 @@ mod tests {
     use krkr_core::StoragePort;
 
     use super::*;
+
+    #[test]
+    fn normalizes_logical_storage_names_like_krkr() {
+        assert_eq!(
+            normalize_storage_name(r"foo\\bar/./baz/../qux").unwrap(),
+            "foo/bar/qux"
+        );
+        assert_eq!(
+            normalize_storage_name(r"archive.xp3>FOO\\BAR/../Baz").unwrap(),
+            "archive.xp3>foo/baz"
+        );
+        assert!(normalize_storage_name("../escape").is_err());
+    }
+
+    #[test]
+    fn decode_text_storage_strips_utf8_bom() {
+        let bytes = [0xef, 0xbb, 0xbf, b'a', b'b', b'c'];
+        assert_eq!(
+            decode_text_storage("text.tjs", &bytes, None, "UTF-8").expect("decode"),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn remove_auto_path_normalizes_case_and_separators() {
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage.add_auto_path(r"Sound\");
+        assert!(storage.remove_auto_path("sound/"));
+        assert!(storage.auto_paths().is_empty());
+    }
 
     #[test]
     fn storage_candidates_apply_auto_paths_to_xp3_lookups() {
@@ -2238,6 +2403,41 @@ mod tests {
         );
         assert!(!ambiguous.storage_exists_exact("portrait.txt"));
         assert!(ambiguous.read_binary_vec("portrait.txt").is_err());
+    }
+
+    #[test]
+    fn catalogue_changes_invalidate_resolver_revision() {
+        let storage = ProjectStorage::from_memory([("startup.tjs", b"WEB".to_vec())]);
+        let before = storage.revision();
+        storage.add_catalog_paths(["deferred.ks"]);
+        assert!(storage.revision() > before);
+        let before_clear = storage.revision();
+        storage.clear_archive_cache().expect("clear cache");
+        assert!(storage.revision() > before_clear);
+    }
+
+    #[test]
+    fn storage_writes_normalize_backslashes_and_reject_archive_members() {
+        let storage = ProjectStorage::from_memory(std::iter::empty::<(&str, Vec<u8>)>());
+        storage
+            .write_binary_storage("saved\\state.bin", "w", b"ok")
+            .expect("normalized memory write");
+        assert_eq!(
+            storage
+                .read_binary_vec("saved/state.bin")
+                .expect("read normalized"),
+            b"ok"
+        );
+        assert!(
+            storage
+                .write_binary_storage("..\\outside.bin", "w", b"bad")
+                .is_err()
+        );
+        assert!(
+            storage
+                .write_binary_storage("data.xp3>member.bin", "w", b"bad")
+                .is_err()
+        );
     }
 
     #[test]

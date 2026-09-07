@@ -247,7 +247,9 @@ impl Variant {
     }
 
     pub fn increment(&self) -> Result<Self> {
-        self.add(&Self::Integer(1))
+        // KRKRZ performs ++ on the numeric value of a string; it does not
+        // route through the overloaded string-concatenating `add` path.
+        self.to_number_variant()?.add(&Self::Integer(1))
     }
 
     pub fn decrement(&self) -> Result<Self> {
@@ -330,11 +332,10 @@ impl Variant {
     }
 
     pub fn div(&self, rhs: &Self) -> Result<Self> {
-        let divisor = rhs.to_real()?;
-        if divisor == 0.0 {
-            return Err(TjsError::runtime("division by zero"));
-        }
-        Ok(Self::Real(self.to_real()? / divisor))
+        // TJS `/` is IEEE-754 real division: zero produces signed infinity
+        // (or NaN for 0/0). Integer division and modulo retain their explicit
+        // zero-divisor errors below.
+        Ok(Self::Real(self.to_real()? / rhs.to_real()?))
     }
 
     pub fn idiv(&self, rhs: &Self) -> Result<Self> {

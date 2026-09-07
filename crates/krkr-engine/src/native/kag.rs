@@ -11,7 +11,7 @@ use krkr_tjs2::{
 use crate::{
     host::{KrkrHost, SystemHookRegistration},
     kag::{attributes_to_dictionary, tag_to_dictionary},
-    script::{execute_expression_on_runtime, execute_script_on_runtime},
+    script::{execute_expression_on_runtime_with_this, execute_script_on_runtime},
 };
 
 use super::{arg_string, required_arg_string};
@@ -559,7 +559,7 @@ fn alloc_dictionary(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
 
 fn storage_short_name(storage: &str) -> String {
     storage
-        .rsplit(['/', '\\'])
+        .rsplit(['/', '\\', '>'])
         .next()
         .unwrap_or(storage)
         .to_string()
@@ -713,7 +713,7 @@ fn refresh_kag_parser_members_from_parser(
     runtime.set_object_member(
         handle,
         "curLine",
-        Variant::Integer(parser.cur_line().unwrap_or(0) as i64),
+        Variant::Integer(parser.cur_line().unwrap_or(1).saturating_sub(1) as i64),
     );
     runtime.set_object_member(
         handle,
@@ -781,7 +781,10 @@ impl<'a, 'bc, 'rt> TjsKagHost<'a, 'bc, 'rt> {
 
     fn call_event(&mut self, name: &str, args: Vec<Variant>) -> krkr_kag::Result<Option<Variant>> {
         if matches!(
-            self.vm.runtime().object_member(self.owner, name),
+            self.vm
+                .runtime_mut()
+                .resolve_object_member(self.owner, name)
+                .map_err(kag_tjs_error)?,
             Variant::Void
         ) {
             return Ok(None);
@@ -847,17 +850,17 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
     }
 
     fn eval_bool(&mut self, expression: &str) -> krkr_kag::Result<bool> {
-        Ok(eval_expression(self.vm.runtime_mut(), expression)?.is_truthy())
+        Ok(eval_expression(self.vm.runtime_mut(), self.owner, expression)?.is_truthy())
     }
 
     fn eval_string(&mut self, expression: &str) -> krkr_kag::Result<String> {
-        eval_expression(self.vm.runtime_mut(), expression)?
+        eval_expression(self.vm.runtime_mut(), self.owner, expression)?
             .to_tjs_string()
             .map_err(kag_host_error)
     }
 
     fn eval_attribute(&mut self, expression: &str) -> krkr_kag::Result<Option<String>> {
-        match eval_expression(self.vm.runtime_mut(), expression)? {
+        match eval_expression(self.vm.runtime_mut(), self.owner, expression)? {
             Variant::Void => Ok(None),
             value => value.to_tjs_string().map(Some).map_err(kag_host_error),
         }
@@ -878,13 +881,21 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
     }
 
     fn on_script(&mut self, event: ScriptEvent<'_>) -> krkr_kag::Result<()> {
+        let line = self
+            .vm
+            .runtime()
+            .host()
+            .kag_parser(self.owner)
+            .and_then(|parser| parser.line_pos_for_offset(event.storage, event.span.start))
+            .map(|(line, _)| line)
+            .unwrap_or(0);
         if self
             .call_event(
                 "onScript",
                 vec![
                     Variant::String(event.script.to_string()),
-                    Variant::String(event.storage.to_string()),
-                    Variant::Integer(event.span.start as i64),
+                    Variant::String(storage_short_name(event.storage)),
+                    Variant::Integer(line as i64),
                 ],
             )?
             .is_none()
@@ -1237,8 +1248,13 @@ pub(crate) fn kag_to_tjs(error: krkr_kag::KagError) -> TjsError {
     }
 }
 
-fn eval_expression(runtime: &mut Runtime<KrkrHost>, expression: &str) -> krkr_kag::Result<Variant> {
-    execute_expression_on_runtime(runtime, expression, expression).map_err(kag_tjs_error)
+fn eval_expression(
+    runtime: &mut Runtime<KrkrHost>,
+    owner: ObjectHandle,
+    expression: &str,
+) -> krkr_kag::Result<Variant> {
+    execute_expression_on_runtime_with_this(runtime, expression, expression, Some(owner))
+        .map_err(kag_tjs_error)
 }
 
 fn kag_host_error(error: impl std::fmt::Display) -> KagError {

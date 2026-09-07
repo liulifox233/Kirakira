@@ -200,6 +200,13 @@ pub trait ProjectStoragePort: StoragePort {
     /// the engine/core boundary.
     fn placed_path(&self, name: &str) -> Option<String>;
 
+    /// Returns the logical normalized name selected by lookup. Filesystem
+    /// adapters may return the same value as `placed_path`; archive-aware
+    /// adapters should return their `archive.xp3>entry` spelling.
+    fn resolved_storage_name(&self, name: &str) -> Option<String> {
+        self.placed_path(name)
+    }
+
     fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData>;
 
     fn read_text_storage(&self, name: &str, configured_encoding: &str) -> io::Result<String>;
@@ -1318,7 +1325,11 @@ impl LayerTree {
         let mut hits = Vec::new();
         let roots = self.sorted_children(None);
         for root in roots.into_iter().rev() {
-            self.hit_test_layer_all(root.id, Point::new(0.0, 0.0), point, &mut hits);
+            if self.hit_test_layer_all(root.id, Point::new(0.0, 0.0), point, &mut hits)
+                == HitTestOutcome::Blocked
+            {
+                break;
+            }
         }
         hits
     }
@@ -1415,34 +1426,42 @@ impl LayerTree {
         parent_origin: Point,
         point: Point,
         hits: &mut Vec<LayerId>,
-    ) {
+    ) -> HitTestOutcome {
         let Some(layer) = self.layers.get(&id) else {
-            return;
+            return HitTestOutcome::None;
         };
         if !layer.renderable
             || !layer.visible
-            || !layer.enabled
-            || !layer.node_enabled
             || layer.opacity == 0
             || layer.width <= 0.0
             || layer.height <= 0.0
         {
-            return;
+            return HitTestOutcome::None;
         }
 
         let origin = Point::new(parent_origin.x + layer.left, parent_origin.y + layer.top);
         let rect = Rect::new(origin.x, origin.y, layer.width, layer.height);
         if !rect.contains(point) {
-            return;
+            return HitTestOutcome::None;
+        }
+        if !layer.enabled || !layer.node_enabled {
+            // NodeEnabled includes the ancestor state in KRKR. A disabled
+            // parent therefore blocks its descendants and lower siblings.
+            return HitTestOutcome::Blocked;
         }
 
         for child in self.sorted_children(Some(id)).into_iter().rev() {
-            self.hit_test_layer_all(child.id, origin, point, hits);
+            match self.hit_test_layer_all(child.id, origin, point, hits) {
+                HitTestOutcome::Blocked => return HitTestOutcome::Blocked,
+                HitTestOutcome::Hit | HitTestOutcome::None => {}
+            }
         }
 
         if layer.hit_test(origin, point) {
             hits.push(id);
+            return HitTestOutcome::Hit;
         }
+        HitTestOutcome::None
     }
 
     fn sorted_children(&self, parent: Option<LayerId>) -> Vec<&LayerNode> {
@@ -1455,6 +1474,16 @@ impl LayerTree {
         children
     }
 
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HitTestOutcome {
+    None,
+    Hit,
+    Blocked,
+}
+
+impl LayerTree {
     fn is_descendant(&self, id: LayerId, ancestor: LayerId) -> bool {
         let mut current = Some(id);
         while let Some(layer_id) = current {
@@ -2967,6 +2996,34 @@ mod tests {
 
         layers.layer_mut(high).expect("high").visible = false;
         assert_eq!(layers.hit_test(Point::new(15.0, 25.0)), Some(low));
+    }
+
+    #[test]
+    fn ordinary_layers_use_krkr_mask_threshold_and_disabled_layers_block_lower_siblings() {
+        let mut layers = LayerTree::new();
+        let low = layers.create_layer("low", None, 1);
+        let high = layers.create_layer("high", None, 2);
+        for id in [low, high] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 2.0;
+            layer.height = 2.0;
+            layer.visible = true;
+            layer.set_image(LayerImage::new(
+                id as u64,
+                2,
+                2,
+                Arc::from([
+                    255, 255, 255, 8, 255, 255, 255, 8, 255, 255, 255, 8, 255, 255, 255, 8,
+                ]),
+            ));
+        }
+        layers.layer_mut(low).expect("low").hit_threshold = 16;
+        layers.layer_mut(high).expect("high").hit_threshold = 16;
+        assert_eq!(layers.layer(low).expect("low").hit_threshold, 16);
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), None);
+        layers.layer_mut(high).expect("high").hit_threshold = 0;
+        layers.layer_mut(high).expect("high").enabled = false;
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), None);
     }
 
     #[test]

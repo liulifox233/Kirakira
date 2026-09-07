@@ -1317,8 +1317,9 @@ impl KrkrEngine {
         let disabled = match self.tjs_runtime.global_member("System") {
             Variant::Object(system) => self
                 .tjs_runtime
-                .object_member(system, "eventDisabled")
-                .is_truthy(),
+                .resolve_object_member(system, "eventDisabled")
+                .map(|value| value.is_truthy())
+                .unwrap_or(false),
             _ => false,
         };
         self.tjs_runtime
@@ -6153,7 +6154,7 @@ mod tests {
     }
 
     #[test]
-    fn native_window_set_pos_offsets_primary_layer() {
+    fn native_window_set_pos_does_not_move_primary_layer() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -6197,7 +6198,7 @@ mod tests {
             .layer_tree()
             .absolute_position(layer_id)
             .expect("absolute position");
-        assert_eq!(position, Point::new(20.0, 30.0));
+        assert_eq!(position, Point::new(0.0, 0.0));
     }
 
     #[test]
@@ -6673,7 +6674,7 @@ mod tests {
         );
         assert_eq!(
             engine.tjs_runtime().object_member(parser, "curLine"),
-            Variant::Integer(location.line.unwrap_or_default() as i64)
+            Variant::Integer(location.line.unwrap_or_default().saturating_sub(1) as i64)
         );
         assert_eq!(
             engine.tjs_runtime().object_member(parser, "curLabel"),
@@ -14068,6 +14069,24 @@ mod tests {
             .expect("exit");
 
         assert!(engine.host().termination_requested());
+    }
+
+    #[test]
+    fn system_compatibility_helpers_match_krkr_contracts() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "system_compat.tjs",
+                r#"
+                System.setArgument("profile", "demo");
+                var first = System.getArgument("profile");
+                var second = System.createUUID();
+                var third = System.createUUID();
+                return first + ":" + (second != third) + ":" + System.toActualColor(0x112233);
+                "#,
+            )
+            .expect("system compatibility script");
+        assert_eq!(value, Variant::String("demo:1:1122867".to_string()));
     }
 
     #[test]

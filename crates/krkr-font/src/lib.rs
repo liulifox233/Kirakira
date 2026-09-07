@@ -175,6 +175,18 @@ impl PrerenderedFont {
         for alpha in &mut bitmap {
             *alpha = ((u16::from((*alpha).min(64)) * 255 + 32) / 64) as u8;
         }
+        // TVP pre-rendered fonts store scanlines bottom-to-top. The native
+        // loader writes decoded rows into the destination from the last row
+        // backwards, so reverse rows before rendering.
+        let row_width = usize::from(glyph.width);
+        let height = usize::from(glyph.height);
+        for row in 0..height / 2 {
+            let opposite = height - 1 - row;
+            let (head, tail) = bitmap.split_at_mut(opposite * row_width);
+            let first = &mut head[row * row_width..(row + 1) * row_width];
+            let second = &mut tail[..row_width];
+            first.swap_with_slice(second);
+        }
         Some(bitmap)
     }
 }
@@ -1488,7 +1500,7 @@ mod tests {
         assert_eq!(glyph.origin_x, 1);
         assert_eq!(glyph.origin_y, 2);
         assert_eq!(glyph.increment_x, 3);
-        assert_eq!(font.decode_glyph(glyph).unwrap(), [0, 255, 255, 255]);
+        assert_eq!(font.decode_glyph(glyph).unwrap(), [255, 255, 0, 255]);
     }
 
     #[test]
