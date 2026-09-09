@@ -97,6 +97,26 @@ mod tests {
     }
 
     #[test]
+    fn discarded_eval_operator_evaluates_a_statement_list() {
+        // `eval!;` in statement position generates VM_EEXP, and
+        // EvalExpression without a result slot parses the string as a
+        // statement list.  k2compat's `makeDelay` uses that to build a lazy
+        // property object, then reads it back through a plain member access.
+        assert_eq!(
+            execute_source(
+                "inline.tjs",
+                r#"var unnamed = %[];
+                   (function (e) { e!; } incontextof unnamed)("property _ { getter { return 42; } }");
+                   var holder = %[];
+                   &holder.value = (&unnamed._) incontextof unnamed;
+                   return holder.value;"#
+            )
+            .expect("execute"),
+            Variant::Integer(42)
+        );
+    }
+
+    #[test]
     fn execute_source_runs_control_flow_and_assignment() {
         assert_eq!(
             execute_source(
@@ -1407,7 +1427,7 @@ mod tests {
 
     #[test]
     fn eexp_operator_executes_statement_source_in_current_this() {
-        let mut file = compile_source_to_bytecode(
+        let file = compile_source_to_bytecode(
             "eexp_statement.tjs",
             r#"
                 function evalit(source) { source!; }
@@ -1417,17 +1437,17 @@ mod tests {
             "#,
         )
         .expect("compile");
-        let mut patched = false;
-        for object in &mut file.objects {
-            let instructions = object.decode_instructions().expect("decode");
-            for inst in instructions {
-                if inst.opcode == 86 {
-                    object.code_words[inst.offset] = 87;
-                    patched = true;
-                }
-            }
-        }
-        assert!(patched, "expected compiled eval opcode to patch to eexp");
+        // tjsInterCodeGen picks VM_EEXP (87) over VM_EVAL (86) for a `!` whose
+        // result is discarded, and EvalExpression then compiles the string as a
+        // statement list rather than `return <expr>;`.
+        let emitted_eexp = file.objects.iter().any(|object| {
+            object
+                .decode_instructions()
+                .expect("decode")
+                .iter()
+                .any(|inst| inst.opcode == 87)
+        });
+        assert!(emitted_eexp, "expected a discarded eval to compile to eexp");
         assert_eq!(
             Runtime::new().execute_file(&file).expect("execute"),
             Variant::Integer(42)

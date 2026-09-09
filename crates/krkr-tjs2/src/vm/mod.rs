@@ -1573,6 +1573,59 @@ mod tests {
         );
     }
 
+    /// `calld %0, %-2.*0()` is what TJS2 emits for an unqualified call inside
+    /// a method body: the receiver is the `%-2` this-proxy, not the instance.
+    /// tTJSObjectProxy::FuncCall forwards `OBJ1 = objthis ? objthis :
+    /// Dispatch1`, so the member is still looked up on behalf of the real
+    /// instance. A native inherited from a class object that keeps its methods
+    /// off the instance (krkr2's WaveSoundBuffer, VideoOverlay) must therefore
+    /// receive the instance as `this` -- receiving the proxy loses the native
+    /// data behind it.
+    #[test]
+    fn unqualified_call_hands_an_inherited_native_the_instance_not_the_proxy() {
+        let file = file_with_code(
+            vec![DataSlot {
+                ty: DataSlotType::String,
+                index: 1,
+            }],
+            DataPool {
+                strings: vec!["global".to_string(), "play".to_string()],
+                ..DataPool::default()
+            },
+            vec![100, 0, -2, 0, 0, 119],
+            1,
+        );
+
+        let mut runtime = Runtime::new();
+        // The class object keeps `play` to itself, exactly as krkr2's
+        // WaveSoundBuffer does for a script subclass such as KAG's
+        // VoiceSoundBuffer.
+        let class = runtime.alloc_ordinary_object();
+        runtime.register_object_native(
+            class,
+            "play",
+            |runtime: &mut Runtime<NoHost>, this: Option<ObjectHandle>, _| {
+                let this = this.expect("play needs this");
+                let tag = runtime.object_member(this, "tag");
+                runtime.set_global_member("seen", tag);
+                Ok(Variant::Void)
+            },
+        );
+        let instance = runtime.alloc_ordinary_object();
+        runtime.set_object_super_class(instance, class);
+        runtime.set_object_member(instance, "tag", Variant::String("instance".to_string()));
+
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
+        vm.execute_top_level_with_this(Some(instance))
+            .expect("execute");
+
+        assert_eq!(
+            runtime.global_member("seen"),
+            Variant::String("instance".to_string())
+        );
+    }
+
     fn file_with_code(
         data_slots: Vec<DataSlot>,
         data: DataPool,

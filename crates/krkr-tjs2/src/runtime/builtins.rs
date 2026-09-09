@@ -619,15 +619,13 @@ fn array_load_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    if mode.contains('b') {
-        let Ok(bytes) = runtime.host_mut().read_binary(&path, &mode) else {
-            return Ok(Variant::Integer(0));
-        };
-        let Some(Variant::Object(src)) = decode_binary_struct(runtime, &bytes)? else {
-            return Ok(Variant::Integer(0));
-        };
-        assign_array_struct(runtime, handle, src)?;
-        return Ok(Variant::Integer(1));
+    if let Some(value) = load_binary_struct(runtime, &path, &mode)? {
+        if let Variant::Object(src) = value
+            && runtime.heap[handle.0].array_elements().is_some()
+        {
+            assign_array_struct(runtime, handle, src)?;
+        }
+        return Ok(value);
     }
     let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
         return Ok(Variant::Integer(0));
@@ -904,15 +902,16 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    if mode.contains('b') {
-        let Ok(bytes) = runtime.host_mut().read_binary(&path, &mode) else {
-            return Ok(Variant::Integer(0));
-        };
-        let Some(Variant::Object(src)) = decode_binary_struct(runtime, &bytes)? else {
-            return Ok(Variant::Integer(0));
-        };
-        assign_dictionary_struct(runtime, handle, src)?;
-        return Ok(Variant::Integer(1));
+    if let Some(value) = load_binary_struct(runtime, &path, &mode)? {
+        // A static `Dictionary.loadStruct(...)` call arrives with the class
+        // object as `this`; KRKR deserializes into a throw-away dictionary in
+        // that case, so never write the pack's members onto the class itself.
+        if let Variant::Object(src) = value
+            && !runtime.object_is_callable(handle)
+        {
+            assign_dictionary_struct(runtime, handle, src)?;
+        }
+        return Ok(value);
     }
     let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
         return Ok(Variant::Integer(0));
@@ -933,6 +932,27 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
         runtime.heap[handle.0].set(key.to_string(), parse_struct_value(value));
     }
     Ok(Variant::Integer(1))
+}
+
+/// Reads `path` and deserializes it when it holds a `KBAD100` struct pack.
+///
+/// `saveStruct` needs mode `"b"` to *write* the binary form, but KRKR's
+/// `loadStruct` sniffs the header itself and accepts a binary pack in any mode
+/// (`tjsDictionary.cpp` / `tjsArray.cpp`), returning the deserialized root
+/// value rather than a success flag.  `None` means the file is not a binary
+/// pack, which leaves the caller free to try the textual form.
+fn load_binary_struct<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    path: &str,
+    mode: &str,
+) -> Result<Option<Variant>> {
+    let Ok(bytes) = runtime.host_mut().read_binary(path, mode) else {
+        return Ok(None);
+    };
+    if !bytes.starts_with(BINARY_STRUCT_HEADER) {
+        return Ok(None);
+    }
+    decode_binary_struct(runtime, &bytes)
 }
 
 fn assign_array_struct<H: TjsHost + 'static>(

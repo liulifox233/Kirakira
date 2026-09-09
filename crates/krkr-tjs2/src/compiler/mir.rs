@@ -2236,7 +2236,26 @@ impl ObjectBuilder {
             syntax::StmtKind::Empty => {}
             syntax::StmtKind::Block(statements) => push_stmt_tasks(tasks, statements),
             syntax::StmtKind::Expr(expr) => {
-                self.lower_expr(lowerer, expr)?;
+                // tjsInterCodeGen picks VM_EEXP over VM_EVAL for a `!` eval
+                // operator whose value is discarded, and EvalExpression then
+                // compiles the string as a statement list instead of wrapping
+                // it in `return <expr>;`.  k2compat's `makeDelay` depends on
+                // that: it evaluates `property _ { getter { ... } }` through
+                // `eval!;` to build a lazy property object.
+                if let syntax::ExprKind::Postfix {
+                    op: syntax::UnaryOp::Eval,
+                    expr: source,
+                } = &expr.kind
+                {
+                    let source = self.lower_expr(lowerer, source)?;
+                    self.emit(MirInst::Eval {
+                        dst: None,
+                        source,
+                        mode: EvalMode::Statement,
+                    });
+                } else {
+                    self.lower_expr(lowerer, expr)?;
+                }
             }
             syntax::StmtKind::Var { declarations, .. } => {
                 for decl in declarations {

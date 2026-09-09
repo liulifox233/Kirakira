@@ -960,10 +960,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             // class-qualified call from one of the class's instances looks
             // the member up on behalf of that instance: property getters run
             // against it and the inherited-constructor emulation sees it.
+            // An unqualified call inside a method body addresses the `%-2`
+            // this-proxy, which is never an ObjThis of its own either:
+            // tTJSObjectProxy::FuncCall forwards `OBJ1 = objthis ? objthis :
+            // Dispatch1`, so the lookup runs on behalf of the real instance.
+            // Binding it to the proxy would hand an inherited native method a
+            // receiver with no native data behind it -- krkr2 keeps
+            // WaveSoundBuffer's and VideoOverlay's methods on the class
+            // object, so a script subclass reaches them exactly this way.
             let lookup_this = self
                 .bound_super_this(handle, caller_this)?
                 .or(closure_this)
-                .or(Some(handle));
+                .or(Some(self.receiver_this(handle)));
             self.prop_get_handle(
                 handle,
                 name,
