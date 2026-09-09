@@ -1693,6 +1693,74 @@ mod tests {
         );
     }
 
+    /// A `missing` handler may forward a member write to another object while
+    /// the state the member reads stays on the object the write was addressed
+    /// to.  KAGEX's ParentHackLayer does exactly this: it forwards
+    /// `onMouseMove` to its parent layer but keeps `dragHookOwner` on itself.
+    /// The forwarded closure must run with the original object as `this`;
+    /// binding it to the object the handler copied it onto made the callback
+    /// see the parent and fail on a member only the original object had.
+    #[test]
+    fn missing_handler_forwards_a_written_closure_with_the_original_this() {
+        let mut runtime = Runtime::new();
+        runtime.register_global_native(
+            "setCallMissing",
+            |runtime: &mut Runtime, _this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
+                let handle = match args.first() {
+                    Some(Variant::Object(handle)) => *handle,
+                    Some(Variant::Closure(closure)) => closure.object,
+                    Some(other) => {
+                        return Err(TjsError::runtime(format!(
+                            "setCallMissing requires object, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    None => return Err(TjsError::runtime("setCallMissing requires object")),
+                };
+                runtime.set_object_call_missing(handle, "missing");
+                Ok(Variant::Void)
+            },
+        );
+        let file = compile_source_to_bytecode(
+            "missing_forward.tjs",
+            r#"
+                class ForwardProxy {
+                    var parent;
+                    function ForwardProxy(parent) {
+                        this.parent = parent;
+                        setCallMissing(this);
+                    }
+                    function missing(set, name, value) {
+                        if (!(typeof parent[name] == "undefined")) {
+                            if (set) {
+                                parent[name] = *value;
+                            } else {
+                                *value = parent[name];
+                            }
+                            return true;
+                        }
+                        return false;
+                    }
+                }
+                class Parent {
+                    function Parent() {}
+                    function onPing() { return "parent-ping"; }
+                }
+                var parent = new Parent();
+                var proxy = new ForwardProxy(parent);
+                proxy.owner = 7;
+                proxy.onPing = function(orig, *) { return "owner=" + this.owner; };
+                return parent.onPing() + ":" + proxy.onPing();
+            "#,
+        )
+        .expect("bytecode");
+
+        assert_eq!(
+            runtime.execute_file(&file).expect("execute"),
+            Variant::String("owner=7:owner=7".to_string())
+        );
+    }
+
     #[test]
     fn execute_source_marks_class_instances_for_instanceof() {
         assert_eq!(

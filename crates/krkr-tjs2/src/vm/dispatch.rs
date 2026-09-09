@@ -312,11 +312,28 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         // A preceding `__missing` module may already have enabled missing
         // dispatch on the shared instance, but declared fields must still be
         // installed locally instead of being routed to that hook.
-        if !member_exists
-            && !self.is_class_initializing(handle)
-            && self.call_set_missing(handle, name, value.clone())?
-        {
-            return Ok(());
+        //
+        // A `missing` handler can forward the write to another object: KAGEX's
+        // ParentHackLayer forwards `onMouseMove` to its parent layer while
+        // keeping the drag owner on itself.  Binding the closure only after
+        // the handler returns attaches it to the object the handler copied it
+        // onto (the parent), so the forwarded member would run with the parent
+        // as `this` and lose the drag owner.  Bind the closure to the object
+        // the write was addressed to *before* dispatching instead.
+        if !member_exists && !self.is_class_initializing(handle) {
+            let mut missing_value = value.clone();
+            if self.runtime.heap[handle.0].call_missing {
+                let mut materialized = self.materialize_code_object(missing_value);
+                if let Variant::Closure(closure) = &mut materialized
+                    && closure.this_obj.is_none()
+                {
+                    closure.this_obj = Some(handle);
+                }
+                missing_value = materialized;
+            }
+            if self.call_set_missing(handle, name, missing_value)? {
+                return Ok(());
+            }
         }
         if let Some(this_obj) = self.bound_super_this(handle, caller_this)? {
             self.set_bound_member(this_obj, name, value);
