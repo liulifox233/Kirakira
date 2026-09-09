@@ -13,6 +13,7 @@ krkr-kag.workspace = true
 krkr-tjs2.workspace = true
 krkr-video.workspace = true
 libtlg-rs.workspace = true
+png.workspace = true
 
 # The VideoOverlay native object decodes through the host platform's media
 # framework (krkr2/krkrz use DirectShow / Media Foundation); on macOS that is

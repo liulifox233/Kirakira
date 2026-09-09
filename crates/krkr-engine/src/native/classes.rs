@@ -7,8 +7,9 @@ use std::{
 use super::blend;
 
 use krkr_core::{
-    AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerImage, LayerNode, Size,
-    TransitionMethod, TransitionParams, TransitionScrollFrom, TransitionScrollStay,
+    AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerImage, LayerNode,
+    ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
+    TransitionScrollStay,
 };
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
@@ -21,6 +22,7 @@ use crate::host::{
     CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KagLayerSlot, KrkrHost,
     LayerRenderTarget, NativeTransitionCompletion, TraceCategory,
 };
+use crate::resource_manager::decode_province_image;
 use crate::scheduler::AsyncTriggerMode;
 
 use super::{
@@ -1229,7 +1231,30 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     );
     register_native_method_preserving_script(runtime, handle, "drawText", layer_draw_text);
     register_native_method_preserving_script(runtime, handle, "drawGlyph", layer_draw_glyph);
-    register_native_method_preserving_script(runtime, handle, "getProvincePixel", layer_zero);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "loadProvinceImage",
+        layer_load_province_image,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "getProvincePixel",
+        layer_get_province_pixel,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "setProvincePixel",
+        layer_set_province_pixel,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "independProvinceImage",
+        layer_independ_province_image,
+    );
     register_native_method_preserving_script(runtime, handle, "getLayerAt", layer_get_layer_at);
     register_native_method_preserving_script(runtime, handle, "update", layer_update);
     register_native_method_preserving_script(runtime, handle, "focus", layer_focus);
@@ -1827,7 +1852,12 @@ fn deallocate_layer_image(
     handle: ObjectHandle,
     target: &LayerRenderTarget,
 ) {
-    mutate_render_layer(runtime, target, LayerNode::clear_image);
+    // `tTJSNI_BaseLayer::DeallocateImage` (`LayerIntf.cpp:2079`) frees the
+    // province plane together with the main image.
+    mutate_render_layer(runtime, target, |layer| {
+        layer.clear_image();
+        layer.province = None;
+    });
     // Mirror `GetHasImage() == false` (`LayerIntf.cpp:2237`) so a later
     // re-attachment does not resurrect the freed bitmap.
     set_layer_property_storage(runtime, handle, "hasImage", Variant::Integer(0));
@@ -3744,6 +3774,7 @@ fn layer_free_image(
         deallocate_layer_image(runtime, this, &target);
     } else if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
         layer.clear_image();
+        layer.province = None;
         runtime.host_mut().clear_layer_image_storage(layer_id);
         mark_image_modified(runtime, this);
     }
@@ -4307,6 +4338,7 @@ fn copy_render_content(dest: &mut LayerNode, source: &LayerNode) {
     dest.hit_type = source.hit_type;
     dest.hit_threshold = source.hit_threshold;
     dest.image = source.image.clone();
+    dest.province = source.province.clone();
 }
 
 fn layer_stop_transition(
@@ -4484,6 +4516,210 @@ fn layer_set_mask_pixel(
     )
 }
 
+/// `tTJSNI_BaseLayer::LoadProvinceImage` (`LayerIntf.cpp:2561`): loads an
+/// 8-bit palettized/grayscale graphic as the province plane. The plane must
+/// match the main image's size (`TVPProvinceSizeMismatch`), and the layer
+/// must own a main image (`Not drawable layer type`).
+fn layer_load_province_image(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
+    let name = args
+        .first()
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    if name.is_empty() {
+        return Err(TjsError::runtime(
+            "Layer.loadProvinceImage requires storage",
+        ));
+    }
+    let Some(target) = target else {
+        return Err(not_drawable_layer_type());
+    };
+    let Some((main_width, main_height)) = render_layer_snapshot(runtime, &target).and_then(|layer| {
+        layer
+            .image
+            .as_ref()
+            .map(|image| (image.upload.width, image.upload.height))
+    }) else {
+        return Err(not_drawable_layer_type());
+    };
+    let bytes = runtime
+        .host_mut()
+        .read_binary_storage_for_kind(&name, krkr_core::AssetKind::Image)?;
+    // A deferred Web asset leaves the current plane untouched (the retry
+    // replaces it), but a real decode/size failure deallocates it like
+    // `LoadProvinceImage`'s catch block (`LayerIntf.cpp:2578`).
+    let province = match decode_province_image(&bytes, &name) {
+        Ok(province) => province,
+        Err(error) => {
+            mutate_render_layer(runtime, &target, |layer| layer.province = None);
+            return Err(TjsError::runtime(error));
+        }
+    };
+    if province.width != main_width || province.height != main_height {
+        mutate_render_layer(runtime, &target, |layer| layer.province = None);
+        return Err(TjsError::runtime(format!(
+            "Province image {name} size mismatch"
+        )));
+    }
+    mutate_render_layer(runtime, &target, |layer| layer.province = Some(province));
+    mark_image_modified(runtime, this);
+    Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseLayer::GetProvincePixel` (`LayerIntf.cpp:2637`): reads outside
+/// the plane and layers without a province plane return 0.
+fn layer_get_province_pixel(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (_this, target) = this_render_layer_target(runtime, this_obj)?;
+    let x = required_integer(&args, 0, "Layer.getProvincePixel x")?;
+    let y = required_integer(&args, 1, "Layer.getProvincePixel y")?;
+    let Some(target) = target else {
+        return Ok(Variant::Integer(0));
+    };
+    let value = render_layer_snapshot(runtime, &target)
+        .and_then(|layer| layer.province.map(|province| province.pixel(x, y)))
+        .unwrap_or(0);
+    Ok(Variant::Integer(i64::from(value)))
+}
+
+/// `tTJSNI_BaseLayer::SetProvincePixel` (`LayerIntf.cpp:2647`): allocates the
+/// plane from the main image (or the layer Rect without one), honours
+/// `ClipRect`, and ignores writes outside the plane.
+fn layer_set_province_pixel(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
+    let x = required_integer(&args, 0, "Layer.setProvincePixel x")?;
+    let y = required_integer(&args, 1, "Layer.setProvincePixel y")?;
+    let value = required_integer(&args, 2, "Layer.setProvincePixel value")?;
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
+    if let Some((cx0, cy0, cx1, cy1)) = layer_clip_bounds(runtime, &target)
+        && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
+    {
+        return Ok(Variant::Void);
+    }
+    mutate_render_layer(runtime, &target, |layer| {
+        if layer.province.is_none() {
+            let (width, height) = layer
+                .image
+                .as_ref()
+                .map(|image| (image.upload.width, image.upload.height))
+                .unwrap_or((layer.width.max(0.0) as u32, layer.height.max(0.0) as u32));
+            let (width, height) = (width.max(1), height.max(1));
+            layer.province = Some(ProvinceImage::new(
+                width,
+                height,
+                vec![0; (width as usize) * (height as usize)],
+            ));
+        }
+        if let Some(province) = layer.province.as_mut() {
+            province.set_pixel(x, y, (value & 0xff) as u8);
+        }
+    });
+    mark_image_modified(runtime, this);
+    Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseLayer::IndependProvinceImage` (`LayerIntf.cpp:2425`): `copy`
+/// defaults to true; kirakira's copy-on-write makes the plane independent on
+/// the next write either way.
+fn layer_independ_province_image(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let (_this, target) = this_render_layer_target(runtime, this_obj)?;
+    let copy = _args.first().map(Variant::is_truthy).unwrap_or(true);
+    if let Some(target) = target {
+        mutate_render_layer(runtime, &target, |layer| {
+            if let Some(province) = layer.province.as_mut() {
+                province.make_independent(copy);
+            }
+        });
+    }
+    Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseLayer::FillRect`/`ColorRect` `dfProvince`
+/// (`LayerIntf.cpp:3883`): the colour's low byte is the province value,
+/// opacity is ignored, and filling the whole plane with 0 deallocates it.
+fn fill_layer_province(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &LayerRenderTarget,
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    value: u8,
+) {
+    mutate_render_layer(runtime, target, |layer| {
+        let (clip_x, clip_y, clip_width, clip_height) = match layer.clip {
+            Some(clip) => (
+                clip.x.round() as i64,
+                clip.y.round() as i64,
+                clip.width.round() as i64,
+                clip.height.round() as i64,
+            ),
+            None => (
+                0,
+                0,
+                layer.width.round() as i64,
+                layer.height.round() as i64,
+            ),
+        };
+        let x0 = x.max(clip_x);
+        let y0 = y.max(clip_y);
+        let x1 = x.saturating_add(width).min(clip_x.saturating_add(clip_width));
+        let y1 = y
+            .saturating_add(height)
+            .min(clip_y.saturating_add(clip_height));
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        if layer.province.is_none() {
+            if value == 0 {
+                return;
+            }
+            let (plane_width, plane_height) = layer
+                .image
+                .as_ref()
+                .map(|image| (image.upload.width, image.upload.height))
+                .unwrap_or((layer.width.max(0.0) as u32, layer.height.max(0.0) as u32));
+            let (plane_width, plane_height) = (plane_width.max(1), plane_height.max(1));
+            layer.province = Some(ProvinceImage::new(
+                plane_width,
+                plane_height,
+                vec![0; (plane_width as usize) * (plane_height as usize)],
+            ));
+        }
+        let Some(province) = layer.province.as_mut() else {
+            return;
+        };
+        if value == 0
+            && x0 == 0
+            && y0 == 0
+            && x1 == province.width as i64
+            && y1 == province.height as i64
+        {
+            layer.province = None;
+            return;
+        }
+        province.fill_rect(x0, y0, x1 - x0, y1 - y0, value);
+    });
+}
+
 /// Shared body of the pixel setters: both honour `ClipRect` and both write
 /// into the destination bitmap in place (`SetPointMain` / `SetPointMask`,
 /// `LayerBitmapIntf.cpp:186`).
@@ -4575,11 +4811,6 @@ fn layer_fill_rect(
 ) -> Result<Variant> {
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let face = effective_draw_face(runtime, this);
-    // The province plane is not modelled, so a province fill has no effect on
-    // the drawn image.
-    if face == DF_PROVINCE {
-        return Ok(Variant::Void);
-    }
     let Some((x, y, width, height)) = rect_args(&args)? else {
         return Ok(Variant::Void);
     };
@@ -4595,6 +4826,9 @@ fn layer_fill_rect(
     // `AffineSourceBMPBase.redrawImage`) clears a canvas without painting a
     // solid plate over the background.
     match face {
+        DF_PROVINCE => {
+            fill_layer_province(runtime, &target, x, y, width, height, (color & 0xff) as u8);
+        }
         DF_MASK => {
             let mask = (color.max(0) & 0xff) as u8;
             blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
@@ -4647,18 +4881,14 @@ fn layer_color_rect(
 ) -> Result<Variant> {
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let face = effective_draw_face(runtime, this);
-    // The province plane is not modelled, so a province fill has no effect on
-    // the drawn image.
-    if face == DF_PROVINCE {
-        return Ok(Variant::Void);
-    }
     let Some((x, y, width, height)) = rect_args(&args)? else {
         return Ok(Variant::Void);
     };
-    let color = required_integer(&args, 4, "Layer.colorRect color")?;
+    let raw_color = required_integer(&args, 4, "Layer.colorRect color")?;
     // `tTJSNI_BaseLayer::ColorRect` (`LayerIntf.cpp:3922`) resolves the colour
-    // through `TVPToActualColor` before `FillColorOnAlpha` / `FillColor`.
-    let color = to_actual_color(color);
+    // through `TVPToActualColor` before `FillColorOnAlpha` / `FillColor`; the
+    // mask and province faces use the raw low byte instead.
+    let color = to_actual_color(raw_color);
     let opacity = optional_integer(&args, 5)?.unwrap_or(255);
     let Some(target) = target else {
         return Ok(Variant::Void);
@@ -4670,8 +4900,19 @@ fn layer_color_rect(
     // the alpha faces ever touch the destination alpha, and a negative opacity
     // erases opacity instead of painting.
     match face {
+        DF_PROVINCE => {
+            fill_layer_province(
+                runtime,
+                &target,
+                x,
+                y,
+                width,
+                height,
+                (raw_color & 0xff) as u8,
+            );
+        }
         DF_MASK => {
-            let mask = (color.max(0) & 0xff) as u8;
+            let mask = (raw_color.max(0) & 0xff) as u8;
             blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
                 pixel[3] = mask;
             })?;
@@ -6007,7 +6248,7 @@ fn layer_get_layer_at(
         if exclude_self && layer_id == this_layer {
             continue;
         }
-        let (origin, hit_threshold, hit_type, image_left, image_top, image) = {
+        let (origin, hit_threshold, hit_type, image_left, image_top, image, province) = {
             let Some(layer) = runtime.host().layer_tree().layer(layer_id) else {
                 continue;
             };
@@ -6021,13 +6262,17 @@ fn layer_get_layer_at(
                 layer.image_left,
                 layer.image_top,
                 layer.image.clone(),
+                layer.province.clone(),
             )
         };
         let local_x = (point_x - origin.x).floor() as i64;
         let local_y = (point_y - origin.y).floor() as i64;
         let pixel_hit = if hit_type == 1 {
-            // htProvince is unsupported; province layers never hit.
-            false
+            // htProvince: hit where the province index is non-zero
+            // (`LayerIntf.cpp:2911`).
+            province.as_ref().is_some_and(|province| {
+                province.pixel(local_x - image_left as i64, local_y - image_top as i64) != 0
+            })
         } else if let Some(image) = &image {
             let px = local_x - image_left as i64;
             let py = local_y - image_top as i64;
@@ -6150,14 +6395,6 @@ fn collect_front_child_candidates(
         );
     }
     out.push(id);
-}
-
-fn layer_zero(
-    _runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
-) -> Result<Variant> {
-    Ok(Variant::Integer(0))
 }
 
 fn font_get_text_width(

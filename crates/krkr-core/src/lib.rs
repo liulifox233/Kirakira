@@ -1107,6 +1107,82 @@ impl LayerImage {
     }
 }
 
+/// Official `tTJSNI_BaseLayer::ProvinceImage` (`LayerIntf.cpp:410`): an 8-bit
+/// map used for `htProvince` hit testing, one province index per pixel. It is
+/// loaded from a palettized or grayscale graphic and must match the main
+/// image's size; it is never composited.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProvinceImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<[u8]>,
+}
+
+impl ProvinceImage {
+    pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            pixels: Arc::from(pixels),
+        }
+    }
+
+    pub fn pixel(&self, x: i64, y: i64) -> u8 {
+        if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
+            return 0;
+        }
+        self.pixels
+            .get((y as usize) * (self.width as usize) + x as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn set_pixel(&mut self, x: i64, y: i64, value: u8) {
+        if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
+            return;
+        }
+        self.make_independent(true);
+        let index = (y as usize) * (self.width as usize) + x as usize;
+        if let Some(pixels) = Arc::get_mut(&mut self.pixels)
+            && let Some(pixel) = pixels.get_mut(index)
+        {
+            *pixel = value;
+        }
+    }
+
+    /// `tTVPBaseBitmap::Fill` on the province plane: clips to the plane and
+    /// writes `value` into the given layer-local rectangle.
+    pub fn fill_rect(&mut self, x: i64, y: i64, width: i64, height: i64, value: u8) {
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x.saturating_add(width)).min(self.width as i64);
+        let y1 = (y.saturating_add(height)).min(self.height as i64);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        self.make_independent(true);
+        let Some(pixels) = Arc::get_mut(&mut self.pixels) else {
+            return;
+        };
+        for py in y0..y1 {
+            let row = (py as usize) * (self.width as usize);
+            for px in x0..x1 {
+                pixels[row + px as usize] = value;
+            }
+        }
+    }
+
+    /// Official `tTJSNI_BaseLayer::IndependProvinceImage`: `copy` detaches the
+    /// bitmap from any shared source, `IndependNoCopy` only drops the sharing
+    /// marker. Kirakira's copy-on-write is automatic, so `copy == false` is a
+    /// no-op and `copy == true` materializes a private buffer.
+    pub fn make_independent(&mut self, copy: bool) {
+        if copy && Arc::strong_count(&self.pixels) > 1 {
+            self.pixels = Arc::from(self.pixels.to_vec());
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerNode {
     pub id: LayerId,
@@ -1140,6 +1216,8 @@ pub struct LayerNode {
     pub hit_type: i32,
     pub hit_threshold: i32,
     pub image: Option<LayerImage>,
+    /// `htProvince` hit-test map (`tTJSNI_BaseLayer::ProvinceImage`).
+    pub province: Option<ProvinceImage>,
     /// Official `tTJSNI_BaseLayer::ClipRect` (`LayerIntf.cpp`): every blit and
     /// fill is clipped to this layer-local rectangle. `None` is the
     /// `ResetClip()` state, where the clip equals the layer rectangle.
@@ -1177,6 +1255,7 @@ impl LayerNode {
             hit_type: 0,
             hit_threshold: 0,
             image: None,
+            province: None,
             clip: None,
         }
     }
@@ -1196,9 +1275,22 @@ impl LayerNode {
 
     fn hit_test(&self, origin: Point, point: Point) -> bool {
         match self.hit_type {
-            1 => false,
+            // htProvince
+            1 => self.province_hit_test(origin, point),
             _ => self.alpha_hit_test(origin, point),
         }
+    }
+
+    /// Official `tTJSNI_BaseLayer::_HitTestNoVisibleCheck` (`LayerIntf.cpp:2911`):
+    /// a province layer hits where its province index is non-zero and never
+    /// hits without a province image.
+    fn province_hit_test(&self, origin: Point, point: Point) -> bool {
+        let Some(province) = &self.province else {
+            return false;
+        };
+        let x = (point.x - origin.x - self.image_left).floor() as i64;
+        let y = (point.y - origin.y - self.image_top).floor() as i64;
+        province.pixel(x, y) != 0
     }
 
     fn alpha_hit_test(&self, origin: Point, point: Point) -> bool {
@@ -3072,6 +3164,27 @@ mod tests {
 
         layers.layer_mut(high).expect("high").visible = false;
         assert_eq!(layers.hit_test(Point::new(15.0, 25.0)), Some(low));
+    }
+
+    #[test]
+    fn province_layers_hit_test_through_the_province_plane() {
+        let mut layers = LayerTree::new();
+        let id = layers.create_layer("province", None, 1);
+        let layer = layers.layer_mut(id).expect("layer");
+        layer.width = 2.0;
+        layer.height = 2.0;
+        layer.visible = true;
+        // htProvince
+        layer.hit_type = 1;
+        layer.province = Some(ProvinceImage::new(2, 2, vec![0, 0, 0, 5]));
+
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), Some(id));
+        assert_eq!(layers.hit_test(Point::new(0.0, 0.0)), None);
+
+        // `tTJSNI_BaseLayer::_HitTestNoVisibleCheck` returns false without a
+        // province plane.
+        layers.layer_mut(id).expect("layer").province = None;
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), None);
     }
 
     #[test]

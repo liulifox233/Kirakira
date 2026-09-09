@@ -3111,6 +3111,9 @@ fn copy_layer_node_render_content(dest: &mut LayerNode, source: &LayerNode) {
     dest.layer_type = source.layer_type;
     dest.face = source.face;
     dest.image = source.image.clone();
+    // `tTJSNI_BaseLayer::AssignImages` (`LayerIntf.cpp:2142`) copies the
+    // province plane along with the main image.
+    dest.province = source.province.clone();
 }
 
 fn kag_layer_z_order(layer: &str) -> i32 {

@@ -12325,6 +12325,121 @@ mod tests {
     }
 
     #[test]
+    fn layer_province_plane_loads_pixels_and_drives_province_hit_testing() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        let mut samples = vec![0u8; 32 * 32];
+        samples[32 + 2] = 7;
+        write_province_png(root.join("province.png"), 32, 32, &samples);
+        let mut indices = vec![0u8; 32 * 32];
+        indices[32 + 3] = 200;
+        write_province_palette_png(root.join("palette.png"), 32, 32, &indices);
+        write_province_png(root.join("small.png"), 16, 16, &vec![0u8; 16 * 16]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.hits = 0;
+                global.layer = new Layer();
+                layer.setSize(32, 32);
+                layer.setImageSize(32, 32);
+                layer.loadProvinceImage("province.png");
+                global.gray = layer.getProvincePixel(2, 1);
+                global.outside = layer.getProvincePixel(100, 100);
+                layer.loadProvinceImage("palette.png");
+                global.index = layer.getProvincePixel(3, 1);
+                layer.loadProvinceImage("province.png");
+                layer.setProvincePixel(5, 5, 9);
+                global.set_pixel = layer.getProvincePixel(5, 5);
+                layer.hitType = htProvince;
+                layer.visible = true;
+                layer.onMouseUp = function(x, y, button, shift) { global.hits++; };
+
+                // A province-face fill writes the colour's low byte
+                // (`LayerIntf.cpp:3883`), ignoring the opacity argument.
+                global.rect = new Layer();
+                rect.setSize(32, 32);
+                rect.setImageSize(32, 32);
+                rect.face = dfProvince;
+                rect.colorRect(1, 1, 2, 2, 0x2a);
+                global.rect_pixel = rect.getProvincePixel(1, 1);
+                global.rect_zero = rect.getProvincePixel(10, 10);
+                rect.independProvinceImage();
+                global.after_independ = rect.getProvincePixel(1, 1);
+                // Filling the whole plane with 0 deallocates it.
+                rect.colorRect(0, 0, 32, 32, 0);
+                global.cleared = rect.getProvincePixel(1, 1);
+                "#,
+            )
+            .expect("script");
+        for (name, expected) in [
+            ("gray", 7),
+            ("outside", 0),
+            ("index", 200),
+            ("set_pixel", 9),
+            ("rect_pixel", 0x2a),
+            ("rect_zero", 0),
+            ("after_independ", 0x2a),
+            ("cleared", 0),
+        ] {
+            assert_eq!(
+                engine
+                    .execute_expression("inline.tjs", name)
+                    .expect("expression"),
+                Variant::Integer(expected),
+                "{name}"
+            );
+        }
+
+        // Only the province pixel at (2, 1) is non-zero.
+        for position in [Point::new(2.0, 1.0), Point::new(6.0, 6.0)] {
+            engine
+                .update(
+                    EngineInput::new(
+                        FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                        vec![
+                            EngineEvent::CursorMoved { position },
+                            EngineEvent::PointerInput {
+                                button: PointerButton::Primary,
+                                state: ButtonState::Released,
+                            },
+                        ],
+                    ),
+                    Duration::ZERO,
+                )
+                .expect("province hit frame");
+        }
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "hits")
+                .expect("hits"),
+            Variant::Integer(1)
+        );
+
+        // `TVPProvinceSizeMismatch`: the plane must match the main image.
+        let error = engine
+            .execute_script("inline.tjs", "layer.loadProvinceImage(\"small.png\");")
+            .expect_err("size mismatch");
+        assert!(
+            error
+                .to_string()
+                .contains("Province image small.png size mismatch"),
+            "{error}"
+        );
+        // The failed load deallocates the plane (`LayerIntf.cpp:2578`).
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "layer.getProvincePixel(2, 1)")
+                .expect("expression"),
+            Variant::Integer(0)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn captured_layer_receives_drag_move_until_release() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -16126,6 +16241,29 @@ mod tests {
     fn write_png(path: PathBuf, width: u32, height: u32, rgba: &[u8]) {
         let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).expect("rgba image");
         image.save(path).expect("write png");
+    }
+
+    /// 8-bit grayscale PNG: the sample is the province value.
+    fn write_province_png(path: PathBuf, width: u32, height: u32, samples: &[u8]) {
+        let file = std::fs::File::create(path).expect("create province png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(samples).expect("png samples");
+    }
+
+    /// 8-bit palette PNG: the province value is the palette index, not the
+    /// palette colour.
+    fn write_province_palette_png(path: PathBuf, width: u32, height: u32, indices: &[u8]) {
+        let file = std::fs::File::create(path).expect("create province palette png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        let palette: Vec<u8> = (0..=255u8).flat_map(|value| [value, value, value]).collect();
+        encoder.set_palette(palette);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(indices).expect("png indices");
     }
 
     fn object_handle(engine: &KrkrEngine, name: &str) -> ObjectHandle {

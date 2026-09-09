@@ -10,7 +10,7 @@ use std::{
     thread,
 };
 
-use krkr_core::{ProjectStoragePort, ResourceData};
+use krkr_core::{ProjectStoragePort, ProvinceImage, ResourceData};
 
 #[cfg(test)]
 use krkr_assets::ProjectStorage;
@@ -306,6 +306,117 @@ pub(crate) fn decode_image_bytes(
         height,
         rgba: Arc::<[u8]>::from(rgba),
     })
+}
+
+/// Official `TVPLoadGraphic(..., glmPalettized)` for province images
+/// (`GraphicsLoaderIntf.h:57`): the result must be 8-bit and the source's
+/// color index must be preserved. KRKR's PNG loader accepts palette or
+/// grayscale sources of at most 8 bits and rejects the rest
+/// (`LoadPNG.cpp:255`); non-PNG sources fall back to luminance, which is
+/// exact for a grayscale map and an approximation for a palettized one.
+pub(crate) fn decode_province_image(
+    bytes: &[u8],
+    name: &str,
+) -> std::result::Result<ProvinceImage, String> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return decode_png_province(bytes, name);
+    }
+    let decoded = decode_image_bytes(bytes, name)?;
+    let mut pixels = Vec::with_capacity(decoded.rgba.len() / 4);
+    for rgba in decoded.rgba.chunks_exact(4) {
+        let luma = 0.299 * f32::from(rgba[0]) + 0.587 * f32::from(rgba[1]) + 0.114 * f32::from(rgba[2]);
+        pixels.push(luma.round().clamp(0.0, 255.0) as u8);
+    }
+    Ok(ProvinceImage::new(decoded.width, decoded.height, pixels))
+}
+
+fn decode_png_province(
+    bytes: &[u8],
+    name: &str,
+) -> std::result::Result<ProvinceImage, String> {
+    use png::{BitDepth, ColorType, Transformations};
+
+    let probe = png::Decoder::new(Cursor::new(bytes))
+        .read_info()
+        .map_err(|error| format!("failed to decode province image `{name}`: {error}"))?;
+    let color_type = probe.info().color_type;
+    let bit_depth = probe.info().bit_depth;
+    let (width, height) = (probe.info().width, probe.info().height);
+    drop(probe);
+
+    let supported = matches!(color_type, ColorType::Indexed | ColorType::Grayscale)
+        && bit_depth != BitDepth::Sixteen;
+    if !supported {
+        return Err(format!(
+            "province image `{name}` must be an 8-bit palettized or grayscale image"
+        ));
+    }
+
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    if color_type == ColorType::Grayscale {
+        // 1/2/4-bit grayscale samples expand to one byte per pixel; indexed
+        // sources keep their packed indices so the palette index survives.
+        decoder.set_transformations(Transformations::EXPAND);
+    } else {
+        decoder.set_transformations(Transformations::IDENTITY);
+    }
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("failed to decode province image `{name}`: {error}"))?;
+    let mut buffer = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(|error| format!("failed to decode province image `{name}`: {error}"))?;
+
+    let mut pixels = Vec::with_capacity((width as usize) * (height as usize));
+    match (info.color_type, info.bit_depth) {
+        (ColorType::Grayscale, BitDepth::Eight) => {
+            for y in 0..height as usize {
+                let row = &buffer[y * info.line_size..(y + 1) * info.line_size];
+                pixels.extend_from_slice(&row[..width as usize]);
+            }
+        }
+        // A grayscale tRNS chunk expands to an alpha pair; the gray sample is
+        // still the province value.
+        (ColorType::GrayscaleAlpha, BitDepth::Eight) => {
+            for y in 0..height as usize {
+                let row = &buffer[y * info.line_size..(y + 1) * info.line_size];
+                for x in 0..width as usize {
+                    pixels.push(row[x * 2]);
+                }
+            }
+        }
+        (ColorType::Indexed, BitDepth::Eight) => {
+            for y in 0..height as usize {
+                let row = &buffer[y * info.line_size..(y + 1) * info.line_size];
+                pixels.extend_from_slice(&row[..width as usize]);
+            }
+        }
+        (ColorType::Indexed, depth) => {
+            let bits = match depth {
+                BitDepth::One => 1,
+                BitDepth::Two => 2,
+                BitDepth::Four => 4,
+                _ => 8,
+            };
+            let mask = (1u8 << bits) - 1;
+            for y in 0..height as usize {
+                let row = &buffer[y * info.line_size..(y + 1) * info.line_size];
+                for x in 0..width as usize {
+                    let bit = x * bits;
+                    let byte = row.get(bit / 8).copied().unwrap_or(0);
+                    let shift = 8 - bits - (bit % 8);
+                    pixels.push((byte >> shift) & mask);
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "province image `{name}` must be an 8-bit palettized or grayscale image"
+            ));
+        }
+    }
+    Ok(ProvinceImage::new(width, height, pixels))
 }
 
 fn apply_magenta_color_key(rgba: &mut [u8]) {
