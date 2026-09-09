@@ -1068,8 +1068,51 @@ fn window_set_inner_size(
     let this = this_obj.ok_or_else(|| TjsError::runtime("Window.setInnerSize requires this"))?;
     let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
     let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
-    set_window_size_members(runtime, this, width, height);
+    set_window_inner_size_members(runtime, this, width, height);
     Ok(Variant::Void)
+}
+
+/// Official `SetInnerSize` (`WindowFormUnit.cpp`) stores the logical size and
+/// recomputes the paint box, which is `inner * zoomNumer / zoomDenom`; the
+/// window's `width`/`height` report the paint box.
+fn set_window_inner_size_members(
+    runtime: &mut Runtime<KrkrHost>,
+    window: ObjectHandle,
+    width: i64,
+    height: i64,
+) {
+    set_window_property_storage(runtime, window, "innerWidth", Variant::Integer(width));
+    set_window_property_storage(runtime, window, "innerHeight", Variant::Integer(height));
+    let (paint_width, paint_height) = window_paint_box_size(runtime, window, width, height);
+    set_window_property_storage(runtime, window, "width", Variant::Integer(paint_width));
+    set_window_property_storage(runtime, window, "height", Variant::Integer(paint_height));
+}
+
+fn window_property_i64(
+    runtime: &Runtime<KrkrHost>,
+    window: ObjectHandle,
+    name: &str,
+    fallback: i64,
+) -> i64 {
+    runtime
+        .host()
+        .native_window_property(window, name)
+        .and_then(|value| value.to_integer().ok())
+        .unwrap_or(fallback)
+}
+
+fn window_paint_box_size(
+    runtime: &Runtime<KrkrHost>,
+    window: ObjectHandle,
+    inner_width: i64,
+    inner_height: i64,
+) -> (i64, i64) {
+    let numer = window_property_i64(runtime, window, "zoomNumer", 100).max(0);
+    let denom = window_property_i64(runtime, window, "zoomDenom", 100).max(1);
+    (
+        inner_width.saturating_mul(numer) / denom,
+        inner_height.saturating_mul(numer) / denom,
+    )
 }
 
 fn set_window_size_members(
@@ -4339,6 +4382,16 @@ fn window_set_zoom(
     denom /= divisor;
     set_window_property_storage(runtime, this, "zoomNumer", Variant::Integer(numer));
     set_window_property_storage(runtime, this, "zoomDenom", Variant::Integer(denom));
+    // `InternalSetPaintBoxSize` recomputes `width`/`height` from the stored
+    // logical size (`WindowFormUnit.cpp:681`).
+    let inner_width = window_property_i64(runtime, this, "innerWidth", 0);
+    let inner_height = window_property_i64(runtime, this, "innerHeight", 0);
+    if inner_width > 0 && inner_height > 0 {
+        let (paint_width, paint_height) =
+            window_paint_box_size(runtime, this, inner_width, inner_height);
+        set_window_property_storage(runtime, this, "width", Variant::Integer(paint_width));
+        set_window_property_storage(runtime, this, "height", Variant::Integer(paint_height));
+    }
     Ok(Variant::Void)
 }
 
@@ -4868,6 +4921,11 @@ fn stretch_copy_impl(
     };
     let hold_alpha = layer_holds_alpha(runtime, this);
     let clip = layer_clip_bounds(runtime, &dest_target);
+    let stretch_type = blend::stretch_type_from_i64(if operate {
+        optional_integer(&args, 11)?.unwrap_or(0)
+    } else {
+        optional_integer(&args, 9)?.unwrap_or(0)
+    });
     mutate_layer_pixels_min(
         runtime,
         &dest_target,
@@ -4893,6 +4951,7 @@ fn stretch_copy_impl(
                 opacity,
                 hold_alpha,
                 clip,
+                stretch_type,
             );
         },
     )?;
@@ -5008,6 +5067,11 @@ fn affine_copy_impl(
     };
     let hold_alpha = layer_holds_alpha(runtime, this);
     let clip = layer_clip_bounds(runtime, &dest_target);
+    let stretch_type = blend::stretch_type_from_i64(if operate {
+        optional_integer(&args, 15)?.unwrap_or(0)
+    } else {
+        optional_integer(&args, 12)?.unwrap_or(0)
+    });
     mutate_layer_pixels(runtime, &dest_target, |pixels, dest_width, dest_height| {
         if clear {
             clear_affine_destination(pixels, dest_width, dest_height, points, clear_color);
@@ -5028,6 +5092,7 @@ fn affine_copy_impl(
             opacity,
             hold_alpha,
             clip,
+            stretch_type,
         );
     })?;
     mark_image_modified(runtime, this);
@@ -7417,6 +7482,7 @@ fn affine_copy_pixels(
     opacity: i64,
     hold_alpha: bool,
     clip: Option<(i64, i64, i64, i64)>,
+    stretch_type: blend::StretchType,
 ) {
     let [(x0, y0), (x1, y1), (x2, y2)] = points;
     let ux = x1 - x0;
@@ -7461,16 +7527,36 @@ fn affine_copy_pixels(
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 continue;
             }
-            let src_x = sx + (u * source_width as f64).floor() as i64;
-            let src_y = sy + (v * source_height as f64).floor() as i64;
-            if src_x < 0
-                || src_y < 0
-                || src_x >= i64::from(texture_width)
-                || src_y >= i64::from(texture_height)
-            {
-                continue;
-            }
-            let source_offset = ((src_y as u32 * texture_width + src_x as u32) * 4) as usize;
+            let sample = if stretch_type == blend::StretchType::Nearest {
+                let src_x = sx + (u * source_width as f64).floor() as i64;
+                let src_y = sy + (v * source_height as f64).floor() as i64;
+                if src_x < 0
+                    || src_y < 0
+                    || src_x >= i64::from(texture_width)
+                    || src_y >= i64::from(texture_height)
+                {
+                    continue;
+                }
+                let source_offset = ((src_y as u32 * texture_width + src_x as u32) * 4) as usize;
+                [
+                    source[source_offset],
+                    source[source_offset + 1],
+                    source[source_offset + 2],
+                    source[source_offset + 3],
+                ]
+            } else {
+                let Some(sample) = blend::sample_rgba(
+                    source,
+                    texture_width,
+                    texture_height,
+                    sx as f64 + u * source_width as f64 - 0.5,
+                    sy as f64 + v * source_height as f64 - 0.5,
+                    stretch_type,
+                ) else {
+                    continue;
+                };
+                sample
+            };
             let dest_offset = ((dy as u32 * dest_width + dx as u32) * 4) as usize;
             let d = u32::from_le_bytes([
                 dest[dest_offset],
@@ -7478,12 +7564,7 @@ fn affine_copy_pixels(
                 dest[dest_offset + 2],
                 dest[dest_offset + 3],
             ]);
-            let s = u32::from_le_bytes([
-                source[source_offset],
-                source[source_offset + 1],
-                source[source_offset + 2],
-                source[source_offset + 3],
-            ]);
+            let s = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
             let out = blend::blt_pixel(d, s, blt, opacity as u32, hold_alpha);
             dest[dest_offset..dest_offset + 4].copy_from_slice(&out.to_le_bytes());
         }
@@ -7791,21 +7872,30 @@ fn composite_piled_layer(
                 continue;
             }
             let source_pixel = &source[source_index..source_index + 4];
-            if source_pixel[3] == 0 {
-                continue;
-            }
-            let dest_pixel = &mut dest[dest_index..dest_index + 4];
-            if layer.opacity >= 0.999 {
-                blend_pixel(dest_pixel, source_pixel);
-            } else {
-                let pixel = [
-                    source_pixel[0],
-                    source_pixel[1],
-                    source_pixel[2],
-                    ((source_pixel[3] as f32 * layer.opacity).round()).clamp(0.0, 255.0) as u8,
-                ];
-                blend_pixel(dest_pixel, &pixel);
-            }
+            // Official `Complete()` builds the source cache with `BltImage`,
+            // which picks the blt method from the child layer's type
+            // (`LayerIntf.cpp:5164`); a plain alpha blend ignores `ltOpaque`
+            // and the blend modes.
+            let blt = blend::operation_mode_to_blt(
+                operation_mode_from_layer_type(i64::from(layer.layer.layer_type)),
+                DF_ALPHA,
+            )
+            .unwrap_or(blend::Blt::AlphaOnAlpha);
+            let opacity = (layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+            let d = u32::from_le_bytes([
+                dest[dest_index],
+                dest[dest_index + 1],
+                dest[dest_index + 2],
+                dest[dest_index + 3],
+            ]);
+            let s = u32::from_le_bytes([
+                source_pixel[0],
+                source_pixel[1],
+                source_pixel[2],
+                source_pixel[3],
+            ]);
+            let out = blend::blt_pixel(d, s, blt, opacity, false);
+            dest[dest_index..dest_index + 4].copy_from_slice(&out.to_le_bytes());
         }
     }
 }
@@ -7830,6 +7920,7 @@ fn stretch_copy_pixels(
     opacity: i64,
     hold_alpha: bool,
     clip: Option<(i64, i64, i64, i64)>,
+    stretch_type: blend::StretchType,
 ) {
     if dest_rect_width <= 0
         || dest_rect_height <= 0
@@ -7873,27 +7964,54 @@ fn stretch_copy_pixels(
         }
         for dest_x in dest_x0..dest_x1 {
             let rel_x = dest_x - dx;
-            let source_x = sx_scaled_coordinate(sx, rel_x, source_rect_width, dest_rect_width);
-            if source_x < 0 || source_x >= source_texture_width as i64 {
-                continue;
-            }
-            let source_index = source_y as usize * source_stride + source_x as usize * 4;
             let dest_index = dest_y as usize * dest_stride + dest_x as usize * 4;
-            if source_index + 4 > source.len() || dest_index + 4 > dest.len() {
+            if dest_index + 4 > dest.len() {
                 continue;
             }
+            let sample = if stretch_type == blend::StretchType::Nearest {
+                let source_x = sx_scaled_coordinate(sx, rel_x, source_rect_width, dest_rect_width);
+                if source_x < 0 || source_x >= source_texture_width as i64 {
+                    continue;
+                }
+                let source_index = source_y as usize * source_stride + source_x as usize * 4;
+                if source_index + 4 > source.len() {
+                    continue;
+                }
+                [
+                    source[source_index],
+                    source[source_index + 1],
+                    source[source_index + 2],
+                    source[source_index + 3],
+                ]
+            } else {
+                // Filtered sampling maps destination pixel centres into the
+                // source rectangle.
+                let fx = sx as f64
+                    + (rel_x as f64 + 0.5) * (source_rect_width as f64 / dest_rect_width as f64)
+                    - 0.5;
+                let fy = sy as f64
+                    + (dest_y - dy) as f64
+                        * (source_rect_height as f64 / dest_rect_height as f64)
+                    - 0.5;
+                let Some(sample) = blend::sample_rgba(
+                    source,
+                    source_texture_width,
+                    source_texture_height,
+                    fx,
+                    fy,
+                    stretch_type,
+                ) else {
+                    continue;
+                };
+                sample
+            };
             let d = u32::from_le_bytes([
                 dest[dest_index],
                 dest[dest_index + 1],
                 dest[dest_index + 2],
                 dest[dest_index + 3],
             ]);
-            let s = u32::from_le_bytes([
-                source[source_index],
-                source[source_index + 1],
-                source[source_index + 2],
-                source[source_index + 3],
-            ]);
+            let s = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
             let out = blend::blt_pixel(d, s, blt, opacity as u32, hold_alpha);
             dest[dest_index..dest_index + 4].copy_from_slice(&out.to_le_bytes());
         }

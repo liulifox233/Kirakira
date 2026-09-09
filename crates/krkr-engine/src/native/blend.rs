@@ -415,3 +415,206 @@ fn const_alpha_blend_d(d: u32, s: u32, opacity: u32) -> u32 {
             channel(d, 0) + (((channel(s, 0) - channel(d, 0)) * a) >> 8),
         )
 }
+
+/// `tTVPBBStretchType` (`LayerBitmapIntf.h:61`), collapsed to the kernels the
+/// resamplers implement. The `stFast*` variants share their precise
+/// counterpart's kernel (the official difference is fixed-point rounding).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StretchType {
+    Nearest,
+    Bilinear,
+    Bicubic,
+    Lanczos2,
+    Lanczos3,
+    Spline16,
+    Spline36,
+    AreaAvg,
+    Gaussian,
+    BlackmanSinc,
+}
+
+pub(crate) fn stretch_type_from_i64(value: i64) -> StretchType {
+    // `stTypeMask = 0x0000ffff` selects the interpolation type; the
+    // `stFlagMask` bits (`stRefNoClip`) are not part of it.
+    match value & 0xffff {
+        1 | 2 | 4 => StretchType::Bilinear,
+        3 | 5 => StretchType::Bicubic,
+        6 | 7 => StretchType::Lanczos2,
+        8 | 9 => StretchType::Lanczos3,
+        10 | 11 => StretchType::Spline16,
+        12 | 13 => StretchType::Spline36,
+        14 | 15 => StretchType::AreaAvg,
+        16 | 17 => StretchType::Gaussian,
+        18 | 19 => StretchType::BlackmanSinc,
+        _ => StretchType::Nearest,
+    }
+}
+
+/// Filter kernels from `visual/gl/WeightFunctor.h`.
+fn stretch_weight(kind: StretchType, distance: f64) -> f64 {
+    let x = distance.abs();
+    match kind {
+        StretchType::Nearest | StretchType::AreaAvg => {
+            if x < 0.5 { 1.0 } else { 0.0 }
+        }
+        // `BilinearWeight` (`WeightFunctor.h:19`), RANGE 1.
+        StretchType::Bilinear => (1.0 - x).max(0.0),
+        // `BicubicWeight` with the default `coeff = -1` (`WeightFunctor.h:34`).
+        StretchType::Bicubic => {
+            if x <= 1.0 {
+                1.0 - 2.0 * x * x + x * x * x
+            } else if x <= 2.0 {
+                4.0 - 8.0 * x + 5.0 * x * x - x * x * x
+            } else {
+                0.0
+            }
+        }
+        // `LanczosWeight<TTap>` (`WeightFunctor.h:65`).
+        StretchType::Lanczos2 | StretchType::Lanczos3 => {
+            let tap = if kind == StretchType::Lanczos2 { 2.0 } else { 3.0 };
+            if x < f64::EPSILON {
+                1.0
+            } else if x >= tap {
+                0.0
+            } else {
+                let pi = std::f64::consts::PI;
+                (pi * distance).sin() * (pi * distance / tap).sin()
+                    / (pi * pi * distance * distance / tap)
+            }
+        }
+        // `Spline16Weight` / `Spline36Weight` (`WeightFunctor.h:80` / `:97`).
+        StretchType::Spline16 => {
+            if x <= 1.0 {
+                x * x * x - x * x * 9.0 / 5.0 - x / 5.0 + 1.0
+            } else if x <= 2.0 {
+                -x * x * x / 3.0 + x * x * 9.0 / 5.0 - x * 46.0 / 15.0 + 8.0 / 5.0
+            } else {
+                0.0
+            }
+        }
+        StretchType::Spline36 => {
+            if x <= 1.0 {
+                x * x * x * 13.0 / 11.0 - x * x * 453.0 / 209.0 - x * 3.0 / 209.0 + 1.0
+            } else if x <= 2.0 {
+                -x * x * x * 6.0 / 11.0 + x * x * 612.0 / 209.0 - x * 1038.0 / 209.0
+                    + 540.0 / 209.0
+            } else if x <= 3.0 {
+                x * x * x / 11.0 - x * x * 159.0 / 209.0 + x * 434.0 / 209.0 - 384.0 / 209.0
+            } else {
+                0.0
+            }
+        }
+        // `GaussianWeight` (`WeightFunctor.h:115`), RANGE 2.
+        StretchType::Gaussian => (-2.0 * x * x).exp() * (2.0 / std::f64::consts::PI).sqrt(),
+        // `BlackmanSincWeight` (`WeightFunctor.h:131`), RANGE 4.
+        StretchType::BlackmanSinc => {
+            if x >= 4.0 {
+                0.0
+            } else if x < f64::EPSILON {
+                1.0
+            } else {
+                let pi = std::f64::consts::PI;
+                (0.42 + 0.5 * (pi * x / 4.0).cos() + 0.08 * (2.0 * pi * x / 4.0).cos())
+                    * (pi * x).sin()
+                    / (pi * x)
+            }
+        }
+    }
+}
+
+fn stretch_range(kind: StretchType) -> f64 {
+    match kind {
+        StretchType::Nearest | StretchType::AreaAvg | StretchType::Bilinear => 1.0,
+        StretchType::Bicubic | StretchType::Spline16 | StretchType::Gaussian => 2.0,
+        StretchType::Lanczos2 => 2.0,
+        StretchType::Lanczos3 | StretchType::Spline36 => 3.0,
+        StretchType::BlackmanSinc => 4.0,
+    }
+}
+
+/// Resample one source pixel at a fractional source coordinate. `None` means
+/// the sample falls outside the texture.
+pub(crate) fn sample_rgba(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    x: f64,
+    y: f64,
+    kind: StretchType,
+) -> Option<[u8; 4]> {
+    if kind == StretchType::Nearest {
+        let sx = x.round() as i64;
+        let sy = y.round() as i64;
+        if sx < 0 || sy < 0 || sx >= i64::from(source_width) || sy >= i64::from(source_height) {
+            return None;
+        }
+        let index = ((sy as u32 * source_width + sx as u32) * 4) as usize;
+        return source.get(index..index + 4).map(|p| [p[0], p[1], p[2], p[3]]);
+    }
+    if kind == StretchType::AreaAvg {
+        let x0 = x.floor().max(0.0) as i64;
+        let y0 = y.floor().max(0.0) as i64;
+        let x1 = (x.ceil() as i64).min(i64::from(source_width));
+        let y1 = (y.ceil() as i64).min(i64::from(source_height));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let mut sum = [0u64; 4];
+        let mut count = 0u64;
+        for sy in y0..y1 {
+            for sx in x0..x1 {
+                let index = ((sy as u32 * source_width + sx as u32) * 4) as usize;
+                for (channel, value) in sum.iter_mut().enumerate() {
+                    *value += u64::from(source[index + channel]);
+                }
+                count += 1;
+            }
+        }
+        return Some([
+            (sum[0] / count) as u8,
+            (sum[1] / count) as u8,
+            (sum[2] / count) as u8,
+            (sum[3] / count) as u8,
+        ]);
+    }
+
+    let range = stretch_range(kind);
+    let base_x = x.floor() as i64;
+    let base_y = y.floor() as i64;
+    let mut sum = [0f64; 4];
+    let mut weight_sum = 0f64;
+    for ty in 0..=(range as i64 * 2) {
+        let sy = base_y + ty - range as i64 + 1;
+        if sy < 0 || sy >= i64::from(source_height) {
+            continue;
+        }
+        let wy = stretch_weight(kind, y - sy as f64);
+        if wy == 0.0 {
+            continue;
+        }
+        for tx in 0..=(range as i64 * 2) {
+            let sx = base_x + tx - range as i64 + 1;
+            if sx < 0 || sx >= i64::from(source_width) {
+                continue;
+            }
+            let weight = wy * stretch_weight(kind, x - sx as f64);
+            if weight == 0.0 {
+                continue;
+            }
+            let index = ((sy as u32 * source_width + sx as u32) * 4) as usize;
+            for channel in 0..4 {
+                sum[channel] += f64::from(source[index + channel]) * weight;
+            }
+            weight_sum += weight;
+        }
+    }
+    if weight_sum.abs() <= f64::EPSILON {
+        return None;
+    }
+    Some([
+        (sum[0] / weight_sum).round().clamp(0.0, 255.0) as u8,
+        (sum[1] / weight_sum).round().clamp(0.0, 255.0) as u8,
+        (sum[2] / weight_sum).round().clamp(0.0, 255.0) as u8,
+        (sum[3] / weight_sum).round().clamp(0.0, 255.0) as u8,
+    ])
+}

@@ -339,10 +339,12 @@ impl KrkrEngine {
 
     pub fn preferred_viewport_size(&self) -> Option<Size> {
         let window = self.runtime_window_object()?;
-        let width = object_positive_i64(&self.tjs_runtime, window, "innerWidth")
-            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "width"))?;
-        let height = object_positive_i64(&self.tjs_runtime, window, "innerHeight")
-            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "height"))?;
+        // `width`/`height` report the paint box, which is the logical inner
+        // size scaled by `zoomNumer/zoomDenom` (`WindowFormUnit.cpp:681`).
+        let width = object_positive_i64(&self.tjs_runtime, window, "width")
+            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "innerWidth"))?;
+        let height = object_positive_i64(&self.tjs_runtime, window, "height")
+            .or_else(|| object_positive_i64(&self.tjs_runtime, window, "innerHeight"))?;
         Some(Size::new(width as f32, height as f32))
     }
 
@@ -5122,7 +5124,9 @@ mod tests {
         let bytes = fs::read(root.join("savedata/thumb-pipeline.bmp")).expect("bmp");
         assert_eq!(&bytes[0..2], b"BM");
         assert_eq!(bytes.len(), 54 + 8);
-        assert_eq!(&bytes[54..62], &[255, 0, 0, 0, 0, 255, 0, 0]);
+        // `alpha_blend_func` uses the official packed `>> 8` rounding
+        // (`blend_functor_c.h:64`), so a full-alpha blend lands on 254.
+        assert_eq!(&bytes[54..62], &[255, 0, 0, 0, 0, 254, 0, 0]);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -10799,6 +10803,81 @@ mod tests {
         assert_eq!(alpha(&mut engine, "freed"), 0);
     }
 
+    /// `tTVPBBStretchType` (`LayerBitmapIntf.h:61`): `stLinear` interpolates,
+    /// while `stNearest` replicates the nearest source column.
+    #[test]
+    fn native_layer_stretch_copy_honours_the_stretch_type() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let pixels = |engine: &mut KrkrEngine, name: &str| -> Vec<u8> {
+            let layer_id = engine
+                .execute_expression("inline.tjs", &format!("{name}.__nativeLayerId"))
+                .expect("layer id")
+                .to_integer()
+                .expect("integer layer id") as u64;
+            engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .and_then(|layer| layer.image.as_ref())
+                .expect("layer image")
+                .upload
+                .rgba
+                .to_vec()
+        };
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var src = new Layer();
+                src.setImageSize(2, 1);
+                src.fillRect(0, 0, 1, 1, 0xffff0000);
+                src.fillRect(1, 0, 1, 1, 0xff0000ff);
+
+                global.nearest = new Layer();
+                nearest.setImageSize(4, 1);
+                nearest.stretchCopy(0, 0, 4, 1, src, 0, 0, 2, 1, stNearest);
+
+                global.linear = new Layer();
+                linear.setImageSize(4, 1);
+                linear.stretchCopy(0, 0, 4, 1, src, 0, 0, 2, 1, stLinear);
+                "#,
+            )
+            .expect("script");
+
+        let nearest = pixels(&mut engine, "nearest");
+        assert_eq!(&nearest[..4], &[255, 0, 0, 255]);
+        assert_eq!(&nearest[4..8], &[255, 0, 0, 255]);
+        assert_eq!(&nearest[8..12], &[0, 0, 255, 255]);
+        assert_eq!(&nearest[12..16], &[0, 0, 255, 255]);
+
+        // Bilinear blends the two source columns in the middle.
+        let linear = pixels(&mut engine, "linear");
+        assert_eq!(&linear[..4], &[255, 0, 0, 255]);
+        assert!(linear[4] > 0 && linear[6] > 0, "{linear:?}");
+        assert!(linear[8] > 0 && linear[10] > 0, "{linear:?}");
+        assert_eq!(&linear[12..16], &[0, 0, 255, 255]);
+    }
+
+    /// `Window.setZoom` recomputes the paint box from the logical inner size
+    /// (`WindowFormUnit.cpp:681`).
+    #[test]
+    fn window_set_zoom_recomputes_the_paint_box() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var win = new Window();
+                win.setZoom(200, 100);
+                win.setInnerSize(100, 50);
+                return win.zoomNumer + ":" + win.zoomDenom + ":" + win.innerWidth + ":" +
+                    win.innerHeight + ":" + win.width + ":" + win.height;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("2:1:100:50:200:100".to_string()));
+    }
+
     /// `tTJSNI_BaseLayer::GetMainPixel`/`SetMainPixel` (`LayerIntf.cpp:2587`)
     /// expose the 24-bit colour only, and the mask accessors expose the alpha
     /// channel; both setters honour `ClipRect`.
@@ -11606,7 +11685,8 @@ mod tests {
             .and_then(|layer| layer.image.as_ref())
             .expect("layer image");
         let base = [0x20, 0x20, 0x20, 255];
-        let red = [255, 0, 0, 255];
+        // Official packed blend rounding (`>> 8`) turns full alpha into 254.
+        let red = [254, 0, 0, 255];
         let mut expected = Vec::new();
         for y in 0..4 {
             for x in 0..4 {
