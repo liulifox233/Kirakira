@@ -1162,68 +1162,93 @@ impl KagParser {
                 return Ok(Some(Tag::interrupt()));
             }
 
-            let item = self.next_raw_item()?;
-
-            let mut tag = match item {
-                RawItem::Eof => return Ok(None),
-                RawItem::ScriptStart { script_start, span } => {
-                    let storage = self.current_storage_name()?.to_owned();
-                    let (script, span) = self.collect_script_block_from(script_start, span)?;
-                    if self.is_executing() {
-                        host.sync_parser_state(self)?;
-                        host.on_script(ScriptEvent {
-                            storage: &storage,
-                            script: &script,
-                            span,
-                        })?;
-                    }
-                    continue;
+            // Checkpoint before consuming the next item.  A host callback can
+            // discover that an asynchronous resource (scenario text, decoded
+            // image, ...) is still outstanding; rewinding to this exact item
+            // lets the platform retry the same native call once the resource
+            // arrives without re-running the scripts, jumps, macro definitions
+            // and labels that this call already processed.
+            let checkpoint = self.store();
+            match self.next_tag_item(host) {
+                Ok(NextItem::Tag(tag)) => return Ok(Some(tag)),
+                Ok(NextItem::Consumed) => continue,
+                Ok(NextItem::Eof) => return Ok(None),
+                Err(
+                    error @ (KagError::ResourcePending { .. } | KagError::HostSuspended { .. }),
+                ) => {
+                    self.restore(checkpoint)?;
+                    return Err(error);
                 }
-                RawItem::Label(label) => {
-                    let storage = self.current_storage_name()?.to_owned();
-                    self.current_label = Some(label.name.clone());
-                    host.sync_parser_state(self)?;
-                    host.on_label(LabelEvent {
-                        storage: &storage,
-                        label: &label,
-                    })?;
-                    continue;
-                }
-                RawItem::Tag(tag) => tag,
-            };
-
-            if self.options.process_special_tags && self.handle_condition_tag(&tag, host)? {
-                continue;
+                Err(error) => return Err(error),
             }
-
-            if !self.is_executing() {
-                continue;
-            }
-
-            self.apply_macro_arguments(&mut tag);
-
-            if self.options.process_cond
-                && tag_supports_cond(&tag.tagname, self.options.process_special_tags)
-                && !self.process_cond_attr(&mut tag, host)?
-            {
-                continue;
-            }
-
-            if self.options.resolve_entities {
-                self.resolve_entities(&mut tag, host)?;
-            }
-
-            if !self.options.process_special_tags && self.macros.contains_key(&tag.tagname) {
-                self.expand_macro(tag)?;
-                continue;
-            }
-
-            if self.options.process_special_tags && self.handle_special_tag(tag.clone(), host)? {
-                continue;
-            }
-
-            return Ok(Some(tag));
         }
+    }
+
+    fn next_tag_item<H>(&mut self, host: &mut H) -> Result<NextItem>
+    where
+        H: KagHost,
+    {
+        let item = self.next_raw_item()?;
+
+        let mut tag = match item {
+            RawItem::Eof => return Ok(NextItem::Eof),
+            RawItem::ScriptStart { script_start, span } => {
+                let storage = self.current_storage_name()?.to_owned();
+                let (script, span) = self.collect_script_block_from(script_start, span)?;
+                if self.is_executing() {
+                    host.sync_parser_state(self)?;
+                    host.on_script(ScriptEvent {
+                        storage: &storage,
+                        script: &script,
+                        span,
+                    })?;
+                }
+                return Ok(NextItem::Consumed);
+            }
+            RawItem::Label(label) => {
+                let storage = self.current_storage_name()?.to_owned();
+                self.current_label = Some(label.name.clone());
+                host.sync_parser_state(self)?;
+                host.on_label(LabelEvent {
+                    storage: &storage,
+                    label: &label,
+                })?;
+                return Ok(NextItem::Consumed);
+            }
+            RawItem::Tag(tag) => tag,
+        };
+
+        if self.options.process_special_tags && self.handle_condition_tag(&tag, host)? {
+            return Ok(NextItem::Consumed);
+        }
+
+        if !self.is_executing() {
+            return Ok(NextItem::Consumed);
+        }
+
+        self.apply_macro_arguments(&mut tag);
+
+        if self.options.process_cond
+            && tag_supports_cond(&tag.tagname, self.options.process_special_tags)
+            && !self.process_cond_attr(&mut tag, host)?
+        {
+            return Ok(NextItem::Consumed);
+        }
+
+        if self.options.resolve_entities {
+            self.resolve_entities(&mut tag, host)?;
+        }
+
+        if !self.options.process_special_tags && self.macros.contains_key(&tag.tagname) {
+            self.expand_macro(tag)?;
+            return Ok(NextItem::Consumed);
+        }
+
+        if self.options.process_special_tags && self.handle_special_tag(tag.clone(), host)? {
+            return Ok(NextItem::Consumed);
+        }
+
+        Ok(NextItem::Tag(tag))
     }
 
     fn install_scenario(&mut self, storage: String, source: String) -> Result<()> {
@@ -2521,6 +2546,17 @@ enum RawItem {
     Eof,
 }
 
+/// Outcome of processing one raw scenario item inside [`KagParser::next_tag_with`].
+enum NextItem {
+    /// The item produced a tag for the scenario host.
+    Tag(Tag),
+    /// The item was handled by the parser (script block, label, control tag,
+    /// macro definition, excluded branch) and parsing continues.
+    Consumed,
+    /// The scenario ended.
+    Eof,
+}
+
 fn parse_tag_content(
     storage: Option<&str>,
     source: &str,
@@ -2791,10 +2827,23 @@ mod tests {
         strings: BTreeMap<String, String>,
         labels: Vec<String>,
         scripts: Vec<String>,
+        /// Number of upcoming `load_scenario` calls that report a pending
+        /// resource before succeeding (mirrors ciphered/remote storages).
+        pending_scenario_loads: usize,
+        /// Number of upcoming `on_script` dispatches that report a parked
+        /// script call before succeeding (mirrors an async image decode
+        /// inside an iscript block).
+        suspended_scripts: usize,
     }
 
     impl KagHost for TestHost {
         fn load_scenario(&mut self, storage: &str) -> Result<String> {
+            if self.pending_scenario_loads > 0 {
+                self.pending_scenario_loads -= 1;
+                return Err(KagError::ResourcePending {
+                    storage: storage.to_owned(),
+                });
+            }
             self.sources
                 .get(storage)
                 .cloned()
@@ -2835,6 +2884,12 @@ mod tests {
 
         fn on_script(&mut self, event: ScriptEvent<'_>) -> Result<()> {
             self.scripts.push(event.script.to_owned());
+            if self.suspended_scripts > 0 {
+                self.suspended_scripts -= 1;
+                return Err(KagError::HostSuspended {
+                    storage: event.storage.to_owned(),
+                });
+            }
             Ok(())
         }
     }
@@ -3551,5 +3606,52 @@ mod tests {
 
         assert_eq!(next(&mut parser).tagname, "interrupt");
         assert_eq!(lit(&next(&mut parser), "text"), Some("A"));
+    }
+
+    #[test]
+    fn suspended_script_dispatch_rewinds_to_the_same_item() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text(
+                "first.ks",
+                "[iscript]\nglobal.flag = 1;\n[endscript]\n[wait]",
+            )
+            .unwrap();
+        let mut host = TestHost {
+            suspended_scripts: 1,
+            ..TestHost::default()
+        };
+
+        let error = parser.next_tag_with(&mut host).unwrap_err();
+        assert!(matches!(error, KagError::HostSuspended { .. }));
+
+        // The retry re-runs the same iscript item (its script was not
+        // consumed by the failed attempt) and then continues with [wait].
+        assert_eq!(next_with(&mut parser, &mut host).tagname, "wait");
+        assert_eq!(host.scripts.len(), 2);
+        assert_eq!(host.scripts[0], host.scripts[1]);
+        assert_eq!(host.scripts[0].trim(), "global.flag = 1;");
+    }
+
+    #[test]
+    fn pending_scenario_load_rewinds_to_the_control_tag() {
+        let mut parser = KagParser::new();
+        parser
+            .load_scenario_text("first.ks", "[call storage=\"sub.ks\"][wait]")
+            .unwrap();
+        let mut host = TestHost {
+            pending_scenario_loads: 1,
+            ..TestHost::default()
+        };
+        host.sources
+            .insert("sub.ks".to_string(), "[return]".to_string());
+
+        let error = parser.next_tag_with(&mut host).unwrap_err();
+        assert!(matches!(error, KagError::ResourcePending { .. }));
+
+        // The retried [call] still pushes and pops its call frame, so parsing
+        // continues in first.ks instead of skipping the control tag.
+        assert_eq!(next_with(&mut parser, &mut host).tagname, "wait");
+        assert_eq!(parser.call_stack_depth(), 0);
     }
 }

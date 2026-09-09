@@ -260,23 +260,13 @@ fn kag_get_next_tag(
         |parser, vm, owner| {
             let mut host = TjsKagHost::new(vm, owner);
             // `next_tag_with` may execute an expanded `[call]`/`[jump]` while
-            // resolving an on-demand scenario.  If that storage is remote,
-            // the parser has already advanced (for example by pushing a call
-            // frame) when it reports ResourcePending.  The VM retries this
-            // native call after the asset arrives, so restore the exact
-            // pre-read snapshot first; otherwise the expanded control tag is
-            // consumed and the retry silently skips startup hooks such as
-            // A game's opening/logo sequence.
-            let snapshot = parser.store();
-            let next = parser.next_tag_with(&mut host);
-            let Some(tag) = (match next {
-                Ok(tag) => tag,
-                Err(error @ krkr_kag::KagError::ResourcePending { .. }) => {
-                    parser.restore(snapshot).map_err(kag_to_tjs)?;
-                    return Err(kag_to_tjs(error));
-                }
-                Err(error) => return Err(kag_to_tjs(error)),
-            }) else {
+            // resolving an on-demand scenario.  If that storage is remote the
+            // parser reports ResourcePending, and it has already rewound to
+            // the exact item that needed the storage (the control tag is not
+            // consumed, so the retry cannot silently skip startup hooks such
+            // as a game's opening/logo sequence).  The VM retries this native
+            // call once the asset arrives.
+            let Some(tag) = parser.next_tag_with(&mut host).map_err(kag_to_tjs)? else {
                 host.vm
                     .runtime_mut()
                     .host_mut()
@@ -780,6 +770,7 @@ impl<'a, 'bc, 'rt> TjsKagHost<'a, 'bc, 'rt> {
     }
 
     fn call_event(&mut self, name: &str, args: Vec<Variant>) -> krkr_kag::Result<Option<Variant>> {
+        self.ensure_not_suspended()?;
         if matches!(
             self.vm
                 .runtime_mut()
@@ -793,6 +784,26 @@ impl<'a, 'bc, 'rt> TjsKagHost<'a, 'bc, 'rt> {
             .call_object_method(self.owner, name, args)
             .map(Some)
             .map_err(kag_tjs_error)
+    }
+
+    /// Rejects a host callback while a nested script call is parked on an
+    /// asynchronous resource.  Issuing the call now would park it as well and
+    /// hand the parser `void` in place of the callback's value (KRKR has no
+    /// suspended calls, so there is no official value to match).  Reporting
+    /// the suspended host call lets the parser rewind and retry the item once
+    /// the parked call has completed.
+    fn ensure_not_suspended(&self) -> krkr_kag::Result<()> {
+        if !self.vm.runtime().is_suspended() {
+            return Ok(());
+        }
+        let storage = self
+            .vm
+            .runtime()
+            .host()
+            .kag_parser(self.owner)
+            .and_then(|parser| parser.cur_storage().map(str::to_string))
+            .unwrap_or_default();
+        Err(krkr_kag::KagError::HostSuspended { storage })
     }
 
     fn call_process_event(&mut self, name: &str, tag: &Tag) -> krkr_kag::Result<bool> {
@@ -850,16 +861,19 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
     }
 
     fn eval_bool(&mut self, expression: &str) -> krkr_kag::Result<bool> {
+        self.ensure_not_suspended()?;
         Ok(eval_expression(self.vm.runtime_mut(), self.owner, expression)?.is_truthy())
     }
 
     fn eval_string(&mut self, expression: &str) -> krkr_kag::Result<String> {
+        self.ensure_not_suspended()?;
         eval_expression(self.vm.runtime_mut(), self.owner, expression)?
             .to_tjs_string()
             .map_err(kag_host_error)
     }
 
     fn eval_attribute(&mut self, expression: &str) -> krkr_kag::Result<Option<String>> {
+        self.ensure_not_suspended()?;
         match eval_expression(self.vm.runtime_mut(), self.owner, expression)? {
             Variant::Void => Ok(None),
             value => value.to_tjs_string().map(Some).map_err(kag_host_error),
@@ -1235,7 +1249,8 @@ fn debug_level_to_integer(level: DebugLevel) -> i64 {
 
 pub(crate) fn kag_to_tjs(error: krkr_kag::KagError) -> TjsError {
     match error {
-        krkr_kag::KagError::ResourcePending { storage } => TjsError::resource_pending(storage),
+        krkr_kag::KagError::ResourcePending { storage }
+        | krkr_kag::KagError::HostSuspended { storage } => TjsError::resource_pending(storage),
         krkr_kag::KagError::Host { message } if message.contains("KAG resource is pending:") => {
             let storage = message
                 .split_once("KAG resource is pending:")

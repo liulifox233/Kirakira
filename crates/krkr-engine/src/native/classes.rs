@@ -4307,12 +4307,6 @@ fn copy_render_content(dest: &mut LayerNode, source: &LayerNode) {
     dest.hit_type = source.hit_type;
     dest.hit_threshold = source.hit_threshold;
     dest.image = source.image.clone();
-    eprintln!(
-        "DBG copy_render_content dest={} source={} src_has_image={}",
-        dest.id,
-        source.id,
-        source.image.is_some()
-    );
 }
 
 fn layer_stop_transition(

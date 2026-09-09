@@ -24,6 +24,7 @@ impl<'a> EngineKagHost<'a> {
     }
 
     fn call_event(&mut self, name: &str, args: Vec<Variant>) -> krkr_kag::Result<Option<Variant>> {
+        self.ensure_not_suspended()?;
         if matches!(
             self.runtime
                 .resolve_object_member(self.owner, name)
@@ -36,6 +37,23 @@ impl<'a> EngineKagHost<'a> {
             .call_object_method(self.owner, name, args)
             .map(Some)
             .map_err(kag_tjs_error)
+    }
+
+    /// Rejects a host callback while a nested script call is parked on an
+    /// asynchronous resource: issuing it now would park the callback too and
+    /// hand the parser `void` in place of its value. The parser rewinds to the
+    /// current item so the engine can retry it once the parked call finishes.
+    fn ensure_not_suspended(&self) -> krkr_kag::Result<()> {
+        if !self.runtime.is_suspended() {
+            return Ok(());
+        }
+        let storage = self
+            .runtime
+            .host()
+            .kag_parser(self.owner)
+            .and_then(|parser| parser.cur_storage().map(str::to_string))
+            .unwrap_or_default();
+        Err(krkr_kag::KagError::HostSuspended { storage })
     }
 
     fn call_process_event(&mut self, name: &str, tag: &Tag) -> krkr_kag::Result<bool> {
@@ -103,16 +121,19 @@ impl KagHost for EngineKagHost<'_> {
     }
 
     fn eval_bool(&mut self, expression: &str) -> krkr_kag::Result<bool> {
+        self.ensure_not_suspended()?;
         Ok(eval_expression(self.runtime, self.owner, expression)?.is_truthy())
     }
 
     fn eval_string(&mut self, expression: &str) -> krkr_kag::Result<String> {
+        self.ensure_not_suspended()?;
         eval_expression(self.runtime, self.owner, expression)?
             .to_tjs_string()
             .map_err(kag_host_error)
     }
 
     fn eval_attribute(&mut self, expression: &str) -> krkr_kag::Result<Option<String>> {
+        self.ensure_not_suspended()?;
         match eval_expression(self.runtime, self.owner, expression)? {
             Variant::Void => Ok(None),
             value => value.to_tjs_string().map(Some).map_err(kag_host_error),

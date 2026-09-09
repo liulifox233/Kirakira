@@ -3046,7 +3046,14 @@ impl KagSession {
                     let mut host = EngineKagHost::for_owner(runtime, owner);
                     match parser.next_tag_with(&mut host) {
                         Ok(tag) => tag,
-                        Err(KagError::ResourcePending { storage: _ }) => {
+                        Err(
+                            KagError::ResourcePending { storage: _ }
+                            | KagError::HostSuspended { storage: _ },
+                        ) => {
+                            // The parser rewound to the item that could not be
+                            // processed yet (remote scenario text or a script
+                            // call parked on an async resource); retry it once
+                            // the resource provider resumes the VM.
                             self.state = KagTaskState::WaitingResource;
                             return Ok(EngineTickResult {
                                 state: self.state.clone(),

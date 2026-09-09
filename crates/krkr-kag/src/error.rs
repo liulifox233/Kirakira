@@ -42,6 +42,13 @@ pub enum KagError {
     ResourcePending {
         storage: String,
     },
+    /// A host callback could not run because a nested script call is parked
+    /// on an asynchronous resource. The parser rewinds to the current item so
+    /// the platform can retry the same native call once the parked call has
+    /// completed, instead of treating the pending callback as a value.
+    HostSuspended {
+        storage: String,
+    },
     Host {
         message: String,
     },
@@ -125,6 +132,9 @@ impl fmt::Display for KagError {
             }
             Self::ResourcePending { storage } => {
                 write!(f, "KAG resource is pending: {storage}")
+            }
+            Self::HostSuspended { storage } => {
+                write!(f, "KAG host call is suspended in: {storage}")
             }
             Self::Host { message } => write!(f, "{message}"),
         }
