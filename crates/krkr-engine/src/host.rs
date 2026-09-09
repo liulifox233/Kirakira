@@ -27,12 +27,25 @@ use krkr_video::{UnavailableVideoFactory, VideoDecoderFactory};
 use crate::{
     KrkrPlugin,
     native::video::VideoOverlayState,
-    resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId, decode_image_bytes},
+    resource_manager::{
+        DecodedImageData, ResourceCompletion, ResourceManager, ResourceTaskId, decode_image_bytes,
+    },
     scheduler::{AsyncTriggerMode, TvpScheduler},
 };
 
 const IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
+
+/// How long a script image load waits for its decode worker before falling
+/// back to the asynchronous path.
+///
+/// Official `tTJSNI_BaseLayer::LoadImages` loads through the synchronous
+/// `TVPLoadGraphic` (`LayerIntf.cpp:2514`), so a KAG loop that loads N
+/// graphics creates them all in one tick. Waiting here keeps small graphics
+/// on that schedule instead of letting each one cost a frame; a decode that
+/// exceeds the budget keeps the asynchronous path rather than stalling.
+#[cfg(not(target_arch = "wasm32"))]
+const SCRIPT_IMAGE_SYNC_BUDGET: Duration = Duration::from_millis(4);
 
 /// Bounds the in-memory host log; long headless runs with trace categories
 /// enabled would otherwise grow it without limit. When the cap is hit the
@@ -2088,6 +2101,14 @@ impl KrkrHost {
     }
 
     pub(crate) fn load_image_storage_for_script(&mut self, name: &str) -> Result<LayerImage> {
+        self.load_script_image(name, true)
+    }
+
+    /// Loads a script-visible graphic. `wait_for_decode` mirrors official
+    /// synchronous `TVPLoadGraphic` loads by letting a fast worker decode
+    /// finish inside the calling tick; cache warming passes `false` because a
+    /// hint must never block the VM.
+    fn load_script_image(&mut self, name: &str, wait_for_decode: bool) -> Result<LayerImage> {
         self.logs
             .push(format!("script image load requested `{name}`"));
         self.sync_image_cache_revision();
@@ -2097,18 +2118,14 @@ impl KrkrHost {
 
         #[cfg(test)]
         {
+            let _ = wait_for_decode;
             self.load_image_storage(name)
         }
 
         #[cfg(not(test))]
         {
-            let Some(manager) = self.resource_manager.as_ref() else {
-                return self.load_image_storage(name);
-            };
-            if let Some(error) = self.script_image_errors.get(name) {
-                return Err(TjsError::runtime(format!(
-                    "failed to decode image `{name}`: {error}"
-                )));
+            if self.script_image_errors.contains_key(name) {
+                return Err(self.script_image_error(name));
             }
             let revision = self.storage_revision();
             if self
@@ -2118,6 +2135,9 @@ impl KrkrHost {
             {
                 return Err(TjsError::resource_pending(name.to_string()));
             }
+            let Some(manager) = self.resource_manager.as_ref() else {
+                return self.load_image_storage(name);
+            };
             let id = manager.request_image_decode(name.to_string(), revision);
             self.pending_script_image_loads
                 .insert(id, (name.to_string(), revision));
@@ -2125,9 +2145,67 @@ impl KrkrHost {
                 "script image decode queued `{name}` (request {})",
                 id.0
             ));
-            // TJS/KAG resumes this native call after the worker completion is
-            // applied to the image cache; no frame is blocked on decode.
+            // Official `TVPLoadGraphic` is synchronous, so a KAG loop that
+            // loads several graphics creates them all in one tick. Wait for a
+            // fast decode so small graphics keep that schedule; otherwise
+            // TJS/KAG resumes this native call after the completion lands.
+            #[cfg(not(target_arch = "wasm32"))]
+            if wait_for_decode
+                && let Some(result) = self.wait_for_script_image(name)
+            {
+                return result;
+            }
             Err(TjsError::resource_pending(name.to_string()))
+        }
+    }
+
+    fn script_image_error(&self, name: &str) -> TjsError {
+        let error = self
+            .script_image_errors
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or("unknown decode failure");
+        TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
+    }
+
+    /// Waits up to [`SCRIPT_IMAGE_SYNC_BUDGET`] for a queued script image
+    /// decode. `Some(result)` means the image landed (or failed) in time;
+    /// `None` tells the caller to keep the asynchronous path.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_for_script_image(&mut self, name: &str) -> Option<Result<LayerImage>> {
+        self.wait_for_script_image_within(name, SCRIPT_IMAGE_SYNC_BUDGET)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_for_script_image_within(
+        &mut self,
+        name: &str,
+        budget: Duration,
+    ) -> Option<Result<LayerImage>> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(image) = self.image_cache.get(name) {
+                return Some(Ok(image.clone()));
+            }
+            if self.script_image_errors.contains_key(name) {
+                return Some(Err(self.script_image_error(name)));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let completion = self
+                .resource_manager
+                .as_ref()
+                .and_then(|manager| manager.wait_completion(deadline - now));
+            match completion {
+                // The synchronous wait applies its own completion; the frame
+                // start must not treat it as a suspended call to resume.
+                Some(completion) => {
+                    self.handle_resource_completion(completion);
+                }
+                None => return None,
+            }
         }
     }
 
@@ -2279,7 +2357,7 @@ impl KrkrHost {
             // Cache warming is a hint, not a reason to block the VM. Reuse
             // the same queued decode path as Layer.loadImages; the completion
             // will populate the bounded decoded-image cache on a later frame.
-            let image = self.load_image_storage_for_script(name)?;
+            let image = self.load_script_image(name, false)?;
             Ok(image.upload.rgba.len())
         }
     }
@@ -2338,49 +2416,58 @@ impl KrkrHost {
         };
         let completions = manager.drain_completions();
         for completion in completions {
-            if let Some((storage, expected_revision)) =
-                self.pending_script_image_loads.remove(&completion.id)
-            {
-                if expected_revision != completion.revision
-                    || completion.revision != self.storage_revision()
-                {
-                    self.logs.push(format!(
-                        "discarded stale script image `{storage}` after storage revision changed"
-                    ));
-                    continue;
-                }
-                match completion.result {
-                    Ok(decoded) => {
-                        let image = self.layer_image_from_decoded(decoded);
-                        self.logs.push(format!(
-                            "script image decoded `{storage}` ({}x{}, {} bytes)",
-                            image.upload.width,
-                            image.upload.height,
-                            image.upload.rgba.len()
-                        ));
-                        self.script_image_errors.remove(&storage);
-                        self.image_cache.insert(storage, image);
-                        self.completed_script_image_loads =
-                            self.completed_script_image_loads.saturating_add(1);
-                    }
-                    Err(error) => {
-                        self.script_image_errors
-                            .insert(storage.clone(), error.clone());
-                        self.logs
-                            .push(format!("script image decode failed `{storage}`: {error}"));
-                        self.completed_script_image_loads =
-                            self.completed_script_image_loads.saturating_add(1);
-                    }
-                }
-                continue;
+            if self.handle_resource_completion(completion) {
+                // Only a completion drained here belongs to a suspended native
+                // call; a synchronous wait applies its own completion without
+                // leaving anything for the frame-start resume to wake.
+                self.completed_script_image_loads =
+                    self.completed_script_image_loads.saturating_add(1);
             }
-            self.complete_image_load(
-                completion.id,
-                completion.revision,
-                &completion.storage,
-                completion.result,
-            );
         }
+    }
+
+    /// Applies one worker completion. Returns whether it was a script image
+    /// load that still needs its suspended native call resumed.
+    fn handle_resource_completion(&mut self, completion: ResourceCompletion) -> bool {
+        if let Some((storage, expected_revision)) =
+            self.pending_script_image_loads.remove(&completion.id)
+        {
+            if expected_revision != completion.revision
+                || completion.revision != self.storage_revision()
+            {
+                self.logs.push(format!(
+                    "discarded stale script image `{storage}` after storage revision changed"
+                ));
+                return false;
+            }
+            match completion.result {
+                Ok(decoded) => {
+                    let image = self.layer_image_from_decoded(decoded);
+                    self.logs.push(format!(
+                        "script image decoded `{storage}` ({}x{}, {} bytes)",
+                        image.upload.width,
+                        image.upload.height,
+                        image.upload.rgba.len()
+                    ));
+                    self.script_image_errors.remove(&storage);
+                    self.image_cache.insert(storage, image);
+                }
+                Err(error) => {
+                    self.script_image_errors
+                        .insert(storage.clone(), error.clone());
+                    self.logs
+                        .push(format!("script image decode failed `{storage}`: {error}"));
+                }
+            }
+            return true;
+        }
+        self.complete_image_load(
+            completion.id,
+            completion.revision,
+            &completion.storage,
+            completion.result,
+        );
+        false
     }
 
     fn complete_image_load(
@@ -3492,6 +3579,56 @@ mod tests {
             "%[\"answer\" => 42]"
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn script_image_wait_finishes_a_queued_decode_in_the_same_tick() {
+        let root = temp_root("script-image-wait");
+        fs::create_dir_all(&root).expect("create root");
+        write_test_png(&root.join("button.png"), 2, 3);
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        let mut host = KrkrHost::from_storage(storage, SystemPaths::default()).expect("host");
+
+        let revision = host.storage_revision();
+        let id = host
+            .resource_manager
+            .as_ref()
+            .expect("resource manager")
+            .request_image_decode("button.png".to_string(), revision);
+        host.pending_script_image_loads
+            .insert(id, ("button.png".to_string(), revision));
+
+        // A zero budget never waits, so the load stays asynchronous.
+        assert!(host
+            .wait_for_script_image_within("button.png", Duration::ZERO)
+            .is_none());
+
+        // A real budget applies the worker completion inside the same call,
+        // matching official synchronous `TVPLoadGraphic` loads.
+        let image = host
+            .wait_for_script_image_within("button.png", Duration::from_secs(5))
+            .expect("decode lands within the budget")
+            .expect("decoded image");
+        assert_eq!((image.upload.width, image.upload.height), (2, 3));
+        assert!(host.pending_script_image_loads.is_empty());
+
+        // The production budget path resolves from the cache without waiting.
+        assert!(host
+            .wait_for_script_image("button.png")
+            .is_some_and(|result| result.is_ok()));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn write_test_png(path: &std::path::Path, width: u32, height: u32) {
+        let file = fs::File::create(path).expect("create png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer
+            .write_image_data(&vec![0x40u8; (width * height * 4) as usize])
+            .expect("png data");
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

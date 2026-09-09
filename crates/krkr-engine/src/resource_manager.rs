@@ -8,6 +8,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::Duration,
 };
 
 use krkr_core::{ProjectStoragePort, ProvinceImage, ResourceData};
@@ -170,6 +171,15 @@ impl ResourceManager {
             completions.push(completion);
         }
         completions
+    }
+
+    /// Blocks up to `timeout` for the next decode completion. Script image
+    /// loads use this to finish a fast decode inside the calling tick, the way
+    /// official `TVPLoadGraphic` loads synchronously; `None` means the worker
+    /// is still busy and the caller must keep the asynchronous path.
+    pub fn wait_completion(&self, timeout: Duration) -> Option<ResourceCompletion> {
+        let rx = self.completion_rx.lock().ok()?;
+        rx.recv_timeout(timeout).ok()
     }
 
     /// Marks an in-flight decode as no longer needed. The worker checks this
