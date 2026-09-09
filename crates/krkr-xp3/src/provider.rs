@@ -7,6 +7,10 @@ use crate::{Result, Xp3Archive, Xp3Entry, Xp3Error, Xp3OpenOptions, normalize_en
 #[derive(Clone)]
 pub struct Xp3ResourceProvider {
     archives: Arc<[Xp3Archive<File>]>,
+    /// Lower-case archive file names (`data.xp3`), parallel to `archives`.
+    /// KRKR's auto-path table stores `archive.xp3>` entries that address one
+    /// specific archive, so the provider has to keep that identity around.
+    archive_names: Arc<[String]>,
 }
 
 impl Xp3ResourceProvider {
@@ -28,18 +32,27 @@ impl Xp3ResourceProvider {
         P: AsRef<Path>,
     {
         let mut archives = Vec::new();
+        let mut names = Vec::new();
         for path in paths {
-            archives.push(Xp3Archive::open_file_with_options(
-                path.as_ref(),
-                options.clone(),
-            )?);
+            let path = path.as_ref();
+            archives.push(Xp3Archive::open_file_with_options(path, options.clone())?);
+            names.push(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default(),
+            );
         }
-        Ok(Self::from_archives(archives))
+        Ok(Self {
+            archives: archives.into(),
+            archive_names: names.into(),
+        })
     }
 
     pub fn from_archives(archives: Vec<Xp3Archive<File>>) -> Self {
+        let archive_names = vec![String::new(); archives.len()];
         Self {
             archives: archives.into(),
+            archive_names: archive_names.into(),
         }
     }
 
@@ -83,6 +96,44 @@ impl Xp3ResourceProvider {
             }
         }
         None
+    }
+
+    /// Resolves a member inside one named archive, ignoring every other mount.
+    /// `archive` may carry a directory prefix (KRKR builds auto paths from
+    /// `System.arcPath`), so only the file name is compared.
+    pub fn get_entry_in(&self, archive: &str, path: &str) -> Option<&Xp3Entry> {
+        let index = self.archive_index(archive)?;
+        let normalized = normalize_entry_name(path).ok()?;
+        let archive = &self.archives[index];
+        archive
+            .get_entry(&normalized)
+            .or_else(|| archive.get_entry_ascii_case_insensitive(&normalized))
+    }
+
+    pub fn open_in(&self, archive: &str, path: &str) -> io::Result<Box<dyn ResourceStream>> {
+        let entry_name = self
+            .get_entry_in(archive, path)
+            .map(|entry| entry.name.clone())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.to_string()))?;
+        let index = self
+            .archive_index(archive)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, archive.to_string()))?;
+        let stream = self.archives[index]
+            .open_by_name(&entry_name)
+            .map_err(xp3_error_to_io)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, entry_name.clone()))?;
+        Ok(Box::new(stream))
+    }
+
+    fn archive_index(&self, archive: &str) -> Option<usize> {
+        let normalized = archive.replace('\\', "/");
+        let wanted = normalized.rsplit('/').next()?.to_ascii_lowercase();
+        if wanted.is_empty() {
+            return None;
+        }
+        self.archive_names
+            .iter()
+            .rposition(|name| name.as_str() == wanted)
     }
 
     pub fn clear_segment_cache(&self) -> Result<()> {

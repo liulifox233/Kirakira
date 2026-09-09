@@ -57,6 +57,11 @@ struct ProjectStorageInner {
     memory_writes: Mutex<BTreeMap<String, Arc<[u8]>>>,
     auto_paths: RwLock<Vec<String>>,
     revision: AtomicU64,
+    /// Bumped only by changes to the name-to-file layout (search path,
+    /// archive set, catalogue). Plain storage writes move `revision` so the
+    /// lookup and raw-byte caches stay coherent, but leave this alone:
+    /// official KRKR never drops decoded graphics because a file was written.
+    graphic_revision: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +87,9 @@ enum LocatedResource {
     },
     Xp3 {
         storage_name: String,
+        /// Set when an `archive.xp3>` auto path pinned the lookup to one
+        /// archive; `None` means the member was found by scanning mounts.
+        archive: Option<String>,
         entry_name: String,
         byte_len: u64,
     },
@@ -288,6 +296,7 @@ impl ProjectStorage {
                 memory_writes: Mutex::new(BTreeMap::new()),
                 auto_paths: RwLock::new(auto_paths),
                 revision: AtomicU64::new(1),
+                graphic_revision: AtomicU64::new(1),
             }),
         }
     }
@@ -499,6 +508,10 @@ impl ProjectStorage {
         self.inner.revision.load(Ordering::Relaxed)
     }
 
+    pub fn graphic_revision(&self) -> u64 {
+        self.inner.graphic_revision.load(Ordering::Relaxed)
+    }
+
     pub fn root(&self) -> Option<&Path> {
         self.inner.root.as_deref()
     }
@@ -568,6 +581,17 @@ impl ProjectStorage {
         };
 
         for candidate in candidates {
+            if let Some((archive, member)) = split_archive_candidate(&candidate) {
+                if self
+                    .inner
+                    .xp3_provider
+                    .as_ref()
+                    .is_some_and(|provider| provider.get_entry_in(archive, member).is_some())
+                {
+                    return true;
+                }
+                continue;
+            }
             let Ok(relative) = clean_relative_path(&candidate) else {
                 continue;
             };
@@ -890,7 +914,7 @@ impl ProjectStorage {
             if let Ok(mut writes) = self.inner.memory_writes.lock() {
                 writes.insert(key, data);
             }
-            self.invalidate_caches();
+            self.invalidate_write_caches();
             return Ok(());
         };
         let path = storage_write_path(root, name)?;
@@ -912,7 +936,7 @@ impl ProjectStorage {
             fs::write(&path, bytes).map_err(io_error)
         };
         if result.is_ok() {
-            self.invalidate_caches();
+            self.invalidate_write_caches();
         }
         result
     }
@@ -922,11 +946,18 @@ impl ProjectStorage {
             LocatedResource::Fs { path, .. } => {
                 File::open(path).map(|file| Box::new(file) as Box<dyn ResourceStream>)
             }
-            LocatedResource::Xp3 { entry_name, .. } => {
+            LocatedResource::Xp3 {
+                archive,
+                entry_name,
+                ..
+            } => {
                 let provider = self.inner.xp3_provider.as_ref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "XP3 provider is not configured")
                 })?;
-                provider.open(&entry_name)
+                match archive.as_deref() {
+                    Some(archive) => provider.open_in(archive, &entry_name),
+                    None => provider.open(&entry_name),
+                }
             }
             LocatedResource::Memory {
                 source_path, data, ..
@@ -970,6 +1001,9 @@ impl ProjectStorage {
 
         let candidates = self.storage_candidates(name).map_err(tjs_error_to_io)?;
         for candidate in &candidates {
+            if split_archive_candidate(candidate).is_some() {
+                continue;
+            }
             let relative = clean_relative_path(candidate).map_err(tjs_error_to_io)?;
             if let Some(storage) = self.find_fs_candidate(candidate, &relative)? {
                 self.cache_lookup(name, Some(storage.clone()));
@@ -977,11 +1011,34 @@ impl ProjectStorage {
             }
         }
 
+        // KRKR's auto-path table is the authoritative archive index, and an
+        // `archive.xp3>` entry addresses exactly one mount. Honor those before
+        // the name-only scan, otherwise an archive registered late (a patch
+        // overlay) loses to whichever mount happens to sort last.
         if let Some(provider) = &self.inner.xp3_provider {
             for candidate in &candidates {
+                let Some((archive, member)) = split_archive_candidate(candidate) else {
+                    continue;
+                };
+                if let Some(entry) = provider.get_entry_in(archive, member) {
+                    let storage = LocatedResource::Xp3 {
+                        storage_name: candidate.clone(),
+                        archive: Some(archive.to_string()),
+                        entry_name: entry.name.clone(),
+                        byte_len: entry.original_size,
+                    };
+                    self.cache_lookup(name, Some(storage.clone()));
+                    return Ok(storage);
+                }
+            }
+            for candidate in &candidates {
+                if split_archive_candidate(candidate).is_some() {
+                    continue;
+                }
                 if let Some(entry) = provider.get_entry(candidate) {
                     let storage = LocatedResource::Xp3 {
                         storage_name: candidate.clone(),
+                        archive: None,
                         entry_name: entry.name.clone(),
                         byte_len: entry.original_size,
                     };
@@ -992,6 +1049,9 @@ impl ProjectStorage {
         }
 
         for candidate in &candidates {
+            if split_archive_candidate(candidate).is_some() {
+                continue;
+            }
             let normalized = normalize_storage_separators(candidate);
             let Ok(memory_files) = self.inner.memory_files.read() else {
                 continue;
@@ -1028,6 +1088,9 @@ impl ProjectStorage {
         // unique basename.  Resolve only an explicitly named candidate here:
         // extension selection remains the caller's responsibility.
         for candidate in &candidates {
+            if split_archive_candidate(candidate).is_some() {
+                continue;
+            }
             let Some(alias) = self.catalog_alias(candidate) else {
                 continue;
             };
@@ -1042,6 +1105,9 @@ impl ProjectStorage {
         // preloaded `main/Config.tjs` also satisfies `Config.tjs` without a
         // duplicate network request.
         for candidate in &candidates {
+            if split_archive_candidate(candidate).is_some() {
+                continue;
+            }
             let normalized = normalize_storage_separators(candidate);
             if normalized.contains('/') {
                 continue;
@@ -1117,6 +1183,7 @@ impl ProjectStorage {
         {
             return Ok(Some(LocatedResource::Xp3 {
                 storage_name: storage_name.to_string(),
+                archive: None,
                 entry_name: entry.name.clone(),
                 byte_len: entry.original_size,
             }));
@@ -1266,11 +1333,18 @@ impl ProjectStorage {
 
         let data = match located {
             LocatedResource::Fs { path, byte_len, .. } => load_fs_resource_data(path, *byte_len)?,
-            LocatedResource::Xp3 { entry_name, .. } => {
+            LocatedResource::Xp3 {
+                archive,
+                entry_name,
+                ..
+            } => {
                 let provider = self.inner.xp3_provider.as_ref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "XP3 provider is not configured")
                 })?;
-                let mut stream = provider.open(entry_name)?;
+                let mut stream = match archive.as_deref() {
+                    Some(archive) => provider.open_in(archive, entry_name)?,
+                    None => provider.open(entry_name)?,
+                };
                 let mut bytes = Vec::new();
                 stream.read_to_end(&mut bytes)?;
                 ResourceData::from_vec(bytes)
@@ -1299,6 +1373,15 @@ impl ProjectStorage {
     }
 
     fn invalidate_caches(&self) {
+        self.inner.graphic_revision.fetch_add(1, Ordering::Relaxed);
+        self.invalidate_write_caches();
+    }
+
+    /// Drops the caches that a plain storage write invalidates: the name
+    /// lookup, the case-insensitive directory listings and the raw byte
+    /// views. Decoded graphics survive, matching KRKR, where only
+    /// `System.clearGraphicCache` and compact events clear them.
+    fn invalidate_write_caches(&self) {
         self.inner.revision.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut cache) = self.inner.lookup_cache.lock() {
             cache.clear();
@@ -1336,6 +1419,10 @@ impl StoragePort for PackageMount {
     fn revision(&self) -> u64 {
         self.0.revision()
     }
+
+    fn graphic_revision(&self) -> u64 {
+        self.0.graphic_revision()
+    }
 }
 
 impl StoragePort for ProjectStorage {
@@ -1357,6 +1444,10 @@ impl StoragePort for ProjectStorage {
 
     fn revision(&self) -> u64 {
         ProjectStorage::revision(self)
+    }
+
+    fn graphic_revision(&self) -> u64 {
+        ProjectStorage::graphic_revision(self)
     }
 }
 
@@ -1480,7 +1571,14 @@ impl LocatedResource {
     fn cache_source(&self) -> RawCacheSource {
         match self {
             Self::Fs { path, .. } => RawCacheSource::Fs(path.clone()),
-            Self::Xp3 { entry_name, .. } => RawCacheSource::Xp3(entry_name.clone()),
+            Self::Xp3 {
+                archive,
+                entry_name,
+                ..
+            } => RawCacheSource::Xp3(match archive {
+                Some(archive) => format!("{archive}>{entry_name}"),
+                None => entry_name.clone(),
+            }),
             Self::Memory { storage_name, .. } => RawCacheSource::Memory(storage_name.clone()),
         }
     }
@@ -1670,7 +1768,7 @@ fn storage_candidates_with_auto_paths(name: &str, auto_paths: &[String]) -> Resu
         push_unique_storage_candidate(&mut candidates, &clean);
         for auto_path in auto_paths.iter().rev() {
             for candidate in auto_path_candidates(auto_path, &clean) {
-                push_unique_storage_candidate(&mut candidates, &candidate);
+                push_unique_storage_name(&mut candidates, candidate);
             }
         }
     }
@@ -1687,24 +1785,49 @@ fn exact_storage_candidates_with_auto_paths(
     push_unique_storage_candidate(&mut candidates, &clean);
     for auto_path in auto_paths.iter().rev() {
         for candidate in auto_path_candidates(auto_path, &clean) {
-            push_unique_storage_candidate(&mut candidates, &candidate);
+            push_unique_storage_name(&mut candidates, candidate);
         }
     }
     Ok(candidates)
 }
 
-fn auto_path_candidates(auto_path: &str, clean: &Path) -> Vec<PathBuf> {
-    let Some(auto_path) = normalize_auto_path(auto_path) else {
+fn auto_path_candidates(auto_path: &str, clean: &Path) -> Vec<String> {
+    let Some(inner) = normalize_auto_path(auto_path) else {
         return Vec::new();
     };
-    let Ok(auto_relative) = clean_relative_path(&auto_path) else {
+    let Ok(auto_relative) = clean_relative_path(&inner) else {
         return Vec::new();
     };
-    vec![auto_relative.join(clean)]
+    let joined = path_to_storage_name(&auto_relative.join(clean));
+    // `archive.xp3>` auto paths name one archive. KRKR resolves the member
+    // through that archive alone, so keep the qualifier on the candidate
+    // instead of degrading it into a name-only lookup across every mount.
+    match auto_path_archive(auto_path) {
+        Some(archive) => vec![format!("{archive}>{joined}")],
+        None => vec![joined],
+    }
+}
+
+/// Returns the archive file name of an `.../archive.xp3>prefix` auto path.
+fn auto_path_archive(auto_path: &str) -> Option<String> {
+    let path = normalize_storage_separators(auto_path);
+    let (outer, _) = path.split_once('>')?;
+    let name = outer.rsplit('/').next()?;
+    name.rsplit_once('.')
+        .filter(|(_, extension)| extension.eq_ignore_ascii_case("xp3"))
+        .map(|_| name.to_string())
+}
+
+/// Splits a candidate produced from an archive-scoped auto path.
+fn split_archive_candidate(candidate: &str) -> Option<(&str, &str)> {
+    candidate.split_once('>')
 }
 
 fn push_unique_storage_candidate(candidates: &mut Vec<String>, path: &Path) {
-    let candidate = path_to_storage_name(path);
+    push_unique_storage_name(candidates, path_to_storage_name(path));
+}
+
+fn push_unique_storage_name(candidates: &mut Vec<String>, candidate: String) {
     if !candidates.iter().any(|item| item == &candidate) {
         candidates.push(candidate);
     }
@@ -2429,6 +2552,27 @@ mod tests {
         let before_clear = storage.revision();
         storage.clear_archive_cache().expect("clear cache");
         assert!(storage.revision() > before_clear);
+    }
+
+    /// KRKR only drops decoded graphics on `System.clearGraphicCache`, a
+    /// compact event or an out-of-memory retry; writing a save file leaves
+    /// the graphic cache untouched. The name lookup still has to notice the
+    /// new file, so `revision` moves while `graphic_revision` stays put.
+    #[test]
+    fn storage_writes_keep_the_graphic_revision_but_move_the_lookup_revision() {
+        let storage = ProjectStorage::from_memory([("startup.tjs", b"WEB".to_vec())]);
+        let lookup = storage.revision();
+        let graphic = storage.graphic_revision();
+
+        storage
+            .write_binary_storage("savedata/slot0.ksd", "w", b"save")
+            .expect("write save");
+
+        assert!(storage.revision() > lookup);
+        assert_eq!(storage.graphic_revision(), graphic);
+
+        storage.add_auto_path("bgimage/");
+        assert!(storage.graphic_revision() > graphic);
     }
 
     #[test]

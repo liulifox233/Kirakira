@@ -171,6 +171,20 @@ pub trait StoragePort: Send + Sync {
     fn revision(&self) -> u64 {
         0
     }
+
+    /// Revision of the name-to-file layout as far as decoded graphics are
+    /// concerned.
+    ///
+    /// KRKR keys its graphic cache on the storage name alone and only drops
+    /// entries on `System.clearGraphicCache`, a compact event or an
+    /// out-of-memory retry (`GraphicsLoaderIntf.cpp`); writing a file never
+    /// touches it. `revision` still has to move on every write so the
+    /// lookup and raw-byte caches stay coherent, so graphics track this
+    /// separate counter, which only advances when the search path, archive
+    /// set or catalogue changes.
+    fn graphic_revision(&self) -> u64 {
+        self.revision()
+    }
 }
 
 /// Mutable project-storage capability consumed by the engine.
