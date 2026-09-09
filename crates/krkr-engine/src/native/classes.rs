@@ -7100,7 +7100,15 @@ fn finish_kag_window_transition_if_pending(
     else {
         return Ok(());
     };
-    if !runtime.object_member(window, "inTransition").is_truthy()
+    // KAG's window exposes `inTransition` as a script property, so the raw
+    // member is the accessor closure and only TJS dispatch yields the flag.
+    // BaseLayerBase.onTransitionCompleted relays the event to
+    // KAGWindow.onTransitionEnd, which clears the flag; a truthy value here
+    // means that relay did not run.
+    let in_transition = runtime
+        .resolve_object_member(window, "inTransition")?
+        .is_truthy();
+    if !in_transition
         || !kag_window_transition_base(runtime, window, layer)
         || matches!(
             runtime.object_member(window, "onTransitionEnd"),
