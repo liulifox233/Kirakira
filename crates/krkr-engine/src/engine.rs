@@ -10799,6 +10799,75 @@ mod tests {
         assert_eq!(alpha(&mut engine, "freed"), 0);
     }
 
+    /// `tTJSNI_BaseLayer::GetMainPixel`/`SetMainPixel` (`LayerIntf.cpp:2587`)
+    /// expose the 24-bit colour only, and the mask accessors expose the alpha
+    /// channel; both setters honour `ClipRect`.
+    #[test]
+    fn native_layer_pixel_accessors_match_official_contracts() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(2, 1);
+                layer.setMainPixel(0, 0, 0x336699);
+                layer.setMaskPixel(0, 0, 0x80);
+                layer.setMainPixel(1, 0, 0x112233);
+                return layer.getMainPixel(0, 0) + ":" + layer.getMaskPixel(0, 0) + ":" +
+                    layer.getMainPixel(1, 0);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("3368601:128:1122867".to_string()));
+    }
+
+    /// `tTJSNI_BaseLayer::SetClip` / `ResetClip` (`LayerIntf.cpp:7207`): every
+    /// fill and blit is clipped to the layer-local `ClipRect`, and `setClip()`
+    /// without four arguments restores the layer rectangle.
+    #[test]
+    fn native_layer_set_clip_limits_fills_and_blits() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(4, 1);
+                layer.setClip(1, 0, 2, 1);
+                layer.fillRect(0, 0, 4, 1, 0xffff0000);
+                layer.setClip();
+                layer.fillRect(3, 0, 1, 1, 0xff00ff00);
+                "#,
+            )
+            .expect("script");
+
+        let layer_id = engine
+            .execute_expression("inline.tjs", "layer.__nativeLayerId")
+            .expect("layer id")
+            .to_integer()
+            .expect("integer layer id") as u64;
+        let rgba = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image")
+            .upload
+            .rgba
+            .to_vec();
+        assert_eq!(
+            rgba,
+            vec![
+                // Outside the clip: the ctor holder's transparent white.
+                255, 255, 255, 0,
+                255, 0, 0, 255, // inside the clip
+                255, 0, 0, 255, // inside the clip
+                0, 255, 0, 255, // drawn after ResetClip
+            ]
+        );
+    }
+
     /// Official `tTJSNI_BaseLayer` stays allocated for the TJS object's life
     /// (`SetHasImage` → `AllocateImage` in `LayerIntf.cpp:2228`). If Kirakira
     /// drops the tree node, `hasImage = 1` must recreate it so GINKA

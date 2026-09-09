@@ -40,6 +40,7 @@ pub fn composite_frame(
                     *th,
                     rgba,
                     image.opacity,
+                    image.opaque,
                 );
             }
             DrawCommand::Text(_) => {}
@@ -89,6 +90,7 @@ fn blend_image(
     tex_height: u32,
     rgba: &[u8],
     opacity: f32,
+    opaque: bool,
 ) {
     if rect.width <= 0.0 || rect.height <= 0.0 || tex_width == 0 || tex_height == 0 {
         return;
@@ -110,7 +112,14 @@ fn blend_image(
                 continue;
             }
             let index = ((sy * tex_width + sx) * 4) as usize;
-            let alpha = (rgba[index + 3] as f32 * opacity.clamp(0.0, 1.0)) as u8;
+            // `ltOpaque` layers present through `TVPCopyOpaqueImage`, which
+            // ignores the stored alpha (`LayerIntf.cpp:5191`); the GPU shader
+            // applies the same rule via `force_opaque`.
+            let alpha = if opaque {
+                (opacity.clamp(0.0, 1.0) * 255.0) as u8
+            } else {
+                (rgba[index + 3] as f32 * opacity.clamp(0.0, 1.0)) as u8
+            };
             blend_pixel(canvas, width, x, y, &rgba[index..index + 4], alpha);
         }
     }

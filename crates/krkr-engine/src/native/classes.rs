@@ -874,6 +874,7 @@ fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     runtime.register_object_native(handle, "setPos", window_set_pos);
     runtime.register_object_native(handle, "setSize", window_set_size);
     runtime.register_object_native(handle, "setInnerSize", window_set_inner_size);
+    runtime.register_object_native(handle, "setZoom", window_set_zoom);
 }
 
 fn window_finalize(
@@ -1098,6 +1099,37 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "setSize", layer_set_size);
     register_native_method_preserving_script(runtime, handle, "setImagePos", layer_set_image_pos);
     register_native_method_preserving_script(runtime, handle, "setImageSize", layer_set_image_size);
+    register_native_method_preserving_script(runtime, handle, "setClip", layer_set_clip);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "getMainPixel",
+        layer_get_main_pixel,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "setMainPixel",
+        layer_set_main_pixel,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "getMaskPixel",
+        layer_get_mask_pixel,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "setMaskPixel",
+        layer_set_mask_pixel,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "setCursorPos",
+        layer_set_cursor_pos,
+    );
     register_native_method_preserving_script(
         runtime,
         handle,
@@ -1140,6 +1172,18 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "piledCopy", layer_piled_copy);
     register_native_method_preserving_script(runtime, handle, "stretchCopy", layer_stretch_copy);
     register_native_method_preserving_script(runtime, handle, "affineCopy", layer_affine_copy);
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "operateStretch",
+        layer_operate_stretch,
+    );
+    register_native_method_preserving_script(
+        runtime,
+        handle,
+        "operateAffine",
+        layer_operate_affine,
+    );
     register_native_method_preserving_script(runtime, handle, "drawText", layer_draw_text);
     register_native_method_preserving_script(runtime, handle, "drawGlyph", layer_draw_glyph);
     register_native_method_preserving_script(runtime, handle, "getProvincePixel", layer_zero);
@@ -1772,6 +1816,8 @@ fn allocate_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -
         layer.image_left = 0.0;
         layer.image_top = 0.0;
         layer.set_image(image);
+        // `AllocateImage` resets the clip (`LayerIntf.cpp:2056`).
+        layer.clip = None;
     });
     set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(0));
     set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(0));
@@ -1800,6 +1846,8 @@ fn change_layer_image_size(
         layer.image_width = width as f32;
         layer.image_height = height as f32;
         layer.image = Some(image);
+        // `ChangeImageSize` ends with `ResetClip()` (`LayerIntf.cpp:2040`).
+        layer.clip = None;
     });
     set_layer_property_storage(runtime, handle, "imageWidth", Variant::Integer(width));
     set_layer_property_storage(runtime, handle, "imageHeight", Variant::Integer(height));
@@ -2967,6 +3015,8 @@ fn apply_loaded_image_to_layer(
     options: LayerLoadImageOptions,
 ) {
     layer.set_image(image);
+    // `LoadImages` resets the clip (`LayerIntf.cpp:2494`).
+    layer.clip = None;
     if let Some(visible) = options.visible {
         layer.visible = visible;
     }
@@ -4235,6 +4285,242 @@ fn layer_stop_transition(
     Ok(Variant::Void)
 }
 
+/// `StretchCopy` / `AffineCopy` / `PiledCopy` use `bmCopy` at full opacity;
+/// on a dfOpaque destination `HoldAlpha` switches it to MAIN only
+/// (`LayerIntf.cpp:4289`).
+fn copy_blt_for_layer(runtime: &Runtime<KrkrHost>, this: ObjectHandle) -> blend::Blt {
+    if effective_draw_face(runtime, this) == DF_MAIN && layer_holds_alpha(runtime, this) {
+        blend::Blt::CopyColor
+    } else {
+        blend::Blt::CopyMask
+    }
+}
+
+/// `tTJSNI_BaseLayer::SetCursorPos` (`LayerIntf.cpp`): converts the layer
+/// point to window coordinates and asks the layer tree owner to move the
+/// cursor. Kirakira records it as the host cursor position, which is what
+/// `cursorX`/`cursorY` and the next input event read.
+fn layer_set_cursor_pos(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, _target) = this_render_layer_target(runtime, this_obj)?;
+    let x = required_integer(&args, 0, "Layer.setCursorPos x")?;
+    let y = required_integer(&args, 1, "Layer.setCursorPos y")?;
+    let origin = runtime
+        .host()
+        .native_layer(this)
+        .and_then(|layer_id| runtime.host().layer_tree().absolute_position(layer_id))
+        .unwrap_or(krkr_core::Point::new(0.0, 0.0));
+    runtime.host_mut().set_cursor_position(krkr_core::Point::new(
+        origin.x + x as f32,
+        origin.y + y as f32,
+    ));
+    Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseWindow::SetZoom` (`WindowImpl.cpp:1819` → `WindowFormUnit.cpp:681`):
+/// reduces the fraction and stores `zoomNumer`/`zoomDenom`, which the window's
+/// paint-box sizing and dialogs read.
+fn window_set_zoom(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let this = this_obj.ok_or_else(|| TjsError::runtime("Window.setZoom requires this"))?;
+    let mut numer = optional_integer(&args, 0)?.unwrap_or(1);
+    let mut denom = optional_integer(&args, 1)?.unwrap_or(1);
+    if denom == 0 {
+        return Err(TjsError::runtime("Divide by zero"));
+    }
+    let divisor = gcd_i64(numer.abs(), denom.abs()).max(1);
+    numer /= divisor;
+    denom /= divisor;
+    set_window_property_storage(runtime, this, "zoomNumer", Variant::Integer(numer));
+    set_window_property_storage(runtime, this, "zoomDenom", Variant::Integer(denom));
+    Ok(Variant::Void)
+}
+
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
+
+/// `tTJSNI_BaseLayer::GetMainPixel` (`LayerIntf.cpp:2587`) returns
+/// `TVPFromActualColor(GetPoint & 0xffffff)` — the 24-bit colour, no alpha.
+fn layer_get_main_pixel(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (_this, target) = this_render_layer_target(runtime, this_obj)?;
+    let x = required_integer(&args, 0, "Layer.getMainPixel x")?;
+    let y = required_integer(&args, 1, "Layer.getMainPixel y")?;
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
+    let Some(image) = render_layer_snapshot(runtime, &target).and_then(|layer| layer.image) else {
+        return Err(not_drawable_layer_type());
+    };
+    let (width, height) = (image.upload.width as i64, image.upload.height as i64);
+    if x < 0 || y < 0 || x >= width || y >= height {
+        return Err(TjsError::runtime("Out of rectangle"));
+    }
+    let index = ((y as usize * width as usize) + x as usize) * 4;
+    let pixel = &image.upload.rgba[index..index + 4];
+    Ok(Variant::Integer(
+        (i64::from(pixel[0]) << 16) | (i64::from(pixel[1]) << 8) | i64::from(pixel[2]),
+    ))
+}
+
+/// `tTJSNI_BaseLayer::SetMainPixel` (`LayerIntf.cpp:2593`): writes the 24-bit
+/// colour resolved through `TVPToActualColor`, holding the destination alpha.
+fn layer_set_main_pixel(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
+    let x = required_integer(&args, 0, "Layer.setMainPixel x")?;
+    let y = required_integer(&args, 1, "Layer.setMainPixel y")?;
+    let color = required_integer(&args, 2, "Layer.setMainPixel color")?;
+    let rgb = packed_color_to_rgba(to_actual_color(color));
+    set_layer_pixel(runtime, this, target, x, y, Some([rgb[0], rgb[1], rgb[2]]), None)
+}
+
+/// `tTJSNI_BaseLayer::GetMaskPixel`: the alpha channel of the main image.
+fn layer_get_mask_pixel(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (_this, target) = this_render_layer_target(runtime, this_obj)?;
+    let x = required_integer(&args, 0, "Layer.getMaskPixel x")?;
+    let y = required_integer(&args, 1, "Layer.getMaskPixel y")?;
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
+    let Some(image) = render_layer_snapshot(runtime, &target).and_then(|layer| layer.image) else {
+        return Err(not_drawable_layer_type());
+    };
+    let (width, height) = (image.upload.width as i64, image.upload.height as i64);
+    if x < 0 || y < 0 || x >= width || y >= height {
+        return Err(TjsError::runtime("Out of rectangle"));
+    }
+    let index = ((y as usize * width as usize) + x as usize) * 4;
+    Ok(Variant::Integer(i64::from(image.upload.rgba[index + 3])))
+}
+
+/// `tTJSNI_BaseLayer::SetMaskPixel`: writes the alpha channel only.
+fn layer_set_mask_pixel(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
+    let x = required_integer(&args, 0, "Layer.setMaskPixel x")?;
+    let y = required_integer(&args, 1, "Layer.setMaskPixel y")?;
+    let mask = required_integer(&args, 2, "Layer.setMaskPixel mask")?;
+    set_layer_pixel(
+        runtime,
+        this,
+        target,
+        x,
+        y,
+        None,
+        Some((mask & 0xff) as u8),
+    )
+}
+
+/// Shared body of the pixel setters: both honour `ClipRect` and both write
+/// into the destination bitmap in place (`SetPointMain` / `SetPointMask`,
+/// `LayerBitmapIntf.cpp:186`).
+fn set_layer_pixel(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+    target: Option<LayerRenderTarget>,
+    x: i64,
+    y: i64,
+    rgb: Option<[u8; 3]>,
+    mask: Option<u8>,
+) -> Result<Variant> {
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
+    if let Some((cx0, cy0, cx1, cy1)) = layer_clip_bounds(runtime, &target)
+        && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
+    {
+        return Ok(Variant::Void);
+    }
+    let mut out_of_rectangle = false;
+    mutate_layer_pixels(runtime, &target, |pixels, width, height| {
+        if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
+            out_of_rectangle = true;
+            return;
+        }
+        let index = ((y as usize * width as usize) + x as usize) * 4;
+        if let Some(rgb) = rgb {
+            pixels[index..index + 3].copy_from_slice(&rgb);
+        }
+        if let Some(mask) = mask {
+            pixels[index + 3] = mask;
+        }
+    })?;
+    if out_of_rectangle {
+        return Err(TjsError::runtime("Out of rectangle"));
+    }
+    mark_image_modified(runtime, this);
+    Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseLayer::SetClip` / `ResetClip` (`LayerIntf.cpp`). Four
+/// arguments set a layer-local clip rectangle; no arguments reset it to the
+/// layer rectangle. Every blit and fill is clipped to it.
+fn layer_set_clip(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let (_this, target) = this_render_layer_target(runtime, this_obj)?;
+    let clip = if args.len() >= 4 {
+        let x = optional_integer(&args, 0)?.unwrap_or(0);
+        let y = optional_integer(&args, 1)?.unwrap_or(0);
+        let width = optional_integer(&args, 2)?.unwrap_or(0).max(0);
+        let height = optional_integer(&args, 3)?.unwrap_or(0).max(0);
+        Some(krkr_core::Rect::new(
+            x as f32,
+            y as f32,
+            width as f32,
+            height as f32,
+        ))
+    } else {
+        None
+    };
+    if let Some(target) = target {
+        mutate_render_layer(runtime, &target, |layer| layer.clip = clip);
+    }
+    Ok(Variant::Void)
+}
+
+/// The active `ClipRect` in image coordinates, or `None` for `ResetClip`.
+fn layer_clip_bounds(
+    runtime: &Runtime<KrkrHost>,
+    target: &LayerRenderTarget,
+) -> Option<(i64, i64, i64, i64)> {
+    let clip = render_layer_snapshot(runtime, target)?.clip?;
+    Some((
+        clip.x.round() as i64,
+        clip.y.round() as i64,
+        (clip.x + clip.width).round() as i64,
+        (clip.y + clip.height).round() as i64,
+    ))
+}
+
 fn layer_fill_rect(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -4459,6 +4745,25 @@ fn layer_piled_copy(
         return Ok(Variant::Void);
     }
 
+    // `PiledCopy` clips to `ClipRect` like every other blit
+    // (`LayerIntf.cpp:4115`).
+    let clip = layer_clip_bounds(runtime, &dest_target);
+    let (x0, y0, x1, y1) = clip_rect_to_layer_clip(
+        clip,
+        dx.max(0) as u32,
+        dy.max(0) as u32,
+        (dx + width).max(0) as u32,
+        (dy + height).max(0) as u32,
+    );
+    if x1 <= x0 || y1 <= y0 {
+        return Ok(Variant::Void);
+    }
+    let (dx, dy, width, height) = (
+        x0 as i64,
+        y0 as i64,
+        (x1 - x0) as i64,
+        (y1 - y0) as i64,
+    );
     mutate_layer_pixels_min(
         runtime,
         &dest_target,
@@ -4489,6 +4794,25 @@ fn layer_stretch_copy(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
+) -> Result<Variant> {
+    stretch_copy_impl(runtime, this_obj, args, false)
+}
+
+/// Official `operateStretch` (`LayerIntf.cpp:7315`):
+/// `dx, dy, dw, dh, src, sx, sy, sw, sh, mode=omAuto, opa=255, type=0`.
+fn layer_operate_stretch(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    stretch_copy_impl(runtime, this_obj, args, true)
+}
+
+fn stretch_copy_impl(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+    operate: bool,
 ) -> Result<Variant> {
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
     if is_province_face(runtime, this) {
@@ -4524,6 +4848,26 @@ fn layer_stretch_copy(
     let source_texture_width = source_image.upload.width;
     let source_texture_height = source_image.upload.height;
 
+    let blt = if operate {
+        let mut mode = optional_integer(&args, 9)?.unwrap_or(OM_AUTO);
+        if mode == OM_AUTO {
+            let source_type = layer_property_value(runtime, source_object, "type")
+                .to_integer()
+                .unwrap_or(2);
+            mode = operation_mode_from_layer_type(source_type);
+        }
+        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
+            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
+    } else {
+        copy_blt_for_layer(runtime, this)
+    };
+    let opacity = if operate {
+        optional_integer(&args, 10)?.unwrap_or(255).clamp(0, 255)
+    } else {
+        255
+    };
+    let hold_alpha = layer_holds_alpha(runtime, this);
+    let clip = layer_clip_bounds(runtime, &dest_target);
     mutate_layer_pixels_min(
         runtime,
         &dest_target,
@@ -4545,6 +4889,10 @@ fn layer_stretch_copy(
                 sy,
                 source_width,
                 source_height,
+                blt,
+                opacity,
+                hold_alpha,
+                clip,
             );
         },
     )?;
@@ -4560,6 +4908,25 @@ fn layer_affine_copy(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
+) -> Result<Variant> {
+    affine_copy_impl(runtime, this_obj, args, false)
+}
+
+/// Official `operateAffine` (`LayerIntf.cpp:7455`):
+/// `src, sx, sy, sw, sh, affine, a, b, c, d, tx, ty, mode=omAuto, opa=255, type=0`.
+fn layer_operate_affine(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    affine_copy_impl(runtime, this_obj, args, true)
+}
+
+fn affine_copy_impl(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+    operate: bool,
 ) -> Result<Variant> {
     if args.len() < 12 {
         return Err(TjsError::runtime("Layer.affineCopy requires 12 arguments"));
@@ -4621,6 +4988,26 @@ fn layer_affine_copy(
             (values[4], values[5]),
         ]
     };
+    let blt = if operate {
+        let mut mode = optional_integer(&args, 13)?.unwrap_or(OM_AUTO);
+        if mode == OM_AUTO {
+            let source_type = layer_property_value(runtime, source_object, "type")
+                .to_integer()
+                .unwrap_or(2);
+            mode = operation_mode_from_layer_type(source_type);
+        }
+        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
+            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
+    } else {
+        copy_blt_for_layer(runtime, this)
+    };
+    let opacity = if operate {
+        optional_integer(&args, 14)?.unwrap_or(255).clamp(0, 255)
+    } else {
+        255
+    };
+    let hold_alpha = layer_holds_alpha(runtime, this);
+    let clip = layer_clip_bounds(runtime, &dest_target);
     mutate_layer_pixels(runtime, &dest_target, |pixels, dest_width, dest_height| {
         if clear {
             clear_affine_destination(pixels, dest_width, dest_height, points, clear_color);
@@ -4637,6 +5024,10 @@ fn layer_affine_copy(
             source_width,
             source_height,
             points,
+            blt,
+            opacity,
+            hold_alpha,
+            clip,
         );
     })?;
     mark_image_modified(runtime, this);
@@ -4736,6 +5127,7 @@ fn copy_rect_impl(
         LayerCopyKind::Operate => optional_integer(&args, 8)?.unwrap_or(255).clamp(0, 255),
         LayerCopyKind::Copy => 255,
     };
+    let clip = layer_clip_bounds(runtime, &dest_target);
 
     mutate_layer_pixels(
         runtime,
@@ -4757,6 +5149,7 @@ fn copy_rect_impl(
                 blt,
                 opacity,
                 hold_alpha,
+                clip,
             );
         },
     )?;
@@ -5917,6 +6310,9 @@ fn copy_layer_images(
         dest.image_top = source.image_top;
         dest.image_width = source.image_width;
         dest.image_height = source.image_height;
+        // `AssignImages` → `InternalSetImageSize` → `ChangeImageSize`
+        // resets the clip (`LayerIntf.cpp:2139`).
+        dest.clip = None;
         if dest.width <= 0.0 || dest.height <= 0.0 {
             dest.width = source.width;
             dest.height = source.height;
@@ -6717,7 +7113,14 @@ pub(crate) fn to_actual_color(color: i64) -> i64 {
     if raw & 0xff00_0000 == 0 {
         return color;
     }
-    i64::from(*SYSTEM_COLORS.get((raw & 0xff) as usize).unwrap_or(&0))
+    if raw & 0x8000_0000 != 0 {
+        return i64::from(*SYSTEM_COLORS.get((raw & 0xff) as usize).unwrap_or(&0));
+    }
+    // `ColorToRGB` only consults the palette for identifiers with the sign bit
+    // set; any other colour with a high byte passes through as `0xBBGGRR`, and
+    // `TVPToActualColor` swaps it back to `0xRRGGBB`.
+    let bgr = raw & 0x00ff_ffff;
+    i64::from(((bgr & 0xff) << 16) | (bgr & 0xff00) | ((bgr & 0xff0000) >> 16))
 }
 
 fn mutate_layer_pixels<F>(
@@ -6829,15 +7232,17 @@ fn fill_layer_pixels(
         .unwrap_or_else(|| layer.image_height.max(layer.height).max(1.0) as u32)
         .max(1);
 
+    let clip = layer_clip_bounds(runtime, target);
     let x0 = x.max(0) as u32;
     let y0 = y.max(0) as u32;
     let x1 = (x + width).clamp(0, image_width as i64) as u32;
     let y1 = (y + height).clamp(0, image_height as i64) as u32;
+    let (x0, y0, x1, y1) = clip_rect_to_layer_clip(clip, x0, y0, x1, y1);
     if x1 <= x0 || y1 <= y0 {
         return Ok(());
     }
 
-    if x0 == 0 && y0 == 0 && x1 == image_width && y1 == image_height {
+    if x0 == 0 && y0 == 0 && x1 == image_width && y1 == image_height && clip.is_none() {
         let mut pixels = vec![0; image_width as usize * image_height as usize * 4];
         if rgba != [0, 0, 0, 0] {
             fill_pixel_buffer(&mut pixels, rgba);
@@ -6859,6 +7264,12 @@ fn fill_layer_pixels(
         return Ok(());
     }
 
+    let (x, y, width, height) = (
+        x0 as i64,
+        y0 as i64,
+        (x1 - x0) as i64,
+        (y1 - y0) as i64,
+    );
     mutate_layer_pixels_min_with_host(
         runtime,
         target,
@@ -6867,6 +7278,25 @@ fn fill_layer_pixels(
         |_, pixels, _, _| {
             fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
         },
+    )
+}
+
+/// Trim an image-space rectangle to the layer's active `ClipRect`.
+fn clip_rect_to_layer_clip(
+    clip: Option<(i64, i64, i64, i64)>,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> (u32, u32, u32, u32) {
+    let Some((cx0, cy0, cx1, cy1)) = clip else {
+        return (x0, y0, x1, y1);
+    };
+    (
+        x0.max(cx0.max(0) as u32),
+        y0.max(cy0.max(0) as u32),
+        x1.min(cx1.max(0) as u32),
+        y1.min(cy1.max(0) as u32),
     )
 }
 
@@ -6886,11 +7316,13 @@ fn blend_layer_pixels<F>(
 where
     F: Fn(&mut [u8]),
 {
+    let clip = layer_clip_bounds(runtime, target);
     mutate_layer_pixels(runtime, target, |pixels, image_width, image_height| {
         let x0 = x.max(0) as u32;
         let y0 = y.max(0) as u32;
         let x1 = (x + width).clamp(0, image_width as i64) as u32;
         let y1 = (y + height).clamp(0, image_height as i64) as u32;
+        let (x0, y0, x1, y1) = clip_rect_to_layer_clip(clip, x0, y0, x1, y1);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -6981,6 +7413,10 @@ fn affine_copy_pixels(
     source_width: i64,
     source_height: i64,
     points: [(f64, f64); 3],
+    blt: blend::Blt,
+    opacity: i64,
+    hold_alpha: bool,
+    clip: Option<(i64, i64, i64, i64)>,
 ) {
     let [(x0, y0), (x1, y1), (x2, y2)] = points;
     let ux = x1 - x0;
@@ -6997,6 +7433,19 @@ fn affine_copy_pixels(
     let max_x = x0.max(x1).max(x2).max(x3).ceil().min(dest_width as f64) as i64;
     let min_y = y0.min(y1).min(y2).min(y3).floor().max(0.0) as i64;
     let max_y = y0.max(y1).max(y2).max(y3).ceil().min(dest_height as f64) as i64;
+    let (min_x, min_y, max_x, max_y) = clip_rect_to_layer_clip(
+        clip,
+        min_x.max(0) as u32,
+        min_y.max(0) as u32,
+        max_x.max(0) as u32,
+        max_y.max(0) as u32,
+    );
+    let (min_x, min_y, max_x, max_y) = (
+        min_x as i64,
+        min_y as i64,
+        max_x as i64,
+        max_y as i64,
+    );
     for dy in min_y..max_y {
         for dx in min_x..max_x {
             // KRKR's AffineBlt receives points in pixel coordinates.  The
@@ -7023,8 +7472,20 @@ fn affine_copy_pixels(
             }
             let source_offset = ((src_y as u32 * texture_width + src_x as u32) * 4) as usize;
             let dest_offset = ((dy as u32 * dest_width + dx as u32) * 4) as usize;
-            dest[dest_offset..dest_offset + 4]
-                .copy_from_slice(&source[source_offset..source_offset + 4]);
+            let d = u32::from_le_bytes([
+                dest[dest_offset],
+                dest[dest_offset + 1],
+                dest[dest_offset + 2],
+                dest[dest_offset + 3],
+            ]);
+            let s = u32::from_le_bytes([
+                source[source_offset],
+                source[source_offset + 1],
+                source[source_offset + 2],
+                source[source_offset + 3],
+            ]);
+            let out = blend::blt_pixel(d, s, blt, opacity as u32, hold_alpha);
+            dest[dest_offset..dest_offset + 4].copy_from_slice(&out.to_le_bytes());
         }
     }
 }
@@ -7086,6 +7547,7 @@ fn copy_pixels(
     method: blend::Blt,
     opacity: i64,
     hold_alpha: bool,
+    clip: Option<(i64, i64, i64, i64)>,
 ) {
     let Some((dx, dy, sx, sy, width, height)) = clipped_copy_rect(
         dx,
@@ -7098,6 +7560,7 @@ fn copy_pixels(
         dest_height as i64,
         source_width as i64,
         source_height as i64,
+        clip,
     ) else {
         return;
     };
@@ -7363,6 +7826,10 @@ fn stretch_copy_pixels(
     sy: i64,
     source_rect_width: i64,
     source_rect_height: i64,
+    blt: blend::Blt,
+    opacity: i64,
+    hold_alpha: bool,
+    clip: Option<(i64, i64, i64, i64)>,
 ) {
     if dest_rect_width <= 0
         || dest_rect_height <= 0
@@ -7379,6 +7846,19 @@ fn stretch_copy_pixels(
     let dest_y1 = dy
         .saturating_add(dest_rect_height)
         .clamp(0, dest_height as i64);
+    let (dest_x0, dest_y0, dest_x1, dest_y1) = clip_rect_to_layer_clip(
+        clip,
+        dest_x0 as u32,
+        dest_y0 as u32,
+        dest_x1 as u32,
+        dest_y1 as u32,
+    );
+    let (dest_x0, dest_y0, dest_x1, dest_y1) = (
+        dest_x0 as i64,
+        dest_y0 as i64,
+        dest_x1 as i64,
+        dest_y1 as i64,
+    );
     if dest_x1 <= dest_x0 || dest_y1 <= dest_y0 {
         return;
     }
@@ -7402,8 +7882,20 @@ fn stretch_copy_pixels(
             if source_index + 4 > source.len() || dest_index + 4 > dest.len() {
                 continue;
             }
-            dest[dest_index..dest_index + 4]
-                .copy_from_slice(&source[source_index..source_index + 4]);
+            let d = u32::from_le_bytes([
+                dest[dest_index],
+                dest[dest_index + 1],
+                dest[dest_index + 2],
+                dest[dest_index + 3],
+            ]);
+            let s = u32::from_le_bytes([
+                source[source_index],
+                source[source_index + 1],
+                source[source_index + 2],
+                source[source_index + 3],
+            ]);
+            let out = blend::blt_pixel(d, s, blt, opacity as u32, hold_alpha);
+            dest[dest_index..dest_index + 4].copy_from_slice(&out.to_le_bytes());
         }
     }
 }
@@ -7427,6 +7919,7 @@ fn dest_min_extent(offset: i64, length: i64) -> u32 {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn clipped_copy_rect(
     mut dx: i64,
     mut dy: i64,
@@ -7438,9 +7931,31 @@ fn clipped_copy_rect(
     dest_height: i64,
     source_width: i64,
     source_height: i64,
+    clip: Option<(i64, i64, i64, i64)>,
 ) -> Option<(i64, i64, i64, i64, i64, i64)> {
     if width <= 0 || height <= 0 {
         return None;
+    }
+    // `ClipDestPointAndSrcRect` (`LayerIntf.cpp:3755`) trims the destination
+    // rectangle to `ClipRect` and shifts the source accordingly.
+    if let Some((cx0, cy0, cx1, cy1)) = clip {
+        if dx < cx0 {
+            let delta = cx0 - dx;
+            dx = cx0;
+            sx += delta;
+            width -= delta;
+        }
+        if dy < cy0 {
+            let delta = cy0 - dy;
+            dy = cy0;
+            sy += delta;
+            height -= delta;
+        }
+        width = width.min(cx1 - dx).max(0);
+        height = height.min(cy1 - dy).max(0);
+        if width <= 0 || height <= 0 {
+            return None;
+        }
     }
     if sx < 0 {
         let delta = -sx;

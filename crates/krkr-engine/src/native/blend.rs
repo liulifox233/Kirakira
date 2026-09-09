@@ -135,7 +135,7 @@ pub(crate) fn blt_row(dest: &mut [u8], src: &[u8], blt: Blt, opacity: u32, hda: 
     }
 }
 
-fn blt_pixel(d: u32, s: u32, blt: Blt, opacity: u32, hda: bool) -> u32 {
+pub(crate) fn blt_pixel(d: u32, s: u32, blt: Blt, opacity: u32, hda: bool) -> u32 {
     match blt {
         Blt::CopyMask => s,
         Blt::CopyColor => (d & 0xff00_0000) | (s & 0x00ff_ffff),

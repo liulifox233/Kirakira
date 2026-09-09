@@ -1126,6 +1126,10 @@ pub struct LayerNode {
     pub hit_type: i32,
     pub hit_threshold: i32,
     pub image: Option<LayerImage>,
+    /// Official `tTJSNI_BaseLayer::ClipRect` (`LayerIntf.cpp`): every blit and
+    /// fill is clipped to this layer-local rectangle. `None` is the
+    /// `ResetClip()` state, where the clip equals the layer rectangle.
+    pub clip: Option<Rect>,
 }
 
 impl LayerNode {
@@ -1158,6 +1162,7 @@ impl LayerNode {
             hit_type: 0,
             hit_threshold: 0,
             image: None,
+            clip: None,
         }
     }
 
