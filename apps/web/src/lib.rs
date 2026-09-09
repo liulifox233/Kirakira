@@ -1885,7 +1885,7 @@ impl AssetScheduler for WebResourceStore {
             .borrow_mut()
             .insert(cache_key.clone(), vec![waiter]);
         web_log(format!(
-            "asset fetch queued: {normalized} -> {} (request {})",
+            "asset fetch queued: {normalized} [{kind:?}] -> {} (request {})",
             entry.path, id.0
         ));
         Self::fetch_entry(

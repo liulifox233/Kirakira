@@ -3,6 +3,7 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::host::KrkrHost;
@@ -368,6 +369,9 @@ fn system_create_uuid(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let ticks = runtime.host_mut().now_millis() as u64;
+    #[cfg(target_arch = "wasm32")]
+    let nanos = ticks;
+    #[cfg(not(target_arch = "wasm32"))]
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)

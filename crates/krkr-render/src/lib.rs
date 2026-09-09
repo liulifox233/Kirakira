@@ -72,6 +72,12 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Format for uploaded bitmaps, matched to the surface's encoding.
+    ///
+    /// WebGPU canvases only accept non-sRGB formats, so an sRGB texture would
+    /// be linearised on sample and written to the canvas without the matching
+    /// linear->sRGB encode, darkening every image.
+    image_texture_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     texture_pipeline: TexturePipelineResources,
     transition_pipeline: TransitionPipelineResources,
@@ -156,11 +162,17 @@ impl Renderer {
             .map_err(RendererInitError::RequestDevice)?;
 
         let capabilities = surface.get_capabilities(&adapter);
+        // TVP presents 8-bit display-referred values unchanged, and the engine
+        // feeds sRGB-normalized colors and bitmaps. A non-sRGB target keeps
+        // that pass-through; an sRGB target would treat fragment output as
+        // linear and re-encode it, so a mid-gray fill would brighten. WebGPU
+        // canvases only expose non-sRGB formats anyway, so this also makes the
+        // desktop and browser paths agree.
         let format = capabilities
             .formats
             .iter()
             .copied()
-            .find(wgpu::TextureFormat::is_srgb)
+            .find(|format| !format.is_srgb())
             .or_else(|| capabilities.formats.first().copied())
             .ok_or(RendererInitError::NoSurfaceFormats)?;
         let present_mode = if capabilities
@@ -198,12 +210,18 @@ impl Renderer {
         let pipeline = create_rect_pipeline(&device, format);
         let texture_pipeline = TexturePipelineResources::new(&device, format);
         let transition_pipeline = TransitionPipelineResources::new(&device, format);
+        let image_texture_format = if format.is_srgb() {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
 
         Ok(Self {
             surface,
             device,
             queue,
             config,
+            image_texture_format,
             pipeline,
             texture_pipeline,
             transition_pipeline,
@@ -438,7 +456,7 @@ impl Renderer {
         if let (Some((_, path)), Some((buffer, width, height))) =
             (capture_texture, capture_texture_buffer)
         {
-            // Uploaded textures are Rgba8UnormSrgb, so no BGRA swap.
+            // Uploaded textures always use an RGBA format, so no BGRA swap.
             if let Err(error) = self.save_capture_buffer(&buffer, &path, width, height, false) {
                 eprintln!("[krkr-render][warn] texture capture failed: {error}");
             }
@@ -587,7 +605,7 @@ impl Renderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: self.image_texture_format,
                 usage: if self.capture_enabled {
                     wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::COPY_DST

@@ -622,10 +622,11 @@ impl ProjectStorage {
         self.catalog_contains(name)
     }
 
-    /// Returns whether a deferred publication catalogue can satisfy a logical
-    /// name even though its bytes have not been fetched. This mirrors the
-    /// ordinary root/basename lookup without claiming that the resource is
-    /// already resident in memory.
+    /// Returns whether a deferred publication catalogue holds `name` exactly,
+    /// even though its bytes have not been fetched. This mirrors
+    /// `Storages.isExistentStorage`, which is an exact probe in KRKR
+    /// (`TVPGetPlacedPath`): it must not suggest extensions, or `title` would
+    /// appear present because `title.ks` exists.
     pub fn catalog_contains(&self, name: &str) -> bool {
         let normalized = normalize_storage_separators(name);
         let Ok(catalog) = self.inner.catalog_paths.read() else {
@@ -650,6 +651,52 @@ impl ProjectStorage {
                 .is_some_and(|file| file.eq_ignore_ascii_case(&normalized))
         });
         matches.next().is_some() && matches.next().is_none()
+    }
+
+    /// Returns whether a deferred publication catalogue can satisfy a *load*
+    /// of `name`. KRKR suggests extensions one layer above storage lookup
+    /// (`TVPInternalLoadGraphic` walks the registered graphic handlers), so
+    /// `PageBreak` must reach `PageBreak.png` and not the `PageBreak.asd`
+    /// sidecar that shares its stem. The candidate order is the ordinary
+    /// resolver's: the requested name plus its known extensions against the
+    /// root and each auto path, then a unique basename for an explicitly
+    /// extended name.
+    pub fn catalog_contains_for_load(&self, name: &str) -> bool {
+        self.catalog_load_path(name).is_some()
+    }
+
+    fn catalog_load_path(&self, name: &str) -> Option<String> {
+        let normalized = normalize_storage_separators(name);
+        let Ok(catalog) = self.inner.catalog_paths.read() else {
+            return None;
+        };
+        let lookup = |candidate: &str| {
+            catalog_path(candidate).and_then(|key| catalog.get(&key).cloned())
+        };
+        if let Ok(candidates) = self.storage_candidates(&normalized) {
+            for candidate in &candidates {
+                if split_archive_candidate(candidate).is_some() {
+                    continue;
+                }
+                if let Some(path) = lookup(candidate) {
+                    return Some(path);
+                }
+            }
+        }
+        // An explicitly extended bare name may use a unique auto-path
+        // basename. Ambiguous basenames remain unresolved; an explicitly
+        // qualified path was already checked above. Do not let `startup.ks`
+        // make `startup.tjs` appear present merely because both share a stem.
+        if normalized.contains('/') || !normalized.contains('.') {
+            return None;
+        }
+        let mut matches = catalog.values().filter(|path| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|file| file.eq_ignore_ascii_case(&normalized))
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then(|| first.clone())
     }
 
     /// Returns whether a logical directory exists in the filesystem, XP3
@@ -1525,6 +1572,10 @@ impl krkr_core::ProjectStoragePort for ProjectStorage {
 
     fn catalog_contains(&self, name: &str) -> bool {
         ProjectStorage::catalog_contains(self, name)
+    }
+
+    fn catalog_contains_for_load(&self, name: &str) -> bool {
+        ProjectStorage::catalog_contains_for_load(self, name)
     }
 
     fn set_catalog_paths(&self, paths: &[String]) {
@@ -2500,6 +2551,30 @@ mod tests {
         );
         assert!(!ambiguous.storage_exists_exact("portrait.txt"));
         assert!(ambiguous.read_binary_vec("portrait.txt").is_err());
+    }
+
+    #[test]
+    fn catalog_resolves_extensionless_name_for_loads_only() {
+        // A translation overlay publishes `backlog_base.png` at the package
+        // root while the base archive keeps `image/backlog_base.png`. An
+        // extensionless *load* must see the deferred resource so the Web host
+        // can fetch it, while the exact probe stays exact like
+        // `Storages.isExistentStorage`.
+        let storage = ProjectStorage::from_memory_with_catalog(
+            [("image/backlog_base.png", b"image".to_vec())],
+            ["backlog_base.png", "image/backlog_base.png"],
+        );
+        assert!(!storage.catalog_contains("backlog_base"));
+        assert!(storage.catalog_contains_for_load("backlog_base"));
+        assert!(storage.storage_exists("backlog_base"));
+
+        let nested_only = ProjectStorage::from_memory_with_catalog(
+            [("image/title.png", b"title".to_vec())],
+            ["image/title.png"],
+        );
+        assert!(!nested_only.catalog_contains_for_load("title"));
+        nested_only.add_auto_path("image/");
+        assert!(nested_only.catalog_contains_for_load("title"));
     }
 
     #[test]

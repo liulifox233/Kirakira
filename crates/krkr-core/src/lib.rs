@@ -249,6 +249,11 @@ pub trait ProjectStoragePort: StoragePort {
 
     fn catalog_contains(&self, name: &str) -> bool;
 
+    /// Load-time counterpart of [`Self::catalog_contains`]: whether a deferred
+    /// asset can satisfy a read of `name` once storage extensions are
+    /// suggested, the way KRKR's graphic/sound loaders do.
+    fn catalog_contains_for_load(&self, name: &str) -> bool;
+
     /// Replaces deferred logical names for a new package while retaining
     /// resident memory files owned by this storage view.
     fn set_catalog_paths(&self, paths: &[String]);

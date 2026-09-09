@@ -398,6 +398,9 @@ pub struct KrkrHost {
     external_resource_catalog: BTreeSet<String>,
     pending_external_resources: BTreeMap<(String, AssetKind), ()>,
     system_hooks: BTreeMap<String, SystemHookRegistration>,
+    /// `Instant::now` is unsupported on browser WASM; that target reads the
+    /// host-provided virtual clock in `tick_count_millis` instead.
+    #[cfg(not(target_arch = "wasm32"))]
     tick_start: Instant,
 }
 
@@ -471,6 +474,7 @@ impl Default for KrkrHost {
             external_resource_catalog: BTreeSet::new(),
             pending_external_resources: BTreeMap::new(),
             system_hooks: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             tick_start: Instant::now(),
         }
     }
@@ -732,6 +736,9 @@ impl KrkrHost {
         TjsError::resource_pending(path.to_string())
     }
 
+    /// Whether a deferred Web asset can satisfy a *load* of `path`. This is
+    /// the load-time probe (extensions suggested), not the exact
+    /// `Storages.isExistentStorage` probe used by `storage_exists_exact`.
     fn is_external_resource(&self, path: &str) -> bool {
         self.external_resource_catalog
             .iter()
@@ -739,7 +746,7 @@ impl KrkrHost {
             || self
                 .project_storage
                 .as_ref()
-                .is_some_and(|storage| storage.catalog_contains(path))
+                .is_some_and(|storage| storage.catalog_contains_for_load(path))
     }
 
     pub fn resource_provider(&self) -> Option<Arc<dyn StoragePort>> {
@@ -992,10 +999,22 @@ impl KrkrHost {
     }
 
     pub(crate) fn read_binary_storage_for_tjs(&mut self, name: &str) -> Result<Vec<u8>> {
+        self.read_binary_storage_for_kind(name, AssetKind::Binary)
+    }
+
+    /// Reads raw bytes for a load whose deferred Web asset must be fetched
+    /// under a specific kind. An image load has to request `AssetKind::Image`
+    /// so the publication resolves it like KRKR's graphic loader, which only
+    /// suggests graphic extensions and never a same-stem binary sidecar.
+    pub(crate) fn read_binary_storage_for_kind(
+        &mut self,
+        name: &str,
+        kind: AssetKind,
+    ) -> Result<Vec<u8>> {
         match self.read_binary_storage(name) {
             Ok(bytes) => Ok(bytes),
             Err(_) if self.is_external_resource(name) => {
-                Err(self.request_external_resource(name, AssetKind::Binary))
+                Err(self.request_external_resource(name, kind))
             }
             Err(error) => Err(error),
         }
@@ -2056,7 +2075,10 @@ impl KrkrHost {
             return Ok(image.clone());
         }
 
-        let bytes = self.read_binary_storage_for_tjs(name)?;
+        // The decoder consumes raw bytes, but the deferred publication must
+        // resolve the name as an image (`TVPInternalLoadGraphic` suggests
+        // graphic extensions only), not as a same-stem `.asd` sidecar.
+        let bytes = self.read_binary_storage_for_kind(name, AssetKind::Image)?;
         let decoded = decode_image_bytes(&bytes, name).map_err(TjsError::runtime)?;
         let texture_id = self.next_texture_id;
         self.next_texture_id = self.next_texture_id.saturating_add(1);
@@ -2190,7 +2212,11 @@ impl KrkrHost {
             return;
         }
 
-        let start = Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let start: Option<Instant> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = Some(Instant::now());
+        let elapsed = || start.map(|started| started.elapsed()).unwrap_or_default();
         let timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
         let limit_bytes = graphic_cache_limit_bytes(limit);
         let mut touched = 0usize;
@@ -2199,7 +2225,7 @@ impl KrkrHost {
         let mut limit_exceeded = false;
 
         for storage in storages {
-            if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
+            if timeout.is_some_and(|timeout| elapsed() >= timeout) {
                 timed_out = true;
                 break;
             }
@@ -2233,7 +2259,7 @@ impl KrkrHost {
         self.logs.push(format!(
             "touched {touched} image(s), {} bytes in {}ms{reason}",
             bytes,
-            start.elapsed().as_millis()
+            elapsed().as_millis()
         ));
     }
 

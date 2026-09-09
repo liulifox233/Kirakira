@@ -5740,7 +5740,7 @@ mod tests {
         assert!(engine.is_script_suspended());
         assert_eq!(
             engine.take_external_resource_requests(),
-            vec![("sprite.png".to_string(), krkr_core::AssetKind::Binary)]
+            vec![("sprite.png".to_string(), krkr_core::AssetKind::Image)]
         );
         engine
             .provide_external_resource("sprite.png", bytes)
