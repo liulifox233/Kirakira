@@ -1109,6 +1109,15 @@ pub struct LayerNode {
     pub parent: Option<LayerId>,
     pub left: f32,
     pub top: f32,
+    /// Frame translation of the owning window's client origin.
+    ///
+    /// Official KRKR gives every `Window` its own layer tree owner and places
+    /// its client area at the window position, so a dialog's layers are drawn
+    /// where `Window.setPos`/`left`/`top` put the window.  Kirakira composites
+    /// every window into one frame, so the subtree root of a non-main window
+    /// carries the window's offset relative to the main window here.  Only
+    /// render-tree roots are non-zero; children inherit it through traversal.
+    pub window_offset: Point,
     pub width: f32,
     pub height: f32,
     pub image_left: f32,
@@ -1145,6 +1154,7 @@ impl LayerNode {
             parent,
             left: 0.0,
             top: 0.0,
+            window_offset: Point::new(0.0, 0.0),
             width: 0.0,
             height: 0.0,
             image_left: 0.0,
@@ -1366,8 +1376,8 @@ impl LayerTree {
         let mut current = Some(id);
         while let Some(layer_id) = current {
             let layer = self.layers.get(&layer_id)?;
-            x += layer.left;
-            y += layer.top;
+            x += layer.left + layer.window_offset.x;
+            y += layer.top + layer.window_offset.y;
             current = layer.parent;
         }
         Some(Point::new(x, y))
@@ -1455,7 +1465,10 @@ impl LayerTree {
         if !layer.renderable || !layer.visible || layer.opacity == 0 {
             return;
         }
-        let origin = Point::new(parent_origin.x + layer.left, parent_origin.y + layer.top);
+        let origin = Point::new(
+            parent_origin.x + layer.left + layer.window_offset.x,
+            parent_origin.y + layer.top + layer.window_offset.y,
+        );
         let layer_rect = Rect::new(origin.x, origin.y, layer.width, layer.height);
         let Some(clip) = intersect_rect(parent_clip, layer_rect) else {
             return;
@@ -1495,7 +1508,10 @@ impl LayerTree {
             return HitTestOutcome::None;
         }
 
-        let origin = Point::new(parent_origin.x + layer.left, parent_origin.y + layer.top);
+        let origin = Point::new(
+            parent_origin.x + layer.left + layer.window_offset.x,
+            parent_origin.y + layer.top + layer.window_offset.y,
+        );
         let rect = Rect::new(origin.x, origin.y, layer.width, layer.height);
         if !rect.contains(point) {
             return HitTestOutcome::None;

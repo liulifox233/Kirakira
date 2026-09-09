@@ -390,6 +390,11 @@ pub struct KrkrHost {
     clock_offset_millis: i64,
     termination_requested: bool,
     modal_windows: Vec<ObjectHandle>,
+    /// First native `Window` constructed, matching `Window.mainWindow`
+    /// (`classes.rs` assigns it when the class member is still void).  Frame
+    /// coordinates are the main window's client area, so other windows are
+    /// translated by their position relative to this one.
+    main_window: Option<ObjectHandle>,
     external_resource_catalog: BTreeSet<String>,
     pending_external_resources: BTreeMap<(String, AssetKind), ()>,
     system_hooks: BTreeMap<String, SystemHookRegistration>,
@@ -462,6 +467,7 @@ impl Default for KrkrHost {
             clock_offset_millis: 0,
             termination_requested: false,
             modal_windows: Vec::new(),
+            main_window: None,
             external_resource_catalog: BTreeSet::new(),
             pending_external_resources: BTreeMap::new(),
             system_hooks: BTreeMap::new(),
@@ -1274,9 +1280,44 @@ impl KrkrHost {
         handle: ObjectHandle,
         children_array: Option<ObjectHandle>,
     ) {
+        if self.main_window.is_none() {
+            self.main_window = Some(handle);
+        }
         self.native_windows
             .entry(handle)
             .or_insert_with(|| WindowInstance::new(children_array));
+    }
+
+    fn window_position(&self, window: ObjectHandle) -> Point {
+        let left = self
+            .native_window_property(window, "left")
+            .and_then(|value| value.to_integer().ok())
+            .unwrap_or(0);
+        let top = self
+            .native_window_property(window, "top")
+            .and_then(|value| value.to_integer().ok())
+            .unwrap_or(0);
+        Point::new(left as f32, top as f32)
+    }
+
+    /// Offset from the main window's client origin to `window`'s client
+    /// origin.  `Window.left`/`top` are desktop coordinates in KRKR
+    /// (`tTVPWindow::GetLeft` reads the OS window rect) and KAG centers
+    /// dialogs with `((main.width - width) >> 1) + main.left`, so subtracting
+    /// the main window position maps them back onto the single host frame.
+    fn window_frame_offset(&self, window: ObjectHandle) -> Point {
+        let Some(main) = self.main_window else {
+            return Point::new(0.0, 0.0);
+        };
+        if window == main {
+            return Point::new(0.0, 0.0);
+        }
+        let window_position = self.window_position(window);
+        let main_position = self.window_position(main);
+        Point::new(
+            window_position.x - main_position.x,
+            window_position.y - main_position.y,
+        )
     }
 
     pub(crate) fn native_window_property(
@@ -1330,8 +1371,15 @@ impl KrkrHost {
             }
             _ => {}
         }
+        let position_changed = matches!(name.as_str(), "left" | "top");
         window.set_property(name, value);
-        self.apply_window_visibility_to_layers(handle);
+        if position_changed {
+            // The main window is the frame origin, so moving any window changes
+            // the offset every other window's subtree is translated by.
+            self.reapply_all_layer_instances_to_render();
+        } else {
+            self.apply_window_visibility_to_layers(handle);
+        }
     }
 
     pub(crate) fn native_window_closed(&self, handle: ObjectHandle) -> bool {
@@ -1688,6 +1736,10 @@ impl KrkrHost {
         let window_closed = instance
             .window
             .is_some_and(|window| self.native_window_closed(window));
+        let window_offset = instance
+            .window
+            .map(|window| self.window_frame_offset(window))
+            .unwrap_or(Point::new(0.0, 0.0));
         match instance.render_target.clone() {
             LayerRenderTarget::Native(layer_id) => {
                 let render_parent = self
@@ -1697,6 +1749,7 @@ impl KrkrHost {
                 if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
                     apply_layer_properties_to_node(layer, &instance.properties, window_closed);
                     layer.renderable = true;
+                    apply_window_offset_to_node(layer, window_offset);
                 }
             }
             LayerRenderTarget::Kag(slot) => {
@@ -1705,8 +1758,16 @@ impl KrkrHost {
                 }
                 self.mutate_kag_layer(&slot.page, &slot.layer, |layer| {
                     apply_layer_properties_to_node(layer, &instance.properties, window_closed);
+                    apply_window_offset_to_node(layer, window_offset);
                 });
             }
+        }
+    }
+
+    fn reapply_all_layer_instances_to_render(&mut self) {
+        let handles = self.native_layers.keys().copied().collect::<Vec<_>>();
+        for handle in handles {
+            self.apply_layer_instance_to_render(handle);
         }
     }
 
@@ -2987,6 +3048,18 @@ fn apply_layer_properties_to_node(
     {
         layer.z_order = z_order.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
+}
+
+/// Official windows each own a layer tree placed at the window position;
+/// kirakira translates a window's subtree by its offset relative to the main
+/// window.  Only render-tree roots carry it — children accumulate it through
+/// the draw/hit-test traversal.
+fn apply_window_offset_to_node(layer: &mut LayerNode, offset: Point) {
+    layer.window_offset = if layer.parent.is_none() {
+        offset
+    } else {
+        Point::new(0.0, 0.0)
+    };
 }
 
 fn layer_property_i64(properties: &BTreeMap<String, Variant>, name: &str, fallback: i64) -> i64 {

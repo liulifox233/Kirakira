@@ -6396,6 +6396,119 @@ mod tests {
     }
 
     #[test]
+    fn dialog_window_position_translates_its_layer_subtree() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.main = new Window();
+                main.setInnerSize(1024, 576);
+                // KAG centers the game window on the desktop at startup, so
+                // the frame origin is the main window's client origin.
+                main.setPos(100, 50);
+                global.mainLayer = new Layer(main, null);
+                main.add(mainLayer);
+                mainLayer.setSize(1024, 576);
+                mainLayer.setImageSize(1024, 576);
+                mainLayer.fillRect(0, 0, 1024, 576, 0xffffffff);
+                mainLayer.visible = true;
+
+                global.dialog = new Window();
+                global.dialogRoot = new Layer(dialog, null);
+                dialog.add(dialogRoot);
+                dialogRoot.setSize(200, 100);
+                dialogRoot.setImageSize(200, 100);
+                dialogRoot.fillRect(0, 0, 200, 100, 0xffffffff);
+                dialogRoot.visible = true;
+
+                global.dialogButton = new Layer(dialog, dialogRoot);
+                dialogButton.setPos(10, 20);
+                dialogButton.setSize(30, 20);
+                dialogButton.setImageSize(30, 20);
+                dialogButton.fillRect(0, 0, 30, 20, 0xffffffff);
+                dialogButton.visible = true;
+
+                dialog.setInnerSize(200, 100);
+                // `system/YesNoDialog.tjs`: center inside the main window.
+                var win = Window.mainWindow;
+                dialog.setPos((win.width - dialog.width >> 1) + win.left, (win.height - dialog.height >> 1) + win.top);
+                dialog.visible = true;
+                global.dialogRootLeft = dialogRoot.left;
+                "#,
+            )
+            .expect("script");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(1024.0, 576.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("frame");
+
+        let dialog_root = object_handle(&engine, "dialogRoot");
+        let dialog_root_id = engine
+            .host()
+            .native_layer(dialog_root)
+            .expect("native layer");
+        // Desktop (512, 288) minus the main window origin (100, 50).
+        assert_eq!(
+            engine.host().layer_tree().absolute_position(dialog_root_id),
+            Some(Point::new(412.0, 238.0))
+        );
+        // The window translation is a render projection: the layer's own
+        // position stays untouched (`tTJSNI_BaseWindow::SetPosition`).
+        assert_eq!(
+            engine.tjs_runtime().global_member("dialogRootLeft"),
+            Variant::Integer(0)
+        );
+        let main_layer = object_handle(&engine, "mainLayer");
+        let main_layer_id = engine
+            .host()
+            .native_layer(main_layer)
+            .expect("native layer");
+        assert_eq!(
+            engine.host().layer_tree().absolute_position(main_layer_id),
+            Some(Point::new(0.0, 0.0))
+        );
+
+        let texture = engine
+            .host()
+            .layer_tree()
+            .layer(dialog_root_id)
+            .and_then(|layer| layer.image.as_ref())
+            .map(|image| image.upload.texture_id);
+        let dialog_rect = frame
+            .output
+            .draw_commands
+            .iter()
+            .find_map(|command| match command {
+                krkr_core::DrawCommand::Image(image) if Some(image.texture_id) == texture => {
+                    Some(image.rect)
+                }
+                _ => None,
+            })
+            .expect("dialog draw command");
+        assert_eq!(
+            dialog_rect,
+            krkr_core::Rect::new(412.0, 238.0, 200.0, 100.0)
+        );
+
+        // Hit testing uses the same translated coordinates.
+        let dialog_button = object_handle(&engine, "dialogButton");
+        let dialog_button_id = engine
+            .host()
+            .native_layer(dialog_button)
+            .expect("native layer");
+        assert_eq!(
+            engine
+                .host()
+                .layer_tree()
+                .hit_test(Point::new(412.0 + 15.0, 238.0 + 25.0)),
+            Some(dialog_button_id)
+        );
+    }
+
+    #[test]
     fn native_layer_get_layer_at_uses_its_window_primary_and_disabled_semantics() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let result = engine
@@ -16013,6 +16126,13 @@ mod tests {
     fn write_png(path: PathBuf, width: u32, height: u32, rgba: &[u8]) {
         let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).expect("rgba image");
         image.save(path).expect("write png");
+    }
+
+    fn object_handle(engine: &KrkrEngine, name: &str) -> ObjectHandle {
+        match engine.tjs_runtime().global_member(name) {
+            Variant::Object(handle) => handle,
+            _ => panic!("{name} missing"),
+        }
     }
 
     fn image_command_count(frame: &EngineFrame) -> usize {
