@@ -25,6 +25,7 @@ use krkr_tjs2::{
 use krkr_video::{UnavailableVideoFactory, VideoDecoderFactory};
 
 use crate::{
+    KrkrPlugin,
     native::video::VideoOverlayState,
     resource_manager::{DecodedImageData, ResourceManager, ResourceTaskId, decode_image_bytes},
     scheduler::{AsyncTriggerMode, TvpScheduler},
@@ -104,27 +105,28 @@ fn parse_trace_mask(value: &str) -> u8 {
     mask
 }
 
+/// `TVPGetCommandLine` compares an option against the raw program arguments
+/// with the leading dash included and without folding case, so scripts ask for
+/// `System.getArgument("-debugwin")`.  `-name=value` carries a value and a bare
+/// `-name` reads back as `"yes"`; a following token is never consumed as the
+/// value.
 fn parse_process_arguments() -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
-    let mut args = std::env::args().skip(1).peekable();
-    while let Some(arg) = args.next() {
-        let Some(mut key) = arg.strip_prefix('-') else {
+    // `TVPGetDebugSupportShowable` only defaults to true because the Win32
+    // environ layer actually owns the debug window, console, watch list and
+    // script editor forms.  This host has none of them, and games gate whole
+    // debug surfaces on the option -- KAGEX's `debugWindowEnabled`, k2compat's
+    // `Debug.console`/`controller`/`scripted` singletons -- so answer `no`
+    // unless the option is given explicitly.
+    result.insert("-debugwin".to_string(), "no".to_string());
+    for arg in std::env::args().skip(1) {
+        if !arg.starts_with('-') || arg.len() < 2 {
             continue;
+        }
+        match arg.split_once('=') {
+            Some((name, value)) => result.insert(name.to_string(), value.to_string()),
+            None => result.insert(arg, "yes".to_string()),
         };
-        key = key.trim_start_matches('-');
-        if key.is_empty() {
-            continue;
-        }
-        if let Some((name, value)) = key.split_once('=') {
-            result.insert(name.to_ascii_lowercase(), value.to_string());
-        } else if args.peek().is_some_and(|next| !next.starts_with('-')) {
-            result.insert(
-                key.to_ascii_lowercase(),
-                args.next().expect("peeked process argument"),
-            );
-        } else {
-            result.insert(key.to_ascii_lowercase(), "1".to_string());
-        }
     }
     result
 }
@@ -333,6 +335,13 @@ pub struct KrkrHost {
     /// Invocation counts of stubbed native methods, keyed `Class.method`.
     stub_calls: BTreeMap<String, u64>,
     linked_plugins: BTreeSet<String>,
+    /// Plugins the host build registered up front, kept so `Plugins.link` can
+    /// install their classes at the moment KRKR would load the DLL.
+    plugin_registry: Vec<Arc<dyn KrkrPlugin>>,
+    /// Plugin names a script already linked explicitly.  `TVPLoadPlugin`
+    /// returns early for an already-loaded module, so a repeated link must not
+    /// re-register anything.
+    script_linked_plugins: BTreeSet<String>,
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
     kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
     layer_tree: LayerTree,
@@ -406,6 +415,8 @@ impl Default for KrkrHost {
             trace_mask: trace_mask_from_env(),
             stub_calls: BTreeMap::new(),
             linked_plugins: BTreeSet::new(),
+            plugin_registry: Vec::new(),
+            script_linked_plugins: BTreeSet::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
             layer_tree: LayerTree::new(),
@@ -756,12 +767,11 @@ impl KrkrHost {
     }
 
     pub(crate) fn command_argument(&self, name: &str) -> Option<String> {
-        self.command_line.get(&name.to_ascii_lowercase()).cloned()
+        self.command_line.get(name).cloned()
     }
 
     pub(crate) fn set_command_argument(&mut self, name: &str, value: &str) {
-        self.command_line
-            .insert(name.to_ascii_lowercase(), value.to_string());
+        self.command_line.insert(name.to_string(), value.to_string());
     }
 
     pub(crate) fn assign_system_message(&mut self, id: &str, message: &str) -> bool {
@@ -997,30 +1007,39 @@ impl KrkrHost {
             .map_err(storage_error)
     }
 
+    // KRKR keeps the decoded graphic cache alive across storage writes; only
+    // `System.clearGraphicCache`, a compact event or an out-of-memory retry
+    // drops it (`GraphicsLoaderIntf.cpp`). A save or config write therefore
+    // must not throw away decoded images or cancel an in-flight decode, both
+    // of which the storage layer already keeps coherent through its
+    // write-only cache invalidation.
     pub fn write_text_storage(&mut self, name: &str, mode: &str, text: &str) -> Result<()> {
-        let result = self
-            .project_storage()?
+        self.project_storage()?
             .write_text_storage(name, mode, text)
-            .map_err(storage_error);
-        if result.is_ok() {
-            self.invalidate_resource_state();
-        }
-        result
+            .map_err(storage_error)
     }
 
     pub fn write_binary_storage(&mut self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
-        let result = self
-            .project_storage()?
+        self.project_storage()?
             .write_binary_storage(name, mode, bytes)
-            .map_err(storage_error);
-        if result.is_ok() {
-            self.invalidate_resource_state();
-        }
-        result
+            .map_err(storage_error)
     }
 
-    pub(crate) fn register_plugin(&mut self, name: &str) {
-        self.linked_plugins.insert(name.to_string());
+    pub(crate) fn register_plugin(&mut self, plugin: Arc<dyn KrkrPlugin>) {
+        self.linked_plugins.insert(plugin.name().to_string());
+        self.plugin_registry.push(plugin);
+    }
+
+    /// Returns the registered plugin a `Plugins.link` call should install, or
+    /// `None` when the module is unknown or a script already linked it.
+    pub(crate) fn plugin_to_install(&mut self, name: &str) -> Option<Arc<dyn KrkrPlugin>> {
+        if !self.script_linked_plugins.insert(name.to_string()) {
+            return None;
+        }
+        self.plugin_registry
+            .iter()
+            .find(|plugin| plugin.name().eq_ignore_ascii_case(name))
+            .cloned()
     }
 
     pub(crate) fn insert_kag_parser(&mut self, handle: ObjectHandle, parser: KagParser) {
@@ -2274,7 +2293,7 @@ impl KrkrHost {
     fn storage_revision(&self) -> u64 {
         self.project_storage
             .as_ref()
-            .map(|storage| storage.revision())
+            .map(|storage| storage.graphic_revision())
             .unwrap_or(0)
     }
 
@@ -2299,17 +2318,27 @@ impl KrkrHost {
         self.image_target_generations.clear();
     }
 
-    fn cancel_pending_resource_tasks(&self) {
-        let Some(manager) = self.resource_manager.as_ref() else {
-            return;
-        };
-        for id in self
-            .pending_image_loads
-            .keys()
-            .chain(self.pending_script_image_loads.keys())
-            .copied()
-        {
-            manager.cancel(id);
+    fn cancel_pending_resource_tasks(&mut self) {
+        if let Some(manager) = self.resource_manager.as_ref() {
+            for id in self
+                .pending_image_loads
+                .keys()
+                .chain(self.pending_script_image_loads.keys())
+                .copied()
+            {
+                manager.cancel(id);
+            }
+        }
+        // A cancelled decode never reports a completion, but the TJS call
+        // that asked for it is parked on `resource_pending` and only wakes
+        // when a script image load finishes. KRKR loads graphics
+        // synchronously, so nothing there can strand a script mid-call:
+        // forget the cancelled requests and wake the VM so the retry queues
+        // a fresh decode against the current storage layout.
+        if !self.pending_script_image_loads.is_empty() {
+            self.pending_script_image_loads.clear();
+            self.script_image_errors.clear();
+            self.completed_script_image_loads = self.completed_script_image_loads.saturating_add(1);
         }
     }
 

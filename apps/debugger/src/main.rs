@@ -286,6 +286,11 @@ fn parse_args() -> Config {
             _ if config.root.is_none() && !arg.starts_with('-') => {
                 config.root = Some(PathBuf::from(arg));
             }
+            // KRKR options use a single dash (`-debugwin=no`) and reach scripts
+            // through `System.getArgument`, which reads the process arguments
+            // directly. Leave them alone so a game option can be set from the
+            // debugger command line; the debugger's own flags all use `--`.
+            _ if !arg.starts_with("--") => {}
             _ => panic!("unknown argument: {arg}"),
         }
     }

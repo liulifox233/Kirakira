@@ -60,6 +60,18 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
             "exePath",
             Variant::String(runtime.host().system_paths().exe_path.clone()),
         ),
+        // `TVPNormalizeStorageName(ParamStr(0))`: the full path of the running
+        // program, not just its directory.  Restart helpers pass it straight to
+        // `Storages.getLocalName`, so leaving it undefined turns a reboot into a
+        // "requires a storage name" throw.
+        (
+            "exeName",
+            Variant::String(
+                std::env::current_exe()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| runtime.host().system_paths().exe_path.clone()),
+            ),
+        ),
         (
             "dataPath",
             Variant::String(runtime.host().system_paths().data_path.clone()),

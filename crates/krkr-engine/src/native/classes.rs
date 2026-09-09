@@ -3817,19 +3817,86 @@ fn layer_color_rect(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
-    if is_province_face(runtime, this) {
+    let face = effective_draw_face(runtime, this);
+    // The province plane is not modelled, so a province fill has no effect on
+    // the drawn image.
+    if face == DF_PROVINCE {
         return Ok(Variant::Void);
     }
     let Some((x, y, width, height)) = rect_args(&args)? else {
         return Ok(Variant::Void);
     };
     let color = required_integer(&args, 4, "Layer.colorRect color")?;
-    let opacity = optional_integer(&args, 5)?;
-    let rgba = color_to_rgba(color, opacity);
-    if let Some(target) = target {
-        fill_layer_pixels(runtime, &target, x, y, width, height, rgba)?;
-        mark_image_modified(runtime, this);
+    let opacity = optional_integer(&args, 5)?.unwrap_or(255);
+    let Some(target) = target else {
+        return Ok(Variant::Void);
+    };
+    let rgb = packed_color_to_rgba(color);
+    let rgb = [rgb[0], rgb[1], rgb[2]];
+
+    // `tTJSNI_BaseLayer::ColorRect` dispatches on the resolved draw face; only
+    // the alpha faces ever touch the destination alpha, and a negative opacity
+    // erases opacity instead of painting.
+    match face {
+        DF_MASK => {
+            let mask = (color.max(0) & 0xff) as u8;
+            blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
+                pixel[3] = mask;
+            })?;
+        }
+        DF_MAIN => {
+            let opacity = opacity.clamp(0, 255);
+            if opacity == 0 {
+                return Ok(Variant::Void);
+            }
+            blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
+                if opacity == 255 {
+                    pixel[..3].copy_from_slice(&rgb);
+                } else {
+                    blend_const_color_keep_alpha(pixel, rgb, opacity);
+                }
+            })?;
+        }
+        DF_ADD_ALPHA => {
+            if opacity < 0 {
+                return Ok(Variant::Void);
+            }
+            let opacity = opacity.min(255);
+            if opacity == 0 {
+                return Ok(Variant::Void);
+            }
+            blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
+                blend_const_color_on_alpha(pixel, rgb, opacity);
+            })?;
+        }
+        // dfAlpha / dfBoth, and any face value the engine does not model.
+        _ => {
+            if opacity > 0 {
+                let opacity = opacity.min(255);
+                blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
+                    if opacity == 255 {
+                        pixel[..3].copy_from_slice(&rgb);
+                        pixel[3] = 255;
+                    } else {
+                        blend_const_color_on_alpha(pixel, rgb, opacity);
+                    }
+                })?;
+            } else {
+                let level = (-opacity).clamp(0, 255);
+                if level == 0 {
+                    return Ok(Variant::Void);
+                }
+                blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
+                    if level == 255 {
+                        pixel[3] = 0;
+                    } else {
+                        remove_const_opacity(pixel, level);
+                    }
+                })?;
+            }
+        }
     }
+    mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
 
@@ -5948,6 +6015,76 @@ fn is_province_face(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> bool {
         .is_ok_and(|face| face == 3)
 }
 
+/// `tTVPDrawFace` (`LayerIntf.h`): `dfBoth`/`dfAlpha` share value 0 and
+/// `dfMain`/`dfOpaque` share value 1.
+const DF_ALPHA: i64 = 0;
+const DF_MAIN: i64 = 1;
+const DF_MASK: i64 = 2;
+const DF_PROVINCE: i64 = 3;
+const DF_ADD_ALPHA: i64 = 4;
+const DF_AUTO: i64 = 128;
+
+/// `tTJSNI_BaseLayer::UpdateDrawFace`: `dfAuto` resolves to a concrete face
+/// from the layer type, everything else is used verbatim.
+fn effective_draw_face(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> i64 {
+    let face = layer_property_value(runtime, layer, "face")
+        .to_integer()
+        .unwrap_or(DF_AUTO);
+    if face != DF_AUTO {
+        return face;
+    }
+    let layer_type = layer_property_value(runtime, layer, "type")
+        .to_integer()
+        .unwrap_or(1);
+    match layer_type {
+        // ltAlpha and the ltPs* Photoshop blend modes draw onto both planes.
+        2 | 13..=28 => DF_ALPHA,
+        12 => DF_ADD_ALPHA, // ltAddAlpha
+        _ => DF_MAIN,
+    }
+}
+
+/// `TVPOpacityOnOpacityTable`: the weight the source colour gets when a source
+/// with opacity `opa` is composited over a destination with opacity `dopa`.
+fn opacity_on_opacity(dopa: i64, opa: i64) -> i64 {
+    if dopa == 0 {
+        return 255;
+    }
+    let at = dopa as f32 / 255.0;
+    let bt = opa as f32 / 255.0;
+    let mut c = bt / at;
+    c /= 1.0 - bt + c;
+    ((c * 255.0) as i64).clamp(0, 255)
+}
+
+/// `TVPConstColorAlphaBlend_d`: composite a constant colour onto a pixel while
+/// honouring the destination alpha.
+fn blend_const_color_on_alpha(pixel: &mut [u8], rgb: [u8; 3], opa: i64) {
+    let dopa = pixel[3] as i64;
+    let alpha = opacity_on_opacity(dopa, opa);
+    for channel in 0..3 {
+        let d = pixel[channel] as i64;
+        pixel[channel] = (d + (((rgb[channel] as i64) - d) * alpha >> 8)).clamp(0, 255) as u8;
+    }
+    pixel[3] = (255 - ((255 - dopa) * (255 - opa) >> 8)).clamp(0, 255) as u8;
+}
+
+/// `TVPConstColorAlphaBlend`: composite a constant colour onto the colour plane
+/// only, leaving the destination alpha untouched.
+fn blend_const_color_keep_alpha(pixel: &mut [u8], rgb: [u8; 3], opa: i64) {
+    let inv = 255 - opa;
+    for channel in 0..3 {
+        let d = pixel[channel] as i64;
+        pixel[channel] = ((d * inv + (rgb[channel] as i64) * opa) >> 8).clamp(0, 255) as u8;
+    }
+}
+
+/// `TVPRemoveConstOpacity`: scale the destination alpha down, keeping colour.
+fn remove_const_opacity(pixel: &mut [u8], level: i64) {
+    let strength = 255 - level;
+    pixel[3] = (((pixel[3] as i64) * strength) >> 8).clamp(0, 255) as u8;
+}
+
 fn mark_image_modified(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) {
     let layer = runtime.bound_this(layer).unwrap_or(layer);
     runtime.set_object_member(layer, "imageModified", Variant::Integer(1));
@@ -6125,6 +6262,45 @@ fn fill_layer_pixels(
             fill_pixels(pixels, image_width, image_height, x, y, width, height, rgba);
         },
     )
+}
+
+/// Apply a per-pixel operation over a rectangle of a layer's image, keeping the
+/// pixels outside the rectangle (and the parts of the pixel the operation does
+/// not touch) intact.
+#[allow(clippy::too_many_arguments)]
+fn blend_layer_pixels<F>(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &LayerRenderTarget,
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    blend: F,
+) -> Result<()>
+where
+    F: Fn(&mut [u8]),
+{
+    mutate_layer_pixels(runtime, target, |pixels, image_width, image_height| {
+        let x0 = x.max(0) as u32;
+        let y0 = y.max(0) as u32;
+        let x1 = (x + width).clamp(0, image_width as i64) as u32;
+        let y1 = (y + height).clamp(0, image_height as i64) as u32;
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let row_width = image_width as usize * 4;
+        for py in y0..y1 {
+            let row_start = py as usize * row_width;
+            let start = row_start + x0 as usize * 4;
+            let end = row_start + x1 as usize * 4;
+            if end > pixels.len() {
+                return;
+            }
+            for pixel in pixels[start..end].chunks_exact_mut(4) {
+                blend(pixel);
+            }
+        }
+    })
 }
 
 fn fill_pixel_buffer(pixels: &mut [u8], rgba: [u8; 4]) {

@@ -30,9 +30,58 @@ impl KrkrPlugin for WindowExPlugin {
     }
 }
 
+/// What a global holds when the extensions look for something to attach to.
+enum HookTarget {
+    /// An object the extensions can be attached to.
+    Object(ObjectHandle),
+    /// Something is registered under that name but it is not an object to
+    /// attach to. Replacing it would destroy whatever the script installed.
+    Occupied,
+    /// Nothing is registered under that name.
+    Missing,
+}
+
+/// Looks a global up the way NCB's class hooks do.
+///
+/// The binder reads the class name off the TJS global through `PropGet`, so it
+/// sees whatever a script bound there — including a closure over the class
+/// object. The raw member accessor reports those as "not an object", which
+/// would make the caller shadow the binding with a dummy the game can no longer
+/// construct.
+fn global_hook_target(runtime: &mut Runtime<KrkrHost>, name: &str) -> HookTarget {
+    let global = runtime.global_handle();
+    member_hook_target(runtime, global, name)
+}
+
+fn member_hook_target(
+    runtime: &mut Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> HookTarget {
+    if matches!(runtime.object_member(object, name), Variant::Void) {
+        return HookTarget::Missing;
+    }
+    let resolved = match runtime.resolve_object_member(object, name) {
+        Ok(value) => value,
+        // A getter that throws still leaves the property in place.
+        Err(_) => return HookTarget::Occupied,
+    };
+    match resolved {
+        Variant::Object(handle) => HookTarget::Object(handle),
+        // A lazy property has to keep firing on read: k2compat publishes `Pad`
+        // and `MenuItem` as one so the class is only built when a script first
+        // touches it. Attaching to the property object itself — let alone
+        // replacing it — would hand the game the stub instead.
+        Variant::Closure(closure) if !runtime.variant_is_property(&resolved) => {
+            HookTarget::Object(closure.object)
+        }
+        _ => HookTarget::Occupied,
+    }
+}
+
 // WindowEx — NCB_ATTACH_CLASS_WITH_HOOK(WindowEx, Window)
 fn install_window_ex(runtime: &mut Runtime<KrkrHost>) {
-    let Variant::Object(window) = runtime.global_member("Window") else {
+    let HookTarget::Object(window) = global_hook_target(runtime, "Window") else {
         return;
     };
 
@@ -128,9 +177,10 @@ fn install_window_ex(runtime: &mut Runtime<KrkrHost>) {
 fn install_menu_item_ex(runtime: &mut Runtime<KrkrHost>) {
     // Mirrors PreRegistCallback: KRKRZ has no MenuItem until menu.dll loads, so
     // a dummy object is registered to carry the extensions.
-    let menu_item = match runtime.global_member("MenuItem") {
-        Variant::Object(handle) => handle,
-        _ => {
+    let menu_item = match global_hook_target(runtime, "MenuItem") {
+        HookTarget::Object(handle) => handle,
+        HookTarget::Occupied => return,
+        HookTarget::Missing => {
             let handle = runtime.alloc_ordinary_object();
             runtime.add_object_class_info(handle, "MenuItem");
             runtime.set_global_member("MenuItem", Variant::Object(handle));
@@ -172,9 +222,10 @@ fn install_menu_item_ex(runtime: &mut Runtime<KrkrHost>) {
 // PadEx — NCB_ATTACH_CLASS_WITH_HOOK(PadEx, Pad)
 fn install_pad_ex(runtime: &mut Runtime<KrkrHost>) {
     // Mirrors PreRegistCallback's dummy Pad for KRKRZ.
-    let pad = match runtime.global_member("Pad") {
-        Variant::Object(handle) => handle,
-        _ => {
+    let pad = match global_hook_target(runtime, "Pad") {
+        HookTarget::Object(handle) => handle,
+        HookTarget::Occupied => return,
+        HookTarget::Missing => {
             let handle = runtime.alloc_ordinary_object();
             runtime.add_object_class_info(handle, "Pad");
             runtime.set_global_member("Pad", Variant::Object(handle));
@@ -186,18 +237,20 @@ fn install_pad_ex(runtime: &mut Runtime<KrkrHost>) {
 
 // ConsoleEx — NCB_ATTACH_FUNCTION_WITHTAG(*, Debug_console, Debug.console, ...)
 fn install_console_ex(runtime: &mut Runtime<KrkrHost>) {
-    let debug = match runtime.global_member("Debug") {
-        Variant::Object(handle) => handle,
-        _ => {
+    let debug = match global_hook_target(runtime, "Debug") {
+        HookTarget::Object(handle) => handle,
+        HookTarget::Occupied => return,
+        HookTarget::Missing => {
             let handle = runtime.alloc_ordinary_object();
             runtime.add_object_class_info(handle, "Debug");
             runtime.set_global_member("Debug", Variant::Object(handle));
             handle
         }
     };
-    let console = match runtime.object_member(debug, "console") {
-        Variant::Object(handle) => handle,
-        _ => {
+    let console = match member_hook_target(runtime, debug, "console") {
+        HookTarget::Object(handle) => handle,
+        HookTarget::Occupied => return,
+        HookTarget::Missing => {
             let handle = runtime.alloc_ordinary_object();
             runtime.add_object_class_info(handle, "Console");
             runtime.set_object_member(debug, "console", Variant::Object(handle));
@@ -216,7 +269,7 @@ fn install_console_ex(runtime: &mut Runtime<KrkrHost>) {
 
 // System — NCB_ATTACH_FUNCTION(*, System, ...)
 fn install_system_ex(runtime: &mut Runtime<KrkrHost>) {
-    let Variant::Object(system) = runtime.global_member("System") else {
+    let HookTarget::Object(system) = global_hook_target(runtime, "System") else {
         return;
     };
 
@@ -248,7 +301,7 @@ fn install_system_ex(runtime: &mut Runtime<KrkrHost>) {
 // Scripts — NCB_ATTACH_FUNCTION(setEvalErrorLog, Scripts, ...). Unlike the
 // reference, Scripts.eval is NOT overridden; the engine builtin stays in place.
 fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
-    let Variant::Object(scripts) = runtime.global_member("Scripts") else {
+    let HookTarget::Object(scripts) = global_hook_target(runtime, "Scripts") else {
         return;
     };
     if matches!(

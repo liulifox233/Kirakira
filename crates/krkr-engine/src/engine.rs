@@ -261,7 +261,7 @@ pub struct KrkrEngine {
     kag_session: KagSession,
     core_engine: CoreEngine,
     kag_budget: KagRunBudget,
-    plugins: Vec<Box<dyn KrkrPlugin>>,
+    plugins: Vec<Arc<dyn KrkrPlugin>>,
     cursor_position: Option<Point>,
     hovered_layer: Option<LayerId>,
     pressed_layer: Option<LayerId>,
@@ -645,7 +645,27 @@ impl KrkrEngine {
     /// engine only provides the conventional `startup.ks` fallback when no
     /// parser was created.  Hosts must call this method instead of guessing
     /// scenario names such as `first.ks` or `title.ks`.
+    /// Runs a loose `patch.tjs` sitting beside the game data before the
+    /// startup script.  kirikiri2/z have no such hook, but kirikiroid2 boots
+    /// one and repacks rely on it to hook `Scripts.execStorage` and register
+    /// their own archives.  Only a filesystem file qualifies: a `patch.tjs`
+    /// shipped inside an archive is ordinary game data.
+    fn execute_boot_patch(&mut self) {
+        if self.tjs_runtime.host().placed_path("patch.tjs").is_none() {
+            return;
+        }
+        self.tjs_runtime
+            .host_mut()
+            .log("project startup: executing patch.tjs boot patch");
+        if let Err(error) = self.execute_storage("patch.tjs") {
+            self.tjs_runtime
+                .host_mut()
+                .log(&format!("patch.tjs failed: {}", error.message));
+        }
+    }
+
     pub fn start_project(&mut self) -> Result<()> {
+        self.execute_boot_patch();
         let has_startup_tjs = self.tjs_runtime.host().storage_exists("startup.tjs");
         let has_startup_ks = self.tjs_runtime.host().storage_exists("startup.ks");
         let mut startup_exception_handled = false;
@@ -1693,6 +1713,7 @@ impl KrkrEngine {
                 EngineEvent::CursorMoved { position } => {
                     self.cursor_position = Some(*position);
                     self.tjs_runtime.host_mut().set_cursor_position(*position);
+                    self.dispatch_window_cursor_move(*position)?;
                     self.dispatch_layer_cursor_move(*position)?;
                 }
                 EngineEvent::PointerInput {
@@ -1851,6 +1872,7 @@ impl KrkrEngine {
                             })?;
                         }
                         krkr_core::TouchPhase::Moved => {
+                            self.dispatch_window_cursor_move(*position)?;
                             self.dispatch_layer_cursor_move(*position)?;
                         }
                         krkr_core::TouchPhase::Ended => {
@@ -1994,6 +2016,49 @@ impl KrkrEngine {
             vec![Variant::Integer(key_code), Variant::Integer(shift)],
         )
         .map(|_| handled_by_script)
+    }
+
+    /// `tTJSNI_BaseWindow::OnMouseMove` posts `onMouseMove(x, y, shift)` to the
+    /// window itself before handing the same position to the draw device (which
+    /// is what eventually produces the per-layer `onMouseMove`).  KAG builds its
+    /// whole hover machinery on that window event -- `KAGWindow.onMouseMove`
+    /// runs the `mouseMove` hook list, which drives the quick menu slide-in, the
+    /// soft cursor, icon fading and cursor auto-hide -- so skipping it leaves
+    /// those surfaces permanently in their initial state.
+    ///
+    /// The official post uses `TVP_EPT_DISCARDABLE`, so a move that arrives
+    /// while the script is mid-execution is simply superseded by the next one
+    /// rather than re-entering the interpreter.  A parked resource load is that
+    /// same "script is still running" state here, and the hooks are registered
+    /// before the objects they touch exist -- `QuickMenuLayerBase` installs its
+    /// `mouseMove` hook and only then runs `setup()`, whose `uiload` suspends
+    /// long before `createOffTimer()` -- so delivering during a suspend throws
+    /// on `offtimer.enabled`.  Drop the move instead, exactly as a discardable
+    /// event would be.
+    fn dispatch_window_cursor_move(&mut self, position: Point) -> Result<()> {
+        if self.tjs_runtime.is_suspended() {
+            return Ok(());
+        }
+        let Some(window) = self.runtime_window_object() else {
+            return Ok(());
+        };
+        if matches!(
+            self.tjs_runtime.object_member(window, "onMouseMove"),
+            Variant::Void
+        ) {
+            return Ok(());
+        }
+        let shift = self.current_shift_state(false);
+        self.call_event_method(
+            window,
+            "onMouseMove",
+            vec![
+                Variant::Integer(position.x.round() as i64),
+                Variant::Integer(position.y.round() as i64),
+                Variant::Integer(shift),
+            ],
+        )
+        .map(|_| ())
     }
 
     fn dispatch_window_pointer_event(&mut self, method: &str, button: i64) -> Result<bool> {
@@ -2514,8 +2579,11 @@ impl KrkrEngine {
         P: KrkrPlugin + 'static,
     {
         plugin.register(&mut self.tjs_runtime)?;
-        self.tjs_runtime.host_mut().register_plugin(plugin.name());
-        self.plugins.push(Box::new(plugin));
+        let plugin: Arc<dyn KrkrPlugin> = Arc::new(plugin);
+        self.tjs_runtime
+            .host_mut()
+            .register_plugin(Arc::clone(&plugin));
+        self.plugins.push(plugin);
         Ok(())
     }
 
@@ -10433,7 +10501,10 @@ mod tests {
 
                 parent.operateRect(0, 0, line, 0, 0, 4, 4);
                 var wasModified = parent.imageModified;
-                if(parent.imageModified) parent.colorRect(0, 0, 32, 32, 0);
+                // `colorRect` on a dfAlpha face fills opaquely at opacity 255
+                // (`PartialBlendColor` ORs in 0xff000000), so clearing back to
+                // a transparent plane is `fillRect`'s job.
+                if(parent.imageModified) parent.fillRect(0, 0, 32, 32, 0);
                 parent.imageModified = false;
                 return wasModified;
                 "#,
@@ -10460,6 +10531,62 @@ mod tests {
                 .chunks_exact(4)
                 .all(|pixel| pixel[3] == 0)
         );
+    }
+
+    /// `tTJSNI_BaseLayer::ColorRect` dispatches on the resolved draw face.
+    /// A `new Layer()` is ltAlpha, so dfAuto resolves to dfAlpha and the fill
+    /// paints the alpha plane too; setting `face` to dfOpaque switches to
+    /// `FillColor`, which "always holds destination alpha". The KAG message
+    /// window paints its background through the second path, so a face-blind
+    /// fill would either erase it or leave it fully opaque.
+    #[test]
+    fn native_layer_color_rect_follows_the_resolved_draw_face() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.alpha = new Layer();
+                alpha.setImageSize(1, 1);
+                alpha.colorRect(0, 0, 1, 1, 0x204060);
+
+                global.opaque = new Layer();
+                opaque.setImageSize(1, 1);
+                opaque.face = 1; // dfOpaque
+                opaque.colorRect(0, 0, 1, 1, 0x204060);
+
+                global.mask = new Layer();
+                mask.setImageSize(1, 1);
+                mask.face = 2; // dfMask
+                mask.colorRect(0, 0, 1, 1, 0x807f);
+                "#,
+            )
+            .expect("script");
+
+        let pixel = |engine: &mut KrkrEngine, name: &str| -> Vec<u8> {
+            let layer_id = engine
+                .execute_expression("inline.tjs", &format!("{name}.__nativeLayerId"))
+                .expect("layer id")
+                .to_integer()
+                .expect("integer layer id") as u64;
+            engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .and_then(|layer| layer.image.as_ref())
+                .expect("layer image")
+                .upload
+                .rgba
+                .to_vec()
+        };
+
+        // dfAlpha at opacity 255 is `PartialBlendColor`'s opaque path, which
+        // ORs 0xff000000 into the fill colour.
+        assert_eq!(pixel(&mut engine, "alpha"), vec![0x20, 0x40, 0x60, 255]);
+        // dfOpaque is `FillColor`, which holds the destination alpha.
+        assert_eq!(pixel(&mut engine, "opaque"), vec![0x20, 0x40, 0x60, 0]);
+        // dfMask is `FillMask(color & 0xff)`; the colour planes are untouched.
+        assert_eq!(pixel(&mut engine, "mask"), vec![0, 0, 0, 0x7f]);
     }
 
     #[test]
