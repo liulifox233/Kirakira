@@ -5094,14 +5094,14 @@ mod tests {
                 base.visible = true;
                 base.setSize(4, 2);
                 base.setImageSize(4, 2);
-                base.fillRect(0, 0, 4, 2, 0x0000ff);
+                base.fillRect(0, 0, 4, 2, 0xff0000ff);
 
                 var child = new Layer(null, base);
                 child.visible = true;
                 child.setPos(2, 0);
                 child.setSize(2, 2);
                 child.setImageSize(2, 2);
-                child.fillRect(0, 0, 2, 2, 0xff0000);
+                child.fillRect(0, 0, 2, 2, 0xffff0000);
 
                 var snapshot = new Layer();
                 snapshot.setImageSize(4, 2);
@@ -6538,8 +6538,8 @@ mod tests {
                 r#"
                 global.source = new Layer();
                 source.setImageSize(2, 1);
-                source.fillRect(0, 0, 1, 1, 0x0000ff);
-                source.fillRect(1, 0, 1, 1, 0x00ff00);
+                source.fillRect(0, 0, 1, 1, 0xff0000ff);
+                source.fillRect(1, 0, 1, 1, 0xff00ff00);
                 global.dest = new Layer();
                 dest.setImageSize(1, 1);
                 dest.affineCopy(source, 1, 0, 1, 1, false, 0, 0, 1, 0, 0, 1);
@@ -8863,12 +8863,15 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("frame");
+        // `new Layer()` always carries the ctor's 32×32 transparent holder
+        // (`AllocateDefaultImage`, `LayerIntf.cpp:404`), so the visible
+        // `rootProbe` contributes an image command. The 1×1 child under the
+        // hidden parent must not.
         assert!(
-            !frame
-                .output
-                .draw_commands
-                .iter()
-                .any(|command| matches!(command, krkr_core::DrawCommand::Image(_)))
+            !frame.output.draw_commands.iter().any(|command| matches!(
+                command,
+                krkr_core::DrawCommand::Image(image) if image.texture_size.width == 1.0
+            ))
         );
 
         fs::remove_dir_all(root).expect("cleanup");
@@ -9100,8 +9103,14 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// Official `tTJSNI_BaseLayer::LoadImages` (`LayerIntf.cpp:2494`) ends with
+    /// `InternalSetImageSize(MainImage->GetWidth(), MainImage->GetHeight())`,
+    /// whose first step is `if(width < Rect.get_width()) SetWidth(width)`
+    /// (`LayerIntf.cpp:2353`). A smaller loaded image therefore shrinks the
+    /// layer rectangle; callers that need a fixed viewport set the size after
+    /// loading.
     #[test]
-    fn native_layer_load_images_preserves_existing_viewport_size() {
+    fn native_layer_load_images_shrinks_the_layer_rect_like_internal_set_image_size() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
         write_png(root.join("sprite.png"), 2, 3, &[255; 24]);
@@ -9121,7 +9130,7 @@ mod tests {
             )
             .expect("script");
 
-        assert_eq!(result, Variant::String("1280:720:2:3".to_string()));
+        assert_eq!(result, Variant::String("2:3:2:3".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -9155,6 +9164,44 @@ mod tests {
         assert_eq!(result, Variant::String("2:2:6".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `tTJSNI_BaseLayer` image semantics, straight from `LayerIntf.cpp`:
+    /// ctor `AllocateDefaultImage` (`:404`) installs the 32×32 transparent
+    /// holder, `SetWidth` → `ImageLayerSizeChanged` (`:2388`) grows the bitmap,
+    /// `SetImageWidth` (`:2296`) shrinks the Rect before `ChangeImageSize`,
+    /// `SetHasImage(false)` (`:2228`) deallocates, and reading `imageWidth`
+    /// without a bitmap throws `TVPNotDrawableLayerType` (`:2321`).
+    #[test]
+    fn native_layer_image_size_matches_official_main_image() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                var initial = layer.hasImage + ":" + layer.width + ":" + layer.height +
+                    ":" + layer.imageWidth + ":" + layer.imageHeight;
+                layer.width = 64;
+                var grown = layer.width + ":" + layer.imageWidth;
+                layer.imageWidth = 10;
+                var shrunk = layer.width + ":" + layer.imageWidth;
+                layer.hasImage = false;
+                var freed = layer.hasImage;
+                var thrown = "";
+                try { thrown += layer.imageWidth; } catch(e) { thrown = "get"; }
+                layer.hasImage = true;
+                var restored = layer.hasImage + ":" + layer.width + ":" + layer.imageWidth;
+                return initial + ":" + grown + ":" + shrunk + ":" + freed + ":" +
+                    thrown + ":" + restored;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            result,
+            Variant::String("1:32:32:32:32:64:64:10:10:0:get:1:10:10".to_string())
+        );
     }
 
     #[test]
@@ -9197,7 +9244,7 @@ mod tests {
             )
             .expect("script");
 
-        assert_eq!(result, Variant::String("0:0:320:320:24:24:2".to_string()));
+        assert_eq!(result, Variant::String("32:32:320:320:24:24:2".to_string()));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -9641,7 +9688,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("sync fore");
-        assert_eq!(image_command_count(&frame), 1);
+        assert_eq!(content_image_command_count(&engine, &frame), 1);
 
         engine
             .update(
@@ -9727,7 +9774,7 @@ mod tests {
                 Duration::from_millis(1),
             )
             .expect("complete transition");
-        assert_eq!(image_command_count(&frame), 1);
+        assert_eq!(content_image_command_count(&engine, &frame), 1);
         assert_eq!(
             engine
                 .execute_expression(
@@ -9993,7 +10040,7 @@ mod tests {
                     if image.rect.x == 5.0 && image.rect.y == 7.0
             )
         }));
-        assert_eq!(image_command_count(&frame), 0);
+        assert_eq!(content_image_command_count(&engine, &frame), 0);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -10585,8 +10632,208 @@ mod tests {
         assert_eq!(pixel(&mut engine, "alpha"), vec![0x20, 0x40, 0x60, 255]);
         // dfOpaque is `FillColor`, which holds the destination alpha.
         assert_eq!(pixel(&mut engine, "opaque"), vec![0x20, 0x40, 0x60, 0]);
-        // dfMask is `FillMask(color & 0xff)`; the colour planes are untouched.
-        assert_eq!(pixel(&mut engine, "mask"), vec![0, 0, 0, 0x7f]);
+        // dfMask is `FillMask(color & 0xff)`; the colour planes keep the
+        // ctor holder's transparent white (`AllocateDefaultImage`,
+        // `LayerIntf.cpp:404`) because `TVPFillMask` is `const_alpha_copy`
+        // (`gl/blend_functor_c.h:674`): `(d & 0x00ffffff) + (a << 24)`.
+        assert_eq!(pixel(&mut engine, "mask"), vec![255, 255, 255, 0x7f]);
+    }
+
+    /// `tTJSNI_BaseLayer::FillRect` writes the 32-bit colour as-is on dfAlpha
+    /// (`MainImage->Fill`). A 24-bit RGB value therefore keeps alpha 0; only
+    /// an explicit 0xAARRGGBB high byte, or dfOpaque+HoldAlpha (`FillColor`),
+    /// produces an opaque plate. Forcing that alpha to 255 is what turned
+    /// GINKA stand canvases into solid maroon rectangles.
+    #[test]
+    fn native_layer_fill_rect_follows_the_resolved_draw_face() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.alpha = new Layer();
+                alpha.setImageSize(1, 1);
+                alpha.fillRect(0, 0, 1, 1, 0x5b2e2e);
+
+                global.opaque_hold = new Layer();
+                opaque_hold.setImageSize(1, 1);
+                opaque_hold.face = 1; // dfOpaque
+                opaque_hold.holdAlpha = 1;
+                opaque_hold.fillRect(0, 0, 1, 1, 0x5b2e2e);
+
+                global.mask = new Layer();
+                mask.setImageSize(1, 1);
+                mask.face = 2; // dfMask
+                mask.fillRect(0, 0, 1, 1, 0x807f);
+
+                global.explicit_alpha = new Layer();
+                explicit_alpha.setImageSize(1, 1);
+                explicit_alpha.fillRect(0, 0, 1, 1, 0xff5b2e2e);
+                "#,
+            )
+            .expect("script");
+
+        let pixel = |engine: &mut KrkrEngine, name: &str| -> Vec<u8> {
+            let layer_id = engine
+                .execute_expression("inline.tjs", &format!("{name}.__nativeLayerId"))
+                .expect("layer id")
+                .to_integer()
+                .expect("integer layer id") as u64;
+            engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .and_then(|layer| layer.image.as_ref())
+                .expect("layer image")
+                .upload
+                .rgba
+                .to_vec()
+        };
+
+        assert_eq!(pixel(&mut engine, "alpha"), vec![0x5b, 0x2e, 0x2e, 0]);
+        assert_eq!(pixel(&mut engine, "opaque_hold"), vec![0x5b, 0x2e, 0x2e, 0]);
+        // `FillMask` only writes the alpha byte (`TVPFillMask` =
+        // `const_alpha_copy`, `gl/blend_functor_c.h:674`), so the ctor holder's
+        // transparent white keeps its colour planes.
+        assert_eq!(pixel(&mut engine, "mask"), vec![255, 255, 255, 0x7f]);
+        assert_eq!(
+            pixel(&mut engine, "explicit_alpha"),
+            vec![0x5b, 0x2e, 0x2e, 255]
+        );
+    }
+
+    /// Official TJS `operateRect` (`LayerIntf.cpp:7207`) resolves `omAuto`
+    /// from the source layer type. `ltOpaque` → `omOpaque` → `bmCopyOnAlpha`
+    /// on a dfAlpha dest (`TVPCopyOpaqueImage` ORs `0xff000000`).
+    #[test]
+    fn native_layer_operate_rect_om_auto_follows_source_type() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                dest.setImageSize(1, 1);
+                dest.fillRect(0, 0, 1, 1, 0);
+
+                global.src_opaque = new Layer();
+                src_opaque.type = 1; // ltOpaque
+                src_opaque.setImageSize(1, 1);
+                src_opaque.fillRect(0, 0, 1, 1, 0x5b2e2e);
+
+                dest.operateRect(0, 0, src_opaque, 0, 0, 1, 1);
+                "#,
+            )
+            .expect("script");
+
+        let layer_id = engine
+            .execute_expression("inline.tjs", "dest.__nativeLayerId")
+            .expect("layer id")
+            .to_integer()
+            .expect("integer layer id") as u64;
+        let rgba = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("dest image")
+            .upload
+            .rgba
+            .to_vec();
+        assert_eq!(rgba, vec![0x5b, 0x2e, 0x2e, 255]);
+    }
+
+    /// `tTJSNI_BaseLayer::OperateRect` forwards `HoldAlpha` as `Blt`'s `hda`
+    /// ("hold destination alpha", `LayerIntf.cpp:4380`,
+    /// `LayerBitmapIntf.cpp:1088`); the PS blend modes have dedicated `_HDA`
+    /// variants (`LayerBitmapIntf.cpp:1454`). GINKA's PSD compositing keeps
+    /// `holdAlpha = 1` while tiling an opaque colour over the stand canvas
+    /// with `omPsSoftLight` (`psdlayer.tjs:1963`); without the hold the tile's
+    /// alpha turned the whole 863×960 rect into a solid maroon plate.
+    #[test]
+    fn native_layer_operate_rect_hold_alpha_keeps_destination_alpha() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.held = new Layer();
+                held.setImageSize(2, 1);
+                held.fillRect(0, 0, 2, 1, 0);
+                held.holdAlpha = 1;
+
+                global.freed = new Layer();
+                freed.setImageSize(2, 1);
+                freed.fillRect(0, 0, 2, 1, 0);
+
+                global.src = new Layer();
+                src.setImageSize(1, 1);
+                src.fillRect(0, 0, 1, 1, 0xff684140);
+
+                held.operateRect(0, 0, src, 0, 0, 1, 1, 20);
+                freed.operateRect(0, 0, src, 0, 0, 1, 1, 20);
+                "#,
+            )
+            .expect("script");
+
+        let alpha = |engine: &mut KrkrEngine, name: &str| -> u8 {
+            let layer_id = engine
+                .execute_expression("inline.tjs", &format!("{name}.__nativeLayerId"))
+                .expect("layer id")
+                .to_integer()
+                .expect("integer layer id") as u64;
+            engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .and_then(|layer| layer.image.as_ref())
+                .expect("layer image")
+                .upload
+                .rgba[3]
+        };
+
+        // `omPsSoftLight` with HoldAlpha keeps the cleared canvas transparent.
+        assert_eq!(alpha(&mut engine, "held"), 0);
+        // The PS functors return colour only, so the official `normal_op`
+        // wrapper (no HoldAlpha) writes alpha 0 (`blend_variation.h:25`).
+        assert_eq!(alpha(&mut engine, "freed"), 0);
+    }
+
+    /// Official `tTJSNI_BaseLayer` stays allocated for the TJS object's life
+    /// (`SetHasImage` → `AllocateImage` in `LayerIntf.cpp:2228`). If Kirakira
+    /// drops the tree node, `hasImage = 1` must recreate it so GINKA
+    /// `PSDLayer.updateDisp` can composite stand parts.
+    #[test]
+    fn native_layer_has_image_restores_a_dropped_tree_node() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setSize(4, 3);
+                return layer.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+
+        engine.host_mut().layer_tree_mut().remove_layer(layer_id);
+        assert!(engine.host().layer_tree().layer(layer_id).is_none());
+
+        engine
+            .execute_script("inline.tjs", "layer.hasImage = 1;")
+            .expect("hasImage");
+
+        let layer = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .expect("restored layer node");
+        let image = layer.image.as_ref().expect("allocated image");
+        assert_eq!(image.upload.width, 4);
+        assert_eq!(image.upload.height, 3);
     }
 
     #[test]
@@ -10859,12 +11106,19 @@ mod tests {
                 layer.visible = true;
                 layer.loadImages("sprite.png");
                 layer.freeImage();
-                return layer.imageWidth + ":" + layer.imageHeight + ":" + layer.width;
+                try {
+                    return layer.imageWidth + ":" + layer.imageHeight + ":" + layer.width;
+                } catch(e) {
+                    return "thrown:" + layer.hasImage + ":" + layer.width;
+                }
                 "#,
             )
             .expect("script");
 
-        assert_eq!(result, Variant::String("0:0:1".to_string()));
+        // `LoadImages` shrinks the Rect to the decoded size
+        // (`InternalSetImageSize`, `LayerIntf.cpp:2494`), so after
+        // `freeImage` the layer is 1×1 with no bitmap.
+        assert_eq!(result, Variant::String("thrown:0:1".to_string()));
         let frame = engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
@@ -10885,7 +11139,7 @@ mod tests {
                 r#"
                 var layer = new Layer();
                 layer.setImageSize(2, 2);
-                layer.fillRect(0, 0, 2, 2, 0xff0000);
+                layer.fillRect(0, 0, 2, 2, 0xffff0000);
                 layer.setImageSize(3, 2);
                 return layer.__nativeLayerId;
                 "#,
@@ -10905,8 +11159,8 @@ mod tests {
         assert_eq!(
             image.upload.rgba.as_ref(),
             &[
-                255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 0, 0,
-                0, 0,
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 255, 0, 255, 0, 0, 255, 255, 0, 0, 255,
+                255, 255, 255, 0,
             ]
         );
     }
@@ -11030,7 +11284,18 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("initial frame");
-        assert_eq!(frame.output.image_uploads.len(), 1);
+        // `new Layer()` always owns the ctor's 32×32 holder
+        // (`AllocateDefaultImage`, `LayerIntf.cpp:404`), and `setSize(100, 100)`
+        // grows the parent's bitmap (`ImageLayerSizeChanged`, `:2388`), so the
+        // parent uploads a neutral 100×100 image as well.
+        assert_eq!(frame.output.image_uploads.len(), 2);
+        assert!(
+            frame
+                .output
+                .image_uploads
+                .iter()
+                .any(|upload| upload.width == 5 && upload.height == 6)
+        );
 
         engine
             .execute_script("cleanup.tjs", "invalidate buttonLayer;")
@@ -11063,7 +11328,7 @@ mod tests {
     }
 
     #[test]
-    fn native_layer_invalidate_removes_subtree_backing_and_pending_window_updates() {
+    fn native_layer_invalidate_parts_children_instead_of_destroying_them() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -11088,10 +11353,65 @@ mod tests {
         engine
             .execute_script("cleanup.tjs", "invalidate root;")
             .expect("invalidate");
+        // Official `Invalidate` only `Part()`s children (`LayerIntf.cpp:513`).
         assert!(engine.host().native_layer(root).is_none());
-        assert!(engine.host().native_layer(child).is_none());
-        assert!(!engine.host().has_pending_window_update(child));
-        assert!(!engine.host().has_pending_image_load_for_owner(child));
+        assert!(engine.host().native_layer(child).is_some());
+        engine
+            .execute_script(
+                "draw.tjs",
+                r#"
+                child.setImageSize(2, 2);
+                child.fillRect(0, 0, 2, 2, 0xff00ff00);
+                return child.hasImage;
+                "#,
+            )
+            .expect("child still drawable");
+        let child_id = engine
+            .host()
+            .native_layer(child)
+            .expect("child native layer");
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(child_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("child image");
+        assert_eq!(image.upload.rgba.as_ref()[..4], [0, 255, 0, 255]);
+    }
+
+    /// GINKA's stand pool keeps `StandLayer` objects after `invalidate` and
+    /// still calls `hasImage = 1` / `fillRect` / `copyRect` on them.
+    #[test]
+    fn native_layer_drawing_reattaches_after_invalidate() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                dest.setSize(4, 4);
+                dest.setImageSize(4, 4);
+                invalidate dest;
+                dest.hasImage = 1;
+                dest.fillRect(0, 0, 4, 4, 0xff112233);
+                return dest.hasImage;
+                "#,
+            )
+            .expect("script");
+        let Variant::Object(dest) = engine.tjs_runtime().global_member("dest") else {
+            panic!("dest missing");
+        };
+        let dest_id = engine
+            .host()
+            .native_layer(dest)
+            .expect("reattached native layer");
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(dest_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("reattached image");
+        assert_eq!(image.upload.rgba.as_ref()[..4], [0x11, 0x22, 0x33, 255]);
     }
 
     #[test]
@@ -11125,7 +11445,7 @@ mod tests {
         assert_eq!(
             frame.output.image_uploads[0].rgba.as_ref(),
             &[
-                0, 0, 0, 0, 0x40, 0x20, 0x10, 0x80, 0, 0, 0, 0, 0x40, 0x20, 0x10, 0x80
+                255, 255, 255, 0, 0x40, 0x20, 0x10, 0x80, 255, 255, 255, 0, 0x40, 0x20, 0x10, 0x80
             ]
         );
 
@@ -11141,9 +11461,9 @@ mod tests {
                 r#"
                 var source = new Layer();
                 source.setImageSize(2, 2);
-                source.fillRect(0, 0, 1, 1, 0xff0000);
-                source.fillRect(1, 0, 1, 1, 0x00ff00);
-                source.fillRect(0, 1, 1, 1, 0x0000ff);
+                source.fillRect(0, 0, 1, 1, 0xffff0000);
+                source.fillRect(1, 0, 1, 1, 0xff00ff00);
+                source.fillRect(0, 1, 1, 1, 0xff0000ff);
                 source.fillRect(1, 1, 1, 1, 0xffffffff);
 
                 global.dest = new Layer();
@@ -11191,14 +11511,14 @@ mod tests {
                 base.visible = true;
                 base.setSize(4, 4);
                 base.setImageSize(4, 4);
-                base.fillRect(0, 0, 4, 4, 0x202020);
+                base.fillRect(0, 0, 4, 4, 0xff202020);
 
                 var child = new Layer(null, base);
                 child.visible = true;
                 child.setPos(1, 1);
                 child.setSize(2, 2);
                 child.setImageSize(2, 2);
-                child.fillRect(0, 0, 2, 2, 0xff0000);
+                child.fillRect(0, 0, 2, 2, 0xffff0000);
 
                 global.dest = new Layer();
                 dest.setImageSize(4, 4);
@@ -15545,6 +15865,31 @@ mod tests {
             .draw_commands
             .iter()
             .filter(|command| matches!(command, krkr_core::DrawCommand::Image(_)))
+            .count()
+    }
+
+    /// Official `tTJSNI_BaseLayer` always owns a `MainImage`
+    /// (`LayerIntf.cpp:404` `AllocateDefaultImage`), so a visible layer
+    /// contributes an image command even when the script never drew into it.
+    /// Count only commands whose texture has any non-transparent pixel, which
+    /// is what a scene actually shows.
+    fn content_image_command_count(engine: &KrkrEngine, frame: &EngineFrame) -> usize {
+        let mut textures = std::collections::BTreeMap::new();
+        for layer in engine.host().layer_tree().layers() {
+            if let Some(image) = &layer.image {
+                textures.insert(image.upload.texture_id, &image.upload.rgba);
+            }
+        }
+        frame
+            .output
+            .draw_commands
+            .iter()
+            .filter(|command| match command {
+                krkr_core::DrawCommand::Image(image) => textures
+                    .get(&image.texture_id)
+                    .is_some_and(|rgba| rgba.chunks_exact(4).any(|pixel| pixel[3] != 0)),
+                _ => false,
+            })
             .count()
     }
 

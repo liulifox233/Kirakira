@@ -1329,6 +1329,7 @@ mod tests {
                 source_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
                 texture_size: Size::new(1.0, 1.0),
                 opacity: 1.0,
+                opaque: false,
             })],
         );
         let first = compose_scene(&output, &textures).visual_hash();
@@ -1349,6 +1350,7 @@ mod tests {
                 source_rect: Rect::new(1.0, 0.0, 1.0, 1.0),
                 texture_size: Size::new(2.0, 1.0),
                 opacity: 0.5,
+                opaque: false,
             })],
         );
         let scene = compose_scene(&output, &textures);

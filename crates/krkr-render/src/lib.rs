@@ -556,6 +556,7 @@ impl Renderer {
                         source_rect: Rect::new(0.0, 0.0, image.width as f32, image.height as f32),
                         texture_size: Size::new(image.width as f32, image.height as f32),
                         opacity: text.color.a,
+                        opaque: false,
                     }));
                 }
                 _ => prepared.push(command.clone()),
@@ -862,12 +863,12 @@ impl Renderer {
     ) {
         let tint = [1.0, 1.0, 1.0, 1.0];
         let vertices = [
-            TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint),
-            TexturedVertex::new([1.0, 1.0], [1.0, 0.0], tint),
-            TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint),
-            TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint),
-            TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint),
-            TexturedVertex::new([-1.0, -1.0], [0.0, 1.0], tint),
+            TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint, 0.0),
+            TexturedVertex::new([1.0, 1.0], [1.0, 0.0], tint, 0.0),
+            TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint, 0.0),
+            TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint, 0.0),
+            TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint, 0.0),
+            TexturedVertex::new([-1.0, -1.0], [0.0, 1.0], tint, 0.0),
         ];
         let vertex_buffer = self
             .device
@@ -895,14 +896,15 @@ impl Renderer {
         let ty1 = (command.source_rect.y + command.source_rect.height)
             / command.texture_size.height.max(1.0);
         let tint = [1.0, 1.0, 1.0, command.opacity.clamp(0.0, 1.0)];
+        let force_opaque = if command.opaque { 1.0 } else { 0.0 };
 
         [
-            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint),
-            TexturedVertex::new(self.ndc(x1, y0), [tx1, ty0], tint),
-            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint),
-            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint),
-            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint),
-            TexturedVertex::new(self.ndc(x0, y1), [tx0, ty1], tint),
+            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint, force_opaque),
+            TexturedVertex::new(self.ndc(x1, y0), [tx1, ty0], tint, force_opaque),
+            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint, force_opaque),
+            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint, force_opaque),
+            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint, force_opaque),
+            TexturedVertex::new(self.ndc(x0, y1), [tx0, ty1], tint, force_opaque),
         ]
     }
 
@@ -1296,6 +1298,8 @@ struct TexturedVertex {
     position: [f32; 2],
     tex_coord: [f32; 2],
     tint: [f32; 4],
+    force_opaque: f32,
+    _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -1371,14 +1375,21 @@ fn color_uniform(color: Color) -> [f32; 4] {
 }
 
 impl TexturedVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+    const ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32];
 
-    const fn new(position: [f32; 2], tex_coord: [f32; 2], tint: [f32; 4]) -> Self {
+    const fn new(
+        position: [f32; 2],
+        tex_coord: [f32; 2],
+        tint: [f32; 4],
+        force_opaque: f32,
+    ) -> Self {
         Self {
             position,
             tex_coord,
             tint,
+            force_opaque,
+            _pad: [0.0; 3],
         }
     }
 

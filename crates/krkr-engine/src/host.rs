@@ -771,7 +771,8 @@ impl KrkrHost {
     }
 
     pub(crate) fn set_command_argument(&mut self, name: &str, value: &str) {
-        self.command_line.insert(name.to_string(), value.to_string());
+        self.command_line
+            .insert(name.to_string(), value.to_string());
     }
 
     pub(crate) fn assign_system_message(&mut self, id: &str, message: &str) -> bool {
@@ -1646,7 +1647,41 @@ impl KrkrHost {
         }
     }
 
+    /// Official `tTJSNI_BaseLayer` is not discarded while the TJS object is
+    /// alive (`LayerIntf.cpp`). Recreate a dropped tree node so later
+    /// `SetHasImage` / `FillRect` / `CopyRect` still have a dest bitmap.
+    ///
+    /// Returns whether a node had to be recreated: the caller must restore the
+    /// ctor's `AllocateDefaultImage` bitmap on it (`LayerIntf.cpp:404`), because
+    /// the dropped node took the `MainImage` with it.
+    pub(crate) fn ensure_native_layer_node(&mut self, handle: ObjectHandle) -> bool {
+        let Some(instance) = self.native_layers.get(&handle).cloned() else {
+            return false;
+        };
+        let LayerRenderTarget::Native(layer_id) = instance.render_target else {
+            return false;
+        };
+        if self.layer_tree.layer(layer_id).is_some() {
+            return false;
+        }
+        let render_parent = self
+            .native_layer_render_parent(handle, instance.parent)
+            .filter(|parent_id| *parent_id != layer_id);
+        self.layer_tree
+            .ensure_layer(layer_id, format!("native:{}", handle.0), render_parent, 0);
+        let window_closed = instance
+            .window
+            .is_some_and(|window| self.native_window_closed(window));
+        if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
+            apply_layer_properties_to_node(layer, &instance.properties, window_closed);
+            layer.renderable = true;
+            layer.parent = render_parent;
+        }
+        true
+    }
+
     pub(crate) fn apply_layer_instance_to_render(&mut self, handle: ObjectHandle) {
+        self.ensure_native_layer_node(handle);
         let Some(instance) = self.native_layers.get(&handle).cloned() else {
             return;
         };
@@ -1748,51 +1783,72 @@ impl KrkrHost {
             return;
         };
 
-        let mut removed_layer_ids = BTreeSet::new();
-        self.collect_layer_subtree_ids(layer_id, &mut removed_layer_ids);
-        for layer_id in &removed_layer_ids {
-            self.layer_tree.remove_layer(*layer_id);
+        // Official `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:482`):
+        // `Part()` from the parent, then `Part()` each direct child.
+        // Children keep their native instances; only this layer is destroyed.
+        // Kirakira used to wipe the whole tree subtree, which left GINKA
+        // `StandLayer` dests in `window._standpoollayer.children` without a
+        // bitmap — `PSDLayer.updateDisp` / `hasImage = 1` became no-ops.
+        let children = self.native_layer_children(handle);
+        self.part_native_layer(handle);
+        for child in children {
+            self.part_native_layer(child);
+            // Official orphans leave the manager tree. Kirakira treats
+            // `parent=None` as a draw-list root, so keep them off-screen
+            // until a later `Join` / parent assignment.
+            if let Some(child_id) = self.native_layer(child)
+                && let Some(layer) = self.layer_tree.layer_mut(child_id)
+            {
+                layer.renderable = false;
+            }
         }
 
-        let removed_handles = self
-            .native_layers
-            .iter()
-            .filter_map(|(handle, instance)| {
-                removed_layer_ids
-                    .contains(&instance.layer_id)
-                    .then_some(*handle)
-            })
-            .collect::<Vec<_>>();
-        for handle in removed_handles {
-            if let Some(instance) = self.native_layers.remove(&handle) {
-                if let Some(parent) = instance.parent {
-                    self.remove_native_layer_child(parent, handle);
-                }
-                if let Some(window) = instance.window {
-                    self.remove_native_window_child(window, handle);
-                }
+        self.layer_tree.remove_layer(layer_id);
+        if let Some(instance) = self.native_layers.remove(&handle) {
+            if let Some(parent) = instance.parent {
+                self.remove_native_layer_child(parent, handle);
             }
-            if let Some(slot) = self.kag_layer_slots.remove(&handle)
-                && slot.page == "back"
-            {
-                self.pending_kag_layers.remove(&slot.layer);
+            if let Some(window) = instance.window {
+                self.remove_native_window_child(window, handle);
             }
-            for window in self.native_windows.values_mut() {
-                window.children.retain(|child| *child != handle);
-                if window.primary_layer == Some(handle) {
-                    window.primary_layer = None;
-                    window
-                        .properties
-                        .insert("primaryLayer".to_string(), Variant::Void);
-                }
-                if window.focused_layer == Some(handle) {
-                    window.focused_layer = None;
-                    window
-                        .properties
-                        .insert("focusedLayer".to_string(), Variant::Null);
-                }
+        }
+        if let Some(slot) = self.kag_layer_slots.remove(&handle)
+            && slot.page == "back"
+        {
+            self.pending_kag_layers.remove(&slot.layer);
+        }
+        for window in self.native_windows.values_mut() {
+            window.children.retain(|child| *child != handle);
+            if window.primary_layer == Some(handle) {
+                window.primary_layer = None;
+                window
+                    .properties
+                    .insert("primaryLayer".to_string(), Variant::Void);
             }
-            self.cleanup_invalidated_handle(handle);
+            if window.focused_layer == Some(handle) {
+                window.focused_layer = None;
+                window
+                    .properties
+                    .insert("focusedLayer".to_string(), Variant::Null);
+            }
+        }
+    }
+
+    /// Official `tTJSNI_BaseLayer::Part` (`LayerIntf.cpp:589`): detach from
+    /// the current parent without destroying the native instance.
+    fn part_native_layer(&mut self, handle: ObjectHandle) {
+        let Some(instance) = self.native_layers.get(&handle).cloned() else {
+            return;
+        };
+        if let Some(parent) = instance.parent {
+            self.remove_native_layer_child(parent, handle);
+        }
+        if let Some(instance) = self.native_layers.get_mut(&handle) {
+            instance.parent = None;
+            instance.set_property("parent", Variant::Void);
+        }
+        if let LayerRenderTarget::Native(layer_id) = instance.render_target {
+            self.layer_tree.set_parent(layer_id, None);
         }
     }
 
@@ -2878,20 +2934,6 @@ impl KrkrHost {
             .unwrap_or(0)
             .saturating_add(1)
     }
-
-    fn collect_layer_subtree_ids(&self, root: LayerId, output: &mut BTreeSet<LayerId>) {
-        if !output.insert(root) {
-            return;
-        }
-        let children = self
-            .layer_tree()
-            .layers()
-            .filter_map(|layer| (layer.parent == Some(root)).then_some(layer.id))
-            .collect::<Vec<_>>();
-        for child in children {
-            self.collect_layer_subtree_ids(child, output);
-        }
-    }
 }
 
 fn normalize_kag_page(page: &str) -> &str {
@@ -2915,12 +2957,16 @@ fn apply_layer_properties_to_node(
         layer_property_i64(properties, "imageLeft", layer.image_left.round() as i64) as f32;
     layer.image_top =
         layer_property_i64(properties, "imageTop", layer.image_top.round() as i64) as f32;
-    layer.image_width =
-        layer_property_i64(properties, "imageWidth", layer.image_width.round() as i64).max(0)
-            as f32;
-    layer.image_height =
-        layer_property_i64(properties, "imageHeight", layer.image_height.round() as i64).max(0)
-            as f32;
+    // Official `imageWidth`/`imageHeight` are `MainImage` dimensions, not a
+    // stored TJS field. AffineLayer getters may report `_image` size (or 0).
+    if let Some(image) = &layer.image {
+        let size = image.size();
+        layer.image_width = size.width;
+        layer.image_height = size.height;
+    } else {
+        layer.image_width = 0.0;
+        layer.image_height = 0.0;
+    }
     layer.visible =
         layer_property_i64(properties, "visible", i64::from(layer.visible)) != 0 && !window_closed;
     layer.enabled = layer_property_i64(properties, "enabled", i64::from(layer.enabled)) != 0;

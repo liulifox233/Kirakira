@@ -1611,6 +1611,7 @@ pub(crate) fn video_overlay_frame_quads(
             source_rect: Rect::new(0.0, 0.0, frame.width as f32, frame.height as f32),
             texture_size: Size::new(frame.width as f32, frame.height as f32),
             opacity: 1.0,
+            opaque: false,
         }));
     }
     for message in present_logs {

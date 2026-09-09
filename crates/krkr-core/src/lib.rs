@@ -879,6 +879,10 @@ pub struct ImageCommand {
     pub source_rect: Rect,
     pub texture_size: Size,
     pub opacity: f32,
+    /// Official `GetOperationModeFromType` → `omOpaque` presents the RGB
+    /// through `TVPCopyOpaqueImage` (`0xff000000 | src`), ignoring stored
+    /// alpha. Kirakira's GPU path must do the same for `ltOpaque`.
+    pub opaque: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1201,6 +1205,10 @@ impl LayerNode {
             return None;
         }
 
+        // Official `DrawSelf` (`LayerIntf.cpp:5366`) presents `MainImage` at
+        // the bitmap size. Kirakira's `imageWidth` can be 0 on AffineLayer
+        // dests because the TJS getter reads `_image.imageWidth`, not the
+        // dest bitmap; skipping those uploads blacks out GINKA's background.
         let texture_size = image.size();
         let image_width = texture_size.width;
         let image_height = texture_size.height;
@@ -1237,6 +1245,10 @@ impl LayerNode {
             ),
             texture_size,
             opacity: inherited_opacity * self.opacity as f32 / 255.0,
+            // `tTJSNI_BaseLayer::GetOperationModeFromType` (`LayerIntf.cpp:1404`):
+            // `ltOpaque` → `omOpaque`. Unknown types also fall through to
+            // `omOpaque`; binders have no image so they never reach here.
+            opaque: self.layer_type == 1,
         })
     }
 
@@ -1305,6 +1317,31 @@ impl LayerTree {
 
     pub fn remove_layer(&mut self, id: LayerId) -> Option<LayerNode> {
         self.layers.remove(&id)
+    }
+
+    /// Put a previously-created layer id back in the tree.
+    ///
+    /// Official `tTJSNI_BaseLayer` stays allocated for the TJS Layer object's
+    /// lifetime (`LayerIntf.cpp`). Kirakira must not lose the node while that
+    /// handle is still live — GINKA `StandLayer` / `PSDLayer` dests were
+    /// dropped after construction, so `hasImage` / `FillRect` / `CopyRect`
+    /// became no-ops and stands never composited.
+    pub fn ensure_layer(
+        &mut self,
+        id: LayerId,
+        name: impl Into<String>,
+        parent: Option<LayerId>,
+        z_order: i32,
+    ) -> bool {
+        if self.layers.contains_key(&id) {
+            return false;
+        }
+        self.layers
+            .insert(id, LayerNode::new(id, name, parent, z_order));
+        if id >= self.next_layer_id {
+            self.next_layer_id = id.saturating_add(1);
+        }
+        true
     }
 
     pub fn set_parent(&mut self, id: LayerId, parent: Option<LayerId>) -> bool {
@@ -1487,7 +1524,6 @@ impl LayerTree {
         children.sort_by_key(|layer| (layer.z_order, layer.id));
         children
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -8,13 +8,13 @@ use krkr_tjs2::{
     runtime::Variant,
 };
 
-pub(crate) enum BreakpointSpec {
+pub enum BreakpointSpec {
     Tjs { file: String, line: usize },
     KagLine { storage: String, line: usize },
     KagLabel { label: String },
 }
 
-pub(crate) fn parse_breakpoint_spec(spec: &str) -> Result<BreakpointSpec, String> {
+pub fn parse_breakpoint_spec(spec: &str) -> Result<BreakpointSpec, String> {
     if let Some(label) = spec.strip_prefix('*') {
         if label.is_empty() {
             return Err("empty label".to_string());
@@ -42,14 +42,14 @@ pub(crate) fn parse_breakpoint_spec(spec: &str) -> Result<BreakpointSpec, String
     }
 }
 
-pub(crate) struct CliDebugger {
+pub struct CliDebugger {
     stdin: std::io::BufReader<std::io::Stdin>,
     scripted: VecDeque<String>,
     last_action: Option<DebugAction>,
 }
 
 impl CliDebugger {
-    pub(crate) fn new(commands_file: Option<PathBuf>) -> Self {
+    pub fn new(commands_file: Option<PathBuf>) -> Self {
         let scripted = commands_file
             .map(|path| {
                 std::fs::read_to_string(&path)

@@ -1174,6 +1174,7 @@ dependencies = [
  "krkr-assets",
  "krkr-audio",
  "krkr-core",
+ "krkr-debug",
  "krkr-engine",
  "krkr-plugins",
  "krkr-render",

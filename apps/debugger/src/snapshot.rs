@@ -6,9 +6,9 @@ use std::{collections::HashMap, sync::Arc};
 use krkr_core::{DrawCommand, ImageUpload};
 use krkr_engine::KrkrEngine;
 
-pub(crate) type TextureCache = HashMap<u64, (u32, u32, Arc<[u8]>)>;
+pub type TextureCache = HashMap<u64, (u32, u32, Arc<[u8]>)>;
 
-pub(crate) fn composite_frame(
+pub fn composite_frame(
     width: u32,
     height: u32,
     commands: &[DrawCommand],
@@ -134,7 +134,7 @@ fn blend_pixel(canvas: &mut [u8], width: u32, x: u32, y: u32, src: &[u8], alpha:
     *dst.last_mut().expect("alpha channel") = out_a as u8;
 }
 
-pub(crate) fn write_png(path: &str, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+pub fn write_png(path: &str, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
     let mut raw = Vec::with_capacity((width * height * 4 + height) as usize);
     for row in rgba.chunks_exact((width * 4) as usize) {
         raw.push(0);
@@ -202,7 +202,7 @@ fn adler32(data: &[u8]) -> u32 {
 type AlphaBounds = (u32, u32, u32, u32);
 type RgbaStats = (usize, u64, usize, Option<AlphaBounds>);
 
-pub(crate) fn print_image_pixels(
+pub fn print_image_pixels(
     image: &krkr_core::ImageCommand,
     uploads: &[ImageUpload],
     engine: &KrkrEngine,
@@ -239,7 +239,7 @@ pub(crate) fn print_image_pixels(
     );
 }
 
-pub(crate) fn rgba_stats(width: u32, height: u32, rgba: &[u8]) -> RgbaStats {
+pub fn rgba_stats(width: u32, height: u32, rgba: &[u8]) -> RgbaStats {
     let mut nonzero_alpha = 0usize;
     let mut alpha_sum = 0u64;
     let mut nonzero_rgb = 0usize;

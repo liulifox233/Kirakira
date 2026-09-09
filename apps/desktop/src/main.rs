@@ -1,10 +1,24 @@
-use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc, time::Instant};
-
+use std::{
+    fmt,
+    io::BufRead,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
+    thread,
+    time::Instant,
+};
 use krkr_assets::{NativeAssetStore, ProjectStorage};
 use krkr_audio::AudioSystem;
 use krkr_core::{
-    AudioEvent, AudioStatusLevel, ButtonState, Clock, Engine, EngineConfig, EngineEvent, EngineKey,
-    FrameInput, Point, PointerButton, Size, StatusLevel,
+    AudioEvent, AudioStatusLevel, ButtonState, Clock, DrawCommand, Engine, EngineConfig, EngineEvent,
+    EngineKey, FrameInput, Point, PointerButton, Size, StatusLevel,
+};
+use krkr_debug::{
+    console::{self, InteractiveCommand, InteractiveUntil},
+    snapshot::{self, TextureCache},
 };
 use krkr_engine::{
     EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, RuntimeSession,
@@ -33,8 +47,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let initial_project_root = initial_project_root();
-    let mut app = DesktopApp::new(initial_project_root);
+    let (initial_project_root, console_path) = parse_desktop_args();
+    let mut app = DesktopApp::new(initial_project_root, console_path);
 
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
@@ -47,6 +61,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--debug-console <fifo>` attaches the shared `krkr-debug` console to this
+/// windowed process: an agent writes commands to the FIFO and reads the dumps
+/// from stdout while the player drives the game with the mouse and keyboard.
+fn parse_desktop_args() -> (Option<PathBuf>, Option<PathBuf>) {
+    let mut root = None;
+    let mut console = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--debug-console" {
+            console = args.next().map(PathBuf::from);
+            continue;
+        }
+        if root.is_none() {
+            root = Some(PathBuf::from(arg));
+        }
+    }
+    (root.or_else(initial_project_root), console)
+}
+
 fn show_error(title: &str, message: &str) {
     let _ = MessageDialog::new()
         .set_level(MessageLevel::Error)
@@ -57,10 +90,6 @@ fn show_error(title: &str, message: &str) {
 }
 
 fn initial_project_root() -> Option<PathBuf> {
-    if let Some(arg) = std::env::args_os().nth(1) {
-        return Some(PathBuf::from(arg));
-    }
-
     let current_dir = std::env::current_dir().ok();
     if current_dir
         .as_ref()
@@ -136,6 +165,74 @@ impl DesktopStatus {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ConsoleTick {
+    advance: bool,
+    quit: bool,
+}
+
+/// Interactive console attached to the windowed process (`--debug-console`).
+/// The command grammar and dump helpers are shared with `krkr-debug`
+/// (`krkr_debug::console`); only the frame source differs.
+struct ConsoleState {
+    commands: Receiver<InteractiveCommand>,
+    paused: bool,
+    budget: Option<usize>,
+    until: Option<InteractiveUntil>,
+    pending_clicks: Vec<Point>,
+    pending_releases: Vec<Point>,
+    pending_shots: Vec<String>,
+    auto_click: bool,
+    auto_point: Option<Point>,
+    textures: TextureCache,
+    last_commands: Option<Vec<DrawCommand>>,
+}
+
+impl ConsoleState {
+    fn start(path: PathBuf) -> Self {
+        let (sender, commands) = mpsc::channel();
+        let reader_path = path.clone();
+        thread::spawn(move || loop {
+            let Ok(file) = std::fs::File::open(&reader_path) else {
+                thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            };
+            for line in std::io::BufReader::new(file).lines() {
+                let Ok(line) = line else { break };
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match console::parse_interactive_command(line) {
+                    Ok(command) => {
+                        if sender.send(command).is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => println!("console_error {line:?}: {error}"),
+                }
+            }
+        });
+        println!(
+            "console=ready path={} (write commands to the fifo, dumps print here)",
+            path.display()
+        );
+        Self {
+            commands,
+            paused: false,
+            budget: None,
+            until: None,
+            pending_clicks: Vec::new(),
+            pending_releases: Vec::new(),
+            pending_shots: Vec::new(),
+            auto_click: false,
+            auto_point: None,
+            textures: TextureCache::new(),
+            last_commands: None,
+        }
+    }
+}
+
 struct DesktopApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -147,6 +244,8 @@ struct DesktopApp {
     state: DesktopState,
     project_root: Option<PathBuf>,
     initial_project_root: Option<PathBuf>,
+    console_path: Option<PathBuf>,
+    console: Option<ConsoleState>,
     status: Option<DesktopStatus>,
     last_frame: Instant,
     rendered_frames: u64,
@@ -156,7 +255,7 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new(initial_project_root: Option<PathBuf>) -> Self {
+    fn new(initial_project_root: Option<PathBuf>, console_path: Option<PathBuf>) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -168,6 +267,8 @@ impl DesktopApp {
             state: DesktopState::Running,
             project_root: None,
             initial_project_root,
+            console_path,
+            console: None,
             status: None,
             last_frame: Instant::now(),
             rendered_frames: 0,
@@ -232,10 +333,118 @@ impl DesktopApp {
         }
     }
 
+    /// Applies every queued console command, then converts console-queued
+    /// clicks into engine events. Returns whether the engine should advance
+    /// this frame and whether the console asked to quit.
+    fn console_tick(&mut self, frame_index: u64) -> ConsoleTick {
+        let Some(console) = self.console.as_mut() else {
+            return ConsoleTick {
+                advance: true,
+                quit: false,
+            };
+        };
+        let Some(runtime) = self.runtime.as_mut() else {
+            return ConsoleTick {
+                advance: true,
+                quit: false,
+            };
+        };
+        let mut quit = false;
+        while let Ok(command) = console.commands.try_recv() {
+            quit |= console::apply_interactive_control(
+                command,
+                &mut console.paused,
+                &mut console.budget,
+                &mut console.until,
+                &mut console.pending_clicks,
+                &mut console.pending_shots,
+                frame_index as usize,
+                runtime,
+                &mut console.textures,
+                console.last_commands.as_deref(),
+                &mut console.auto_click,
+                &mut console.auto_point,
+            );
+        }
+        for position in std::mem::take(&mut console.pending_clicks) {
+            println!("interactive click press frame={frame_index} position={position:?}");
+            self.pending_runtime_events
+                .push(EngineEvent::CursorMoved { position });
+            self.pending_runtime_events.push(EngineEvent::PointerInput {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+            });
+            console.pending_releases.push(position);
+        }
+        for position in std::mem::take(&mut console.pending_releases) {
+            self.pending_runtime_events
+                .push(EngineEvent::CursorMoved { position });
+            self.pending_runtime_events.push(EngineEvent::PointerInput {
+                button: PointerButton::Primary,
+                state: ButtonState::Released,
+            });
+        }
+        for path in std::mem::take(&mut console.pending_shots) {
+            let viewport = runtime
+                .engine()
+                .content_viewport_size()
+                .unwrap_or(Size::new(1280.0, 720.0));
+            let commands = console.last_commands.clone().unwrap_or_default();
+            let (width, height, rgba) = snapshot::composite_frame(
+                viewport.width.max(1.0) as u32,
+                viewport.height.max(1.0) as u32,
+                &commands,
+                &console.textures,
+            );
+            match snapshot::write_png(&path, width, height, &rgba) {
+                Ok(()) => println!("interactive screenshot={path}"),
+                Err(error) => println!("interactive screenshot_error={path}: {error}"),
+            }
+        }
+        ConsoleTick {
+            advance: !console.paused && console.budget != Some(0),
+            quit,
+        }
+    }
+
+    /// Records the presented frame for later `draw` / `shot` dumps and applies
+    /// the console's frame budget and `until` conditions.
+    fn console_after_frame(&mut self, commands: &[DrawCommand], uploads: &[krkr_core::ImageUpload]) {
+        let Some(console) = self.console.as_mut() else {
+            return;
+        };
+        console.last_commands = Some(commands.to_vec());
+        for upload in uploads {
+            console.textures.insert(
+                upload.texture_id,
+                (upload.width, upload.height, Arc::clone(&upload.rgba)),
+            );
+        }
+        if let Some(budget) = console.budget.as_mut() {
+            *budget = budget.saturating_sub(1);
+        }
+        let frame_index = self.rendered_frames;
+        if let Some(condition) = console.until.clone() {
+            let satisfied = self.runtime.as_ref().is_some_and(|runtime| {
+                console::interactive_condition_satisfied(runtime.engine(), &condition)
+            });
+            if satisfied {
+                println!("interactive=until-hit condition={condition:?} frame={frame_index}");
+                console.until = None;
+                console.budget = Some(0);
+            }
+        }
+        if console.budget == Some(0) {
+            console.budget = None;
+            console.paused = true;
+            println!("interactive=paused frame={frame_index}");
+        }
+    }
+
     fn handle_redraw(&mut self, event_loop: &ActiveEventLoop) {
         self.report_audio_events();
 
-        let Some(renderer) = &mut self.renderer else {
+        let Some(window_logical_size) = self.renderer.as_ref().map(Renderer::logical_size) else {
             return;
         };
         let window = self.window.clone();
@@ -244,10 +453,24 @@ impl DesktopApp {
         let delta_seconds = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        let window_logical_size = renderer.logical_size();
         let content_size = self.runtime_viewport_size.unwrap_or(window_logical_size);
         let frame_input = FrameInput::new(content_size, delta_seconds);
         let mut exit_after_render = false;
+        // Console commands run before the update so `pause` / `advance` /
+        // `click` take effect on this frame, exactly like `krkr-debug`.
+        let console_tick = self.console_tick(self.rendered_frames);
+        if console_tick.quit {
+            self.persist_running_project();
+            event_loop.exit();
+            return;
+        }
+        if !console_tick.advance {
+            // Paused for inspection: keep the last presented frame on screen.
+            return;
+        }
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
         let frame = match self.state {
             DesktopState::Running => {
                 if let Some(runtime) = &mut self.runtime {
@@ -405,6 +628,7 @@ impl DesktopApp {
                 }
             }
         }
+        self.console_after_frame(&frame.draw_commands, &frame.image_uploads);
 
         if exit_after_render {
             self.persist_running_project();
@@ -506,6 +730,9 @@ impl DesktopApp {
         }
         apply_window_fullscreen(window, runtime.engine().window_fullscreen());
         self.runtime = Some(runtime);
+        if let Some(path) = self.console_path.take() {
+            self.console = Some(ConsoleState::start(path));
+        }
         self.runtime_viewport_size = content_size
             .filter(|size| !size.is_empty())
             .or_else(|| self.renderer.as_ref().map(Renderer::logical_size));

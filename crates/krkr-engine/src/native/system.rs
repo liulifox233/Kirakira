@@ -313,21 +313,9 @@ fn system_to_actual_color(
         .first()
         .ok_or_else(|| TjsError::runtime("System.toActualColor requires a color"))?
         .to_integer()? as u32;
-    // KRKR uses Win32 system-color identifiers (0x80000000 | index). Keep a
-    // stable portable palette for those identifiers while ordinary RGB values
-    // pass through unchanged.
-    const PALETTE: [u32; 25] = [
-        0x00c0_c0c0, 0x00ff_ffff, 0x0080_8080, 0x0000_0080, 0x00c0_c0c0, 0x00ff_ffff, 0x0000_0000,
-        0x0000_0000, 0x00ff_ffff, 0x0000_0000, 0x00c0_c0c0, 0x00c0_c0c0, 0x00e0_e0e0, 0x0000_007f,
-        0x00ff_ffff, 0x00f0_f0f0, 0x0080_8080, 0x0080_8080, 0x0000_0000, 0x00c0_c0c0, 0x00ff_ffff,
-        0x00ff_ffff, 0x0000_0000, 0x00ff_ffff, 0x00ff_ffff,
-    ];
-    let rgb = if color & 0xff00_0000 != 0 {
-        PALETTE.get((color & 0xff) as usize).copied().unwrap_or(0)
-    } else {
-        color & 0x00ff_ffff
-    };
-    Ok(Variant::Integer(rgb as i64))
+    Ok(Variant::Integer(super::classes::to_actual_color(
+        color as i64,
+    )))
 }
 
 fn system_assign_message(

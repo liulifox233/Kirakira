@@ -1,4 +1,5 @@
 pub(crate) mod classes;
+mod blend;
 mod clipboard;
 mod debug;
 mod kag;

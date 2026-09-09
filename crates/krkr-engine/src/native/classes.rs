@@ -4,12 +4,15 @@ use std::{
     time::Duration,
 };
 
+use super::blend;
+
 use krkr_core::{
     AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerImage, LayerNode, Size,
     TransitionMethod, TransitionParams, TransitionScrollFrom, TransitionScrollStay,
 };
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
+
     Result, TjsError,
     runtime::{Closure, ObjectHandle, Runtime, TjsHost, Variant},
 };
@@ -528,12 +531,32 @@ fn apply_constructor_defaults(
                 set_layer_property_storage(runtime, handle, "children", Variant::Object(children));
                 set_layer_property_storage(runtime, handle, "left", Variant::Integer(0));
                 set_layer_property_storage(runtime, handle, "top", Variant::Integer(0));
-                set_layer_property_storage(runtime, handle, "width", Variant::Integer(0));
-                set_layer_property_storage(runtime, handle, "height", Variant::Integer(0));
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "width",
+                    Variant::Integer(DEFAULT_LAYER_SIZE as i64),
+                );
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "height",
+                    Variant::Integer(DEFAULT_LAYER_SIZE as i64),
+                );
                 set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(0));
                 set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(0));
-                set_layer_property_storage(runtime, handle, "imageWidth", Variant::Integer(0));
-                set_layer_property_storage(runtime, handle, "imageHeight", Variant::Integer(0));
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "imageWidth",
+                    Variant::Integer(DEFAULT_LAYER_SIZE as i64),
+                );
+                set_layer_property_storage(
+                    runtime,
+                    handle,
+                    "imageHeight",
+                    Variant::Integer(DEFAULT_LAYER_SIZE as i64),
+                );
                 set_layer_property_storage(runtime, handle, "order", Variant::Integer(0));
                 set_layer_property_storage(
                     runtime,
@@ -565,6 +588,8 @@ fn apply_constructor_defaults(
                     Variant::Integer(if is_primary { 0xffff_ffff } else { 0x00ff_ffff }),
                 );
                 set_layer_property_storage(runtime, handle, "face", Variant::Integer(128));
+                // `tTJSNI_BaseLayer` ctor: `HoldAlpha = TVPDefaultHoldAlpha` (false).
+                set_layer_property_storage(runtime, handle, "holdAlpha", Variant::Integer(0));
                 set_layer_property_storage(runtime, handle, "hitType", Variant::Integer(0));
                 set_layer_property_storage(
                     runtime,
@@ -598,6 +623,12 @@ fn apply_constructor_defaults(
                     let children = ensure_child_array(runtime, parent);
                     runtime.array_push(children, Variant::Object(handle));
                 }
+                // `tTJSNI_BaseLayer` ctor (`LayerIntf.cpp:342` / `:404`): Rect is
+                // 32×32 and `AllocateDefaultImage` copies the 32×32 transparent
+                // white holder. Drawable layers never start with no bitmap.
+                // `hasImage` records that intent for re-attachment.
+                set_layer_property_storage(runtime, handle, "hasImage", Variant::Integer(1));
+                allocate_default_layer_image(runtime, handle);
             }
         }
         "Font" => {
@@ -1200,6 +1231,11 @@ fn install_image_function_methods(runtime: &mut Runtime<KrkrHost>, handle: Objec
 type NativeMethod =
     fn(&mut Runtime<KrkrHost>, Option<ObjectHandle>, Vec<Variant>) -> Result<Variant>;
 
+/// Official `tTJSNI_BaseLayer` ctor Rect / `TVPTempBitmapHolder` size (`LayerIntf.cpp:78`).
+const DEFAULT_LAYER_SIZE: u32 = 32;
+/// `TVP_RGBA2COLOR(255, 255, 255, 0)` — the default holder fill.
+const DEFAULT_LAYER_IMAGE_RGBA: [u8; 4] = [255, 255, 255, 0];
+
 const LAYER_NATIVE_PROPERTIES: &[&str] = &[
     "window",
     "parent",
@@ -1221,6 +1257,7 @@ const LAYER_NATIVE_PROPERTIES: &[&str] = &[
     "imageHeight",
     "type",
     "face",
+    "holdAlpha",
     "hitType",
     "hitThreshold",
     "cursor",
@@ -1313,11 +1350,21 @@ fn layer_native_property_get(
         return Ok(layer_cursor_position_value(runtime, this, name));
     }
     if name == "hasImage" {
-        let has_image = render_layer_target(runtime, this)?
-            .as_ref()
-            .and_then(|target| render_layer_snapshot(runtime, target))
-            .is_some_and(|layer| layer.image.is_some());
-        return Ok(Variant::Integer(i64::from(has_image)));
+        return Ok(Variant::Integer(i64::from(layer_has_main_image(
+            runtime, this,
+        )?)));
+    }
+    if matches!(
+        name,
+        "imageWidth" | "imageHeight" | "imageLeft" | "imageTop"
+    ) {
+        let (width, height) = layer_main_image_size(runtime, this)?;
+        return Ok(Variant::Integer(match name {
+            "imageWidth" => width as i64,
+            "imageHeight" => height as i64,
+            "imageLeft" => layer_property_i64(runtime, this, "imageLeft", 0)?,
+            _ => layer_property_i64(runtime, this, "imageTop", 0)?,
+        }));
     }
     Ok(layer_property_value(runtime, this, name))
 }
@@ -1366,6 +1413,22 @@ fn layer_native_property_set(
     let value = normalize_layer_property_value(name, value)?;
     if name == "hasImage" {
         set_layer_has_image(runtime, this, value.is_truthy())?;
+        return Ok(());
+    }
+    if name == "imageWidth" {
+        set_layer_image_width(runtime, this, value.to_integer()?)?;
+        return Ok(());
+    }
+    if name == "imageHeight" {
+        set_layer_image_height(runtime, this, value.to_integer()?)?;
+        return Ok(());
+    }
+    if name == "width" {
+        set_layer_geographical_width(runtime, this, value.to_integer()?)?;
+        return Ok(());
+    }
+    if name == "height" {
+        set_layer_geographical_height(runtime, this, value.to_integer()?)?;
         return Ok(());
     }
     set_layer_property_storage(runtime, this, name, value.clone());
@@ -1520,7 +1583,7 @@ fn normalize_layer_property_value(name: &str, value: Variant) -> Result<Variant>
         }
         "opacity" => Ok(Variant::Integer(value.to_integer()?.clamp(0, 255))),
         "neutralColor" => Ok(Variant::Integer(value.to_integer()? & 0xffff_ffff)),
-        "hasImage" => Ok(Variant::Integer(i64::from(value.is_truthy()))),
+        "hasImage" | "holdAlpha" => Ok(Variant::Integer(i64::from(value.is_truthy()))),
         "left" | "top" | "imageLeft" | "imageTop" | "order" | "absolute" | "absoluteOrderMode"
         | "visible" | "nodeVisible" | "enabled" | "nodeEnabled" | "type" | "face" | "hitType"
         | "hitThreshold" | "cursor" | "isPrimary" | "showParentHint" | "callOnPaint" => {
@@ -1543,46 +1606,408 @@ fn neutral_color_for_layer_type(layer_type: i64) -> i64 {
     }
 }
 
+fn not_drawable_layer_type() -> TjsError {
+    TjsError::runtime("Not drawable layer type")
+}
+
+fn cannot_create_empty_layer_image() -> TjsError {
+    TjsError::runtime("Cannot create empty layer image")
+}
+
+/// `tTJSNI_BaseLayer::MainImage` belongs to the native instance
+/// (`LayerIntf.cpp:2018` `AllocateImage`, `:2242` `GetImageWidth`). Kirakira
+/// additionally *projects* an instance into the render tree, and a back-page
+/// KAG layer is projected onto a shared `kag:<name>` node
+/// (`Host::replace_kag_layer_slots`) that starts with no bitmap. Reading the
+/// projected node first keeps real drawing visible; falling back to the
+/// instance's own node keeps the ctor's `AllocateDefaultImage` visible, so
+/// `setSizeToImageSize` does not throw on a normally constructed layer.
+fn layer_main_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> Option<LayerImage> {
+    // A dropped tree node must be rebuilt before the read, or a layer the
+    // script still owns reports `hasImage = 0` and throws from `imageWidth`.
+    ensure_native_layer_attached(runtime, handle);
+    let projected = render_layer_target(runtime, handle)
+        .ok()
+        .flatten()
+        .and_then(|target| render_layer_snapshot(runtime, &target))
+        .and_then(|layer| layer.image);
+    if projected.is_some() {
+        return projected;
+    }
+    let instance_id = runtime.host().native_layer(handle)?;
+    runtime
+        .host()
+        .layer_tree()
+        .layer(instance_id)
+        .and_then(|layer| layer.image.clone())
+}
+
+fn layer_has_main_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> Result<bool> {
+    Ok(layer_main_image(runtime, handle).is_some())
+}
+
+fn layer_main_image_size(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Result<(u32, u32)> {
+    let Some(image) = layer_main_image(runtime, handle) else {
+        return Err(not_drawable_layer_type());
+    };
+    Ok((image.upload.width, image.upload.height))
+}
+
+fn layer_neutral_fill(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> [u8; 4] {
+    packed_color_to_rgba(
+        layer_property_value(runtime, handle, "neutralColor")
+            .to_integer()
+            .unwrap_or(0x00ff_ffff),
+    )
+}
+
+fn filled_layer_pixels(width: u32, height: u32, fill: [u8; 4]) -> Vec<u8> {
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    if fill != [0, 0, 0, 0] {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&fill);
+        }
+    }
+    pixels
+}
+
+fn allocate_default_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    // `AllocateDefaultImage` copies the 32×32 transparent-white holder. A
+    // second `super.Layer(window, parent)` must not wipe a bitmap already
+    // attached to this native instance.
+    let Some(target) = runtime.host().layer_render_target(handle) else {
+        return;
+    };
+    if render_layer_snapshot(runtime, &target).is_some_and(|layer| layer.image.is_some()) {
+        return;
+    }
+    let pixels = filled_layer_pixels(
+        DEFAULT_LAYER_SIZE,
+        DEFAULT_LAYER_SIZE,
+        DEFAULT_LAYER_IMAGE_RGBA,
+    );
+    let image =
+        runtime
+            .host_mut()
+            .create_layer_image(DEFAULT_LAYER_SIZE, DEFAULT_LAYER_SIZE, pixels);
+    mutate_render_layer(runtime, &target, |layer| {
+        layer.width = DEFAULT_LAYER_SIZE as f32;
+        layer.height = DEFAULT_LAYER_SIZE as f32;
+        layer.image_left = 0.0;
+        layer.image_top = 0.0;
+        layer.set_image(image);
+    });
+}
+
+/// Official `tTJSNI_BaseLayer` keeps a `MainImage` for the object's whole life
+/// unless the script frees it (`SetHasImage(false)` → `DeallocateImage`,
+/// `LayerIntf.cpp:2228`). Kirakira projects the layer into the render tree, and
+/// `Invalidate` / KAG retargeting can drop or recreate that node, taking the
+/// bitmap with it. When the script still expects an image, rebuild it at the
+/// layer Rect the way `AllocateImage` (`LayerIntf.cpp:2056`) does, so
+/// `imageWidth` / `imageHeight` stay readable for scripts that read them
+/// unconditionally (GINKA `BaseLayer.freeImage`, `baselayer.tjs:285`, reads
+/// `imageWidth` → `fillRect`).
+fn restore_default_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    if !layer_property_value(runtime, handle, "hasImage").is_truthy() {
+        return;
+    }
+    let Some(target) = runtime.host().layer_render_target(handle) else {
+        return;
+    };
+    let Some(layer) = render_layer_snapshot(runtime, &target) else {
+        return;
+    };
+    if layer.image.is_some() {
+        return;
+    }
+    let width = layer.width.round().max(1.0) as u32;
+    let height = layer.height.round().max(1.0) as u32;
+    let pixels = filled_layer_pixels(width, height, layer_neutral_fill(runtime, handle));
+    let image = runtime.host_mut().create_layer_image(width, height, pixels);
+    mutate_render_layer(runtime, &target, |layer| {
+        layer.image_left = 0.0;
+        layer.image_top = 0.0;
+        layer.set_image(image);
+    });
+}
+
+fn deallocate_layer_image(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    target: &LayerRenderTarget,
+) {
+    mutate_render_layer(runtime, target, LayerNode::clear_image);
+    // Mirror `GetHasImage() == false` (`LayerIntf.cpp:2237`) so a later
+    // re-attachment does not resurrect the freed bitmap.
+    set_layer_property_storage(runtime, handle, "hasImage", Variant::Integer(0));
+    runtime
+        .host_mut()
+        .clear_layer_image_storage_for_target(target);
+    mark_image_modified(runtime, handle);
+}
+
+fn allocate_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> Result<()> {
+    let Some(target) = render_layer_target(runtime, handle)? else {
+        return Ok(());
+    };
+    if render_layer_snapshot(runtime, &target).is_some_and(|layer| layer.image.is_some()) {
+        return Ok(());
+    }
+    // `AllocateImage` (`LayerIntf.cpp:2056`) builds a bitmap at Rect, filled
+    // with NeutralColor. Empty Rect is illegal for a drawable image.
+    let width = layer_property_i64(runtime, handle, "width", DEFAULT_LAYER_SIZE as i64)?.max(0);
+    let height = layer_property_i64(runtime, handle, "height", DEFAULT_LAYER_SIZE as i64)?.max(0);
+    if width == 0 || height == 0 {
+        return Err(cannot_create_empty_layer_image());
+    }
+    let width = width as u32;
+    let height = height as u32;
+    let pixels = filled_layer_pixels(width, height, layer_neutral_fill(runtime, handle));
+    let image = runtime.host_mut().create_layer_image(width, height, pixels);
+    mutate_render_layer(runtime, &target, |layer| {
+        layer.image_left = 0.0;
+        layer.image_top = 0.0;
+        layer.set_image(image);
+    });
+    set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(0));
+    set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(0));
+    sync_layer_image_members(runtime, handle, width as i64, height as i64);
+    mark_image_modified(runtime, handle);
+    Ok(())
+}
+
+fn change_layer_image_size(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    width: i64,
+    height: i64,
+) -> Result<()> {
+    if width <= 0 || height <= 0 {
+        return Err(cannot_create_empty_layer_image());
+    }
+    let Some(target) = render_layer_target(runtime, handle)? else {
+        return Ok(());
+    };
+    let existing = render_layer_snapshot(runtime, &target).and_then(|layer| layer.image);
+    let fill = layer_neutral_fill(runtime, handle);
+    let image = resize_layer_image(runtime, existing, width as u32, height as u32, fill)
+        .ok_or_else(cannot_create_empty_layer_image)?;
+    mutate_render_layer(runtime, &target, |layer| {
+        layer.image_width = width as f32;
+        layer.image_height = height as f32;
+        layer.image = Some(image);
+    });
+    set_layer_property_storage(runtime, handle, "imageWidth", Variant::Integer(width));
+    set_layer_property_storage(runtime, handle, "imageHeight", Variant::Integer(height));
+    mark_image_modified(runtime, handle);
+    Ok(())
+}
+
+fn image_layer_size_changed(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> Result<()> {
+    // `ImageLayerSizeChanged` (`LayerIntf.cpp:2388`): grow the bitmap to cover
+    // Rect; never shrink it when the layer shrinks.
+    if !layer_has_main_image(runtime, handle)? {
+        return Ok(());
+    }
+    let layer_width = layer_property_i64(runtime, handle, "width", 0)?.max(0);
+    let layer_height = layer_property_i64(runtime, handle, "height", 0)?.max(0);
+    let (mut image_width, mut image_height) = layer_main_image_size(runtime, handle)?;
+    if (image_width as i64) < layer_width {
+        change_layer_image_size(runtime, handle, layer_width, image_height as i64)?;
+        image_width = layer_width as u32;
+    }
+    let image_left = layer_property_i64(runtime, handle, "imageLeft", 0)?;
+    if image_width as i64 + image_left < layer_width {
+        let image_left = layer_width - image_width as i64;
+        set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(image_left));
+        if let Some(target) = render_layer_target(runtime, handle)? {
+            mutate_render_layer(runtime, &target, |layer| {
+                layer.image_left = image_left as f32;
+            });
+        }
+    }
+    if (image_height as i64) < layer_height {
+        change_layer_image_size(runtime, handle, image_width as i64, layer_height)?;
+        image_height = layer_height as u32;
+    }
+    let image_top = layer_property_i64(runtime, handle, "imageTop", 0)?;
+    if image_height as i64 + image_top < layer_height {
+        let image_top = layer_height - image_height as i64;
+        set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(image_top));
+        if let Some(target) = render_layer_target(runtime, handle)? {
+            mutate_render_layer(runtime, &target, |layer| {
+                layer.image_top = image_top as f32;
+            });
+        }
+    }
+    Ok(())
+}
+
+fn set_layer_geographical_width(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    width: i64,
+) -> Result<()> {
+    let width = width.max(0);
+    if layer_property_i64(runtime, handle, "width", 0)? == width {
+        return Ok(());
+    }
+    set_layer_property_storage(runtime, handle, "width", Variant::Integer(width));
+    if let Some(target) = render_layer_target(runtime, handle)? {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.width = width as f32;
+        });
+    }
+    image_layer_size_changed(runtime, handle)
+}
+
+fn set_layer_geographical_height(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    height: i64,
+) -> Result<()> {
+    let height = height.max(0);
+    if layer_property_i64(runtime, handle, "height", 0)? == height {
+        return Ok(());
+    }
+    set_layer_property_storage(runtime, handle, "height", Variant::Integer(height));
+    if let Some(target) = render_layer_target(runtime, handle)? {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.height = height as f32;
+        });
+    }
+    image_layer_size_changed(runtime, handle)
+}
+
+fn set_layer_geographical_size(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    width: i64,
+    height: i64,
+) -> Result<()> {
+    let width = width.max(0);
+    let height = height.max(0);
+    let same = layer_property_i64(runtime, handle, "width", 0)? == width
+        && layer_property_i64(runtime, handle, "height", 0)? == height;
+    if same {
+        return Ok(());
+    }
+    set_layer_property_storage(runtime, handle, "width", Variant::Integer(width));
+    set_layer_property_storage(runtime, handle, "height", Variant::Integer(height));
+    if let Some(target) = render_layer_target(runtime, handle)? {
+        mutate_render_layer(runtime, &target, |layer| {
+            layer.width = width as f32;
+            layer.height = height as f32;
+        });
+    }
+    image_layer_size_changed(runtime, handle)
+}
+
+fn internal_set_layer_image_size(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    width: i64,
+    height: i64,
+) -> Result<()> {
+    // `InternalSetImageSize` (`LayerIntf.cpp:2353`): shrinking the image
+    // below Rect also shrinks the layer.
+    let layer_width = layer_property_i64(runtime, handle, "width", 0)?;
+    let layer_height = layer_property_i64(runtime, handle, "height", 0)?;
+    if width < layer_width {
+        set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(0));
+        if let Some(target) = render_layer_target(runtime, handle)? {
+            mutate_render_layer(runtime, &target, |layer| {
+                layer.image_left = 0.0;
+            });
+        }
+        set_layer_geographical_width(runtime, handle, width)?;
+    }
+    let layer_width = layer_property_i64(runtime, handle, "width", 0)?;
+    let image_left = layer_property_i64(runtime, handle, "imageLeft", 0)?;
+    if width + image_left < layer_width {
+        let image_left = layer_width - width;
+        set_layer_property_storage(runtime, handle, "imageLeft", Variant::Integer(image_left));
+        if let Some(target) = render_layer_target(runtime, handle)? {
+            mutate_render_layer(runtime, &target, |layer| {
+                layer.image_left = image_left as f32;
+            });
+        }
+    }
+    if height < layer_height {
+        set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(0));
+        if let Some(target) = render_layer_target(runtime, handle)? {
+            mutate_render_layer(runtime, &target, |layer| {
+                layer.image_top = 0.0;
+            });
+        }
+        set_layer_geographical_height(runtime, handle, height)?;
+    }
+    let layer_height = layer_property_i64(runtime, handle, "height", 0)?;
+    let image_top = layer_property_i64(runtime, handle, "imageTop", 0)?;
+    if height + image_top < layer_height {
+        let image_top = layer_height - height;
+        set_layer_property_storage(runtime, handle, "imageTop", Variant::Integer(image_top));
+        if let Some(target) = render_layer_target(runtime, handle)? {
+            mutate_render_layer(runtime, &target, |layer| {
+                layer.image_top = image_top as f32;
+            });
+        }
+    }
+    change_layer_image_size(runtime, handle, width, height)
+}
+
+fn set_layer_image_width(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    width: i64,
+) -> Result<()> {
+    let (current_width, current_height) = layer_main_image_size(runtime, handle)?;
+    if width == current_width as i64 {
+        return Ok(());
+    }
+    internal_set_layer_image_size(runtime, handle, width, current_height as i64)
+}
+
+fn set_layer_image_height(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    height: i64,
+) -> Result<()> {
+    let (current_width, current_height) = layer_main_image_size(runtime, handle)?;
+    if height == current_height as i64 {
+        return Ok(());
+    }
+    internal_set_layer_image_size(runtime, handle, current_width as i64, height)
+}
+
 fn set_layer_has_image(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
     has_image: bool,
 ) -> Result<()> {
+    // `tTJSNI_BaseLayer::SetHasImage` → `AllocateImage` / `DeallocateImage`
+    // (`LayerIntf.cpp:2228`). The native instance exists for the TJS object's
+    // life; restore a dropped tree node (or a stripped native instance) so
+    // GINKA `PSDLayer.updateDisp` (`hasImage = 1`) can actually get a dest.
+    ensure_native_layer_attached(runtime, handle);
+    set_layer_property_storage(
+        runtime,
+        handle,
+        "hasImage",
+        Variant::Integer(i64::from(has_image)),
+    );
     let Some(target) = render_layer_target(runtime, handle)? else {
         return Ok(());
     };
     if !has_image {
-        mutate_render_layer(runtime, &target, LayerNode::clear_image);
-        runtime
-            .host_mut()
-            .clear_layer_image_storage_for_target(&target);
-        sync_layer_image_members(runtime, handle, 0, 0);
+        deallocate_layer_image(runtime, handle, &target);
         return Ok(());
     }
-    if render_layer_snapshot(runtime, &target).is_some_and(|layer| layer.image.is_some()) {
-        return Ok(());
-    }
-
-    let width = layer_property_i64(runtime, handle, "imageWidth", 0)?
-        .max(layer_property_i64(runtime, handle, "width", 0)?)
-        .max(1) as u32;
-    let height = layer_property_i64(runtime, handle, "imageHeight", 0)?
-        .max(layer_property_i64(runtime, handle, "height", 0)?)
-        .max(1) as u32;
-    let neutral = layer_property_value(runtime, handle, "neutralColor")
-        .to_integer()
-        .unwrap_or(0x00ff_ffff);
-    let mut pixels = vec![0; width as usize * height as usize * 4];
-    let rgba = packed_color_to_rgba(neutral);
-    if rgba != [0, 0, 0, 0] {
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&rgba);
-        }
-    }
-    let image = runtime.host_mut().create_layer_image(width, height, pixels);
-    mutate_render_layer(runtime, &target, |layer| layer.set_image(image));
-    sync_layer_image_members(runtime, handle, width as i64, height as i64);
-    Ok(())
+    allocate_layer_image(runtime, handle)
 }
 
 fn apply_layer_property_to_render(
@@ -2310,7 +2735,88 @@ fn this_render_layer_target(
 ) -> Result<(ObjectHandle, Option<LayerRenderTarget>)> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
     let this = runtime.bound_this(this).unwrap_or(this);
+    ensure_native_layer_attached(runtime, this);
     Ok((this, render_layer_target(runtime, this)?))
+}
+
+/// Official `tTJSNI_BaseLayer` is constructed in `Layer.Construct` and lives
+/// until `Invalidate` (`LayerIntf.cpp`). GINKA keeps `StandLayer` dests in
+/// `_standpoollayer.children` and still calls `hasImage` / `fillRect` /
+/// `copyRect` on them after a parent `invalidate` or after the script
+/// `invalidate`s an older pool entry. Rebuild the native instance so those
+/// drawing calls have a dest bitmap instead of silently no-op'ing.
+fn ensure_native_layer_attached(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    if runtime.host().native_layer(handle).is_some() {
+        runtime.host_mut().ensure_native_layer_node(handle);
+        restore_default_layer_image(runtime, handle);
+        return;
+    }
+    let had_id = matches!(
+        runtime.object_member(handle, "__nativeLayerId"),
+        Variant::Integer(_)
+    );
+    let window = variant_object(&runtime.object_member(handle, "__nativeLayerProperty$window"));
+    let parent = variant_object(&runtime.object_member(handle, "__nativeLayerProperty$parent"));
+    if !had_id && window.is_none() && parent.is_none() {
+        return;
+    }
+    let children = match runtime.object_member(handle, "__nativeLayerProperty$children") {
+        Variant::Object(children) => Some(children),
+        _ => None,
+    };
+    let is_primary = runtime
+        .object_member(handle, "__nativeLayerProperty$isPrimary")
+        .is_truthy();
+    let snapshot = snapshot_layer_tjs_properties(runtime, handle);
+    let layer_id = runtime.host_mut().register_native_layer(
+        handle,
+        format!("native:{}", handle.0),
+        window,
+        parent,
+        children,
+        is_primary,
+    );
+    runtime.set_object_member(handle, "__nativeLayerId", Variant::Integer(layer_id as i64));
+    for (name, value) in snapshot {
+        set_layer_property_storage(runtime, handle, &name, value);
+    }
+    runtime.host_mut().apply_layer_instance_to_render(handle);
+    restore_default_layer_image(runtime, handle);
+}
+
+fn snapshot_layer_tjs_properties(
+    runtime: &Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Vec<(String, Variant)> {
+    const NAMES: &[&str] = &[
+        "left",
+        "top",
+        "width",
+        "height",
+        "imageLeft",
+        "imageTop",
+        "imageWidth",
+        "imageHeight",
+        "hasImage",
+        "visible",
+        "opacity",
+        "type",
+        "face",
+        "holdAlpha",
+        "neutralColor",
+        "name",
+        "order",
+        "enabled",
+        "hitType",
+        "hitThreshold",
+    ];
+    NAMES
+        .iter()
+        .filter_map(|name| {
+            let value = runtime.object_member(handle, layer_property_backing_key(name).as_ref());
+            (!matches!(value, Variant::Void)).then(|| ((*name).to_string(), value))
+        })
+        .collect()
 }
 
 fn render_layer_target(
@@ -2553,6 +3059,12 @@ fn layer_load_images(
     let image = runtime.host_mut().load_image_storage_for_script(&storage)?;
     let size = image.size();
 
+    // Official `tTJSNI_BaseLayer::LoadImages` (`LayerIntf.cpp:2494`) decodes
+    // into `MainImage` and then calls
+    // `InternalSetImageSize(MainImage->GetWidth(), MainImage->GetHeight())`,
+    // so the layer Rect follows the decoded bitmap. Kirakira's KAG target form
+    // loads into a different layer, so only the plain form adjusts `this`.
+    let mut loaded_into_this = false;
     if has_explicit_target {
         let page = explicit_page.unwrap_or_else(|| "back".to_string());
         let layer_name = explicit_layer.unwrap_or_else(|| "base".to_string());
@@ -2574,6 +3086,7 @@ fn layer_load_images(
                 runtime
                     .host_mut()
                     .record_layer_image_storage(&target, &storage);
+                loaded_into_this = true;
             }
             None => {
                 let load_options = LayerLoadImageOptions {
@@ -2591,6 +3104,9 @@ fn layer_load_images(
                 );
             }
         }
+    }
+    if loaded_into_this {
+        internal_set_layer_image_size(runtime, this, size.width as i64, size.height as i64)?;
     }
     sync_layer_image_members(runtime, this, size.width as i64, size.height as i64);
     mark_image_modified(runtime, this);
@@ -3131,11 +3647,13 @@ fn layer_free_image(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let (this, layer_id) = this_layer_id(runtime, this_obj)?;
-    if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+    if let Some(target) = runtime.host().layer_render_target(this) {
+        deallocate_layer_image(runtime, this, &target);
+    } else if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
         layer.clear_image();
+        runtime.host_mut().clear_layer_image_storage(layer_id);
+        mark_image_modified(runtime, this);
     }
-    runtime.host_mut().clear_layer_image_storage(layer_id);
-    sync_layer_image_members(runtime, this, 0, 0);
     Ok(Variant::Void)
 }
 
@@ -3181,6 +3699,9 @@ fn layer_set_pos(
     if let Some(height) = height {
         set_layer_property_storage(runtime, this, "height", Variant::Integer(height));
     }
+    if width.is_some() || height.is_some() {
+        image_layer_size_changed(runtime, this)?;
+    }
     Ok(Variant::Void)
 }
 
@@ -3189,17 +3710,10 @@ fn layer_set_size(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, target) = this_render_layer_target(runtime, this_obj)?;
+    let (this, _target) = this_render_layer_target(runtime, this_obj)?;
     let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
     let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
-    if let Some(target) = target {
-        mutate_render_layer(runtime, &target, |layer| {
-            layer.width = width as f32;
-            layer.height = height as f32;
-        });
-    }
-    set_layer_property_storage(runtime, this, "width", Variant::Integer(width));
-    set_layer_property_storage(runtime, this, "height", Variant::Integer(height));
+    set_layer_geographical_size(runtime, this, width, height)?;
     Ok(Variant::Void)
 }
 
@@ -3227,37 +3741,14 @@ fn layer_set_image_size(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, target) = this_render_layer_target(runtime, this_obj)?;
-    let width = optional_integer(&args, 0)?.unwrap_or(0).max(0);
-    let height = optional_integer(&args, 1)?.unwrap_or(0).max(0);
-    let existing_image = target
-        .as_ref()
-        .and_then(|target| render_layer_snapshot(runtime, target))
-        .and_then(|layer| layer.image);
-    let image = resize_layer_image(runtime, existing_image, width as u32, height as u32);
-    if let Some(target) = target {
-        mutate_render_layer(runtime, &target, |layer| {
-            // KRKR2/KRKRZ InternalSetImageSize keeps the image inside the
-            // layer rectangle. Merely replacing the texture leaves a stale
-            // image offset for subsequent affine clipping.
-            if width as f32 >= layer.width {
-                layer.image_left = 0.0;
-            } else if width as f32 + layer.image_left < layer.width {
-                layer.image_left = layer.width - width as f32;
-            }
-            if height as f32 >= layer.height {
-                layer.image_top = 0.0;
-            } else if height as f32 + layer.image_top < layer.height {
-                layer.image_top = layer.height - height as f32;
-            }
-            layer.image_width = width as f32;
-            layer.image_height = height as f32;
-            layer.image = image;
-        });
+    let (this, _target) = this_render_layer_target(runtime, this_obj)?;
+    let (current_width, current_height) = layer_main_image_size(runtime, this)?;
+    let width = optional_integer(&args, 0)?.unwrap_or(0);
+    let height = optional_integer(&args, 1)?.unwrap_or(0);
+    if width == current_width as i64 && height == current_height as i64 {
+        return Ok(Variant::Void);
     }
-    set_layer_property_storage(runtime, this, "imageWidth", Variant::Integer(width));
-    set_layer_property_storage(runtime, this, "imageHeight", Variant::Integer(height));
-    mark_image_modified(runtime, this);
+    internal_set_layer_image_size(runtime, this, width, height)?;
     Ok(Variant::Void)
 }
 
@@ -3266,6 +3757,7 @@ fn resize_layer_image(
     existing: Option<LayerImage>,
     width: u32,
     height: u32,
+    fill: [u8; 4],
 ) -> Option<LayerImage> {
     if width == 0 || height == 0 {
         return None;
@@ -3275,7 +3767,7 @@ fn resize_layer_image(
         return Some(runtime.host_mut().create_layer_image(
             width,
             height,
-            vec![0; width as usize * height as usize * 4],
+            filled_layer_pixels(width, height, fill),
         ));
     };
 
@@ -3283,7 +3775,7 @@ fn resize_layer_image(
         return Some(existing);
     }
 
-    let mut rgba = vec![0; width as usize * height as usize * 4];
+    let mut rgba = filled_layer_pixels(width, height, fill);
     let copy_width = existing.upload.width.min(width) as usize;
     let copy_height = existing.upload.height.min(height) as usize;
     let source_stride = existing.upload.width as usize * 4;
@@ -3304,49 +3796,9 @@ fn layer_set_size_to_image_size(
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    let (this, target) = this_render_layer_target(runtime, this_obj)?;
-    let width = layer_property_value(runtime, this, "imageWidth")
-        .to_integer()?
-        .max(0);
-    let height = layer_property_value(runtime, this, "imageHeight")
-        .to_integer()?
-        .max(0);
-    let replacement_image = if width > 0 && height > 0 {
-        let needs_image = target
-            .as_ref()
-            .and_then(|target| render_layer_snapshot(runtime, target))
-            .and_then(|layer| layer.image)
-            .map(|image| image.upload.width != width as u32 || image.upload.height != height as u32)
-            .unwrap_or(true);
-        needs_image.then(|| {
-            runtime.host_mut().create_layer_image(
-                width as u32,
-                height as u32,
-                vec![0; width as usize * height as usize * 4],
-            )
-        })
-    } else {
-        None
-    };
-    let replaces_content = width == 0 || height == 0 || replacement_image.is_some();
-    if let Some(target) = target {
-        mutate_render_layer(runtime, &target, |layer| {
-            layer.image_width = width as f32;
-            layer.image_height = height as f32;
-            layer.width = width as f32;
-            layer.height = height as f32;
-            if width == 0 || height == 0 {
-                layer.image = None;
-            } else if let Some(image) = replacement_image {
-                layer.image = Some(image);
-            }
-        });
-    }
-    set_layer_property_storage(runtime, this, "width", Variant::Integer(width));
-    set_layer_property_storage(runtime, this, "height", Variant::Integer(height));
-    if replaces_content {
-        mark_image_modified(runtime, this);
-    }
+    let (this, _target) = this_render_layer_target(runtime, this_obj)?;
+    let (width, height) = layer_main_image_size(runtime, this)?;
+    set_layer_geographical_size(runtime, this, width as i64, height as i64)?;
     Ok(Variant::Void)
 }
 
@@ -3642,20 +4094,14 @@ fn apply_script_layer_members(
     layer.image_left =
         layer_member_i64(runtime, handle, "imageLeft", layer.image_left as i64)? as f32;
     layer.image_top = layer_member_i64(runtime, handle, "imageTop", layer.image_top as i64)? as f32;
-    layer.image_width = layer_member_i64(
-        runtime,
-        handle,
-        "imageWidth",
-        layer.image_width.max(0.0) as i64,
-    )?
-    .max(0) as f32;
-    layer.image_height = layer_member_i64(
-        runtime,
-        handle,
-        "imageHeight",
-        layer.image_height.max(0.0) as i64,
-    )?
-    .max(0) as f32;
+    if let Some(image) = &layer.image {
+        let size = image.size();
+        layer.image_width = size.width;
+        layer.image_height = size.height;
+    } else {
+        layer.image_width = 0.0;
+        layer.image_height = 0.0;
+    }
     layer.visible = layer_member_i64(runtime, handle, "visible", i64::from(layer.visible))? != 0;
     layer.opacity =
         layer_member_i64(runtime, handle, "opacity", i64::from(layer.opacity))?.clamp(0, 255) as u8;
@@ -3768,6 +4214,12 @@ fn copy_render_content(dest: &mut LayerNode, source: &LayerNode) {
     dest.hit_type = source.hit_type;
     dest.hit_threshold = source.hit_threshold;
     dest.image = source.image.clone();
+    eprintln!(
+        "DBG copy_render_content dest={} source={} src_has_image={}",
+        dest.id,
+        source.id,
+        source.image.is_some()
+    );
 }
 
 fn layer_stop_transition(
@@ -3789,25 +4241,69 @@ fn layer_fill_rect(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
-    if is_province_face(runtime, this) {
+    let face = effective_draw_face(runtime, this);
+    // The province plane is not modelled, so a province fill has no effect on
+    // the drawn image.
+    if face == DF_PROVINCE {
         return Ok(Variant::Void);
     }
     let Some((x, y, width, height)) = rect_args(&args)? else {
         return Ok(Variant::Void);
     };
     let color = required_integer(&args, 4, "Layer.fillRect color")?;
-    let rgba = if layer_property_value(runtime, this, "neutralColor")
-        .to_integer()
-        .is_ok_and(|neutral| neutral == color)
-    {
-        packed_color_to_rgba(color)
-    } else {
-        color_to_rgba(color, None)
+    let Some(target) = target else {
+        return Ok(Variant::Void);
     };
-    if let Some(target) = target {
-        fill_layer_pixels(runtime, &target, x, y, width, height, rgba)?;
-        mark_image_modified(runtime, this);
+
+    // `tTJSNI_BaseLayer::FillRect` (krkrz/src/core/visual/LayerIntf.cpp) writes
+    // the 32-bit colour as-is on alpha faces — it does not force opaque RGB.
+    // A 24-bit value such as 0x5b2e2e therefore keeps alpha 0 on dfAlpha, which
+    // is how KAGEX stand compositing (`PSDLayer.redrawRect` /
+    // `AffineSourceBMPBase.redrawImage`) clears a canvas without painting a
+    // solid plate over the background.
+    match face {
+        DF_MASK => {
+            let mask = (color.max(0) & 0xff) as u8;
+            blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
+                pixel[3] = mask;
+            })?;
+        }
+        DF_MAIN => {
+            if layer_holds_alpha(runtime, this) {
+                // `FillColor(..., 255)`: replace RGB, keep destination alpha.
+                // `FillRect`'s dfOpaque branch resolves system colours
+                // (`LayerIntf.cpp:3873`).
+                let rgb = packed_color_to_rgba(to_actual_color(color));
+                let rgb = [rgb[0], rgb[1], rgb[2]];
+                blend_layer_pixels(runtime, &target, x, y, width, height, |pixel| {
+                    pixel[..3].copy_from_slice(&rgb);
+                })?;
+            } else {
+                fill_layer_pixels(
+                    runtime,
+                    &target,
+                    x,
+                    y,
+                    width,
+                    height,
+                    packed_color_to_rgba(color),
+                )?;
+            }
+        }
+        // dfAlpha / dfAddAlpha / (dfOpaque && !HoldAlpha): `MainImage->Fill`.
+        _ => {
+            fill_layer_pixels(
+                runtime,
+                &target,
+                x,
+                y,
+                width,
+                height,
+                packed_color_to_rgba(color),
+            )?;
+        }
     }
+    mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
 
@@ -3827,6 +4323,9 @@ fn layer_color_rect(
         return Ok(Variant::Void);
     };
     let color = required_integer(&args, 4, "Layer.colorRect color")?;
+    // `tTJSNI_BaseLayer::ColorRect` (`LayerIntf.cpp:3922`) resolves the colour
+    // through `TVPToActualColor` before `FillColorOnAlpha` / `FillColor`.
+    let color = to_actual_color(color);
     let opacity = optional_integer(&args, 5)?.unwrap_or(255);
     let Some(target) = target else {
         return Ok(Variant::Void);
@@ -3905,7 +4404,7 @@ fn layer_copy_rect(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    copy_rect_impl(runtime, this_obj, args, false)
+    copy_rect_impl(runtime, this_obj, args, LayerCopyKind::Copy)
 }
 
 fn layer_operate_rect(
@@ -3913,7 +4412,7 @@ fn layer_operate_rect(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    copy_rect_impl(runtime, this_obj, args, true)
+    copy_rect_impl(runtime, this_obj, args, LayerCopyKind::Operate)
 }
 
 fn layer_piled_copy(
@@ -4144,11 +4643,43 @@ fn layer_affine_copy(
     Ok(Variant::Void)
 }
 
+#[derive(Clone, Copy)]
+enum LayerCopyKind {
+    Copy,
+    Operate,
+}
+
+const OM_OPAQUE: i64 = 1;
+const OM_ALPHA: i64 = 2;
+const OM_AUTO: i64 = 128;
+
+/// `tTJSNI_BaseLayer::GetOperationModeFromType` (`LayerIntf.cpp:1404`).
+fn operation_mode_from_layer_type(layer_type: i64) -> i64 {
+    match layer_type {
+        1 => OM_OPAQUE, // ltOpaque
+        2 => OM_ALPHA,  // ltAlpha
+        12 => 12,       // ltAddAlpha / omAddAlpha
+        3..=11 | 13..=28 => layer_type,
+        _ => OM_OPAQUE,
+    }
+}
+
+/// `tTJSNI_BaseLayer::CopyRect` (`LayerIntf.cpp:4144`) picks its copy flags
+/// from the destination face and `HoldAlpha`: alpha faces copy MAIN|MASK,
+/// dfOpaque copies MAIN only when `HoldAlpha` is set, and dfMask copies MASK.
+fn copy_rect_blt(dest_face: i64, hold_alpha: bool) -> blend::Blt {
+    match dest_face {
+        DF_MASK => blend::Blt::CopyAlpha,
+        DF_MAIN if hold_alpha => blend::Blt::CopyColor,
+        _ => blend::Blt::CopyMask,
+    }
+}
+
 fn copy_rect_impl(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
-    alpha_blend: bool,
+    kind: LayerCopyKind,
 ) -> Result<Variant> {
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
     if is_province_face(runtime, this) {
@@ -4182,6 +4713,30 @@ fn copy_rect_impl(
     let source_width = source_image.upload.width;
     let source_height = source_image.upload.height;
 
+    // Official TJS `operateRect` (`LayerIntf.cpp:7207`): `omAuto` becomes
+    // the source layer's `GetOperationModeFromType()`. `copyRect` does not
+    // take a mode; its flags come from the destination face and `HoldAlpha`.
+    let dest_face = effective_draw_face(runtime, this);
+    let hold_alpha = layer_holds_alpha(runtime, this);
+    let blt = match kind {
+        LayerCopyKind::Copy => copy_rect_blt(dest_face, hold_alpha),
+        LayerCopyKind::Operate => {
+            let mut mode = optional_integer(&args, 7)?.unwrap_or(OM_AUTO);
+            if mode == OM_AUTO {
+                let source_type = layer_property_value(runtime, source_object, "type")
+                    .to_integer()
+                    .unwrap_or(2);
+                mode = operation_mode_from_layer_type(source_type);
+            }
+            blend::operation_mode_to_blt(mode, dest_face)
+                .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
+        }
+    };
+    let opacity = match kind {
+        LayerCopyKind::Operate => optional_integer(&args, 8)?.unwrap_or(255).clamp(0, 255),
+        LayerCopyKind::Copy => 255,
+    };
+
     mutate_layer_pixels(
         runtime,
         &dest_target,
@@ -4199,7 +4754,9 @@ fn copy_rect_impl(
                 sy,
                 width,
                 height,
-                alpha_blend,
+                blt,
+                opacity,
+                hold_alpha,
             );
         },
     )?;
@@ -6024,6 +6581,12 @@ const DF_PROVINCE: i64 = 3;
 const DF_ADD_ALPHA: i64 = 4;
 const DF_AUTO: i64 = 128;
 
+/// `tTJSNI_BaseLayer::HoldAlpha`. Unset members follow `TVPDefaultHoldAlpha`
+/// (false) in `LayerIntf.cpp`.
+fn layer_holds_alpha(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> bool {
+    layer_property_value(runtime, layer, "holdAlpha").is_truthy()
+}
+
 /// `tTJSNI_BaseLayer::UpdateDrawFace`: `dfAuto` resolves to a concrete face
 /// from the layer type, everything else is used verbatim.
 fn effective_draw_face(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> i64 {
@@ -6112,6 +6675,49 @@ fn packed_color_to_rgba(color: i64) -> [u8; 4] {
         (color & 0xff) as u8,
         ((color >> 24) & 0xff) as u8,
     ]
+}
+
+/// Win32 system-colour palette behind `TVPToActualColor`
+/// (`visual/win32/LayerImpl.cpp:21`, `visual/win32/TVPColor.h:37`). The
+/// official `GetSysColor` reads platform state; this is the classic desktop
+/// palette, already swapped from `0xBBGGRR` to `0xRRGGBB`.
+pub(crate) const SYSTEM_COLORS: [u32; 25] = [
+    0x00c0_c0c0, // clScrollBar
+    0x00ff_ffff, // clBackground
+    0x0080_8080, // clActiveCaption
+    0x0000_0080, // clInactiveCaption
+    0x00c0_c0c0, // clMenu
+    0x00ff_ffff, // clWindow
+    0x0000_0000, // clWindowFrame
+    0x0000_0000, // clMenuText
+    0x00ff_ffff, // clWindowText
+    0x0000_0000, // clCaptionText
+    0x00c0_c0c0, // clActiveBorder
+    0x00c0_c0c0, // clInactiveBorder
+    0x00e0_e0e0, // clAppWorkSpace
+    0x0000_007f, // clHighlight
+    0x00ff_ffff, // clHighlightText
+    0x00f0_f0f0, // clBtnFace
+    0x0080_8080, // clBtnShadow
+    0x0080_8080, // clGrayText
+    0x0000_0000, // clBtnText
+    0x00c0_c0c0, // clInactiveCaptionText
+    0x00ff_ffff, // clBtnHighlight
+    0x00ff_ffff, // cl3DDkShadow
+    0x0000_0000, // cl3DLight
+    0x00ff_ffff, // clInfoText
+    0x00ff_ffff, // clInfoBk
+];
+
+/// `TVPToActualColor` (`visual/win32/LayerImpl.cpp:21`): a colour whose top
+/// byte is set is a `GetSysColor` identifier (`cl*`, `TVPColor.h:6`), not a
+/// raw RGB value. Shared with `System.toActualColor`.
+pub(crate) fn to_actual_color(color: i64) -> i64 {
+    let raw = color as u32;
+    if raw & 0xff00_0000 == 0 {
+        return color;
+    }
+    i64::from(*SYSTEM_COLORS.get((raw & 0xff) as usize).unwrap_or(&0))
 }
 
 fn mutate_layer_pixels<F>(
@@ -6477,7 +7083,9 @@ fn copy_pixels(
     sy: i64,
     width: i64,
     height: i64,
-    alpha_blend: bool,
+    method: blend::Blt,
+    opacity: i64,
+    hold_alpha: bool,
 ) {
     let Some((dx, dy, sx, sy, width, height)) = clipped_copy_rect(
         dx,
@@ -6513,14 +7121,7 @@ fn copy_pixels(
         }
         let src_row = &source[src_start..src_end];
         let dest_row = &mut dest[dest_start..dest_end];
-        if alpha_blend {
-            for (dest_pixel, src_pixel) in dest_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4))
-            {
-                blend_pixel(dest_pixel, src_pixel);
-            }
-        } else {
-            dest_row.copy_from_slice(src_row);
-        }
+        blend::blt_row(dest_row, src_row, method, opacity as u32, hold_alpha);
     }
 }
 
