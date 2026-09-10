@@ -447,6 +447,15 @@ pub struct KrkrHost {
     /// Modal-layer stack per window (`tTVPLayerManager::ModalLayerVector`),
     /// fed by `Layer.setMode()`/`removeMode()`.
     modal_layers: Vec<(Option<ObjectHandle>, LayerId)>,
+    /// The layer that received the last `onMouseMove`
+    /// (`tTVPLayerManager::LastMouseMoveSent`).  It lives here rather than in
+    /// the frame loop because `Part()` has to be able to take the mouse off a
+    /// subtree (`NotifyPart` -> `LeaveMouseFromTree`, `LayerManager.cpp:590`).
+    hovered_layer: Option<LayerId>,
+    /// The layer that holds the mouse (`tTVPLayerManager::CaptureOwner`);
+    /// `NotifyPart` -> `ReleaseCaptureFromTree` drops it when that subtree
+    /// parts.
+    captured_layer: Option<LayerId>,
     /// First native `Window` constructed, matching `Window.mainWindow`
     /// (`classes.rs` assigns it when the class member is still void).  Frame
     /// coordinates are the main window's client area, so other windows are
@@ -528,6 +537,8 @@ impl Default for KrkrHost {
             termination_requested: false,
             modal_windows: Vec::new(),
             modal_layers: Vec::new(),
+            hovered_layer: None,
+            captured_layer: None,
             main_window: None,
             external_resource_catalog: BTreeSet::new(),
             pending_external_resources: BTreeMap::new(),
@@ -1660,6 +1671,45 @@ impl KrkrHost {
         self.modal_layers
             .retain(|(entry_window, _)| *entry_window != Some(window));
         self.sync_modal_layer();
+    }
+
+    /// `tTVPLayerManager::RemoveTreeModalState` (`LayerManager.cpp:894`): a
+    /// subtree that parts from the tree loses its modal state, so the layers
+    /// it disabled become reachable again instead of staying blocked behind a
+    /// dialog that is no longer on screen.
+    pub(crate) fn remove_modal_layers_under(&mut self, root: LayerId) {
+        let victims: Vec<LayerId> = {
+            let tree = &self.layer_tree;
+            self.modal_layers
+                .iter()
+                .map(|(_, layer)| *layer)
+                .filter(|layer| tree.is_ancestor_or_self(root, *layer))
+                .collect()
+        };
+        if victims.is_empty() {
+            return;
+        }
+        self.modal_layers
+            .retain(|(_, layer)| !victims.contains(layer));
+        self.sync_modal_layer();
+    }
+
+    /// The layer the mouse rests on (`LastMouseMoveSent`).
+    pub(crate) fn hovered_layer(&self) -> Option<LayerId> {
+        self.hovered_layer
+    }
+
+    pub(crate) fn set_hovered_layer(&mut self, layer: Option<LayerId>) {
+        self.hovered_layer = layer;
+    }
+
+    /// The layer that holds the mouse during a drag (`CaptureOwner`).
+    pub(crate) fn captured_layer(&self) -> Option<LayerId> {
+        self.captured_layer
+    }
+
+    pub(crate) fn set_captured_layer(&mut self, layer: Option<LayerId>) {
+        self.captured_layer = layer;
     }
 
     /// The TJS object that owns a rendered layer. The layer tree only carries

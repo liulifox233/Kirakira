@@ -7,7 +7,7 @@ use std::{
 use super::blend;
 
 use krkr_core::{
-    AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerImage, LayerNode,
+    AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerId, LayerImage, LayerNode,
     ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
     TransitionScrollStay,
 };
@@ -2370,6 +2370,10 @@ fn apply_layer_property_to_render(
     if name == "parent" {
         let parent =
             variant_object(value).map(|parent| runtime.bound_this(parent).unwrap_or(parent));
+        // `tTJSNI_BaseLayer::Join()` parts the old parent first
+        // (`LayerIntf.cpp:576`), which is what tells the manager about a layer
+        // leaving the tree.
+        notify_part_if_attached(runtime, handle, parent)?;
         let old_parent = runtime.host().native_layer_parent(handle);
         let updated = runtime
             .host_mut()
@@ -7113,13 +7117,79 @@ fn join_native_layer(
     handle: ObjectHandle,
     parent: Option<ObjectHandle>,
 ) -> Result<()> {
-    if parent.is_none() {
-        // SeverChild / NotifyPart: BlurTree(child) before the node leaves.
-        blur_tree(runtime, handle)?;
-    }
+    notify_part_if_attached(runtime, handle, parent)?;
     let value = parent.map(Variant::Object).unwrap_or(Variant::Void);
     set_layer_property_storage(runtime, handle, "parent", value.clone());
     apply_layer_property_to_render(runtime, handle, "parent", &value)
+}
+
+/// `tTJSNI_BaseLayer::Join()` (`LayerIntf.cpp:576`): adopting a different
+/// parent parts the old one first, so the manager hears about the layer
+/// leaving the tree before it re-enters.
+fn notify_part_if_attached(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    next_parent: Option<ObjectHandle>,
+) -> Result<()> {
+    let current = runtime.host().native_layer_parent(handle);
+    if current.is_some() && current != next_parent {
+        notify_part(runtime, handle)?;
+    }
+    Ok(())
+}
+
+/// `tTVPLayerManager::NotifyPart` (`LayerManager.cpp:168`): a subtree that
+/// parts from the tree loses its modal state, the mouse leaves it, its capture
+/// is released, and focus moves off it.  Without this a parted dialog keeps
+/// blocking the layers it disabled for good, and a parted page keeps the
+/// hover/focus state of controls that are no longer on screen.
+fn notify_part(runtime: &mut Runtime<KrkrHost>, root: ObjectHandle) -> Result<()> {
+    let Some(root_id) = runtime.host().native_layer(root) else {
+        return blur_tree(runtime, root);
+    };
+    runtime.host_mut().remove_modal_layers_under(root_id);
+    leave_mouse_from_tree(runtime, root_id)?;
+    release_capture_from_tree(runtime, root_id);
+    blur_tree(runtime, root)
+}
+
+/// `tTVPLayerManager::LeaveMouseFromTree` (`LayerManager.cpp:590`): only the
+/// layer that actually received the last `onMouseMove` is notified, and the
+/// manager forgets it so the next move enters whatever is under the cursor
+/// afresh.
+fn leave_mouse_from_tree(runtime: &mut Runtime<KrkrHost>, root: LayerId) -> Result<()> {
+    let Some(hovered) = runtime.host().hovered_layer() else {
+        return Ok(());
+    };
+    if !runtime
+        .host()
+        .layer_tree()
+        .is_ancestor_or_self(root, hovered)
+    {
+        return Ok(());
+    }
+    runtime.host_mut().set_hovered_layer(None);
+    let Some(handle) = runtime.host().native_object_for_layer(hovered) else {
+        return Ok(());
+    };
+    if !matches!(runtime.object_member(handle, "onMouseLeave"), Variant::Void) {
+        runtime.call_object_method(handle, "onMouseLeave", Vec::new())?;
+    }
+    Ok(())
+}
+
+/// `tTVPLayerManager::ReleaseCaptureFromTree` (`LayerManager.cpp:620`): a drag
+/// that parts with its layer must not keep delivering moves to it.
+fn release_capture_from_tree(runtime: &mut Runtime<KrkrHost>, root: LayerId) {
+    let captured = runtime.host().captured_layer();
+    if captured.is_some_and(|layer| {
+        runtime
+            .host()
+            .layer_tree()
+            .is_ancestor_or_self(root, layer)
+    }) {
+        runtime.host_mut().set_captured_layer(None);
+    }
 }
 
 fn blur_tree(runtime: &mut Runtime<KrkrHost>, root: ObjectHandle) -> Result<()> {
@@ -7132,7 +7202,28 @@ fn blur_tree(runtime: &mut Runtime<KrkrHost>, root: ObjectHandle) -> Result<()> 
     if !layer_is_ancestor_or_self(runtime, root, focused) {
         return Ok(());
     }
+    // `BlurTree` (`LayerManager.cpp:692`) hands focus to the parted tree's next
+    // focusable layer instead of dropping it: a focused button that leaves
+    // with its page must not take the window's keyboard focus out of the
+    // screen that is still up.
+    if let Some(next) = next_focusable_outside(runtime, window, root) {
+        return layer_set_focus_to(runtime, next, true).map(|_| ());
+    }
     blur_window_focus(runtime, window)
+}
+
+/// `tTJSNI_BaseLayer::GetNextFocusable` (`LayerIntf.cpp:3300`) searches
+/// forward through the overall layer order from the parted root.  This engine
+/// keeps focusables in tree order instead, so the answer is the first
+/// focusable that does not belong to the tree being blurred.
+fn next_focusable_outside(
+    runtime: &Runtime<KrkrHost>,
+    window: ObjectHandle,
+    root: ObjectHandle,
+) -> Option<ObjectHandle> {
+    focusable_layers_for_window(runtime, window, root)
+        .into_iter()
+        .find(|layer| !layer_is_ancestor_or_self(runtime, root, *layer))
 }
 
 fn blur_window_focus(runtime: &mut Runtime<KrkrHost>, window: ObjectHandle) -> Result<()> {

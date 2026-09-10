@@ -263,13 +263,11 @@ pub struct KrkrEngine {
     kag_budget: KagRunBudget,
     plugins: Vec<Arc<dyn KrkrPlugin>>,
     cursor_position: Option<Point>,
-    hovered_layer: Option<LayerId>,
     /// Rounded cursor position of the last dispatched move, so
     /// `onMouseMove` only fires when the position actually changed
     /// (`tTVPLayerManager::LastMouseMoveX/Y`, `LayerManager.cpp:400`).
     last_mouse_move: Option<(i64, i64)>,
     pressed_layer: Option<LayerId>,
-    captured_layer: Option<LayerId>,
     input_result: EngineInputResult,
     scheduler_turn_started: bool,
 }
@@ -297,10 +295,8 @@ impl KrkrEngine {
             kag_budget: config.kag_budget,
             plugins: Vec::new(),
             cursor_position: None,
-            hovered_layer: None,
             last_mouse_move: None,
             pressed_layer: None,
-            captured_layer: None,
             input_result: EngineInputResult::default(),
             scheduler_turn_started: false,
         })
@@ -1742,7 +1738,7 @@ impl KrkrEngine {
                     });
                     self.dispatch_layer_pointer_event("onMouseDown", 0, raw_target)?;
                     self.pressed_layer = raw_target;
-                    self.captured_layer = raw_target;
+                    self.tjs_runtime.host_mut().set_captured_layer(raw_target);
                     if !modal_active
                         && !handled_by_script
                         && self.should_fire_primary_click(raw_target)
@@ -1770,14 +1766,15 @@ impl KrkrEngine {
                                 .iter()
                                 .any(|method| self.layer_has_script_handler(layer_id, method))
                         });
+                    let captured = self.tjs_runtime.host().captured_layer();
                     self.tjs_runtime.host_mut().log(&format!(
                         "input primary release pressed={:?} captured={:?} release={:?} handled_by_script={handled_by_script}",
-                        self.pressed_layer, self.captured_layer, release_hit
+                        self.pressed_layer, captured, release_hit
                     ));
                     self.dispatch_layer_pointer_event(
                         "onMouseUp",
                         0,
-                        self.captured_layer.or(release_hit),
+                        captured.or(release_hit),
                     )?;
                     let click_target = self.pressed_layer.filter(|pressed| {
                         release_hit == Some(*pressed) || self.layer_contains_cursor(*pressed)
@@ -1787,7 +1784,7 @@ impl KrkrEngine {
                         self.dispatch_layer_click(pressed)?;
                     }
                     self.pressed_layer = None;
-                    self.captured_layer = None;
+                    self.tjs_runtime.host_mut().set_captured_layer(None);
                     if !modal_active && !handled_by_script {
                         self.signal_kag_click();
                     }
@@ -1803,7 +1800,7 @@ impl KrkrEngine {
                         self.layer_has_script_handler(layer_id, "onMouseDown")
                     });
                     self.dispatch_layer_pointer_event("onMouseDown", 1, raw_target)?;
-                    self.captured_layer = raw_target;
+                    self.tjs_runtime.host_mut().set_captured_layer(raw_target);
                     if !modal_active && !handled_by_window && !handled_by_layer {
                         self.fire_kag_secondary_click()?;
                     }
@@ -1814,12 +1811,9 @@ impl KrkrEngine {
                 } => {
                     self.dispatch_window_pointer_event("onMouseUp", 1)?;
                     let release_hit = self.layer_at_cursor()?;
-                    self.dispatch_layer_pointer_event(
-                        "onMouseUp",
-                        1,
-                        self.captured_layer.or(release_hit),
-                    )?;
-                    self.captured_layer = None;
+                    let captured = self.tjs_runtime.host().captured_layer();
+                    self.dispatch_layer_pointer_event("onMouseUp", 1, captured.or(release_hit))?;
+                    self.tjs_runtime.host_mut().set_captured_layer(None);
                 }
                 EngineEvent::MouseWheel { delta } => {
                     self.dispatch_window_mouse_wheel(*delta)?;
@@ -1889,7 +1883,7 @@ impl KrkrEngine {
                         }
                         krkr_core::TouchPhase::Cancelled => {
                             self.pressed_layer = None;
-                            self.captured_layer = None;
+                            self.tjs_runtime.host_mut().set_captured_layer(None);
                         }
                     }
                 }
@@ -2323,8 +2317,9 @@ impl KrkrEngine {
         // integer cursor position actually changed (`poschanged`).
         let moved = self.record_cursor_move_position(position);
         let mut target = self.cursor_event_target(position)?;
-        if target != self.hovered_layer {
-            if let Some(layer_id) = self.hovered_layer {
+        let hovered = self.tjs_runtime.host().hovered_layer();
+        if target != hovered {
+            if let Some(layer_id) = hovered {
                 self.call_layer_event(layer_id, "onMouseLeave", Vec::new())?;
                 // The handler may invalidate the layer, so the target is
                 // re-queried once after each enter/leave, exactly like the
@@ -2342,7 +2337,7 @@ impl KrkrEngine {
                     }
                 }
             }
-            self.hovered_layer = target;
+            self.tjs_runtime.host_mut().set_hovered_layer(target);
         }
 
         if !moved {
@@ -2374,7 +2369,7 @@ impl KrkrEngine {
     /// (`EventIntf.cpp:104`), so a handler-less layer swallows the event
     /// instead of passing it to a layer behind it.
     fn cursor_event_target(&mut self, position: Point) -> Result<Option<LayerId>> {
-        if let Some(captured) = self.captured_layer {
+        if let Some(captured) = self.tjs_runtime.host().captured_layer() {
             return Ok(Some(captured));
         }
         self.layer_at_position(position)
@@ -12599,6 +12594,140 @@ mod tests {
             .expect("script");
 
         assert_eq!(value, Variant::String("1:0:1:blur:focus".to_string()));
+    }
+
+    /// `NotifyPart` -> `RemoveTreeModalState` (`LayerManager.cpp:168`,
+    /// `:894`): a dialog that leaves the tree must give up the layers it
+    /// disabled, otherwise the screen stays unclickable with nothing on it.
+    #[test]
+    fn parting_a_modal_subtree_releases_its_modal_state() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.root = new Layer(window, null);
+                global.page = new Layer(window, root);
+                global.dialog = new Layer(window, page);
+                global.lower = new Layer(window, root);
+                page.visible = true;
+                dialog.visible = true;
+                lower.visible = true;
+                dialog.setMode();
+                "#,
+            )
+            .expect("script");
+
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window");
+        };
+        let Variant::Object(lower) = engine.tjs_runtime().global_member("lower") else {
+            panic!("lower");
+        };
+        let lower_id = engine.host().native_layer(lower).expect("lower layer");
+        assert!(engine.host().current_modal_layer(Some(window)).is_some());
+        assert!(engine.host().layer_tree().is_disabled_by_mode(lower_id));
+
+        engine
+            .execute_script("inline.tjs", "page.parent = null;")
+            .expect("part");
+
+        assert_eq!(engine.host().current_modal_layer(Some(window)), None);
+        assert!(!engine.host().layer_tree().is_disabled_by_mode(lower_id));
+    }
+
+    /// `NotifyPart` -> `LeaveMouseFromTree`: the layer under the cursor gets
+    /// its `onMouseLeave` when its page leaves the screen.
+    #[test]
+    fn parting_a_page_takes_the_mouse_off_its_children() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.root = new Layer(window, null);
+                global.page = new Layer(window, root);
+                global.button = new Layer(window, page);
+                page.setSize(200, 200);
+                page.setImageSize(200, 200);
+                page.fillRect(0, 0, 200, 200, 0xffffffff);
+                button.setPos(10, 10);
+                button.setSize(50, 50);
+                button.setImageSize(50, 50);
+                button.fillRect(0, 0, 50, 50, 0xffffffff);
+                page.hitType = htMask;
+                button.hitType = htMask;
+                page.hitThreshold = 0;
+                button.hitThreshold = 0;
+                page.visible = true;
+                button.visible = true;
+                global.leaves = 0;
+                button.onMouseLeave = function() { global.leaves++; };
+                "#,
+            )
+            .expect("script");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::CursorMoved {
+                        position: Point::new(20.0, 20.0),
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("hover");
+        assert!(engine.host().hovered_layer().is_some());
+
+        engine
+            .execute_script("inline.tjs", "page.parent = null;")
+            .expect("part");
+
+        assert_eq!(engine.host().hovered_layer(), None);
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "leaves")
+                .expect("leaves"),
+            Variant::Integer(1)
+        );
+    }
+
+    /// `NotifyPart` -> `BlurTree` -> `GetNextFocusable` (`LayerManager.cpp:692`):
+    /// focus moves to the next focusable layer rather than vanishing with the
+    /// page that held it.
+    #[test]
+    fn parting_the_focused_layer_moves_focus_to_the_next_focusable() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.root = new Layer(window, null);
+                global.page = new Layer(window, root);
+                global.other = new Layer(window, root);
+                root.focusable = false;
+                page.focusable = true;
+                other.focusable = true;
+                page.visible = true;
+                other.visible = true;
+                root.events = "";
+                page.events = "";
+                other.events = "";
+                global.blurs = 0;
+                global.focuses = 0;
+                page.onBlur = function() { global.blurs++; };
+                other.onFocus = function() { global.focuses++; };
+                page.focus();
+                page.parent = null;
+                return (window.focusedLayer === other) + ":" + global.blurs + ":" + global.focuses;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1:1:1".to_string()));
     }
 
     #[test]
