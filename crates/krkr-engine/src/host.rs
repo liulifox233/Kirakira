@@ -296,8 +296,8 @@ impl LayerInstance {
     /// it is the manager's primary (`Exchange` hands that role to the layer it
     /// swaps in, `LayerIntf.cpp:927`), never left the tree itself, or is
     /// projected onto a root by the engine's page bookkeeping.
-    fn renderable_in_tree(&self, render_parent: Option<LayerId>) -> bool {
-        render_parent.is_some() || !self.detached || self.is_primary_layer()
+    fn renderable_in_tree(&self, render_parent: Option<LayerId>, parent_in_tree: bool) -> bool {
+        parent_in_tree && (render_parent.is_some() || !self.detached || self.is_primary_layer())
     }
 
     fn property(&self, name: &str) -> Option<Variant> {
@@ -1699,6 +1699,18 @@ impl KrkrHost {
             .and_then(|instance| instance.parent)
     }
 
+    /// Whether the layer's script parent still resolves to a native layer.
+    /// A handle that no longer owns one (a non-layer object assigned while the
+    /// layer constructor tolerated a temporary parent, or a parent whose
+    /// native instance is gone) cannot anchor a render edge: official rejects
+    /// the assignment outright (`TVPSpecifyLayer`, `LayerIntf.cpp:451`) and
+    /// would never draw the child at its parented coordinates.
+    fn parent_resolves(&self, instance: &LayerInstance) -> bool {
+        instance
+            .parent
+            .is_none_or(|parent| self.native_layer(parent).is_some())
+    }
+
     pub(crate) fn native_layer_window(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
         self.native_layers
             .get(&handle)
@@ -1843,9 +1855,10 @@ impl KrkrHost {
         let window_closed = instance
             .window
             .is_some_and(|window| self.native_window_closed(window));
+        let renderable = instance.renderable_in_tree(render_parent, self.parent_resolves(&instance));
         if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
             apply_layer_properties_to_node(layer, &instance.properties, window_closed);
-            layer.renderable = instance.renderable_in_tree(render_parent);
+            layer.renderable = renderable;
             layer.parent = render_parent;
         }
         true
@@ -1869,9 +1882,11 @@ impl KrkrHost {
                     .native_layer_render_parent(handle, instance.parent)
                     .filter(|parent_id| *parent_id != layer_id);
                 self.layer_tree.set_parent(layer_id, render_parent);
+                let renderable =
+                    instance.renderable_in_tree(render_parent, self.parent_resolves(&instance));
                 if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
                     apply_layer_properties_to_node(layer, &instance.properties, window_closed);
-                    layer.renderable = instance.renderable_in_tree(render_parent);
+                    layer.renderable = renderable;
                     apply_window_offset_to_node(layer, window_offset);
                 }
             }
@@ -3128,15 +3143,31 @@ impl KrkrHost {
             return;
         };
         for (layer_id, source) in overrides {
+            // A parted layer is off-screen for the whole transition
+            // (`Part()`, `LayerIntf.cpp:589`): the override replay must not put
+            // it back just because its snapshot was taken while it still drew.
+            let draws = self.render_layer_draws(layer_id);
             if let Some(dest) = self.layer_tree.layer_mut(layer_id) {
                 copy_layer_node_render_content(dest, &source);
-                dest.renderable = source.renderable;
+                dest.renderable = source.renderable && draws;
             }
         }
     }
 
     pub(crate) fn take_completed_native_transitions(&mut self) -> Vec<NativeTransitionCompletion> {
         std::mem::take(&mut self.completed_native_transitions)
+    }
+
+    /// Whether a rendered layer node may draw: engine projection nodes always
+    /// may, a native layer only while it is still in the official layer tree
+    /// (`Part()`, `LayerIntf.cpp:589`).  Render overrides that force a layer
+    /// visible -- a transition destination, KAG page projection, a comp swap --
+    /// have to ask first, otherwise they resurrect a parted subtree.
+    pub(crate) fn render_layer_draws(&self, layer_id: LayerId) -> bool {
+        self.native_layers
+            .values()
+            .find(|instance| instance.layer_id == layer_id)
+            .is_none_or(|instance| !instance.detached)
     }
 
     pub(crate) fn backlay_kag_layers(&mut self, layer: Option<&str>) {

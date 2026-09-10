@@ -1705,6 +1705,19 @@ fn layer_native_property_set(
         })
         .flatten();
     let value = normalize_layer_property_value(name, value)?;
+    if name == "parent" {
+        // `TVPSpecifyLayer` (`LayerIntf.cpp:451`): the property takes a layer or
+        // nothing at all.  Kirakira used to accept any object and then
+        // materialize the child as a render root at the coordinates its missing
+        // parent used to clip.
+        let parent =
+            variant_object(&value).map(|parent| runtime.bound_this(parent).unwrap_or(parent));
+        if let Some(parent) = parent
+            && runtime.host().native_layer(parent).is_none()
+        {
+            return Err(TjsError::runtime("Specify layer"));
+        }
+    }
     if name == "hasImage" {
         set_layer_has_image(runtime, this, value.is_truthy())?;
         return Ok(());
@@ -3233,6 +3246,16 @@ fn registered_render_layer_target(
     runtime.host().layer_render_target(handle)
 }
 
+/// Whether a render target may be forced visible: a native layer only while it
+/// is still in the official layer tree (`Part()`, `LayerIntf.cpp:589`), while
+/// the engine's KAG projection nodes always may.
+fn render_target_draws(runtime: &Runtime<KrkrHost>, target: &LayerRenderTarget) -> bool {
+    match target {
+        LayerRenderTarget::Native(layer_id) => runtime.host().render_layer_draws(*layer_id),
+        LayerRenderTarget::Kag(_) => true,
+    }
+}
+
 fn mutate_render_layer<R>(
     runtime: &mut Runtime<KrkrHost>,
     target: &LayerRenderTarget,
@@ -4159,12 +4182,18 @@ fn exchange_native_layer_info(
     };
     let this_is_primary = layer_property_value(runtime, this, "isPrimary").is_truthy();
     let comp_is_primary = layer_property_value(runtime, comp, "isPrimary").is_truthy();
-
+    // The swap moves render state between two live page layers; neither may be
+    // handed the other's visibility while it is parted from the tree
+    // (`Part()`, `LayerIntf.cpp:589`).
+    let this_draws = runtime.host().render_layer_draws(this_layer_id);
+    let comp_draws = runtime.host().render_layer_draws(comp_layer_id);
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(this_layer_id) {
         copy_render_state(layer, &comp_layer);
+        layer.renderable &= this_draws;
     }
     if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(comp_layer_id) {
         copy_render_state(layer, &this_layer);
+        layer.renderable &= comp_draws;
     }
     apply_layer_node_state_to_script(runtime, this, &comp_layer);
     apply_layer_node_state_to_script(runtime, comp, &this_layer);
@@ -4242,9 +4271,10 @@ fn layer_begin_transition(
             materialize_kag_back_to_native(runtime, source)?;
             copy_layer_images(runtime, this, &target, source)?;
         }
+        let draws = render_target_draws(runtime, &target);
         mutate_render_layer(runtime, &target, |layer| {
             layer.visible = true;
-            layer.renderable = true;
+            layer.renderable = draws;
         });
     }
     set_layer_property_storage(runtime, this, "visible", Variant::Integer(1));
@@ -4357,11 +4387,15 @@ fn kag_base_children_transition_live_overrides(
         let Some(mut override_layer) = runtime.host().layer_tree().layer(layer_id).cloned() else {
             continue;
         };
+        // The projection only shows what is still in the layer tree: a parted
+        // fore layer must not come back for the length of the transition
+        // (`Part()`, `LayerIntf.cpp:589`).
+        let draws = runtime.host().render_layer_draws(layer_id);
         copy_render_content(&mut override_layer, &source_layer);
-        override_layer.renderable = true;
+        override_layer.renderable = draws;
         if let Some(dest_layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
             copy_render_content(dest_layer, &source_layer);
-            dest_layer.renderable = true;
+            dest_layer.renderable = draws;
         }
         overrides.insert(layer_id, override_layer);
     }
@@ -6873,6 +6907,10 @@ fn native_layer_id(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> Result<
 fn variant_object(value: &Variant) -> Option<ObjectHandle> {
     match value {
         Variant::Object(handle) => Some(*handle),
+        // A value stored from `this` or from `new` carries the instance as its
+        // own ObjThis (`tTJSVariant(objthis, objthis)`), which this engine
+        // models as a bound closure over the same object.
+        Variant::Closure(closure) => Some(closure.object),
         _ => None,
     }
 }
