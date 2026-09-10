@@ -93,6 +93,18 @@ impl Default for KagRunBudget {
     fn default() -> Self {
         Self {
             max_tags_per_tick: 1000,
+            // The wall-clock guard exists to keep a frame responsive, not to
+            // shape script semantics: a tag run that decodes an image easily
+            // outlives 16 ms, so how much of a scenario one `update` covers
+            // depends on the machine.  Unit tests assert on the state a single
+            // update produced -- the doc comment on this struct's timer calls
+            // it an "optional per-tick guard" -- so under `cfg(test)` the
+            // guard is pinned wide enough to never trip and the tests stay
+            // about what the tags do.  The budget's own behaviour is covered
+            // by the tests that pass it explicitly.
+            #[cfg(test)]
+            max_wall_time: Duration::from_secs(1),
+            #[cfg(not(test))]
             max_wall_time: Duration::from_millis(16),
         }
     }
