@@ -125,13 +125,14 @@ fn parse_trace_mask(value: &str) -> u8 {
 /// value.
 fn parse_process_arguments() -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
-    // `TVPGetDebugSupportShowable` only defaults to true because the Win32
-    // environ layer actually owns the debug window, console, watch list and
-    // script editor forms.  This host has none of them, and games gate whole
-    // debug surfaces on the option -- KAGEX's `debugWindowEnabled`, k2compat's
-    // `Debug.console`/`controller`/`scripted` singletons -- so answer `no`
-    // unless the option is given explicitly.
-    result.insert("-debugwin".to_string(), "no".to_string());
+    // `TVPGetDebugSupportShowable` defaults to true on every platform that
+    // ships the Win32 environ layer, so an absent `-debugwin` reads back as
+    // "not no" and games enable their debug-gated behaviour: KAGEX's
+    // `debugWindowEnabled` (`boot.tjs`) picks the debug `System.exceptionHandler`
+    // -- log and carry on -- instead of the release one that calls
+    // `System.terminate()`.  Answering `no` here silently turned every
+    // recorded script exception into a game exit, so leave the option alone
+    // unless the caller passes it.
     for arg in std::env::args().skip(1) {
         if !arg.starts_with('-') || arg.len() < 2 {
             continue;
@@ -238,6 +239,13 @@ pub(crate) struct LayerInstance {
     pub children: Vec<ObjectHandle>,
     pub children_array: Option<ObjectHandle>,
     pub render_target: LayerRenderTarget,
+    /// Set once the layer is `Part()`ed out of the layer tree
+    /// (`LayerIntf.cpp:589`).  Draw and hit test only walk from each manager's
+    /// primary layer (`tTVPLayerManager::RecreateOverallOrderIndex`,
+    /// `LayerManager.cpp:188`), so a parted layer is invisible until it is
+    /// joined again -- its TJS object outliving the tree edge does not keep it
+    /// on screen.
+    pub detached: bool,
     properties: BTreeMap<String, Variant>,
 }
 
@@ -255,8 +263,41 @@ impl LayerInstance {
             children: Vec::new(),
             children_array,
             render_target: LayerRenderTarget::Native(layer_id),
+            detached: false,
             properties: BTreeMap::new(),
         }
+    }
+
+    /// Official `tTJSNI_BaseLayer::Construct` gives a layer created without a
+    /// parent its own layer manager and makes it that manager's primary
+    /// (`LayerIntf.cpp:466` `AttachPrimary`).  `Exchange` later moves the
+    /// primary to the layer it swaps in (`LayerIntf.cpp:927`
+    /// `Manager->AttachPrimary(target)`), so the stored value is the one the
+    /// script sees as `isPrimary`.
+    fn is_primary_layer(&self) -> bool {
+        self.properties
+            .get("isPrimary")
+            .is_some_and(Variant::is_truthy)
+    }
+
+    /// Records a `Join` / `Part` of the official layer tree, remembering
+    /// whether the layer is currently detached from it.
+    fn note_parent_change(&mut self, parent: Option<ObjectHandle>) {
+        if parent.is_some() {
+            self.detached = false;
+        } else if self.parent.is_some() && !self.is_primary_layer() {
+            self.detached = true;
+        }
+        self.parent = parent;
+    }
+
+    /// Whether the layer tree node may be drawn at this attachment state: a
+    /// layer joined under a render parent always is, and a parentless one while
+    /// it is the manager's primary (`Exchange` hands that role to the layer it
+    /// swaps in, `LayerIntf.cpp:927`), never left the tree itself, or is
+    /// projected onto a root by the engine's page bookkeeping.
+    fn renderable_in_tree(&self, render_parent: Option<LayerId>) -> bool {
+        render_parent.is_some() || !self.detached || self.is_primary_layer()
     }
 
     fn property(&self, name: &str) -> Option<Variant> {
@@ -403,6 +444,9 @@ pub struct KrkrHost {
     clock_offset_millis: i64,
     termination_requested: bool,
     modal_windows: Vec<ObjectHandle>,
+    /// Modal-layer stack per window (`tTVPLayerManager::ModalLayerVector`),
+    /// fed by `Layer.setMode()`/`removeMode()`.
+    modal_layers: Vec<(Option<ObjectHandle>, LayerId)>,
     /// First native `Window` constructed, matching `Window.mainWindow`
     /// (`classes.rs` assigns it when the class member is still void).  Frame
     /// coordinates are the main window's client area, so other windows are
@@ -483,6 +527,7 @@ impl Default for KrkrHost {
             clock_offset_millis: 0,
             termination_requested: false,
             modal_windows: Vec::new(),
+            modal_layers: Vec::new(),
             main_window: None,
             external_resource_catalog: BTreeSet::new(),
             pending_external_resources: BTreeMap::new(),
@@ -1514,7 +1559,7 @@ impl KrkrHost {
                     if window.is_some() {
                         instance.window = window;
                     }
-                    instance.parent = parent;
+                    instance.note_parent_change(parent);
                     instance.children_array = children_array.or(instance.children_array);
                 }
                 let render_parent = self
@@ -1569,6 +1614,52 @@ impl KrkrHost {
         self.native_layers
             .get(&handle)
             .map(|instance| instance.layer_id)
+    }
+
+    /// `tTVPLayerManager::SetModeTo` (`LayerManager.cpp:826`): push the layer
+    /// onto the window's modal-layer stack. The current modal layer disables
+    /// every layer outside its ancestry (`IsDisabledByMode`).
+    pub(crate) fn set_modal_layer(&mut self, handle: ObjectHandle, layer: LayerId) {
+        let window = self.native_layer_window(handle);
+        self.modal_layers
+            .retain(|(entry_window, entry_layer)| {
+                !(*entry_window == window && *entry_layer == layer)
+            });
+        self.modal_layers.push((window, layer));
+        self.sync_modal_layer();
+    }
+
+    /// `tTVPLayerManager::RemoveModeFrom` (`LayerManager.cpp:862`): drop the
+    /// layer from the modal stack.
+    pub(crate) fn remove_modal_layer(&mut self, layer: LayerId) {
+        self.modal_layers
+            .retain(|(_, entry_layer)| *entry_layer != layer);
+        self.sync_modal_layer();
+    }
+
+    /// Current modal layer for a window (`GetCurrentModalLayer`): the most
+    /// recently pushed entry, matching the window when one is given.
+    pub(crate) fn current_modal_layer(&self, window: Option<ObjectHandle>) -> Option<LayerId> {
+        match window {
+            Some(window) => self
+                .modal_layers
+                .iter()
+                .rev()
+                .find(|(entry_window, _)| *entry_window == Some(window))
+                .map(|(_, layer)| *layer),
+            None => self.modal_layers.last().map(|(_, layer)| *layer),
+        }
+    }
+
+    fn sync_modal_layer(&mut self) {
+        let layer = self.modal_layers.last().map(|(_, layer)| *layer);
+        self.layer_tree.set_modal_layer(layer);
+    }
+
+    pub(crate) fn modal_layer_drop_window(&mut self, window: ObjectHandle) {
+        self.modal_layers
+            .retain(|(entry_window, _)| *entry_window != Some(window));
+        self.sync_modal_layer();
     }
 
     /// The TJS object that owns a rendered layer. The layer tree only carries
@@ -1661,7 +1752,7 @@ impl KrkrHost {
             }
         }
         if let Some(instance) = self.native_layers.get_mut(&handle) {
-            instance.parent = parent;
+            instance.note_parent_change(parent);
             instance.set_property("parent", stored_value);
         }
         self.apply_layer_instance_to_render(handle);
@@ -1754,7 +1845,7 @@ impl KrkrHost {
             .is_some_and(|window| self.native_window_closed(window));
         if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
             apply_layer_properties_to_node(layer, &instance.properties, window_closed);
-            layer.renderable = true;
+            layer.renderable = instance.renderable_in_tree(render_parent);
             layer.parent = render_parent;
         }
         true
@@ -1780,7 +1871,7 @@ impl KrkrHost {
                 self.layer_tree.set_parent(layer_id, render_parent);
                 if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
                     apply_layer_properties_to_node(layer, &instance.properties, window_closed);
-                    layer.renderable = true;
+                    layer.renderable = instance.renderable_in_tree(render_parent);
                     apply_window_offset_to_node(layer, window_offset);
                 }
             }
@@ -1886,17 +1977,12 @@ impl KrkrHost {
         self.part_native_layer(handle);
         for child in children {
             self.part_native_layer(child);
-            // Official orphans leave the manager tree. Kirakira treats
-            // `parent=None` as a draw-list root, so keep them off-screen
-            // until a later `Join` / parent assignment.
-            if let Some(child_id) = self.native_layer(child)
-                && let Some(layer) = self.layer_tree.layer_mut(child_id)
-            {
-                layer.renderable = false;
-            }
         }
 
         self.layer_tree.remove_layer(layer_id);
+        self.modal_layers
+            .retain(|(_, entry_layer)| *entry_layer != layer_id);
+        self.sync_modal_layer();
         if let Some(instance) = self.native_layers.remove(&handle) {
             if let Some(parent) = instance.parent {
                 self.remove_native_layer_child(parent, handle);
@@ -1928,7 +2014,9 @@ impl KrkrHost {
     }
 
     /// Official `tTJSNI_BaseLayer::Part` (`LayerIntf.cpp:589`): detach from
-    /// the current parent without destroying the native instance.
+    /// the current parent without destroying the native instance.  The layer
+    /// leaves the draw and hit-test tree, so a node the engine kept has to stop
+    /// rendering until a later `Join` gives the layer a parent again.
     fn part_native_layer(&mut self, handle: ObjectHandle) {
         let Some(instance) = self.native_layers.get(&handle).cloned() else {
             return;
@@ -1936,12 +2024,19 @@ impl KrkrHost {
         if let Some(parent) = instance.parent {
             self.remove_native_layer_child(parent, handle);
         }
+        let mut detached = false;
         if let Some(instance) = self.native_layers.get_mut(&handle) {
-            instance.parent = None;
+            instance.note_parent_change(None);
             instance.set_property("parent", Variant::Void);
+            detached = instance.detached;
         }
         if let LayerRenderTarget::Native(layer_id) = instance.render_target {
             self.layer_tree.set_parent(layer_id, None);
+        }
+        if detached
+            && let Some(layer) = self.layer_tree.layer_mut(instance.layer_id)
+        {
+            layer.renderable = false;
         }
     }
 

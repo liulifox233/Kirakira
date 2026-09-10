@@ -434,8 +434,9 @@ pub(crate) enum StretchType {
 }
 
 pub(crate) fn stretch_type_from_i64(value: i64) -> StretchType {
-    // `stTypeMask = 0x0000ffff` selects the interpolation type; the
-    // `stFlagMask` bits (`stRefNoClip`) are not part of it.
+    // `stTypeMask = 0x0000ffff` in the C++ header selects the interpolation
+    // type; the `stFlagMask` bits (`stRefNoClip`) are not part of it
+    // (`visual/LayerBitmapIntf.h:82`).
     match value & 0xffff {
         1 | 2 | 4 => StretchType::Bilinear,
         3 | 5 => StretchType::Bicubic,

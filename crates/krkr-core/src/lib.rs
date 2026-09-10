@@ -1386,6 +1386,13 @@ impl LayerNode {
 pub struct LayerTree {
     layers: BTreeMap<LayerId, LayerNode>,
     next_layer_id: LayerId,
+    /// Current modal layer (`tTVPLayerManager::GetCurrentModalLayer`,
+    /// `LayerManager.cpp:926`): `Layer.setMode()` pushes it and
+    /// `Layer.removeMode()` pops it.  While one is set, every layer that is
+    /// not an ancestor-or-self of it is disabled by mode
+    /// (`tTJSNI_BaseLayer::IsDisabledByMode`, `LayerIntf.cpp:3416`), which
+    /// both `NodeEnabled` and `GetMostFrontChildAt` consult.
+    modal_layer: Option<LayerId>,
 }
 
 impl Default for LayerTree {
@@ -1399,7 +1406,66 @@ impl LayerTree {
         Self {
             layers: BTreeMap::new(),
             next_layer_id: 1,
+            modal_layer: None,
         }
+    }
+
+    pub fn modal_layer(&self) -> Option<LayerId> {
+        self.modal_layer
+    }
+
+    pub fn set_modal_layer(&mut self, layer: Option<LayerId>) {
+        self.modal_layer = layer.filter(|id| self.layers.contains_key(id));
+    }
+
+    /// `tTJSNI_BaseLayer::IsDisabledByMode` (`LayerIntf.cpp:3416`):
+    /// `!IsAncestorOrSelf(currentModalLayer)`, and the official
+    /// `IsAncestorOrSelf(ancestor)` (`LayerIntf.h:256`) asks whether the
+    /// *argument* is an ancestor of `this`.  So while a modal layer is set,
+    /// only that layer's own subtree stays hittable; everything else -- the
+    /// modal layer's ancestors and every unrelated layer -- is disabled, which
+    /// is what makes `GetMostFrontChildAt` report "no layer at this point"
+    /// (`LayerIntf.cpp:3000`) instead of delivering to the background.
+    pub fn is_disabled_by_mode(&self, id: LayerId) -> bool {
+        match self
+            .modal_layer
+            .filter(|modal| self.layers.contains_key(modal))
+        {
+            Some(modal) => !self.is_ancestor_or_self(modal, id),
+            None => false,
+        }
+    }
+
+    /// True when `ancestor` is `id` itself or one of its ancestors.
+    pub fn is_ancestor_or_self(&self, ancestor: LayerId, id: LayerId) -> bool {
+        let mut current = Some(id);
+        while let Some(node) = current.and_then(|id| self.layers.get(&id)) {
+            if node.id == ancestor {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    /// `tTJSNI_BaseLayer::GetNodeEnabled` (`LayerIntf.h:651`):
+    /// `GetEnabled() && ParentEnabled() && !IsDisabledByMode()`.
+    /// `ParentEnabled()` walks every ancestor's own `Enabled`
+    /// (`LayerIntf.cpp:3489`), so disabling a layer disables its whole subtree
+    /// without touching the children's own flags -- which is why this must be
+    /// computed from the live tree rather than from a cached per-node flag.
+    pub fn node_enabled(&self, id: LayerId) -> bool {
+        if self.is_disabled_by_mode(id) {
+            return false;
+        }
+        let mut current = Some(id);
+        while let Some(node) = current.and_then(|id| self.layers.get(&id)) {
+            if !node.enabled {
+                return false;
+            }
+            current = node.parent;
+        }
+        true
     }
 
     pub fn create_layer(
@@ -1596,12 +1662,15 @@ impl LayerTree {
         let Some(layer) = self.layers.get(&id) else {
             return HitTestOutcome::None;
         };
-        if !layer.renderable
-            || !layer.visible
-            || layer.opacity == 0
-            || layer.width <= 0.0
-            || layer.height <= 0.0
-        {
+        // Only `Visible` and the rectangle gate a hit. Opacity is a drawing
+        // property: official `GetMostFrontChildAt` (`LayerIntf.cpp:2967`)
+        // checks `Visible` alone, and `GetNodeVisible()` is explicitly
+        // documented as "this does not check opacity" (`LayerIntf.h:308`).
+        // `IsSeen()` -- visible *and* non-zero opacity -- is used by the draw
+        // pass only. KAGEX buttons fade a state image to opacity 0 while the
+        // pointer is on them, so honouring opacity here drops the layer out
+        // from under the cursor and makes the hover state oscillate.
+        if !layer.renderable || !layer.visible || layer.width <= 0.0 || layer.height <= 0.0 {
             return HitTestOutcome::None;
         }
 
@@ -1613,11 +1682,6 @@ impl LayerTree {
         if !rect.contains(point) {
             return HitTestOutcome::None;
         }
-        if !layer.enabled || !layer.node_enabled {
-            // NodeEnabled includes the ancestor state in KRKR. A disabled
-            // parent therefore blocks its descendants and lower siblings.
-            return HitTestOutcome::Blocked;
-        }
 
         for child in self.sorted_children(Some(id)).into_iter().rev() {
             match self.hit_test_layer_all(child.id, origin, point, hits) {
@@ -1627,6 +1691,17 @@ impl LayerTree {
         }
 
         if layer.hit_test(origin, point) {
+            // `GetMostFrontChildAt` only reports "disabled or under a modal
+            // layer" once the layer's own mask/province test passed
+            // (`LayerIntf.cpp:2996`): a disabled layer that is transparent at
+            // this point stays transparent instead of swallowing the event,
+            // while a hit on a disabled layer blocks lower siblings with a
+            // NULL result.  `GetNodeEnabled()` is `GetEnabled() &&
+            // ParentEnabled() && !IsDisabledByMode()` and is recomputed on
+            // every query (`LayerIntf.h:651`).
+            if !self.node_enabled(id) {
+                return HitTestOutcome::Blocked;
+            }
             hits.push(id);
             return HitTestOutcome::Hit;
         }
@@ -3164,6 +3239,114 @@ mod tests {
 
         layers.layer_mut(high).expect("high").visible = false;
         assert_eq!(layers.hit_test(Point::new(15.0, 25.0)), Some(low));
+    }
+
+    #[test]
+    fn hit_testing_ignores_opacity_like_the_reference_engine() {
+        // `GetMostFrontChildAt` (`LayerIntf.cpp:2967`) gates a hit on `Visible`
+        // alone, and `GetNodeVisible()` is documented as "this does not check
+        // opacity" (`LayerIntf.h:308`); `IsSeen()` (visible *and* non-zero
+        // opacity) belongs to the draw pass. KAGEX buttons fade their state
+        // image to opacity 0 while the pointer rests on them, so an opacity
+        // gate here drops the hover target out from under the cursor.
+        let mut layers = LayerTree::new();
+        let low = layers.create_layer("low", None, 1);
+        let high = layers.create_layer("high", None, 2);
+        for id in [low, high] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 4.0;
+            layer.height = 4.0;
+            layer.visible = true;
+        }
+        layers.layer_mut(high).expect("high").opacity = 0;
+
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), Some(high));
+    }
+
+    #[test]
+    fn disabled_layers_block_only_after_their_own_hit_test_passes() {
+        // `GetMostFrontChildAt` reports "disabled or under a modal layer" only
+        // once the layer's own mask test succeeded (`LayerIntf.cpp:2996`), so
+        // a disabled layer that is transparent at this point must stay
+        // transparent instead of swallowing the event.
+        let mut layers = LayerTree::new();
+        let low = layers.create_layer("low", None, 1);
+        let high = layers.create_layer("high", None, 2);
+        for id in [low, high] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 2.0;
+            layer.height = 2.0;
+            layer.visible = true;
+        }
+        layers.layer_mut(high).expect("high").hit_threshold = 16;
+
+        // No image and a threshold of 16: the high layer is transparent here.
+        layers.layer_mut(high).expect("high").enabled = false;
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), Some(low));
+
+        // An opaque disabled layer hits its own mask and therefore blocks.
+        layers.layer_mut(high).expect("high").set_image(LayerImage::new(
+            1,
+            2,
+            2,
+            Arc::from([
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            ]),
+        ));
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn disabling_a_parent_disables_the_whole_subtree_for_hit_testing() {
+        // `GetNodeEnabled()` is `GetEnabled() && ParentEnabled() &&
+        // !IsDisabledByMode()` and is recomputed on every query
+        // (`LayerIntf.h:651`); `ParentEnabled()` walks every ancestor's own
+        // `Enabled` (`LayerIntf.cpp:3489`).
+        let mut layers = LayerTree::new();
+        let low = layers.create_layer("low", None, 0);
+        let parent = layers.create_layer("parent", None, 1);
+        let child = layers.create_layer("child", Some(parent), 1);
+        for id in [parent, child, low] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 4.0;
+            layer.height = 4.0;
+            layer.visible = true;
+        }
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), Some(child));
+        assert!(layers.node_enabled(child));
+
+        layers.layer_mut(parent).expect("parent").enabled = false;
+        assert!(!layers.node_enabled(child));
+        // The child's own mask still passes, so official reports "disabled"
+        // rather than "no hit": the disabled subtree blocks the lower sibling
+        // instead of letting the event fall through (`LayerIntf.cpp:2996`).
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn a_modal_layer_disables_everything_outside_its_own_subtree() {
+        // `IsDisabledByMode()` is `!IsAncestorOrSelf(currentModalLayer)`
+        // (`LayerIntf.cpp:3416`): only the modal layer's own subtree keeps
+        // hitting; its ancestors and unrelated layers are mode-disabled.
+        let mut layers = LayerTree::new();
+        let background = layers.create_layer("background", None, 1);
+        let modal = layers.create_layer("modal", None, 2);
+        let modal_child = layers.create_layer("modal_child", Some(modal), 1);
+        for id in [background, modal, modal_child] {
+            let layer = layers.layer_mut(id).expect("layer");
+            layer.width = 4.0;
+            layer.height = 4.0;
+            layer.visible = true;
+        }
+
+        layers.set_modal_layer(Some(modal));
+        assert!(layers.is_disabled_by_mode(background));
+        assert!(!layers.is_disabled_by_mode(modal));
+        assert!(!layers.is_disabled_by_mode(modal_child));
+        assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), Some(modal_child));
+
+        layers.set_modal_layer(None);
+        assert!(!layers.is_disabled_by_mode(background));
     }
 
     #[test]

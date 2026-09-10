@@ -51,10 +51,41 @@ pub(crate) fn install_native_class(
     install_native_properties(runtime, handle, spec.name);
     install_methods(runtime, handle, spec.name, spec.static_methods);
     install_properties(runtime, handle, spec.static_properties);
+    install_class_name_constructor(runtime, handle, spec.name, handle, None);
     if global {
         runtime.set_global_member(spec.name, Variant::Object(handle));
     }
     handle
+}
+
+/// krkrz publishes every native class's constructor as a member named after
+/// the class: `TJS_END_NATIVE_CONSTRUCTOR_DECL(Layer)` ends in
+/// `RegisterNCM("Layer", new NCM_Layer())` (tjsNative.h:233), which stores the
+/// NCM on the class object at `val = dsp` — an object with no ObjThis
+/// (tjsNative.cpp:246).  Scripts lean on that member to run a native
+/// initializer on an object of their own: `_Layer.Layer(win, this)` from a
+/// class whose first parent is not `Layer` (KAGEX's
+/// `GUIAnimButtonObjectBase`, k2compat's layer wrappers) reaches it through
+/// the class object, and TJS2 resolves the call's objthis as
+/// `clo.ObjThis ? clo.ObjThis : ra[-1]` (tjsInterCodeExec.cpp:2015), so the
+/// initializer runs on the *caller's* `this` rather than on the class object.
+///
+/// When a native class is initialized on an object, `tTJSNativeClass::FuncCall`
+/// copies every registered member onto it as `tTJSVariant(val, objthis)`
+/// (tjsNative.cpp:295), binding this constructor to that object; pass it as
+/// `bound_to`.
+fn install_class_name_constructor(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    class_name: &str,
+    class_handle: ObjectHandle,
+    bound_to: Option<ObjectHandle>,
+) {
+    runtime.set_object_member(
+        handle,
+        class_name,
+        Variant::Closure(Closure::new(class_handle, bound_to)),
+    );
 }
 
 fn construct_native_instance(
@@ -89,10 +120,13 @@ fn construct_native_instance(
         "__className",
         Variant::String(spec.name.to_string()),
     );
-    if let Variant::Object(class_handle) = runtime.global_member(spec.name)
-        && runtime.object_super_class(handle).is_none()
-    {
-        runtime.set_object_super_class(handle, class_handle);
+    if let Variant::Object(class_handle) = runtime.global_member(spec.name) {
+        if runtime.object_super_class(handle).is_none() {
+            runtime.set_object_super_class(handle, class_handle);
+        }
+        if class_handle != handle {
+            install_class_name_constructor(runtime, handle, spec.name, class_handle, Some(handle));
+        }
     }
     // WaveSoundBuffer and VideoOverlay keep their native methods on the class
     // object only: script subclasses override `open`/`play`/`stop` (a game's
@@ -492,6 +526,9 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "group", Variant::Integer(0));
             let children = runtime.alloc_array_object(Vec::new());
             runtime.set_object_member(handle, "children", Variant::Object(children));
+            // Runs on an already initialized script subclass instance
+            // (`super.MenuItem(...)`), so keep a script override of `index`.
+            install_menu_item_index_property(runtime, handle, true);
         }
         "Layer" => {
             let window = args.first().cloned().unwrap_or_default();
@@ -745,7 +782,42 @@ fn alloc_menu_item_object(
     runtime.set_object_member(handle, "parent", Variant::Void);
     let children = runtime.alloc_array_object(Vec::new());
     runtime.set_object_member(handle, "children", Variant::Object(children));
+    install_menu_item_index_property(runtime, handle, false);
     handle
+}
+
+/// `MenuItem.index` (`plugins/win32/menu/manual.tjs:134`) is a native property
+/// in the reference menu plugin; `preserve_script_properties` keeps a script
+/// subclass's own `index` member when the native constructor runs on an
+/// already initialized instance.
+fn install_menu_item_index_property(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    preserve_script_properties: bool,
+) {
+    if preserve_script_properties && runtime.object_member_is_property(handle, "index") {
+        return;
+    }
+    let property_handle = runtime.register_object_native_property(
+        handle,
+        "index",
+        move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
+            menu_item_index(runtime, this_obj)
+        },
+        move |runtime: &mut Runtime<KrkrHost>,
+              this_obj: Option<ObjectHandle>,
+              value: Variant| {
+            let index = value.to_integer().unwrap_or(0);
+            set_menu_item_index(runtime, this_obj, index)
+        },
+    );
+    if preserve_script_properties {
+        runtime.set_object_member(
+            handle,
+            "index",
+            Variant::Closure(Closure::new(property_handle, Some(handle))),
+        );
+    }
 }
 
 fn install_menu_item_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -851,6 +923,79 @@ fn menu_item_set_parent(
         return;
     };
     runtime.set_object_member(*child, "parent", Variant::Object(this));
+}
+
+fn variant_object_handle(value: &Variant) -> Option<ObjectHandle> {
+    match value {
+        Variant::Object(handle) => Some(*handle),
+        Variant::Closure(closure) => Some(closure.object),
+        _ => None,
+    }
+}
+
+/// The array a menu item lives in, or `None` when it has no parent
+/// (`MenuItem.parent` is void for a root item).
+fn menu_item_siblings(runtime: &Runtime<KrkrHost>, this: ObjectHandle) -> Option<ObjectHandle> {
+    let Variant::Object(parent) = runtime.object_member(this, "parent") else {
+        return None;
+    };
+    match runtime.object_member(parent, "children") {
+        Variant::Object(children) => Some(children),
+        _ => None,
+    }
+}
+
+/// `MenuItem.index` (`plugins/win32/menu/manual.tjs:134`): the item's position
+/// among the children of its parent, 0 based.
+fn menu_item_index(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+) -> Result<Variant> {
+    let Some(this) = this_obj else {
+        return Ok(Variant::Integer(0));
+    };
+    let Some(children) = menu_item_siblings(runtime, this) else {
+        return Ok(Variant::Integer(0));
+    };
+    let position = runtime
+        .array_elements(children)
+        .and_then(|elements| {
+            elements
+                .iter()
+                .position(|element| variant_object_handle(element) == Some(this))
+        })
+        .unwrap_or(0);
+    Ok(Variant::Integer(position as i64))
+}
+
+/// Assigning `MenuItem.index` moves the item to that position among its
+/// siblings, the same way the reference menu handle does.
+fn set_menu_item_index(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    index: i64,
+) -> Result<()> {
+    let Some(this) = this_obj else {
+        return Ok(());
+    };
+    let Some(children) = menu_item_siblings(runtime, this) else {
+        return Ok(());
+    };
+    let elements = runtime
+        .array_elements(children)
+        .map(<[Variant]>::to_vec)
+        .unwrap_or_default();
+    let Some(position) = elements
+        .iter()
+        .position(|element| variant_object_handle(element) == Some(this))
+    else {
+        return Ok(());
+    };
+    let value = elements[position].clone();
+    runtime.array_remove_value(children, &value);
+    let target = index.clamp(0, (elements.len() - 1) as i64) as usize;
+    runtime.array_insert(children, target, value);
+    Ok(())
 }
 
 fn menu_item_noop(
@@ -1260,8 +1405,8 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "focus", layer_focus);
     register_native_method_preserving_script(runtime, handle, "focusPrev", layer_focus_prev);
     register_native_method_preserving_script(runtime, handle, "focusNext", layer_focus_next);
-    register_native_method_preserving_script(runtime, handle, "setMode", layer_void);
-    register_native_method_preserving_script(runtime, handle, "removeMode", layer_void);
+    register_native_method_preserving_script(runtime, handle, "setMode", layer_set_mode);
+    register_native_method_preserving_script(runtime, handle, "removeMode", layer_remove_mode);
     register_native_method_preserving_script(runtime, handle, "releaseCapture", layer_void);
     register_native_method_preserving_script(runtime, handle, "onClick", layer_on_click);
     register_native_method_preserving_script(runtime, handle, "onHitTest", layer_on_hit_test);
@@ -1466,6 +1611,17 @@ fn layer_native_property_get(
             runtime, this,
         )?)));
     }
+    if name == "nodeEnabled" {
+        // `GetNodeEnabled()` is computed on every read (`LayerIntf.h:651`) and
+        // the official property is read-only (`TJS_DENY_NATIVE_PROP_SETTER`,
+        // `LayerIntf.cpp:9334`); KAGEX reads it while drawing to pick between
+        // full and halved text alpha, so it has to follow an ancestor's
+        // `enabled` immediately.
+        if let Some(layer_id) = runtime.host().native_layer(this) {
+            let enabled = runtime.host().layer_tree().node_enabled(layer_id);
+            return Ok(Variant::Integer(i64::from(enabled)));
+        }
+    }
     if matches!(
         name,
         "imageWidth" | "imageHeight" | "imageLeft" | "imageTop"
@@ -1478,8 +1634,34 @@ fn layer_native_property_get(
             _ => layer_property_i64(runtime, this, "imageTop", 0)?,
         }));
     }
-    Ok(layer_property_value(runtime, this, name))
+    Ok(self_bound_object(
+        LAYER_SELF_BOUND_PROPERTIES.contains(&name),
+        layer_property_value(runtime, this, name),
+    ))
 }
+
+/// `tTJSNI_BaseLayer`'s `font` getter hands the font object back as
+/// `tTJSVariant(dsp, dsp)` (`LayerIntf.cpp:8875`): the value carries the font
+/// itself as its ObjThis. TJS2 picks a call's or a write's objthis with
+/// `Object.ObjThis ? Object.ObjThis : ra[-1]`, so a script that reads
+/// `layer.font` and writes through it reaches the font object -- KAGEX relies
+/// on that when `objectHookInjection` replaces the font's `face` property and
+/// the injected setter runs against the font rather than against the writer's
+/// `this`.
+///
+/// The remaining `tTJSVariant(dsp, dsp)` members (`parent`, `children`,
+/// `window`, `prevFocusable`, `nextFocusable`, `Window.focusedLayer`,
+/// `Window.primaryLayer`, and `VM_NEW`'s own result) still need the same
+/// treatment; they are held back because the engine's readers pattern-match
+/// `Variant::Object` and would have to learn to unwrap a bound closure first.
+fn self_bound_object(bind: bool, value: Variant) -> Variant {
+    match value {
+        Variant::Object(handle) if bind => Variant::Closure(Closure::new(handle, Some(handle))),
+        value => value,
+    }
+}
+
+const LAYER_SELF_BOUND_PROPERTIES: &[&str] = &["font"];
 
 // Layer.cursorX/cursorY report the current mouse cursor position in the
 // layer's local coordinate system, so they must be computed on read rather
@@ -6132,6 +6314,36 @@ fn layer_fire_parent_key_event(
         .map(|_| ())
 }
 
+fn layer_set_mode(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this_obj) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle)) else {
+        return Ok(Variant::Void);
+    };
+    let Some(layer_id) = runtime.host().native_layer(this_obj) else {
+        return Ok(Variant::Void);
+    };
+    runtime.host_mut().set_modal_layer(this_obj, layer_id);
+    Ok(Variant::Void)
+}
+
+fn layer_remove_mode(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this_obj) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle)) else {
+        return Ok(Variant::Void);
+    };
+    let Some(layer_id) = runtime.host().native_layer(this_obj) else {
+        return Ok(Variant::Void);
+    };
+    runtime.host_mut().remove_modal_layer(layer_id);
+    Ok(Variant::Void)
+}
+
 fn layer_void(
     _runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -6337,22 +6549,11 @@ fn render_root_for_layer(
 }
 
 // `nodeEnabled` in KRKR2 is derived from this layer's enabled state, every
-// ancestor, and the current modal layer. The host has no layer-modal state,
-// but deriving the ancestor portion here avoids treating a child of a disabled
-// parent as clickable when its cached render-node flag has not yet been synced.
-fn render_node_enabled(tree: &krkr_core::LayerTree, mut id: krkr_core::LayerId) -> bool {
-    loop {
-        let Some(layer) = tree.layer(id) else {
-            return false;
-        };
-        if !layer.enabled || !layer.node_enabled {
-            return false;
-        }
-        match layer.parent {
-            Some(parent) => id = parent,
-            None => return true,
-        }
-    }
+// ancestor, and the current modal layer (`GetNodeEnabled()` is
+// `GetEnabled() && ParentEnabled() && !IsDisabledByMode()`, `LayerIntf.h:651`).
+// It is recomputed on every query, never cached.
+fn render_node_enabled(tree: &krkr_core::LayerTree, id: krkr_core::LayerId) -> bool {
+    tree.node_enabled(id)
 }
 
 fn collect_front_child_candidates(
@@ -6809,6 +7010,11 @@ fn exchange_layer_tree(
         "isPrimary",
         Variant::Integer(i64::from(this_primary)),
     );
+    // `Exchange` parts both layers before it hands the primary role to the
+    // swapped-in one (`LayerIntf.cpp:927`), so their render state has to be
+    // recomputed for the new primary to draw as the page root.
+    runtime.host_mut().apply_layer_instance_to_render(this);
+    runtime.host_mut().apply_layer_instance_to_render(target);
     if this_primary || target_primary {
         let window = variant_object(&layer_property_value(runtime, this, "window"))
             .or_else(|| variant_object(&layer_property_value(runtime, target, "window")))

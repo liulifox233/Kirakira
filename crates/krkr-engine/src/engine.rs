@@ -264,6 +264,10 @@ pub struct KrkrEngine {
     plugins: Vec<Arc<dyn KrkrPlugin>>,
     cursor_position: Option<Point>,
     hovered_layer: Option<LayerId>,
+    /// Rounded cursor position of the last dispatched move, so
+    /// `onMouseMove` only fires when the position actually changed
+    /// (`tTVPLayerManager::LastMouseMoveX/Y`, `LayerManager.cpp:400`).
+    last_mouse_move: Option<(i64, i64)>,
     pressed_layer: Option<LayerId>,
     captured_layer: Option<LayerId>,
     input_result: EngineInputResult,
@@ -294,6 +298,7 @@ impl KrkrEngine {
             plugins: Vec::new(),
             cursor_position: None,
             hovered_layer: None,
+            last_mouse_move: None,
             pressed_layer: None,
             captured_layer: None,
             input_result: EngineInputResult::default(),
@@ -1726,11 +1731,12 @@ impl KrkrEngine {
                     self.dispatch_window_pointer_event("onMouseDown", 0)?;
                     // A KRKR control is commonly composed of a script-backed
                     // parent and one or more decorative/image children. The
-                    // visual child is the topmost hit-test result, but it is
-                    // not the object that owns onClick/onMouseUp. Prefer the
-                    // first script-backed candidate and fall back to the raw
-                    // visual target for linkNum/KAG click handling.
-                    let raw_target = self.interactive_layer_at_cursor()?;
+                    // reference engine hands pointer events to the front-most
+                    // hittable layer (`GetMostFrontChildAt`), so a decorative
+                    // child is expected to mark itself event-transparent with
+                    // `hitThreshold = 256`; whatever the hit test returns here
+                    // is the event target and the capture owner.
+                    let raw_target = self.layer_at_cursor()?;
                     let handled_by_script = raw_target.is_some_and(|layer_id| {
                         self.layer_has_script_handler(layer_id, "onMouseDown")
                     });
@@ -1750,7 +1756,7 @@ impl KrkrEngine {
                 } => {
                     let modal_active = self.active_modal_window().is_some();
                     self.dispatch_window_pointer_event("onMouseUp", 0)?;
-                    let release_hit = self.interactive_layer_at_cursor()?;
+                    let release_hit = self.layer_at_cursor()?;
                     // The click handler can invalidate/rebuild its layer
                     // (many title Start handlers do exactly that). Determine
                     // ownership while the original target is still alive;
@@ -1760,10 +1766,8 @@ impl KrkrEngine {
                         .into_iter()
                         .flatten()
                         .any(|layer_id| {
-                            pointer_event_methods("onMouseDown")
+                            ["onMouseDown", "onMouseUp", "onClick"]
                                 .iter()
-                                .chain(pointer_event_methods("onMouseUp"))
-                                .chain(["onClick"].iter())
                                 .any(|method| self.layer_has_script_handler(layer_id, method))
                         });
                     self.tjs_runtime.host_mut().log(&format!(
@@ -1794,7 +1798,7 @@ impl KrkrEngine {
                 } => {
                     let modal_active = self.active_modal_window().is_some();
                     let handled_by_window = self.dispatch_window_pointer_event("onMouseDown", 1)?;
-                    let raw_target = self.interactive_layer_at_cursor()?;
+                    let raw_target = self.layer_at_cursor()?;
                     let handled_by_layer = raw_target.is_some_and(|layer_id| {
                         self.layer_has_script_handler(layer_id, "onMouseDown")
                     });
@@ -1809,7 +1813,7 @@ impl KrkrEngine {
                     state: ButtonState::Released,
                 } => {
                     self.dispatch_window_pointer_event("onMouseUp", 1)?;
-                    let release_hit = self.interactive_layer_at_cursor()?;
+                    let release_hit = self.layer_at_cursor()?;
                     self.dispatch_layer_pointer_event(
                         "onMouseUp",
                         1,
@@ -2095,6 +2099,29 @@ impl KrkrEngine {
         method: &str,
         args: Vec<Variant>,
     ) -> Result<Variant> {
+        self.call_event_method_inner(object, method, args, false)
+    }
+
+    /// Event delivery on a layer: `tTVPEvent::Deliver` (`EventIntf.cpp:95`)
+    /// ignores `TJS_E_MEMBERNOTFOUND`, so a target without that handler just
+    /// carries on (no `System.exceptionHandler` report).
+    fn call_optional_event_method(
+        &mut self,
+        object: ObjectHandle,
+        method: &str,
+        args: Vec<Variant>,
+    ) -> Result<()> {
+        self.call_event_method_inner(object, method, args, true)
+            .map(|_| ())
+    }
+
+    fn call_event_method_inner(
+        &mut self,
+        object: ObjectHandle,
+        method: &str,
+        args: Vec<Variant>,
+        optional: bool,
+    ) -> Result<Variant> {
         let result = if self.tjs_runtime.is_suspended() {
             self.tjs_runtime
                 .call_object_method_during_suspend(object, method, args)
@@ -2103,40 +2130,48 @@ impl KrkrEngine {
         };
         match result {
             Ok(value) => Ok(value),
-            Err(mut error) => {
+            Err(error) => {
                 if is_resource_pending_error(&error) || error.is_debug_quit() {
                     return Err(error);
                 }
-                if self.tjs_runtime.process_unhandled_exception(&error)? {
-                    self.tjs_runtime.host_mut().log(&format!(
-                        "handled event `{method}` error: {}",
-                        error.message
-                    ));
-                    Ok(Variant::Void)
-                } else {
-                    error.message = format!(
-                        "event `{method}` on object#{} failed: {}",
-                        object.0, error.message
-                    );
-                    Err(error)
+                if optional && error.is_member_not_found() {
+                    return Ok(Variant::Void);
                 }
+                // KRKR delivers every posted event inside
+                // `TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION` (`EventIntf.cpp:622`);
+                // the macro reports the exception through
+                // `System.exceptionHandler` when the game installed one and
+                // otherwise shows it (`TVPShowScriptException`), and event
+                // delivery then carries on. An exception escaping a handler
+                // must not abort the frame.
+                let handled = self.tjs_runtime.process_unhandled_exception(&error)?;
+                self.tjs_runtime.host_mut().log(&format!(
+                    "{} event `{method}` on object#{} error: {}",
+                    if handled { "handled" } else { "unhandled" },
+                    object.0,
+                    error.message
+                ));
+                Ok(Variant::Void)
             }
         }
     }
 
-    fn handle_callback_error(&mut self, context: &str, mut error: TjsError) -> Result<()> {
+    fn handle_callback_error(&mut self, context: &str, error: TjsError) -> Result<()> {
         if is_resource_pending_error(&error) || error.is_debug_quit() {
             return Err(error);
         }
-        if self.tjs_runtime.process_unhandled_exception(&error)? {
-            self.tjs_runtime
-                .host_mut()
-                .log(&format!("handled {context}: {}", error.message));
-            Ok(())
-        } else {
-            error.message = format!("{context}: {}", error.message);
-            Err(error)
-        }
+        // Same rule as `call_event_method`: KRKR runs every posted callback
+        // inside `TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION`
+        // (`base/ScriptMgnIntf.h:77`), which reports the exception and lets
+        // the engine carry on. A game callback that throws must not take the
+        // frame down with it.
+        let handled = self.tjs_runtime.process_unhandled_exception(&error)?;
+        self.tjs_runtime.host_mut().log(&format!(
+            "{} {context}: {}",
+            if handled { "handled" } else { "unhandled" },
+            error.message
+        ));
+        Ok(())
     }
 
     fn dispatch_window_mouse_wheel(&mut self, delta: i32) -> Result<()> {
@@ -2200,9 +2235,7 @@ impl KrkrEngine {
         };
         let layer_id = match layer_override {
             Some(layer_id) => Some(layer_id),
-            None => {
-                self.script_pointer_layer_at_position(position, pointer_event_methods(method))?
-            }
+            None => self.layer_at_position(position)?,
         };
         let Some(layer_id) = layer_id else {
             return Ok(None);
@@ -2283,39 +2316,43 @@ impl KrkrEngine {
     }
 
     fn dispatch_layer_cursor_move(&mut self, position: Point) -> Result<()> {
-        let shift = self.current_shift_state(false);
-        if let Some(captured_layer) = self.captured_layer
-            && let Some((x, y)) = self.layer_local_point(captured_layer, position)
-        {
-            self.call_layer_event(
-                captured_layer,
-                "onMouseMove",
-                vec![
-                    Variant::Integer(x),
-                    Variant::Integer(y),
-                    Variant::Integer(shift),
-                ],
-            )?;
-            return Ok(());
-        }
-
-        let hit_layer = self.script_pointer_layer_at_position(
-            position,
-            &["onMouseMove", "onMouseEnter", "onMouseLeave"],
-        )?;
-        if hit_layer != self.hovered_layer {
+        // `tTVPLayerManager::PrimaryMouseMove` (`LayerManager.cpp:398`):
+        // the target is the capture owner, else the front-most hittable layer
+        // -- never a layer picked for "having a handler"; enter/leave follow
+        // a change of that target, and `onMouseMove` is only posted while the
+        // integer cursor position actually changed (`poschanged`).
+        let moved = self.record_cursor_move_position(position);
+        let mut target = self.cursor_event_target(position)?;
+        if target != self.hovered_layer {
             if let Some(layer_id) = self.hovered_layer {
                 self.call_layer_event(layer_id, "onMouseLeave", Vec::new())?;
+                // The handler may invalidate the layer, so the target is
+                // re-queried once after each enter/leave, exactly like the
+                // reference implementation.
+                target = self.cursor_event_target(position)?;
             }
-            self.hovered_layer = hit_layer;
-            if let Some(layer_id) = hit_layer {
+            if let Some(layer_id) = target {
                 self.call_layer_event(layer_id, "onMouseEnter", Vec::new())?;
+                let rechecked = self.cursor_event_target(position)?;
+                if rechecked != target {
+                    self.call_layer_event(layer_id, "onMouseLeave", Vec::new())?;
+                    target = rechecked;
+                    if let Some(next) = target {
+                        self.call_layer_event(next, "onMouseEnter", Vec::new())?;
+                    }
+                }
             }
+            self.hovered_layer = target;
         }
 
-        if let Some(layer_id) = hit_layer
-            && let Some((x, y)) = self.layer_local_point(layer_id, position)
-        {
+        if !moved {
+            return Ok(());
+        }
+        let Some(layer_id) = target else {
+            return Ok(());
+        };
+        let shift = self.current_shift_state(false);
+        if let Some((x, y)) = self.layer_local_point(layer_id, position) {
             self.call_layer_event(
                 layer_id,
                 "onMouseMove",
@@ -2327,6 +2364,30 @@ impl KrkrEngine {
             )?;
         }
         Ok(())
+    }
+
+    /// The layer a pointer event is delivered to: the capture owner while a
+    /// button is held, the front-most hittable layer otherwise
+    /// (`tTVPLayerManager::PrimaryMouseMove`/`PrimaryMouseDown`,
+    /// `LayerManager.cpp:398` and `:360`).  `tTVPEvent::Deliver` drops the
+    /// event when that layer has no matching handler
+    /// (`EventIntf.cpp:104`), so a handler-less layer swallows the event
+    /// instead of passing it to a layer behind it.
+    fn cursor_event_target(&mut self, position: Point) -> Result<Option<LayerId>> {
+        if let Some(captured) = self.captured_layer {
+            return Ok(Some(captured));
+        }
+        self.layer_at_position(position)
+    }
+
+    /// `poschanged = LastMouseMoveX != x || LastMouseMoveY != y`
+    /// (`LayerManager.cpp:400`): the reference compares rounded positions, so
+    /// a sub-pixel move posts no `onMouseMove`.
+    fn record_cursor_move_position(&mut self, position: Point) -> bool {
+        let current = (position.x.round() as i64, position.y.round() as i64);
+        let moved = self.last_mouse_move != Some(current);
+        self.last_mouse_move = Some(current);
+        moved
     }
 
     fn dispatch_layer_mouse_wheel(&mut self, delta: i32) -> Result<()> {
@@ -2376,32 +2437,6 @@ impl KrkrEngine {
             return Ok(None);
         };
         self.layer_at_position(position)
-    }
-
-    fn interactive_layer_at_cursor(&mut self) -> Result<Option<LayerId>> {
-        let Some(position) = self.cursor_position else {
-            return Ok(None);
-        };
-        let scripted = self
-            .script_pointer_layer_at_position(position, &["onMouseDown", "onMouseUp", "onClick"])?;
-        Ok(scripted.or(self.layer_at_cursor()?))
-    }
-
-    fn script_pointer_layer_at_position(
-        &mut self,
-        position: Point,
-        methods: &[&str],
-    ) -> Result<Option<LayerId>> {
-        for layer_id in self.hit_tested_layers_at_position(position)? {
-            if !methods
-                .iter()
-                .any(|method| self.layer_has_script_handler(layer_id, method))
-            {
-                continue;
-            }
-            return Ok(Some(layer_id));
-        }
-        Ok(None)
     }
 
     fn layer_at_position(&mut self, position: Point) -> Result<Option<LayerId>> {
@@ -2499,10 +2534,11 @@ impl KrkrEngine {
         let y = (position.y - origin.y).round() as i64;
         self.tjs_runtime
             .set_object_member(object, "__nativeHitTestWork", Variant::Integer(1));
-        if !matches!(
+        let has_handler = !matches!(
             self.tjs_runtime.object_member(object, "onHitTest"),
             Variant::Void
-        ) {
+        );
+        if has_handler {
             self.call_event_method(
                 object,
                 "onHitTest",
@@ -2513,10 +2549,11 @@ impl KrkrEngine {
                 ],
             )?;
         }
-        Ok(self
+        let result = self
             .tjs_runtime
             .object_member(object, "__nativeHitTestWork")
-            .is_truthy())
+            .is_truthy();
+        Ok(result)
     }
 
     fn dispatch_layer_click(&mut self, layer_id: LayerId) -> Result<()> {
@@ -2554,13 +2591,15 @@ impl KrkrEngine {
         let Some(object) = self.tjs_runtime.host().native_object_for_layer(layer_id) else {
             return Ok(());
         };
-        if matches!(
-            self.tjs_runtime.object_member(object, method),
-            Variant::Void
-        ) {
-            return Ok(());
-        }
-        let result = self.call_event_method(object, method, args).map(|_| ());
+        // `tTVPEvent::Deliver` (`EventIntf.cpp:95`) FuncCalls the event name on
+        // the target with the target itself as objthis, and a member miss is
+        // simply "no handler here".  The lookup must go through `missing`
+        // (`tTJSCustomObject::FuncCall`, `tjsObject.cpp:1316`): a layer that
+        // inherits the handler from a script parent -- KAGEX's
+        // `ParentHackLayer` forwards every member write to the message layer --
+        // is still called with itself as `this`, which is what the forwarded
+        // wrapper reads `dragHookOwner` from.
+        let result = self.call_optional_event_method(object, method, args);
         self.sync_kag_slots_after_ok(result)
     }
 
@@ -4322,15 +4361,6 @@ fn pointer_button_vk_code(button: PointerButton) -> Option<i64> {
         PointerButton::Secondary => Some(0x02),
         PointerButton::Middle => Some(0x04),
         PointerButton::Other(_) => None,
-    }
-}
-
-fn pointer_event_methods(method: &str) -> &'static [&'static str] {
-    match method {
-        "onMouseDown" => &["onMouseDown"],
-        "onMouseUp" => &["onMouseUp"],
-        "onMouseMove" => &["onMouseMove", "onMouseEnter", "onMouseLeave"],
-        _ => &[],
     }
 }
 
@@ -8273,9 +8303,16 @@ mod tests {
                 "inline.tjs",
                 r#"
                 var handler = new Dictionary();
+                // KAGEX writes handlers as `function (...) { ... } incontextof
+                // global` (Override.tjs does this for every dictionary-stored
+                // callback): a bare name inside a function assigned to a
+                // Dictionary is read against that Dictionary first, and
+                // `tTJSDictionaryObject::PropGet` answers void instead of
+                // falling through to the global object
+                // (`tjsDictionary.cpp:721`).
                 handler.onTag = function(elm) {
                     throw new Exception("tag boom");
-                };
+                } incontextof global;
                 return handler;
                 "#,
             )
@@ -11434,6 +11471,186 @@ mod tests {
     }
 
     #[test]
+    fn array_index_read_past_the_end_is_void_like_krkr() {
+        // KAGEX's `system.tjs` `_applyEntries` splits a config line and reads
+        // `l2[1]` even when the split produced a single element; official
+        // `ARRAY_GET_VAL` (`tjsArray.cpp:1404`) answers void there, while a
+        // `typeof` of the same index must report `undefined` because the
+        // opcode passes TJS_MEMBERMUSTEXIST (`tjsInterCodeExec.cpp:1296`).
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var single = "flag".split("=");
+                var pair = "name=value".split("=");
+                return (single.count)
+                    + "/" + (single[1] === void)
+                    + "/" + (typeof single[1])
+                    + "/" + pair[1]
+                    + "/" + single[-1];
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            result.to_tjs_string().expect("string"),
+            "1/1/undefined/value/flag"
+        );
+    }
+
+    #[test]
+    fn property_getter_reads_a_void_instance_member_like_krkr() {
+        // KAGEX's `KAGWindow` sets `this._BookMarkIO = void` in its class body
+        // and its `BookMarkIO` property getter reads that bare name. Inside a
+        // method a bare name compiles against `%-2`, the objthis proxy the VM
+        // builds when it enters a context (`tjsInterCodeExec.cpp:791`): the
+        // instance first, the global object second.
+        // `tTJSObjectProxy::PropGet` (`tjsInterCodeExec.cpp:284`) falls through
+        // to the second object only for TJS_E_MEMBERNOTFOUND, so an instance
+        // member that exists and holds void must be the result instead of
+        // being treated as absent.
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Probe {
+                    this.g = void;
+                    property G {
+                        getter() { if (g === void) { g = 5; } return g; }
+                        setter(value) { g = value; }
+                    }
+                    function Probe() { }
+                }
+                global.probe = new Probe();
+                var first = probe.G;
+                probe.G = 9;
+                return first + "/" + probe.G;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result.to_tjs_string().expect("string"), "5/9");
+    }
+
+    #[test]
+    fn tvp_global_constants_match_the_reference_init_script() {
+        // `TVPInitTJSScript` (`ScriptMgnIntf.cpp:58`) is evaluated at script
+        // engine init, so the stock KAG `Config.tjs` line
+        // `;System.graphicCacheLimit = gcsAuto;` -- where `;` is TJS2's empty
+        // statement (`tjs.y:243`), not a comment -- reads a name that must
+        // exist. The dictionary and a handful of values stand in for the whole
+        // table: `fsfUseFontFace` and `fsfIgnoreSymbol` are easy to swap,
+        // `ltPsExclusion` is the end of the Photoshop blend family.
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                return gcsAuto
+                    + "/" + imageTagLayerType.addalpha.type
+                    + "/" + imageTagLayerType.psexcl.type
+                    + "/" + fsfUseFontFace
+                    + "/" + fsfIgnoreSymbol
+                    + "/" + VK_F1
+                    + "/" + dtnAuto;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            result.to_tjs_string().expect("string"),
+            "-1/12/28/256/16/112/0"
+        );
+    }
+
+    #[test]
+    fn layer_font_reads_back_bound_to_the_font_like_krkr() {
+        // `tTJSNI_BaseLayer`'s font getter returns `tTJSVariant(dsp, dsp)`
+        // (LayerIntf.cpp:8875). TJS2 resolves a write's objthis with
+        // `Object.ObjThis ? Object.ObjThis : ra[-1]`, so a write through
+        // `layer.font` must reach the font. KAGEX relies on exactly that:
+        // `objectHookInjection` gives the font a property whose setter
+        // forwards through `this`, and the setter has to see the font.
+        // Writing from another object's method makes the caller's `this` the
+        // writer, which is what the write falls back to when the font value
+        // carries no ObjThis.
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let seen = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class FontLike {
+                    var seen;
+                    function FontLike() { this.seen = "init"; }
+                }
+                class Writer {
+                    var holder;
+                    function Writer(holder) { this.holder = holder; }
+                    function poke() { this.holder.font.probe = 456; }
+                }
+                global.hooked = function(v) { this.seen = "set:" + v; };
+                var build = function() {
+                    ("property probe { setter(v) { (global.hooked incontextof this)(v); } }")!;
+                    return this.probe;
+                } incontextof (new Dictionary());
+                global.fontLike = new FontLike();
+                fontLike.probe = build() incontextof null;
+                global.layer = new Layer();
+                layer.font = fontLike;
+                global.writer = new Writer(layer);
+                writer.poke();
+                return fontLike.seen + "/" + (typeof writer.seen);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(seen.to_tjs_string().expect("string"), "set:456/undefined");
+    }
+
+    #[test]
+    fn native_class_constructor_member_runs_on_the_callers_object() {
+        // `TJS_END_NATIVE_CONSTRUCTOR_DECL(Layer)` ends in
+        // `RegisterNCM("Layer", new NCM_Layer())` (tjsNative.h:233): the
+        // class object carries a member named after the class, stored with no
+        // ObjThis. VM_CALLD hands the callee `clo.ObjThis ? clo.ObjThis :
+        // ra[-1]` (tjsInterCodeExec.cpp:2015), so `Layer.Layer(win, this)`
+        // from a class whose *first* parent is not Layer -- KAGEX's
+        // `GUIAnimButtonObjectBase` and this game's title buttons -- runs the
+        // layer initializer on the caller's object. Missing the member made
+        // the call fail with `void is not callable`; binding it to the class
+        // object would have attached the window to the class instead of the
+        // instance.
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.win = new Window();
+                class Holder {
+                    var window;
+                    function Holder() { this.window = global.win; }
+                }
+                class Mixin { function Mixin() {} }
+                class Base extends Mixin, Layer {
+                    var _Layer = global.Layer;
+                    var resultIsThis = 0;
+                    function Base(a0) {
+                        var t1 = a0.window;
+                        var r = _Layer.Layer(t1, a0);
+                        this.resultIsThis = (r === this);
+                    }
+                }
+                global.holder = new Holder();
+                global.base = new Base(holder);
+                return base.resultIsThis + "/" + (base.window === win) + "/"
+                    + (base.parent === holder) + "/" + (base instanceof "Layer");
+                "#,
+            )
+            .expect("script")
+            .to_tjs_string()
+            .expect("string");
+        assert_eq!(value, "1/1/1/1");
+    }
+
+    #[test]
     fn native_layer_property_setters_update_render_tree_without_frame_sync() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let layer_id = engine
@@ -11647,6 +11864,95 @@ mod tests {
         assert_eq!(image.upload.rgba.as_ref()[..4], [0, 255, 0, 255]);
     }
 
+    /// Draw and hit test walk from each manager's primary layer
+    /// (`tTVPLayerManager::RecreateOverallOrderIndex`, `LayerManager.cpp:188`),
+    /// so a child that `Invalidate` `Part()`s from its parent
+    /// (`LayerIntf.cpp:514`) leaves the tree and stops being drawn.  Kirakira
+    /// materializes parentless nodes as render roots, and KAGEX keeps writing
+    /// layer properties right after tearing a page down; that re-applies the
+    /// instance and used to put the parted child back on screen at the
+    /// coordinates its parent's clip used to hide.
+    #[test]
+    fn invalidated_parent_keeps_partied_child_off_screen_after_reapply() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let cell_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.page = new Layer(window, null);
+                page.setSize(320, 240);
+                page.hasImage = 0;
+                global.container = new Layer(window, page);
+                container.setSize(320, 240);
+                container.hasImage = 0;
+                global.cell = new Layer(window, container);
+                cell.setSize(64, 64);
+                cell.left = 400; // past the page edge: only the parent's clip hides it
+                cell.hasImage = 1;
+                return cell.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("parented frame");
+        let texture_id = engine
+            .host()
+            .layer_tree()
+            .layer(cell_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("cell image")
+            .upload
+            .texture_id;
+        let draws_cell = |frame: &EngineFrame| {
+            frame
+                .output
+                .draw_commands
+                .iter()
+                .any(|command| matches!(command, krkr_core::DrawCommand::Image(image) if image.texture_id == texture_id))
+        };
+        assert!(!draws_cell(&frame), "the page clip hides the cell");
+
+        engine
+            .execute_script("cleanup.tjs", "invalidate container; cell.left = 401;")
+            .expect("invalidate and re-apply");
+        assert!(
+            !engine
+                .host()
+                .layer_tree()
+                .layer(cell_id)
+                .expect("parted cell node")
+                .renderable
+        );
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("parted frame");
+        assert!(!draws_cell(&frame), "a parted layer must stay off-screen");
+
+        // `Join` back into the tree makes it draw again.
+        engine
+            .execute_script("cleanup.tjs", "cell.parent = page;")
+            .expect("rejoin");
+        assert!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(cell_id)
+                .expect("rejoined cell node")
+                .renderable
+        );
+    }
+
     /// GINKA's stand pool keeps `StandLayer` objects after `invalidate` and
     /// still calls `hasImage = 1` / `fillRect` / `copyRect` on them.
     #[test]
@@ -11766,6 +12072,166 @@ mod tests {
             }
         }
         assert_eq!(image.upload.rgba.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn image_less_child_layer_wins_cursor_over_its_parent() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.events = "";
+                var win = new Window();
+                var message = new Layer(win, null);
+                message.name = "message";
+                message.setPos(0, 0);
+                message.setSize(320, 240);
+                message.setImageSize(320, 240);
+                message.fillRect(0, 0, 320, 240, 0xff808080);
+                message.hitType = htMask;
+                message.hitThreshold = 16;
+                message.visible = true;
+                message.onMouseMove = function(x, y, shift) { global.events += "message;"; };
+
+                var hack = new Layer(win, message);
+                hack.name = "hack";
+                hack.setPos(0, 0);
+                hack.setSize(320, 240);
+                hack.hasImage = 0;
+                hack.hitType = htMask;
+                hack.hitThreshold = 256;
+                hack.hitThreshold = 0;
+                hack.visible = 1;
+                hack.onMouseMove = function(x, y, shift) {
+                    global.events += (this === hack ? "hack;" : "other;");
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::CursorMoved {
+                        position: Point::new(100.0, 100.0),
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("move frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "events")
+                .expect("events"),
+            Variant::String("hack;".to_string())
+        );
+    }
+
+    #[test]
+    fn script_subclass_with_call_missing_receives_cursor_as_itself() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.events = "";
+                var win = new Window();
+                var foreBase = new Layer(win, null);
+                foreBase.setPos(0, 0);
+                foreBase.setSize(320, 240);
+                foreBase.setImageSize(320, 240);
+                foreBase.fillRect(0, 0, 320, 240, 0xff000000);
+                foreBase.visible = true;
+
+                var message = new Layer(win, foreBase);
+                message.name = "message";
+                message.setPos(0, 0);
+                message.setSize(320, 240);
+                message.setImageSize(320, 240);
+                message.fillRect(0, 0, 320, 240, 0xff808080);
+                message.hitType = htMask;
+                message.hitThreshold = 16;
+                message.visible = true;
+                message.onMouseMove = function(x, y, shift) { global.events += "message;"; };
+
+                class ParentHackLayer extends Layer {
+                    function ParentHackLayer(a0, a1) {
+                        super.Layer(a0, a1);
+                        name = "ParentHackLayer";
+                        hasImage = 0;
+                        hitType = htMask;
+                        hitThreshold = 256;
+                        Scripts.setCallMissing(this);
+                    }
+                    property __hackTarget {
+                        getter() { return this.parent; }
+                    }
+                    function missing(a0, a1, a2) {
+                        var l0;
+                        if (this isvalid) {
+                            l0 = this.__hackTarget;
+                            if (typeof this.__hackTarget == "Object" && l0 && l0 isvalid) {
+                                if (!(typeof l0[a1] == "undefined")) {
+                                    if (a0) {
+                                        l0[a1] = *a2;
+                                    } else {
+                                        var t1 = l0[a1];
+                                        *a2 = t1;
+                                    }
+                                    return 1;
+                                }
+                            }
+                        }
+                        return 0;
+                    }
+                }
+
+                var hack = new ParentHackLayer(win, message);
+                hack.setPos(0, 0);
+                hack.setSize(320, 240);
+                hack.visible = 1;
+                hack.hitThreshold = 0;
+                hack.dragHookOwner = "owner";
+                hack.onMouseMove = function(x, y, shift) {
+                    global.events += "wrapper:" + this.dragHookOwner + ";";
+                };
+                "#,
+            )
+            .expect("script");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync frame");
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::CursorMoved {
+                        position: Point::new(100.0, 100.0),
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("move frame");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "events")
+                .expect("events"),
+            Variant::String("wrapper:owner;".to_string())
+        );
     }
 
     #[test]
@@ -13682,25 +14148,53 @@ mod tests {
                     global.conductorResumed++;
                 }, "");
 
-                global.owner = new Dictionary();
-                owner.conductor = new Dictionary();
-                owner.conductor.status = 2;
-                owner.conductor.waitUntil = new Dictionary();
-                owner.conductor.run = function() {
-                    this.status = 1;
-                    global.asyncProbe.trigger();
-                };
-                owner.conductor.trigger = function(name) {
-                    if(this.status != 2) return false;
-                    var func = this.waitUntil[name];
-                    if(func === void) return false;
-                    func();
-                    this.waitUntil = new Dictionary();
-                    this.run();
-                    return true;
-                };
-                owner.onSESoundBufferStop = function(id) {
-                    this.conductor.trigger("sestop" + id);
+                // KRKR binds a class method to its instance while copying the
+                // class members (`regmember` -> ChangeClosureObjThis, krkrz
+                // tjsInterCodeExec.cpp:3033); a plain member assigned from an
+                // expression function keeps no ObjThis, and a call on it runs
+                // on `clo.ObjThis ? clo.ObjThis : ra[-1]` -- the *caller's*
+                // this -- so the conductor and its owner are classes here,
+                // exactly like KAG's Conductor and MainWindow.
+                class TestConductor {
+                    var status;
+                    var waitUntil;
+
+                    function TestConductor() {
+                        this.status = 2;
+                        this.waitUntil = new Dictionary();
+                    }
+
+                    function run() {
+                        this.status = 1;
+                        global.asyncProbe.trigger();
+                    }
+
+                    function trigger(name) {
+                        if(this.status != 2) return false;
+                        var func = this.waitUntil[name];
+                        if(func === void) return false;
+                        func();
+                        this.waitUntil = new Dictionary();
+                        this.run();
+                        return true;
+                    }
+                }
+
+                class TestOwner {
+                    var conductor;
+
+                    function TestOwner() {
+                        this.conductor = new TestConductor();
+                    }
+
+                    function onSESoundBufferStop(id) {
+                        this.conductor.trigger("sestop" + id);
+                    }
+                }
+
+                global.owner = new TestOwner();
+                owner.conductor.waitUntil["sestop7"] = function() {
+                    global.waitHandlerRan++;
                 };
 
                 class SESoundBuffer extends WaveSoundBuffer
@@ -15339,7 +15833,7 @@ mod tests {
                 r#"
                 global.kag = new Window();
                 kag.onCloseQuery(false);
-                return kag.__nativeCanClose + ":" + (kag.__nativeClosed === void);
+                return kag.__nativeCanClose + ":" + (typeof kag.__nativeClosed == "undefined" ? 1 : 0);
                 "#,
             )
             .expect("deny close");
