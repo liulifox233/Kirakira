@@ -75,7 +75,11 @@ fn install_text_render_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
         // Layout state the base class owns.  `system/TextRender.tjs` reads
         // `vertical` as a bare symbol -- `drawText` loads it through the
         // this-proxy (`gpd %3, %-2.*"vertical"`, bytecode 68) and uses it to
-        // pick the glyph angle -- and `setOption` is the only writer.
+        // pick the glyph angle -- and `setOption` is the only writer.  Only the
+        // flag is modelled, not the writing mode: laying text out vertically
+        // also needs the glyph rotation the text drawing path does not
+        // perform, so this is state scripts can read and set, not a switch
+        // this renderer acts on.
         ("vertical", Variant::Integer(0)),
         // Script-assignable callbacks.
         ("onEval", Variant::Void),
