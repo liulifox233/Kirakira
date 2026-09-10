@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::bytecode::{BytecodeContextType, CallArgs, CodeObject, Instruction};
 use crate::compiler::compile_source_to_bytecode;
-use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
+use crate::error::{Result, TjsError, TjsErrorKind, TjsMemberAccess, TjsMemberOperation};
 use crate::runtime::builtins::{regexp_object_handle, regexp_regex};
 use crate::runtime::{
     Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant, split_delimited_string,
@@ -13,7 +13,9 @@ use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form
 use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
 
 impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
-    pub(crate) fn get_object_member(
+    /// Host-side member read that mirrors the C++ side of KRKR: a missing
+    /// member is `void`, never the script-facing "member not found" error.
+    pub(crate) fn get_object_member_probe(
         &mut self,
         object: ObjectHandle,
         name: &str,
@@ -21,7 +23,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.prop_get(
             Variant::Object(object),
             name,
-            DispatchFlags::default(),
+            DispatchFlags::probe(),
             Some(object),
         )
     }
@@ -97,10 +99,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         } = kind
         {
             if let Some(primary) = primary {
-                let value =
-                    self.prop_get_handle(primary, name, flags, bind_this.or(caller_this))?;
-                if !matches!(value, Variant::Void) {
-                    return Ok(self.bind_proxy_value(value, bind_this));
+                // `tTJSObjectProxy::PropGet` (`tjsInterCodeExec.cpp:284`) tries
+                // the first object and moves to the second -- for a frame's
+                // `%-2`, the global object -- only for TJS_E_MEMBERNOTFOUND. A
+                // member that exists and holds void is a hit, so `probe` is
+                // cleared here: with it the primary would report "absent" for
+                // a void member and the global object's value would win.
+                match self.prop_get_handle(
+                    primary,
+                    name,
+                    flags.without_probe(),
+                    bind_this.or(caller_this),
+                ) {
+                    Ok(value) => return Ok(self.bind_proxy_value(value, bind_this)),
+                    Err(error) if error.is_member_not_found() => {}
+                    Err(error) => return Err(error),
                 }
                 if bind_this.is_some() && self.handle_class_name_matches(primary, name) {
                     return Ok(Variant::Closure(Closure::new(primary, bind_this)));
@@ -116,7 +129,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return self.prop_get_handle(fallback, name, flags, caller_this);
         }
 
-        let Some(value) = self.runtime.heap[handle.0].get_raw(name) else {
+        let mut member = self.runtime.heap[handle.0].get_raw(name);
+        if flags.must_exist && self.runtime.heap[handle.0].array_index_missing(name) {
+            // `ARRAY_GET_VAL` (`tjsArray.cpp:1407`) reports an out-of-range
+            // index to a `TJS_MEMBERMUSTEXIST` reader -- `typeof arr[9]` -- as
+            // member-not-found, which the TYPEOFD opcode renders "undefined".
+            member = None;
+        }
+        let Some(value) = member else {
             let bind_this = self.bound_super_this(handle, caller_this)?;
             if let Some(this_obj) = bind_this
                 && self.handle_class_name_matches(handle, name)
@@ -124,10 +144,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 return Ok(Variant::Closure(Closure::new(handle, Some(this_obj))));
             }
             if let Some(class_handle) = self.super_class_handle(handle)? {
-                let receiver = caller_this.or(Some(handle));
-                let value = self.prop_get_handle(class_handle, name, flags, receiver)?;
-                if !matches!(value, Variant::Void) {
-                    return Ok(self.bind_proxy_value(value, receiver));
+                let receiver = self.inherited_member_this(handle, caller_this);
+                // `tTJSInterCodeContext::PropGet` (`tjsInterCodeExec.cpp:3144`)
+                // walks on only for TJS_E_MEMBERNOTFOUND, so a super class
+                // member that exists with a void value is the answer.
+                match self.prop_get_handle(
+                    class_handle,
+                    name,
+                    flags.without_probe(),
+                    receiver,
+                ) {
+                    Ok(value) => return Ok(self.bind_proxy_value(value, receiver)),
+                    Err(error) if error.is_member_not_found() => {}
+                    Err(error) => return Err(error),
                 }
             }
             // tTJSInterCodeContext::PropGet on a class object consults every
@@ -137,10 +166,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 && let Some(owner) = self.class_member_owner(handle, name, true)?
                 && owner != handle
             {
-                let receiver = caller_this.or(Some(handle));
-                let value = self.prop_get_handle(owner, name, flags, receiver)?;
-                if !matches!(value, Variant::Void) {
-                    return Ok(self.bind_proxy_value(value, receiver));
+                let receiver = self.inherited_member_this(handle, caller_this);
+                match self.prop_get_handle(owner, name, flags.without_probe(), receiver) {
+                    Ok(value) => return Ok(self.bind_proxy_value(value, receiver)),
+                    Err(error) if error.is_member_not_found() => {}
+                    Err(error) => return Err(error),
                 }
             }
             // TYPEOFD/TYPEOFI pass MEMBERMUSTEXIST in KRKR2/Z.  A qualified
@@ -158,10 +188,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             if let Some(value) = self.call_get_missing(handle, name)? {
                 return Ok(value);
             }
-            if flags.must_exist {
-                return Err(TjsError::runtime(format!("member `{name}` not found")));
-            }
-            return Ok(Variant::Void);
+            return self.missing_member(handle, name, flags);
         };
 
         if !flags.ignore_prop
@@ -173,11 +200,25 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         // Native methods carry no receiver of their own; bind them to the
         // object they were read from so a fetched method called as a plain
         // value still runs on the receiver (krkrz ObjThis semantics).
+        //
+        // Native *constructors* are the exception: `RegisterNCM` stores the
+        // class's own constructor with `val = dsp` and no ObjThis
+        // (tjsNative.cpp:246, `TJS_END_NATIVE_CONSTRUCTOR_DECL`), and
+        // instances receive their copy already bound when the native class is
+        // initialized on them (`tTJSVariant(val, objthis)`, tjsNative.cpp:295
+        // -> `install_class_name_constructor`).  Binding one here would make
+        // `Layer.Layer(win, this)` -- read through `global.Layer` -- run on
+        // whichever object the class was looked up from instead of on the
+        // caller's `this`, which is what VM_CALLD resolves
+        // (tjsInterCodeExec.cpp:2015).
         if bind_this.is_none()
             && let Variant::Object(native) = &value
             && matches!(
                 self.runtime.heap[native.0].kind,
-                ObjectKind::NativeFunction { .. } | ObjectKind::VmNativeFunction { .. }
+                ObjectKind::NativeFunction {
+                    constructable: false,
+                    ..
+                } | ObjectKind::VmNativeFunction { .. }
             )
         {
             return Ok(self.bind_proxy_value(value, Some(handle)));
@@ -271,7 +312,24 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return self.prop_set_handle(fallback, name, value, flags, caller_this);
         }
 
-        let member_exists = self.runtime.heap[handle.0].get_raw(name).is_some();
+        // `tTJSNativeClass::FuncCall` copies every non-static member of the
+        // native class onto the object it initializes (`tjsNative.cpp:293`),
+        // and a class body registers its own members on the instance as well
+        // (`tTJSInterCodeContext::CreateNew`, `tjsInterCodeExec.cpp:3211`), so
+        // in KRKR a class-provided member *is* an own member: `Find` sees it
+        // and `missing` is never consulted for it (`tTJSCustomObject::PropSet`,
+        // `tjsObject.cpp:1475`).  Kirakira installs only part of that copy --
+        // `install_methods` skips whatever the class chain already supplies --
+        // so a chain-provided name has to count as present here too, or a
+        // script write routes through `missing` into the script parent
+        // (KAGEX's `ParentHackLayer` forwards event-handler writes that way and
+        // then never receives the events as itself).
+        // Class objects keep their own rule: a write to an inherited member
+        // updates the class that owns it (see below), so only instances take
+        // the chain into account here.
+        let member_exists = self.runtime.heap[handle.0].get_raw(name).is_some()
+            || (!self.is_bytecode_class(handle)
+                && self.class_chain_provides_member(handle, name)?);
         if let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
             && (!flags.ignore_prop || self.runtime.variant_is_native_property(&existing))
             && self
@@ -281,11 +339,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Ok(());
         }
         if !flags.ignore_prop {
+            let receiver = self.inherited_member_this(handle, caller_this);
             let mut current = self.super_class_handle(handle)?;
             while let Some(class_handle) = current {
                 if let Some(existing) = self.runtime.heap[class_handle.0].get_raw(name)
                     && self
-                        .property_setter(existing, value.clone(), caller_this.or(Some(handle)))?
+                        .property_setter(existing, value.clone(), receiver)?
                         .is_some()
                 {
                     return Ok(());
@@ -322,14 +381,48 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.set_bound_member(this_obj, name, value);
             return Ok(());
         }
-        let mut value = self.materialize_code_object(value);
-        if let Variant::Closure(closure) = &mut value
-            && closure.this_obj.is_none()
+        if self
+            .runtime
+            .heap[handle.0]
+            .array_negative_index_after_wrap(name)
         {
-            closure.this_obj = Some(handle);
+            // `tTJSArrayObject::PropSetByNum` (`tjsArray.cpp:1634`) fails such
+            // a write instead of creating a member named `-n`.
+            return Err(TjsError::runtime(format!("member `{name}` not found")));
         }
+        let value = self.materialize_code_object(value);
         self.runtime.heap[handle.0].set(name, value);
         Ok(())
+    }
+
+    /// A read that fell through every lookup.  Official
+    /// `tTJSCustomObject::PropGet` reports `TJS_E_MEMBERNOTFOUND`, which
+    /// `TJSThrowFrom_tjs_error` turns into the script error "member not
+    /// found" (`tjsError.cpp:238`); only a TJS `Dictionary` maps a missing
+    /// member back to void (`tTJSDictionaryObject::PropGet`,
+    /// `tjsDictionary.cpp:721`).  Host-side probes and the dispatcher's own
+    /// chain walks raise `flags.probe` and get void, mirroring the C++ side of
+    /// KRKR, which treats `TJS_E_MEMBERNOTFOUND` as "absent".
+    fn missing_member(
+        &mut self,
+        handle: ObjectHandle,
+        name: &str,
+        flags: DispatchFlags,
+    ) -> Result<Variant> {
+        if flags.probe {
+            return Ok(Variant::Void);
+        }
+        let is_dictionary = self.runtime.heap[handle.0]
+            .class_infos
+            .iter()
+            .any(|class| class == "Dictionary");
+        if is_dictionary && !flags.must_exist {
+            return Ok(Variant::Void);
+        }
+        Err(TjsError::new(
+            TjsErrorKind::MemberNotFound,
+            format!("member `{name}` not found"),
+        ))
     }
 
     fn call_get_missing(&mut self, handle: ObjectHandle, name: &str) -> Result<Option<Variant>> {
@@ -386,7 +479,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let missing = self.prop_get_handle(
                 handle,
                 &missing_name,
-                DispatchFlags::no_bound_instance_fallback(),
+                DispatchFlags::no_bound_instance_fallback().with_probe(),
                 Some(handle),
             )?;
             if matches!(missing, Variant::Void) {
@@ -878,7 +971,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let base_depth = self.runtime.call_depth;
         let receiver_type = self.value_debug_type(&object_value);
-        match self.call_member_direct_cont(object_value, name, args, None, Continuation::Root)? {
+        // Host code has no frame, so nothing supplies `ra[-1]`: the object the
+        // host is calling through stands in for it, which is what the
+        // reference does when it drives a member call from C++ with an
+        // explicit objthis.
+        let caller_this = match self.materialize_code_object(object_value.clone()) {
+            Variant::Object(handle) => Some(handle),
+            Variant::Closure(closure) => closure.this_obj.or(Some(closure.object)),
+            _ => None,
+        };
+        match self.call_member_direct_cont(object_value, name, args, caller_this, Continuation::Root)?
+        {
             CallOutcome::Immediate(value, Continuation::Root) => {
                 Ok(if dest_reg == 0 { Variant::Void } else { value })
             }
@@ -971,7 +1074,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let lookup_this = self
                 .bound_super_this(handle, caller_this)?
                 .or(closure_this)
-                .or(Some(self.receiver_this(handle)));
+                .or(caller_this);
             self.prop_get_handle(
                 handle,
                 name,
@@ -1001,21 +1104,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let bind_this = self.bound_super_this(handle, caller_this)?;
         let member = self.bind_proxy_value(member, bind_this);
         let callee_type = self.value_debug_type(&member);
-        let receiver = self.receiver_this(handle);
-        let receiver_this = if let Some(this_obj) = caller_this
-            && self.is_class_in_instance_chain(this_obj, handle)?
-        {
-            this_obj
-        } else {
-            receiver
-        };
-        self.call_value(
-            member,
-            closure_this.or(Some(receiver_this)),
-            args,
-            false,
-            continuation,
-        )
+        // `CallFunctionDirect` (`tjsInterCodeExec.cpp:2406`) resolves the
+        // member with `objthis = clo.ObjThis ? clo.ObjThis : ra[-1]` -- the
+        // *object expression*'s own ObjThis, else the caller's `this`.  The
+        // invocant never supplies it: class members are stored with no
+        // ObjThis of their own, so a class-qualified call such as
+        // `PreRenderFontEx.KAGLayerFinalizer(...)` -- how the KAGEX font
+        // plugin calls back into the `finalize` it saved off `KAGLayer` --
+        // must keep running on the caller's `this` (the layer instance), not
+        // on the class object the member was read from.
+        // A native class object keeps its constructor under the class name
+        // with no ObjThis, which is how `Layer.Layer(win, this)` reaches the
+        // caller's object even when `Layer` is only one of several parents.
+        // Members that do carry an ObjThis -- every method `regmember` copied
+        // onto an instance, and every native function the property read bound
+        // to its receiver -- keep it, because `call_value` prefers the
+        // callee's own binding.
+        let call_this = self
+            .bound_super_this(handle, caller_this)?
+            .or(closure_this)
+            .or(caller_this);
+        self.call_value(member, call_this, args, false, continuation)
         .map_err(|error| {
             error.with_member_access(TjsMemberAccess {
                 operation: TjsMemberOperation::Calling,
@@ -1462,8 +1571,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.runtime.heap[handle.0].invalidating = true;
         let receiver_type = self.object_debug_type(handle, "object");
         let result = (|| {
-            let finalize =
-                self.prop_get_handle(handle, "finalize", DispatchFlags::default(), Some(handle))?;
+            // `tTJSCustomObject::Finalize` (`tjsObject.cpp:451`) dispatches
+            // `finalize` through `FuncCall` and *ignores its return value*, so
+            // an object that does not carry the member -- an Array, a
+            // Dictionary, a plain data object -- finalizes silently.  Only a
+            // member that exists and throws propagates.
+            let finalize = match self.prop_get_handle(
+                handle,
+                "finalize",
+                DispatchFlags::default(),
+                Some(handle),
+            ) {
+                Ok(value) => value,
+                Err(error) if error.is_member_not_found() => Variant::Void,
+                Err(error) => return Err(error),
+            };
             if !matches!(finalize, Variant::Void) {
                 let base_depth = self.runtime.call_depth;
                 let outcome = self
@@ -1775,6 +1897,28 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
+    /// Whether `name` is declared anywhere in the object's class chain.
+    ///
+    /// In KRKR an instance owns a copy of every class member -- native classes
+    /// copy their members when they are initialized on the object
+    /// (`tTJSNativeClass::FuncCall`, `tjsNative.cpp:293`), script classes
+    /// register theirs from the class body (`tTJSInterCodeContext::CreateNew`,
+    /// `tjsInterCodeExec.cpp:3211`) -- so this is what `Find` would report for
+    /// the instance's own member table (`tjsObject.cpp:1475`).
+    fn class_chain_provides_member(&mut self, handle: ObjectHandle, name: &str) -> Result<bool> {
+        let mut current = self.super_class_handle(handle)?;
+        for _ in 0..64 {
+            let Some(class_handle) = current else {
+                return Ok(false);
+            };
+            if self.runtime.heap[class_handle.0].get_raw(name).is_some() {
+                return Ok(true);
+            }
+            current = self.super_class_handle(class_handle)?;
+        }
+        Ok(false)
+    }
+
     pub(super) fn super_class_handle(
         &mut self,
         handle: ObjectHandle,
@@ -2074,6 +2218,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Ok(Some(this_obj));
         }
         Ok(None)
+    }
+
+    /// The `this` a member inherited through a class chain runs on.
+    ///
+    /// `regmember` copies a class's members onto every instance with
+    /// `val.ChangeClosureObjThis(Dest)` (`tjsInterCodeExec.cpp:3033`), so in the
+    /// reference an inherited member reached through an instance always carries
+    /// that instance as its ObjThis.  A receiver that *is* a class object keeps
+    /// the caller's `this` instead: the class owns those members directly, with
+    /// no ObjThis of their own, and the VM falls back to `ra[-1]`
+    /// (`tjsInterCodeExec.cpp:1593`).
+    fn inherited_member_this(
+        &mut self,
+        handle: ObjectHandle,
+        caller_this: Option<ObjectHandle>,
+    ) -> Option<ObjectHandle> {
+        if self.is_bytecode_class(handle) {
+            caller_this.or(Some(handle))
+        } else {
+            Some(handle)
+        }
     }
 
     fn effective_member_this(

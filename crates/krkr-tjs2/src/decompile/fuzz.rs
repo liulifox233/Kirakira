@@ -603,7 +603,12 @@ mod tests {
         // condition whose taken branch assignment the decompiler drops, so
         // the reconstructed program switches on `void`, matches `case 0`,
         // and executes `a |= null` which the original never reached.
-        const KNOWN_FAILURES: usize = 32;
+        //
+        // 32 -> 34: missing-member reads now throw "member not found" like
+        // `tTJSCustomObject::PropGet` instead of yielding void.  Two generated
+        // programs read a member the other form does not, so the two runs
+        // raise different messages and the pair no longer compares equal.
+        const KNOWN_FAILURES: usize = 34;
         let mut covered = BTreeSet::new();
         let mut failures = Vec::new();
         let mut total = 0usize;

@@ -52,8 +52,18 @@ impl Object {
             ObjectKind::Array { elements } => {
                 if name == "count" || name == "length" {
                     Some(Variant::Integer(elements.len() as i64))
-                } else if let Some(index) = array_index(name, elements.len()) {
-                    elements.get(index).cloned()
+                } else if parse_array_index_name(name).is_some() {
+                    // `tTJSArrayObject::PropGet` (`tjsArray.cpp:1601`) sends any
+                    // numeric member name to `PropGetByNum`, so an array read
+                    // never reaches the ordinary member table; `ARRAY_GET_VAL`
+                    // (`tjsArray.cpp:1404`) answers void for an index outside
+                    // the array, counting a negative index from the end.
+                    Some(
+                        array_index(name, elements.len())
+                            .and_then(|index| elements.get(index))
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
                 } else {
                     self.members.get(name).cloned()
                 }
@@ -62,8 +72,32 @@ impl Object {
         }
     }
 
+    /// True when `name` addresses an element this Array has no value for.
+    /// `ARRAY_GET_VAL` (`tjsArray.cpp:1407`) hands that to a
+    /// `TJS_MEMBERMUSTEXIST` reader -- `typeof arr[9]` -- as member-not-found,
+    /// while a plain read sees void.
+    pub fn array_index_missing(&self, name: &str) -> bool {
+        let ObjectKind::Array { elements } = &self.kind else {
+            return false;
+        };
+        parse_array_index_name(name).is_some() && array_index(name, elements.len()).is_none()
+    }
+
     pub fn get(&self, name: &str) -> Variant {
         self.get_raw(name).unwrap_or_default()
+    }
+
+    /// `tTJSArrayObject::PropSetByNum` (`tjsArray.cpp:1634`): an index still
+    /// negative after wrapping from the end is member-not-found, while writing
+    /// past the end is how an array grows.
+    pub fn array_negative_index_after_wrap(&self, name: &str) -> bool {
+        let ObjectKind::Array { elements } = &self.kind else {
+            return false;
+        };
+        let Some(index) = parse_array_index_name(name) else {
+            return false;
+        };
+        index < 0 && index + (elements.len() as i64) < 0
     }
 
     pub fn set(&mut self, name: impl Into<String>, value: Variant) {
@@ -336,6 +370,34 @@ mod tests {
         array.set("01", Variant::Integer(1));
         assert_eq!(array.get("1"), Variant::Integer(1));
         assert!(!array.members.contains_key("01"));
+    }
+
+    #[test]
+    fn array_reads_resolve_numeric_names_as_indices_like_krkr() {
+        // `tTJSArrayObject::PropGet` (`tjsArray.cpp:1601`): a numeric member
+        // name is an index, never an entry of the member table. `ARRAY_GET_VAL`
+        // (`tjsArray.cpp:1404`) yields void for an index the array does not
+        // have -- with a negative index counted from the end -- and
+        // `tjsArray.cpp:1407` reports that to a TJS_MEMBERMUSTEXIST reader as
+        // member-not-found.
+        let array = Object::array(vec![Variant::Integer(7), Variant::Integer(8)]);
+        assert_eq!(array.get_raw("0"), Some(Variant::Integer(7)));
+        assert_eq!(array.get_raw("1"), Some(Variant::Integer(8)));
+        assert_eq!(array.get_raw("2"), Some(Variant::Void));
+        assert_eq!(array.get_raw("-1"), Some(Variant::Integer(8)));
+        assert_eq!(array.get_raw("-3"), Some(Variant::Void));
+        assert!(!array.array_index_missing("1"));
+        assert!(array.array_index_missing("2"));
+        assert!(array.array_index_missing("-3"));
+        assert!(!array.array_index_missing("count"));
+        assert!(!array.array_index_missing("push"));
+
+        let mut empty = Object::array(Vec::new());
+        assert_eq!(empty.get_raw("0"), Some(Variant::Void));
+        assert!(empty.array_negative_index_after_wrap("-1"));
+        empty.set("0", Variant::Integer(1));
+        assert!(!empty.array_negative_index_after_wrap("-1"));
+        assert!(empty.array_negative_index_after_wrap("-2"));
     }
 }
 

@@ -185,7 +185,7 @@ mod tests {
         round_trip("function f(*) { return 0; } return f(...);");
         round_trip("var x = 5; return -x + !0;");
         round_trip("var a = %[\"b\" => 1]; return typeof a.b;");
-        round_trip("function Base() {} return Base instanceof Object;");
+        round_trip("function Base() {} var Object = \"Base\"; return Base instanceof Object;");
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
         round_trip("var a = 1; var b = 0; var x = a && b; var y = a || b; return x + y;");
         round_trip("var a = 1; if (a && 2) { return 1; } if (0 || a) { return 2; } return 3;");
         round_trip("try { return 1; } catch (e) { return 2; }");
-        round_trip("var t = a ? 1 : 2; return t;");
+        round_trip("var a = 0; var t = a ? 1 : 2; return t;");
         round_trip(
             "var x = 2; var r = 0; switch (x) { case 1: r = 1; case 2: r = 2; break; default: r = 3; } return r;",
         );

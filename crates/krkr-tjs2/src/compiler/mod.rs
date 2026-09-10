@@ -183,7 +183,7 @@ mod tests {
     fn codegen_relaxes_out_of_range_branches_with_veneers() {
         // A branch spanning more than the VM's i16-relative range must be
         // routed through jmp veneers and still execute correctly.
-        let mut source = String::from("if (x) { return 1; }\n");
+        let mut source = String::from("var x = 0; if (x) { return 1; }\n");
         for index in 0..4000 {
             source.push_str(&format!("x = x + {index};\n"));
         }
@@ -195,7 +195,7 @@ mod tests {
         let result = crate::runtime::Runtime::new()
             .execute_file(&file)
             .expect("execute");
-        // x is undefined (0), so the if is skipped and all 4000 additions
+        // x is 0, so the if is skipped and all 4000 additions
         // run: sum(0..4000) = 4000 * 3999 / 2.
         assert_eq!(result, Variant::Integer(7_998_000));
     }

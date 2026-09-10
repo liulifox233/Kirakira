@@ -27,6 +27,12 @@ pub(super) struct DispatchFlags {
     ignore_prop: bool,
     hidden: bool,
     no_bound_instance_fallback: bool,
+    /// A lookup that may legitimately miss and wants `void` back instead of
+    /// the script-facing "member not found" error. Used by the class-chain and
+    /// proxy walks inside the dispatcher and by host-side reads
+    /// (`resolve_object_member`), which mirror the C++ side of KRKR and treat
+    /// `TJS_E_MEMBERNOTFOUND` as "absent".
+    probe: bool,
 }
 
 pub struct Vm<'bc, 'rt, H: TjsHost = NoHost> {
@@ -1442,6 +1448,31 @@ impl DispatchFlags {
         Self {
             no_bound_instance_fallback: true,
             ..Self::default()
+        }
+    }
+
+    fn probe() -> Self {
+        Self {
+            probe: true,
+            ..Self::default()
+        }
+    }
+
+    fn with_probe(self) -> Self {
+        Self {
+            probe: true,
+            ..self
+        }
+    }
+
+    /// Clears `probe` for a lookup that must tell "the member is absent" from
+    /// "the member is present and holds void" -- `tTJSObjectProxy` only moves
+    /// on to its second object for `TJS_E_MEMBERNOTFOUND`
+    /// (`tjsInterCodeExec.cpp:284`).
+    fn without_probe(self) -> Self {
+        Self {
+            probe: false,
+            ..self
         }
     }
 }

@@ -38,6 +38,13 @@ pub enum TjsErrorKind {
     Bytecode,
     Verify,
     Runtime,
+    /// A member read that found nothing. The reference reports
+    /// `TJS_E_MEMBERNOTFOUND` here, and several callers branch on exactly that
+    /// code instead of on the message -- `tTJSObjectProxy` falls through to
+    /// its second object, the TYPEOFD opcode answers "undefined"
+    /// (`tjsInterCodeExec.cpp:2134`).  It carries the same script-facing text
+    /// as any other runtime error.
+    MemberNotFound,
     /// A host operation cannot complete yet (for example a Web resource
     /// fetch). The VM preserves its call stack and retries the instruction
     /// after the host supplies the resource.
@@ -133,6 +140,12 @@ impl TjsError {
 
     pub fn is_debug_quit(&self) -> bool {
         self.kind == TjsErrorKind::DebugQuit
+    }
+
+    /// True when the read found no member at all, the shape KRKR reports as
+    /// `TJS_E_MEMBERNOTFOUND`.
+    pub fn is_member_not_found(&self) -> bool {
+        self.kind == TjsErrorKind::MemberNotFound
     }
 
     pub fn with_context(mut self, context: TjsErrorContext) -> Self {

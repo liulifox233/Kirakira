@@ -545,10 +545,23 @@ impl<H: TjsHost + 'static> Runtime<H> {
     /// script or native property's getter. `object_member` intentionally
     /// exposes the raw member for VM/runtime bookkeeping; native integrations
     /// that need the value visible to TJS code should use this method.
+    ///
+    /// A missing member reads back as `void` the way the C++ side of KRKR sees
+    /// `TJS_E_MEMBERNOTFOUND` from `PropGet`; script-level reads go through the
+    /// VM opcodes instead and raise "member not found"
+    /// (`tTJSCustomObject::PropGet`, `tjsError.cpp:238`).
     pub fn resolve_object_member(&mut self, object: ObjectHandle, name: &str) -> Result<Variant> {
+        self.resolve_object_member_lenient(object, name)
+    }
+
+    fn resolve_object_member_lenient(
+        &mut self,
+        object: ObjectHandle,
+        name: &str,
+    ) -> Result<Variant> {
         let file_id = self.call_context_file_id();
         let mut vm = Vm::new(file_id, self)?;
-        vm.get_object_member(object, name)
+        vm.get_object_member_probe(object, name)
     }
 
     pub fn object_members(&self, object: ObjectHandle) -> Vec<(String, Variant)> {
@@ -1011,7 +1024,19 @@ impl<H: TjsHost + 'static> Runtime<H> {
                 let Some(member_handle) = code_handles.get(property.object).copied() else {
                     continue;
                 };
-                let closure = Variant::Closure(Closure::new(member_handle, Some(parent_handle)));
+                // `tTJSByteCodeLoader::ReadObjects` registers `val =
+                // objs[pobj]` -- a bare object variant whose ObjThis stays
+                // NULL -- with `PropSet(TJS_MEMBERENSURE|TJS_IGNOREPROP, ...,
+                // obj)`.  A class's members therefore carry no receiver of
+                // their own: instances get bound copies from `regmember`
+                // (`ChangeClosureObjThis(Dest)`), and a call that reaches the
+                // member through the class object runs on the caller's `this`
+                // (`TJS_SELECT_OBJTHIS`).  Binding here instead would hand
+                // `PreRenderFontEx.KAGLayerFinalizer(...)` -- the KAGEX font
+                // plugin calling the `finalize` it saved off `KAGLayer` -- the
+                // class object as `this`, where the layer's own members are
+                // not reachable.
+                let closure = Variant::Closure(Closure::new(member_handle, None));
                 self.heap[parent_handle.0].set(name, closure);
             }
         }
