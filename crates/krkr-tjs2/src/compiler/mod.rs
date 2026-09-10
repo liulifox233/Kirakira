@@ -522,6 +522,7 @@ mod tests {
         runtime.execute_file(&file).expect("execute");
         let c = match runtime.global_member("c") {
             Variant::Object(handle) => handle,
+            Variant::Closure(closure) => closure.object,
             value => panic!("expected C instance, got {value:?}"),
         };
         assert!(

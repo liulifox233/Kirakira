@@ -1123,6 +1123,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let call_this = self
             .bound_super_this(handle, caller_this)?
             .or(closure_this)
+            .or_else(|| self.receiver_supplies_call_this(handle, name).then_some(handle))
             .or(caller_this);
         self.call_value(member, call_this, args, false, continuation)
         .map_err(|error| {
@@ -1133,6 +1134,45 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 callee_type: Some(callee_type),
             })
         })
+    }
+
+    /// Whether a member call on this receiver supplies the callee's `this`
+    /// when neither the receiver value nor a `super` qualifier carries one.
+    ///
+    /// `CallFunctionDirect` uses `clo.ObjThis ? clo.ObjThis : ra[-1]`
+    /// (`tjsInterCodeExec.cpp:2406`), and the reference hands scripts object
+    /// values that carry their own ObjThis: `this` and `new` results are
+    /// stored as `tTJSVariant(objthis, objthis)` (`:839`, `:2372`), and native
+    /// accessors return `tTJSVariant(o, o)` the same way
+    /// (`LayerIntf.cpp:6906`).  So a method read off an object normally runs
+    /// on that object rather than on whichever object made the call -- KAGEX
+    /// depends on it, because `objectHookInjection` installs its override
+    /// functions directly onto the window (`l0[l5] = t1 incontextof l4`,
+    /// `system_Utils.tjs`), leaving them without a binding of their own.
+    ///
+    /// Class objects keep the caller's `this`: `PreRenderFontEx.KAGLayerFinalizer(...)`
+    /// (how the font plugin calls back into the `finalize` it saved off
+    /// `KAGLayer`) and the native `Layer.Layer(win, this)` constructor must
+    /// run on the caller's object, and `bound_super_this` already covers the
+    /// class-qualified cases that do belong to the calling instance.
+    fn receiver_supplies_call_this(&self, handle: ObjectHandle, name: &str) -> bool {
+        // `handle_class_name_matches` covers the native class objects too:
+        // `Layer.Layer(win, this)` reads the constructor stored under the class
+        // name, and that member is what makes the call a class-qualified
+        // construction instead of a method invocation.
+        !self.handle_class_name_matches(handle, name)
+            && handle != self.runtime.global
+            // A `%-2` this-proxy receiver already forwards property access to
+            // the instance that made it, so it keeps the caller's `this`
+            // instead of turning the proxy itself into the callee's receiver.
+            && !matches!(
+                self.runtime.heap[handle.0].kind,
+                ObjectKind::Proxy { .. }
+                    | ObjectKind::InterCode {
+                        context: BytecodeContextType::Class,
+                        ..
+                    }
+            )
     }
 
     fn secondary_class_member_for_call(
