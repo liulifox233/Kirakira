@@ -72,6 +72,11 @@ fn install_text_render_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
         ("defaultEdgeColor", Variant::Integer(0)),
         ("defaultBold", Variant::Integer(0)),
         ("defaultItalic", Variant::Integer(0)),
+        // Layout state the base class owns.  `system/TextRender.tjs` reads
+        // `vertical` as a bare symbol -- `drawText` loads it through the
+        // this-proxy (`gpd %3, %-2.*"vertical"`, bytecode 68) and uses it to
+        // pick the glyph angle -- and `setOption` is the only writer.
+        ("vertical", Variant::Integer(0)),
         // Script-assignable callbacks.
         ("onEval", Variant::Void),
         ("onLabel", Variant::Void),
@@ -86,7 +91,6 @@ fn install_text_render_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
     }
 
     for method in [
-        "setOption",
         "setDefault",
         "resetFont",
         "resetStyle",
@@ -95,6 +99,7 @@ fn install_text_render_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
     ] {
         runtime.register_object_native(handle, method, native_void);
     }
+    runtime.register_object_native(handle, "setOption", set_option);
     runtime.register_object_native(handle, "setRenderSize", set_render_size);
     runtime.register_object_native(handle, "clear", clear);
     runtime.register_object_native(handle, "render", render);
@@ -146,6 +151,33 @@ const RENDER_HEIGHT_MEMBER: &str = "__krkr_text_render_height";
 
 fn bound_this(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Option<ObjectHandle> {
     this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+}
+
+/// `setOption(Dictionary)` is how `setDefaultFromMessageLayer`
+/// (`system/TextRender.tjs`) hands the message layer's layout flags to the
+/// plugin, and `vertical` is the one flag the class reads back out of it: the
+/// option dictionary carries the layer's direction, and `drawText` /
+/// `onFontChange` then read `vertical` from the render object to choose
+/// between a zero and a 2700-hundredth degree glyph angle.  The other keys the
+/// scripts pass (`following`, `leading`, `kinsoku_max`, `begin`, `end`,
+/// `word_break`, `width_time_scale`, `ignore_*`) only steer native layout and
+/// are never read back from the render, so they are accepted and ignored
+/// rather than stored as members the real plugin would not have.
+fn set_option(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(this) = bound_this(runtime, this_obj) else {
+        return Ok(Variant::Void);
+    };
+    let Some(Variant::Object(options)) = args.first() else {
+        return Ok(Variant::Void);
+    };
+    if let Ok(vertical) = runtime.resolve_object_member(*options, "vertical") {
+        runtime.set_object_member(this, "vertical", vertical);
+    }
+    Ok(Variant::Void)
 }
 
 fn set_render_size(
@@ -530,4 +562,44 @@ fn native_void(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Void)
+}
+
+#[cfg(test)]
+mod tests {
+    use krkr_engine::{EngineConfig, KrkrEngine};
+
+    use super::TextRenderPlugin;
+
+    /// `system/TextRender.tjs` reads `vertical` as a bare symbol inside a
+    /// method (`gpd %3, %-2.*"vertical"`, bytecode 68 of `drawText`), so the
+    /// value has to come from the base class: the class body of `TextRender`
+    /// never writes it. `setDefaultFromMessageLayer` is the writer, through
+    /// the `vertical` key of its `setOption` dictionary.
+    #[test]
+    fn subclass_reads_vertical_set_through_set_option() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(TextRenderPlugin).expect("register plugin");
+
+        let value = engine
+            .execute_script(
+                "probe.tjs",
+                r#"
+                class ProbeRender extends TextRenderBase {
+                    function ProbeRender() {
+                        TextRenderBase.TextRenderBase();
+                    }
+                    function readVertical() {
+                        return vertical;
+                    }
+                }
+                var render = new ProbeRender();
+                var before = render.readVertical();
+                render.setOption(%["vertical" => 1]);
+                return "" + before + "/" + render.readVertical();
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value.to_tjs_string().expect("string"), "0/1");
+    }
 }
