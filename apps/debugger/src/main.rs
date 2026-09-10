@@ -23,6 +23,10 @@
 //!                           order; repeatable)
 //!   --click <n,x,y>         inject a click at (x, y) on frame n, release on
 //!                           frame n+1 (repeatable)
+//!   --move <n,x,y>          move the cursor to (x, y) on frame n without
+//!                           pressing (repeatable); hover probes need the
+//!                           cursor to rest on a control across many frames
+//!                           without activating it
 //!   --auto-click            automatically confirm [l]/[p] click waits
 //!   --kag-state             log semantic KAG state transitions: the game's
 //!                           own `kag` object (storage/label/line/conductor
@@ -144,6 +148,7 @@ struct Config {
     before_expr: Option<String>,
     at_frames: Vec<(usize, Option<String>)>,
     clicks: Vec<(usize, Point)>,
+    moves: Vec<(usize, Point)>,
     auto_click: bool,
     kag_clicks: Vec<usize>,
     kag_auto_click: bool,
@@ -218,6 +223,20 @@ fn parse_args() -> Config {
                     Point::new(
                         x.parse().expect("--click x must be a number"),
                         y.parse().expect("--click y must be a number"),
+                    ),
+                ));
+            }
+            "--move" => {
+                let value = next_arg(&mut args, "--move");
+                let parts: Vec<&str> = value.split(',').collect();
+                let [frame, x, y] = parts.as_slice() else {
+                    panic!("--move expects <frame>,<x>,<y>");
+                };
+                config.moves.push((
+                    frame.parse().expect("--move frame must be a number"),
+                    Point::new(
+                        x.parse().expect("--move x must be a number"),
+                        y.parse().expect("--move y must be a number"),
                     ),
                 ));
             }
@@ -756,6 +775,14 @@ fn main() {
                 events.push(EngineEvent::PointerInput {
                     button: PointerButton::Primary,
                     state: ButtonState::Released,
+                });
+            }
+        }
+        for (move_frame, position) in &config.moves {
+            if frame_index == *move_frame {
+                println!("move at frame={frame_index} position={position:?}");
+                events.push(EngineEvent::CursorMoved {
+                    position: *position,
                 });
             }
         }
