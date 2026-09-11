@@ -1040,6 +1040,17 @@ pub struct FrameTransition {
     pub rule_image_upload: Option<ImageUpload>,
     pub frozen_draw_commands: Vec<DrawCommand>,
     pub frozen_image_uploads: Vec<ImageUpload>,
+    /// The scene without the destination layer's subtree.
+    ///
+    /// Official's transition blends the two layer bitmaps and lets the *layer
+    /// manager* composite the result, so the destination's pixels are not
+    /// pre-composited over the scene when the blend runs: at a pixel the source
+    /// does not cover the destination's alpha scales by `1 - progress`
+    /// (`const_alpha_blend_functor`, `blend_functor_c.h:584-594`) and the
+    /// layers underneath show through.  Rendering the incoming face over this
+    /// base is what gives the composite that behaviour.
+    pub under_draw_commands: Vec<DrawCommand>,
+    pub under_image_uploads: Vec<ImageUpload>,
     /// The incoming face (`tTVPDivisibleData::Src2`, `LayerIntf.cpp:6611`): the
     /// source layer's own content, positioned where the destination draws.
     ///
@@ -2476,6 +2487,8 @@ impl Engine {
                 self.filter_new_image_uploads(std::mem::take(&mut transition.frozen_image_uploads));
             transition.source_image_uploads =
                 self.filter_new_image_uploads(std::mem::take(&mut transition.source_image_uploads));
+            transition.under_image_uploads =
+                self.filter_new_image_uploads(std::mem::take(&mut transition.under_image_uploads));
             if let Some(upload) = transition.rule_image_upload.take() {
                 let mut uploads = self.filter_new_image_uploads(vec![upload]);
                 transition.rule_image_upload = uploads.pop();
@@ -2485,6 +2498,7 @@ impl Engine {
         collect_image_texture_ids(&output.draw_commands, &mut referenced_textures);
         for transition in &output.transitions {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced_textures);
+            collect_image_texture_ids(&transition.under_draw_commands, &mut referenced_textures);
             collect_image_texture_ids(&transition.source_draw_commands, &mut referenced_textures);
             if let Some(texture_id) = transition.rule_texture_id {
                 referenced_textures.insert(texture_id);

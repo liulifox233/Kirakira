@@ -362,26 +362,21 @@ impl Renderer {
                     "Kirakira transition frozen pass",
                     frame.clear_color,
                     None,
-                    &transition.frozen_draw_commands,
+                    transition_face_commands(transition, TransitionFace::Old),
                 );
-                // The incoming face is the source layer's own bitmap
-                // (`tTVPDivisibleData::Src2`, `LayerIntf.cpp:6611`), which
-                // official blends *into* the destination layer's bitmap
-                // (`TVPConstAlphaBlend_SD`, `TransIntf.cpp:667`).  It is
-                // therefore drawn over the destination's own pass, so a pixel
-                // the source does not cover keeps the destination's content
-                // instead of the frame background.
                 let new_target = self.create_offscreen_target("Kirakira transition source target");
-                let passes = transition_source_target_passes(transition);
-                for (index, commands) in passes.into_iter().enumerate() {
+                for (index, face) in transition_source_target_passes(transition)
+                    .into_iter()
+                    .enumerate()
+                {
                     if index == 0 {
                         self.render_commands_to_view(
                             &mut encoder,
                             &new_target.view,
-                            "Kirakira transition source base pass",
+                            "Kirakira transition under pass",
                             frame.clear_color,
                             None,
-                            commands,
+                            transition_face_commands(transition, face),
                         );
                     } else {
                         self.render_commands_over_view(
@@ -389,7 +384,7 @@ impl Renderer {
                             &new_target.view,
                             "Kirakira transition source pass",
                             None,
-                            commands,
+                            transition_face_commands(transition, face),
                         );
                     }
                 }
@@ -555,6 +550,9 @@ impl Renderer {
                 let (frozen_draw_commands, mut frozen_image_uploads) =
                     self.prepare_commands(&transition.frozen_draw_commands);
                 frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
+                let (under_draw_commands, mut under_image_uploads) =
+                    self.prepare_commands(&transition.under_draw_commands);
+                under_image_uploads.extend(transition.under_image_uploads.iter().cloned());
                 let (source_draw_commands, mut source_image_uploads) =
                     self.prepare_commands(&transition.source_draw_commands);
                 source_image_uploads.extend(transition.source_image_uploads.iter().cloned());
@@ -567,6 +565,8 @@ impl Renderer {
                     rule_image_upload: transition.rule_image_upload.clone(),
                     frozen_draw_commands,
                     frozen_image_uploads,
+                    under_draw_commands,
+                    under_image_uploads,
                     source_draw_commands,
                     source_image_uploads,
                 }
@@ -631,6 +631,7 @@ impl Renderer {
         self.upload_images(&frame.image_uploads);
         for transition in &frame.transitions {
             self.upload_images(&transition.frozen_image_uploads);
+            self.upload_images(&transition.under_image_uploads);
             self.upload_images(&transition.source_image_uploads);
             if let Some(upload) = &transition.rule_image_upload {
                 self.upload_images(std::slice::from_ref(upload));
@@ -712,6 +713,7 @@ impl Renderer {
         collect_image_texture_ids(&frame.draw_commands, &mut referenced);
         for transition in &frame.transitions {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced);
+            collect_image_texture_ids(&transition.under_draw_commands, &mut referenced);
             collect_image_texture_ids(&transition.source_draw_commands, &mut referenced);
             if let Some(texture_id) = transition.rule_texture_id {
                 referenced.insert(texture_id);
@@ -1423,20 +1425,78 @@ struct TransitionUniforms {
     data: [[f32; 4]; 8],
 }
 
-/// The draws the incoming face's target receives, in order.
+/// One of the three faces a transition is composed from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionFace {
+    /// The scene the transition started from (`tTVPDivisibleData::Src1`,
+    /// `LayerIntf.cpp:6592`).  It is the composite's other input, never part of
+    /// the incoming target.
+    Old,
+    /// The scene *without* the destination layer's subtree.
+    ///
+    /// Official's crossfade is `dest = lerp(src1, src2, p)` per channel
+    /// including alpha (`const_alpha_blend_functor`, `blend_functor_c.h:584-594`;
+    /// `sd_blend_func_c`, `blend_function.cpp:109-114`; called with `Phase` from
+    /// `TransIntf.cpp:680`), and the layer manager composites the result.  The
+    /// destination's bitmap is therefore *not* pre-composited over the scene
+    /// when the blend runs, so the incoming face has to be drawn over the bare
+    /// under-content: at a pixel the source does not cover, the destination's
+    /// pixels fade out by `1 - p` and the scene beneath shows through.
+    Under,
+    /// The source layer's own bitmap (`tTVPDivisibleData::Src2`, `:6611`).
+    Source,
+}
+
+/// The draw list behind one face.
+fn transition_face_commands(
+    transition: &FrameTransition,
+    face: TransitionFace,
+) -> &[DrawCommand] {
+    match face {
+        TransitionFace::Old => &transition.frozen_draw_commands,
+        TransitionFace::Under => &transition.under_draw_commands,
+        TransitionFace::Source => &transition.source_draw_commands,
+    }
+}
+
+/// The faces the incoming target receives, in order.
 ///
-/// The destination's own pass comes first: the incoming face is the source
-/// layer's bitmap, which official blends *into* the destination layer's bitmap
-/// (`TVPConstAlphaBlend_SD`, `TransIntf.cpp:667`), so a pixel the source does
-/// not cover has to keep the destination's content rather than the frame
-/// background.  Drawing the destination's pass underneath is what gives the
-/// composite that base; dropping it paints every transparent pixel of the
-/// source with the clear colour.
-fn transition_source_target_passes(transition: &FrameTransition) -> [&[DrawCommand]; 2] {
-    [
-        &transition.frozen_draw_commands,
-        &transition.source_draw_commands,
-    ]
+/// This is the whole composition: `Under` then `Source` builds the target, and
+/// the composite pass mixes it with `Old` at the progress.  Dropping the base
+/// leaves every transparent pixel of the source sitting on the frame clear
+/// colour; using `Old` as the base holds the destination's content at full
+/// strength where official fades it out (see `composite_pixel`).
+fn transition_source_target_passes(_transition: &FrameTransition) -> [TransitionFace; 2] {
+    [TransitionFace::Under, TransitionFace::Source]
+}
+
+/// The transition composite for one pixel, as the pass plan above produces it.
+///
+/// `old` is the scene the transition started from, `under` the scene without
+/// the destination layer's subtree, `source` the source layer's bitmap.  The
+/// incoming target is `source` drawn over `under` with straight-alpha
+/// source-over (the renderer's texture pipeline blend), and the composite pass
+/// writes `mix(old, target, progress)` (`transition.wgsl`).
+///
+/// With `old = 1` and a fully transparent source this is `lerp(1, under,
+/// progress)` -- the destination's pixel fades toward the scene beneath it
+/// (`const_alpha_blend_functor` applied to a transparent `src2`), which is what
+/// official does and what drawing the incoming face over the *old* face instead
+/// would not do.
+#[allow(dead_code)]
+fn composite_pixel(old: [f32; 4], under: [f32; 4], source: [f32; 4], progress: f32) -> [f32; 4] {
+    let alpha = source[3];
+    let incoming = [
+        source[0] * alpha + under[0] * (1.0 - alpha),
+        source[1] * alpha + under[1] * (1.0 - alpha),
+        source[2] * alpha + under[2] * (1.0 - alpha),
+        alpha + under[3] * (1.0 - alpha),
+    ];
+    let mut out = [0.0f32; 4];
+    for channel in 0..4 {
+        out[channel] = old[channel] * (1.0 - progress) + incoming[channel] * progress;
+    }
+    out
 }
 
 fn transition_uniforms(
@@ -1610,7 +1670,11 @@ mod tests {
     use super::*;
     use krkr_core::{Rect, TransitionParams};
 
-    fn transition(frozen: Vec<DrawCommand>, source: Vec<DrawCommand>) -> FrameTransition {
+    fn transition(
+        frozen: Vec<DrawCommand>,
+        under: Vec<DrawCommand>,
+        source: Vec<DrawCommand>,
+    ) -> FrameTransition {
         FrameTransition {
             method: "crossfade".to_string(),
             progress: 0.5,
@@ -1620,6 +1684,8 @@ mod tests {
             rule_image_upload: None,
             frozen_draw_commands: frozen,
             frozen_image_uploads: Vec::new(),
+            under_draw_commands: under,
+            under_image_uploads: Vec::new(),
             source_draw_commands: source,
             source_image_uploads: Vec::new(),
         }
@@ -1636,16 +1702,61 @@ mod tests {
         })
     }
 
-    /// A transparent pixel of the incoming face must keep the destination's
-    /// content, so the source target has to be drawn over the destination's own
-    /// pass instead of over the frame background.
+    /// The incoming target is the under-content with the source drawn over it.
+    /// Dropping the base pass leaves the source sitting on the frame clear
+    /// colour, and using the old face as the base holds the destination's
+    /// content where official fades it out.
     #[test]
-    fn source_target_is_drawn_over_the_destination_pass() {
-        let transition = transition(vec![image(1)], vec![image(2)]);
-        let [base, source] = transition_source_target_passes(&transition);
-        assert_eq!(base.len(), 1);
-        assert_eq!(source.len(), 1);
-        assert!(matches!(&base[0], DrawCommand::Image(image) if image.texture_id == 1));
-        assert!(matches!(&source[0], DrawCommand::Image(image) if image.texture_id == 2));
+    fn source_target_draws_the_source_over_the_under_content() {
+        let transition = transition(vec![image(1)], vec![image(2)], vec![image(3)]);
+        assert_eq!(
+            transition_source_target_passes(&transition),
+            [TransitionFace::Under, TransitionFace::Source]
+        );
+        let faces = transition_source_target_passes(&transition);
+        assert!(matches!(
+            transition_face_commands(&transition, faces[0]),
+            [DrawCommand::Image(image)] if image.texture_id == 2
+        ));
+        assert!(matches!(
+            transition_face_commands(&transition, faces[1]),
+            [DrawCommand::Image(image)] if image.texture_id == 3
+        ));
+        // The old face is the composite's other input, a different list.
+        assert!(matches!(
+            transition_face_commands(&transition, TransitionFace::Old),
+            [DrawCommand::Image(image)] if image.texture_id == 1
+        ));
+    }
+
+    /// `dest = lerp(src1, src2, p)` includes alpha (`const_alpha_blend_functor`,
+    /// `blend_functor_c.h:584-594`), so a pixel the source does not cover fades
+    /// the destination's own pixel out by `1 - p` and shows the scene beneath
+    /// -- it does not hold the destination at full strength.
+    #[test]
+    fn transparent_source_pixels_fade_toward_the_under_content() {
+        let destination = [0.0, 0.0, 1.0, 1.0];
+        let under = [0.0, 1.0, 0.0, 1.0];
+        let transparent = [0.0, 0.0, 0.0, 0.0];
+
+        // Endpoints: the destination at p = 0, the under-content at p = 1.
+        assert_eq!(
+            composite_pixel(destination, under, transparent, 0.0),
+            destination
+        );
+        assert_eq!(composite_pixel(destination, under, transparent, 1.0), under);
+        // Halfway is the halfway colour, i.e. the destination contributed
+        // `1 - p` of it -- which is exactly what the official lerp gives a
+        // transparent src2 composited over the scene beneath the layer.
+        assert_eq!(
+            composite_pixel(destination, under, transparent, 0.5),
+            [0.0, 0.5, 0.5, 1.0]
+        );
+        // An opaque source pixel is the plain crossfade.
+        let source = [1.0, 0.0, 0.0, 1.0];
+        assert_eq!(
+            composite_pixel(destination, under, source, 0.5),
+            [0.5, 0.0, 0.5, 1.0]
+        );
     }
 }

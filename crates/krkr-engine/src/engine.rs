@@ -10149,14 +10149,25 @@ mod tests {
         }));
         // The incoming page is the transition's own source face, not the live
         // tree: official writes neither layer while the transition runs
-        // (`tTransDrawable::DrawCompleted`, `LayerIntf.cpp:6567-6681`).
-        assert!(transition.source_draw_commands.iter().any(|command| {
-            matches!(
-                command,
-                krkr_core::DrawCommand::Image(image)
-                    if image.rect.x == 40.0 && image.rect.y == 50.0
-            )
-        }));
+        // (`tTransDrawable::DrawCompleted`, `LayerIntf.cpp:6567-6681`).  The
+        // staged layer appears exactly once -- it is both a page layer and (in
+        // this engine) an independent object, and a duplicate root would double
+        // every semi-transparent pixel.
+        let face = transition
+            .source_draw_commands
+            .iter()
+            .filter_map(|command| match command {
+                krkr_core::DrawCommand::Image(image) => Some(image.rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            face,
+            vec![
+                krkr_core::Rect::new(0.0, 0.0, 200.0, 200.0),
+                krkr_core::Rect::new(40.0, 50.0, 4.0, 4.0),
+            ]
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -12656,6 +12667,19 @@ mod tests {
         };
         let source_texture = texture_id(&transition.source_draw_commands).expect("source face");
         let dest_texture = texture_id(&transition.frozen_draw_commands).expect("destination");
+        // The incoming face is drawn over the scene *without* the destination
+        // layer's subtree: official blends the two layer bitmaps before the
+        // layer manager composites the result (`const_alpha_blend_functor`,
+        // `blend_functor_c.h:584-594`), so a pixel the source does not cover
+        // fades the destination's own pixel out by `1 - progress` and lets the
+        // scene beneath show through.
+        assert!(
+            !transition
+                .under_draw_commands
+                .iter()
+                .any(|command| matches!(command, krkr_core::DrawCommand::Image(image) if image.texture_id == dest_texture)),
+            "the under-content must not contain the destination layer"
+        );
         assert_ne!(source_texture, dest_texture);
         let upload = transition
             .source_image_uploads

@@ -1176,6 +1176,18 @@ impl WebRuntime {
                     &wasm_bindgen::JsValue::from_str("frozenUploads"),
                     &frozen_uploads,
                 )?;
+                let under_draws = draw_commands_to_js(&transition.under_draw_commands)?;
+                js_sys::Reflect::set(
+                    &transition_model,
+                    &wasm_bindgen::JsValue::from_str("underDrawList"),
+                    &under_draws,
+                )?;
+                let under_uploads = image_uploads_to_js(&transition.under_image_uploads)?;
+                js_sys::Reflect::set(
+                    &transition_model,
+                    &wasm_bindgen::JsValue::from_str("underUploads"),
+                    &under_uploads,
+                )?;
                 let source_draws = draw_commands_to_js(&transition.source_draw_commands)?;
                 js_sys::Reflect::set(
                     &transition_model,

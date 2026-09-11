@@ -3174,6 +3174,14 @@ impl KrkrHost {
         }
 
         let (frozen_draw_commands, frozen_image_uploads) = self.layer_tree.draw_model();
+        // The scene the incoming face is drawn over: the page without the
+        // destination's own subtree, so the crossfade fades the outgoing page
+        // out toward what is behind it (`const_alpha_blend_functor`,
+        // `blend_functor_c.h:584-594`).
+        let (under_draw_commands, under_image_uploads) =
+            self.layer_tree.draw_model_filtered(|node| {
+                !self.layer_tree.is_ancestor_or_self(dest_layer, node.id)
+            });
         let dest_rect = self.transition_destination_rect(dest_layer, true);
         self.apply_pending_kag_layers();
         // The tag has no separate source layer: `backlay` staged the incoming
@@ -3186,12 +3194,14 @@ impl KrkrHost {
             rule_image_upload,
             elapsed: Duration::ZERO,
             duration,
-            frozen_draw_commands,
-            frozen_image_uploads,
-            source_face: TransitionSourceFace::Frozen {
-                commands: source_draw_commands,
-                uploads: source_image_uploads,
-            },
+            faces: TransitionFaces::Frozen(TransitionFaceLists {
+                old_draw_commands: frozen_draw_commands,
+                old_image_uploads: frozen_image_uploads,
+                under_draw_commands,
+                under_image_uploads,
+                source_draw_commands,
+                source_image_uploads,
+            }),
             suppressed_live_images: BTreeSet::new(),
             dest_layer: Some(dest_layer),
             gate_dest,
@@ -3214,9 +3224,7 @@ impl KrkrHost {
             duration,
             params,
             rule_image_upload,
-            frozen_draw_commands,
-            frozen_image_uploads,
-            source_face,
+            faces,
             suppressed_live_images,
             completion,
             dest_rect,
@@ -3230,9 +3238,7 @@ impl KrkrHost {
             rule_image_upload,
             elapsed: Duration::ZERO,
             duration,
-            frozen_draw_commands,
-            frozen_image_uploads,
-            source_face,
+            faces,
             suppressed_live_images,
             dest_layer,
             gate_dest: None,
@@ -3507,8 +3513,7 @@ impl KrkrHost {
                 } else {
                     transition.elapsed.as_secs_f32() / transition.duration.as_secs_f32()
                 };
-                let (source_draw_commands, source_image_uploads) =
-                    self.transition_source_face(transition);
+                let faces = self.transition_faces(transition);
                 FrameTransition {
                     method: transition.params.method.as_name().to_string(),
                     progress: progress.clamp(0.0, 1.0),
@@ -3516,38 +3521,51 @@ impl KrkrHost {
                     dest_rect: transition.dest_rect,
                     rule_texture_id: transition.rule_texture_id,
                     rule_image_upload: transition.rule_image_upload.clone(),
-                    frozen_draw_commands: transition.frozen_draw_commands.clone(),
-                    frozen_image_uploads: transition.frozen_image_uploads.clone(),
-                    source_draw_commands,
-                    source_image_uploads,
+                    frozen_draw_commands: faces.old_draw_commands,
+                    frozen_image_uploads: faces.old_image_uploads,
+                    under_draw_commands: faces.under_draw_commands,
+                    under_image_uploads: faces.under_image_uploads,
+                    source_draw_commands: faces.source_draw_commands,
+                    source_image_uploads: faces.source_image_uploads,
                 }
             })
             .collect()
     }
 
-    /// The incoming face for one pass.
+    /// The three faces the composite is built from, for one pass.
     ///
-    /// Official re-renders the source's own cache on every completion
-    /// (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`, driven by
-    /// `InvokeTransition`'s `Update(true)`, `:6478`), so the face follows the
-    /// layers while the transition runs; the render tree is rebuilt here for
-    /// the same reason.  The KAG page projection has no source layer of its own
-    /// and keeps the snapshot taken when the staged page was applied.
-    fn transition_source_face(
-        &self,
-        transition: &ActiveTransition,
-    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
-        match &transition.source_face {
-            TransitionSourceFace::Layer {
-                layer,
+    /// Official re-completes both layers on every completion
+    /// (`InvokeTransition` updates them, `LayerIntf.cpp:6455-6490`;
+    /// `DrawCompleted` re-renders `TransSrc->Complete(destrect)`, `:6604`), so
+    /// the faces follow the layers while the transition runs and the render
+    /// tree is walked again here for the same reason.  The KAG page projection
+    /// has no layer pair of its own and keeps the snapshots taken when the
+    /// staged page was applied.
+    fn transition_faces(&self, transition: &ActiveTransition) -> TransitionFaceLists {
+        match &transition.faces {
+            TransitionFaces::Layers {
+                dest,
+                source,
                 extra_roots,
                 with_children,
             } => {
+                let suppressed = &transition.suppressed_live_images;
+                let (old_draw_commands, old_image_uploads) =
+                    self.layer_tree.draw_model_suppressing_images(suppressed);
+                // `Src1` is the destination layer's own bitmap, not the
+                // destination pre-composited over the scene: the official blend
+                // runs before the layer manager composites the result, so the
+                // incoming face is drawn over the scene *without* the
+                // destination's subtree.
+                let (under_draw_commands, under_image_uploads) = self
+                    .layer_tree
+                    .draw_model_filtered_suppressing_images(
+                        |node| !self.layer_tree.is_ancestor_or_self(*dest, node.id),
+                        suppressed,
+                    );
                 let offset = match (
-                    self.layer_tree.absolute_position(*layer),
-                    transition
-                        .dest_layer
-                        .and_then(|dest| self.layer_tree.absolute_position(dest)),
+                    self.layer_tree.absolute_position(*source),
+                    self.layer_tree.absolute_position(*dest),
                 ) {
                     (Some(source_origin), Some(dest_origin)) => Point::new(
                         dest_origin.x - source_origin.x,
@@ -3555,12 +3573,19 @@ impl KrkrHost {
                     ),
                     _ => Point::new(0.0, 0.0),
                 };
-                self.layer_tree
-                    .source_face(*layer, extra_roots, offset, *with_children)
+                let (source_draw_commands, source_image_uploads) = self
+                    .layer_tree
+                    .source_face(*source, extra_roots, offset, *with_children);
+                TransitionFaceLists {
+                    old_draw_commands,
+                    old_image_uploads,
+                    under_draw_commands,
+                    under_image_uploads,
+                    source_draw_commands,
+                    source_image_uploads,
+                }
             }
-            TransitionSourceFace::Frozen { commands, uploads } => {
-                (commands.clone(), uploads.clone())
-            }
+            TransitionFaces::Frozen(lists) => lists.clone(),
         }
     }
 
@@ -3921,26 +3946,37 @@ fn krkr_volume_product_to_linear(volume: i64, volume2: i64, global_volume: i64) 
     (volume * volume2 * global_volume).clamp(0.0, 1.0)
 }
 
-/// Where a transition's incoming face (`tTVPDivisibleData::Src2`,
-/// `LayerIntf.cpp:6611`) comes from.
+/// Where a transition's three faces come from.
 #[derive(Clone)]
-pub(crate) enum TransitionSourceFace {
-    /// The source layer's own content, rebuilt from the render tree on every
-    /// pass the way `TransSrc->Complete(destrect)` (`:6604`) re-renders the
-    /// layer's cache.
-    Layer {
-        layer: LayerId,
+pub(crate) enum TransitionFaces {
+    /// Rebuilt from the render tree every pass.
+    Layers {
+        dest: LayerId,
+        source: LayerId,
         /// Staged page layers the source subtree cannot reach (see
         /// `sync_kag_source_page`).
         extra_roots: Vec<LayerId>,
         with_children: bool,
     },
-    /// A whole-tree snapshot.  The KAG `[trans]` projection has no source layer:
-    /// its incoming page is the tree the staged page was applied to.
-    Frozen {
-        commands: Vec<DrawCommand>,
-        uploads: Vec<ImageUpload>,
-    },
+    /// Whole-tree snapshots.  The KAG `[trans]` projection has no layer pair of
+    /// its own: its incoming page is the tree the staged page was applied to.
+    Frozen(TransitionFaceLists),
+}
+
+/// The three faces one composite is built from.
+#[derive(Clone, Default)]
+pub(crate) struct TransitionFaceLists {
+    /// The scene the transition started from (`Src1`, `LayerIntf.cpp:6592`).
+    pub old_draw_commands: Vec<DrawCommand>,
+    pub old_image_uploads: Vec<ImageUpload>,
+    /// The scene without the destination layer's subtree: the base the incoming
+    /// face is drawn over, because the official blend runs before the layer
+    /// manager composites the result.
+    pub under_draw_commands: Vec<DrawCommand>,
+    pub under_image_uploads: Vec<ImageUpload>,
+    /// The source layer's own bitmap (`Src2`, `:6611`).
+    pub source_draw_commands: Vec<DrawCommand>,
+    pub source_image_uploads: Vec<ImageUpload>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3971,11 +4007,8 @@ struct ActiveTransition {
     rule_image_upload: Option<ImageUpload>,
     elapsed: Duration,
     duration: Duration,
-    frozen_draw_commands: Vec<DrawCommand>,
-    frozen_image_uploads: Vec<ImageUpload>,
-    /// `tTVPDivisibleData::Src2` (`LayerIntf.cpp:6611`): where the incoming
-    /// face comes from.
-    source_face: TransitionSourceFace,
+    /// Where the three faces the composite is built from come from.
+    faces: TransitionFaces,
     suppressed_live_images: BTreeSet<LayerId>,
     /// The render-tree layer the handler composites into
     /// (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6532`).  Every transition has
@@ -4032,9 +4065,7 @@ pub(crate) struct NativeTransitionStart {
     pub duration: Duration,
     pub params: TransitionParams,
     pub rule_image_upload: Option<ImageUpload>,
-    pub frozen_draw_commands: Vec<DrawCommand>,
-    pub frozen_image_uploads: Vec<ImageUpload>,
-    pub source_face: TransitionSourceFace,
+    pub faces: TransitionFaces,
     pub suppressed_live_images: BTreeSet<LayerId>,
     pub completion: NativeTransitionCompletion,
     pub dest_rect: Option<Rect>,

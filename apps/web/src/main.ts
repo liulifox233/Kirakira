@@ -825,6 +825,7 @@ if (wasmUrl) {
       drawCommands(model.drawList, 1);
       for (const transition of transitions) {
         uploadTextures(transition.frozenUploads, transitionTextures);
+        uploadTextures(transition.underUploads, transitionTextures);
         uploadTextures(transition.sourceUploads, transitionTextures);
         uploadTextures(transition.ruleUploads, transitionTextures);
         const progress = Math.max(0, Math.min(1, Number(transition.progress ?? 1)));
@@ -837,17 +838,19 @@ if (wasmUrl) {
           context.rect(0, 0, contentWidth, contentHeight);
         }
         context.clip();
-        // Canvas2D implements no KRKR transition shader. The frozen face is the
-        // destination's own content and the source face is the source layer's
-        // (`tTVPDivisibleData::Src1`/`Src2`, LayerIntf.cpp:6592/6611), which
-        // official blends *into* the destination layer's bitmap
-        // (`TVPConstAlphaBlend_SD`, TransIntf.cpp:667). The destination's pass
-        // is therefore the base and the incoming face fades in over it, so a
-        // pixel the source does not cover keeps the destination's content
-        // instead of the cleared background.
+        // Canvas2D implements no KRKR transition shader, but the composition is
+        // the same one the wgpu path builds: the incoming face is the source
+        // bitmap (`tTVPDivisibleData::Src2`, LayerIntf.cpp:6611) drawn over the
+        // scene *without* the destination layer, and the old face is then mixed
+        // in at `1 - progress`.  Official's crossfade is `lerp(src1, src2, p)`
+        // per channel including alpha (`const_alpha_blend_functor`,
+        // blend_functor_c.h:584-594), so a pixel the source does not cover has
+        // to fade toward the scene beneath it instead of holding the
+        // destination's content at full strength.
         context.globalAlpha = 1;
-        drawCommands(transition.frozenDrawList, 1, transitionTextures);
+        drawCommands(transition.underDrawList, 1, transitionTextures);
         drawCommands(transition.sourceDrawList, progress, transitionTextures);
+        drawCommands(transition.frozenDrawList, 1 - progress, transitionTextures);
         context.restore();
       }
     } else {

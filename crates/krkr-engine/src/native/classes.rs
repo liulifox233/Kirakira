@@ -21,7 +21,7 @@ use krkr_tjs2::{
 use crate::host::{
     CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KagLayerSlot, KrkrHost,
     LayerRenderTarget, NativeTransitionCompletion, NativeTransitionStart, TraceCategory,
-    TransitionSourceFace,
+    TransitionFaceLists, TransitionFaces,
 };
 use crate::resource_manager::decode_province_image;
 use crate::scheduler::AsyncTriggerMode;
@@ -4437,12 +4437,8 @@ fn layer_begin_transition(
         suppressed_images.insert(source_layer_id);
     }
     // `Src1` (`tTVPDivisibleData::Src1`, `LayerIntf.cpp:6592`) is the
-    // destination's own composite.
-    let frozen = runtime
-        .host()
-        .layer_tree()
-        .draw_model_suppressing_images(&suppressed_images);
-    // `Src2` (`:6611`) is the source layer's own cached bitmap
+    // destination's own composite and `Src2` (`:6611`) the source layer's own
+    // cached bitmap
     // (`TransSrc->Complete(destrect)`, `:6604`) aligned with the destination's.
     // Neither layer is written while the transition runs: the destination keeps
     // its own image, rect and pixels, and only the stop's `Exchange`/`Swap`
@@ -4465,16 +4461,14 @@ fn layer_begin_transition(
     // re-renders the source's own cache each completion
     // (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`) -- and the staged
     // page model was just folded into those nodes.
-    let source_face = match source_layer_id {
-        Some(layer) => TransitionSourceFace::Layer {
-            layer,
+    let faces = match source_layer_id {
+        Some(source) => TransitionFaces::Layers {
+            dest: dest_layer_id.unwrap_or(source),
+            source,
             extra_roots: source_page_layers,
             with_children,
         },
-        None => TransitionSourceFace::Frozen {
-            commands: Vec::new(),
-            uploads: Vec::new(),
-        },
+        None => TransitionFaces::Frozen(TransitionFaceLists::default()),
     };
     let comp = variant_object(&runtime.object_member(this, "comp"))
         .map(|comp| runtime.bound_this(comp).unwrap_or(comp));
@@ -4509,9 +4503,7 @@ fn layer_begin_transition(
                 duration: Duration::from_millis(duration),
                 params: transition_params,
                 rule_image_upload,
-                frozen_draw_commands: frozen.0,
-                frozen_image_uploads: frozen.1,
-                source_face,
+                faces,
                 suppressed_live_images: suppressed_images,
                 dest_rect,
                 self_update,
