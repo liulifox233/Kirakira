@@ -5271,6 +5271,78 @@ mod tests {
     }
 
     #[test]
+    fn layer_children_is_a_cached_array_rebuilt_from_the_tree() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var parent = new Layer(window, null);
+                var child = new Layer(window, parent);
+                var first = parent.children;
+                var joined = first.count;
+                child.parent = null;
+                // `GetChildrenArrayObjectNoAddRef` (`LayerIntf.cpp:630`):
+                // the same array object is handed out, rebuilt in place.
+                var detached = parent.children.count;
+                var stable = (first === parent.children) + ":" + first.count;
+                // Script writes into the array never reach the tree and are
+                // dropped by the next rebuild (`LayerIntf.cpp:659`).
+                first.push(99);
+                var polluted = first.count;
+                var sibling = new Layer(window, parent);
+                return joined + ":" + detached + ":" + stable + ":" + polluted +
+                    ":" + parent.children.count;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1:0:1:0:1:1".to_string()));
+    }
+
+    #[test]
+    fn layer_children_survives_reconstruction_and_rejects_writes() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class ShellLayer extends Layer {
+                    // Two `super.Layer()` calls: the first ownerless one makes
+                    // the native instance, the second joins the real parent.
+                    function ShellLayer(window, parent) {
+                        super.Layer();
+                        super.Layer(window, parent);
+                    }
+                }
+
+                var window = new Window();
+                var parent = new ShellLayer(window, null);
+                var first = parent.children;
+                var before = first.count;
+                var child = new Layer(window, parent);
+                // Only a `parent.children` read rebuilds the cached array
+                // (`GetChildrenArrayObjectNoAddRef`, `LayerIntf.cpp:630`), and
+                // the rebuild reaches a reference the script already holds.
+                var lazy = first.count;
+                var refreshed = parent.children.count;
+                var stable = (first === parent.children) + ":" + first.count;
+                var denied = "";
+                try { parent.children = 0; } catch (e) { denied = e.message; }
+                return before + ":" + lazy + ":" + refreshed + ":" + stable +
+                    ":" + denied;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("0:0:1:1:1:Access denied".to_string())
+        );
+    }
+
+    #[test]
     fn window_add_remove_updates_backing_primary_layer_and_keeps_focus_empty() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
@@ -9939,7 +10011,9 @@ mod tests {
         let frame = engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::from_millis(1),
+                // The crossfade family floors `time` at 2 ms
+                // (`TransIntf.cpp:530`).
+                Duration::from_millis(2),
             )
             .expect("complete transition");
         assert_eq!(content_image_command_count(&engine, &frame), 1);
@@ -10391,12 +10465,17 @@ mod tests {
                 kag.fore.base.setSize(2, 1);
                 kag.fore.base.setImageSize(2, 1);
                 kag.back.base.loadImages("new.png");
-                kag.fore.base.beginTransition("crossfade", true, kag.back.base, %[]);
-                var tmp = kag.fore;
-                kag.fore = kag.back;
-                kag.back = tmp;
-                global.foreBasePrimary = kag.fore.base.isPrimary;
-                global.backBasePrimary = kag.back.base.isPrimary;
+                // The crossfade family requires `time` (`TransIntf.cpp:528`)
+                // and completes on a later tick, so the page swap runs in the
+                // completion callback.
+                kag.fore.base.onTransitionCompleted = function(dest, src) {
+                    var tmp = kag.fore;
+                    kag.fore = kag.back;
+                    kag.back = tmp;
+                    global.foreBasePrimary = kag.fore.base.isPrimary;
+                    global.backBasePrimary = kag.back.base.isPrimary;
+                };
+                kag.fore.base.beginTransition("crossfade", true, kag.back.base, %[time: 2]);
                 "#,
             )
             .expect("script");
@@ -10404,7 +10483,7 @@ mod tests {
         let frame = engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::ZERO,
+                Duration::from_millis(2),
             )
             .expect("update");
 
@@ -10506,7 +10585,9 @@ mod tests {
         engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::from_millis(1),
+                // The crossfade family floors `time` at 2 ms
+                // (`TransIntf.cpp:530`).
+                Duration::from_millis(2),
             )
             .expect("complete transition");
 
@@ -10583,9 +10664,16 @@ mod tests {
                 var source = new Layer();
                 source.loadImages("sprite.png");
                 source.visible = true;
+                source.setPos(0, 0, 1, 1);
                 var dest = new Layer();
                 dest.visible = true;
+                dest.setPos(5, 0, 1, 1);
                 dest.assignImages(source);
+                // `AssignImages` shares the source's bitmap
+                // (`MainImage->Assign`); the write forks it
+                // (`tTVPNativeBaseBitmap::Independ`) and leaves the
+                // destination with the assigned pixels.
+                source.fillRect(0, 0, 1, 1, 0xff00ff00);
                 return dest.imageWidth + ":" + dest.imageHeight;
                 "#,
             )
@@ -10598,27 +10686,55 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("update");
-        assert_eq!(frame.output.image_uploads.len(), 1);
-        let images = frame
-            .output
-            .draw_commands
-            .iter()
-            .filter_map(|command| match command {
-                krkr_core::DrawCommand::Image(image) => Some(image),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(images.len(), 2);
+        let mut pixels_by_x = BTreeMap::new();
+        for command in &frame.output.draw_commands {
+            let krkr_core::DrawCommand::Image(image) = command else {
+                continue;
+            };
+            let Some(upload) = frame
+                .output
+                .image_uploads
+                .iter()
+                .find(|upload| upload.texture_id == image.texture_id)
+            else {
+                continue;
+            };
+            pixels_by_x.insert(image.rect.x as i64, upload.rgba.as_ref().to_vec());
+        }
         assert_eq!(
-            images[0].texture_id,
-            frame.output.image_uploads[0].texture_id
+            pixels_by_x.get(&5).map(Vec::as_slice),
+            Some([255, 0, 0, 255].as_slice())
         );
         assert_eq!(
-            images[1].texture_id,
-            frame.output.image_uploads[0].texture_id
+            pixels_by_x.get(&0).map(Vec::as_slice),
+            Some([0, 255, 0, 255].as_slice())
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_assign_images_moves_the_province_plane() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setProvincePixel(0, 0, 7);
+                var dest = new Layer();
+                dest.assignImages(source);
+                var assigned = dest.getProvincePixel(0, 0);
+                // A source without a plane drops the destination's
+                // (`DeallocateProvinceImage`, `LayerIntf.cpp:2150`).
+                var bare = new Layer();
+                dest.assignImages(bare);
+                return assigned + ":" + dest.getProvincePixel(0, 0);
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("7:0".to_string()));
     }
 
     #[test]
@@ -11163,31 +11279,147 @@ mod tests {
                 source.loadImages("sprite.png");
                 var dest = new Layer();
                 dest.visible = true;
+                dest.setSize(1, 1);
                 dest.window = %[transCount: 1];
                 dest.inTransition = true;
-                dest.beginTransition("crossfade", true, source, %[]);
+                dest.beginTransition("crossfade", true, source, %[time: 2]);
                 return dest.window.transCount + ":" + dest.inTransition + ":" + dest.imageWidth;
                 "#,
             )
             .expect("script");
 
-        assert_eq!(result, Variant::String("0:0:1".to_string()));
+        // The source image is applied while `beginTransition` runs; the
+        // transition itself completes on a later tick.
+        assert_eq!(result, Variant::String("1:1:1".to_string()));
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(2),
+            )
+            .expect("update");
+        assert_eq!(frame.output.image_uploads.len(), 1);
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "dest.window.transCount + ':' + dest.inTransition"
+                )
+                .expect("completion"),
+            Variant::String("0:0".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_layer_begin_transition_enforces_official_checks() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var dest = new Layer();
+                var source = new Layer();
+                var missing = "";
+                try { dest.beginTransition("crossfade", true); }
+                catch (e) { missing = e.message; }
+                var notALayer = "";
+                try { dest.beginTransition("crossfade", true, %[]); }
+                catch (e) { notALayer = e.message; }
+                var mismatch = "";
+                source.setSize(2, 1);
+                try { dest.beginTransition("crossfade", true, source, %[time: 10]); }
+                catch (e) { mismatch = e.message; }
+                var imageless = "";
+                var bare = new Layer();
+                dest.freeImage();
+                bare.freeImage();
+                try { dest.beginTransition("crossfade", false, bare, %[time: 10]); }
+                catch (e) { imageless = e.message; }
+                // The crossfade family requires `time` (`TransIntf.cpp:528`)
+                // and `universal` requires a rule graphic (`:777`).
+                var pair = new Layer();
+                var other = new Layer();
+                var noTime = "";
+                try { pair.beginTransition("crossfade", true, other, %[]); }
+                catch (e) { noTime = e.message; }
+                var noRule = "";
+                try { pair.beginTransition("universal", true, other, %[time: 10]); }
+                catch (e) { noRule = e.message; }
+                return missing + "|" + notALayer + "|" + mismatch + "|" + imageless +
+                    "|" + noTime + "|" + noRule;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            result,
+            Variant::String(
+                "Specify layer|Specify layer|Transition layer size mismatch: 2x1 and 32x32|\
+                 Transition source and destination must have image|Specify option: time|\
+                 Specify option: rule"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn native_layer_transition_stops_when_the_destination_hides() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                global.source = new Layer();
+                dest.visible = true;
+                dest.window = %[completed: 0];
+                dest.inTransition = true;
+                dest.onTransitionCompleted = function(d, s) {
+                    this.window.completed++;
+                    this.inTransition = false;
+                };
+                dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                return dest.inTransition;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(result, Variant::Integer(1));
+
+        engine
+            .execute_script("inline.tjs", "dest.visible = false;")
+            .expect("hide");
         let frame = engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
                 Duration::ZERO,
             )
             .expect("update");
-        assert_eq!(frame.output.image_uploads.len(), 1);
-
-        fs::remove_dir_all(root).expect("cleanup");
+        assert!(frame.output.transition.is_none());
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "dest.window.completed + ':' + dest.inTransition"
+                )
+                .expect("completion"),
+            Variant::String("1:0".to_string())
+        );
     }
 
     #[test]
     fn native_layer_timed_transition_completes_through_update() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
-        write_png(root.join("old.png"), 1, 1, &[255, 0, 0, 255]);
+        // The crossfade family requires both faces to have the same size
+        // (`TransIntf.cpp:508`), so the source and destination layers share
+        // one.
+        write_png(
+            root.join("old.png"),
+            2,
+            1,
+            &[255, 0, 0, 255, 255, 0, 0, 255],
+        );
         write_png(
             root.join("new.png"),
             2,
@@ -11275,15 +11507,33 @@ mod tests {
 
                 global.window = %[transCount: 1, completed: 0, inTransition: 0];
                 global.dest = new TransitionLayer(window);
+                var source = new Layer();
                 dest.window = window;
                 dest.inTransition = true;
-                dest.beginTransition("crossfade", false, null, %[time: 0]);
+                dest.beginTransition("crossfade", false, source, %[time: 0]);
                 return window.completed + ":" + dest.inTransition + ":" + window.transCount;
                 "#,
             )
             .expect("script");
 
-        assert_eq!(result, Variant::String("1:0:0".to_string()));
+        // `time` is floored at 2 ms (`TransIntf.cpp:530`), so the completion
+        // event lands on the next tick.
+        assert_eq!(result, Variant::String("0:1:1".to_string()));
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(2),
+            )
+            .expect("complete transition");
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "window.completed + ':' + dest.inTransition + ':' + window.transCount"
+                )
+                .expect("completion"),
+            Variant::String("1:0:0".to_string())
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -11323,6 +11573,12 @@ mod tests {
                 function startTransition(storage) {
                     var source = new Layer();
                     source.loadImages(storage);
+                    // KAG's `assign` copies the destination's visible state
+                    // onto the source before the transition
+                    // (`assignVisibleState`, KAGLayer.tjs:172), which is what
+                    // keeps both faces the same size for the crossfade family
+                    // (`TransIntf.cpp:508`).
+                    source.setPos(dest.left, dest.top, dest.width, dest.height);
                     dest.inTransition = true;
                     dest.window.transCount++;
                     dest.beginTransition("crossfade", true, source, %[time: 1000]);
@@ -11359,7 +11615,13 @@ mod tests {
     fn native_layer_stop_transition_completes_active_transition() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
-        write_png(root.join("old.png"), 1, 1, &[255, 0, 0, 255]);
+        // Same size on both faces (`TransIntf.cpp:508`).
+        write_png(
+            root.join("old.png"),
+            2,
+            1,
+            &[255, 0, 0, 255, 255, 0, 0, 255],
+        );
         write_png(
             root.join("new.png"),
             2,
@@ -11475,6 +11737,30 @@ mod tests {
                 255, 255, 255, 0,
             ]
         );
+    }
+
+    #[test]
+    fn native_layer_set_image_size_resizes_the_province_plane() {
+        // `ChangeImageSize` resizes both planes (`LayerIntf.cpp:2043-2047`):
+        // the province values that survive the size change are kept and the
+        // expanded band is zero-filled.
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(2, 2);
+                layer.setProvincePixel(1, 1, 9);
+                layer.setImageSize(3, 2);
+                return layer.getProvincePixel(1, 1) + ":" +
+                    layer.getProvincePixel(2, 1) + ":" +
+                    layer.imageWidth + ":" + layer.imageHeight;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(result, Variant::String("9:0:3:2".to_string()));
     }
 
     #[test]

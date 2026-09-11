@@ -238,6 +238,11 @@ pub(crate) struct LayerInstance {
     pub parent: Option<ObjectHandle>,
     pub children: Vec<ObjectHandle>,
     pub children_array: Option<ObjectHandle>,
+    /// Set whenever the tree edge list changed.  `Layer.children` is the
+    /// official cached array object (`GetChildrenArrayObjectNoAddRef`,
+    /// `LayerIntf.cpp:630`): the TJS array is reused and its contents are
+    /// rebuilt from this list the next time the property is read.
+    pub children_dirty: bool,
     pub render_target: LayerRenderTarget,
     /// Set once the layer is `Part()`ed out of the layer tree
     /// (`LayerIntf.cpp:589`).  Draw and hit test only walk from each manager's
@@ -262,6 +267,7 @@ impl LayerInstance {
             parent,
             children: Vec::new(),
             children_array,
+            children_dirty: true,
             render_target: LayerRenderTarget::Native(layer_id),
             detached: false,
             properties: BTreeMap::new(),
@@ -329,6 +335,9 @@ impl LayerInstance {
 pub(crate) struct WindowInstance {
     pub children: Vec<ObjectHandle>,
     pub children_array: Option<ObjectHandle>,
+    /// See [`LayerInstance::children_dirty`]; `Window.children` is the same
+    /// cached array the script sees.
+    pub children_dirty: bool,
     pub primary_layer: Option<ObjectHandle>,
     pub focused_layer: Option<ObjectHandle>,
     pub visible: bool,
@@ -342,6 +351,7 @@ impl WindowInstance {
         Self {
             children: Vec::new(),
             children_array,
+            children_dirty: true,
             primary_layer: None,
             focused_layer: None,
             visible: false,
@@ -1500,6 +1510,7 @@ impl KrkrHost {
             .or_insert_with(|| WindowInstance::new(None));
         window_instance.children.retain(|entry| *entry != child);
         window_instance.children.push(child);
+        window_instance.children_dirty = true;
         if self.native_layers.contains_key(&child) {
             if window_instance.primary_layer.is_none() {
                 window_instance.primary_layer = Some(child);
@@ -1522,6 +1533,7 @@ impl KrkrHost {
             return;
         };
         window_instance.children.retain(|entry| *entry != child);
+        window_instance.children_dirty = true;
         if window_instance.primary_layer == Some(child) {
             window_instance.primary_layer = None;
             window_instance
@@ -1774,6 +1786,34 @@ impl KrkrHost {
             .unwrap_or_default()
     }
 
+    pub(crate) fn native_window_children(&self, handle: ObjectHandle) -> Vec<ObjectHandle> {
+        self.native_windows
+            .get(&handle)
+            .map(|instance| instance.children.clone())
+            .unwrap_or_default()
+    }
+
+    /// Registers the array a native instance hands to script as its `children`
+    /// list (`ChildrenArray`, `LayerIntf.h:237`), creating it on demand the way
+    /// `GetChildrenArrayObjectNoAddRef` does.
+    pub(crate) fn register_children_array(
+        &mut self,
+        handle: ObjectHandle,
+        array: ObjectHandle,
+    ) -> bool {
+        if let Some(instance) = self.native_layers.get_mut(&handle) {
+            instance.children_array = Some(array);
+            instance.children_dirty = true;
+            return true;
+        }
+        if let Some(instance) = self.native_windows.get_mut(&handle) {
+            instance.children_array = Some(array);
+            instance.children_dirty = true;
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn native_layer_roots(&self) -> Vec<ObjectHandle> {
         self.native_layers
             .iter()
@@ -1840,13 +1880,44 @@ impl KrkrHost {
             && !parent.children.contains(&child)
         {
             parent.children.push(child);
+            parent.children_dirty = true;
         }
     }
 
     fn remove_native_layer_child(&mut self, parent: ObjectHandle, child: ObjectHandle) {
-        if let Some(parent) = self.native_layers.get_mut(&parent) {
+        if let Some(parent) = self.native_layers.get_mut(&parent)
+            && parent.children.contains(&child)
+        {
             parent.children.retain(|entry| *entry != child);
+            parent.children_dirty = true;
         }
+    }
+
+    pub(crate) fn native_layer_children_array(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.native_layers
+            .get(&handle)
+            .and_then(|instance| instance.children_array)
+    }
+
+    pub(crate) fn native_window_children_array(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<ObjectHandle> {
+        self.native_windows
+            .get(&handle)
+            .and_then(|instance| instance.children_array)
+    }
+
+    /// Takes the "children array needs a rebuild" flag
+    /// (`ChildrenArrayValid`, `LayerIntf.cpp:630`).
+    pub(crate) fn take_native_children_array_dirty(&mut self, handle: ObjectHandle) -> bool {
+        if let Some(instance) = self.native_layers.get_mut(&handle) {
+            return std::mem::take(&mut instance.children_dirty);
+        }
+        if let Some(instance) = self.native_windows.get_mut(&handle) {
+            return std::mem::take(&mut instance.children_dirty);
+        }
+        false
     }
 
     pub(crate) fn kag_layer_slot(&self, handle: ObjectHandle) -> Option<&KagLayerSlot> {
@@ -2062,7 +2133,11 @@ impl KrkrHost {
             self.pending_kag_layers.remove(&slot.layer);
         }
         for window in self.native_windows.values_mut() {
+            let before = window.children.len();
             window.children.retain(|child| *child != handle);
+            if window.children.len() != before {
+                window.children_dirty = true;
+            }
             if window.primary_layer == Some(handle) {
                 window.primary_layer = None;
                 window
@@ -3087,6 +3162,7 @@ impl KrkrHost {
             frozen_image_uploads,
             suppressed_live_images: BTreeSet::new(),
             live_layer_overrides: BTreeMap::new(),
+            live_layer_restore: BTreeMap::new(),
             native_completion: None,
         });
     }
@@ -3099,10 +3175,12 @@ impl KrkrHost {
         frozen_model: (Vec<DrawCommand>, Vec<ImageUpload>),
         suppressed_live_images: BTreeSet<LayerId>,
         live_layer_overrides: BTreeMap<LayerId, LayerNode>,
+        live_layer_restore: BTreeMap<LayerId, LayerNode>,
         completion: NativeTransitionCompletion,
     ) {
         self.complete_active_transition();
         if duration.is_zero() || self.transition_policy == TransitionPolicy::Immediate {
+            self.restore_transition_live_overrides(&live_layer_overrides, &live_layer_restore);
             self.completed_native_transitions.push(completion);
             self.active_transition = None;
             return;
@@ -3118,21 +3196,88 @@ impl KrkrHost {
             frozen_image_uploads: frozen_model.1,
             suppressed_live_images,
             live_layer_overrides,
+            live_layer_restore,
             native_completion: Some(completion),
         });
     }
 
+    /// Puts back the pre-transition state of every layer a running transition
+    /// projected the incoming page onto.
+    ///
+    /// Official transitions never write into either layer's subtree
+    /// (`tTransDrawable::DrawCompleted`, `LayerIntf.cpp:6567` draws the source
+    /// composite as the second face), so the projection is unwound here.  Only
+    /// what the projection wrote is restored (`LayerNode::copy_render_state_from`)
+    /// and the layer's own script properties are re-applied on top, so a change
+    /// the script made while the transition ran -- including an image it loaded
+    /// into the layer -- survives.
+    pub(crate) fn restore_transition_live_overrides(
+        &mut self,
+        projected: &BTreeMap<LayerId, LayerNode>,
+        restore: &BTreeMap<LayerId, LayerNode>,
+    ) {
+        for (layer_id, original) in restore {
+            let script_image = match (projected.get(layer_id), self.layer_tree.layer(*layer_id)) {
+                (Some(projected), Some(current)) if current.image != projected.image => Some((
+                    current.image.clone(),
+                    current.province.clone(),
+                    current.image_width,
+                    current.image_height,
+                )),
+                _ => None,
+            };
+            if let Some(layer) = self.layer_tree.layer_mut(*layer_id) {
+                layer.copy_render_state_from(original);
+                if let Some((image, province, image_width, image_height)) = script_image {
+                    layer.image = image;
+                    layer.province = province;
+                    layer.image_width = image_width;
+                    layer.image_height = image_height;
+                }
+            }
+            let handle = self
+                .native_layers
+                .iter()
+                .find_map(|(handle, instance)| (instance.layer_id == *layer_id).then_some(*handle));
+            if let Some(handle) = handle {
+                self.apply_layer_instance_to_render(handle);
+            }
+        }
+    }
+
     pub(crate) fn advance_transition(&mut self, delta: Duration) {
+        // `tTJSNI_BaseLayer::InvokeTransition` (`LayerIntf.cpp:6463`): a
+        // destination that is no longer node-visible stops the transition,
+        // which still runs the exchange and fires `onTransitionCompleted`.
+        let dest_invisible = self
+            .active_transition
+            .as_ref()
+            .and_then(|transition| transition.native_completion.as_ref())
+            .is_some_and(|completion| !self.native_layer_node_visible(completion.dest));
         let Some(transition) = &mut self.active_transition else {
             return;
         };
         transition.elapsed = transition.elapsed.saturating_add(delta);
-        if transition.elapsed >= transition.duration {
-            if let Some(completion) = transition.native_completion.take() {
+        if dest_invisible || transition.elapsed >= transition.duration {
+            let (completion, overrides, restore) = (
+                transition.native_completion.take(),
+                std::mem::take(&mut transition.live_layer_overrides),
+                std::mem::take(&mut transition.live_layer_restore),
+            );
+            if let Some(completion) = completion {
                 self.completed_native_transitions.push(completion);
             }
             self.active_transition = None;
+            self.restore_transition_live_overrides(&overrides, &restore);
         }
+    }
+
+    /// Official `tTJSNI_BaseLayer::GetNodeVisible` (`LayerIntf.h:308`) for a
+    /// TJS layer handle.  A handle without a native layer never stops a
+    /// transition.
+    fn native_layer_node_visible(&self, handle: ObjectHandle) -> bool {
+        self.native_layer(handle)
+            .is_none_or(|layer_id| self.layer_tree.node_visible(layer_id))
     }
 
     pub(crate) fn complete_active_transition(&mut self) {
@@ -3142,6 +3287,9 @@ impl KrkrHost {
         if let Some(completion) = transition.native_completion.take() {
             self.completed_native_transitions.push(completion);
         }
+        let overrides = std::mem::take(&mut transition.live_layer_overrides);
+        let restore = std::mem::take(&mut transition.live_layer_restore);
+        self.restore_transition_live_overrides(&overrides, &restore);
     }
 
     pub(crate) fn complete_native_transition_for(&mut self, dest: ObjectHandle) {
@@ -3586,6 +3734,16 @@ struct ActiveTransition {
     frozen_image_uploads: Vec<ImageUpload>,
     suppressed_live_images: BTreeSet<LayerId>,
     live_layer_overrides: BTreeMap<LayerId, LayerNode>,
+    /// Pre-override copies of the layers in `live_layer_overrides`.
+    ///
+    /// Official page transitions never write into the outgoing page's layers
+    /// (`tTJSNI_BaseLayer::InternalStopTransition` only calls `Exchange` plus
+    /// position/visibility swaps, `LayerIntf.cpp:6364`); the staged page is
+    /// shown because its own subtree moves into view.  The live override is
+    /// this engine's stand-in for the transition handler drawing the source
+    /// tree, so it must not outlive the transition: the outgoing page's layers
+    /// keep their own content, ready for the next page swap.
+    live_layer_restore: BTreeMap<LayerId, LayerNode>,
     native_completion: Option<NativeTransitionCompletion>,
 }
 
@@ -3794,6 +3952,80 @@ mod tests {
             .is_some_and(|result| result.is_ok()));
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_transition_live_overrides_keeps_state_the_projection_never_wrote() {
+        let mut host = KrkrHost::default();
+        let layer_id = host.layer_tree.create_layer("native:1", None, 0);
+        {
+            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
+            layer.left = 5.0;
+            layer.image_width = 4.0;
+            layer.z_order = 7;
+        }
+        let original = host.layer_tree.layer(layer_id).cloned().expect("layer");
+        let mut projected = original.clone();
+        projected.left = 40.0;
+        projected.image_width = 8.0;
+        {
+            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
+            *layer = projected.clone();
+            // State the projection never writes and the script changed while
+            // the transition ran.
+            layer.clip = Some(krkr_core::Rect::new(3.0, 3.0, 1.0, 1.0));
+            layer.z_order = 9;
+        }
+        let mut overrides = BTreeMap::new();
+        overrides.insert(layer_id, projected);
+        let mut restore = BTreeMap::new();
+        restore.insert(layer_id, original);
+
+        host.restore_transition_live_overrides(&overrides, &restore);
+
+        let layer = host.layer_tree.layer(layer_id).expect("layer");
+        assert_eq!(layer.left, 5.0);
+        assert_eq!(layer.image_width, 4.0);
+        assert_eq!(layer.clip, Some(krkr_core::Rect::new(3.0, 3.0, 1.0, 1.0)));
+        assert_eq!(layer.z_order, 9);
+    }
+
+    #[test]
+    fn restore_transition_live_overrides_keeps_an_image_the_script_loaded() {
+        let mut host = KrkrHost::default();
+        let layer_id = host.layer_tree.create_layer("native:1", None, 0);
+        let original_image = host.create_layer_image(4, 4, vec![0; 64]);
+        let projected_image = host.create_layer_image(4, 4, vec![1; 64]);
+        let script_image = host.create_layer_image(2, 2, vec![2; 16]);
+        {
+            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
+            layer.image = Some(original_image.clone());
+        }
+        let original = host.layer_tree.layer(layer_id).cloned().expect("layer");
+        let mut projected = original.clone();
+        projected.image = Some(projected_image.clone());
+        {
+            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
+            *layer = projected.clone();
+            // `loadImages` while the transition ran: the official engine never
+            // overwrites an image the script put there.
+            layer.image = Some(script_image.clone());
+            layer.image_width = 2.0;
+            layer.image_height = 2.0;
+        }
+        let mut overrides = BTreeMap::new();
+        overrides.insert(layer_id, projected);
+        let mut restore = BTreeMap::new();
+        restore.insert(layer_id, original);
+
+        host.restore_transition_live_overrides(&overrides, &restore);
+
+        let layer = host.layer_tree.layer(layer_id).expect("layer");
+        assert_eq!(
+            layer.image.as_ref().map(|image| image.upload.texture_id),
+            Some(script_image.upload.texture_id)
+        );
+        assert_eq!(layer.image_width, 2.0);
     }
 
     fn write_test_png(path: &std::path::Path, width: u32, height: u32) {

@@ -1137,6 +1137,25 @@ impl ProvinceImage {
             .unwrap_or(0)
     }
 
+    /// `tTVPBaseBitmap::SetSizeWithFill` on the province plane
+    /// (`LayerIntf.cpp:2047`): the overlapping region keeps its values and the
+    /// expanded band is filled with 0, matching `ChangeImageSize`.
+    pub fn resized(&self, width: u32, height: u32) -> ProvinceImage {
+        if self.width == width && self.height == height {
+            return self.clone();
+        }
+        let mut pixels = vec![0u8; width as usize * height as usize];
+        let copy_width = self.width.min(width) as usize;
+        let copy_height = self.height.min(height) as usize;
+        for row in 0..copy_height {
+            let source = row * self.width as usize;
+            let dest = row * width as usize;
+            pixels[dest..dest + copy_width]
+                .copy_from_slice(&self.pixels[source..source + copy_width]);
+        }
+        ProvinceImage::new(width, height, pixels)
+    }
+
     pub fn set_pixel(&mut self, x: i64, y: i64, value: u8) {
         if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
             return;
@@ -1380,6 +1399,32 @@ impl LayerNode {
         self.image_width = 0.0;
         self.image_height = 0.0;
     }
+
+    /// Copies the render state a KAG page transition projects from one layer
+    /// onto another (`copy_render_content`): geometry, the image plane, and
+    /// the visual properties.  `clip`, `order`, `renderable`, the name and the
+    /// tree edge stay with the destination, so restoring a projected layer
+    /// only undoes what the projection wrote.
+    pub fn copy_render_state_from(&mut self, source: &LayerNode) {
+        self.left = source.left;
+        self.top = source.top;
+        self.width = source.width;
+        self.height = source.height;
+        self.image_left = source.image_left;
+        self.image_top = source.image_top;
+        self.image_width = source.image_width;
+        self.image_height = source.image_height;
+        self.visible = source.visible;
+        self.enabled = source.enabled;
+        self.node_enabled = source.node_enabled;
+        self.opacity = source.opacity;
+        self.layer_type = source.layer_type;
+        self.face = source.face;
+        self.hit_type = source.hit_type;
+        self.hit_threshold = source.hit_threshold;
+        self.image = source.image.clone();
+        self.province = source.province.clone();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1461,6 +1506,20 @@ impl LayerTree {
         let mut current = Some(id);
         while let Some(node) = current.and_then(|id| self.layers.get(&id)) {
             if !node.enabled {
+                return false;
+            }
+            current = node.parent;
+        }
+        true
+    }
+
+    /// `tTJSNI_BaseLayer::GetNodeVisible` (`LayerIntf.h:308`):
+    /// `GetParentVisible() && Visible` -- the layer and every ancestor must be
+    /// visible. Opacity is not consulted.
+    pub fn node_visible(&self, id: LayerId) -> bool {
+        let mut current = Some(id);
+        while let Some(node) = current.and_then(|id| self.layers.get(&id)) {
+            if !node.visible {
                 return false;
             }
             current = node.parent;

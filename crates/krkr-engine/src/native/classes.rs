@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -551,7 +552,15 @@ fn apply_constructor_defaults(
                     .map(Variant::Object)
                     .unwrap_or_else(|| parent.clone());
                 runtime.set_object_member(handle, "__actionOwner", stored_window.clone());
-                let children = runtime.alloc_array_object(Vec::new());
+                // A script subclass may run this constructor twice (an
+                // intermediate `super.Layer()`); the official instance keeps
+                // one `ChildrenArray` across `Construct` calls
+                // (`LayerIntf.h:237`, created in the C++ ctor only), so reuse
+                // whatever the instance already registered.
+                let children = runtime
+                    .host()
+                    .native_layer_children_array(handle)
+                    .unwrap_or_else(|| runtime.alloc_array_object(Vec::new()));
                 let layer_id = runtime.host_mut().register_native_layer(
                     handle,
                     format!("native:{}", handle.0),
@@ -658,10 +667,11 @@ fn apply_constructor_defaults(
                         Variant::Object(handle),
                     );
                 }
-                if let Some(parent) = parent_object {
-                    let children = ensure_child_array(runtime, parent);
-                    runtime.array_push(children, Variant::Object(handle));
-                }
+                // The layer joins its parent inside `register_native_layer`;
+                // the script visible `children` array follows the tree list on
+                // its next read (`GetChildrenArrayObjectNoAddRef`,
+                // `LayerIntf.cpp:630`), so nothing is pushed here.
+                //
                 // `tTJSNI_BaseLayer` ctor (`LayerIntf.cpp:342` / `:404`): Rect is
                 // 32×32 and `AllocateDefaultImage` copies the 32×32 transparent
                 // white holder. Drawable layers never start with no bitmap.
@@ -720,7 +730,53 @@ fn apply_constructor_defaults(
     Ok(())
 }
 
+/// Official `tTJSNI_BaseLayer::GetChildrenArrayObjectNoAddRef`
+/// (`LayerIntf.cpp:630`): every read hands out the *same* array object, and
+/// its contents are rebuilt in place from the live tree whenever a tree
+/// change dirtied it.  Script writes into that array never reach the tree and
+/// are dropped by the next rebuild.
+fn sync_children_array(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+) -> Option<ObjectHandle> {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    let array = match runtime
+        .host()
+        .native_layer_children_array(handle)
+        .or_else(|| runtime.host().native_window_children_array(handle))
+    {
+        Some(array) => array,
+        None => {
+            let array = runtime.alloc_array_object(Vec::new());
+            if !runtime.host_mut().register_children_array(handle, array) {
+                return None;
+            }
+            array
+        }
+    };
+    if !runtime.host_mut().take_native_children_array_dirty(handle) {
+        return Some(array);
+    }
+    // Ask again which list this instance keeps: a layer registered without a
+    // cached array got one just above, and reading the window list for it
+    // would leave the array permanently empty.
+    let children = if runtime.host().native_layer_children_array(handle).is_some() {
+        runtime.host().native_layer_children(handle)
+    } else {
+        runtime.host().native_window_children(handle)
+    };
+    runtime.array_clear(array);
+    for child in children {
+        runtime.array_push(array, Variant::Object(child));
+    }
+    Some(array)
+}
+
 fn ensure_child_array(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> ObjectHandle {
+    let handle = runtime.bound_this(handle).unwrap_or(handle);
+    if let Some(children) = sync_children_array(runtime, handle) {
+        return children;
+    }
     match runtime.object_member(handle, "children") {
         Variant::Object(children) => children,
         _ => {
@@ -1551,6 +1607,11 @@ fn window_native_property_get(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
+    if name == "children" {
+        return Ok(sync_children_array(runtime, this)
+            .map(Variant::Object)
+            .unwrap_or(Variant::Void));
+    }
     Ok(runtime
         .host()
         .native_window_property(this, name)
@@ -1566,6 +1627,13 @@ fn window_native_property_set(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(());
     };
+    if name == "children" {
+        // Read-only, like `Layer.children` in the reference
+        // (`TJS_DENY_NATIVE_PROP_SETTER`, `LayerIntf.cpp:8532`): a write used
+        // to replace the registered array and shadow the accessor, leaving the
+        // tree unreachable from script.
+        return Err(TjsError::runtime("Access denied"));
+    }
     let value = normalize_window_property_value(name, value)?;
     set_window_property_storage(runtime, this, name, value);
     Ok(())
@@ -1603,6 +1671,11 @@ fn layer_native_property_get(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
+    if name == "children" {
+        return Ok(sync_children_array(runtime, this)
+            .map(Variant::Object)
+            .unwrap_or(Variant::Void));
+    }
     if matches!(name, "cursorX" | "cursorY") {
         return Ok(layer_cursor_position_value(runtime, this, name));
     }
@@ -1697,6 +1770,12 @@ fn layer_native_property_set(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(());
     };
+    if name == "children" {
+        // `TJS_DENY_NATIVE_PROP_SETTER` (`LayerIntf.cpp:8532`): the array is
+        // the tree view and has no setter.  Storing the write would also
+        // corrupt the backing key `ensure_native_layer_attached` reads.
+        return Err(TjsError::runtime("Access denied"));
+    }
     let previous_type = (name == "type")
         .then(|| {
             layer_property_value(runtime, this, "type")
@@ -2114,6 +2193,11 @@ fn change_layer_image_size(
         layer.image_width = width as f32;
         layer.image_height = height as f32;
         layer.image = Some(image);
+        // `ChangeImageSize` resizes both planes -- the province plane keeps its
+        // overlapping values and zero-fills the rest (`LayerIntf.cpp:2043-2047`).
+        if let Some(province) = layer.province.as_ref() {
+            layer.province = Some(province.resized(width as u32, height as u32));
+        }
         // `ChangeImageSize` ends with `ResetClip()` (`LayerIntf.cpp:2040`).
         layer.clip = None;
     });
@@ -2372,25 +2456,13 @@ fn apply_layer_property_to_render(
             variant_object(value).map(|parent| runtime.bound_this(parent).unwrap_or(parent));
         // `tTJSNI_BaseLayer::Join()` parts the old parent first
         // (`LayerIntf.cpp:576`), which is what tells the manager about a layer
-        // leaving the tree.
+        // leaving the tree.  The parent's `children` array follows the tree on
+        // its next read (`GetChildrenArrayObjectNoAddRef`,
+        // `LayerIntf.cpp:630`), so only the tree edges are touched here.
         notify_part_if_attached(runtime, handle, parent)?;
-        let old_parent = runtime.host().native_layer_parent(handle);
-        let updated = runtime
+        runtime
             .host_mut()
             .set_native_layer_parent(handle, parent, value.clone());
-        if updated && old_parent != parent {
-            if let Some(old_parent) = old_parent
-                && let Variant::Object(children) =
-                    layer_property_value(runtime, old_parent, "children")
-            {
-                runtime.array_remove_value(children, &Variant::Object(handle));
-            }
-            if let Some(parent) = parent {
-                let children = ensure_child_array(runtime, parent);
-                runtime.array_remove_value(children, &Variant::Object(handle));
-                runtime.array_push(children, Variant::Object(handle));
-            }
-        }
     } else if name == "window" {
         let window =
             variant_object(value).map(|window| runtime.bound_this(window).unwrap_or(window));
@@ -3876,13 +3948,15 @@ fn transition_params_from_options(
         params.max_drift = (value as f32).max(0.0);
     }
 
+    // `tTVPUniversalTransHandlerProvider::GetTransitionObject`
+    // (`TransIntf.cpp:777`): the rule graphic is required.
     let rule_image_upload = if params.method == TransitionMethod::Universal {
-        match object_optional_string(runtime, options, "rule")? {
-            Some(rule) if !rule.is_empty() => {
-                Some(runtime.host_mut().load_image_storage(&rule)?.upload)
-            }
-            _ => None,
-        }
+        let Some(rule) =
+            object_optional_string(runtime, options, "rule")?.filter(|rule| !rule.is_empty())
+        else {
+            return Err(TjsError::runtime("Specify option: rule"));
+        };
+        Some(runtime.host_mut().load_image_storage(&rule)?.upload)
     } else {
         None
     };
@@ -4141,8 +4215,14 @@ fn layer_assign_images(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
-    let Some(source) = args.first().and_then(variant_object) else {
-        return Ok(Variant::Void);
+    // The argument must be a Layer (`LayerIntf.cpp:7840-7844`,
+    // `TVPSpecifyLayer`).
+    let Some(source) = args
+        .first()
+        .and_then(variant_object)
+        .filter(|source| native_layer_id(runtime, *source).ok().flatten().is_some())
+    else {
+        return Err(TjsError::runtime("Specify layer"));
     };
     if let Some(target) = target {
         copy_layer_images(runtime, this, &target, source)?;
@@ -4217,6 +4297,28 @@ fn exchange_native_layer_info(
     Ok(Variant::Void)
 }
 
+/// The size `tTJSNI_BaseLayer::StartTransition` hands to the transition
+/// provider for one layer (`LayerIntf.cpp:6243`): the layer Rect when children
+/// are included, the main image's own size otherwise.
+fn transition_layer_size(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    with_children: bool,
+) -> Result<(i64, i64)> {
+    if with_children {
+        Ok((
+            layer_property_i64(runtime, handle, "width", 0)?,
+            layer_property_i64(runtime, handle, "height", 0)?,
+        ))
+    } else {
+        // A layer without a bitmap has no size to compare; the explicit
+        // image check reports it (`LayerIntf.cpp:6271`).
+        Ok(layer_main_image(runtime, handle)
+            .map(|image| (image.upload.width as i64, image.upload.height as i64))
+            .unwrap_or((0, 0)))
+    }
+}
+
 fn layer_begin_transition(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -4226,10 +4328,15 @@ fn layer_begin_transition(
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
-    let source = args
-        .get(2)
-        .and_then(variant_object)
-        .or_else(|| variant_object(&runtime.object_member(this, "comp")));
+    // The third argument must be a Layer (`LayerIntf.cpp:7798-7809`): the
+    // official wrapper throws `TVPSpecifyLayer` for a missing, void or
+    // non-Layer value and never falls back to the destination's `comp`.
+    let source = args.get(2).and_then(variant_object);
+    let Some(source) =
+        source.filter(|source| native_layer_id(runtime, *source).ok().flatten().is_some())
+    else {
+        return Err(TjsError::runtime("Specify layer"));
+    };
     let with_children = args
         .get(1)
         .filter(|value| !matches!(value, Variant::Void))
@@ -4243,20 +4350,53 @@ fn layer_begin_transition(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_else(|| "crossfade".to_string());
-    let options = args.get(3).and_then(variant_object);
-    let duration = match options {
-        Some(options) => object_optional_integer(runtime, options, "time")
-            .transpose()?
-            .unwrap_or(0),
-        None => 0,
+    // The three providers the reference registers (`TVPRegisterDefaultTransHandlerProvider`,
+    // `TransIntf.cpp:1196`) and the rules they impose on their options.
+    let crossfade_family = matches!(
+        method.to_ascii_lowercase().as_str(),
+        "crossfade" | "universal" | "scroll"
+    );
+    // `tTVPCrossFadeTransHandlerProvider::StartTransition` (`TransIntf.cpp:508`,
+    // inherited by `universal` and `scroll`): both faces must have the same
+    // size, reported as the source size against the destination size.
+    if crossfade_family {
+        let dest_size = transition_layer_size(runtime, this, with_children)?;
+        let source_size = transition_layer_size(runtime, source, with_children)?;
+        if dest_size != source_size {
+            return Err(TjsError::runtime(format!(
+                "Transition layer size mismatch: {}x{} and {}x{}",
+                source_size.0, source_size.1, dest_size.0, dest_size.1
+            )));
+        }
     }
-    .max(0) as u64;
+    let options = args.get(3).and_then(variant_object);
+    let time = match options {
+        Some(options) => object_optional_integer(runtime, options, "time").transpose()?,
+        None => None,
+    };
+    // `GetTransitionObject` (`TransIntf.cpp:528`): the family requires `time`
+    // and treats anything below 2 ms as 2 ("too small time may cause
+    // problem"), so it never runs an instantaneous exchange.
+    let duration = if crossfade_family {
+        let Some(time) = time else {
+            return Err(TjsError::runtime("Specify option: time"));
+        };
+        time.max(2) as u64
+    } else {
+        time.unwrap_or(0).max(0) as u64
+    };
     let (transition_params, rule_image_upload) =
         transition_params_from_options(runtime, &method, options)?;
-    let source_layer_id = source
-        .map(|source| native_layer_id(runtime, source))
-        .transpose()?
-        .flatten();
+    // `StartTransition` (`LayerIntf.cpp:6271`): without children the handler
+    // blends the two main images, so both layers must have one.
+    if !with_children
+        && (!layer_has_main_image(runtime, this)? || !layer_has_main_image(runtime, source)?)
+    {
+        return Err(TjsError::runtime(
+            "Transition source and destination must have image",
+        ));
+    }
+    let source_layer_id = native_layer_id(runtime, source)?;
     let mut suppressed_images = BTreeSet::new();
     if let Some(source_layer_id) = source_layer_id {
         suppressed_images.insert(source_layer_id);
@@ -4267,23 +4407,23 @@ fn layer_begin_transition(
         .draw_model_suppressing_images(&suppressed_images);
     let comp = variant_object(&runtime.object_member(this, "comp"))
         .map(|comp| runtime.bound_this(comp).unwrap_or(comp));
-    let paired_comp = source
-        .map(|source| runtime.bound_this(source).unwrap_or(source))
-        .is_some_and(|source| Some(source) == comp);
+    let paired_comp = Some(runtime.bound_this(source).unwrap_or(source)) == comp;
     if let Some(target) = render_layer_target(runtime, this)? {
-        if let Some(source) = source {
-            materialize_kag_back_to_native(runtime, source)?;
-            copy_layer_images(runtime, this, &target, source)?;
-        }
+        // Official `tTransDrawable::DrawCompleted` (`LayerIntf.cpp:6567`) draws
+        // the destination's own composite as Src1 and the source's as Src2,
+        // leaving both layer trees untouched.  This engine renders the two
+        // faces from a frozen model plus the live tree, so the source content
+        // is materialized into the destination here and unwound by
+        // `restore_transition_live_overrides` once the transition ends.
+        materialize_kag_back_to_native(runtime, source)?;
+        copy_layer_images(runtime, this, &target, source)?;
         let draws = render_target_draws(runtime, &target);
         mutate_render_layer(runtime, &target, |layer| {
-            layer.visible = true;
             layer.renderable = draws;
         });
     }
-    set_layer_property_storage(runtime, this, "visible", Variant::Integer(1));
-    let live_layer_overrides =
-        kag_base_children_transition_live_overrides(runtime, this, source, with_children)?;
+    let (live_layer_overrides, live_layer_restore) =
+        kag_base_children_transition_live_overrides(runtime, this, Some(source), with_children)?;
     if duration == 0 {
         if !paired_comp
             && let Some(source_layer_id) = source_layer_id
@@ -4294,7 +4434,10 @@ fn layer_begin_transition(
         {
             source_layer.renderable = false;
         }
-        finish_immediate_transition(runtime, this, source, with_children)?;
+        finish_immediate_transition(runtime, this, Some(source), with_children)?;
+        runtime
+            .host_mut()
+            .restore_transition_live_overrides(&live_layer_overrides, &live_layer_restore);
     } else {
         runtime.host_mut().begin_native_transition(
             Duration::from_millis(duration),
@@ -4303,9 +4446,10 @@ fn layer_begin_transition(
             frozen,
             suppressed_images,
             live_layer_overrides,
+            live_layer_restore,
             NativeTransitionCompletion {
                 dest: this,
-                source,
+                source: Some(source),
                 paired_comp,
                 with_children,
             },
@@ -4332,38 +4476,49 @@ fn materialize_kag_back_to_native(
     };
     if let Some(native_layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
         let renderable = native_layer.renderable;
-        copy_render_content(native_layer, &snapshot);
+        native_layer.copy_render_state_from(&snapshot);
         native_layer.renderable = renderable;
     }
     Ok(())
 }
 
+/// Builds the transition-time live view for a KAG page transition.
+///
+/// The official engine shows the incoming page through the transition handler,
+/// which draws the source tree next to the destination; the layer trees
+/// themselves are untouched until `Exchange` at the end
+/// (`tTJSNI_BaseLayer::InternalStopTransition`, `LayerIntf.cpp:6364`).  This
+/// engine projects that live view onto the render tree instead, so the
+/// overridden layers are also returned a copy of their pre-transition state:
+/// the override must not outlive the transition, or the outgoing page's layers
+/// keep the incoming page's picture and show it again at the next page swap.
 fn kag_base_children_transition_live_overrides(
     runtime: &mut Runtime<KrkrHost>,
     dest: ObjectHandle,
     source: Option<ObjectHandle>,
     with_children: bool,
-) -> Result<BTreeMap<u64, LayerNode>> {
+) -> Result<(BTreeMap<u64, LayerNode>, BTreeMap<u64, LayerNode>)> {
     if !with_children {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeMap::new()));
     }
     if !matches!(
         kag_layer_target(runtime, dest),
         Some(LayerRenderTarget::Kag(slot)) if slot.page == "fore" && slot.layer == "base"
     ) {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeMap::new()));
     }
     let Some(source) = source else {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeMap::new()));
     };
     if !matches!(
         kag_layer_target(runtime, source),
         Some(LayerRenderTarget::Kag(slot)) if slot.page == "back" && slot.layer == "base"
     ) {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), BTreeMap::new()));
     }
 
     let mut overrides = BTreeMap::new();
+    let mut restore = BTreeMap::new();
     let pending_layers = runtime.host().pending_kag_layer_names();
     for layer_name in pending_layers {
         if layer_name == "base" {
@@ -4378,7 +4533,7 @@ fn kag_base_children_transition_live_overrides(
             && let Some(back_layer_id) = native_layer_id(runtime, back_handle)?
             && let Some(back_layer) = runtime.host_mut().layer_tree_mut().layer_mut(back_layer_id)
         {
-            copy_render_content(back_layer, &source_layer);
+            back_layer.copy_render_state_from(&source_layer);
             back_layer.renderable = false;
         }
 
@@ -4388,22 +4543,24 @@ fn kag_base_children_transition_live_overrides(
         let Some(layer_id) = native_layer_id(runtime, fore_handle)? else {
             continue;
         };
-        let Some(mut override_layer) = runtime.host().layer_tree().layer(layer_id).cloned() else {
+        let Some(original) = runtime.host().layer_tree().layer(layer_id).cloned() else {
             continue;
         };
+        let mut override_layer = original.clone();
         // The projection only shows what is still in the layer tree: a parted
         // fore layer must not come back for the length of the transition
         // (`Part()`, `LayerIntf.cpp:589`).
         let draws = runtime.host().render_layer_draws(layer_id);
-        copy_render_content(&mut override_layer, &source_layer);
+        override_layer.copy_render_state_from(&source_layer);
         override_layer.renderable = draws;
         if let Some(dest_layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-            copy_render_content(dest_layer, &source_layer);
+            dest_layer.copy_render_state_from(&source_layer);
             dest_layer.renderable = draws;
         }
+        restore.insert(layer_id, original);
         overrides.insert(layer_id, override_layer);
     }
-    Ok(overrides)
+    Ok((overrides, restore))
 }
 
 fn kag_layer_object_snapshot(
@@ -4509,7 +4666,7 @@ fn kag_page_layer_handle(
 }
 
 fn copy_render_state(dest: &mut LayerNode, source: &LayerNode) {
-    copy_render_content(dest, source);
+    dest.copy_render_state_from(source);
     dest.renderable = source.renderable;
 }
 
@@ -4538,27 +4695,6 @@ fn apply_layer_node_state_to_script(
     ] {
         set_layer_property_storage(runtime, handle, name, Variant::Integer(value));
     }
-}
-
-fn copy_render_content(dest: &mut LayerNode, source: &LayerNode) {
-    dest.left = source.left;
-    dest.top = source.top;
-    dest.width = source.width;
-    dest.height = source.height;
-    dest.image_left = source.image_left;
-    dest.image_top = source.image_top;
-    dest.image_width = source.image_width;
-    dest.image_height = source.image_height;
-    dest.visible = source.visible;
-    dest.enabled = source.enabled;
-    dest.node_enabled = source.node_enabled;
-    dest.opacity = source.opacity;
-    dest.layer_type = source.layer_type;
-    dest.face = source.face;
-    dest.hit_type = source.hit_type;
-    dest.hit_threshold = source.hit_threshold;
-    dest.image = source.image.clone();
-    dest.province = source.province.clone();
 }
 
 fn layer_stop_transition(
@@ -6211,6 +6347,12 @@ fn layer_children(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Vec<Objec
     if !children.is_empty() {
         return children;
     }
+    // A native instance's child list is authoritative -- an empty one means no
+    // children -- and the script array may still be dirty (empty right after a
+    // detach); only a handle without an instance falls back to the array.
+    if runtime.host().native_layer(layer).is_some() {
+        return children;
+    }
     let Variant::Object(children) = layer_property_value(runtime, layer, "children") else {
         return Vec::new();
     };
@@ -6838,60 +6980,52 @@ fn copy_layer_images(
         return Ok(());
     };
 
-    let mut resized_to_source = false;
+    // `tTJSNI_BaseLayer::AssignImages` (`LayerIntf.cpp:2124`) re-points the
+    // destination at the source's bitmap (`MainImage->Assign`,
+    // `LayerBitmapImpl.cpp:617`) rather than copying pixels; a destination that
+    // already holds that bitmap reports "unchanged" and skips the geometry tail
+    // below (`main_changed`, `LayerIntf.cpp:2154`).  This engine's layers own an
+    // immutable `LayerImage`, so sharing it is the same copy-on-write contract:
+    // every pixel write allocates a fresh image and never touches the other
+    // layer's bitmap.  Identity is the pixel buffer, not the texture id -- a
+    // running layer replaces its pixels under a stable id.
+    let dest_image = render_layer_snapshot(runtime, dest_target).and_then(|layer| layer.image);
+    let main_changed = match (dest_image.as_ref(), source.image.as_ref()) {
+        (Some(dest), Some(source)) => !Arc::ptr_eq(&dest.upload.rgba, &source.upload.rgba),
+        _ => true,
+    };
+    let copied_image = source.image.clone();
+    let copied_province = source.province.clone();
     mutate_render_layer(runtime, dest_target, |dest| {
-        dest.image = source.image.clone();
-        dest.image_left = source.image_left;
-        dest.image_top = source.image_top;
-        dest.image_width = source.image_width;
-        dest.image_height = source.image_height;
-        // `AssignImages` → `InternalSetImageSize` → `ChangeImageSize`
-        // resets the clip (`LayerIntf.cpp:2139`).
-        dest.clip = None;
-        if dest.width <= 0.0 || dest.height <= 0.0 {
-            dest.width = source.width;
-            dest.height = source.height;
-            resized_to_source = true;
+        match copied_image {
+            Some(image) => {
+                dest.image_width = image.upload.width as f32;
+                dest.image_height = image.upload.height as f32;
+                dest.image = Some(image);
+                // `AssignImages` resets the clip after the assign
+                // (`LayerIntf.cpp:2162`); a deallocated image leaves it alone.
+                dest.clip = None;
+            }
+            None => dest.clear_image(),
         }
+        // `ProvinceImage` is assigned alongside the main image, and dropped
+        // when the source has none (`LayerIntf.cpp:2142`).
+        dest.province = copied_province;
     });
 
-    set_layer_property_storage(
-        runtime,
-        dest_object,
-        "imageLeft",
-        Variant::Integer(source.image_left as i64),
-    );
-    set_layer_property_storage(
-        runtime,
-        dest_object,
-        "imageTop",
-        Variant::Integer(source.image_top as i64),
-    );
-    set_layer_property_storage(
-        runtime,
-        dest_object,
-        "imageWidth",
-        Variant::Integer(source.image_width as i64),
-    );
-    set_layer_property_storage(
-        runtime,
-        dest_object,
-        "imageHeight",
-        Variant::Integer(source.image_height as i64),
-    );
-    if resized_to_source {
-        set_layer_property_storage(
+    // `AssignImages` copies only the main image; the image offsets follow from
+    // `InternalSetImageSize` (`LayerIntf.cpp:2154`), never from the source --
+    // KAGEX copies `ImageLeft`/`ImageTop` itself (`MessageLayer.assignImages`)
+    // when it wants them.  The old shape of this function handed over the
+    // source offsets and sizes verbatim, which let a page-sized snapshot leak
+    // past the destination rect.
+    if main_changed && let Some(image) = source.image.as_ref() {
+        internal_set_layer_image_size(
             runtime,
             dest_object,
-            "width",
-            Variant::Integer(source.width as i64),
-        );
-        set_layer_property_storage(
-            runtime,
-            dest_object,
-            "height",
-            Variant::Integer(source.height as i64),
-        );
+            image.upload.width as i64,
+            image.upload.height as i64,
+        )?;
     }
     mark_image_modified(runtime, dest_object);
     Ok(())
