@@ -10489,6 +10489,102 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// The save-screen close (`sysscn/save.ks *return`) is `[backlay]` ->
+    /// `[syspage free page=back]` -> `[systrans save.close]`.  The only
+    /// clearing operation in the whole path hides the *back* page's message
+    /// layer, and the transition then publishes that page (`KAGWindow.
+    /// onTransitionEnd` copies the message layers across the pages and swaps
+    /// them).  The hidden state written to the back page has to survive the
+    /// exchange: the page the transition publishes must not draw the outgoing
+    /// save image again.
+    #[test]
+    fn kag_save_close_message_layer_hidden_on_the_back_page_stays_hidden_after_the_exchange() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .host_mut()
+            .set_transition_policy(crate::TransitionPolicy::Immediate);
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                global.win = new Window();
+                kag.fore = %[base: new Layer(win), layers: [], messages: []];
+                kag.back = %[base: new Layer(win), layers: [], messages: []];
+                kag.fore.base.comp = kag.back.base;
+                kag.back.base.comp = kag.fore.base;
+                kag.fore.base.visible = true;
+                kag.back.base.visible = true;
+                kag.fore.messages[1] = new Layer(win, kag.fore.base);
+                kag.back.messages[1] = new Layer(win, kag.back.base);
+                kag.fore.messages[1].comp = kag.back.messages[1];
+                kag.back.messages[1].comp = kag.fore.messages[1];
+                // The save screen is drawn on the visible page's message1.
+                kag.fore.messages[1].setSize(64, 48);
+                kag.fore.messages[1].fillRect(0, 0, 64, 48, 0x2244ff);
+                kag.fore.messages[1].visible = true;
+                // [backlay]: the back page takes the visible page's content.
+                kag.back.messages[1].assignImages(kag.fore.messages[1]);
+                kag.back.messages[1].setSize(64, 48);
+                kag.back.messages[1].visible = true;
+                // [syspage free page=back]: the close's clearing op.
+                kag.back.messages[1].visible = false;
+                kag.fore.base.onTransitionCompleted = function(dest, src) {
+                    // KAGWindow.onTransitionEnd: the outgoing page's message
+                    // layer takes the incoming page's state, then the pages
+                    // swap.
+                    kag.fore.messages[1].assignImages(kag.back.messages[1]);
+                    kag.fore.messages[1].visible = kag.back.messages[1].visible;
+                    var tmp = kag.fore;
+                    kag.fore = kag.back;
+                    kag.back = tmp;
+                };
+                kag.fore.base.beginTransition("crossfade", true, kag.back.base, %[time: 2]);
+                "#,
+            )
+            .expect("close path");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.fore.messages[1].visible")
+                .expect("published page message layer"),
+            Variant::Integer(0),
+            "the published page keeps the hidden message state"
+        );
+        let Variant::Integer(node_id) = engine
+            .execute_expression("inline.tjs", "kag.fore.messages[1].__nativeLayerId")
+            .expect("native layer id")
+        else {
+            panic!("message layer has no native id");
+        };
+        let node = engine
+            .host()
+            .layer_tree()
+            .layer(node_id as u64)
+            .expect("message layer node");
+        assert!(
+            !node.visible,
+            "the published page's message layer node must be hidden"
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(
+            !frame.output.draw_commands.iter().any(|command| {
+                matches!(
+                    command,
+                    krkr_core::DrawCommand::Image(image)
+                        if image.rect.width == 64.0 && image.rect.height == 48.0
+                )
+            }),
+            "the outgoing save image must not be republished on the visible page"
+        );
+    }
+
     #[test]
     fn native_layer_exchange_info_swaps_staged_comp_backing_before_page_exchange() {
         let root = temp_root();
