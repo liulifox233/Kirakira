@@ -3430,13 +3430,6 @@ impl KrkrHost {
             .and_then(|transition| transition.tick_callback.clone())
     }
 
-    pub(crate) fn transition_self_update(&self, dest: ObjectHandle) -> bool {
-        self.active_transitions
-            .iter()
-            .find(|transition| transition.dest_handle() == Some(dest))
-            .is_some_and(|transition| transition.self_update)
-    }
-
     /// Official `tTJSNI_BaseLayer::StopTransitionByHandler` (`LayerIntf.cpp:6440`):
     /// a handler-driven stop is deferred to the next
     /// `InvokeTransition` while `TVPEventDisabled` is set.
@@ -3494,18 +3487,6 @@ impl KrkrHost {
         }
     }
 
-    /// Official `tTJSNI_BaseLayer::StopTransitionByHandler` for the handler
-    /// stop of the transition whose destination is `dest`.
-    pub(crate) fn stop_transition_for_dest_by_handler(&mut self, dest: ObjectHandle) {
-        if let Some(index) = self
-            .active_transitions
-            .iter()
-            .position(|transition| transition.dest_handle() == Some(dest))
-        {
-            self.stop_transition_by_handler(index);
-        }
-    }
-
     /// `tTJSNI_BaseLayer::InTransition` for a layer object.
     pub(crate) fn layer_in_transition(&self, handle: ObjectHandle) -> bool {
         self.active_transitions
@@ -3526,26 +3507,9 @@ impl KrkrHost {
         !self.active_transitions.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn active_transition_count(&self) -> usize {
         self.active_transitions.len()
-    }
-
-    /// Marks a running transition as driven by user code
-    /// (`tTJSNI_BaseLayer::TransSelfUpdate`, `LayerIntf.cpp:6211`).
-    pub(crate) fn set_transition_self_update(&mut self, dest: ObjectHandle, self_update: bool) {
-        if let Some(transition) = self
-            .active_transitions
-            .iter_mut()
-            .find(|transition| transition.dest_handle() == Some(dest))
-        {
-            transition.self_update = self_update;
-        }
-    }
-
-    /// Completes a transition that the handler decided to finish, respecting
-    /// the `TVPEventDisabled` deferral.
-    pub(crate) fn complete_transition_by_handler(&mut self, dest: ObjectHandle) {
-        self.stop_transition_for_dest_by_handler(dest);
     }
 
     pub(crate) fn frame_transitions(&self) -> Vec<FrameTransition> {

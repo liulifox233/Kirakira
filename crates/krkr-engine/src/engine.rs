@@ -11770,6 +11770,44 @@ mod tests {
     }
 
 
+    /// KAG sizes `fore.base` to the screen (`MainWindow.tjs`,
+    /// `setImageSize(scWidth, scHeight); setSizeToImageSize();`), so a page
+    /// transition's destination rectangle is the whole frame and the composite
+    /// still covers every pixel -- the single-transition rendering is unchanged.
+    #[test]
+    fn kag_page_transition_destination_covers_the_frame() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.host_mut().mutate_kag_layer("back", "base", |layer| {
+            layer.visible = true;
+            layer.width = 320.0;
+            layer.height = 240.0;
+        });
+        let dest_layer = engine.host_mut().ensure_kag_layer("fore", "base");
+        if let Some(node) = engine.host_mut().layer_tree_mut().layer_mut(dest_layer) {
+            node.visible = true;
+            node.width = 320.0;
+            node.height = 240.0;
+        }
+        engine.host_mut().begin_kag_transition(
+            Duration::from_millis(1000),
+            TransitionParams::default(),
+            None,
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.1), Vec::new()),
+                Duration::from_millis(100),
+            )
+            .expect("update");
+        let transition = frame.output.transitions.first().expect("transition");
+        assert_eq!(
+            transition.dest_rect,
+            Some(krkr_core::Rect::new(0.0, 0.0, 320.0, 240.0))
+        );
+    }
+
+    /// A transition never leaves its destination layer's rectangle
     /// (`tTransDrawable::DrawCompleted`, `LayerIntf.cpp:6575`), so the frame
     /// carries the destination's own bounds and unrelated layers stay visible.
     #[test]
