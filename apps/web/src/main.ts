@@ -733,6 +733,8 @@ if (wasmUrl) {
 
   const color = (item: any) => `rgba(${Math.round(item.r * 255)},${Math.round(item.g * 255)},${Math.round(item.b * 255)},${item.a ?? 1})`;
   const transitionTextures = new Map<number, HTMLCanvasElement>();
+  // Reused by `buildIncomingFace` for the transition's incoming face.
+  const transitionScratch = document.createElement("canvas");
   const uploadTextures = (uploads: any[], target: Map<number, HTMLCanvasElement>) => {
     for (const upload of uploads ?? []) {
       const bitmap = document.createElement("canvas");
@@ -775,54 +777,90 @@ if (wasmUrl) {
     for (const textureId of model.imageReleases ?? []) {
       textures.delete(Number(textureId));
     }
-    const drawCommands = (commands: any[], alpha: number, preferred?: Map<number, HTMLCanvasElement>) => {
-      context.save();
-      context.globalAlpha = alpha;
+    // `target` is explicit because the transition composite also draws the
+    // incoming face on a scratch canvas (see `buildIncomingFace`).
+    const drawCommands = (
+      target: CanvasRenderingContext2D,
+      commands: any[],
+      alpha: number,
+      preferred?: Map<number, HTMLCanvasElement>,
+    ) => {
+      target.save();
+      target.globalAlpha = alpha;
       for (const item of commands ?? []) {
         if (item.kind === "rect") {
-          context.fillStyle = color(item);
-          context.fillRect(item.x, item.y, item.width, item.height);
+          target.fillStyle = color(item);
+          target.fillRect(item.x, item.y, item.width, item.height);
         } else if (item.kind === "text") {
-          context.fillStyle = color(item);
+          target.fillStyle = color(item);
           const face = item.fontFace?.trim() || "sans-serif";
           const style = item.italic ? "italic " : "";
           const weight = item.bold ? "700 " : "400 ";
-          context.font = `${style}${weight}${item.size}px "${face.replaceAll('"', '')}"`;
-          context.textBaseline = "top";
-          context.shadowColor = item.shadowR !== undefined
+          target.font = `${style}${weight}${item.size}px "${face.replaceAll('"', '')}"`;
+          target.textBaseline = "top";
+          target.shadowColor = item.shadowR !== undefined
             ? `rgba(${Math.round(item.shadowR * 255)},${Math.round(item.shadowG * 255)},${Math.round(item.shadowB * 255)},${item.shadowA ?? 1})`
             : "transparent";
-          context.shadowOffsetX = item.shadowX ?? 0;
-          context.shadowOffsetY = item.shadowY ?? 0;
-          context.fillText(item.text, item.x, item.y);
-          context.shadowColor = "transparent";
+          target.shadowOffsetX = item.shadowX ?? 0;
+          target.shadowOffsetY = item.shadowY ?? 0;
+          target.fillText(item.text, item.x, item.y);
+          target.shadowColor = "transparent";
           if (item.underline || item.strikeout) {
-            const metrics = context.measureText(item.text);
-            context.fillRect(item.x, item.y + item.size * (item.strikeout ? 0.55 : 0.9), metrics.width, Math.max(1, item.size / 16));
+            const metrics = target.measureText(item.text);
+            target.fillRect(item.x, item.y + item.size * (item.strikeout ? 0.55 : 0.9), metrics.width, Math.max(1, item.size / 16));
           }
         } else if (item.kind === "image") {
           const bitmap = preferred?.get(Number(item.textureId)) ?? textures.get(Number(item.textureId));
           if (!bitmap) continue;
-          context.globalAlpha = alpha * (item.opacity ?? 1);
+          target.globalAlpha = alpha * (item.opacity ?? 1);
           const sx = item.sourceX ?? 0;
           const sy = item.sourceY ?? 0;
           const sw = item.sourceWidth ?? bitmap.width;
           const sh = item.sourceHeight ?? bitmap.height;
           // Draw the same atlas sub-rectangle selected by the Rust renderer.
           if (sw > 0 && sh > 0 && item.width > 0 && item.height > 0) {
-            context.drawImage(bitmap, sx, sy, sw, sh, item.x, item.y, item.width, item.height);
+            target.drawImage(bitmap, sx, sy, sw, sh, item.x, item.y, item.width, item.height);
           }
-          context.globalAlpha = alpha;
+          target.globalAlpha = alpha;
         }
       }
-      context.restore();
+      target.restore();
     };
+    // The incoming face is the source bitmap drawn over the scene *without* the
+    // destination layer (`underDrawList`), which is what the wgpu plan builds
+    // (`krkr_render::transition_composite_plan`).  Canvas2D can only chain
+    // straight-alpha source-over draws, and the composite needs the incoming
+    // face at `progress` *and* the old face at `1 - progress`, so the face is
+    // built on a scratch canvas and blended in as one image: drawing the source
+    // and the old face as two draws on one canvas would scale the incoming face
+    // by a second `progress`.
+    const buildIncomingFace = (
+      transition: any,
+    ): CanvasRenderingContext2D | null => {
+      if (
+        transitionScratch.width !== canvas.width
+        || transitionScratch.height !== canvas.height
+      ) {
+        transitionScratch.width = canvas.width;
+        transitionScratch.height = canvas.height;
+      }
+      const scratch = transitionScratch.getContext("2d");
+      if (!scratch) return null;
+      scratch.setTransform(scaleX, 0, 0, scaleY, 0, 0);
+      scratch.clearRect(0, 0, canvas.width, canvas.height);
+      scratch.translate(contentOffsetX, contentOffsetY);
+      scratch.scale(contentScale, contentScale);
+      drawCommands(scratch, transition.underDrawList, 1, transitionTextures);
+      drawCommands(scratch, transition.sourceDrawList, 1, transitionTextures);
+      return scratch;
+    };
+
     const transitions = Array.isArray(model.transitions) ? model.transitions : [];
     if (transitions.length > 0) {
       // The live frame is the base; each transition then rewrites only its own
       // destination rectangle, which keeps unrelated layers visible
       // (`tTransDrawable::DrawCompleted`, LayerIntf.cpp:6575).
-      drawCommands(model.drawList, 1);
+      drawCommands(context, model.drawList, 1);
       for (const transition of transitions) {
         uploadTextures(transition.frozenUploads, transitionTextures);
         uploadTextures(transition.underUploads, transitionTextures);
@@ -838,24 +876,33 @@ if (wasmUrl) {
           context.rect(0, 0, contentWidth, contentHeight);
         }
         context.clip();
-        // Canvas2D implements no KRKR transition shader, but the composition is
-        // the same one the wgpu path builds: the incoming face is the source
-        // bitmap (`tTVPDivisibleData::Src2`, LayerIntf.cpp:6611) drawn over the
-        // scene *without* the destination layer, and the old face is then mixed
-        // in at `1 - progress`.  Official's crossfade is `lerp(src1, src2, p)`
-        // per channel including alpha (`const_alpha_blend_functor`,
-        // blend_functor_c.h:584-594), so a pixel the source does not cover has
-        // to fade toward the scene beneath it instead of holding the
-        // destination's content at full strength.
-        context.globalAlpha = 1;
-        drawCommands(transition.underDrawList, 1, transitionTextures);
-        drawCommands(transition.sourceDrawList, progress, transitionTextures);
-        drawCommands(transition.frozenDrawList, 1 - progress, transitionTextures);
+        // The old face is the base inside the rectangle, and the incoming face
+        // is mixed over it at `progress`: `(1 - p) * old + p * (a * S +
+        // (1 - a) * under)`, the crossfade official performs -- `lerp(src1,
+        // src2, p)` per channel including alpha (`const_alpha_blend_functor`,
+        // blend_functor_c.h:584-594`) with the layer manager compositing the
+        // result over the scene beneath.
+        drawCommands(context, transition.frozenDrawList, 1, transitionTextures);
+        const incoming = buildIncomingFace(transition);
+        if (incoming) {
+          context.save();
+          // The scratch canvas already carries the content transform; reset it
+          // so the image lands pixel for pixel.  The clip is in device space
+          // and survives the reset.
+          context.setTransform(1, 0, 0, 1, 0, 0);
+          context.globalAlpha = progress;
+          context.drawImage(incoming.canvas, 0, 0);
+          context.restore();
+        } else {
+          // Without a scratch canvas the source face goes over the live frame,
+          // which is the destination's own content.
+          drawCommands(context, transition.sourceDrawList, progress, transitionTextures);
+        }
         context.restore();
       }
     } else {
       transitionTextures.clear();
-      drawCommands(model.drawList, 1);
+      drawCommands(context, model.drawList, 1);
     }
     context.restore();
   };
