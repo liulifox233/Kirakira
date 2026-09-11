@@ -335,8 +335,9 @@ impl LayerInstance {
 pub(crate) struct WindowInstance {
     pub children: Vec<ObjectHandle>,
     pub children_array: Option<ObjectHandle>,
-    /// See [`LayerInstance::children_dirty`]; `Window.children` is the same
-    /// cached array the script sees.
+    /// See [`LayerInstance::children_dirty`]. The array is engine-internal --
+    /// official `Window` has no `children` member (M2 §5a) -- and is rebuilt in
+    /// place for `Window.add`/`Window.remove` and layer invalidation.
     pub children_dirty: bool,
     pub primary_layer: Option<ObjectHandle>,
     pub focused_layer: Option<ObjectHandle>,

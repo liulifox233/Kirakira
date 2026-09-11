@@ -5309,6 +5309,51 @@ mod tests {
         assert_eq!(engine.host().native_layer_window(layer), Some(window));
     }
 
+    /// `Window.add`/`remove` take their argument through
+    /// `AsObjectClosureNoAddRef()` (`WindowIntf.cpp:829-847`), so the
+    /// self-bound values this engine hands out for `parent`/`children[i]` name
+    /// the layer they bind.
+    #[test]
+    fn window_add_and_remove_accept_self_bound_layer_values() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.root = new Layer(window, null);
+                global.child = new Layer(window, root);
+                // `child.parent` and `root.children[0]` are both
+                // `tTJSVariant(dsp, dsp)` (`LayerIntf.cpp:8490`, `:665`).
+                window.add(child.parent);
+                window.add(root.children[0]);
+                "#,
+            )
+            .expect("add");
+
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window missing");
+        };
+        let Variant::Object(root) = engine.tjs_runtime().global_member("root") else {
+            panic!("root missing");
+        };
+        let Variant::Object(child) = engine.tjs_runtime().global_member("child") else {
+            panic!("child missing");
+        };
+        assert_eq!(
+            engine.host().native_window_children(window),
+            vec![root, child]
+        );
+        assert_eq!(engine.host().native_layer_window(root), Some(window));
+        assert_eq!(engine.host().native_layer_window(child), Some(window));
+
+        engine
+            .execute_script("inline.tjs", "window.remove(child.parent);")
+            .expect("remove");
+        assert_eq!(engine.host().native_window_children(window), vec![child]);
+        assert_eq!(engine.host().native_window_primary_layer(window), None);
+    }
+
     #[test]
     fn layer_children_is_a_cached_array_rebuilt_from_the_tree() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -5569,16 +5614,59 @@ mod tests {
                 var mode = second.order + ":" + second.absolute;
                 second.absolute = 5;
                 var absoluteAfter = second.absolute + ":" + parent.absoluteOrderMode;
+                // Writing either index needs a parent:
+                // `TVPCannotMovePrimaryOrSiblingless` (`LayerIntf.cpp:1221`,
+                // `:1264`; `string_table_en.rc:128`).
+                var siblinglessOrder = "";
+                try { (new Layer()).order = 0; } catch (e) { siblinglessOrder = e.message; }
+                var siblinglessAbsolute = "";
+                try { (new Layer()).absolute = 1; } catch (e) {
+                    siblinglessAbsolute = e.message;
+                }
                 return before + ":" + absoluteBefore + ":" + after + ":" + detached + ":" +
-                    mode + ":" + absoluteAfter;
+                    mode + ":" + absoluteAfter + ":" + siblinglessOrder + ":" +
+                    siblinglessAbsolute;
                 "#,
             )
             .expect("script");
 
         assert_eq!(
             value,
-            Variant::String("0:1:2:0:2:0:1:0:0:0:0:5:1".to_string())
+            Variant::String(
+                "0:1:2:0:2:0:1:0:0:0:0:5:1:Cannot move primary or siblingless:\
+                 Cannot move primary or siblingless"
+                    .to_string()
+            )
         );
+    }
+
+    /// A layer placed with an absolute index keeps that index until an `order`
+    /// write; the render apply then has to follow the sibling order rather than
+    /// snap back to the stale absolute value (`apply_layer_properties_to_node`
+    /// prefers `absolute`).
+    #[test]
+    fn layer_order_write_clears_a_stale_absolute_placement() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                var parent = new Layer(window, null);
+                global.first = new Layer(null, parent);
+                global.second = new Layer(null, parent);
+                global.third = new Layer(null, parent);
+                first.absolute = 500;
+                first.order = 0;
+                // Any window move re-applies every layer to the render tree,
+                // which is when the stored keys are read back.
+                window.left = 5;
+                return first.order + ":" + second.order + ":" + third.order;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("0:1:2".to_string()));
     }
 
     /// `nodeFocusable`, `prevFocusable`, `nextFocusable` and `focused` are
@@ -5614,19 +5702,29 @@ mod tests {
                 var focus = first.focused + ":" + second.focused + ":" + third.focused;
                 first.focus();
                 var moved = first.focused + ":" + second.focused;
+                // `order` moves the layer inside the children vector, and the
+                // focus search walks that vector (`tTVPLayerManager::AllNodes`,
+                // `LayerManager.cpp:181-190`), not the creation order: after
+                // moving `first` to index 1 the cycle is
+                // `root, second, first, third`.
+                first.order = 1;
+                var reordered = (first.nextFocusable == third) + ":" +
+                    (first.prevFocusable == second) + ":" +
+                    (second.nextFocusable == first) + ":" +
+                    (third.nextFocusable == second);
                 // Leaving the focus chain removes a layer from the search.
                 second.joinFocusChain = false;
                 third.joinFocusChain = false;
                 var lonely = (first.nextFocusable === null) + ":" +
                     (first.prevFocusable === null);
-                return chain + ":" + focus + ":" + moved + ":" + lonely;
+                return chain + ":" + focus + ":" + moved + ":" + reordered + ":" + lonely;
                 "#,
             )
             .expect("script");
 
         assert_eq!(
             value,
-            Variant::String("0:1:1:1:1:1:1:0:1:0:1:0:1:1".to_string())
+            Variant::String("0:1:1:1:1:1:1:0:1:0:1:0:1:1:1:1:1:1".to_string())
         );
     }
 
@@ -7314,7 +7412,12 @@ mod tests {
                 under.setImageSize(120, 80);
                 under.fillRect(0, 0, 120, 80, 0xffffffff);
                 under.visible = true;
-                under.order = 100;
+                // The under layer has to be the topmost root for this test to
+                // mean anything. A parentless layer cannot be moved with
+                // `order` (`TVPCannotMovePrimaryOrSiblingless`,
+                // `LayerIntf.cpp:1220`), and `bringToFront` is the engine's
+                // pre-existing lenient path for exactly this fixture.
+                under.bringToFront();
                 under.onClick = function(x, y) { global.trace += "U"; };
 
                 global.modal = new Window();
@@ -15649,7 +15752,11 @@ mod tests {
             .execute_script(
                 "inline.tjs",
                 r#"
-                global.layer = new Layer();
+                // `SetAbsoluteOrderIndex` needs a parent
+                // (`TVPCannotMovePrimaryOrSiblingless`, `LayerIntf.cpp:1263`)
+                // and switches that parent to absolute order mode.
+                global.parent = new Layer();
+                global.layer = new Layer(null, parent);
                 layer.absolute = 2000000;
                 "#,
             )

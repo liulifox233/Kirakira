@@ -819,12 +819,19 @@ fn sync_children_array(
     };
     runtime.array_clear(array);
     for child in children {
-        // Official inserts each child as `tTJSVariant(dsp, dsp)`
-        // (`LayerIntf.cpp:665`), so `parent.children[0].focus()` runs with the
-        // child as its own objthis.
-        runtime.array_push(array, self_bound(Variant::Object(child)));
+        runtime.array_push(array, children_array_entry(child));
     }
     Some(array)
+}
+
+/// The value a children array stores for one child.
+///
+/// Official inserts `tTJSVariant(dsp, dsp)` (`LayerIntf.cpp:665`), so
+/// `parent.children[0].focus()` runs with the child as its own objthis. The
+/// engine's own array writes (`Window.add`/`Window.remove`) must use the same
+/// shape or they cannot find an entry the rebuild created.
+fn children_array_entry(child: ObjectHandle) -> Variant {
+    self_bound(Variant::Object(child))
 }
 
 /// The engine-internal "the array a window/layer keeps its children in"
@@ -1232,12 +1239,15 @@ fn window_add(
 ) -> Result<Variant> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("Window.add requires this"))?;
     let item = args.first().cloned().unwrap_or_default();
-    let Variant::Object(item_handle) = item else {
+    // The reference takes the argument through `AsObjectClosureNoAddRef()`
+    // (`WindowIntf.cpp:829-847`), so a self-bound value -- `layer.parent`,
+    // `parent.children[0]` -- names the object it binds.
+    let Some(item_handle) = variant_object(&item) else {
         return Ok(Variant::Void);
     };
     let children = ensure_child_array(runtime, this);
-    runtime.array_remove_value(children, &Variant::Object(item_handle));
-    runtime.array_push(children, Variant::Object(item_handle));
+    runtime.array_remove_value(children, &children_array_entry(item_handle));
+    runtime.array_push(children, children_array_entry(item_handle));
     runtime
         .host_mut()
         .add_native_window_child(this, item_handle);
@@ -1270,23 +1280,24 @@ fn window_remove(
 ) -> Result<Variant> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("Window.remove requires this"))?;
     let item = args.first().cloned().unwrap_or_default();
+    // See `window_add`: the argument is an object closure, and a self-bound
+    // value names the layer it binds.
+    let Some(item_handle) = variant_object(&item) else {
+        return Ok(Variant::Void);
+    };
     let children = ensure_child_array(runtime, this);
-    runtime.array_remove_value(children, &item);
-    if let Variant::Object(item_handle) = &item {
-        runtime
-            .host_mut()
-            .remove_native_window_child(this, *item_handle);
+    runtime.array_remove_value(children, &children_array_entry(item_handle));
+    runtime
+        .host_mut()
+        .remove_native_window_child(this, item_handle);
+    // `primaryLayer`/`focusedLayer` are native properties whose value lives in
+    // the host instance, so the comparison runs against that storage rather
+    // than against the accessor the object member holds.
+    if runtime.host().native_window_primary_layer(this) == Some(item_handle) {
+        set_window_property_storage(runtime, this, "primaryLayer", Variant::Void);
     }
-    if let Variant::Object(item_handle) = &item {
-        // `primaryLayer`/`focusedLayer` are native properties whose value lives
-        // in the host instance, so the comparison runs against that storage
-        // rather than against the accessor the object member holds.
-        if runtime.host().native_window_primary_layer(this) == Some(*item_handle) {
-            set_window_property_storage(runtime, this, "primaryLayer", Variant::Void);
-        }
-        if runtime.host().native_window_focused_layer(this) == Some(*item_handle) {
-            set_window_property_storage(runtime, this, "focusedLayer", Variant::Null);
-        }
+    if runtime.host().native_window_focused_layer(this) == Some(item_handle) {
+        set_window_property_storage(runtime, this, "focusedLayer", Variant::Null);
     }
     Ok(Variant::Void)
 }
@@ -2066,23 +2077,28 @@ fn layer_native_property_set(
         return Ok(());
     }
     if name == "order" {
-        // `SetOrderIndex` (`LayerIntf.cpp:1218-1231`): the parent drops
-        // absolute order mode and the layer moves to the requested sibling
-        // position, clamped to the child count. `Layer.order` reports the live
-        // position, so the write has to move the tree rather than only store a
-        // number.
-        let index = set_layer_sibling_order(runtime, this, value.to_integer()?);
+        // `SetOrderIndex` (`LayerIntf.cpp:1218-1231`): the layer must have a
+        // parent, the parent drops absolute order mode, and the layer moves to
+        // the requested sibling position, clamped to the child count.
+        // `Layer.order` reports the live position, so the write has to move the
+        // tree rather than only store a number.
+        let requested = value.to_integer()?;
+        let Some(index) = set_layer_sibling_order(runtime, this, requested) else {
+            return Err(cannot_move_primary_or_siblingless());
+        };
         set_layer_property_storage(runtime, this, "order", Variant::Integer(index));
         return Ok(());
     }
     if name == "absolute" {
-        // `SetAbsoluteOrderIndex` (`:1262-1272`): the parent switches to
-        // absolute order mode and this layer's index is stored verbatim -- KAG
-        // picks `absolute` values far above the child count on purpose.
+        // `SetAbsoluteOrderIndex` (`:1262-1272`): the layer must have a parent,
+        // which switches to absolute order mode; this layer's index is stored
+        // verbatim -- KAG picks `absolute` values far above the child count on
+        // purpose.
         let index = value.to_integer()?;
-        if let Some(parent) = layer_parent_object(runtime, this) {
-            set_layer_absolute_order_mode(runtime, parent, true);
-        }
+        let Some(parent) = layer_parent_object(runtime, this) else {
+            return Err(cannot_move_primary_or_siblingless());
+        };
+        set_layer_absolute_order_mode(runtime, parent, true);
         let index = Variant::Integer(index);
         set_layer_property_storage(runtime, this, "absolute", index.clone());
         return apply_layer_property_to_render(runtime, this, name, &index);
@@ -2128,20 +2144,33 @@ fn layer_absolute_order_index(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) 
     }
 }
 
+/// `TVPCannotMovePrimaryOrSiblingless` (`LayerIntf.cpp:1221`, `:1264`;
+/// `IDS_TVP_CANNOT_MOVE_PRIMARY_OR_SIBLINGLESS`, `string_table_en.rc:128`): a
+/// primary or otherwise parentless layer has no sibling list to move through.
+fn cannot_move_primary_or_siblingless() -> TjsError {
+    TjsError::runtime("Cannot move primary or siblingless")
+}
+
 /// Moves a layer to `requested` among its siblings and reports the index it
-/// landed on. Official `ChildChangeOrder` (`LayerIntf.cpp:1120-1167`) rotates
-/// the children vector; the render tree orders siblings by `(z_order, id)`, so
-/// the new arrangement is written back as dense `z_order` values, and every
-/// sibling's stored `order` follows (`apply_layer_properties_to_node` reads it
-/// back into the render node on the next apply).
+/// landed on, or `None` when it has no parent (the caller reports
+/// `TVPCannotMovePrimaryOrSiblingless`).
+///
+/// Official `ChildChangeOrder` (`LayerIntf.cpp:1120-1167`) rotates the children
+/// vector; the render tree orders siblings by `(z_order, id)`, so the new
+/// arrangement is written back as dense `z_order` values.
+///
+/// Every sibling's stored `order` *and* `absolute` follow, because
+/// `apply_layer_properties_to_node` reads those keys back into the render node
+/// on the next apply and prefers `absolute`. With absolute order mode off the
+/// two are the same index (`GetAbsoluteOrderIndex` returns `GetOrderIndex()`,
+/// `:1253-1260`), so updating both keeps a layer that was once placed with an
+/// absolute index from snapping back to it after an `order` write.
 fn set_layer_sibling_order(
     runtime: &mut Runtime<KrkrHost>,
     layer: ObjectHandle,
     requested: i64,
-) -> i64 {
-    let Some(parent) = layer_parent_object(runtime, layer) else {
-        return 0;
-    };
+) -> Option<i64> {
+    let parent = layer_parent_object(runtime, layer)?;
     // `SetOrderIndex` leaves absolute order mode (`LayerIntf.cpp:1223`).
     set_layer_absolute_order_mode(runtime, parent, false);
     let index = runtime
@@ -2149,10 +2178,12 @@ fn set_layer_sibling_order(
         .reorder_native_layer(layer, requested)
         .unwrap_or(0);
     for child in runtime.host().native_layer_children(parent) {
-        let order = runtime.host().native_layer_order_index(child).unwrap_or(0) as i64;
-        set_layer_property_storage(runtime, child, "order", Variant::Integer(order));
+        let order =
+            Variant::Integer(runtime.host().native_layer_order_index(child).unwrap_or(0) as i64);
+        set_layer_property_storage(runtime, child, "order", order.clone());
+        set_layer_property_storage(runtime, child, "absolute", order);
     }
-    index
+    Some(index)
 }
 
 /// Official `SetAbsoluteOrderMode` (`LayerIntf.cpp:1274-1294`): entering the
@@ -6776,6 +6807,11 @@ fn window_layers_in_order(
 
 /// Depth-first walk of one layer subtree that records every node and, in the
 /// same pass, the focus-chain members.
+///
+/// Children are visited in the reference's `Children` order, i.e. z-order:
+/// `tTVPLayerManager::AllNodes` is rebuilt from that vector
+/// (`LayerManager.cpp:181-190`) and `GetPrevFocusable`/`GetNextFocusable` walk
+/// the result, so a reorder has to move the focus search with it.
 fn collect_layers(
     runtime: &Runtime<KrkrHost>,
     layer: ObjectHandle,
@@ -6791,9 +6827,28 @@ fn collect_layers(
         focusable.push(layer);
     }
     all.push(layer);
-    for child in layer_children(runtime, layer) {
+    for child in layer_children_in_draw_order(runtime, layer) {
         collect_layers(runtime, child, visited, all, focusable);
     }
+}
+
+/// [`layer_children`] sorted into the render tree's draw order --
+/// `LayerTree::sorted_children`'s `(z_order, id)` key, the engine's counterpart
+/// of the reference's `Children` vector.
+fn layer_children_in_draw_order(
+    runtime: &Runtime<KrkrHost>,
+    layer: ObjectHandle,
+) -> Vec<ObjectHandle> {
+    let mut children = layer_children(runtime, layer);
+    children.sort_by_key(|child| {
+        runtime
+            .host()
+            .native_layer(*child)
+            .and_then(|id| runtime.host().layer_tree().layer(id))
+            .map(|node| (node.z_order, node.id))
+            .unwrap_or((i32::MAX, 0))
+    });
+    children
 }
 
 fn focusable_layers_for_window(
