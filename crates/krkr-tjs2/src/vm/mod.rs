@@ -1688,3 +1688,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod closure_tests;
