@@ -390,9 +390,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let primary_value = self.member_in_super_chain(primary, name)?;
                 let primary_has_member = primary_value.is_some();
                 if primary_has_member || (bind_this.is_none() && flags.ensure) {
+                    // Known deviation, deferred to the self-bound value model
+                    // mission: the reference skips the property object for a
+                    // store that carries `TJS_IGNOREPROP`
+                    // (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1519-1541`),
+                    // but a value stored from `this` carries no binding in this
+                    // engine, so the KAGEX font hook (`&a2.font = this` then
+                    // `layer.font.face = x`) needs the setter to run until
+                    // `this` and `new` results are `tTJSVariant(dsp, dsp)`.
                     if let Some(this_obj) = bind_this {
                         if let Some(existing) = primary_value.clone()
-                            && !flags.ignore_prop
+                            && (!flags.ignore_prop
+                                || self.runtime.variant_is_native_property(&existing))
                             && self
                                 .property_setter(existing, value.clone(), Some(this_obj))?
                                 .is_some()
@@ -406,7 +415,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         && primary_has_member
                     {
                         if let Some(existing) = primary_value.clone()
-                            && !flags.ignore_prop
+                            && (!flags.ignore_prop
+                                || self.runtime.variant_is_native_property(&existing))
                             && self
                                 .property_setter(existing, value.clone(), Some(this_obj))?
                                 .is_some()
@@ -444,15 +454,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let member_exists = self.runtime.heap[handle.0].get_raw(name).is_some()
             || (!self.is_bytecode_class(handle)
                 && self.class_chain_provides_member(handle, name)?);
-        // `TJS_IGNOREPROP` skips the property object entirely and copies the
-        // value into the member slot (`tTJSCustomObject::PropSet`,
-        // `tjsObject.cpp:1519-1541`, and `TJSDefaultPropSet`, `:1435-1466`), so
-        // `&obj.prop = v` replaces a property -- script or native -- instead of
-        // running its setter, and a property that denies writes
-        // (`TJS_DENY_NATIVE_PROP_SETTER`, `Layer.font`) does not deny this
-        // store.  A plain store runs the setter.
-        if !flags.ignore_prop
-            && let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
+        // Known deviation, deferred to the self-bound value model mission: the
+        // reference skips the property object entirely under `TJS_IGNOREPROP`
+        // and copies the value into the member slot (`tTJSCustomObject::PropSet`,
+        // `tjsObject.cpp:1519-1541`; `TJSDefaultPropSet`, `:1435-1466`), so
+        // `&obj.prop = v` replaces the member -- including a denied native
+        // property such as `Layer.font`.  The skip cannot land before `this`
+        // and `new`'s result carry their binding: a value stored from `this`
+        // keeps none in this engine, so the reference's `&a2.font = this` hook
+        // (`sysscn/prerenderfontex.tjs`, then `layer.font.face = x`) would run
+        // its injected setter against the writer instead of the hook, which
+        // aborts the GINKA boot (round-2 review of 842cc15).  Until then a
+        // native property keeps running its setter under this flag.
+        if let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
+            && (!flags.ignore_prop || self.runtime.variant_is_native_property(&existing))
             && self
                 .property_setter(existing, value.clone(), caller_this)?
                 .is_some()
@@ -3935,16 +3950,26 @@ mod tests {
         );
     }
 
-    /// `&obj.prop = v` is `VM_SPDS` (MEMBERENSURE|TJS_IGNOREPROP), and the
-    /// reference skips the property object for that flag: the value is copied
+    /// `&obj.prop = v` is `VM_SPDS` (MEMBERENSURE|TJS_IGNOREPROP).  The
+    /// reference skips the property object for that flag and copies the value
     /// straight into the member slot (`tTJSCustomObject::PropSet`,
-    /// `tjsObject.cpp:1519-1541`; `TJSDefaultPropSet`, `:1435-1466`).  A plain
-    /// store runs the setter, and a property that denies writes
-    /// (`TJS_DENY_NATIVE_PROP_SETTER` in the reference class registration)
-    /// does not deny the ignore-prop store -- which is what lets a script
-    /// replace such a member.
+    /// `tjsObject.cpp:1519-1541`; `TJSDefaultPropSet`, `:1435-1466`), which a
+    /// *script* property already gets here -- the write replaces the property
+    /// object.  A native property does not yet: this engine keeps invoking its
+    /// setter under the flag.
+    ///
+    /// That last part is a known deviation, deliberately deferred to the
+    /// self-bound value model mission the tower is planning.  The reference's
+    /// KAGEX font hook (`&a2.font = this` in `sysscn/prerenderfontex.tjs`,
+    /// then `layer.font.face = x`) needs the stored value to carry the hook as
+    /// its `ObjThis` -- `ra[-1]` is `tTJSVariant(objthis, objthis)`
+    /// (`tjsInterCodeExec.cpp:839`) -- and until `this` and `new` results are
+    /// bound that way here, skipping the native setter runs the injected `face`
+    /// setter against the writer rather than the hook and aborts the GINKA boot
+    /// (round-2 review of 842cc15).  So this test pins today's behaviour, and
+    /// the skip lands with the value model.
     #[test]
-    fn ignore_prop_store_skips_the_property() {
+    fn ignore_prop_store_reaches_a_native_property_setter_until_the_value_model_lands() {
         assert_eq!(
             run(r#"
                 class Holder {
@@ -3975,14 +4000,14 @@ mod tests {
             |_runtime, _this| Ok(Variant::String("font-object".to_string())),
             |_runtime, _this, _value| Ok(()),
         );
-        let error = run_with(&mut runtime, r#"target.font = "x";"#).expect_err("denied write");
-        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
-        assert_eq!(error.tjs_error_code(), Some(-1007));
-
-        run_with(&mut runtime, r#"&target.font = "hook";"#).expect("ignore-prop store");
+        for source in [r#"target.font = "x";"#, r#"&target.font = "x";"#] {
+            let error = run_with(&mut runtime, source).expect_err("the denial applies");
+            assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{source}");
+            assert_eq!(error.tjs_error_code(), Some(-1007), "{source}");
+        }
         assert_eq!(
-            run_with(&mut runtime, "return target.font;").expect("replaced member"),
-            Variant::String("hook".to_string())
+            run_with(&mut runtime, "return target.font;").expect("getter still answers"),
+            Variant::String("font-object".to_string())
         );
     }
 

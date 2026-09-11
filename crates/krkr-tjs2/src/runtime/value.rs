@@ -221,18 +221,19 @@ impl Variant {
             (Self::Octet(lhs), Self::Octet(rhs)) => lhs == rhs,
             (Self::Object(lhs), Self::Object(rhs)) => lhs == rhs,
             (Self::Closure(lhs), Self::Closure(rhs)) => lhs == rhs,
-            // The two spellings of a self-bound object are the same value
-            // here: `tTJSVariant(objthis, objthis)` -- what the reference
-            // stores for `VM_NEW`'s result (`tjsInterCodeExec.cpp:2384`) and
-            // returns from its self-bound members -- and a host-side
-            // `Variant::Object` carrying only the handle, which is how this
-            // engine hands those values out wherever a host native builds
-            // them.  They meet in script comparisons, so
-            // `new X() === x.selfBoundMember` holds either way.  A closure
-            // bound to *another* object still differs, and so does a closure
-            // whose object is a different one; a NULL binding is the
-            // reference's unbound object and compares equal too
-            // (`tTJSVariant::DiscernCompare`, `tjsVariant.cpp:778-780`).
+            // TEMPORARY, until `this` and `new` results carry their binding
+            // (`tTJSVariant(objthis, objthis)`, `tjsInterCodeExec.cpp:839`,
+            // `:2384`): an object and a closure over that same object bound to
+            // itself -- or not bound at all -- are one value here, because this
+            // engine cannot tell the reference's `(h, h)` from its `(h, NULL)`:
+            // a host hands a self-bound member out as a plain object.  Script
+            // meets both spellings in `===`, so `new X() === x.selfBoundMember`
+            // holds, and a closure bound to *another* object (or over another
+            // handle) still differs.  The reference does distinguish `(h, h)`
+            // from `(h, NULL)` (`tTJSVariant::DiscernCompare`,
+            // `tjsVariant.cpp:775-778`), so this arm answers true in that one
+            // window; retire it when the literal self-binding lands (the
+            // engine's `variant_object` helpers already unwrap closures).
             (Self::Object(handle), Self::Closure(closure))
             | (Self::Closure(closure), Self::Object(handle)) => {
                 handle == &closure.object && closure.this_obj.is_none_or(|this| this == *handle)
