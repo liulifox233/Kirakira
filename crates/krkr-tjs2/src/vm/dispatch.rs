@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::bytecode::{BytecodeContextType, CallArgs, CodeObject, Instruction};
@@ -970,20 +971,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             19 | 23 => {
                 let object_value = frame.get(inst.operands[1])?;
                 let name = self.data_slot_string(object, inst.operands[2])?;
-                self.operate_property(object_value, &name, None, frame.this_obj, |value, _| {
-                    if inc {
-                        value.increment()
-                    } else {
-                        value.decrement()
-                    }
-                })?
+                self.operate_property(
+                    object_value,
+                    OpMember::Name(&name),
+                    None,
+                    frame.this_obj,
+                    |value, _| {
+                        if inc {
+                            value.increment()
+                        } else {
+                            value.decrement()
+                        }
+                    },
+                )?
             }
             20 | 24 => {
                 let object_value = frame.get(inst.operands[1])?;
                 let member = frame.get(inst.operands[2])?;
-                self.operate_property_member(
+                self.operate_property(
                     object_value,
-                    &member,
+                    OpMember::Value(&member),
                     None,
                     frame.this_obj,
                     |value, _| {
@@ -1034,7 +1041,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let family = binary_family(inst.opcode);
                 let value = self.operate_property(
                     object_value,
-                    &name,
+                    OpMember::Name(&name),
                     Some(rhs),
                     frame.this_obj,
                     |value, rhs| execute_binary_value(family, value, rhs.expect("rhs present")),
@@ -1048,9 +1055,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let member = frame.get(inst.operands[2])?;
                 let rhs = frame.get(inst.operands[3])?;
                 let family = binary_family(inst.opcode);
-                let value = self.operate_property_member(
+                let value = self.operate_property(
                     object_value,
-                    &member,
+                    OpMember::Value(&member),
                     Some(rhs),
                     frame.this_obj,
                     |value, rhs| execute_binary_value(family, value, rhs.expect("rhs present")),
@@ -1073,53 +1080,47 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         Ok(())
     }
 
+    /// The op protocol behind compound assignment and inc/dec on a member
+    /// (`OperatePropertyDirect`/`OperatePropertyIndirect`/
+    /// `OperatePropertyDirect0`/`OperatePropertyIndirect0`,
+    /// `tjsInterCodeExec.cpp:1811-1985`).
+    ///
+    /// Every one of those functions takes the receiver's closure *before* the
+    /// member (`:1816`, `:1842`, `:1925`, `:1950` call `AsObjectClosure`,
+    /// which throws for anything that is not an object, `tjsVariant.h:710-719`),
+    /// so a string or octet receiver fails with the conversion error here and
+    /// its member is never read or written -- unlike a plain `"abc"[0] = x`
+    /// store, which reaches `SetStringProperty`.
     fn operate_property(
         &mut self,
         object_value: Variant,
-        name: &str,
+        member: OpMember<'_>,
         rhs: Option<Variant>,
         caller_this: Option<ObjectHandle>,
         op: impl FnOnce(Variant, Option<Variant>) -> Result<Variant>,
     ) -> Result<Variant> {
+        let (handle, closure_this) = self.closure_parts(object_value)?;
+        let receiver = match closure_this {
+            Some(this_obj) => Variant::Closure(Closure::new(handle, Some(this_obj))),
+            None => Variant::Object(handle),
+        };
+        // The member name is read only after that conversion succeeded
+        // (`:1842-1853`, `:1950-1963`), so a failure there never masks the
+        // receiver's own conversion error.
+        let name: Cow<'_, str> = match member {
+            OpMember::Name(name) => Cow::Borrowed(name),
+            OpMember::Value(value) => Cow::Owned(self.key_from_variant(value)?),
+        };
         let current = self.prop_get(
-            object_value.clone(),
-            name,
+            receiver.clone(),
+            &name,
             DispatchFlags::default(),
             caller_this,
         )?;
         let value = op(current, rhs)?;
         self.prop_set(
-            object_value,
-            name,
-            value.clone(),
-            DispatchFlags::default(),
-            caller_this,
-        )?;
-        Ok(value)
-    }
-
-    /// [`Vm::operate_property`] for a member operand that is a value rather
-    /// than a name. Both halves see the same member (`PropGet` then `PropSet`
-    /// on the same variant, `tjsInterCodeExec.cpp:1682-1730`), so a string or
-    /// octet receiver reads and writes through the reference's typed member.
-    fn operate_property_member(
-        &mut self,
-        object_value: Variant,
-        member: &Variant,
-        rhs: Option<Variant>,
-        caller_this: Option<ObjectHandle>,
-        op: impl FnOnce(Variant, Option<Variant>) -> Result<Variant>,
-    ) -> Result<Variant> {
-        let current = self.prop_get_member(
-            object_value.clone(),
-            member,
-            DispatchFlags::default(),
-            caller_this,
-        )?;
-        let value = op(current, rhs)?;
-        self.prop_set_member(
-            object_value,
-            member,
+            receiver,
+            &name,
             value.clone(),
             DispatchFlags::default(),
             caller_this,
@@ -1136,6 +1137,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let object_value = frame.get(inst.operands[1])?;
         let name = self.data_slot_string(object, inst.operands[2])?;
+        // When the `typeof` finding is fixed, a string/octet receiver must be
+        // read through [`Vm::prop_get_member`] with this name as the member
+        // (`TypeOfMemberDirect` calls `GetStringProperty` outside any error
+        // handler, `tjsInterCodeExec.cpp:2093-2105`), and only the object
+        // branch may map a miss to "undefined".
         Ok(
             match self.prop_get(
                 object_value,
@@ -1157,6 +1163,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let object_value = frame.get(inst.operands[1])?;
         let name = self.key_from_variant(&frame.get(inst.operands[2])?)?;
+        // See [`Vm::typeof_direct`]: the fixed form takes the raw member and
+        // goes through [`Vm::prop_get_member`] for a string/octet receiver
+        // (`TypeOfMemberIndirect`, `tjsInterCodeExec.cpp:2142-2163`).
         Ok(
             match self.prop_get(
                 object_value,
@@ -3326,6 +3335,15 @@ fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
+/// The member operand of an op-protocol access (`OperateProperty*`,
+/// `tjsInterCodeExec.cpp:1811-1985`): a name from the instruction's data
+/// area, or the raw register value of the indirect form, which the reference
+/// converts with `AsString` only after the receiver's closure.
+enum OpMember<'a> {
+    Name(&'a str),
+    Value(&'a Variant),
+}
+
 /// The member operand of a string/octet property access, resolved the way
 /// `GetStringProperty`/`GetOctetProperty` see it (`tjsInterCodeExec.cpp:50`,
 /// `:106`, `:132`, `:176`): an Integer or Real member is an index, every
@@ -3343,6 +3361,10 @@ fn member_kind(member: &Variant) -> Result<MemberKind<'_>> {
         // its 32-bit `tjs_int`, so an out-of-range key truncates instead of
         // reporting a range error.
         Variant::Integer(value) => Ok(MemberKind::Index(*value as i32)),
+        // A real outside the i64 range saturates in the first cast where the
+        // reference's `(tjs_int64)` is undefined (x86 yields the integer
+        // indefinite value, so `"abc"[1e20]` is index 0 there and a range
+        // error here).
         Variant::Real(value) => Ok(MemberKind::Index(*value as i64 as i32)),
         other => Err(TjsError::variant_convert(other, "string")),
     }
@@ -4081,13 +4103,65 @@ mod tests {
     }
 
     #[test]
-    fn string_and_octet_property_failures_no_longer_convert_to_object() {
-        // Before the string/octet arms, these writes reported the
-        // variant-to-object conversion failure instead of the official code
-        // (`prop_set` fell through to `closure_parts`).
-        let error = failure(r#"return "abc".length = 1;"#);
-        assert!(!error.message.contains("Cannot convert"));
-        let error = failure("return (<% 10 20 FF %>).length = 1;");
-        assert!(!error.message.contains("Cannot convert"));
+    fn plain_string_and_octet_writes_reach_the_property_readers() {
+        // A plain store goes to `SetStringProperty`/`SetOctetProperty`
+        // (`tjsInterCodeExec.cpp:1624-1656`) and reports the official codes
+        // there, where `prop_set` used to fall through to `closure_parts` and
+        // answer the object conversion error.
+        for source in [
+            r#"return "abc".length = 1;"#,
+            r#"return "abc"[0] = "z";"#,
+            "return (<% 10 20 FF %>).length = 1;",
+            "return (<% 10 20 FF %>)[0] = 1;",
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{source}");
+            assert_eq!(
+                error.message, "Invalid operation for Read-only or Write-only property",
+                "{source}"
+            );
+        }
+        for source in [
+            r#"return "abc"[" 1"] = "z";"#,
+            "return (<% 10 20 FF %>)[' 1'] = 1;",
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::MemberNotFound, "{source}");
+        }
+    }
+
+    #[test]
+    fn compound_and_inc_dec_members_convert_the_receiver_first() {
+        // The op protocol asks the receiver for its closure *before* touching
+        // the member (`AsObjectClosure`, `tjsInterCodeExec.cpp:1816`, `:1842`,
+        // `:1925`, `:1950`), so these forms fail with the conversion error and
+        // never reach the string/octet property readers -- unlike the plain
+        // stores pinned above.
+        for (source, rendered) in [
+            (r#"return "abc"[0] += "z";"#, "(string)\"abc\""),
+            (r#"return "abc"["0"] += "z";"#, "(string)\"abc\""),
+            (r#"return "abc".length++;"#, "(string)\"abc\""),
+            (r#"return "abc"[0]++;"#, "(string)\"abc\""),
+            ("return (<% 10 %>)[0] += 1;", "(octet)<% 10 %>"),
+            ("return (<% 10 %>).length++;", "(octet)<% 10 %>"),
+            (r#"return 5[0] += 1;"#, "(int)5"),
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::Runtime, "{source}");
+            assert_eq!(
+                error.message,
+                format!("Cannot convert the variable type ({rendered} to Object)"),
+                "{source}"
+            );
+        }
+        // Object receivers keep working through the same protocol.
+        assert_eq!(
+            run(r#"var o = %[]; o.x = 1; o.x += 2; o.x++; return o.x;"#).expect("object op"),
+            Variant::Integer(4)
+        );
+        assert_eq!(
+            run(r#"var a = [1, 2]; a[0] += 5; a[1]++; return a[0] + a[1];"#).expect("array op"),
+            Variant::Integer(9)
+        );
     }
 }
