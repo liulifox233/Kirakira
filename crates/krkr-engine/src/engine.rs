@@ -5071,7 +5071,7 @@ mod tests {
                 var z = Scripts.evalStorage(zipPath, "z1");
                 var be = Scripts.evalStorage(binPath, "b");
                 var b = new Dictionary();
-                b.loadStruct(binPath, "b");
+                (Dictionary.loadStruct incontextof b)(binPath, "b");
                 return c.child.name + ":" + z.list[1] + ":" + b.answer + ":" + be.child.name;
                 "#,
             )
