@@ -59,8 +59,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         caller_this: Option<ObjectHandle>,
     ) -> Result<Variant> {
         let receiver_type = self.value_debug_type(&target);
+        // A receiver that is not an object fails the member read up front:
+        // `GetPropertyDirect` converts the object expression with
+        // `AsObjectClosureNoAddRef` before it looks at the name
+        // (`tjsInterCodeExec.cpp:1593-1615`), and that conversion raises
+        // `TJSThrowVariantConvertError` for a void value
+        // (`tjsVariant.h:722-731`, `tjsVariant.cpp:142-152`).  Only a string
+        // or octet receiver has a property reader of its own.
         match &target {
-            Variant::Void if !flags.must_exist => return Ok(Variant::Void),
             Variant::String(value) => return self.string_property(value, MemberKind::Name(name)),
             Variant::Octet(value) => return self.octet_property(value, MemberKind::Name(name)),
             _ => {}
@@ -1137,22 +1143,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let object_value = frame.get(inst.operands[1])?;
         let name = self.data_slot_string(object, inst.operands[2])?;
-        // When the `typeof` finding is fixed, a string/octet receiver must be
-        // read through [`Vm::prop_get_member`] with this name as the member
-        // (`TypeOfMemberDirect` calls `GetStringProperty` outside any error
-        // handler, `tjsInterCodeExec.cpp:2093-2105`), and only the object
-        // branch may map a miss to "undefined".
-        Ok(
-            match self.prop_get(
-                object_value,
-                &name,
-                DispatchFlags::must_exist(),
-                frame.this_obj,
-            ) {
-                Ok(value) => Variant::String(value.typeof_name().to_string()),
-                Err(_) => Variant::String("undefined".to_string()),
-            },
-        )
+        // A string/octet receiver is still read through [`Vm::prop_get`] with
+        // the name rather than through `GetStringProperty`/`GetOctetProperty`
+        // (`tjsInterCodeExec.cpp:2093-2105`); what this function pins is the
+        // error mapping below.
+        match self.prop_get(
+            object_value,
+            &name,
+            DispatchFlags::must_exist(),
+            frame.this_obj,
+        ) {
+            Ok(value) => Ok(Variant::String(value.typeof_name().to_string())),
+            // `TypeOfMemberDirect` answers "undefined" for
+            // `TJS_E_MEMBERNOTFOUND` only (`tjsInterCodeExec.cpp:2134-2139`);
+            // every other failure -- a property object with no getter, a
+            // receiver that is not an object -- reaches
+            // `TJSThrowFrom_tjs_error(hr, name)` and propagates.
+            Err(error) if error.is_member_not_found() => {
+                Ok(Variant::String("undefined".to_string()))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) fn typeof_indirect(
@@ -1163,20 +1174,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let object_value = frame.get(inst.operands[1])?;
         let name = self.key_from_variant(&frame.get(inst.operands[2])?)?;
-        // See [`Vm::typeof_direct`]: the fixed form takes the raw member and
-        // goes through [`Vm::prop_get_member`] for a string/octet receiver
-        // (`TypeOfMemberIndirect`, `tjsInterCodeExec.cpp:2142-2163`).
-        Ok(
-            match self.prop_get(
-                object_value,
-                &name,
-                DispatchFlags::must_exist(),
-                frame.this_obj,
-            ) {
-                Ok(value) => Variant::String(value.typeof_name().to_string()),
-                Err(_) => Variant::String("undefined".to_string()),
-            },
-        )
+        // See [`Vm::typeof_direct`]: the same member-not-found-only mapping
+        // applies (`TypeOfMemberIndirect`, `tjsInterCodeExec.cpp:2183-2193`).
+        match self.prop_get(
+            object_value,
+            &name,
+            DispatchFlags::must_exist(),
+            frame.this_obj,
+        ) {
+            Ok(value) => Ok(Variant::String(value.typeof_name().to_string())),
+            Err(error) if error.is_member_not_found() => {
+                Ok(Variant::String("undefined".to_string()))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) fn materialize_call_args(
@@ -3479,6 +3490,48 @@ mod tests {
         assert_eq!(error.tjs_error_code(), Some(-1001));
         assert_eq!(error.message, "Member \"no_such_global\" does not exist");
         assert!(error.is_member_not_found());
+    }
+
+    /// A member read whose receiver is not an object fails the object
+    /// conversion before the name is looked at: `GetPropertyDirect` takes
+    /// `AsObjectClosureNoAddRef` on the object expression first
+    /// (`tjsInterCodeExec.cpp:1593-1608`), which raises
+    /// `TJSThrowVariantConvertError` for a void value (`tjsVariant.h:710-719`,
+    /// `tjsVariant.cpp:142-151`).  A void receiver therefore raises instead of
+    /// answering void.
+    #[test]
+    fn void_receiver_member_read_raises_the_conversion_error() {
+        let error = failure("var empty = void; return empty.member;");
+        assert_eq!(error.kind, TjsErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((void) to Object)"
+        );
+    }
+
+    /// The indirect form converts the receiver first as well
+    /// (`GetPropertyIndirect`, `tjsInterCodeExec.cpp:1689-1705`).
+    #[test]
+    fn void_receiver_indirect_read_raises_the_conversion_error() {
+        let error = failure("var empty = void; return empty[0];");
+        assert_eq!(error.kind, TjsErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((void) to Object)"
+        );
+    }
+
+    /// `TypeOfMemberDirect` maps `TJS_E_MEMBERNOTFOUND` to "undefined" and
+    /// lets every other failure propagate (`tjsInterCodeExec.cpp:2127-2143`),
+    /// so the same void receiver raises through `typeof` too.
+    #[test]
+    fn typeof_member_expression_propagates_the_conversion_failure() {
+        let error = failure("var empty = void; return typeof empty.member;");
+        assert_eq!(error.kind, TjsErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((void) to Object)"
+        );
     }
 
     #[test]
