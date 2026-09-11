@@ -3142,6 +3142,7 @@ impl KrkrHost {
         duration: Duration,
         params: TransitionParams,
         rule_image_upload: Option<ImageUpload>,
+        page_base: Option<ObjectHandle>,
     ) {
         if self.pending_kag_layers.is_empty() {
             return;
@@ -3151,7 +3152,14 @@ impl KrkrHost {
         // not a script `Layer.beginTransition`: the tag has no layer object to
         // report a guard failure to, and a repeated `[trans]` on the same page
         // must restart rather than leave the previous projection running.
-        let dest_layer = self.ensure_kag_layer("fore", "base");
+        // When KAG's own page base object exists it is the layer the script
+        // sized and the layer official would mark `InTransition`, so it is used
+        // for both the rectangle and the guards.
+        let slot_layer = self.ensure_kag_layer("fore", "base");
+        let gate_dest = page_base.filter(|handle| self.native_layer(*handle).is_some());
+        let dest_layer = gate_dest
+            .and_then(|handle| self.native_layer(handle))
+            .unwrap_or(slot_layer);
         if self
             .active_transitions
             .iter()
@@ -3180,10 +3188,13 @@ impl KrkrHost {
             duration,
             frozen_draw_commands,
             frozen_image_uploads,
-            source_draw_commands,
-            source_image_uploads,
+            source_face: TransitionSourceFace::Frozen {
+                commands: source_draw_commands,
+                uploads: source_image_uploads,
+            },
             suppressed_live_images: BTreeSet::new(),
             dest_layer: Some(dest_layer),
+            gate_dest,
             dest_rect,
             native_completion: None,
             self_update: false,
@@ -3205,8 +3216,7 @@ impl KrkrHost {
             rule_image_upload,
             frozen_draw_commands,
             frozen_image_uploads,
-            source_draw_commands,
-            source_image_uploads,
+            source_face,
             suppressed_live_images,
             completion,
             dest_rect,
@@ -3222,10 +3232,10 @@ impl KrkrHost {
             duration,
             frozen_draw_commands,
             frozen_image_uploads,
-            source_draw_commands,
-            source_image_uploads,
+            source_face,
             suppressed_live_images,
             dest_layer,
+            gate_dest: None,
             dest_rect,
             native_completion: Some(completion),
             self_update,
@@ -3497,6 +3507,8 @@ impl KrkrHost {
                 } else {
                     transition.elapsed.as_secs_f32() / transition.duration.as_secs_f32()
                 };
+                let (source_draw_commands, source_image_uploads) =
+                    self.transition_source_face(transition);
                 FrameTransition {
                     method: transition.params.method.as_name().to_string(),
                     progress: progress.clamp(0.0, 1.0),
@@ -3506,11 +3518,50 @@ impl KrkrHost {
                     rule_image_upload: transition.rule_image_upload.clone(),
                     frozen_draw_commands: transition.frozen_draw_commands.clone(),
                     frozen_image_uploads: transition.frozen_image_uploads.clone(),
-                    source_draw_commands: transition.source_draw_commands.clone(),
-                    source_image_uploads: transition.source_image_uploads.clone(),
+                    source_draw_commands,
+                    source_image_uploads,
                 }
             })
             .collect()
+    }
+
+    /// The incoming face for one pass.
+    ///
+    /// Official re-renders the source's own cache on every completion
+    /// (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`, driven by
+    /// `InvokeTransition`'s `Update(true)`, `:6478`), so the face follows the
+    /// layers while the transition runs; the render tree is rebuilt here for
+    /// the same reason.  The KAG page projection has no source layer of its own
+    /// and keeps the snapshot taken when the staged page was applied.
+    fn transition_source_face(
+        &self,
+        transition: &ActiveTransition,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        match &transition.source_face {
+            TransitionSourceFace::Layer {
+                layer,
+                extra_roots,
+                with_children,
+            } => {
+                let offset = match (
+                    self.layer_tree.absolute_position(*layer),
+                    transition
+                        .dest_layer
+                        .and_then(|dest| self.layer_tree.absolute_position(dest)),
+                ) {
+                    (Some(source_origin), Some(dest_origin)) => Point::new(
+                        dest_origin.x - source_origin.x,
+                        dest_origin.y - source_origin.y,
+                    ),
+                    _ => Point::new(0.0, 0.0),
+                };
+                self.layer_tree
+                    .source_face(*layer, extra_roots, offset, *with_children)
+            }
+            TransitionSourceFace::Frozen { commands, uploads } => {
+                (commands.clone(), uploads.clone())
+            }
+        }
     }
 
     pub(crate) fn suppressed_transition_live_images(&self) -> BTreeSet<LayerId> {
@@ -3870,6 +3921,28 @@ fn krkr_volume_product_to_linear(volume: i64, volume2: i64, global_volume: i64) 
     (volume * volume2 * global_volume).clamp(0.0, 1.0)
 }
 
+/// Where a transition's incoming face (`tTVPDivisibleData::Src2`,
+/// `LayerIntf.cpp:6611`) comes from.
+#[derive(Clone)]
+pub(crate) enum TransitionSourceFace {
+    /// The source layer's own content, rebuilt from the render tree on every
+    /// pass the way `TransSrc->Complete(destrect)` (`:6604`) re-renders the
+    /// layer's cache.
+    Layer {
+        layer: LayerId,
+        /// Staged page layers the source subtree cannot reach (see
+        /// `sync_kag_source_page`).
+        extra_roots: Vec<LayerId>,
+        with_children: bool,
+    },
+    /// A whole-tree snapshot.  The KAG `[trans]` projection has no source layer:
+    /// its incoming page is the tree the staged page was applied to.
+    Frozen {
+        commands: Vec<DrawCommand>,
+        uploads: Vec<ImageUpload>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransitionStop {
     /// `tTJSNI_BaseLayer::StopTransition` (`LayerIntf.cpp:6434`) and engine
@@ -3900,10 +3973,9 @@ struct ActiveTransition {
     duration: Duration,
     frozen_draw_commands: Vec<DrawCommand>,
     frozen_image_uploads: Vec<ImageUpload>,
-    /// `tTVPDivisibleData::Src2` (`LayerIntf.cpp:6611`): the source layer's own
-    /// content, drawn where the destination layer is.
-    source_draw_commands: Vec<DrawCommand>,
-    source_image_uploads: Vec<ImageUpload>,
+    /// `tTVPDivisibleData::Src2` (`LayerIntf.cpp:6611`): where the incoming
+    /// face comes from.
+    source_face: TransitionSourceFace,
     suppressed_live_images: BTreeSet<LayerId>,
     /// The render-tree layer the handler composites into
     /// (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6532`).  Every transition has
@@ -3911,6 +3983,12 @@ struct ActiveTransition {
     /// waits on it, and its frame-space `dest_rect` decides which part of the
     /// frame the composite replaces.
     dest_layer: Option<LayerId>,
+    /// The destination's layer object when the transition has no script
+    /// payload of its own.  The engine's KAG `[trans]` projection stands in for
+    /// `kag.fore.base.beginTransition` (`KAGLayer.tjs`), and official records
+    /// that as the layer's `InTransition`, so the guards and `stopTransition`
+    /// have to see it.
+    gate_dest: Option<ObjectHandle>,
     dest_rect: Option<Rect>,
     /// TJS-side stop payload.  Only a script `Layer.beginTransition` has layer
     /// objects to exchange and to notify; the KAG page projection does not.
@@ -3935,7 +4013,10 @@ struct ActiveTransition {
 
 impl ActiveTransition {
     fn dest_handle(&self) -> Option<ObjectHandle> {
-        self.native_completion.as_ref().map(|completion| completion.dest)
+        self.native_completion
+            .as_ref()
+            .map(|completion| completion.dest)
+            .or(self.gate_dest)
     }
 
     fn source_handle(&self) -> Option<ObjectHandle> {
@@ -3953,8 +4034,7 @@ pub(crate) struct NativeTransitionStart {
     pub rule_image_upload: Option<ImageUpload>,
     pub frozen_draw_commands: Vec<DrawCommand>,
     pub frozen_image_uploads: Vec<ImageUpload>,
-    pub source_draw_commands: Vec<DrawCommand>,
-    pub source_image_uploads: Vec<ImageUpload>,
+    pub source_face: TransitionSourceFace,
     pub suppressed_live_images: BTreeSet<LayerId>,
     pub completion: NativeTransitionCompletion,
     pub dest_rect: Option<Rect>,

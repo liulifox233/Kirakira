@@ -839,20 +839,14 @@ if (wasmUrl) {
         context.clip();
         // Canvas2D implements no KRKR transition shader. The frozen face is the
         // destination's own content and the source face is the source layer's
-        // (`tTVPDivisibleData::Src1`/`Src2`, LayerIntf.cpp:6592/6611), so
-        // crossfading them is a deterministic fallback that still shows both
-        // faces correctly and, importantly, avoids the abrupt black/flash frame
-        // of the old fallback. Clearing first makes the rectangle behave like
-        // the renderer's replace-in-place composite; where neither face draws
-        // the base is gone, exactly as a real crossfade of two transparent
-        // bitmaps would be.
+        // (`tTVPDivisibleData::Src1`/`Src2`, LayerIntf.cpp:6592/6611), which
+        // official blends *into* the destination layer's bitmap
+        // (`TVPConstAlphaBlend_SD`, TransIntf.cpp:667). The destination's pass
+        // is therefore the base and the incoming face fades in over it, so a
+        // pixel the source does not cover keeps the destination's content
+        // instead of the cleared background.
         context.globalAlpha = 1;
-        if (rect) {
-          context.clearRect(rect.x, rect.y, rect.width, rect.height);
-        } else {
-          context.clearRect(0, 0, contentWidth, contentHeight);
-        }
-        drawCommands(transition.frozenDrawList, 1 - progress, transitionTextures);
+        drawCommands(transition.frozenDrawList, 1, transitionTextures);
         drawCommands(transition.sourceDrawList, progress, transitionTextures);
         context.restore();
       }

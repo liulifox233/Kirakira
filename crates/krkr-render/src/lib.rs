@@ -364,19 +364,35 @@ impl Renderer {
                     None,
                     &transition.frozen_draw_commands,
                 );
-                // The incoming face is the source layer's own content
-                // (`tTVPDivisibleData::Src2`, `LayerIntf.cpp:6611`), not the
-                // live frame: the destination layer is never written during a
-                // transition, so the live tree still shows its own content.
+                // The incoming face is the source layer's own bitmap
+                // (`tTVPDivisibleData::Src2`, `LayerIntf.cpp:6611`), which
+                // official blends *into* the destination layer's bitmap
+                // (`TVPConstAlphaBlend_SD`, `TransIntf.cpp:667`).  It is
+                // therefore drawn over the destination's own pass, so a pixel
+                // the source does not cover keeps the destination's content
+                // instead of the frame background.
                 let new_target = self.create_offscreen_target("Kirakira transition source target");
-                self.render_commands_to_view(
-                    &mut encoder,
-                    &new_target.view,
-                    "Kirakira transition source pass",
-                    frame.clear_color,
-                    None,
-                    &transition.source_draw_commands,
-                );
+                let passes = transition_source_target_passes(transition);
+                for (index, commands) in passes.into_iter().enumerate() {
+                    if index == 0 {
+                        self.render_commands_to_view(
+                            &mut encoder,
+                            &new_target.view,
+                            "Kirakira transition source base pass",
+                            frame.clear_color,
+                            None,
+                            commands,
+                        );
+                    } else {
+                        self.render_commands_over_view(
+                            &mut encoder,
+                            &new_target.view,
+                            "Kirakira transition source pass",
+                            None,
+                            commands,
+                        );
+                    }
+                }
                 self.render_transition_to_view(
                     &mut encoder,
                     &view,
@@ -703,6 +719,41 @@ impl Renderer {
         }
         self.textures
             .retain(|texture_id, _| referenced.contains(texture_id));
+    }
+
+    /// Draws `commands` on top of whatever `view` already holds.
+    fn render_commands_over_view(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        label: &'static str,
+        clip: Option<Rect>,
+        commands: &[DrawCommand],
+    ) {
+        let physical_clip = clip.and_then(|clip| self.physical_rect(clip));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        if let Some(clip) = physical_clip {
+            pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        }
+        if clip.is_none() || physical_clip.is_some() {
+            self.draw_commands(&mut pass, commands);
+        }
     }
 
     fn render_commands_to_view(
@@ -1372,6 +1423,22 @@ struct TransitionUniforms {
     data: [[f32; 4]; 8],
 }
 
+/// The draws the incoming face's target receives, in order.
+///
+/// The destination's own pass comes first: the incoming face is the source
+/// layer's bitmap, which official blends *into* the destination layer's bitmap
+/// (`TVPConstAlphaBlend_SD`, `TransIntf.cpp:667`), so a pixel the source does
+/// not cover has to keep the destination's content rather than the frame
+/// background.  Drawing the destination's pass underneath is what gives the
+/// composite that base; dropping it paints every transparent pixel of the
+/// source with the clear colour.
+fn transition_source_target_passes(transition: &FrameTransition) -> [&[DrawCommand]; 2] {
+    [
+        &transition.frozen_draw_commands,
+        &transition.source_draw_commands,
+    ]
+}
+
 fn transition_uniforms(
     transition: &FrameTransition,
     viewport_width: f32,
@@ -1536,4 +1603,49 @@ fn capture_adler32(data: &[u8]) -> u32 {
         b = (b + a) % MOD;
     }
     (b << 16) | a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krkr_core::{Rect, TransitionParams};
+
+    fn transition(frozen: Vec<DrawCommand>, source: Vec<DrawCommand>) -> FrameTransition {
+        FrameTransition {
+            method: "crossfade".to_string(),
+            progress: 0.5,
+            params: TransitionParams::default(),
+            dest_rect: Some(Rect::new(0.0, 0.0, 4.0, 4.0)),
+            rule_texture_id: None,
+            rule_image_upload: None,
+            frozen_draw_commands: frozen,
+            frozen_image_uploads: Vec::new(),
+            source_draw_commands: source,
+            source_image_uploads: Vec::new(),
+        }
+    }
+
+    fn image(texture_id: TextureId) -> DrawCommand {
+        DrawCommand::Image(ImageCommand {
+            texture_id,
+            rect: Rect::new(0.0, 0.0, 4.0, 4.0),
+            source_rect: Rect::new(0.0, 0.0, 4.0, 4.0),
+            texture_size: Size::new(4.0, 4.0),
+            opacity: 1.0,
+            opaque: false,
+        })
+    }
+
+    /// A transparent pixel of the incoming face must keep the destination's
+    /// content, so the source target has to be drawn over the destination's own
+    /// pass instead of over the frame background.
+    #[test]
+    fn source_target_is_drawn_over_the_destination_pass() {
+        let transition = transition(vec![image(1)], vec![image(2)]);
+        let [base, source] = transition_source_target_passes(&transition);
+        assert_eq!(base.len(), 1);
+        assert_eq!(source.len(), 1);
+        assert!(matches!(&base[0], DrawCommand::Image(image) if image.texture_id == 1));
+        assert!(matches!(&source[0], DrawCommand::Image(image) if image.texture_id == 2));
+    }
 }

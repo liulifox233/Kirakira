@@ -9,7 +9,7 @@ use super::blend;
 
 use krkr_core::{
     AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerId, LayerImage, LayerNode,
-    Point, ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
+    ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
     TransitionScrollStay,
 };
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
@@ -21,6 +21,7 @@ use krkr_tjs2::{
 use crate::host::{
     CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KagLayerSlot, KrkrHost,
     LayerRenderTarget, NativeTransitionCompletion, NativeTransitionStart, TraceCategory,
+    TransitionSourceFace,
 };
 use crate::resource_manager::decode_province_image;
 use crate::scheduler::AsyncTriggerMode;
@@ -3321,16 +3322,6 @@ fn registered_render_layer_target(
     runtime.host().layer_render_target(handle)
 }
 
-/// Whether a render target may be forced visible: a native layer only while it
-/// is still in the official layer tree (`Part()`, `LayerIntf.cpp:589`), while
-/// the engine's KAG projection nodes always may.
-fn render_target_draws(runtime: &Runtime<KrkrHost>, target: &LayerRenderTarget) -> bool {
-    match target {
-        LayerRenderTarget::Native(layer_id) => runtime.host().render_layer_draws(*layer_id),
-        LayerRenderTarget::Kag(_) => true,
-    }
-}
-
 fn mutate_render_layer<R>(
     runtime: &mut Runtime<KrkrHost>,
     target: &LayerRenderTarget,
@@ -4458,28 +4449,32 @@ fn layer_begin_transition(
     // moves content between the two objects
     // (`tTJSNI_BaseLayer::InternalStopTransition`, `:6364`).
     let mut source_page_layers = sync_kag_source_page(runtime, source)?;
-    let (source_draw_commands, source_image_uploads) = match source_layer_id {
-        Some(source_layer_id) => {
-            source_page_layers.retain(|layer_id| *layer_id != source_layer_id);
-            let host = runtime.host();
-            let offset = match (
-                host.layer_tree().absolute_position(source_layer_id),
-                dest_layer_id.and_then(|id| host.layer_tree().absolute_position(id)),
-            ) {
-                (Some(source_origin), Some(dest_origin)) => Point::new(
-                    dest_origin.x - source_origin.x,
-                    dest_origin.y - source_origin.y,
-                ),
-                _ => Point::new(0.0, 0.0),
-            };
-            host.layer_tree().source_face(
-                source_layer_id,
-                &source_page_layers,
-                offset,
-                with_children,
-            )
-        }
-        None => (Vec::new(), Vec::new()),
+    // Staged layers the source's own subtree already covers must not become
+    // extra roots: the face draws its roots in order, so a layer reachable from
+    // the source would be drawn twice (doubling every semi-transparent pixel).
+    if let Some(source_layer_id) = source_layer_id {
+        source_page_layers.retain(|layer_id| {
+            *layer_id != source_layer_id
+                && !runtime
+                    .host()
+                    .layer_tree()
+                    .is_ancestor_or_self(source_layer_id, *layer_id)
+        });
+    }
+    // The face itself is rebuilt from the render tree on every pass -- official
+    // re-renders the source's own cache each completion
+    // (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`) -- and the staged
+    // page model was just folded into those nodes.
+    let source_face = match source_layer_id {
+        Some(layer) => TransitionSourceFace::Layer {
+            layer,
+            extra_roots: source_page_layers,
+            with_children,
+        },
+        None => TransitionSourceFace::Frozen {
+            commands: Vec::new(),
+            uploads: Vec::new(),
+        },
     };
     let comp = variant_object(&runtime.object_member(this, "comp"))
         .map(|comp| runtime.bound_this(comp).unwrap_or(comp));
@@ -4516,8 +4511,7 @@ fn layer_begin_transition(
                 rule_image_upload,
                 frozen_draw_commands: frozen.0,
                 frozen_image_uploads: frozen.1,
-                source_draw_commands,
-                source_image_uploads,
+                source_face,
                 suppressed_live_images: suppressed_images,
                 dest_rect,
                 self_update,
@@ -4595,10 +4589,20 @@ fn sync_kag_source_page(
         return Ok(Vec::new());
     }
 
+    // Only a whole-page transition draws the staged page.  `[backlay]` with no
+    // `layer=` stages every page layer for the `[trans]` on the page base
+    // (`MainWindow.tjs:3166-3183`), while a single-layer `[trans layer=N]`
+    // stages -- and draws -- that one layer.  The staging buffer is only
+    // consumed by the engine's own page swap and is never cleared on the script
+    // path, so a stale full staging must not leak into a later layer
+    // transition: it would paint the old page's opaque background over the
+    // incoming sprite inside the destination rectangle.
     let mut names = vec![slot.layer.clone()];
-    for name in runtime.host().pending_kag_layer_names() {
-        if !names.contains(&name) {
-            names.push(name);
+    if is_kag_page_base(&slot.layer) {
+        for name in runtime.host().pending_kag_layer_names() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
         }
     }
     let mut layer_ids = Vec::new();
@@ -4622,6 +4626,12 @@ fn sync_kag_source_page(
     Ok(layer_ids)
 }
 
+/// Whether a KAG layer name is the page base (`[backlay]` stages the whole page
+/// for it, `MainWindow.tjs:346-355`).
+fn is_kag_page_base(name: &str) -> bool {
+    name == "base" || name == "background"
+}
+
 fn kag_layer_object_snapshot(
     runtime: &Runtime<KrkrHost>,
     page: &str,
@@ -4630,7 +4640,7 @@ fn kag_layer_object_snapshot(
     let Some(mut snapshot) = runtime.host().kag_layer(page, layer).cloned() else {
         return Ok(None);
     };
-    if layer == "base" || layer == "background" {
+    if is_kag_page_base(layer) {
         return Ok(Some(snapshot));
     }
     let Some(handle) = kag_page_layer_handle(runtime, page, layer) else {
@@ -4639,6 +4649,21 @@ fn kag_layer_object_snapshot(
     apply_script_layer_members(runtime, handle, &mut snapshot)?;
     Ok(Some(snapshot))
 }
+/// The TJS layer object for a KAG page layer (`kag.<page>.<name>`), when the
+/// script has one.
+///
+/// The KAG projection works on the engine's own layer slots, but KAG's page
+/// base is also a script `Layer`: `[trans]` is `kag.fore.base.beginTransition`
+/// in KAG itself, so the projection has to own that object's `InTransition`
+/// and take its rectangle from the object the script actually sized.
+pub(crate) fn kag_layer_object(
+    runtime: &Runtime<KrkrHost>,
+    page: &str,
+    layer: &str,
+) -> Option<ObjectHandle> {
+    kag_page_layer_handle(runtime, page, layer)
+}
+
 fn kag_page_layer_handle(
     runtime: &Runtime<KrkrHost>,
     page: &str,
@@ -4650,7 +4675,7 @@ fn kag_page_layer_handle(
     let Variant::Object(page_object) = runtime.object_member(kag, page) else {
         return None;
     };
-    if layer == "base" || layer == "background" {
+    if is_kag_page_base(layer) {
         return variant_object(&runtime.object_member(page_object, "base"))
             .map(|handle| runtime.bound_this(handle).unwrap_or(handle));
     }
