@@ -28,6 +28,9 @@
 //! | `(Dictionary.assign incontextof d)(void)` | `TJSNullAccess` (`:359`) |
 //! | `Dictionary.assign(src, 1)` (no `incontextof`) | `TJS_E_NATIVECLASSCRASH` (`TJS_GET_NATIVE_INSTANCE`, `tjsNative.h:320-328`) |
 //! | `(Dictionary.assign incontextof d)(d, 1)` | `d` ends up empty |
+//! | `(Dictionary.load incontextof d)(path)` / `(Dictionary.save ...)` | void: both are registered TODO stubs that validate the instance and return `TJS_S_OK` (`:41-49`, `:110-118`) |
+//! | `Dictionary.load(path)` (no `incontextof`) | `TJS_E_NATIVECLASSCRASH`, like every other method |
+//! | `Dictionary.unknown` | error `TJS_E_MEMBERNOTFOUND`: the class object is a plain `tTJSNativeClass`, so the void mapping of `tTJSDictionaryObject::PropGet` never applies to it |
 //!
 //! Two consequences are easy to get wrong and are pinned individually:
 //! the class surface never appears in a copy (it lives on the class object),
@@ -61,7 +64,7 @@ fn a_new_dictionary_has_no_members_at_all() {
             r#"
             var d = new Dictionary();
             var names = ["clear", "assign", "assignStruct", "saveStruct",
-                "loadStruct", "count", "length"];
+                "loadStruct", "load", "save", "count", "length"];
             var missing = 0;
             for (var i = 0; i < names.count; i++) {
                 if (typeof d[names[i]] == "undefined" && d[names[i]] === void) {
@@ -71,19 +74,81 @@ fn a_new_dictionary_has_no_members_at_all() {
             return missing;
             "#,
         ),
-        Variant::Integer(7)
+        Variant::Integer(9)
     );
-    // The class object still carries the surface.
+    // The class object still carries the surface, `load`/`save` included:
+    // the reference registers both as no-op stubs (`tjsDictionary.cpp:41-49`,
+    // `:110-118`), and a method that is registered but does nothing is part
+    // of the surface a script can probe.
     assert_eq!(
         run(
             "dictionary.tjs",
             r#"
-            return typeof Dictionary.clear + ":" + typeof Dictionary.assign + ":" +
-                typeof Dictionary.assignStruct + ":" + typeof Dictionary.saveStruct + ":" +
-                typeof Dictionary.loadStruct;
+            return typeof Dictionary.load + ":" + typeof Dictionary.loadStruct + ":" +
+                typeof Dictionary.save + ":" + typeof Dictionary.saveStruct + ":" +
+                typeof Dictionary.assign + ":" + typeof Dictionary.assignStruct + ":" +
+                typeof Dictionary.clear;
             "#,
         ),
-        Variant::String("Object:Object:Object:Object:Object".into())
+        Variant::String("Object:Object:Object:Object:Object:Object:Object".into())
+    );
+}
+
+/// `Dictionary.load` and `Dictionary.save` are `// TODO: implement` stubs in
+/// the reference: they read the receiver's native instance and return
+/// `TJS_S_OK`, so a call answers void without touching a file
+/// (`tjsDictionary.cpp:41-49`, `:110-118`).  Without an `incontextof` the
+/// `this` is the class object, which has no native instance
+/// (`TJS_GET_NATIVE_INSTANCE`, `tjsNative.h:320-328`).
+#[test]
+fn dictionary_load_and_save_are_registered_no_op_stubs() {
+    for source in [
+        r#"var d = new Dictionary(); return (Dictionary.load incontextof d)("savedata/x.ksd");"#,
+        r#"var d = new Dictionary(); return (Dictionary.save incontextof d)("savedata/x.ksd");"#,
+    ] {
+        assert_eq!(run("dictionary.tjs", source), Variant::Void, "{source}");
+    }
+    for source in [
+        r#"return Dictionary.load("savedata/x.ksd");"#,
+        r#"return Dictionary.save("savedata/x.ksd");"#,
+    ] {
+        let error = failure(source);
+        assert_eq!(error.kind, TjsErrorKind::NativeClassCrash, "{source}");
+        assert_eq!(error.tjs_error_code(), Some(-1008), "{source}");
+        assert_eq!(error.message, "Invalid object context", "{source}");
+    }
+}
+
+/// The `Dictionary` class object is a `tTJSNativeClass`, i.e. a plain
+/// `tTJSCustomObject` for every protocol `tTJSDictionaryClass` does not
+/// override, and the void-on-miss override belongs to
+/// `tTJSDictionaryObject` -- the *instance* `CreateBaseTJSObject` builds
+/// (`tjsDictionary.cpp:235-238`, `:720-731`).  So a miss on the class object
+/// raises, while the same miss on an instance answers void.
+#[test]
+fn a_miss_on_the_class_object_raises_like_a_plain_object() {
+    let error = failure("return Dictionary.unknown;");
+    assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+    assert_eq!(error.tjs_error_code(), Some(-1001));
+    assert_eq!(error.message, "Member \"unknown\" does not exist");
+
+    let error = failure("return Dictionary.unknown();");
+    assert_eq!(error.message, "Member \"unknown\" does not exist");
+
+    // `typeof` still maps that miss to "undefined" (`TypeOfMemberDirect`,
+    // `tjsInterCodeExec.cpp:2134-2139`).
+    assert_eq!(
+        run("dictionary.tjs", "return typeof Dictionary.unknown;"),
+        Variant::String("undefined".into())
+    );
+
+    // The instance keeps the leniency the class object does not have.
+    assert_eq!(
+        run(
+            "dictionary.tjs",
+            "var d = new Dictionary(); return d.unknown === void;"
+        ),
+        Variant::Integer(1)
     );
 }
 

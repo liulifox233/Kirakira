@@ -221,6 +221,23 @@ impl Variant {
             (Self::Octet(lhs), Self::Octet(rhs)) => lhs == rhs,
             (Self::Object(lhs), Self::Object(rhs)) => lhs == rhs,
             (Self::Closure(lhs), Self::Closure(rhs)) => lhs == rhs,
+            // TEMPORARY, until `this` and `new` results carry their binding
+            // (`tTJSVariant(objthis, objthis)`, `tjsInterCodeExec.cpp:839`,
+            // `:2384`): an object and a closure over that same object bound to
+            // itself -- or not bound at all -- are one value here, because this
+            // engine cannot tell the reference's `(h, h)` from its `(h, NULL)`:
+            // a host hands a self-bound member out as a plain object.  Script
+            // meets both spellings in `===`, so `new X() === x.selfBoundMember`
+            // holds, and a closure bound to *another* object (or over another
+            // handle) still differs.  The reference does distinguish `(h, h)`
+            // from `(h, NULL)` (`tTJSVariant::DiscernCompare`,
+            // `tjsVariant.cpp:775-778`), so this arm answers true in that one
+            // window; retire it when the literal self-binding lands (the
+            // engine's `variant_object` helpers already unwrap closures).
+            (Self::Object(handle), Self::Closure(closure))
+            | (Self::Closure(closure), Self::Object(handle)) => {
+                handle == &closure.object && closure.this_obj.is_none_or(|this| this == *handle)
+            }
             (Self::CodeObject(lhs), Self::CodeObject(rhs)) => lhs == rhs,
             _ => false,
         }
@@ -666,6 +683,31 @@ pub fn real_to_string(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `===` on the two spellings of one object: `tTJSVariant(objthis, objthis)`
+    /// and a handle-only object.  Only a binding that names the object itself
+    /// (or none at all) compares equal; a binding to a *different* object keeps
+    /// the two values distinct, which is what `tTJSVariant::DiscernCompare`
+    /// checks (`tjsVariant.cpp:778-780`).
+    #[test]
+    fn discern_eq_reconciles_the_spellings_of_a_self_bound_object() {
+        let handle = ObjectHandle(7);
+        let other = ObjectHandle(8);
+        let plain = Variant::Object(handle);
+        let self_bound = Variant::Closure(Closure::new(handle, Some(handle)));
+        let unbound = Variant::Closure(Closure::new(handle, None));
+
+        assert!(plain.discern_eq(&self_bound));
+        assert!(self_bound.discern_eq(&plain));
+        assert!(plain.discern_eq(&unbound));
+        assert!(unbound.discern_eq(&plain));
+        assert!(self_bound.discern_eq(&self_bound));
+
+        assert!(!plain.discern_eq(&Variant::Object(other)));
+        assert!(!plain.discern_eq(&Variant::Closure(Closure::new(other, None))));
+        assert!(!plain.discern_eq(&Variant::Closure(Closure::new(handle, Some(other)))));
+        assert!(!plain.discern_eq(&Variant::Closure(Closure::new(other, Some(other)))));
+    }
 
     #[test]
     fn real_to_string_matches_official_tjs2() {

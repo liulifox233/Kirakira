@@ -1046,8 +1046,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             117 => {
                 let object_value = frame.get(inst.operands[1])?;
-                let key = self.key_from_variant(&frame.get(inst.operands[2])?)?;
-                let value = self.delete_member(object_value, &key)?;
+                let member = frame.get(inst.operands[2])?;
+                let value = self.delete_member_indirect(object_value, &member)?;
                 if inst.operands[0] != 0 {
                     frame.set(inst.operands[0], Variant::Integer(i64::from(value)))?;
                 }

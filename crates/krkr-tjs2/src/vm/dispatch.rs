@@ -241,7 +241,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// `GetOctetProperty` unchanged (`tjsInterCodeExec.cpp:1682-1730`), so
     /// only this entry point can reach the reference's numeric-index branch;
     /// every other receiver keeps the name-based path, where the value is
-    /// converted to a name the way `PropGet` does.
+    /// converted to a name the way `GetPropertyIndirect` does.
     pub(super) fn prop_get_member(
         &mut self,
         target: Variant,
@@ -257,8 +257,29 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             let kind = member_kind(member)?;
             return self.octet_property(value, kind);
         }
-        let name = self.key_from_variant(member)?;
+        let name = self.indirect_member_name(member)?;
         self.prop_get(target, &name, flags, caller_this)
+    }
+
+    /// The member name the reference builds for an *object* receiver from an
+    /// indirect member operand (`GetPropertyIndirect`,
+    /// `tjsInterCodeExec.cpp:1706-1730`; `SetPropertyIndirect`, `:1757-1795`;
+    /// `OperatePropertyIndirect`, `:1841-1886`).
+    ///
+    /// An Integer member is narrowed to the reference's 32-bit `tjs_int` and
+    /// rendered like `PropGetByNum`/`PropSetByNum`/`OperationByNum`
+    /// (`tjsObject.cpp:157-180`), so `o[4294967296]` addresses member `"0"`.
+    /// Any other member goes through `AsString()` (`tjsVariant.h:760-772`),
+    /// which answers NULL for a void member -- the object protocols read a
+    /// NULL member name as `TJS_E_INVALIDTYPE` (`tjsObject.cpp:1375-1378`) --
+    /// and throws the official convert error for an octet.
+    fn indirect_member_name(&self, member: &Variant) -> Result<String> {
+        match member {
+            Variant::Integer(value) => Ok((*value as i32).to_string()),
+            Variant::Void => Err(TjsError::invalid_type()),
+            Variant::Octet(_) => Err(TjsError::variant_convert(member, "string")),
+            other => other.to_tjs_string(),
+        }
     }
 
     pub(super) fn prop_set(
@@ -346,7 +367,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 })
             });
         }
-        let name = self.key_from_variant(member)?;
+        let name = self.indirect_member_name(member)?;
         self.prop_set(target, &name, value, flags, caller_this)
     }
 
@@ -369,6 +390,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let primary_value = self.member_in_super_chain(primary, name)?;
                 let primary_has_member = primary_value.is_some();
                 if primary_has_member || (bind_this.is_none() && flags.ensure) {
+                    // Known deviation, deferred to the self-bound value model
+                    // mission: the reference skips the property object for a
+                    // store that carries `TJS_IGNOREPROP`
+                    // (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1519-1541`),
+                    // but a value stored from `this` carries no binding in this
+                    // engine, so the KAGEX font hook (`&a2.font = this` then
+                    // `layer.font.face = x`) needs the setter to run until
+                    // `this` and `new` results are `tTJSVariant(dsp, dsp)`.
                     if let Some(this_obj) = bind_this {
                         if let Some(existing) = primary_value.clone()
                             && (!flags.ignore_prop
@@ -425,6 +454,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let member_exists = self.runtime.heap[handle.0].get_raw(name).is_some()
             || (!self.is_bytecode_class(handle)
                 && self.class_chain_provides_member(handle, name)?);
+        // Known deviation, deferred to the self-bound value model mission: the
+        // reference skips the property object entirely under `TJS_IGNOREPROP`
+        // and copies the value into the member slot (`tTJSCustomObject::PropSet`,
+        // `tjsObject.cpp:1519-1541`; `TJSDefaultPropSet`, `:1435-1466`), so
+        // `&obj.prop = v` replaces the member -- including a denied native
+        // property such as `Layer.font`.  The skip cannot land before `this`
+        // and `new`'s result carry their binding: a value stored from `this`
+        // keeps none in this engine, so the reference's `&a2.font = this` hook
+        // (`sysscn/prerenderfontex.tjs`, then `layer.font.face = x`) would run
+        // its injected setter against the writer instead of the hook, which
+        // aborts the GINKA boot (round-2 review of 842cc15).  Until then a
+        // native property keeps running its setter under this flag.
         if let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
             && (!flags.ignore_prop || self.runtime.variant_is_native_property(&existing))
             && self
@@ -487,6 +528,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             // error, so the kind is the one the class-chain walks branch on.
             return Err(TjsError::member_not_found(name));
         }
+        if !member_exists && !flags.ensure {
+            // `tTJSCustomObject::PropSet` adds the member only under
+            // `TJS_MEMBERENSURE`; without it a name nobody carries is a miss
+            // (`tjsObject.cpp:1500-1505`), which the VM reports as
+            // `Member "%1" does not exist` (`tjsInterCodeExec.cpp:1655-1658`).
+            // The global object is a plain custom object too (`tjs.cpp:141`),
+            // so an unqualified store to an undeclared name raises here as
+            // well -- KRKR's scripts write `global.foo = ...` precisely
+            // because `foo = ...` cannot create one from inside a function.
+            return Err(TjsError::member_not_found(name));
+        }
         let value = self.materialize_code_object(value);
         self.runtime.heap[handle.0].set(name, value);
         Ok(())
@@ -495,11 +547,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// A read that fell through every lookup.  Official
     /// `tTJSCustomObject::PropGet` reports `TJS_E_MEMBERNOTFOUND`, which
     /// `TJSThrowFrom_tjs_error` turns into the script error `Member "%1" does
-    /// not exist` (`tjsError.cpp:240-244`); only a TJS `Dictionary` maps a
-    /// missing member back to void (`tTJSDictionaryObject::PropGet`,
-    /// `tjsDictionary.cpp:721`).  Host-side probes and the dispatcher's own
-    /// chain walks raise `flags.probe` and get void, mirroring the C++ side of
-    /// KRKR, which treats `TJS_E_MEMBERNOTFOUND` as "absent".
+    /// not exist` (`tjsError.cpp:240-244`); only a TJS `Dictionary` instance
+    /// maps a missing member back to void
+    /// (`tTJSDictionaryObject::PropGet`, `tjsDictionary.cpp:721`).  Host-side
+    /// probes and the dispatcher's own chain walks raise `flags.probe` and get
+    /// void, mirroring the C++ side of KRKR, which treats
+    /// `TJS_E_MEMBERNOTFOUND` as "absent".
     fn missing_member(
         &mut self,
         handle: ObjectHandle,
@@ -509,11 +562,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if flags.probe {
             return Ok(Variant::Void);
         }
-        let is_dictionary = self.runtime.heap[handle.0]
-            .class_infos
-            .iter()
-            .any(|class| class == "Dictionary");
-        if is_dictionary && !flags.must_exist {
+        // The `Dictionary` *class object* is a `tTJSNativeClass`, so its own
+        // misses take the plain custom-object path and raise.
+        if !flags.must_exist && self.runtime.is_dictionary_instance(handle) {
             return Ok(Variant::Void);
         }
         Err(TjsError::member_not_found(name))
@@ -714,12 +765,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             property.set(self.runtime, effective_this, value)?;
             return Ok(());
         }
+        // Known deviation, left as it was: `SetProperty` hands the receiver a
+        // NULL member name (`tjsInterCodeExec.cpp:1681`), and the reference
+        // answers `TJS_E_INVALIDTYPE` for that on anything without a property
+        // context (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1502`).  This
+        // engine models the default property of such a receiver as the member
+        // named `value`, so `*obj = x` writes that member whether or not it
+        // exists yet, and the `MEMBERENSURE` rule below must not turn the
+        // model's own default slot into a miss.
         let effective_this = self.effective_member_this(closure_this, caller_this)?;
         self.prop_set_handle(
             handle,
             "value",
             value,
-            DispatchFlags::default(),
+            DispatchFlags::ensure(),
             effective_this,
         )
     }
@@ -851,6 +910,39 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             })
         })?;
         Ok(self.runtime.heap[handle.0].delete(name))
+    }
+
+    /// `DeleteMemberIndirect` (`tjsInterCodeExec.cpp:2058-2075`), the
+    /// delete-side counterpart of [`Vm::prop_get_member`]: the receiver is
+    /// converted with `AsObjectClosure()` first, and the member operand then
+    /// goes through `AsString()` alone.
+    ///
+    /// That is *not* the get/set key rule: an integer member is not narrowed
+    /// here (`delete o[4294967296]` deletes the member named `"4294967296"`),
+    /// and a member with no string form (`void`) hands the object a NULL name.
+    /// A NULL name fails the protocol without raising -- these opcodes answer
+    /// `false` instead of throwing (`:2067-2072`) -- so the delete reports a
+    /// miss.
+    pub(super) fn delete_member_indirect(
+        &mut self,
+        target: Variant,
+        member: &Variant,
+    ) -> Result<bool> {
+        let receiver_type = self.value_debug_type(&target);
+        let handle = self.resolve_object(target).map_err(|error| {
+            error.with_member_access(TjsMemberAccess {
+                operation: TjsMemberOperation::Deleting,
+                receiver_type,
+                member_name: self.member_diagnostic_name(member),
+                callee_type: None,
+            })
+        })?;
+        let name = match member {
+            Variant::Void => return Ok(false),
+            Variant::Octet(_) => return Err(TjsError::variant_convert(member, "string")),
+            other => other.to_tjs_string()?,
+        };
+        Ok(self.runtime.heap[handle.0].delete(&name))
     }
 
     /// `GetStringProperty` (`tjsInterCodeExec.cpp:46-100`).
@@ -1115,7 +1207,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         // receiver's own conversion error.
         let name: Cow<'_, str> = match member {
             OpMember::Name(name) => Cow::Borrowed(name),
-            OpMember::Value(value) => Cow::Owned(self.key_from_variant(value)?),
+            OpMember::Value(value) => Cow::Owned(self.indirect_member_name(value)?),
         };
         let current = self.prop_get(
             receiver.clone(),
@@ -1123,6 +1215,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             DispatchFlags::default(),
             caller_this,
         )?;
+        // `tTJSDictionaryObject::Operation` (`tjsDictionary.cpp:749-765`): the
+        // operation inherits `tTJSCustomObject::Operation`, which reports
+        // `TJS_E_MEMBERNOTFOUND` for a name nobody carries, and a Dictionary
+        // turns that into "create the member as void and run the operation
+        // again".  So `d.newName += 1` assigns where a plain object raises
+        // `Member "%1" does not exist`, and the void the read above answered
+        // for the miss is exactly the value the created member starts with.
+        // A Dictionary with a `missing` hook takes the base protocol instead
+        // (`tjsObject.cpp:2007-2013`), which is what `call_missing` rules out.
+        if self.runtime.is_dictionary_instance(handle)
+            && !self.runtime.heap[handle.0].call_missing
+            && self.runtime.heap[handle.0].get_raw(&name).is_none()
+        {
+            self.prop_set(
+                receiver.clone(),
+                &name,
+                Variant::Void,
+                DispatchFlags::ensure(),
+                caller_this,
+            )?;
+        }
         let value = op(current, rhs)?;
         self.prop_set(
             receiver,
@@ -1143,10 +1256,22 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<Variant> {
         let object_value = frame.get(inst.operands[1])?;
         let name = self.data_slot_string(object, inst.operands[2])?;
-        // A string/octet receiver is still read through [`Vm::prop_get`] with
-        // the name rather than through `GetStringProperty`/`GetOctetProperty`
-        // (`tjsInterCodeExec.cpp:2093-2105`); what this function pins is the
-        // error mapping below.
+        // `TypeOfMemberDirect` branches on the receiver's type first
+        // (`tjsInterCodeExec.cpp:2093-2120`): a string or octet receiver is
+        // read with `GetStringProperty`/`GetOctetProperty` *outside* the error
+        // mapping, so a name miss raises the reader's own
+        // `Member "%1" does not exist` instead of answering "undefined".
+        match &object_value {
+            Variant::String(value) => {
+                let value = self.string_property(value, MemberKind::Name(&name))?;
+                return Ok(Variant::String(value.typeof_name().to_string()));
+            }
+            Variant::Octet(value) => {
+                let value = self.octet_property(value, MemberKind::Name(&name))?;
+                return Ok(Variant::String(value.typeof_name().to_string()));
+            }
+            _ => {}
+        }
         match self.prop_get(
             object_value,
             &name,
@@ -1173,17 +1298,22 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         _flags: DispatchFlags,
     ) -> Result<Variant> {
         let object_value = frame.get(inst.operands[1])?;
-        let name = self.key_from_variant(&frame.get(inst.operands[2])?)?;
-        // See [`Vm::typeof_direct`]: the same member-not-found-only mapping
-        // applies (`TypeOfMemberIndirect`, `tjsInterCodeExec.cpp:2183-2193`).
-        match self.prop_get(
+        let member = frame.get(inst.operands[2])?;
+        // `TypeOfMemberIndirect` (`tjsInterCodeExec.cpp:2142-2213`) has the
+        // same receiver split as the direct form: a string/octet receiver goes
+        // to `GetStringProperty`/`GetOctetProperty` and propagates their
+        // failures, while the object branch answers "undefined" for
+        // `TJS_E_MEMBERNOTFOUND` (`:2183-2193`).
+        let maps_miss_to_undefined =
+            !matches!(object_value, Variant::String(_) | Variant::Octet(_));
+        match self.prop_get_member(
             object_value,
-            &name,
+            &member,
             DispatchFlags::must_exist(),
             frame.this_obj,
         ) {
             Ok(value) => Ok(Variant::String(value.typeof_name().to_string())),
-            Err(error) if error.is_member_not_found() => {
+            Err(error) if maps_miss_to_undefined && error.is_member_not_found() => {
                 Ok(Variant::String("undefined".to_string()))
             }
             Err(error) => Err(error),
@@ -3778,6 +3908,109 @@ mod tests {
         );
     }
 
+    /// Hands its argument back the way the reference's self-bound members do:
+    /// `tTJSVariant(objthis, objthis)`, the shape `Layer.font`,
+    /// `Window.mainWindow` and `new`'s own result all carry
+    /// (`tjsInterCodeExec.cpp:2384`).  A host hands those values out as
+    /// closures, while the object the script itself holds -- a `new` result,
+    /// or the same object read back from another member -- is a plain object
+    /// here, so `===` has to reconcile the two spellings.
+    fn native_self_bound(
+        _runtime: &mut Runtime<NoHost>,
+        _this_obj: Option<ObjectHandle>,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        match args.first() {
+            Some(Variant::Object(handle)) => {
+                Ok(Variant::Closure(Closure::new(*handle, Some(*handle))))
+            }
+            _ => Ok(Variant::Void),
+        }
+    }
+
+    #[test]
+    fn a_self_bound_member_read_compares_equal_to_the_object() {
+        let mut runtime = Runtime::new();
+        runtime.register_global_native("selfBound", native_self_bound);
+        assert_eq!(
+            run_with(
+                &mut runtime,
+                r#"
+                class Box { function Box() {} }
+                var box = new Box();
+                var other = new Box();
+                var holder = %[];
+                holder.self = selfBound(box);
+                return (holder.self === box) + ":" + (holder.self === other) + ":" +
+                    (selfBound(box) !== box ? "differs" : "same");
+                "#
+            )
+            .expect("self-bound comparison"),
+            Variant::String("1:0:same".to_string())
+        );
+    }
+
+    /// `&obj.prop = v` is `VM_SPDS` (MEMBERENSURE|TJS_IGNOREPROP).  The
+    /// reference skips the property object for that flag and copies the value
+    /// straight into the member slot (`tTJSCustomObject::PropSet`,
+    /// `tjsObject.cpp:1519-1541`; `TJSDefaultPropSet`, `:1435-1466`), which a
+    /// *script* property already gets here -- the write replaces the property
+    /// object.  A native property does not yet: this engine keeps invoking its
+    /// setter under the flag.
+    ///
+    /// That last part is a known deviation, deliberately deferred to the
+    /// self-bound value model mission the tower is planning.  The reference's
+    /// KAGEX font hook (`&a2.font = this` in `sysscn/prerenderfontex.tjs`,
+    /// then `layer.font.face = x`) needs the stored value to carry the hook as
+    /// its `ObjThis` -- `ra[-1]` is `tTJSVariant(objthis, objthis)`
+    /// (`tjsInterCodeExec.cpp:839`) -- and until `this` and `new` results are
+    /// bound that way here, skipping the native setter runs the injected `face`
+    /// setter against the writer rather than the hook and aborts the GINKA boot
+    /// (round-2 review of 842cc15).  So this test pins today's behaviour, and
+    /// the skip lands with the value model.
+    #[test]
+    fn ignore_prop_store_reaches_a_native_property_setter_until_the_value_model_lands() {
+        assert_eq!(
+            run(r#"
+                class Holder {
+                    var stored = 0;
+                    property value {
+                        getter { return stored; }
+                        setter(v) { stored = v * 3; }
+                    }
+                }
+                var holder = new Holder();
+                holder.value = 2;
+                var plain = holder.stored;
+                &holder.value = 5;
+                return plain + ":" + holder.stored + ":" + typeof holder.value + ":" +
+                    holder.value;
+                "#)
+            .expect("script property"),
+            Variant::String("6:6:Integer:5".to_string())
+        );
+
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        runtime.register_object_native_property_with_access(
+            target,
+            "font",
+            NativePropertyAccess::ReadOnly,
+            |_runtime, _this| Ok(Variant::String("font-object".to_string())),
+            |_runtime, _this, _value| Ok(()),
+        );
+        for source in [r#"target.font = "x";"#, r#"&target.font = "x";"#] {
+            let error = run_with(&mut runtime, source).expect_err("the denial applies");
+            assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{source}");
+            assert_eq!(error.tjs_error_code(), Some(-1007), "{source}");
+        }
+        assert_eq!(
+            run_with(&mut runtime, "return target.font;").expect("getter still answers"),
+            Variant::String("font-object".to_string())
+        );
+    }
+
     #[test]
     fn read_only_native_property_denies_script_writes() {
         let mut runtime = Runtime::new();
@@ -4221,6 +4454,250 @@ mod tests {
         assert_eq!(
             run(r#"var a = [1, 2]; a[0] += 5; a[1]++; return a[0] + a[1];"#).expect("array op"),
             Variant::Integer(9)
+        );
+    }
+
+    /// `TypeOfMemberDirect`/`TypeOfMemberIndirect` branch on the receiver
+    /// first (`tjsInterCodeExec.cpp:2093-2120`, `:2142-2170`): a string or
+    /// octet receiver is read with `GetStringProperty`/`GetOctetProperty`
+    /// *outside* the error mapping, and those readers throw for a name that is
+    /// neither `length` nor an index -- so `typeof "abc".unknown` raises the
+    /// member error instead of answering "undefined".
+    #[test]
+    fn typeof_on_a_string_or_octet_receiver_propagates_the_miss() {
+        for source in [
+            r#"return typeof "abc".unknown;"#,
+            r#"return typeof "abc"["unknown"];"#,
+            "return typeof (<% 01 %>).unknown;",
+            "return typeof (<% 01 %>)[\"unknown\"];",
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::MemberNotFound, "{source}");
+            assert_eq!(error.tjs_error_code(), Some(-1001), "{source}");
+            assert_eq!(
+                error.message, "Member \"unknown\" does not exist",
+                "{source}"
+            );
+        }
+        // The members those readers do answer keep their own type...
+        assert_eq!(
+            run(r#"return typeof "abc".length;"#).expect("length"),
+            Variant::String("Integer".to_string())
+        );
+        assert_eq!(
+            run(r#"return typeof "abc"[1];"#).expect("index"),
+            Variant::String("String".to_string())
+        );
+        // ... and an index outside the value keeps raising the range error
+        // (`tjsInterCodeExec.cpp:75`, `:154`).
+        for source in [r#"return typeof "abc"[9];"#, "return typeof (<% 01 %>)[9];"] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::Runtime, "{source}");
+            assert_eq!(error.message, "The value is out of the range", "{source}");
+        }
+    }
+
+    /// The object branch of the same opcodes keeps its mapping: only
+    /// `TJS_E_MEMBERNOTFOUND` becomes "undefined" (`tjsInterCodeExec.cpp:2134-2139`),
+    /// which is what a Dictionary instance, a class object and `typeof
+    /// someVoid` all rely on.
+    #[test]
+    fn typeof_on_an_object_receiver_still_answers_undefined_for_a_miss() {
+        for source in [
+            r#"class H { function H() {} } var h = new H(); return typeof h.absent;"#,
+            r#"class H { function H() {} } var h = new H(); return typeof h["absent"];"#,
+            r#"var d = new Dictionary(); return typeof d.absent;"#,
+            r#"return typeof Dictionary.absent;"#,
+        ] {
+            assert_eq!(
+                run(source).expect("typeof miss"),
+                Variant::String("undefined".to_string()),
+                "{source}"
+            );
+        }
+        // `typeof someVoid` is the plain register form (`VM_TYPEOF`,
+        // `tjsInterCodeExec.cpp:1275`), which never reaches the member
+        // opcodes at all.
+        assert_eq!(
+            run("var v = void; return typeof v;").expect("plain typeof"),
+            Variant::String("void".to_string())
+        );
+    }
+
+    /// `tTJSCustomObject::PropSet` adds the member only under
+    /// `TJS_MEMBERENSURE` (`tjsObject.cpp:1500-1505`), and the compiler emits
+    /// flags 0 for an unqualified store (`VM_SPD`, `tjsInterCodeGen.cpp:1912`),
+    /// so a name neither the receiver nor the global carries raises.  The
+    /// global object is a plain custom object (`tjs.cpp:141`), which is why
+    /// KRKR's scripts write `global.name = ...` to create a global.
+    #[test]
+    fn unqualified_store_to_an_undeclared_name_raises() {
+        let error = failure("function f() { brandNew = 5; } f();");
+        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+        assert_eq!(error.tjs_error_code(), Some(-1001));
+        assert_eq!(error.message, "Member \"brandNew\" does not exist");
+        assert!(error.is_member_not_found());
+
+        // The same name does not become reachable either.
+        let error = failure(r#"function f() { global.kept = 1; gone = 2; } f();"#);
+        assert_eq!(error.message, "Member \"gone\" does not exist");
+    }
+
+    /// An explicit receiver store is `VM_SPDE`/`VM_SPI` (MEMBERENSURE,
+    /// `tjsInterCodeGen.cpp:1915-1917`), so it still creates the member --
+    /// including on the global object and on an Array instance.
+    #[test]
+    fn store_with_an_explicit_receiver_creates_the_member() {
+        assert_eq!(
+            run(r#"function f() { global.brandNew = 5; } f(); return global.brandNew;"#)
+                .expect("global store"),
+            Variant::Integer(5)
+        );
+        assert_eq!(
+            run("var a = new Array(); a.marker = 1; return a.marker;").expect("array store"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            run(r#"class H { function H() {} } var h = new H(); h.marker = 1; return h.marker;"#)
+                .expect("instance store"),
+            Variant::Integer(1)
+        );
+    }
+
+    /// `tTJSDictionaryObject::Operation` creates the member as void and runs
+    /// the operation again when it finds nothing (`tjsDictionary.cpp:749-765`),
+    /// so a compound write to a missing name works on a Dictionary and raises
+    /// on a plain object (`tTJSCustomObject::Operation`, `tjsObject.cpp:2016`).
+    #[test]
+    fn dictionary_operation_creates_the_missing_member() {
+        assert_eq!(
+            run(r#"var d = %[]; d.count += 1; d.other = void; d.other -= 2; return d.count + ":" + d.other;"#)
+                .expect("dictionary op"),
+            Variant::String("1:-2".to_string())
+        );
+        for source in [
+            r#"class H { function H() {} } var h = new H(); h.absent += 1;"#,
+            r#"class H { function H() {} } var h = new H(); h.absent++;"#,
+            r#"class H { function H() {} } var h = new H(); h["absent"] *= 2;"#,
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::MemberNotFound, "{source}");
+            assert_eq!(
+                error.message, "Member \"absent\" does not exist",
+                "{source}"
+            );
+        }
+    }
+
+    /// An indirect member operand goes through the reference's
+    /// `AsString()`/`PropGetByNum` split for an object receiver
+    /// (`tjsInterCodeExec.cpp:1706-1730`, `:1757-1795`): an Integer is
+    /// narrowed to the 32-bit `tjs_int` before the name is built, a void
+    /// member has no string form and reaches the protocol as a NULL name
+    /// (`TJS_E_INVALIDTYPE`), and an octet member raises the official convert
+    /// error.
+    #[test]
+    fn object_indirect_keys_convert_like_the_reference() {
+        // 2^32 narrows to 0, so the write addresses member "0" (and never
+        // tries to build a four-billion-element array).
+        assert_eq!(
+            run("var a = [1, 2]; a[4294967296] = 9; return a[0] + \":\" + a.count;")
+                .expect("wrapped index"),
+            Variant::String("9:2".to_string())
+        );
+        assert_eq!(
+            run(r#"class H { function H() {} } var h = new H(); h[4294967296] = 7; return h[0];"#)
+                .expect("wrapped member"),
+            Variant::Integer(7)
+        );
+
+        for source in [
+            r#"var o = %[]; return o[void];"#,
+            r#"var o = %[]; o[void] = 1;"#,
+            r#"var o = %[]; return typeof o[void];"#,
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::InvalidType, "{source}");
+            assert_eq!(error.tjs_error_code(), Some(-1005), "{source}");
+            assert_eq!(
+                error.message, "Not a function or invalid method/property type",
+                "{source}"
+            );
+        }
+
+        let error = failure("var o = %[]; return o[<% 01 %>];");
+        assert_eq!(error.kind, TjsErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((octet)<% 01 %> to string)"
+        );
+
+        // The delete form is `AsString()` alone (`DeleteMemberIndirect`,
+        // `tjsInterCodeExec.cpp:2058-2075`): no integer narrowing, and a void
+        // member fails the delete instead of raising, so the member stays.
+        assert_eq!(
+            run(r#"var o = %[x => 1]; delete o[void]; return (o.x === void) ? "gone" : "kept";"#)
+                .expect("void delete"),
+            Variant::String("kept".to_string())
+        );
+        // The name is the full 64-bit spelling, so the delete reaches the
+        // member the string key created -- the integer key it was given is
+        // *not* narrowed the way the get/set paths narrow it.
+        assert_eq!(
+            run(r#"var o = %[]; o["4294967296"] = 1; delete o[4294967296]; return (o["4294967296"] === void) ? "gone" : "kept";"#)
+                .expect("un-narrowed delete"),
+            Variant::String("gone".to_string())
+        );
+    }
+
+    /// `Array.assign`/`Array.assignStruct` answer `TJS_S_OK` without writing
+    /// `result`, and `tTJSNativeClassMethod::FuncCall` clears the result
+    /// variant before the call (`tjsNative.cpp:94`), so both read as void.
+    /// The argument protocol is the reference's (`tjsArray.cpp:745-782`):
+    /// no arguments is `TJS_E_BADPARAMCOUNT`, a source with no object closure
+    /// is `TJSNullAccess`, and the destination is cleared before that source
+    /// is converted.
+    #[test]
+    fn array_assign_answers_void_and_checks_its_source() {
+        assert_eq!(
+            run("var a = [1]; var b = [1, 2]; return typeof a.assign(b) + \":\" + a.count + \":\" + a[0];")
+                .expect("array assign"),
+            Variant::String("void:2:1".to_string())
+        );
+        assert_eq!(
+            run("var a = [1]; var b = [1, 2]; return typeof a.assignStruct(b);")
+                .expect("array assignStruct"),
+            Variant::String("void".to_string())
+        );
+        assert_eq!(
+            run(r#"var a = []; a.assign(%[x => 1]); return a.count + ":" + a[0] + ":" + a[1];"#)
+                .expect("dictionary source"),
+            Variant::String("2:x:1".to_string())
+        );
+
+        for source in [
+            "var a = [1]; return a.assign();",
+            "var a = [1]; return a.assignStruct();",
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::BadParamCount, "{source}");
+            assert_eq!(error.message, "Invalid argument count", "{source}");
+        }
+
+        for source in [
+            "var a = [1]; return a.assign(5);",
+            "var a = [1]; return a.assign(void);",
+            "var a = [1]; return a.assign(null);",
+            "var a = [1]; return a.assignStruct(5);",
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::Runtime, "{source}");
+            assert_eq!(error.message, "Accessing to null object", "{source}");
+        }
+        assert_eq!(
+            run("var a = [1, 2]; try { a.assign(5); } catch (e) {} return a.count;")
+                .expect("cleared before the source is converted"),
+            Variant::Integer(0)
         );
     }
 }
