@@ -1011,8 +1011,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     DispatchFlags::default()
                 };
                 let object_value = frame.get(inst.operands[1])?;
-                let key = self.key_from_variant(&frame.get(inst.operands[2])?)?;
-                let value = self.prop_get(object_value, &key, flags, frame.this_obj)?;
+                let member = frame.get(inst.operands[2])?;
+                let value = self.prop_get_member(object_value, &member, flags, frame.this_obj)?;
                 frame.set(inst.operands[0], value)?;
             }
             108 | 109 | 113 => {
@@ -1022,9 +1022,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     _ => DispatchFlags::default(),
                 };
                 let object_value = frame.get(inst.operands[0])?;
-                let key = self.key_from_variant(&frame.get(inst.operands[1])?)?;
+                let member = frame.get(inst.operands[1])?;
                 let value = frame.get(inst.operands[2])?;
-                self.prop_set(object_value, &key, value, flags, frame.this_obj)?;
+                self.prop_set_member(object_value, &member, value, flags, frame.this_obj)?;
             }
             114 => {
                 let object_value = frame.get(inst.operands[0])?;
@@ -1688,3 +1688,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod closure_tests;
