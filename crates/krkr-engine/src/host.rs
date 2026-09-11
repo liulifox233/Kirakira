@@ -1431,6 +1431,12 @@ impl KrkrHost {
             .and_then(|window| window.property(name))
     }
 
+    /// The first constructed native window, the `TVPMainWindow` the official
+    /// `Window.mainWindow` property reports (`WindowIntf.cpp:1796-1815`).
+    pub(crate) fn main_window(&self) -> Option<ObjectHandle> {
+        self.main_window
+    }
+
     pub(crate) fn set_native_window_property(
         &mut self,
         handle: ObjectHandle,
@@ -1787,6 +1793,21 @@ impl KrkrHost {
             .get(&handle)
             .map(|instance| instance.children.clone())
             .unwrap_or_default()
+    }
+
+    /// Live sibling position of a native layer, the official `GetOrderIndex()`
+    /// (`LayerIntf.h:278`): `Layer.order` reports this rather than a stored
+    /// value, so it follows every join, part and reorder.
+    ///
+    /// `if(!Parent) return 0` (`:280`): a parentless layer -- a window's
+    /// primary layer, or one the script parted -- has no sibling list of its
+    /// own, even though the render tree files every root side by side.
+    pub(crate) fn native_layer_order_index(&self, handle: ObjectHandle) -> Option<usize> {
+        let instance = self.native_layers.get(&handle)?;
+        if instance.parent.is_none() {
+            return Some(0);
+        }
+        self.layer_tree.order_index(instance.layer_id)
     }
 
     pub(crate) fn native_window_children(&self, handle: ObjectHandle) -> Vec<ObjectHandle> {
@@ -3675,6 +3696,42 @@ impl KrkrHost {
             .max()
             .unwrap_or(0)
             .saturating_add(1)
+    }
+
+    /// Official `tTJSNI_BaseLayer::SetOrderIndex`/`ChildChangeOrder`
+    /// (`LayerIntf.cpp:1120-1231`): move a layer to `index` among its siblings,
+    /// shifting the siblings in between and clamping to the child count.
+    ///
+    /// The render tree orders siblings by `(z_order, id)`, so the move is
+    /// expressed by renumbering the siblings' `z_order` in their new order.
+    /// Returns the index the layer landed on, or `None` when the handle has no
+    /// layer node.
+    pub(crate) fn reorder_native_layer(&mut self, handle: ObjectHandle, index: i64) -> Option<i64> {
+        let layer_id = self.native_layer(handle)?;
+        let parent = self.layer_tree.layer(layer_id)?.parent;
+        let mut siblings = self
+            .layer_tree
+            .layers()
+            .filter(|layer| layer.parent == parent)
+            .map(|layer| (layer.z_order, layer.id))
+            .collect::<Vec<_>>();
+        siblings.sort_unstable();
+        let mut siblings = siblings
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<LayerId>>();
+        let from = siblings.iter().position(|id| *id == layer_id)?;
+        let to = index.clamp(0, siblings.len() as i64 - 1) as usize;
+        if from != to {
+            let moved = siblings.remove(from);
+            siblings.insert(to, moved);
+        }
+        for (order, id) in siblings.iter().enumerate() {
+            if let Some(layer) = self.layer_tree.layer_mut(*id) {
+                layer.z_order = order as i32;
+            }
+        }
+        Some(to as i64)
     }
 }
 

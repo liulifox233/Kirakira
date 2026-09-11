@@ -1609,6 +1609,20 @@ impl LayerTree {
         true
     }
 
+    /// Position of `id` among its parent's children in draw order, the index
+    /// the official `GetOrderIndex()` reports (`LayerIntf.h:278`, computed from
+    /// the parent's `Children` vector). `None` when the layer is unknown; a
+    /// parentless layer is filed among the other roots the render tree keeps
+    /// side by side, so callers that need `if(!Parent) return 0` filter first.
+    pub fn order_index(&self, id: LayerId) -> Option<usize> {
+        let node = self.layers.get(&id)?;
+        Some(
+            self.sorted_children(node.parent)
+                .iter()
+                .position(|child| child.id == id)?,
+        )
+    }
+
     pub fn absolute_position(&self, id: LayerId) -> Option<Point> {
         let mut x = 0.0;
         let mut y = 0.0;
