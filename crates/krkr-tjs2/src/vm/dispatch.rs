@@ -60,8 +60,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let receiver_type = self.value_debug_type(&target);
         match &target {
             Variant::Void if !flags.must_exist => return Ok(Variant::Void),
-            Variant::String(value) => return self.string_property(value, name),
-            Variant::Octet(value) => return self.octet_property(value, name),
+            Variant::String(value) => return self.string_property(value, MemberKind::Name(name)),
+            Variant::Octet(value) => return self.octet_property(value, MemberKind::Name(name)),
             _ => {}
         }
 
@@ -227,6 +227,33 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         Ok(self.bind_proxy_value(value, bind_this))
     }
 
+    /// Read a member whose operand is the raw value of a VM register or data
+    /// area (`GET_STR_ID`/`GET_STR_IND`) instead of a name.
+    ///
+    /// The reference hands that value to `GetStringProperty` /
+    /// `GetOctetProperty` unchanged (`tjsInterCodeExec.cpp:1682-1730`), so
+    /// only this entry point can reach the reference's numeric-index branch;
+    /// every other receiver keeps the name-based path, where the value is
+    /// converted to a name the way `PropGet` does.
+    pub(super) fn prop_get_member(
+        &mut self,
+        target: Variant,
+        member: &Variant,
+        flags: DispatchFlags,
+        caller_this: Option<ObjectHandle>,
+    ) -> Result<Variant> {
+        if let Variant::String(value) = &target {
+            let kind = member_kind(member)?;
+            return self.string_property(value, kind);
+        }
+        if let Variant::Octet(value) = &target {
+            let kind = member_kind(member)?;
+            return self.octet_property(value, kind);
+        }
+        let name = self.key_from_variant(member)?;
+        self.prop_get(target, &name, flags, caller_this)
+    }
+
     pub(super) fn prop_set(
         &mut self,
         target: Variant,
@@ -236,15 +263,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         caller_this: Option<ObjectHandle>,
     ) -> Result<()> {
         let receiver_type = self.value_debug_type(&target);
-        // `tTJSInterCodeContext::PropSet` reaches `SetStringProperty` /
-        // `SetOctetProperty` directly for a string/octet receiver
-        // (`tjsInterCodeExec.cpp:1958-1970`), before any object conversion,
+        // `tTJSInterCodeContext::SetPropertyDirect` reaches `SetStringProperty`
+        // / `SetOctetProperty` directly for a string/octet receiver
+        // (`tjsInterCodeExec.cpp:1624-1656`), before any object conversion,
         // and no string or octet member is writable. The member-access
         // context is attached here because this arm answers the error itself
         // instead of running through `closure_parts` below.
         let string_set = match &target {
-            Variant::String(receiver) => Some(self.set_string_property(receiver, name)),
-            Variant::Octet(receiver) => Some(self.set_octet_property(receiver, name)),
+            Variant::String(receiver) => {
+                Some(self.set_string_property(receiver, MemberKind::Name(name)))
+            }
+            Variant::Octet(receiver) => {
+                Some(self.set_octet_property(receiver, MemberKind::Name(name)))
+            }
             _ => None,
         };
         if let Some(result) = string_set {
@@ -275,6 +306,41 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     callee_type: None,
                 })
             })
+    }
+
+    /// Write a member whose operand is the raw value of a VM register or data
+    /// area (`SET_STR_ID`/`SET_STR_IND`), the write-side counterpart of
+    /// [`Vm::prop_get_member`].
+    pub(super) fn prop_set_member(
+        &mut self,
+        target: Variant,
+        member: &Variant,
+        value: Variant,
+        flags: DispatchFlags,
+        caller_this: Option<ObjectHandle>,
+    ) -> Result<()> {
+        let member_set = match &target {
+            Variant::String(receiver) => Some(
+                member_kind(member).and_then(|kind| self.set_string_property(receiver, kind)),
+            ),
+            Variant::Octet(receiver) => Some(
+                member_kind(member).and_then(|kind| self.set_octet_property(receiver, kind)),
+            ),
+            _ => None,
+        };
+        if let Some(result) = member_set {
+            let receiver_type = self.value_debug_type(&target);
+            return result.map_err(|error| {
+                error.with_member_access(TjsMemberAccess {
+                    operation: TjsMemberOperation::Setting,
+                    receiver_type,
+                    member_name: self.member_diagnostic_name(member),
+                    callee_type: None,
+                })
+            });
+        }
+        let name = self.key_from_variant(member)?;
+        self.prop_set(target, &name, value, flags, caller_this)
     }
 
     pub(super) fn prop_set_handle(
@@ -783,30 +849,41 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// `GetStringProperty` (`tjsInterCodeExec.cpp:46-100`).
     ///
     /// Only `length` names a member; every other name routes through the
-    /// index rule: a name whose first character is a digit is parsed
-    /// `TJS_atoi`-style (an optional sign plus a digit prefix, like C's
-    /// `atoi`) and reads the UTF-16 code unit at that index, and anything
-    /// else is `TJS_E_MEMBERNOTFOUND`. The reference has no `count` member
-    /// for strings -- `GetStringProperty` compares against `length` alone --
-    /// so `count` is a miss here too.
-    fn string_property(&self, value: &str, name: &str) -> Result<Variant> {
-        if name == "length" {
-            return Ok(Variant::Integer(value.encode_utf16().count() as i64));
+    /// index rule: a name whose *first* character is a digit is parsed
+    /// `TJS_atoi`-style and reads the UTF-16 code unit at that index
+    /// (`:67-81`), and anything else is `TJS_E_MEMBERNOTFOUND`. A numeric
+    /// member never looks at names at all (`:85-98`). The reference has no
+    /// `count` member for strings -- `GetStringProperty` compares against
+    /// `length` alone -- so `count` is a miss here too.
+    fn string_property(&self, value: &str, member: MemberKind<'_>) -> Result<Variant> {
+        match member {
+            MemberKind::Name(name) => {
+                if name == "length" {
+                    return Ok(Variant::Integer(utf16_len(value) as i64));
+                }
+                if !is_index_name(name) {
+                    return Err(TjsError::member_not_found(name));
+                }
+                self.string_index(value, tjs_atoi(name))
+            }
+            MemberKind::Index(index) => self.string_index(value, index),
         }
-        if !tjs_atoi_name_prefix(name) {
-            return Err(TjsError::member_not_found(name));
-        }
-        let index = tjs_atoi(name);
-        let units = value.encode_utf16().collect::<Vec<_>>();
-        // The reference treats an index equal to the length as an empty
-        // result, not as an error (`tjsInterCodeExec.cpp:73`).
-        if index == units.len() as i64 {
+    }
+
+    /// The index read behind both `GetStringProperty` branches: the reference
+    /// treats an index equal to the length as an empty result, not as an
+    /// error (`tjsInterCodeExec.cpp:73`), and anything outside that as
+    /// `TJSRangeError`.
+    fn string_index(&self, value: &str, index: i32) -> Result<Variant> {
+        let len = utf16_len(value) as i64;
+        let index = i64::from(index);
+        if index == len {
             return Ok(Variant::String(String::new()));
         }
-        if index < 0 || index > units.len() as i64 {
+        if index < 0 || index > len {
             return Err(TjsError::range_error());
         }
-        let unit = units[index as usize];
+        let unit = value.encode_utf16().nth(index as usize).unwrap_or(0);
         // Known deviation: `String` is UTF-8, so a code unit that is half of
         // an astral pair becomes U+FFFD here where the reference returns the
         // lone surrogate (`tTJSVariantString` holds UTF-16). The length and
@@ -820,16 +897,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// `length` is the byte count and an index reads one byte as an integer;
     /// every index outside the octet is `TJSRangeError`, and a name that is
     /// neither `length` nor an index is a miss. Unlike the string form, an
-    /// index equal to the length *is* out of range here.
-    fn octet_property(&self, value: &[u8], name: &str) -> Result<Variant> {
-        if name == "length" {
-            return Ok(Variant::Integer(value.len() as i64));
+    /// index equal to the length *is* out of range here (`:152`).
+    fn octet_property(&self, value: &[u8], member: MemberKind<'_>) -> Result<Variant> {
+        match member {
+            MemberKind::Name(name) => {
+                if name == "length" {
+                    return Ok(Variant::Integer(value.len() as i64));
+                }
+                if !is_index_name(name) {
+                    return Err(TjsError::member_not_found(name));
+                }
+                self.octet_index(value, tjs_atoi(name))
+            }
+            MemberKind::Index(index) => self.octet_index(value, index),
         }
-        if !tjs_atoi_name_prefix(name) {
-            return Err(TjsError::member_not_found(name));
-        }
-        let index = tjs_atoi(name);
-        if index < 0 || index >= value.len() as i64 {
+    }
+
+    /// The index read behind both `GetOctetProperty` branches
+    /// (`tjsInterCodeExec.cpp:150-155`, `:162-168`).
+    fn octet_index(&self, value: &[u8], index: i32) -> Result<Variant> {
+        if index < 0 || i64::from(index) >= value.len() as i64 {
             return Err(TjsError::range_error());
         }
         Ok(Variant::Integer(i64::from(value[index as usize])))
@@ -838,23 +925,38 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// `SetStringProperty` (`tjsInterCodeExec.cpp:102-126`).
     ///
     /// No string member accepts a write: `length` and every index-shaped name
-    /// report `TJS_E_ACCESSDENYED`, and any other name is a miss. The value
-    /// being stored never matters -- the reference throws before reading
-    /// `param`.
-    fn set_string_property(&self, _value: &str, name: &str) -> Result<()> {
-        if name == "length" || tjs_atoi_name_prefix(name) {
-            return Err(TjsError::access_denied());
+    /// report `TJS_E_ACCESSDENYED`, every numeric member does (`:122-125`),
+    /// and any other name is a miss. The value being stored never matters --
+    /// the reference throws before reading `param`.
+    fn set_string_property(&self, _value: &str, member: MemberKind<'_>) -> Result<()> {
+        match member {
+            MemberKind::Name(name) if name == "length" || is_index_name(name) => {
+                Err(TjsError::access_denied())
+            }
+            MemberKind::Name(name) => Err(TjsError::member_not_found(name)),
+            MemberKind::Index(_) => Err(TjsError::access_denied()),
         }
-        Err(TjsError::member_not_found(name))
     }
 
     /// `SetOctetProperty` (`tjsInterCodeExec.cpp:172-196`), the string form's
     /// rule over bytes.
-    fn set_octet_property(&self, _value: &[u8], name: &str) -> Result<()> {
-        if name == "length" || tjs_atoi_name_prefix(name) {
-            return Err(TjsError::access_denied());
+    fn set_octet_property(&self, _value: &[u8], member: MemberKind<'_>) -> Result<()> {
+        match member {
+            MemberKind::Name(name) if name == "length" || is_index_name(name) => {
+                Err(TjsError::access_denied())
+            }
+            MemberKind::Name(name) => Err(TjsError::member_not_found(name)),
+            MemberKind::Index(_) => Err(TjsError::access_denied()),
         }
-        Err(TjsError::member_not_found(name))
+    }
+
+    /// The member name a dispatch diagnostic reports for a member operand
+    /// that arrived as a value: its name when it has one, else the rendering
+    /// `key_from_variant` would have produced, else the value's debug type
+    /// (an octet has no string conversion at all).
+    fn member_diagnostic_name(&self, member: &Variant) -> String {
+        self.key_from_variant(member)
+            .unwrap_or_else(|_| self.value_debug_type(member))
     }
 
     pub(super) fn execute_update_property(
@@ -878,14 +980,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             20 | 24 => {
                 let object_value = frame.get(inst.operands[1])?;
-                let name = self.key_from_variant(&frame.get(inst.operands[2])?)?;
-                self.operate_property(object_value, &name, None, frame.this_obj, |value, _| {
-                    if inc {
-                        value.increment()
-                    } else {
-                        value.decrement()
-                    }
-                })?
+                let member = frame.get(inst.operands[2])?;
+                self.operate_property_member(
+                    object_value,
+                    &member,
+                    None,
+                    frame.this_obj,
+                    |value, _| {
+                        if inc {
+                            value.increment()
+                        } else {
+                            value.decrement()
+                        }
+                    },
+                )?
             }
             21 | 25 => {
                 let object_value = frame.get(inst.operands[1])?;
@@ -937,12 +1045,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             OpcodeForm::IndirectProperty => {
                 let object_value = frame.get(inst.operands[1])?;
-                let name = self.key_from_variant(&frame.get(inst.operands[2])?)?;
+                let member = frame.get(inst.operands[2])?;
                 let rhs = frame.get(inst.operands[3])?;
                 let family = binary_family(inst.opcode);
-                let value = self.operate_property(
+                let value = self.operate_property_member(
                     object_value,
-                    &name,
+                    &member,
                     Some(rhs),
                     frame.this_obj,
                     |value, rhs| execute_binary_value(family, value, rhs.expect("rhs present")),
@@ -983,6 +1091,35 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.prop_set(
             object_value,
             name,
+            value.clone(),
+            DispatchFlags::default(),
+            caller_this,
+        )?;
+        Ok(value)
+    }
+
+    /// [`Vm::operate_property`] for a member operand that is a value rather
+    /// than a name. Both halves see the same member (`PropGet` then `PropSet`
+    /// on the same variant, `tjsInterCodeExec.cpp:1682-1730`), so a string or
+    /// octet receiver reads and writes through the reference's typed member.
+    fn operate_property_member(
+        &mut self,
+        object_value: Variant,
+        member: &Variant,
+        rhs: Option<Variant>,
+        caller_this: Option<ObjectHandle>,
+        op: impl FnOnce(Variant, Option<Variant>) -> Result<Variant>,
+    ) -> Result<Variant> {
+        let current = self.prop_get_member(
+            object_value.clone(),
+            member,
+            DispatchFlags::default(),
+            caller_this,
+        )?;
+        let value = op(current, rhs)?;
+        self.prop_set_member(
+            object_value,
+            member,
             value.clone(),
             DispatchFlags::default(),
             caller_this,
@@ -3189,28 +3326,43 @@ fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
-/// The index half of [`tjs_atoi`]: C's `atoi` accepts an optional sign, so
-/// skipping spaces and one `-` and finding a digit is what decides whether a
-/// member name is an index at all.
-fn tjs_atoi_name_prefix(name: &str) -> bool {
-    let mut chars = name.chars().peekable();
-    while chars.next_if(|ch| *ch <= ' ').is_some() {}
-    if chars.next_if_eq(&'-').is_some() {
-        while chars.next_if(|ch| *ch <= ' ').is_some() {}
+/// The member operand of a string/octet property access, resolved the way
+/// `GetStringProperty`/`GetOctetProperty` see it (`tjsInterCodeExec.cpp:50`,
+/// `:106`, `:132`, `:176`): an Integer or Real member is an index, every
+/// other member must be a string variant, and the rest raises the conversion
+/// failure `member.GetString()` reports (`tjsVariant.cpp:790-795`).
+enum MemberKind<'a> {
+    Index(i32),
+    Name(&'a str),
+}
+
+fn member_kind(member: &Variant) -> Result<MemberKind<'_>> {
+    match member {
+        Variant::String(name) => Ok(MemberKind::Name(name)),
+        // `(tjs_int)member.AsInteger()`: the reference narrows the value to
+        // its 32-bit `tjs_int`, so an out-of-range key truncates instead of
+        // reporting a range error.
+        Variant::Integer(value) => Ok(MemberKind::Index(*value as i32)),
+        Variant::Real(value) => Ok(MemberKind::Index(*value as i64 as i32)),
+        other => Err(TjsError::variant_convert(other, "string")),
     }
-    chars.peek().is_some_and(|ch| ch.is_ascii_digit())
+}
+
+/// The reference's "is this name an index" test: the *first* character must
+/// be a digit (`tjsInterCodeExec.cpp:67`, `:147`). `TJS_atoi` tolerates
+/// leading spaces and a sign, but that code sits inside this branch, so a
+/// name like `" 1"` or `"-1"` is an ordinary member miss.
+fn is_index_name(name: &str) -> bool {
+    name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
 }
 
 /// `TJS_atoi` (`tjsConfig.cpp:54-76`): skip spaces, accept one leading `-`,
-/// then consume digits until the first non-digit.
-///
-/// The reference accumulates into a `tjs_int` and so wraps on overflow;
-/// saturating here keeps such a name "very large" instead, which every
-/// caller reports the same way because the length it is compared against
-/// cannot reach the wrap point.
-fn tjs_atoi(name: &str) -> i64 {
+/// then consume digits until the first non-digit, accumulating in the
+/// reference's 32-bit `tjs_int` (so it wraps, and `"4294967296"` is index
+/// 0).
+fn tjs_atoi(name: &str) -> i32 {
     let mut chars = name.chars().peekable();
-    let mut value: i64 = 0;
+    let mut value: i32 = 0;
     while chars.next_if(|ch| *ch <= ' ').is_some() {}
     let negative = chars.next_if_eq(&'-').is_some();
     if negative {
@@ -3218,10 +3370,10 @@ fn tjs_atoi(name: &str) -> i64 {
     }
     while let Some(digit) = chars.next_if(|ch| ch.is_ascii_digit()) {
         value = value
-            .saturating_mul(10)
-            .saturating_add(digit as i64 - '0' as i64);
+            .wrapping_mul(10)
+            .wrapping_add(digit as i32 - '0' as i32);
     }
-    if negative { -value } else { value }
+    if negative { value.wrapping_neg() } else { value }
 }
 
 fn escape_tjs_string_fragment(value: &str) -> String {
@@ -3713,14 +3865,56 @@ mod tests {
             run(r#"return "abcd"["1x"];"#).expect("atoi prefix"),
             Variant::String("b".to_string())
         );
-        // A numeric key reaches the same rule through `key_from_variant`,
-        // which renders a real as its decimal text.
+        // A numeric key takes the reference's numeric branch, which narrows
+        // through `(tjs_int)member.AsInteger()` (`tjsInterCodeExec.cpp:89`).
         assert_eq!(
-            run(r#"return "abcd"[1.5];"#).expect("real key"),
-            Variant::String("b".to_string())
+            run(r#"return "abcd"[1.5] + "abcd"[1.9];"#).expect("real key"),
+            Variant::String("bb".to_string())
         );
         assert_eq!(
             run(r#"return "abcd"["0"];"#).expect("zero"),
+            Variant::String("a".to_string())
+        );
+    }
+
+    #[test]
+    fn string_names_that_are_not_digit_leading_are_ordinary_members() {
+        // The reference's index test is the *first* character
+        // (`tjsInterCodeExec.cpp:67`); `TJS_atoi`'s space and sign handling
+        // lives inside that branch, so these names are plain misses -- only
+        // numeric keys reach the negative index check.
+        for (source, name) in [
+            (r#"return "abc"["-1x"];"#, "-1x"),
+            (r#"return "abc"["-1"];"#, "-1"),
+            (r#"return "abc"[" 1"];"#, " 1"),
+            (r#"return "abc"["\t1"];"#, "\t1"),
+            (r#"return "abc"["+1"];"#, "+1"),
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::MemberNotFound, "{source}");
+            assert_eq!(
+                error.message,
+                format!("Member \"{name}\" does not exist"),
+                "{source}"
+            );
+        }
+        // A negative *numeric* key does reach the string reader's range check
+        // (`tjsInterCodeExec.cpp:92`).
+        let error = failure(r#"return "abc"[-1];"#);
+        assert_eq!(error.kind, TjsErrorKind::Runtime);
+        assert_eq!(error.message, "The value is out of the range");
+    }
+
+    #[test]
+    fn string_indices_truncate_to_32_bits() {
+        // `(tjs_int)member.AsInteger()` and `TJS_atoi`'s 32-bit accumulator
+        // (`tjsConfig.cpp:56`) both wrap, so 2^32 is index 0 either way.
+        assert_eq!(
+            run(r#"return "abc"[4294967296] + "abc"["4294967296"];"#).expect("wrapped index"),
+            Variant::String("aa".to_string())
+        );
+        assert_eq!(
+            run(r#"return "abc"[-0x100000000];"#).expect("wrapped negative key"),
             Variant::String("a".to_string())
         );
     }
@@ -3736,11 +3930,39 @@ mod tests {
         let error = failure(r#"return "abc"[4];"#);
         assert_eq!(error.kind, TjsErrorKind::Runtime);
         assert_eq!(error.message, "The value is out of the range");
-        // The reference's negative branch of the index check is reachable
-        // through `TJS_atoi`'s sign handling, where a digit still follows.
-        let negative = failure(r#"return "abc"["-1x"];"#);
-        assert_eq!(negative.kind, TjsErrorKind::Runtime);
-        assert_eq!(negative.message, "The value is out of the range");
+    }
+
+    #[test]
+    fn non_string_member_keys_report_the_convert_failure() {
+        // `member.GetString()` (`tjsVariant.h:790-795`) throws for anything
+        // that is not a string variant, so the readers never reach the name
+        // rule with a void, object or octet key.
+        for (source, rendered) in [
+            (r#"return "abc"[void];"#, "(void)"),
+            (r#"return "abc"[null];"#, "(object)"),
+            ("return (<% 10 20 FF %>)[<% 01 %>];", "(octet)<% 01 %>"),
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::Runtime, "{source}");
+            assert_eq!(
+                error.message,
+                format!("Cannot convert the variable type ({rendered} to string)"),
+                "{source}"
+            );
+        }
+        // The write side takes the same branch before the read-only rule.
+        let error = failure(r#"return "abc"[void] = 1;"#);
+        assert_eq!(error.kind, TjsErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((void) to string)"
+        );
+        let error = failure("var o = <% 10 %>; o[null] = 1;");
+        assert_eq!(error.kind, TjsErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((object) to string)"
+        );
     }
 
     #[test]
@@ -3763,6 +3985,7 @@ mod tests {
             r#"return "abc".length = 1;"#,
             r#"return "abc"[0] = "z";"#,
             r#"return "abc"[1.5] = "z";"#,
+            r#"return "abc"[-1] = "z";"#,
         ] {
             let error = failure(source);
             assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{source}");
@@ -3777,6 +4000,15 @@ mod tests {
         let error = failure(r#"return "abc"[9] = "z";"#);
         assert_eq!(error.kind, TjsErrorKind::AccessDenied);
         assert_eq!(error.message, "Invalid operation for Read-only or Write-only property");
+        // A name that only *looks* like an index is a miss on the write side
+        // too (`tjsInterCodeExec.cpp:115-120`).
+        for source in [
+            r#"return "abc"[" 1"] = "z";"#,
+            r#"return "abc"["-1x"] = "z";"#,
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::MemberNotFound, "{source}");
+        }
         let error = failure(r#"return "abc".unknownProp = 1;"#);
         assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
         assert_eq!(error.message, "Member \"unknownProp\" does not exist");
@@ -3798,11 +4030,23 @@ mod tests {
         let error = failure("return (<% 10 20 FF %>)[3];");
         assert_eq!(error.kind, TjsErrorKind::Runtime);
         assert_eq!(error.message, "The value is out of the range");
-        // A negative index only parses when `TJS_atoi` sees a digit after the
-        // sign, which is why this reaches the range check.
-        let error = failure("return (<% 10 20 FF %>)['-2x'];");
+        // A negative *numeric* index reaches the range check; the same text
+        // as a name does not (`:160-168`).
+        let error = failure("return (<% 10 20 FF %>)[-2];");
         assert_eq!(error.kind, TjsErrorKind::Runtime);
         assert_eq!(error.message, "The value is out of the range");
+        for source in [
+            "return (<% 10 20 FF %>)['-2x'];",
+            "return (<% 10 20 FF %>)[' 1'];",
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::MemberNotFound, "{source}");
+        }
+        // 32-bit narrowing, as in the string reader.
+        assert_eq!(
+            run("return (<% 10 20 FF %>)[4294967297];").expect("wrapped index"),
+            Variant::Integer(32)
+        );
         let error = failure("return (<% 10 20 FF %>).unknownProp;");
         assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
         assert_eq!(error.message, "Member \"unknownProp\" does not exist");
@@ -3817,6 +4061,7 @@ mod tests {
             "return (<% 10 20 FF %>).length = 1;",
             "return (<% 10 20 FF %>)[0] = 1;",
             "return (<% 10 20 FF %>)[9] = 1;",
+            "return (<% 10 20 FF %>)[-1] = 1;",
         ] {
             let error = failure(source);
             assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{source}");
@@ -3826,9 +4071,13 @@ mod tests {
                 "{source}"
             );
         }
-        let error = failure("return (<% 10 20 FF %>).unknownProp = 1;");
-        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
-        assert_eq!(error.message, "Member \"unknownProp\" does not exist");
+        for source in [
+            "return (<% 10 20 FF %>).unknownProp = 1;",
+            "return (<% 10 20 FF %>)[' 1'] = 1;",
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::MemberNotFound, "{source}");
+        }
     }
 
     #[test]

@@ -295,6 +295,24 @@ impl TjsError {
         Self::new(TjsErrorKind::Runtime, "Accessing to null object")
     }
 
+    /// The reference's conversion failure, `IDS_TJS_VARIANT_CONVERT_ERROR`:
+    /// `Cannot convert the variable type (%1 to %2)` (`string_table_en.rc:7`),
+    /// with `%1` rendered by `TJSVariantToReadableString` (`tjsUtils.cpp:50`)
+    /// and `%2` by `TJSVariantTypeToTypeString` (`tjsUtils.cpp:36-48`, whose
+    /// names are lower-case: `string`, `int`, `void`, ...).
+    ///
+    /// `TJSThrowVariantConvertError` (`tjsVariant.cpp:142-151`) raises it as a
+    /// plain script exception, so the kind stays `Runtime`.
+    pub fn variant_convert(value: &Variant, target_type: &str) -> Self {
+        Self::new(
+            TjsErrorKind::Runtime,
+            format!(
+                "Cannot convert the variable type ({} to {target_type})",
+                readable_value(value)
+            ),
+        )
+    }
+
     /// The reference's object-conversion failure: `Cannot convert the
     /// variable type (%1 to Object)` (`string_table_en.rc:8`,
     /// `IDS_TJS_VARIANT_CONVERT_ERROR_TO_OBJECT`), with `%1` rendered by
@@ -303,13 +321,7 @@ impl TjsError {
     /// `TJSThrowVariantConvertError` (`tjsVariant.cpp:142-151`) raises it as a
     /// plain script exception, so the kind stays `Runtime`.
     pub fn variant_convert_to_object(value: &Variant) -> Self {
-        Self::new(
-            TjsErrorKind::Runtime,
-            format!(
-                "Cannot convert the variable type ({} to Object)",
-                readable_value(value)
-            ),
-        )
+        Self::variant_convert(value, "Object")
     }
 
     /// Raised when the user quits an interactive debug session. It is never
