@@ -392,8 +392,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 if primary_has_member || (bind_this.is_none() && flags.ensure) {
                     if let Some(this_obj) = bind_this {
                         if let Some(existing) = primary_value.clone()
-                            && (!flags.ignore_prop
-                                || self.runtime.variant_is_native_property(&existing))
+                            && !flags.ignore_prop
                             && self
                                 .property_setter(existing, value.clone(), Some(this_obj))?
                                 .is_some()
@@ -407,8 +406,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         && primary_has_member
                     {
                         if let Some(existing) = primary_value.clone()
-                            && (!flags.ignore_prop
-                                || self.runtime.variant_is_native_property(&existing))
+                            && !flags.ignore_prop
                             && self
                                 .property_setter(existing, value.clone(), Some(this_obj))?
                                 .is_some()
@@ -446,8 +444,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let member_exists = self.runtime.heap[handle.0].get_raw(name).is_some()
             || (!self.is_bytecode_class(handle)
                 && self.class_chain_provides_member(handle, name)?);
-        if let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
-            && (!flags.ignore_prop || self.runtime.variant_is_native_property(&existing))
+        // `TJS_IGNOREPROP` skips the property object entirely and copies the
+        // value into the member slot (`tTJSCustomObject::PropSet`,
+        // `tjsObject.cpp:1519-1541`, and `TJSDefaultPropSet`, `:1435-1466`), so
+        // `&obj.prop = v` replaces a property -- script or native -- instead of
+        // running its setter, and a property that denies writes
+        // (`TJS_DENY_NATIVE_PROP_SETTER`, `Layer.font`) does not deny this
+        // store.  A plain store runs the setter.
+        if !flags.ignore_prop
+            && let Some(existing) = self.runtime.heap[handle.0].get_raw(name)
             && self
                 .property_setter(existing, value.clone(), caller_this)?
                 .is_some()
@@ -3885,6 +3890,99 @@ mod tests {
         assert_eq!(
             error.message,
             "Invalid operation for Read-only or Write-only property"
+        );
+    }
+
+    /// Hands its argument back the way the reference's self-bound members do:
+    /// `tTJSVariant(objthis, objthis)`, the shape `Layer.font`,
+    /// `Window.mainWindow` and `new`'s own result all carry
+    /// (`tjsInterCodeExec.cpp:2384`).  A host hands those values out as
+    /// closures, while the object the script itself holds -- a `new` result,
+    /// or the same object read back from another member -- is a plain object
+    /// here, so `===` has to reconcile the two spellings.
+    fn native_self_bound(
+        _runtime: &mut Runtime<NoHost>,
+        _this_obj: Option<ObjectHandle>,
+        args: Vec<Variant>,
+    ) -> Result<Variant> {
+        match args.first() {
+            Some(Variant::Object(handle)) => {
+                Ok(Variant::Closure(Closure::new(*handle, Some(*handle))))
+            }
+            _ => Ok(Variant::Void),
+        }
+    }
+
+    #[test]
+    fn a_self_bound_member_read_compares_equal_to_the_object() {
+        let mut runtime = Runtime::new();
+        runtime.register_global_native("selfBound", native_self_bound);
+        assert_eq!(
+            run_with(
+                &mut runtime,
+                r#"
+                class Box { function Box() {} }
+                var box = new Box();
+                var other = new Box();
+                var holder = %[];
+                holder.self = selfBound(box);
+                return (holder.self === box) + ":" + (holder.self === other) + ":" +
+                    (selfBound(box) !== box ? "differs" : "same");
+                "#
+            )
+            .expect("self-bound comparison"),
+            Variant::String("1:0:same".to_string())
+        );
+    }
+
+    /// `&obj.prop = v` is `VM_SPDS` (MEMBERENSURE|TJS_IGNOREPROP), and the
+    /// reference skips the property object for that flag: the value is copied
+    /// straight into the member slot (`tTJSCustomObject::PropSet`,
+    /// `tjsObject.cpp:1519-1541`; `TJSDefaultPropSet`, `:1435-1466`).  A plain
+    /// store runs the setter, and a property that denies writes
+    /// (`TJS_DENY_NATIVE_PROP_SETTER` in the reference class registration)
+    /// does not deny the ignore-prop store -- which is what lets a script
+    /// replace such a member.
+    #[test]
+    fn ignore_prop_store_skips_the_property() {
+        assert_eq!(
+            run(r#"
+                class Holder {
+                    var stored = 0;
+                    property value {
+                        getter { return stored; }
+                        setter(v) { stored = v * 3; }
+                    }
+                }
+                var holder = new Holder();
+                holder.value = 2;
+                var plain = holder.stored;
+                &holder.value = 5;
+                return plain + ":" + holder.stored + ":" + typeof holder.value + ":" +
+                    holder.value;
+                "#)
+            .expect("script property"),
+            Variant::String("6:6:Integer:5".to_string())
+        );
+
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        runtime.register_object_native_property_with_access(
+            target,
+            "font",
+            NativePropertyAccess::ReadOnly,
+            |_runtime, _this| Ok(Variant::String("font-object".to_string())),
+            |_runtime, _this, _value| Ok(()),
+        );
+        let error = run_with(&mut runtime, r#"target.font = "x";"#).expect_err("denied write");
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
+        assert_eq!(error.tjs_error_code(), Some(-1007));
+
+        run_with(&mut runtime, r#"&target.font = "hook";"#).expect("ignore-prop store");
+        assert_eq!(
+            run_with(&mut runtime, "return target.font;").expect("replaced member"),
+            Variant::String("hook".to_string())
         );
     }
 

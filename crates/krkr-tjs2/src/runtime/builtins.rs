@@ -1786,14 +1786,21 @@ pub(crate) fn regexp_object_handle<H: TjsHost>(
     runtime: &Runtime<H>,
     value: &Variant,
 ) -> Option<ObjectHandle> {
-    let Variant::Object(handle) = value else {
-        return None;
+    // `AsObjectNoAddRef()`: the object behind the value, whether it arrived as
+    // a plain object or as a closure.  A host hands out self-bound values
+    // (`tTJSVariant(objthis, objthis)`, the shape the reference gives `new`'s
+    // result and its self-bound members), and the native reads the object the
+    // binding points at.
+    let handle = match value {
+        Variant::Object(handle) => *handle,
+        Variant::Closure(closure) => closure.object,
+        _ => return None,
     };
     let object = &runtime.heap[handle.0];
     if matches!(object.get("pattern"), Variant::String(_))
         && !matches!(object.get("_compile"), Variant::Void)
     {
-        Some(*handle)
+        Some(handle)
     } else {
         None
     }

@@ -738,17 +738,13 @@ impl<H: TjsHost + 'static> Runtime<H> {
     /// Returns the names that were not a native property of `object`, so the
     /// caller can assert its deny-list still matches the class.
     ///
-    /// Callers must know about one modelling gap before denying a property
-    /// that scripts also store through: `prop_set_handle` invokes a native
-    /// property's setter even for a store that carries `TJS_IGNOREPROP` (a
-    /// regmember-style `&obj.prop = v` or VM member store), so such a store
-    /// fails with -1007 on a denied property, where the reference's
-    /// `TJSDefaultPropSet` (`tjsObject.cpp:1435-1466`) skips the property
-    /// entirely and overwrites the member.  A caller with an ignore-prop
-    /// store path onto a denied name has to either implement that skip or
-    /// confirm no script reaches it (real games normally write such
-    /// properties through their setters); everything else about the denial is
-    /// the official behaviour.
+    /// A denied property is denied for *plain* stores only.  A store that
+    /// carries `TJS_IGNOREPROP` (the regmember-style `&obj.prop = v`, VM_SPDS)
+    /// skips the property object the way `tTJSCustomObject::PropSet` does
+    /// (`tjsObject.cpp:1519-1541`) and copies the value into the member slot,
+    /// so a script can still replace the member outright -- which is exactly
+    /// how KAGEX swaps a layer's font (`&layer.font = hook`,
+    /// `sysscn/prerenderfontex.tjs`).
     pub fn deny_native_property_writes(
         &mut self,
         object: ObjectHandle,
