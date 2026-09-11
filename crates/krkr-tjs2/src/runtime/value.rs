@@ -602,7 +602,7 @@ fn string_to_real(value: &str) -> f64 {
 /// `-Infinity`, `+0.0`, `-0.0`, and otherwise C `%g` rules with 15
 /// significant digits — exponent form when the decimal exponent is < -4 or
 /// >= 15, trailing zeros stripped in both forms.
-fn real_to_string(value: f64) -> String {
+pub fn real_to_string(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
     }
