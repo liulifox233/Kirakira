@@ -332,34 +332,7 @@ impl Renderer {
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        if let Some(transition) = &prepared.transition {
-            let old_target = self.create_offscreen_target("Kirakira transition frozen target");
-            let new_target = self.create_offscreen_target("Kirakira transition live target");
-            self.render_commands_to_view(
-                &mut encoder,
-                &old_target.view,
-                "Kirakira transition frozen pass",
-                frame.clear_color,
-                None,
-                &transition.frozen_draw_commands,
-            );
-            self.render_commands_to_view(
-                &mut encoder,
-                &new_target.view,
-                "Kirakira transition live pass",
-                frame.clear_color,
-                frame.clip,
-                &prepared.draw_commands,
-            );
-            self.render_transition_to_view(
-                &mut encoder,
-                &view,
-                frame.clear_color,
-                &old_target.view,
-                &new_target.view,
-                transition,
-            );
-        } else {
+        if prepared.transitions.is_empty() {
             self.render_commands_to_view(
                 &mut encoder,
                 &view,
@@ -368,6 +341,59 @@ impl Renderer {
                 frame.clip,
                 &prepared.draw_commands,
             );
+        } else {
+            // The live tree is drawn first; each transition then replaces only
+            // its own destination rectangle (`tTVPDivisibleData::Dest`,
+            // `LayerIntf.cpp:6513`), so unrelated layers keep drawing normally
+            // while their neighbours transition.
+            self.render_commands_to_view(
+                &mut encoder,
+                &view,
+                "Kirakira render pass",
+                frame.clear_color,
+                frame.clip,
+                &prepared.draw_commands,
+            );
+            for transition in &prepared.transitions {
+                let plan = transition_composite_plan();
+                let old_target = self.create_offscreen_target("Kirakira transition frozen target");
+                self.render_commands_to_view(
+                    &mut encoder,
+                    &old_target.view,
+                    transition_face_label(plan.old),
+                    frame.clear_color,
+                    None,
+                    transition_face_commands(transition, plan.old),
+                );
+                let new_target = self.create_offscreen_target("Kirakira transition source target");
+                for (face, load) in plan.incoming {
+                    match load {
+                        FaceLoad::Clear => self.render_commands_to_view(
+                            &mut encoder,
+                            &new_target.view,
+                            transition_face_label(face),
+                            frame.clear_color,
+                            None,
+                            transition_face_commands(transition, face),
+                        ),
+                        FaceLoad::Load => self.render_commands_over_view(
+                            &mut encoder,
+                            &new_target.view,
+                            transition_face_label(face),
+                            None,
+                            transition_face_commands(transition, face),
+                        ),
+                    }
+                }
+                self.render_transition_to_view(
+                    &mut encoder,
+                    &view,
+                    transition.dest_rect,
+                    &old_target.view,
+                    &new_target.view,
+                    transition,
+                );
+            }
         }
 
         let capture_path = self.capture_path.take();
@@ -514,20 +540,35 @@ impl Renderer {
 
         let (draw_commands, mut image_uploads) = self.prepare_commands(&frame.draw_commands);
         image_uploads.extend(frame.image_uploads.iter().cloned());
-        let transition = frame.transition.as_ref().map(|transition| {
-            let (frozen_draw_commands, mut frozen_image_uploads) =
-                self.prepare_commands(&transition.frozen_draw_commands);
-            frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
-            FrameTransition {
-                method: transition.method.clone(),
-                progress: transition.progress,
-                params: transition.params.clone(),
-                rule_texture_id: transition.rule_texture_id,
-                rule_image_upload: transition.rule_image_upload.clone(),
-                frozen_draw_commands,
-                frozen_image_uploads,
-            }
-        });
+        let transitions = frame
+            .transitions
+            .iter()
+            .map(|transition| {
+                let (frozen_draw_commands, mut frozen_image_uploads) =
+                    self.prepare_commands(&transition.frozen_draw_commands);
+                frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
+                let (under_draw_commands, mut under_image_uploads) =
+                    self.prepare_commands(&transition.under_draw_commands);
+                under_image_uploads.extend(transition.under_image_uploads.iter().cloned());
+                let (source_draw_commands, mut source_image_uploads) =
+                    self.prepare_commands(&transition.source_draw_commands);
+                source_image_uploads.extend(transition.source_image_uploads.iter().cloned());
+                FrameTransition {
+                    method: transition.method.clone(),
+                    progress: transition.progress,
+                    params: transition.params.clone(),
+                    dest_rect: transition.dest_rect,
+                    rule_texture_id: transition.rule_texture_id,
+                    rule_image_upload: transition.rule_image_upload.clone(),
+                    frozen_draw_commands,
+                    frozen_image_uploads,
+                    under_draw_commands,
+                    under_image_uploads,
+                    source_draw_commands,
+                    source_image_uploads,
+                }
+            })
+            .collect();
 
         FrameOutput {
             clear_color: frame.clear_color,
@@ -535,7 +576,7 @@ impl Renderer {
             draw_commands,
             image_uploads,
             image_releases: frame.image_releases.clone(),
-            transition,
+            transitions,
         }
     }
 
@@ -585,8 +626,10 @@ impl Renderer {
 
     fn upload_frame_images(&mut self, frame: &FrameOutput) {
         self.upload_images(&frame.image_uploads);
-        if let Some(transition) = &frame.transition {
+        for transition in &frame.transitions {
             self.upload_images(&transition.frozen_image_uploads);
+            self.upload_images(&transition.under_image_uploads);
+            self.upload_images(&transition.source_image_uploads);
             if let Some(upload) = &transition.rule_image_upload {
                 self.upload_images(std::slice::from_ref(upload));
             }
@@ -665,14 +708,51 @@ impl Renderer {
     fn retain_frame_textures(&mut self, frame: &FrameOutput) {
         let mut referenced = BTreeSet::new();
         collect_image_texture_ids(&frame.draw_commands, &mut referenced);
-        if let Some(transition) = &frame.transition {
+        for transition in &frame.transitions {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced);
+            collect_image_texture_ids(&transition.under_draw_commands, &mut referenced);
+            collect_image_texture_ids(&transition.source_draw_commands, &mut referenced);
             if let Some(texture_id) = transition.rule_texture_id {
                 referenced.insert(texture_id);
             }
         }
         self.textures
             .retain(|texture_id, _| referenced.contains(texture_id));
+    }
+
+    /// Draws `commands` on top of whatever `view` already holds.
+    fn render_commands_over_view(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        label: &'static str,
+        clip: Option<Rect>,
+        commands: &[DrawCommand],
+    ) {
+        let physical_clip = clip.and_then(|clip| self.physical_rect(clip));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        if let Some(clip) = physical_clip {
+            pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        }
+        if clip.is_none() || physical_clip.is_some() {
+            self.draw_commands(&mut pass, commands);
+        }
     }
 
     fn render_commands_to_view(
@@ -714,11 +794,21 @@ impl Renderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        clear_color: Color,
+        dest_rect: Option<Rect>,
         old_view: &wgpu::TextureView,
         new_view: &wgpu::TextureView,
         transition: &FrameTransition,
     ) {
+        // A transition whose destination has no measurable geometry covers the
+        // whole frame; otherwise only the destination layer's own area is
+        // rewritten and the live frame stays visible everywhere else.
+        let clip = match dest_rect {
+            Some(rect) => match self.physical_rect(rect) {
+                Some(clip) => Some(clip),
+                None => return,
+            },
+            None => None,
+        };
         let uniforms = transition_uniforms(
             transition,
             self.config.width.max(1) as f32,
@@ -777,7 +867,10 @@ impl Renderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu_color(clear_color)),
+                    // The live frame is already on the surface; the transition
+                    // only rewrites its destination rectangle, so the rest of
+                    // the frame survives untouched.
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -786,6 +879,9 @@ impl Renderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some(clip) = clip {
+            pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        }
         self.draw_transition_fullscreen(&mut pass, &bind_group);
     }
 
@@ -1326,6 +1422,89 @@ struct TransitionUniforms {
     data: [[f32; 4]; 8],
 }
 
+/// One of the three faces a transition is composed from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionFace {
+    /// The scene the transition started from (`tTVPDivisibleData::Src1`,
+    /// `LayerIntf.cpp:6592`).  It is the composite's other input, never part of
+    /// the incoming target.
+    Old,
+    /// The scene *without* the destination layer's subtree.
+    ///
+    /// Official's crossfade is `dest = lerp(src1, src2, p)` per channel
+    /// including alpha (`const_alpha_blend_functor`, `blend_functor_c.h:584-594`;
+    /// `sd_blend_func_c`, `blend_function.cpp:109-114`; called with `Phase` from
+    /// `TransIntf.cpp:680`), and the layer manager composites the result.  The
+    /// destination's bitmap is therefore *not* pre-composited over the scene
+    /// when the blend runs, so the incoming face has to be drawn over the bare
+    /// under-content: at a pixel the source does not cover, the destination's
+    /// pixels fade out by `1 - p` and the scene beneath shows through.
+    Under,
+    /// The source layer's own bitmap (`tTVPDivisibleData::Src2`, `:6611`).
+    Source,
+}
+
+/// The draw list behind one face.
+fn transition_face_commands(
+    transition: &FrameTransition,
+    face: TransitionFace,
+) -> &[DrawCommand] {
+    match face {
+        TransitionFace::Old => &transition.frozen_draw_commands,
+        TransitionFace::Under => &transition.under_draw_commands,
+        TransitionFace::Source => &transition.source_draw_commands,
+    }
+}
+
+/// How a face starts its target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FaceLoad {
+    /// Clear to the frame colour, then draw the face.
+    Clear,
+    /// Draw the face over what the target already holds.
+    Load,
+}
+
+/// Everything one transition's composite is built from, in render order.
+///
+/// Official's crossfade is `dest = lerp(src1, src2, p)` per channel including
+/// alpha (`const_alpha_blend_functor`, `blend_functor_c.h:584-594`;
+/// `sd_blend_func_c`, `blend_function.cpp:109-114`; caller `TransIntf.cpp:680`)
+/// and the layer manager composites the *result* afterwards.  Rendering `old`
+/// and `source-over-under` and mixing them at the progress expands to
+/// `(1-p)·a_d·D + p·a_s·S + [(1-p)(1-a_d) + p(1-a_s)]·U`, which is the official
+/// blend over the scene beneath the destination layer for every destination
+/// alpha, source alpha and progress.
+///
+/// The value is the renderer's whole plan: it says which face feeds the
+/// composite's `old` input, which this plan builds the incoming target from and
+/// in what order, and whether each starts by clearing.  `Old` as the base would
+/// hold the destination's content where official fades it out; dropping the
+/// base would leave every transparent pixel of the source on the frame colour.
+fn transition_composite_plan() -> TransitionCompositePlan {
+    TransitionCompositePlan {
+        old: TransitionFace::Old,
+        incoming: [
+            (TransitionFace::Under, FaceLoad::Clear),
+            (TransitionFace::Source, FaceLoad::Load),
+        ],
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransitionCompositePlan {
+    old: TransitionFace,
+    incoming: [(TransitionFace, FaceLoad); 2],
+}
+
+fn transition_face_label(face: TransitionFace) -> &'static str {
+    match face {
+        TransitionFace::Old => "Kirakira transition frozen pass",
+        TransitionFace::Under => "Kirakira transition under pass",
+        TransitionFace::Source => "Kirakira transition source pass",
+    }
+}
+
 fn transition_uniforms(
     transition: &FrameTransition,
     viewport_width: f32,
@@ -1490,4 +1669,205 @@ fn capture_adler32(data: &[u8]) -> u32 {
         b = (b + a) % MOD;
     }
     (b << 16) | a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krkr_core::{Rect, TransitionParams};
+
+    fn transition(
+        frozen: Vec<DrawCommand>,
+        under: Vec<DrawCommand>,
+        source: Vec<DrawCommand>,
+    ) -> FrameTransition {
+        FrameTransition {
+            method: "crossfade".to_string(),
+            progress: 0.5,
+            params: TransitionParams::default(),
+            dest_rect: Some(Rect::new(0.0, 0.0, 4.0, 4.0)),
+            rule_texture_id: None,
+            rule_image_upload: None,
+            frozen_draw_commands: frozen,
+            frozen_image_uploads: Vec::new(),
+            under_draw_commands: under,
+            under_image_uploads: Vec::new(),
+            source_draw_commands: source,
+            source_image_uploads: Vec::new(),
+        }
+    }
+
+    fn image(texture_id: TextureId) -> DrawCommand {
+        DrawCommand::Image(ImageCommand {
+            texture_id,
+            rect: Rect::new(0.0, 0.0, 4.0, 4.0),
+            source_rect: Rect::new(0.0, 0.0, 4.0, 4.0),
+            texture_size: Size::new(4.0, 4.0),
+            opacity: 1.0,
+            opaque: false,
+        })
+    }
+
+    /// The whole composition, as the renderer must perform it: `Old` feeds the
+    /// composite, and the incoming target is the under-content cleared and then
+    /// the source drawn over it.  Reversing any of that -- `Old` as the base,
+    /// the source cleared instead of loaded, the two swapped -- fails here.
+    #[test]
+    fn composite_plan_is_the_official_composition() {
+        let plan = transition_composite_plan();
+        assert_eq!(plan.old, TransitionFace::Old);
+        assert_eq!(
+            plan.incoming,
+            [
+                (TransitionFace::Under, FaceLoad::Clear),
+                (TransitionFace::Source, FaceLoad::Load),
+            ]
+        );
+
+        let transition = transition(vec![image(1)], vec![image(2)], vec![image(3)]);
+        // Each face reads its own list.
+        assert!(matches!(
+            transition_face_commands(&transition, plan.old),
+            [DrawCommand::Image(image)] if image.texture_id == 1
+        ));
+        assert!(matches!(
+            transition_face_commands(&transition, plan.incoming[0].0),
+            [DrawCommand::Image(image)] if image.texture_id == 2
+        ));
+        assert!(matches!(
+            transition_face_commands(&transition, plan.incoming[1].0),
+            [DrawCommand::Image(image)] if image.texture_id == 3
+        ));
+    }
+
+    /// Straight-alpha source-over, the blend the renderer's pipeline uses to
+    /// draw one face into a target.
+    fn over(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for channel in 0..3 {
+            out[channel] = src[channel] * src[3] + dst[channel] * (1.0 - src[3]);
+        }
+        out[3] = src[3] + dst[3] * (1.0 - src[3]);
+        out
+    }
+
+    /// The composite the plan produces for one pixel, together with the
+    /// official blend it has to reproduce.
+    ///
+    /// `destination` is the destination layer's own bitmap (`Src1`) with its
+    /// alpha, `under` the scene beneath it, `source` the source layer's bitmap
+    /// (`Src2`) with its alpha.
+    fn plan_result(
+        plan: TransitionCompositePlan,
+        destination: [f32; 4],
+        under: [f32; 4],
+        source: [f32; 4],
+        progress: f32,
+    ) -> ([f32; 4], [f32; 4]) {
+        let clear = [0.0, 0.0, 0.0, 1.0];
+        let scene = over(destination, under);
+        let face_value = |face: TransitionFace| match face {
+            TransitionFace::Old => scene,
+            TransitionFace::Under => under,
+            TransitionFace::Source => source,
+        };
+        let mut target = clear;
+        for (face, load) in plan.incoming {
+            target = match load {
+                FaceLoad::Clear => over(face_value(face), clear),
+                FaceLoad::Load => over(face_value(face), target),
+            };
+        }
+        let old = face_value(plan.old);
+        let mut result = [0.0f32; 4];
+        for channel in 0..4 {
+            result[channel] = old[channel] * (1.0 - progress) + target[channel] * progress;
+        }
+        // The official crossfade, expanded: `TVPConstAlphaBlend_SD` lerps the
+        // two layer bitmaps per channel including alpha
+        // (`blend_functor_c.h:584-594`), and the layer manager composites the
+        // result over the scene beneath the destination layer -- the shared
+        // under-content keeps weight `(1-p)(1-a_d) + p(1-a_s)`.
+        let destination_alpha = destination[3];
+        let source_alpha = source[3];
+        let mut official = [0.0f32; 4];
+        for channel in 0..3 {
+            official[channel] = destination_alpha * destination[channel] * (1.0 - progress)
+                + source_alpha * source[channel] * progress
+                + ((1.0 - destination_alpha) * (1.0 - progress)
+                    + (1.0 - source_alpha) * progress)
+                    * under[channel];
+        }
+        official[3] = 1.0;
+        (result, official)
+    }
+
+    #[test]
+    fn composite_plan_reproduces_the_official_blend_for_every_alpha_and_progress() {
+        let plan = transition_composite_plan();
+        let under = [0.1f32, 0.2, 0.3, 1.0];
+        let source_colour = [0.9f32, 0.1, 0.4, 1.0];
+        let destination_colour = [0.2f32, 0.7, 0.5, 1.0];
+        for destination_alpha in [0.0f32, 0.25, 0.5, 1.0] {
+            for source_alpha in [0.0f32, 0.25, 0.5, 1.0] {
+                for progress in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+                    let mut destination = destination_colour;
+                    destination[3] = destination_alpha;
+                    let mut source = source_colour;
+                    source[3] = source_alpha;
+                    let (result, official) =
+                        plan_result(plan, destination, under, source, progress);
+                    for channel in 0..4 {
+                        assert!(
+                            (result[channel] - official[channel]).abs() < 1e-6,
+                            "channel {channel} at destination alpha {destination_alpha}, \
+                             source alpha {source_alpha}, progress {progress}: \
+                             {} vs {}",
+                            result[channel],
+                            official[channel]
+                        );
+                    }
+                }
+            }
+        }
+
+        // The discriminating cases: with the destination opaque and the source
+        // transparent, `Old` as the base holds the destination's content where
+        // official fades it out, and a cleared source pass replaces it with the
+        // frame colour.
+        let opaque_destination = [0.2f32, 0.7, 0.5, 1.0];
+        let transparent_source = [0.0f32, 0.0, 0.0, 0.0];
+        let (held, faded) = plan_result(
+            TransitionCompositePlan {
+                old: TransitionFace::Old,
+                incoming: [
+                    (TransitionFace::Old, FaceLoad::Clear),
+                    (TransitionFace::Source, FaceLoad::Load),
+                ],
+            },
+            opaque_destination,
+            under,
+            transparent_source,
+            0.75,
+        );
+        // Holding the destination is exactly what the wrong plan does.
+        assert_eq!(held, opaque_destination);
+        assert!((held[0] - faded[0]).abs() > 0.02);
+        // A plan whose first pass clears without the under-content leaves the
+        // source sitting on the frame colour.
+        let (cleared, faded) = plan_result(
+            TransitionCompositePlan {
+                old: TransitionFace::Old,
+                incoming: [
+                    (TransitionFace::Source, FaceLoad::Clear),
+                    (TransitionFace::Source, FaceLoad::Load),
+                ],
+            },
+            opaque_destination,
+            under,
+            transparent_source,
+            0.75,
+        );
+        assert!((cleared[0] - faded[0]).abs() > 0.02);
+    }
 }

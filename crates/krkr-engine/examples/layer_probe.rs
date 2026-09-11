@@ -117,7 +117,7 @@ fn main() {
             )
             .expect("update");
         if frame_index % 30 == 0
-            || (frame.output.transition.is_some() && frame_index % 15 == 0)
+            || (!frame.output.transitions.is_empty() && frame_index % 15 == 0)
             || frame_index + 1 == frames
         {
             let images = frame
@@ -129,7 +129,7 @@ fn main() {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let transition = frame.output.transition.as_ref().map(|transition| {
+            let transition = frame.output.transitions.first().map(|transition| {
                 let frozen_images = transition
                     .frozen_draw_commands
                     .iter()
@@ -152,7 +152,7 @@ fn main() {
             for image in images.iter().take(image_limit) {
                 print_image("  image", image, &frame.output.image_uploads, &engine);
             }
-            if let Some(transition) = &frame.output.transition {
+            if let Some(transition) = frame.output.transitions.first() {
                 let frozen_images = transition
                     .frozen_draw_commands
                     .iter()

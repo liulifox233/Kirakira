@@ -13,7 +13,7 @@ use krkr_assets::storage::normalize_storage_name;
 use krkr_core::{
     AssetKind, AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef,
     DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
-    LifecycleState, Point, ProjectStoragePort, ResourceData, StoragePort, TextInputEvent,
+    LifecycleState, Point, ProjectStoragePort, Rect, ResourceData, StoragePort, TextInputEvent,
     TextureId, TransitionParams,
 };
 use krkr_font::FontSystem;
@@ -418,7 +418,10 @@ pub struct KrkrHost {
     kag_layers: BTreeMap<String, LayerId>,
     pending_kag_layers: BTreeMap<String, LayerNode>,
     transition_policy: TransitionPolicy,
-    active_transition: Option<ActiveTransition>,
+    /// Every running transition, in start order.  Official KRKR keeps one per
+    /// layer, so unrelated layers transition concurrently
+    /// (`tTJSNI_BaseLayer::InTransition`, `LayerIntf.cpp:6334`).
+    active_transitions: Vec<ActiveTransition>,
     completed_native_transitions: Vec<NativeTransitionCompletion>,
     current_kag_page: String,
     current_kag_layer: String,
@@ -513,7 +516,7 @@ impl Default for KrkrHost {
             kag_layers: BTreeMap::new(),
             pending_kag_layers: BTreeMap::new(),
             transition_policy: TransitionPolicy::Animated,
-            active_transition: None,
+            active_transitions: Vec::new(),
             completed_native_transitions: Vec::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
@@ -3127,10 +3130,11 @@ impl KrkrHost {
         }
     }
 
+    /// `TransitionPolicy::Immediate` and zero-duration transitions: nothing is
+    /// ever visible, so every layer's transition finishes at once.
     pub(crate) fn apply_immediate_transition(&mut self) {
-        self.complete_active_transition();
+        self.complete_all_transitions();
         self.apply_pending_kag_layers();
-        self.active_transition = None;
     }
 
     pub(crate) fn begin_kag_transition(
@@ -3138,11 +3142,30 @@ impl KrkrHost {
         duration: Duration,
         params: TransitionParams,
         rule_image_upload: Option<ImageUpload>,
+        page_base: Option<ObjectHandle>,
     ) {
-        self.complete_active_transition();
         if self.pending_kag_layers.is_empty() {
-            self.active_transition = None;
             return;
+        }
+
+        // The `[trans]` tag is the engine's own projection of KAG's page swap,
+        // not a script `Layer.beginTransition`: the tag has no layer object to
+        // report a guard failure to, and a repeated `[trans]` on the same page
+        // must restart rather than leave the previous projection running.
+        // When KAG's own page base object exists it is the layer the script
+        // sized and the layer official would mark `InTransition`, so it is used
+        // for both the rectangle and the guards.
+        let slot_layer = self.ensure_kag_layer("fore", "base");
+        let gate_dest = page_base.filter(|handle| self.native_layer(*handle).is_some());
+        let dest_layer = gate_dest
+            .and_then(|handle| self.native_layer(handle))
+            .unwrap_or(slot_layer);
+        if self
+            .active_transitions
+            .iter()
+            .any(|transition| transition.dest_layer == Some(dest_layer))
+        {
+            self.stop_transition_for_layer(dest_layer, TransitionStop::Manual);
         }
 
         if duration.is_zero() || self.transition_policy == TransitionPolicy::Immediate {
@@ -3151,205 +3174,426 @@ impl KrkrHost {
         }
 
         let (frozen_draw_commands, frozen_image_uploads) = self.layer_tree.draw_model();
+        // The scene the incoming face is drawn over: the page without the
+        // destination's own subtree, so the crossfade fades the outgoing page
+        // out toward what is behind it (`const_alpha_blend_functor`,
+        // `blend_functor_c.h:584-594`).
+        let (under_draw_commands, under_image_uploads) =
+            self.layer_tree.draw_model_filtered(|node| {
+                !self.layer_tree.is_ancestor_or_self(dest_layer, node.id)
+            });
+        let dest_rect = self.transition_destination_rect(dest_layer, true);
         self.apply_pending_kag_layers();
-        self.active_transition = Some(ActiveTransition {
+        // The tag has no separate source layer: `backlay` staged the incoming
+        // page onto the fore layers, so the incoming face is that same tree
+        // after the staged page has been applied.
+        let (source_draw_commands, source_image_uploads) = self.layer_tree.draw_model();
+        self.active_transitions.push(ActiveTransition {
             params,
             rule_texture_id: rule_image_upload.as_ref().map(|upload| upload.texture_id),
             rule_image_upload,
             elapsed: Duration::ZERO,
             duration,
-            frozen_draw_commands,
-            frozen_image_uploads,
+            faces: TransitionFaces::Frozen(TransitionFaceLists {
+                old_draw_commands: frozen_draw_commands,
+                old_image_uploads: frozen_image_uploads,
+                under_draw_commands,
+                under_image_uploads,
+                source_draw_commands,
+                source_image_uploads,
+            }),
             suppressed_live_images: BTreeSet::new(),
-            live_layer_overrides: BTreeMap::new(),
-            live_layer_restore: BTreeMap::new(),
+            dest_layer: Some(dest_layer),
+            gate_dest,
+            dest_rect,
             native_completion: None,
+            self_update: false,
+            tick_callback: None,
+            pending_delta: Duration::ZERO,
+            completion_event_prevented: false,
         });
     }
 
-    pub(crate) fn begin_native_transition(
-        &mut self,
-        duration: Duration,
-        params: TransitionParams,
-        rule_image_upload: Option<ImageUpload>,
-        frozen_model: (Vec<DrawCommand>, Vec<ImageUpload>),
-        suppressed_live_images: BTreeSet<LayerId>,
-        live_layer_overrides: BTreeMap<LayerId, LayerNode>,
-        live_layer_restore: BTreeMap<LayerId, LayerNode>,
-        completion: NativeTransitionCompletion,
-    ) {
-        self.complete_active_transition();
-        if duration.is_zero() || self.transition_policy == TransitionPolicy::Immediate {
-            self.restore_transition_live_overrides(&live_layer_overrides, &live_layer_restore);
-            self.completed_native_transitions.push(completion);
-            self.active_transition = None;
-            return;
-        }
-
-        self.active_transition = Some(ActiveTransition {
+    /// Starts a script `Layer.beginTransition`.
+    ///
+    /// The caller has already checked the two guards `StartTransition` applies
+    /// (`LayerIntf.cpp:6188-6196`) and the immediate-completion cases, so the
+    /// transition always starts.
+    pub(crate) fn begin_native_transition(&mut self, start: NativeTransitionStart) {
+        let NativeTransitionStart {
+            duration,
+            params,
+            rule_image_upload,
+            faces,
+            suppressed_live_images,
+            completion,
+            dest_rect,
+            self_update,
+            tick_callback,
+        } = start;
+        let dest_layer = self.native_layer(completion.dest);
+        self.active_transitions.push(ActiveTransition {
             params,
             rule_texture_id: rule_image_upload.as_ref().map(|upload| upload.texture_id),
             rule_image_upload,
             elapsed: Duration::ZERO,
             duration,
-            frozen_draw_commands: frozen_model.0,
-            frozen_image_uploads: frozen_model.1,
+            faces,
             suppressed_live_images,
-            live_layer_overrides,
-            live_layer_restore,
+            dest_layer,
+            gate_dest: None,
+            dest_rect,
             native_completion: Some(completion),
+            self_update,
+            tick_callback,
+            pending_delta: Duration::ZERO,
+            completion_event_prevented: false,
         });
     }
 
-    /// Puts back the pre-transition state of every layer a running transition
-    /// projected the incoming page onto.
+    /// Official `tTJSNI_BaseLayer::GetNodeVisible`-based destination rectangle
+    /// for `layer_id` (`tTransDrawable::DrawCompleted`, `LayerIntf.cpp:6575`).
     ///
-    /// Official transitions never write into either layer's subtree
-    /// (`tTransDrawable::DrawCompleted`, `LayerIntf.cpp:6567` draws the source
-    /// composite as the second face), so the projection is unwound here.  Only
-    /// what the projection wrote is restored (`LayerNode::copy_render_state_from`)
-    /// and the layer's own script properties are re-applied on top, so a change
-    /// the script made while the transition ran -- including an image it loaded
-    /// into the layer -- survives.
-    pub(crate) fn restore_transition_live_overrides(
-        &mut self,
-        projected: &BTreeMap<LayerId, LayerNode>,
-        restore: &BTreeMap<LayerId, LayerNode>,
-    ) {
-        for (layer_id, original) in restore {
-            let script_image = match (projected.get(layer_id), self.layer_tree.layer(*layer_id)) {
-                (Some(projected), Some(current)) if current.image != projected.image => Some((
-                    current.image.clone(),
-                    current.province.clone(),
-                    current.image_width,
-                    current.image_height,
-                )),
-                _ => None,
+    /// With children the handler covers every drawn child region, so the
+    /// rectangle is the layer's own bounds unioned with its renderable
+    /// descendants'.  Without children only the destination's own main image is
+    /// blended, so the layer's own bounds are used.  A layer that was never
+    /// given a size has no such rectangle and `None` makes the projection cover
+    /// the whole frame.
+    pub(crate) fn transition_destination_rect(
+        &self,
+        layer_id: LayerId,
+        with_children: bool,
+    ) -> Option<Rect> {
+        let bounds = |node: &LayerNode| {
+            let origin = self.layer_tree.absolute_position(node.id)?;
+            (node.width > 0.0 && node.height > 0.0).then(|| {
+                Rect::new(origin.x, origin.y, node.width, node.height)
+            })
+        };
+        let own = self.layer_tree.layer(layer_id).and_then(bounds);
+        if !with_children {
+            return own;
+        }
+        let mut union = own;
+        for node in self.layer_tree.layers() {
+            if node.id == layer_id
+                || !node.renderable
+                || !self.layer_tree.is_ancestor_or_self(layer_id, node.id)
+            {
+                continue;
+            }
+            let Some(rect) = bounds(node) else {
+                continue;
             };
-            if let Some(layer) = self.layer_tree.layer_mut(*layer_id) {
-                layer.copy_render_state_from(original);
-                if let Some((image, province, image_width, image_height)) = script_image {
-                    layer.image = image;
-                    layer.province = province;
-                    layer.image_width = image_width;
-                    layer.image_height = image_height;
+            union = Some(match union {
+                Some(current) => union_rects(current, rect),
+                None => rect,
+            });
+        }
+        union
+    }
+
+    /// One `InvokeTransition` pass (`LayerIntf.cpp:6455`) for every running
+    /// transition.
+    ///
+    /// A transition whose completion event was prevented stops as soon as
+    /// event dispatching is enabled again, and does not advance while it is
+    /// prevented -- the official code returns before `Update()`, so the last
+    /// composited frame stays on screen.  A self-updated transition
+    /// (`TransSelfUpdate`) is not driven by the idle hook at all, so this pass
+    /// leaves its phase alone; `Layer.update()` moves it instead.  Everything
+    /// else advances by `delta` and stops through the handler when it reaches
+    /// its time or its destination is no longer node-visible.
+    pub(crate) fn advance_transition(&mut self, delta: Duration) {
+        let event_disabled = self.scheduler.event_disabled();
+        let mut index = 0;
+        while index < self.active_transitions.len() {
+            let dest_visible = self
+                .active_transitions[index]
+                .dest_layer
+                .is_none_or(|layer_id| self.layer_tree.node_visible(layer_id));
+            if self.active_transitions[index].completion_event_prevented {
+                if event_disabled {
+                    index += 1;
+                    continue;
+                }
+                self.stop_transition_at(index, TransitionStop::Manual);
+                continue;
+            }
+            let transition = &mut self.active_transitions[index];
+            if transition.tick_callback.is_none() {
+                if transition.self_update {
+                    transition.pending_delta = transition.pending_delta.saturating_add(delta);
+                } else {
+                    transition.elapsed = transition.elapsed.saturating_add(delta);
                 }
             }
-            let handle = self
-                .native_layers
-                .iter()
-                .find_map(|(handle, instance)| (instance.layer_id == *layer_id).then_some(*handle));
-            if let Some(handle) = handle {
-                self.apply_layer_instance_to_render(handle);
+            if !dest_visible || transition.elapsed >= transition.duration {
+                self.stop_transition_by_handler(index);
+                continue;
             }
+            index += 1;
         }
     }
 
-    pub(crate) fn advance_transition(&mut self, delta: Duration) {
-        // `tTJSNI_BaseLayer::InvokeTransition` (`LayerIntf.cpp:6463`): a
-        // destination that is no longer node-visible stops the transition,
-        // which still runs the exchange and fires `onTransitionCompleted`.
-        let dest_invisible = self
-            .active_transition
-            .as_ref()
-            .and_then(|transition| transition.native_completion.as_ref())
-            .is_some_and(|completion| !self.native_layer_node_visible(completion.dest));
-        let Some(transition) = &mut self.active_transition else {
-            return;
-        };
-        transition.elapsed = transition.elapsed.saturating_add(delta);
-        if dest_invisible || transition.elapsed >= transition.duration {
-            let (completion, overrides, restore) = (
-                transition.native_completion.take(),
-                std::mem::take(&mut transition.live_layer_overrides),
-                std::mem::take(&mut transition.live_layer_restore),
-            );
-            if let Some(completion) = completion {
-                self.completed_native_transitions.push(completion);
-            }
-            self.active_transition = None;
-            self.restore_transition_live_overrides(&overrides, &restore);
+    /// Destinations whose transition reads its tick from a `callback` option.
+    /// The engine calls each closure once per pass and stores the result with
+    /// `set_transition_tick`, because only the runtime can invoke TJS code.
+    pub(crate) fn transition_tick_callbacks(&self) -> Vec<(ObjectHandle, Variant)> {
+        self.active_transitions
+            .iter()
+            .filter(|transition| !transition.self_update && !transition.completion_event_prevented)
+            .filter_map(|transition| {
+                Some((
+                    transition.dest_handle()?,
+                    transition.tick_callback.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Stores the tick a `callback` option returned.
+    ///
+    /// `StartTransition` runs a dummy `StartProcess(0)` for a callback-driven
+    /// transition before anything else, so the handler's origin tick is zero
+    /// and the phase is simply `tick / time` (`TransIntf.cpp:544`).
+    pub(crate) fn set_transition_tick(&mut self, dest: ObjectHandle, tick: i64) {
+        if let Some(transition) = self
+            .active_transitions
+            .iter_mut()
+            .find(|transition| transition.dest_handle() == Some(dest))
+        {
+            transition.elapsed = Duration::from_millis(tick.max(0) as u64);
         }
     }
 
-    /// Official `tTJSNI_BaseLayer::GetNodeVisible` (`LayerIntf.h:308`) for a
-    /// TJS layer handle.  A handle without a native layer never stops a
-    /// transition.
-    fn native_layer_node_visible(&self, handle: ObjectHandle) -> bool {
-        self.native_layer(handle)
-            .is_none_or(|layer_id| self.layer_tree.node_visible(layer_id))
+    /// Advances a self-updated transition one script-driven step.
+    ///
+    /// Official `tTJSNI_BaseLayer::BeforeCompletion` (`LayerIntf.cpp:5056`)
+    /// takes `TransTick = GetTransTick()` when `TransSelfUpdate` is set, so a
+    /// `Layer.update()` on the destination moves the phase to the current
+    /// clock; the engine keeps the elapsed frame time until that happens.
+    pub(crate) fn advance_self_updated_transition(&mut self, dest: ObjectHandle) -> bool {
+        let Some(transition) = self
+            .active_transitions
+            .iter_mut()
+            .find(|transition| transition.dest_handle() == Some(dest))
+        else {
+            return false;
+        };
+        if !transition.self_update || transition.tick_callback.is_some() {
+            return false;
+        }
+        transition.elapsed = transition.elapsed.saturating_add(transition.pending_delta);
+        transition.pending_delta = Duration::ZERO;
+        true
     }
 
-    pub(crate) fn complete_active_transition(&mut self) {
-        let Some(mut transition) = self.active_transition.take() else {
-            return;
-        };
+    /// Every destination layer with a transition still running.
+    pub(crate) fn transition_destinations(&self) -> Vec<ObjectHandle> {
+        self.active_transitions
+            .iter()
+            .filter_map(ActiveTransition::dest_handle)
+            .collect()
+    }
+
+    /// `tTJSNI_BaseLayer::TransSelfUpdate` (`LayerIntf.cpp:6211`) for the
+    /// transition running on `dest`.
+    pub(crate) fn transition_self_update(&self, dest: ObjectHandle) -> bool {
+        self.active_transitions
+            .iter()
+            .find(|transition| transition.dest_handle() == Some(dest))
+            .is_some_and(|transition| transition.self_update)
+    }
+
+    /// `tTJSNI_BaseLayer::TransDest` (`LayerIntf.cpp:6290`): the destination of
+    /// the transition this layer is the source of.
+    pub(crate) fn layer_transition_destination(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.active_transitions
+            .iter()
+            .find(|transition| transition.source_handle() == Some(handle))
+            .and_then(ActiveTransition::dest_handle)
+    }
+
+    /// The `callback` option of a running transition, so `Layer.update()` can
+    /// move a self-updated transition to the tick the script supplies.
+    pub(crate) fn transition_tick_callback(&self, dest: ObjectHandle) -> Option<Variant> {
+        self.active_transitions
+            .iter()
+            .find(|transition| transition.dest_handle() == Some(dest))
+            .and_then(|transition| transition.tick_callback.clone())
+    }
+
+    /// Official `tTJSNI_BaseLayer::StopTransitionByHandler` (`LayerIntf.cpp:6440`):
+    /// a handler-driven stop is deferred to the next
+    /// `InvokeTransition` while `TVPEventDisabled` is set.
+    fn stop_transition_by_handler(&mut self, index: usize) {
+        if self.scheduler.event_disabled() {
+            self.active_transitions[index].completion_event_prevented = true;
+        } else {
+            self.stop_transition_at(index, TransitionStop::ByHandler);
+        }
+    }
+
+    /// Removes the transition at `index` and runs its stop side effects
+    /// (`tTJSNI_BaseLayer::InternalStopTransition`, `LayerIntf.cpp:6351`).
+    fn stop_transition_at(&mut self, index: usize, stop: TransitionStop) {
+        let mut transition = self.active_transitions.remove(index);
+        // `stopTransition()` runs `InternalStopTransition` directly, so its
+        // event is never withheld and a pending prevention is dropped.
+        if matches!(stop, TransitionStop::Manual) {
+            transition.completion_event_prevented = false;
+        }
         if let Some(completion) = transition.native_completion.take() {
             self.completed_native_transitions.push(completion);
         }
-        let overrides = std::mem::take(&mut transition.live_layer_overrides);
-        let restore = std::mem::take(&mut transition.live_layer_restore);
-        self.restore_transition_live_overrides(&overrides, &restore);
     }
 
-    pub(crate) fn complete_native_transition_for(&mut self, dest: ObjectHandle) {
-        let should_complete = self
-            .active_transition
-            .as_ref()
-            .and_then(|transition| transition.native_completion.as_ref())
-            .is_some_and(|completion| completion.dest == dest);
-        if should_complete {
-            self.complete_active_transition();
+    /// `tTJSNI_BaseLayer::StopTransition` (`LayerIntf.cpp:6434`): manual stop,
+    /// which always runs the event.
+    pub(crate) fn stop_transition_for(&mut self, dest: ObjectHandle) {
+        if let Some(index) = self
+            .active_transitions
+            .iter()
+            .position(|transition| transition.dest_handle() == Some(dest))
+        {
+            self.stop_transition_at(index, TransitionStop::Manual);
         }
+    }
+
+    fn stop_transition_for_layer(&mut self, layer_id: LayerId, stop: TransitionStop) {
+        if let Some(index) = self
+            .active_transitions
+            .iter()
+            .position(|transition| transition.dest_layer == Some(layer_id))
+        {
+            self.stop_transition_at(index, stop);
+        }
+    }
+
+    /// Completes every running transition, whatever layer it belongs to.
+    pub(crate) fn complete_all_transitions(&mut self) {
+        while !self.active_transitions.is_empty() {
+            self.stop_transition_at(self.active_transitions.len() - 1, TransitionStop::Manual);
+        }
+    }
+
+    /// `tTJSNI_BaseLayer::InTransition` for a layer object.
+    pub(crate) fn layer_in_transition(&self, handle: ObjectHandle) -> bool {
+        self.active_transitions
+            .iter()
+            .any(|transition| transition.dest_handle() == Some(handle))
+    }
+
+    /// `tTJSNI_BaseLayer::TransSrc` for a layer object: the source of the
+    /// transition this layer is the destination of.
+    pub(crate) fn layer_transition_source(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.active_transitions
+            .iter()
+            .find(|transition| transition.dest_handle() == Some(handle))
+            .and_then(ActiveTransition::source_handle)
     }
 
     pub(crate) fn has_active_transition(&self) -> bool {
-        self.active_transition.is_some()
+        !self.active_transitions.is_empty()
     }
 
-    pub(crate) fn frame_transition(&self) -> Option<FrameTransition> {
-        let transition = self.active_transition.as_ref()?;
-        let progress = if transition.duration.is_zero() {
-            1.0
-        } else {
-            transition.elapsed.as_secs_f32() / transition.duration.as_secs_f32()
-        };
-        Some(FrameTransition {
-            method: transition.params.method.as_name().to_string(),
-            progress: progress.clamp(0.0, 1.0),
-            params: transition.params.clone(),
-            rule_texture_id: transition.rule_texture_id,
-            rule_image_upload: transition.rule_image_upload.clone(),
-            frozen_draw_commands: transition.frozen_draw_commands.clone(),
-            frozen_image_uploads: transition.frozen_image_uploads.clone(),
-        })
+    #[cfg(test)]
+    pub(crate) fn active_transition_count(&self) -> usize {
+        self.active_transitions.len()
+    }
+
+    pub(crate) fn frame_transitions(&self) -> Vec<FrameTransition> {
+        self.active_transitions
+            .iter()
+            .map(|transition| {
+                let progress = if transition.duration.is_zero() {
+                    1.0
+                } else {
+                    transition.elapsed.as_secs_f32() / transition.duration.as_secs_f32()
+                };
+                let faces = self.transition_faces(transition);
+                FrameTransition {
+                    method: transition.params.method.as_name().to_string(),
+                    progress: progress.clamp(0.0, 1.0),
+                    params: transition.params.clone(),
+                    dest_rect: transition.dest_rect,
+                    rule_texture_id: transition.rule_texture_id,
+                    rule_image_upload: transition.rule_image_upload.clone(),
+                    frozen_draw_commands: faces.old_draw_commands,
+                    frozen_image_uploads: faces.old_image_uploads,
+                    under_draw_commands: faces.under_draw_commands,
+                    under_image_uploads: faces.under_image_uploads,
+                    source_draw_commands: faces.source_draw_commands,
+                    source_image_uploads: faces.source_image_uploads,
+                }
+            })
+            .collect()
+    }
+
+    /// The three faces the composite is built from, for one pass.
+    ///
+    /// Official re-completes both layers on every completion
+    /// (`InvokeTransition` updates them, `LayerIntf.cpp:6455-6490`;
+    /// `DrawCompleted` re-renders `TransSrc->Complete(destrect)`, `:6604`), so
+    /// the faces follow the layers while the transition runs and the render
+    /// tree is walked again here for the same reason.  The KAG page projection
+    /// has no layer pair of its own and keeps the snapshots taken when the
+    /// staged page was applied.
+    fn transition_faces(&self, transition: &ActiveTransition) -> TransitionFaceLists {
+        match &transition.faces {
+            TransitionFaces::Layers {
+                dest,
+                source,
+                extra_roots,
+                with_children,
+            } => {
+                let suppressed = &transition.suppressed_live_images;
+                let (old_draw_commands, old_image_uploads) =
+                    self.layer_tree.draw_model_suppressing_images(suppressed);
+                // `Src1` is the destination layer's own bitmap, not the
+                // destination pre-composited over the scene: the official blend
+                // runs before the layer manager composites the result, so the
+                // incoming face is drawn over the scene *without* the
+                // destination's subtree.
+                let (under_draw_commands, under_image_uploads) = self
+                    .layer_tree
+                    .draw_model_filtered_suppressing_images(
+                        |node| !self.layer_tree.is_ancestor_or_self(*dest, node.id),
+                        suppressed,
+                    );
+                let offset = match (
+                    self.layer_tree.absolute_position(*source),
+                    self.layer_tree.absolute_position(*dest),
+                ) {
+                    (Some(source_origin), Some(dest_origin)) => Point::new(
+                        dest_origin.x - source_origin.x,
+                        dest_origin.y - source_origin.y,
+                    ),
+                    _ => Point::new(0.0, 0.0),
+                };
+                let (source_draw_commands, source_image_uploads) = self
+                    .layer_tree
+                    .source_face(*source, extra_roots, offset, *with_children);
+                TransitionFaceLists {
+                    old_draw_commands,
+                    old_image_uploads,
+                    under_draw_commands,
+                    under_image_uploads,
+                    source_draw_commands,
+                    source_image_uploads,
+                }
+            }
+            TransitionFaces::Frozen(lists) => lists.clone(),
+        }
     }
 
     pub(crate) fn suppressed_transition_live_images(&self) -> BTreeSet<LayerId> {
-        self.active_transition
-            .as_ref()
-            .map(|transition| transition.suppressed_live_images.clone())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn reapply_transition_live_layer_overrides(&mut self) {
-        let Some(overrides) = self
-            .active_transition
-            .as_ref()
-            .map(|transition| transition.live_layer_overrides.clone())
-        else {
-            return;
-        };
-        for (layer_id, source) in overrides {
-            // A parted layer is off-screen for the whole transition
-            // (`Part()`, `LayerIntf.cpp:589`): the override replay must not put
-            // it back just because its snapshot was taken while it still drew.
-            let draws = self.render_layer_draws(layer_id);
-            if let Some(dest) = self.layer_tree.layer_mut(layer_id) {
-                copy_layer_node_render_content(dest, &source);
-                dest.renderable = source.renderable && draws;
-            }
-        }
+        self.active_transitions
+            .iter()
+            .flat_map(|transition| transition.suppressed_live_images.iter().copied())
+            .collect()
     }
 
     pub(crate) fn take_completed_native_transitions(&mut self) -> Vec<NativeTransitionCompletion> {
@@ -3504,27 +3748,6 @@ fn layer_property_i64(properties: &BTreeMap<String, Variant>, name: &str, fallba
         .get(name)
         .and_then(|value| value.to_integer().ok())
         .unwrap_or(fallback)
-}
-
-fn copy_layer_node_render_content(dest: &mut LayerNode, source: &LayerNode) {
-    dest.left = source.left;
-    dest.top = source.top;
-    dest.width = source.width;
-    dest.height = source.height;
-    dest.image_left = source.image_left;
-    dest.image_top = source.image_top;
-    dest.image_width = source.image_width;
-    dest.image_height = source.image_height;
-    dest.visible = source.visible;
-    dest.enabled = source.enabled;
-    dest.node_enabled = source.node_enabled;
-    dest.opacity = source.opacity;
-    dest.layer_type = source.layer_type;
-    dest.face = source.face;
-    dest.image = source.image.clone();
-    // `tTJSNI_BaseLayer::AssignImages` (`LayerIntf.cpp:2142`) copies the
-    // province plane along with the main image.
-    dest.province = source.province.clone();
 }
 
 fn kag_layer_z_order(layer: &str) -> i32 {
@@ -3723,6 +3946,60 @@ fn krkr_volume_product_to_linear(volume: i64, volume2: i64, global_volume: i64) 
     (volume * volume2 * global_volume).clamp(0.0, 1.0)
 }
 
+/// Where a transition's three faces come from.
+#[derive(Clone)]
+pub(crate) enum TransitionFaces {
+    /// Rebuilt from the render tree every pass.
+    Layers {
+        dest: LayerId,
+        source: LayerId,
+        /// Staged page layers the source subtree cannot reach (see
+        /// `sync_kag_source_page`).
+        extra_roots: Vec<LayerId>,
+        with_children: bool,
+    },
+    /// Whole-tree snapshots.  The KAG `[trans]` projection has no layer pair of
+    /// its own: its incoming page is the tree the staged page was applied to.
+    Frozen(TransitionFaceLists),
+}
+
+/// The three faces one composite is built from.
+#[derive(Clone, Default)]
+pub(crate) struct TransitionFaceLists {
+    /// The scene the transition started from (`Src1`, `LayerIntf.cpp:6592`).
+    pub old_draw_commands: Vec<DrawCommand>,
+    pub old_image_uploads: Vec<ImageUpload>,
+    /// The scene without the destination layer's subtree: the base the incoming
+    /// face is drawn over, because the official blend runs before the layer
+    /// manager composites the result.
+    pub under_draw_commands: Vec<DrawCommand>,
+    pub under_image_uploads: Vec<ImageUpload>,
+    /// The source layer's own bitmap (`Src2`, `:6611`).
+    pub source_draw_commands: Vec<DrawCommand>,
+    pub source_image_uploads: Vec<ImageUpload>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionStop {
+    /// `tTJSNI_BaseLayer::StopTransition` (`LayerIntf.cpp:6434`) and engine
+    /// shutdown: the `onTransitionCompleted` event always runs.
+    Manual,
+    /// `tTJSNI_BaseLayer::StopTransitionByHandler` (`LayerIntf.cpp:6440`): the
+    /// event waits for event dispatching to be re-enabled.
+    ByHandler,
+}
+
+fn union_rects(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.width).max(b.x + b.width);
+    let bottom = (a.y + a.height).max(b.y + b.height);
+    Rect::new(x, y, right - x, bottom - y)
+}
+
+/// One in-flight transition (`tTJSNI_BaseLayer::InTransition`,
+/// `LayerIntf.cpp:6334`).  The host holds one per destination layer, so
+/// unrelated layers transition at the same time.
 #[derive(Clone)]
 struct ActiveTransition {
     params: TransitionParams,
@@ -3730,21 +4007,70 @@ struct ActiveTransition {
     rule_image_upload: Option<ImageUpload>,
     elapsed: Duration,
     duration: Duration,
-    frozen_draw_commands: Vec<DrawCommand>,
-    frozen_image_uploads: Vec<ImageUpload>,
+    /// Where the three faces the composite is built from come from.
+    faces: TransitionFaces,
     suppressed_live_images: BTreeSet<LayerId>,
-    live_layer_overrides: BTreeMap<LayerId, LayerNode>,
-    /// Pre-override copies of the layers in `live_layer_overrides`.
-    ///
-    /// Official page transitions never write into the outgoing page's layers
-    /// (`tTJSNI_BaseLayer::InternalStopTransition` only calls `Exchange` plus
-    /// position/visibility swaps, `LayerIntf.cpp:6364`); the staged page is
-    /// shown because its own subtree moves into view.  The live override is
-    /// this engine's stand-in for the transition handler drawing the source
-    /// tree, so it must not outlive the transition: the outgoing page's layers
-    /// keep their own content, ready for the next page swap.
-    live_layer_restore: BTreeMap<LayerId, LayerNode>,
+    /// The render-tree layer the handler composites into
+    /// (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6532`).  Every transition has
+    /// one: the visibility stop (`InvokeTransition`, `LayerIntf.cpp:6463`)
+    /// waits on it, and its frame-space `dest_rect` decides which part of the
+    /// frame the composite replaces.
+    dest_layer: Option<LayerId>,
+    /// The destination's layer object when the transition has no script
+    /// payload of its own.  The engine's KAG `[trans]` projection stands in for
+    /// `kag.fore.base.beginTransition` (`KAGLayer.tjs`), and official records
+    /// that as the layer's `InTransition`, so the guards and `stopTransition`
+    /// have to see it.
+    gate_dest: Option<ObjectHandle>,
+    dest_rect: Option<Rect>,
+    /// TJS-side stop payload.  Only a script `Layer.beginTransition` has layer
+    /// objects to exchange and to notify; the KAG page projection does not.
     native_completion: Option<NativeTransitionCompletion>,
+    /// `tTJSNI_BaseLayer::TransSelfUpdate` (`LayerIntf.cpp:6211`): the
+    /// transition is advanced by user code, not by the idle hook.
+    self_update: bool,
+    /// `tTJSNI_BaseLayer::TransTickCallback` (`LayerIntf.cpp:6222`): the
+    /// closure that supplies the tick instead of `TVPGetTickCount()`.
+    tick_callback: Option<Variant>,
+    /// Time that passed while a `selfupdate` transition waited for the script
+    /// to drive it.  The official handler only computes a phase inside
+    /// `BeforeCompletion` (`LayerIntf.cpp:5056`), so the clock keeps running
+    /// between two `Layer.update()` calls and the phase jumps to whatever the
+    /// tick difference is when the script finally asks.
+    pending_delta: Duration,
+    /// `tTJSNI_BaseLayer::TransCompEventPrevented` (`LayerIntf.cpp:6451`):
+    /// the handler asked to stop while event dispatching was disabled, so the
+    /// stop is deferred until dispatching is enabled again.
+    completion_event_prevented: bool,
+}
+
+impl ActiveTransition {
+    fn dest_handle(&self) -> Option<ObjectHandle> {
+        self.native_completion
+            .as_ref()
+            .map(|completion| completion.dest)
+            .or(self.gate_dest)
+    }
+
+    fn source_handle(&self) -> Option<ObjectHandle> {
+        self.native_completion
+            .as_ref()
+            .and_then(|completion| completion.source)
+    }
+}
+
+/// Everything one `Layer.beginTransition` contributes to the running set.
+#[derive(Clone)]
+pub(crate) struct NativeTransitionStart {
+    pub duration: Duration,
+    pub params: TransitionParams,
+    pub rule_image_upload: Option<ImageUpload>,
+    pub faces: TransitionFaces,
+    pub suppressed_live_images: BTreeSet<LayerId>,
+    pub completion: NativeTransitionCompletion,
+    pub dest_rect: Option<Rect>,
+    pub self_update: bool,
+    pub tick_callback: Option<Variant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3953,81 +4279,6 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup");
     }
-
-    #[test]
-    fn restore_transition_live_overrides_keeps_state_the_projection_never_wrote() {
-        let mut host = KrkrHost::default();
-        let layer_id = host.layer_tree.create_layer("native:1", None, 0);
-        {
-            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
-            layer.left = 5.0;
-            layer.image_width = 4.0;
-            layer.z_order = 7;
-        }
-        let original = host.layer_tree.layer(layer_id).cloned().expect("layer");
-        let mut projected = original.clone();
-        projected.left = 40.0;
-        projected.image_width = 8.0;
-        {
-            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
-            *layer = projected.clone();
-            // State the projection never writes and the script changed while
-            // the transition ran.
-            layer.clip = Some(krkr_core::Rect::new(3.0, 3.0, 1.0, 1.0));
-            layer.z_order = 9;
-        }
-        let mut overrides = BTreeMap::new();
-        overrides.insert(layer_id, projected);
-        let mut restore = BTreeMap::new();
-        restore.insert(layer_id, original);
-
-        host.restore_transition_live_overrides(&overrides, &restore);
-
-        let layer = host.layer_tree.layer(layer_id).expect("layer");
-        assert_eq!(layer.left, 5.0);
-        assert_eq!(layer.image_width, 4.0);
-        assert_eq!(layer.clip, Some(krkr_core::Rect::new(3.0, 3.0, 1.0, 1.0)));
-        assert_eq!(layer.z_order, 9);
-    }
-
-    #[test]
-    fn restore_transition_live_overrides_keeps_an_image_the_script_loaded() {
-        let mut host = KrkrHost::default();
-        let layer_id = host.layer_tree.create_layer("native:1", None, 0);
-        let original_image = host.create_layer_image(4, 4, vec![0; 64]);
-        let projected_image = host.create_layer_image(4, 4, vec![1; 64]);
-        let script_image = host.create_layer_image(2, 2, vec![2; 16]);
-        {
-            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
-            layer.image = Some(original_image.clone());
-        }
-        let original = host.layer_tree.layer(layer_id).cloned().expect("layer");
-        let mut projected = original.clone();
-        projected.image = Some(projected_image.clone());
-        {
-            let layer = host.layer_tree.layer_mut(layer_id).expect("layer");
-            *layer = projected.clone();
-            // `loadImages` while the transition ran: the official engine never
-            // overwrites an image the script put there.
-            layer.image = Some(script_image.clone());
-            layer.image_width = 2.0;
-            layer.image_height = 2.0;
-        }
-        let mut overrides = BTreeMap::new();
-        overrides.insert(layer_id, projected);
-        let mut restore = BTreeMap::new();
-        restore.insert(layer_id, original);
-
-        host.restore_transition_live_overrides(&overrides, &restore);
-
-        let layer = host.layer_tree.layer(layer_id).expect("layer");
-        assert_eq!(
-            layer.image.as_ref().map(|image| image.upload.texture_id),
-            Some(script_image.upload.texture_id)
-        );
-        assert_eq!(layer.image_width, 2.0);
-    }
-
     fn write_test_png(path: &std::path::Path, width: u32, height: u32) {
         let file = fs::File::create(path).expect("create png");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);

@@ -58,7 +58,7 @@ fn main() {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let transition = frame.output.transition.as_ref().map(|transition| {
+        let transition = frame.output.transitions.first().map(|transition| {
             format!(
                 "{}:{:.3}:frozen_images={}",
                 transition.method,
@@ -115,7 +115,7 @@ fn main() {
             }
         }
         if frame.tick.state == krkr_engine::KagTaskState::Finished
-            && frame.output.transition.is_none()
+            && frame.output.transitions.is_empty()
             && frame_index > 30
         {
             // TJS-driven KAG keeps advancing through timers even though the engine KAG task is idle.
