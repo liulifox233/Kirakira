@@ -56,6 +56,7 @@ fn output_to_result<T>(output: FrontendOutput<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::TjsErrorKind;
     use crate::runtime::{ObjectHandle, TjsHost};
 
     use super::*;
@@ -308,6 +309,11 @@ mod tests {
 
     #[test]
     fn dictionary_assign_copies_data_without_builtin_members() {
+        // The full reference matrix lives in `runtime::dictionary_tests`; this
+        // keeps the copy itself pinned where the source-level behavior was
+        // first noticed: the class surface is not part of a copy, and the copy
+        // is reached through the class method (`Dictionary.assign`), because a
+        // Dictionary instance has no members of its own to call.
         assert_eq!(
             execute_source(
                 "dictionary_assign.tjs",
@@ -315,12 +321,12 @@ mod tests {
                 var source = new Dictionary();
                 source.answer = 42;
                 var dest = new Dictionary();
-                dest.assign(source);
+                (Dictionary.assign incontextof dest)(source, 1);
                 return typeof dest.answer + ":" + typeof dest.assign + ":" + dest.answer;
                 "#,
             )
             .expect("execute"),
-            Variant::String("Integer:Object:42".to_string())
+            Variant::String("Integer:undefined:42".to_string())
         );
     }
 
@@ -781,16 +787,34 @@ mod tests {
 
     #[test]
     fn runtime_errors_include_stack_and_member_context() {
+        // A member the receiver does not have is the reference's
+        // `TJS_E_MEMBERNOTFOUND` miss, name included (`FuncCall` keeps the
+        // miss even for a Dictionary, `tjsDictionary.cpp:713-722`).
         let error = execute_source(
             "debug.tjs",
             "function run() {\n  var d = new Dictionary();\n  d.missing();\n}\nrun();",
         )
         .expect_err("missing member call should fail");
         let text = error.to_string();
+        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+        assert_eq!(error.message, "Member \"missing\" does not exist");
         assert!(text.contains("debug.tjs:"), "{text}");
         assert!(text.contains("run [Function] bytecode"), "{text}");
         assert!(text.contains("global [TopLevel] bytecode"), "{text}");
         assert!(text.contains("(debug.tjs:"), "{text}");
+        assert!(text.contains("calling member `missing`"), "{text}");
+
+        // A member that exists but holds void reaches
+        // `TJSDefaultFuncCall`'s `TJS_E_INVALIDTYPE` branch
+        // (`tjsObject.cpp:1280-1312`), which is where the callee type comes
+        // from.
+        let error = execute_source(
+            "debug.tjs",
+            "function run() {\n  var d = %[missing => void];\n  d.missing();\n}\nrun();",
+        )
+        .expect_err("void callee should fail");
+        let text = error.to_string();
+        assert_eq!(error.kind, TjsErrorKind::InvalidType);
         assert!(text.contains("calling member `missing`"), "{text}");
         assert!(text.contains("callee void"), "{text}");
     }

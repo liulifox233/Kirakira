@@ -37,13 +37,22 @@ fn native_array<H: TjsHost + 'static>(
     Ok(Variant::Object(handle))
 }
 
+/// `new Dictionary()`: `tTJSDictionaryClass::CreateNew` builds a
+/// `tTJSDictionaryObject` and runs `FuncCall(0, NULL, ...)` on it, which
+/// copies only the class's *non-static* members.  Every Dictionary method is
+/// registered with `TJS_STATICMEMBER` (`tjsDictionary.cpp:39-219`), so the new
+/// object's member map stays empty -- the official manual states it outright:
+/// "Dictionary クラスのオブジェクトは、作成された状態ではメンバを何一つ持って
+/// いません" (`docs/tjs2/j/contents/dictionary.html`).  Instance-style
+/// `dict.assign(src)` is an error there, and `dict.clear` reads as void, which
+/// is what the KAGEX attribute chains depend on.
 fn native_dictionary<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     _this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = runtime.alloc_object(Object::default());
-    install_dictionary_methods(runtime, handle);
+    runtime.add_object_class_info(handle, "Dictionary");
     Ok(Variant::Object(handle))
 }
 
@@ -514,16 +523,12 @@ fn array_assign<H: TjsHost + 'static>(
             runtime.heap[dest.0].array_push(value);
         }
     } else {
+        // `tTJSArrayNI::Assign` (`tjsArray.cpp:1060-1085`) pushes `name, value`
+        // for every enumerated member of a non-array source, skipping only
+        // `TJS_HIDDENMEMBER` (`tDictionaryEnumCallback`, `:1088-1112`).  A
+        // source key that happens to be named like a builtin (`clear`,
+        // `count`, ...) is ordinary data and is copied.
         for (key, value) in runtime.heap[src.0].members.clone() {
-            // Native helper members are hidden from TJS dictionary
-            // enumeration.  They are stored as ordinary members in this
-            // lightweight runtime, so filter the compatibility surface here
-            // as well; otherwise Array.assign(Dictionary) leaks `assign`,
-            // `clear`, etc. into data arrays (UILoader's filename map relies
-            // on the reference pair count).
-            if is_native_member_name(&key) {
-                continue;
-            }
             runtime.heap[dest.0].array_push(Variant::String(key));
             runtime.heap[dest.0].array_push(value);
         }
@@ -810,37 +815,138 @@ fn array_reverse<H: TjsHost + 'static>(
     Ok(Variant::Object(handle))
 }
 
+/// `tTJSDictionaryNI::Clear` (`tjsDictionary.cpp:374-377`) is `Owner->Clear()`
+/// and nothing else: every member of the destination goes away, and the class
+/// surface is *not* re-registered on the instance (there is none to lose --
+/// the methods live on the class object).
 fn dictionary_clear<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    let handle = require_this(this_obj, "Dictionary.clear")?;
+    let handle = require_dictionary_instance(runtime, this_obj, "Dictionary.clear")?;
     runtime.heap[handle.0].members.clear();
-    install_dictionary_methods(runtime, handle);
     Ok(Variant::Void)
 }
 
+/// `tTJSDictionaryNI::Assign` (`tjsDictionary.cpp:325-373`): copy every
+/// enumerated member of the source onto the destination.
+///
+/// `dict.assign` never reaches this code -- the method is a static class
+/// member, so script uses `(Dictionary.assign incontextof dict)(src, clear)`.
+/// The destination is emptied first unless `clear` is false
+/// (`if(clear) Owner->Clear();`, `:334`/`:347`), and the copy is unconditional:
+/// the enumeration callback only skips `TJS_HIDDENMEMBER` (`:378-400`), so a
+/// source key named like a builtin method (`clear`, `assign`, `count`, ...) is
+/// ordinary data and lands on the destination like any other.
 fn dictionary_assign<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let dest = require_this(this_obj, "Dictionary.assign")?;
-    let Some(Variant::Object(src)) = args.first().cloned() else {
-        return Ok(Variant::Object(dest));
+    let dest = require_dictionary_instance(runtime, this_obj, "Dictionary.assign")?;
+    // Official: `if(numparams < 1) return TJS_E_BADPARAMCOUNT`
+    // (`tjsDictionary.cpp:353`).
+    let Some(source) = args.first().cloned() else {
+        return Err(TjsError::bad_param_count());
     };
-    // Builtin Dictionary methods are attached as implementation members in
-    // this runtime. TVP's Dictionary.assign copies data members, not that
-    // helper surface. Copying them into PBD-derived dictionaries makes UI
-    // enumerators mistake `assign`/`clear` for authored controls.
-    for (key, value) in runtime.heap[src.0].members.clone() {
-        if is_native_member_name(&key) {
-            continue;
+    // Official: `bool clear = true; if(numparams >= 2 && param[1]->Type() !=
+    // tvtVoid) clear = 0!=(tjs_int)*param[1];` (`tjsDictionary.cpp:349-351`).
+    let clear = match args.get(1) {
+        Some(value) if !matches!(value, Variant::Void) => value.to_integer()? != 0,
+        _ => true,
+    };
+    let Some(src) = dictionary_assign_source(runtime, &source) else {
+        // Official: `else TJS_eTJSError(TJSNullAccess)` (`:359`).
+        return Err(TjsError::null_access());
+    };
+    if clear {
+        runtime.heap[dest.0].members.clear();
+    }
+    if let Some(elements) = runtime.heap[src.0].array_elements().map(Vec::from) {
+        // An Array source is a flat name/value stream (`:329-346`): the loop
+        // reads a name, stringifies it, then consumes the next element as the
+        // value, so a trailing unpaired element is dropped.
+        for pair in elements.chunks_exact(2) {
+            let name = pair[0].to_tjs_string()?;
+            let value = pair[1].clone();
+            runtime.heap[dest.0].set(name, value);
         }
+        return Ok(Variant::Void);
+    }
+    // Snapshot after the clear, not before: `d.assign(d, 1)` assigns from the
+    // already-emptied destination in the reference too.
+    let members = runtime.heap[src.0].members.clone();
+    for (key, value) in members {
         runtime.heap[dest.0].set(key, value);
     }
-    Ok(Variant::Object(dest))
+    Ok(Variant::Void)
+}
+
+/// The destination of a `Dictionary.assign`-family call.
+///
+/// Every Dictionary method starts with
+/// `TJS_GET_NATIVE_INSTANCE(ni, tTJSDictionaryNI)`, which reads a Dictionary
+/// native instance off `objthis`; anything else -- the class object above all
+/// -- reports `TJS_E_NATIVECLASSCRASH` (`tjsNative.h:320-328`).  This runtime
+/// has no native-instance table, so the equivalent question is whether the
+/// receiver is a Dictionary: the object itself carries the class name, or its
+/// class chain reaches the Dictionary class object (a script class that
+/// extends `Dictionary`).
+fn require_dictionary_instance<H: TjsHost + 'static>(
+    runtime: &Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    name: &str,
+) -> Result<ObjectHandle> {
+    let handle = require_this(this_obj, name)?;
+    if is_dictionary_receiver(runtime, handle) {
+        Ok(handle)
+    } else {
+        Err(TjsError::native_class_crash())
+    }
+}
+
+fn is_dictionary_receiver<H: TjsHost + 'static>(
+    runtime: &Runtime<H>,
+    handle: ObjectHandle,
+) -> bool {
+    let class = match runtime.global_member("Dictionary") {
+        Variant::Object(class) => class,
+        _ => return false,
+    };
+    // The class object itself is not a Dictionary instance: it carries the
+    // class name for lookup purposes, but no native instance behind `this`.
+    if handle == class {
+        return false;
+    }
+    let mut current = Some(handle);
+    while let Some(object) = current {
+        if runtime.heap[object.0]
+            .class_infos
+            .iter()
+            .any(|info| info == "Dictionary")
+        {
+            return true;
+        }
+        current = runtime.object_super_class(object);
+    }
+    false
+}
+
+/// `tTJSVariantClosure clo = param[0]->AsObjectClosureNoAddRef();` followed by
+/// `if(clo.ObjThis) ... else if(clo.Object) ... else TJS_eTJSError(TJSNullAccess)`
+/// (`tjsDictionary.cpp:353-359`): a bound closure assigns from its `ObjThis`,
+/// any other object from its `Object`, and a non-object (void or null)
+/// reports null access.
+fn dictionary_assign_source<H: TjsHost + 'static>(
+    runtime: &Runtime<H>,
+    value: &Variant,
+) -> Option<ObjectHandle> {
+    match value {
+        Variant::Object(handle) => Some(runtime.bound_this(*handle).unwrap_or(*handle)),
+        Variant::Closure(closure) => Some(closure.this_obj.unwrap_or(closure.object)),
+        _ => None,
+    }
 }
 
 fn dictionary_assign_struct<H: TjsHost + 'static>(
@@ -848,12 +954,18 @@ fn dictionary_assign_struct<H: TjsHost + 'static>(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let dest = require_this(this_obj, "Dictionary.assignStruct")?;
-    let Some(Variant::Object(src)) = args.first().cloned() else {
-        return Ok(Variant::Object(dest));
+    let dest = require_dictionary_instance(runtime, this_obj, "Dictionary.assignStruct")?;
+    // Official: `if(numparams < 1) return TJS_E_BADPARAMCOUNT`, then
+    // `else TJS_eTJSError(TJSNullAccess)` for a non-object source
+    // (`tjsDictionary.cpp:190-208`).
+    let Some(source) = args.first().cloned() else {
+        return Err(TjsError::bad_param_count());
+    };
+    let Some(src) = dictionary_assign_source(runtime, &source) else {
+        return Err(TjsError::null_access());
     };
     assign_dictionary_struct(runtime, dest, src)?;
-    Ok(Variant::Object(dest))
+    Ok(Variant::Void)
 }
 
 fn dictionary_save_struct<H: TjsHost + 'static>(
@@ -861,8 +973,10 @@ fn dictionary_save_struct<H: TjsHost + 'static>(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let handle = require_this(this_obj, "Dictionary.saveStruct")?;
+    let handle = require_dictionary_instance(runtime, this_obj, "Dictionary.saveStruct")?;
     save_structured_value(runtime, handle, &args)?;
+    // Official: `if(result) *result = tTJSVariant(objthis, objthis)`
+    // (`tjsDictionary.cpp:163`).
     Ok(Variant::Object(handle))
 }
 
@@ -930,7 +1044,6 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
         return Ok(Variant::Integer(1));
     }
     runtime.heap[handle.0].members.clear();
-    install_dictionary_methods(runtime, handle);
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -990,7 +1103,6 @@ fn assign_dictionary_struct<H: TjsHost + 'static>(
     src: ObjectHandle,
 ) -> Result<()> {
     runtime.heap[dest.0].members.clear();
-    install_dictionary_methods(runtime, dest);
     let entries = dictionary_struct_entries(runtime, src);
     let mut stack = BTreeSet::new();
     stack.insert(src);
@@ -1029,7 +1141,7 @@ fn deep_clone_struct_value<H: TjsHost + 'static>(
             }
             let entries = dictionary_struct_entries(runtime, *handle);
             let dest = runtime.alloc_ordinary_object();
-            install_dictionary_methods(runtime, dest);
+            runtime.add_object_class_info(dest, "Dictionary");
             for (key, value) in entries {
                 let value = deep_clone_struct_value(runtime, &value, stack)?;
                 runtime.heap[dest.0].set(key, value);
@@ -1127,30 +1239,6 @@ impl<'a, H: TjsHost + 'static> StructTextSerializer<'a, H> {
     }
 }
 
-fn is_native_member_name(key: &str) -> bool {
-    key.starts_with("__")
-        || matches!(
-            key,
-            "clear"
-                | "assign"
-                | "assignStruct"
-                | "saveStruct"
-                | "loadStruct"
-                | "load"
-                | "save"
-                | "add"
-                | "push"
-                | "split"
-                | "insert"
-                | "erase"
-                | "pop"
-                | "join"
-                | "reverse"
-                | "count"
-                | "length"
-        )
-}
-
 fn is_dictionary_object<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) -> bool {
     runtime.heap[handle.0]
         .class_infos
@@ -1158,6 +1246,13 @@ fn is_dictionary_object<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) 
         .any(|info| info == "Dictionary")
 }
 
+/// The destination-side view of a Dictionary's members: every entry, in the
+/// member map's order.  The reference's `SaveStructuredData` and
+/// `AssignStructure` run `EnumMembers` over the object's own symbols and skip
+/// only `TJS_HIDDENMEMBER` (`tjsDictionary.cpp:410-420`, `:452-470`), so a key
+/// named `clear` or `count` is ordinary data -- which is why nothing here may
+/// filter by name.  Builtin methods are not in this map to begin with: they
+/// live on the class object.
 fn dictionary_struct_entries<H: TjsHost>(
     runtime: &Runtime<H>,
     handle: ObjectHandle,
@@ -1165,7 +1260,6 @@ fn dictionary_struct_entries<H: TjsHost>(
     runtime.heap[handle.0]
         .members
         .iter()
-        .filter(|(key, _)| !is_native_member_name(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
@@ -1532,7 +1626,7 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
 
     fn dictionary(&mut self, len: usize) -> Result<Variant> {
         let handle = self.runtime.alloc_ordinary_object();
-        install_dictionary_methods(self.runtime, handle);
+        self.runtime.add_object_class_info(handle, "Dictionary");
         for _ in 0..len {
             let Variant::String(key) = self.value()? else {
                 return Err(TjsError::runtime("binary dictionary key is not a string"));
