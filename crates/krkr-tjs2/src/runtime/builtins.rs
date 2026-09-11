@@ -419,8 +419,10 @@ fn array_remove<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.remove")?;
+    // Official: `if(numparams < 1) return TJS_E_BADPARAMCOUNT`
+    // (`tjsArray.cpp:816`).
     let Some(value) = args.first() else {
-        return Err(TjsError::runtime("Array.remove requires a value"));
+        return Err(TjsError::bad_param_count());
     };
     let remove_all = args.get(1).map(Variant::is_truthy).unwrap_or(true);
     let removed = runtime.heap[handle.0]
@@ -548,8 +550,10 @@ fn array_load<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.load")?;
+    // Official: `if(numparams < 1) return TJS_E_BADPARAMCOUNT`
+    // (`tjsArray.cpp:264`).
     let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
-        return Err(TjsError::runtime("Array.load requires a storage name"));
+        return Err(TjsError::bad_param_count());
     };
     let path = path.to_tjs_string()?;
     let mode = args
@@ -667,10 +671,10 @@ fn array_split<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.split")?;
+    // Official: `if(numparams < 2) return TJS_E_BADPARAMCOUNT`
+    // (`tjsArray.cpp:506`).
     if args.len() < 2 {
-        return Err(TjsError::runtime(
-            "Array.split requires delimiter and string arguments",
-        ));
+        return Err(TjsError::bad_param_count());
     }
     let string = args[1].to_tjs_string()?;
     let purge_empty = args
@@ -759,8 +763,10 @@ fn array_find<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.find")?;
+    // Official: `if(numparams < 1) return TJS_E_BADPARAMCOUNT`
+    // (`tjsArray.cpp:941`).
     let Some(needle) = args.first() else {
-        return Err(TjsError::runtime("Array.find requires a value argument"));
+        return Err(TjsError::bad_param_count());
     };
     let elements = runtime.heap[handle.0]
         .array_elements()
@@ -1627,8 +1633,10 @@ fn regexp_compile_internal<H: TjsHost + 'static>(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "RegExp._compile")?;
+    // Official: `if(numparams != 1) return TJS_E_BADPARAMCOUNT`
+    // (`tjsRegExp.cpp:257`).
     if args.len() != 1 {
-        return Err(TjsError::runtime("RegExp._compile requires one argument"));
+        return Err(TjsError::bad_param_count());
     }
     let source = args[0].to_tjs_string()?;
     // Internal literal format used by precompiled bytecode: `//flags/expression`.

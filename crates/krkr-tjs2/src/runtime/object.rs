@@ -420,11 +420,137 @@ pub enum ObjectKind {
     NativeFunction {
         id: usize,
         constructable: bool,
+        /// Argument-count contract declared at registration; a call that
+        /// breaks it fails with `TJS_E_BADPARAMCOUNT` (-1004) before the
+        /// handler runs.
+        arg_count: NativeArgCount,
     },
     VmNativeFunction {
         id: usize,
+        /// See [`ObjectKind::NativeFunction`].
+        arg_count: NativeArgCount,
     },
     NativeProperty {
         id: usize,
+        /// Which halves of the property script may use. A denied direction
+        /// fails with `TJS_E_ACCESSDENYED` (-1007) before the accessor runs,
+        /// which is how the official `TJS_DENY_NATIVE_PROP_SETTER`
+        /// read-only properties are declared.
+        access: NativePropertyAccess,
     },
+}
+
+/// Which halves of a native property script code may use.
+///
+/// Only the denied-*setter* half has a reference counterpart: krkrz registers
+/// the official read-only properties with a setter that returns
+/// `TJS_E_ACCESSDENYED` (the `TJS_DENY_NATIVE_PROP_SETTER` macro,
+/// `tjsNative.h:463`), and a denied direction answers that code instead of
+/// running the accessor. No property *getter* in the reference reports
+/// `TJS_E_ACCESSDENYED`, so [`WriteOnly`](Self::WriteOnly) and
+/// [`NoAccess`](Self::NoAccess) are engine extensions rather than a modelling
+/// of reference behaviour.
+///
+/// The engine keeps its own write path for storage-backed properties (host
+/// writes go through [`crate::runtime::Runtime::set_object_member`], not
+/// through TJS dispatch), so marking a property read-only only takes the
+/// direction away from script.
+///
+/// Known gap: a script store that carries `TJS_IGNOREPROP` (a regmember-style
+/// `&obj.prop = v` or VM member store) still reaches
+/// [`crate::runtime::Runtime::register_object_native_property`]'s setter,
+/// because `prop_set_handle` keeps invoking native property setters under that
+/// flag. It therefore fails with -1007 on a denied property where the
+/// reference's `TJSDefaultPropSet` (`tjsObject.cpp:1435-1466`) skips the
+/// property and overwrites the member. The gap is unobservable while every
+/// property stays `ReadWrite`; see
+/// [`crate::runtime::Runtime::deny_native_property_writes`] for what a caller
+/// of the deny-list has to check.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativePropertyAccess {
+    /// Script may read and write (the default).
+    #[default]
+    ReadWrite,
+    /// Script may read; a script write fails with `TJS_E_ACCESSDENYED`.
+    ReadOnly,
+    /// Script may write; a script read fails with `TJS_E_ACCESSDENYED`.
+    WriteOnly,
+    /// Neither direction is available to script.
+    NoAccess,
+}
+
+impl NativePropertyAccess {
+    /// Whether a script read is allowed.
+    pub const fn allows_get(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ReadOnly)
+    }
+
+    /// Whether a script write is allowed.
+    pub const fn allows_set(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::WriteOnly)
+    }
+}
+
+/// Argument-count contract of a native method, declared at registration.
+///
+/// Official natives validate `numparams` themselves and return
+/// `TJS_E_BADPARAMCOUNT` (-1004) before looking at any argument
+/// (`LayerIntf.cpp:7835` for `assignImages`, `tjsInterCodeExec.cpp:2592` for
+/// the string methods), so the count is part of the method's declaration
+/// rather than something a handler has to re-derive from `args.len()`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeArgCount {
+    /// No declaration-level check; the handler validates what it needs.
+    #[default]
+    Any,
+    /// At least N arguments: too few fails with `TJS_E_BADPARAMCOUNT`.
+    AtLeast(usize),
+    /// Exactly N arguments.
+    Exactly(usize),
+}
+
+impl NativeArgCount {
+    /// Whether a call with `count` arguments satisfies the declaration.
+    pub const fn accepts(self, count: usize) -> bool {
+        match self {
+            Self::Any => true,
+            Self::AtLeast(min) => count >= min,
+            Self::Exactly(expected) => count == expected,
+        }
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::{NativeArgCount, NativePropertyAccess};
+
+    #[test]
+    fn property_access_allows_only_the_declared_directions() {
+        assert!(NativePropertyAccess::ReadWrite.allows_get());
+        assert!(NativePropertyAccess::ReadWrite.allows_set());
+        assert!(NativePropertyAccess::ReadOnly.allows_get());
+        assert!(!NativePropertyAccess::ReadOnly.allows_set());
+        assert!(!NativePropertyAccess::WriteOnly.allows_get());
+        assert!(NativePropertyAccess::WriteOnly.allows_set());
+        assert!(!NativePropertyAccess::NoAccess.allows_get());
+        assert!(!NativePropertyAccess::NoAccess.allows_set());
+        assert_eq!(
+            NativePropertyAccess::default(),
+            NativePropertyAccess::ReadWrite
+        );
+    }
+
+    #[test]
+    fn argument_counts_accept_what_the_declaration_allows() {
+        assert!(NativeArgCount::Any.accepts(0));
+        assert!(NativeArgCount::Any.accepts(9));
+        assert!(!NativeArgCount::AtLeast(1).accepts(0));
+        assert!(NativeArgCount::AtLeast(1).accepts(1));
+        assert!(NativeArgCount::AtLeast(1).accepts(4));
+        assert!(!NativeArgCount::Exactly(0).accepts(1));
+        assert!(NativeArgCount::Exactly(0).accepts(0));
+        assert!(!NativeArgCount::Exactly(2).accepts(1));
+        assert!(NativeArgCount::Exactly(2).accepts(2));
+        assert_eq!(NativeArgCount::default(), NativeArgCount::Any);
+    }
 }
