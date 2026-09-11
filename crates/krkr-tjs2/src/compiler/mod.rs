@@ -1033,11 +1033,15 @@ mod tests {
 
     #[test]
     fn returned_super_expression_keeps_current_objthis() {
+        // `answer` is a declared member: the constructor's unqualified store
+        // is an `spd` through the `%-2` proxy, which finds the instance's
+        // inherited member but cannot create an undeclared name.
         assert_eq!(
             execute_source(
                 "super_objthis.tjs",
                 r#"
                 class Base {
+                    var answer;
                     function value() { return answer; }
                 }
                 class Child extends Base {
@@ -1382,17 +1386,24 @@ mod tests {
         // dialog class under the same name. `super.Render()` must reach the
         // global base constructor even though regmember has already installed
         // the derived one on the instance.
+        //
+        // `trace` is declared: the unqualified stores below are `VM_SPD`
+        // through the `%-2` proxy, which does not create members -- an
+        // undeclared name raises `Member "trace" does not exist` there, in
+        // this engine and in the reference alike.
         assert_eq!(
             execute_source(
                 "nested_class_shadow.tjs",
                 r#"
                     class Render {
+                        var trace;
                         function Render() { trace = "base"; }
                         function tag() { return "base:" + trace; }
                     }
                     class Outer {
                         function Outer() { }
                         class Render extends Render {
+                            var trace;
                             function Render() { super.Render(); }
                             function tag() { return "inner:" + trace; }
                         }

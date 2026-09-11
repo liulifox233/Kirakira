@@ -226,4 +226,24 @@ mod tests {
             "var p = 0; property holder { getter() { return p; } setter(v) { p = v; } } holder = 41; return holder;",
         );
     }
+
+    /// A top-level declaration is `VM_SPDS`, the one store that can *create*
+    /// the member it writes (`AddLocalVariable`, `tjsInterCodeGen.cpp:2693-2704`,
+    /// plus `MEMBERENSURE` on the opcode itself); the bare `name = value` form
+    /// is `VM_SPD` (flags 0) and raises for a name nobody carries
+    /// (`tjsObject.cpp:1500-1505`).  The decompiler has to keep the two apart,
+    /// or its output raises `Member "x" does not exist` where the original
+    /// ran -- which is what this round trip compares.
+    #[test]
+    fn round_trips_top_level_declarations() {
+        let text = round_trip("var x = 5; x = x + 1; return x;");
+        assert!(text.contains("var x = 5;"), "{text}");
+
+        let text = round_trip("var i = 0; while (i < 3) { i = i + 1; } return i;");
+        assert!(text.contains("var i = 0;"), "{text}");
+
+        // The declared name stays visible to a nested block's assignment.
+        let text = round_trip("var x = 0; if (x) { x = 1; } else { x = 2; } return x;");
+        assert!(text.contains("var x = 0;"), "{text}");
+    }
 }

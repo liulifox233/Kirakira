@@ -345,10 +345,12 @@ pub fn install_dictionary_methods<H: TjsHost + 'static>(
 ) {
     runtime.add_object_class_info(handle, "Dictionary");
     runtime.register_object_native(handle, "clear", dictionary_clear::<H>);
+    runtime.register_object_native(handle, "load", dictionary_load::<H>);
+    runtime.register_object_native(handle, "loadStruct", dictionary_load_struct::<H>);
+    runtime.register_object_native(handle, "save", dictionary_save::<H>);
+    runtime.register_object_native(handle, "saveStruct", dictionary_save_struct::<H>);
     runtime.register_object_native(handle, "assign", dictionary_assign::<H>);
     runtime.register_object_native(handle, "assignStruct", dictionary_assign_struct::<H>);
-    runtime.register_object_native(handle, "saveStruct", dictionary_save_struct::<H>);
-    runtime.register_object_native(handle, "loadStruct", dictionary_load_struct::<H>);
 }
 
 fn require_this(this_obj: Option<ObjectHandle>, name: &str) -> Result<ObjectHandle> {
@@ -502,14 +504,24 @@ fn array_clear<H: TjsHost + 'static>(
     Ok(Variant::Void)
 }
 
+/// `Array.assign` (`tjsArray.cpp:745-762`): clear the destination, then copy
+/// every element of the source.
+///
+/// Both methods of this family answer `TJS_S_OK` without writing `result`, and
+/// `tTJSNativeClassMethod::FuncCall` clears the result variant before the call
+/// (`tjsNative.cpp:94`), so the script-visible value is void.  The source is
+/// converted *after* the clear, so a call without an argument or with a
+/// non-object one leaves the destination empty when it raises.
 fn array_assign<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let dest = require_this(this_obj, "Array.assign")?;
-    let Some(Variant::Object(src)) = args.first().cloned() else {
-        return Ok(Variant::Object(dest));
+    // Official: `if(numparams < 1) return TJS_E_BADPARAMCOUNT`
+    // (`tjsArray.cpp:750`).
+    let Some(source) = args.first().cloned() else {
+        return Err(TjsError::bad_param_count());
     };
 
     if !runtime.heap[dest.0].array_clear() {
@@ -518,6 +530,11 @@ fn array_assign<H: TjsHost + 'static>(
         ));
     }
 
+    let Some(src) = closure_source_object(runtime, &source) else {
+        // Official: `else TJS_eTJSError(TJSNullAccess)` (`:758`).  A void,
+        // null or scalar source has no closure to copy from.
+        return Err(TjsError::null_access());
+    };
     if let Some(elements) = runtime.heap[src.0].array_elements().map(Vec::from) {
         for value in elements {
             runtime.heap[dest.0].array_push(value);
@@ -533,20 +550,31 @@ fn array_assign<H: TjsHost + 'static>(
             runtime.heap[dest.0].array_push(value);
         }
     }
-    Ok(Variant::Object(dest))
+    Ok(Variant::Void)
 }
 
+/// `Array.assignStruct` (`tjsArray.cpp:764-782`), the structured twin of
+/// [`array_assign`]: same `TJS_E_BADPARAMCOUNT` / `TJSNullAccess` protocol,
+/// same void result, and the clear happens before the source conversion.
 fn array_assign_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let dest = require_this(this_obj, "Array.assignStruct")?;
-    let Some(Variant::Object(src)) = args.first().cloned() else {
-        return Ok(Variant::Object(dest));
+    let Some(source) = args.first().cloned() else {
+        return Err(TjsError::bad_param_count());
+    };
+    if !runtime.heap[dest.0].array_clear() {
+        return Err(TjsError::runtime(
+            "Array.assignStruct called on a non-array object",
+        ));
+    }
+    let Some(src) = closure_source_object(runtime, &source) else {
+        return Err(TjsError::null_access());
     };
     assign_array_struct(runtime, dest, src)?;
-    Ok(Variant::Object(dest))
+    Ok(Variant::Void)
 }
 
 fn array_load<H: TjsHost + 'static>(
@@ -829,6 +857,32 @@ fn dictionary_clear<H: TjsHost + 'static>(
     Ok(Variant::Void)
 }
 
+/// `Dictionary.load` is a registered stub in the reference: it validates the
+/// receiver's native instance and returns `TJS_S_OK` -- `// TODO: implement
+/// Dictionary.load()` (`tjsDictionary.cpp:41-49`) -- so the call answers void
+/// without reading a file.  It is part of the class surface, which is why it
+/// is registered here even though it does nothing: a script that probes
+/// `typeof Dictionary.load` has to see a method.
+fn dictionary_load<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    require_dictionary_instance(runtime, this_obj, "Dictionary.load")?;
+    Ok(Variant::Void)
+}
+
+/// `Dictionary.save`, the write-side twin of [`dictionary_load`]
+/// (`tjsDictionary.cpp:110-118`, `// TODO: implement Dictionary.save();`).
+fn dictionary_save<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    require_dictionary_instance(runtime, this_obj, "Dictionary.save")?;
+    Ok(Variant::Void)
+}
+
 /// `tTJSDictionaryNI::Assign` (`tjsDictionary.cpp:325-373`): copy every
 /// enumerated member of the source onto the destination.
 ///
@@ -856,7 +910,7 @@ fn dictionary_assign<H: TjsHost + 'static>(
         Some(value) if !matches!(value, Variant::Void) => value.to_integer()? != 0,
         _ => true,
     };
-    let Some(src) = dictionary_assign_source(runtime, &source) else {
+    let Some(src) = closure_source_object(runtime, &source) else {
         // Official: `else TJS_eTJSError(TJSNullAccess)` (`:359`).
         return Err(TjsError::null_access());
     };
@@ -910,35 +964,18 @@ fn is_dictionary_receiver<H: TjsHost + 'static>(
     runtime: &Runtime<H>,
     handle: ObjectHandle,
 ) -> bool {
-    let class = match runtime.global_member("Dictionary") {
-        Variant::Object(class) => class,
-        _ => return false,
-    };
-    // The class object itself is not a Dictionary instance: it carries the
-    // class name for lookup purposes, but no native instance behind `this`.
-    if handle == class {
-        return false;
-    }
-    let mut current = Some(handle);
-    while let Some(object) = current {
-        if runtime.heap[object.0]
-            .class_infos
-            .iter()
-            .any(|info| info == "Dictionary")
-        {
-            return true;
-        }
-        current = runtime.object_super_class(object);
-    }
-    false
+    // A class object is not a Dictionary instance: it carries the class name
+    // for lookup purposes, but no native instance behind `this`
+    // (`Runtime::is_dictionary_instance`).
+    runtime.is_dictionary_instance(handle)
 }
 
 /// `tTJSVariantClosure clo = param[0]->AsObjectClosureNoAddRef();` followed by
 /// `if(clo.ObjThis) ... else if(clo.Object) ... else TJS_eTJSError(TJSNullAccess)`
-/// (`tjsDictionary.cpp:353-359`): a bound closure assigns from its `ObjThis`,
-/// any other object from its `Object`, and a non-object (void or null)
-/// reports null access.
-fn dictionary_assign_source<H: TjsHost + 'static>(
+/// (`tjsDictionary.cpp:353-359`, `tjsArray.cpp:752-758`): a bound closure
+/// assigns from its `ObjThis`, any other object from its `Object`, and a
+/// non-object (void, null or a scalar) reports null access.
+fn closure_source_object<H: TjsHost + 'static>(
     runtime: &Runtime<H>,
     value: &Variant,
 ) -> Option<ObjectHandle> {
@@ -961,7 +998,7 @@ fn dictionary_assign_struct<H: TjsHost + 'static>(
     let Some(source) = args.first().cloned() else {
         return Err(TjsError::bad_param_count());
     };
-    let Some(src) = dictionary_assign_source(runtime, &source) else {
+    let Some(src) = closure_source_object(runtime, &source) else {
         return Err(TjsError::null_access());
     };
     assign_dictionary_struct(runtime, dest, src)?;

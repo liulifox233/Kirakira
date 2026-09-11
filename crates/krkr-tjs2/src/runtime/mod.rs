@@ -332,6 +332,46 @@ impl<H: TjsHost + 'static> Runtime<H> {
         handle
     }
 
+    /// True when `object` is a TJS `Dictionary` *instance*.
+    ///
+    /// The dispatch overrides of `tTJSDictionaryObject` -- a miss reading as
+    /// void (`tjsDictionary.cpp:720-731`) above all -- belong to the object
+    /// `tTJSDictionaryClass::CreateBaseTJSObject` builds
+    /// (`tjsDictionary.cpp:235-238`), not to the `Dictionary` class object:
+    /// that one is a `tTJSNativeClass`, i.e. a plain `tTJSCustomObject` for
+    /// every protocol it does not override (`tjsNative.h`), so a miss on
+    /// `Dictionary.whatever` raises `Member "%1" does not exist`.
+    ///
+    /// The receiver therefore has to be a constructed object -- a native
+    /// function, a `vm-native` function or a script class object is a class
+    /// object, never an instance whatever class names it carries -- whose own
+    /// class info or whose class chain names `Dictionary`.
+    pub fn is_dictionary_instance(&self, object: ObjectHandle) -> bool {
+        if matches!(
+            self.heap[object.0].kind,
+            ObjectKind::NativeFunction { .. }
+                | ObjectKind::VmNativeFunction { .. }
+                | ObjectKind::InterCode {
+                    context: BytecodeContextType::Class,
+                    ..
+                }
+        ) {
+            return false;
+        }
+        let mut current = Some(object);
+        while let Some(object) = current {
+            if self.heap[object.0]
+                .class_infos
+                .iter()
+                .any(|info| info == "Dictionary")
+            {
+                return true;
+            }
+            current = self.object_super_class(object);
+        }
+        false
+    }
+
     pub fn array_push(&mut self, object: ObjectHandle, value: Variant) -> bool {
         self.heap[object.0].array_push(value)
     }

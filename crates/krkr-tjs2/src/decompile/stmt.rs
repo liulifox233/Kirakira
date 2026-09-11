@@ -100,6 +100,18 @@ pub(crate) struct Scanner<'f> {
     regs: BTreeMap<i16, Expr>,
     flag: Option<Cond>,
     declared: BTreeSet<i16>,
+    /// Bytecode offset of the earliest `VM_SPDS` store of each name declared
+    /// on `this` in this object, keyed by name.
+    ///
+    /// Only that first store is the declaration; a later store of the same
+    /// name (a second write to a declared variable, a field reassignment) is
+    /// a plain assignment, and recompiling a second `var` for those would
+    /// bind a new variable instead of storing into the one that exists.  The
+    /// offsets come from a pass over the whole instruction stream because the
+    /// scanner visits blocks in control-flow order, not address order, and a
+    /// nested block's copy of a name can be scanned before the prologue that
+    /// declares it.
+    declaration_offsets: BTreeMap<String, usize>,
     /// Positive registers whose value was already materialized under its
     /// `tN` name (later redefinitions reassign instead of re-declaring).
     materialized: BTreeSet<i16>,
@@ -126,6 +138,7 @@ impl<'f> Scanner<'f> {
             regs: BTreeMap::new(),
             flag: None,
             declared: BTreeSet::new(),
+            declaration_offsets: declaration_offsets(file, object),
             materialized: BTreeSet::new(),
             out: Vec::new(),
             unhandled: 0,
@@ -355,8 +368,11 @@ impl<'f> Scanner<'f> {
             let name = format!("t{reg}");
             // The first materialization declares the temporary; later
             // redefinitions of the same register reassign it instead of
-            // repeating `var tN = ...`.
-            let stmt = if self.materialized.insert(reg) {
+            // repeating `var tN = ...`.  At the top level every
+            // materialization declares: a bare `tN = ...` there is a global
+            // member write, not the register store the bytecode performs (see
+            // [`Scanner::assign_stmt`]).
+            let stmt = if self.materialized.insert(reg) || self.at_top_level {
                 Stmt::new(
                     StmtKind::Var {
                         kind: VarKind::Var,
@@ -514,7 +530,14 @@ impl<'f> Scanner<'f> {
     fn assign_stmt(&mut self, reg: i16, expr: Expr) -> Stmt {
         let name = self.names.name(reg);
         let is_local = reg <= -3 && self.object.func_decl_arg_count as i16 + 3 <= -reg;
-        if is_local && !self.declared.contains(&reg) {
+        // A top-level register has no other source form: outside a function a
+        // bare `name = value` is a *global member* write (`VM_SPD`), not the
+        // register store the bytecode performs, and a member nobody carries
+        // makes that write raise where the register store always worked.  So
+        // every top-level local assignment re-declares its name, while inside
+        // a function one `var` is enough and later assignments reach the same
+        // register.
+        if is_local && (self.at_top_level || !self.declared.contains(&reg)) {
             self.declared.insert(reg);
             return Stmt::new(
                 StmtKind::Var {
@@ -597,12 +620,23 @@ impl<'f> Scanner<'f> {
     }
 
     fn direct_name(&self, data_index: i16) -> Option<String> {
-        let index = usize::try_from(data_index).ok()?;
-        let slot = self.object.data_slots.get(index)?;
-        match slot.value(self.file) {
-            Ok(crate::runtime::Variant::String(value)) => Some(value),
-            _ => None,
-        }
+        data_slot_name(self.file, self.object, data_index)
+    }
+
+    /// True for the contexts whose declarations land on `this` instead of a
+    /// register: the top level (global variables) and a class body (class
+    /// members).  A function's declarations get registers of their own.
+    fn declaration_level(&self) -> bool {
+        matches!(
+            self.object.context_type,
+            BytecodeContextType::TopLevel | BytecodeContextType::Class
+        )
+    }
+
+    /// The declared name of an `VM_SPDS` store: the receiver has to be `this`
+    /// or the this-proxy (`%-1`/`%-2`) and the member a constant identifier.
+    fn declaration_name(&self, object_reg: i16, data_index: i16) -> Option<String> {
+        declared_name(self.file, self.object, object_reg, data_index)
     }
 
     fn member_from_data(&self, object_reg: i16, data_index: i16) -> Expr {
@@ -630,12 +664,12 @@ impl<'f> Scanner<'f> {
         )
     }
 
-    /// At the top level, plain `name = value` statements that the bytecode
-    /// Top-level assignments recompile faithfully as plain assignments (the
-    /// frontend auto-creates global members), so the `var` conversion only
-    /// applies where the bytecode pattern is unambiguous: kept as a hook for
-    /// later polish, currently a no-op for correctness (block-scoped `var`
-    /// would change semantics inside branches).
+    /// Hook for per-statement rewrites at the top level.  Nothing needs one:
+    /// the two shapes that must not come out of the scanner as plain
+    /// assignments -- the `VM_SPDS` declaration (see the `104 | 105 | 111`
+    /// arm) and a top-level register's definition (see
+    /// [`Scanner::assign_stmt`]) -- are recognized from the instruction that
+    /// produced them, where the opcode and the register are still visible.
     fn top_level_stmt(&self, stmt: Stmt) -> Stmt {
         let _ = self.at_top_level;
         stmt
@@ -1026,8 +1060,34 @@ impl<'f> Scanner<'f> {
                 }
             }
             104 | 105 | 111 => {
-                let target = self.member_from_data(inst.operands[0], inst.operands[1]);
                 let value = self.reg_expr(inst.operands[2]);
+                // `VM_SPDS` is the store a declaration uses when it has no
+                // local register to live in: `AddLocalVariable` creates the
+                // member on `this` for the global level and for a class body
+                // (`tjsInterCodeGen.cpp:2693-2704`).  `var` is the only source
+                // form that recompiles to that instruction -- and to that
+                // `MEMBERENSURE` store, which is what makes the declaration
+                // able to create the member where a bare `name = value`
+                // (`VM_SPD`) could only update one that already exists.
+                if inst.opcode == 111
+                    && self.declaration_level()
+                    && let Some(name) = self.declaration_name(inst.operands[0], inst.operands[1])
+                    && self.declaration_offsets.get(&name).copied() == Some(inst.offset)
+                {
+                    return Effect::Stmt(Stmt::new(
+                        StmtKind::Var {
+                            kind: VarKind::Var,
+                            declarations: vec![VarDecl {
+                                name: Ident::new(name),
+                                ty: None,
+                                initializer: Some(value),
+                                span: Span::empty(0),
+                            }],
+                        },
+                        Span::empty(0),
+                    ));
+                }
+                let target = self.member_from_data(inst.operands[0], inst.operands[1]);
                 Effect::Side(Expr::new(
                     ExprKind::Assignment {
                         op: AssignOp::Assign,
@@ -1248,6 +1308,49 @@ impl<'f> Scanner<'f> {
     }
 }
 
+/// The string a data slot holds, if it is a string at all.
+fn data_slot_name(file: &BytecodeFile, object: &CodeObject, data_index: i16) -> Option<String> {
+    let index = usize::try_from(data_index).ok()?;
+    match object.data_slots.get(index)?.value(file) {
+        Ok(crate::runtime::Variant::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+/// The name an `VM_SPDS` store declares: `this`/the this-proxy (`%-1`/`%-2`)
+/// as the receiver and a constant identifier as the member.
+fn declared_name(
+    file: &BytecodeFile,
+    object: &CodeObject,
+    object_reg: i16,
+    data_index: i16,
+) -> Option<String> {
+    if object_reg != -1 && object_reg != -2 {
+        return None;
+    }
+    let name = data_slot_name(file, object, data_index)?;
+    super::naming::is_ident_name(&name).then_some(name)
+}
+
+/// Bytecode offset of the earliest `VM_SPDS` store of every name declared on
+/// `this`, keyed by name (see [`Scanner::declaration_offsets`]).
+fn declaration_offsets(file: &BytecodeFile, object: &CodeObject) -> BTreeMap<String, usize> {
+    let mut offsets: BTreeMap<String, usize> = BTreeMap::new();
+    let Ok(instructions) = object.decode_instructions() else {
+        return offsets;
+    };
+    for inst in instructions {
+        if inst.opcode != 111 {
+            continue;
+        }
+        let Some(name) = declared_name(file, object, inst.operands[0], inst.operands[1]) else {
+            continue;
+        };
+        offsets.entry(name).or_insert(inst.offset);
+    }
+    offsets
+}
+
 pub(crate) fn cond_expr(cond: Cond, negate: bool, resolve: impl Fn(i16) -> Expr) -> Expr {
     match cond {
         Cond::Truthy { reg, inv } => {
@@ -1429,11 +1532,38 @@ mod tests {
     fn decompiles_assignment_and_locals() {
         let (text, unhandled) = decompile_source("var x = 5; x = x + 1; return x;");
         assert_eq!(unhandled, 0, "{text}");
-        // Top-level bytecode stores globals as member writes; the
-        // decompiler renders them as plain assignments.
         assert!(text.contains("x = 5;"), "{text}");
         assert!(text.contains("x = x + 1;"), "{text}");
         assert!(text.contains("return x;"), "{text}");
+    }
+
+    /// A top-level `var` is `VM_SPDS` (`AddLocalVariable`'s "create member on
+    /// this", `tjsInterCodeGen.cpp:2693-2704`), and only `var` recompiles to
+    /// that instruction: the bare `x = 5;` form is `VM_SPD` (flags 0), which
+    /// cannot create the member it stores to.  Only the *declaring* store gets
+    /// the keyword -- a later write to the same name is a plain assignment,
+    /// and a second `var` would bind a new variable instead of storing into
+    /// the one that exists.
+    #[test]
+    fn renders_shapes_that_can_create_as_declarations() {
+        let (text, unhandled) = decompile_source("var x = 5; x = x + 1; return x;");
+        assert_eq!(unhandled, 0, "{text}");
+        assert!(text.contains("var x = 5;"), "{text}");
+        assert!(!text.contains("var x = x + 1;"), "{text}");
+
+        // A bare assignment is `VM_SPD`: it must not gain a `var`, which
+        // would turn a store into a declaration.
+        let (text, unhandled) = decompile_source("x = 5; return x;");
+        assert_eq!(unhandled, 0, "{text}");
+        assert!(!text.contains("var x"), "{text}");
+        assert!(text.contains("x = 5;"), "{text}");
+
+        // A top-level local lives in a register in the bytecode, so its
+        // source form is a declaration as well -- a bare `l0 = ...` there
+        // would be a global member write instead of the register store.
+        let (text, unhandled) = decompile_source("if (1) { var y = 2; } return 0;");
+        assert_eq!(unhandled, 0, "{text}");
+        assert!(text.starts_with("var "), "{text}");
     }
 
     #[test]

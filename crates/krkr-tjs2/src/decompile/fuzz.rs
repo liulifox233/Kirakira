@@ -617,7 +617,14 @@ mod tests {
         // receiver, so that pair now compares equal.  Measured by dumping the
         // failure set before and after: exactly that one program (the
         // `b.x |= [%[]](false)` corpus entry) left the set.
-        const KNOWN_FAILURES: usize = 33;
+        //
+        // Re-measured 33 -> 31 for the MEMBERENSURE store / typeof /
+        // decompiler-declaration mission.  The recorded 33 had already gone
+        // stale on main: main measures 31 today, and this branch measures the
+        // same 31.  The per-program failure set (`seed/index`, dumped on both
+        // trees) is identical, so the mission added no failure -- recording
+        // the measurement keeps the net tight for the work that follows.
+        const KNOWN_FAILURES: usize = 31;
         let mut covered = BTreeSet::new();
         let mut failures = Vec::new();
         let mut total = 0usize;
