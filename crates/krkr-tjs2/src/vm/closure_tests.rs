@@ -837,7 +837,8 @@ mod official {
 
     /// `constructor` is a global class the fixture instantiates as the
     /// `this` the handler is bound to.
-    fn official_handler_fixture(constructor: &str) -> BytecodeFile {        let mut fixture = Fixture::default();
+    fn official_handler_fixture(constructor: &str) -> BytecodeFile {
+        let mut fixture = Fixture::default();
         let global_name = fixture.string("global");
         let constructor = fixture.string(constructor);
         let kag_name = fixture.string("kag");
