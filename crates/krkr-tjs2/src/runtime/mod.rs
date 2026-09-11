@@ -13,6 +13,9 @@ pub mod object;
 pub(crate) mod tjs_ns0;
 pub mod value;
 
+#[cfg(test)]
+mod dictionary_tests;
+
 pub use self::object::{NativeArgCount, NativePropertyAccess, Object, ObjectKind};
 pub use self::value::{Closure, ObjectHandle, Variant};
 
@@ -313,12 +316,19 @@ impl<H: TjsHost + 'static> Runtime<H> {
         handle
     }
 
-    /// Allocates a TJS Dictionary complete with its builtin member surface.
-    /// Native integrations that materialize structured external data should
-    /// use this instead of only attaching Dictionary class metadata.
+    /// Allocates a TJS Dictionary: an ordinary object carrying the `Dictionary`
+    /// class name and nothing else.  Native integrations that materialize
+    /// structured external data should use this instead of only attaching
+    /// Dictionary class metadata.
+    ///
+    /// The object deliberately gets no method members: the reference registers
+    /// every Dictionary method with `TJS_STATICMEMBER`, so a Dictionary
+    /// instance has an empty member map until script code fills it, and its
+    /// methods are only reachable as
+    /// `(Dictionary.method incontextof instance)(...)`.
     pub fn alloc_dictionary_object(&mut self) -> ObjectHandle {
         let handle = self.alloc_ordinary_object();
-        builtins::install_dictionary_methods(self, handle);
+        self.add_object_class_info(handle, "Dictionary");
         handle
     }
 

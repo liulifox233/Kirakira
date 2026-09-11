@@ -1359,20 +1359,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 .bound_super_this(handle, caller_this)?
                 .or(closure_this)
                 .or(caller_this);
-            self.prop_get_handle(
-                handle,
-                name,
-                DispatchFlags::no_bound_instance_fallback(),
-                lookup_this,
-            )
-            .map_err(|error| {
-                error.with_member_access(TjsMemberAccess {
-                    operation: TjsMemberOperation::Calling,
-                    receiver_type: receiver_type.clone(),
-                    member_name: name.to_string(),
-                    callee_type: None,
-                })
-            })?
+            // A member *call* is `iTJSDispatch2::FuncCall`, which has no
+            // Dictionary exception: only `tTJSDictionaryObject::PropGet` maps
+            // a miss to void (`tjsDictionary.cpp:720-731`), while `FuncCall`
+            // stays with `tTJSCustomObject::FuncCall` and reports
+            // `TJS_E_MEMBERNOTFOUND` (`:713-722`).  `MEMBERMUSTEXIST` carries
+            // that difference into this lookup: without it a missing member of
+            // a Dictionary-classed receiver would read as void and surface as
+            // "not a function" instead of the official miss, and the
+            // `%-2` proxy would stop at the first object for calls too
+            // (`tTJSObjectProxy::FuncCall` walks on `TJS_E_MEMBERNOTFOUND`,
+            // `tjsInterCodeExec.cpp:307-330`).
+            self.prop_get_handle(handle, name, DispatchFlags::call(), lookup_this)
+                .map_err(|error| {
+                    error.with_member_access(TjsMemberAccess {
+                        operation: TjsMemberOperation::Calling,
+                        receiver_type: receiver_type.clone(),
+                        member_name: name.to_string(),
+                        callee_type: None,
+                    })
+                })?
         };
         // TJS2 emits one entry point per class extender in the superclass
         // getter. A class-qualified call searches those entries in reverse

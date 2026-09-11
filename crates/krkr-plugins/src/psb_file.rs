@@ -651,7 +651,14 @@ mod tests {
                 .iter()
                 .any(|name| name == "Dictionary")
         );
-        assert!(!matches!(
+        // A Dictionary instance carries no members of its own: every Dictionary
+        // method is registered with `TJS_STATICMEMBER` on the class object
+        // (`tjsDictionary.cpp:41-219`) and `tTJSNativeClass::FuncCall` copies
+        // only non-static members onto an instance (`tjsNative.cpp:340-364`),
+        // so the class name asserted above is what marks this map as a
+        // Dictionary and `assign` reads void (the official manual says it
+        // outright: 「作成された状態ではメンバを何一つ持っていません」).
+        assert!(matches!(
             runtime.object_member(nested, "assign"),
             Variant::Void
         ));

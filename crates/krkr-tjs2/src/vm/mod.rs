@@ -1443,6 +1443,21 @@ impl DispatchFlags {
         }
     }
 
+    /// The lookup behind a member *call*.  It keeps
+    /// `no_bound_instance_fallback` -- a call resolves on the receiver, not on
+    /// the caller's instance -- and adds `must_exist`, because
+    /// `iTJSDispatch2::FuncCall` has no "answer void for a miss" rule: only
+    /// `tTJSDictionaryObject::PropGet` maps `TJS_E_MEMBERNOTFOUND` to void
+    /// (`tjsDictionary.cpp:720-731`), so a missing member of a
+    /// Dictionary-classed receiver is a miss here too.
+    fn call() -> Self {
+        Self {
+            must_exist: true,
+            no_bound_instance_fallback: true,
+            ..Self::default()
+        }
+    }
+
     fn no_bound_instance_fallback() -> Self {
         Self {
             no_bound_instance_fallback: true,

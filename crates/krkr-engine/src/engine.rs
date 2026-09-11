@@ -5071,7 +5071,7 @@ mod tests {
                 var z = Scripts.evalStorage(zipPath, "z1");
                 var be = Scripts.evalStorage(binPath, "b");
                 var b = new Dictionary();
-                b.loadStruct(binPath, "b");
+                (Dictionary.loadStruct incontextof b)(binPath, "b");
                 return c.child.name + ":" + z.list[1] + ":" + b.answer + ":" + be.child.name;
                 "#,
             )
@@ -10487,6 +10487,102 @@ mod tests {
         }));
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The save-screen close (`sysscn/save.ks *return`) is `[backlay]` ->
+    /// `[syspage free page=back]` -> `[systrans save.close]`.  The only
+    /// clearing operation in the whole path hides the *back* page's message
+    /// layer, and the transition then publishes that page (`KAGWindow.
+    /// onTransitionEnd` copies the message layers across the pages and swaps
+    /// them).  The hidden state written to the back page has to survive the
+    /// exchange: the page the transition publishes must not draw the outgoing
+    /// save image again.
+    #[test]
+    fn kag_save_close_message_layer_hidden_on_the_back_page_stays_hidden_after_the_exchange() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .host_mut()
+            .set_transition_policy(crate::TransitionPolicy::Immediate);
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                global.win = new Window();
+                kag.fore = %[base: new Layer(win), layers: [], messages: []];
+                kag.back = %[base: new Layer(win), layers: [], messages: []];
+                kag.fore.base.comp = kag.back.base;
+                kag.back.base.comp = kag.fore.base;
+                kag.fore.base.visible = true;
+                kag.back.base.visible = true;
+                kag.fore.messages[1] = new Layer(win, kag.fore.base);
+                kag.back.messages[1] = new Layer(win, kag.back.base);
+                kag.fore.messages[1].comp = kag.back.messages[1];
+                kag.back.messages[1].comp = kag.fore.messages[1];
+                // The save screen is drawn on the visible page's message1.
+                kag.fore.messages[1].setSize(64, 48);
+                kag.fore.messages[1].fillRect(0, 0, 64, 48, 0x2244ff);
+                kag.fore.messages[1].visible = true;
+                // [backlay]: the back page takes the visible page's content.
+                kag.back.messages[1].assignImages(kag.fore.messages[1]);
+                kag.back.messages[1].setSize(64, 48);
+                kag.back.messages[1].visible = true;
+                // [syspage free page=back]: the close's clearing op.
+                kag.back.messages[1].visible = false;
+                kag.fore.base.onTransitionCompleted = function(dest, src) {
+                    // KAGWindow.onTransitionEnd: the outgoing page's message
+                    // layer takes the incoming page's state, then the pages
+                    // swap.
+                    kag.fore.messages[1].assignImages(kag.back.messages[1]);
+                    kag.fore.messages[1].visible = kag.back.messages[1].visible;
+                    var tmp = kag.fore;
+                    kag.fore = kag.back;
+                    kag.back = tmp;
+                };
+                kag.fore.base.beginTransition("crossfade", true, kag.back.base, %[time: 2]);
+                "#,
+            )
+            .expect("close path");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "kag.fore.messages[1].visible")
+                .expect("published page message layer"),
+            Variant::Integer(0),
+            "the published page keeps the hidden message state"
+        );
+        let Variant::Integer(node_id) = engine
+            .execute_expression("inline.tjs", "kag.fore.messages[1].__nativeLayerId")
+            .expect("native layer id")
+        else {
+            panic!("message layer has no native id");
+        };
+        let node = engine
+            .host()
+            .layer_tree()
+            .layer(node_id as u64)
+            .expect("message layer node");
+        assert!(
+            !node.visible,
+            "the published page's message layer node must be hidden"
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(
+            !frame.output.draw_commands.iter().any(|command| {
+                matches!(
+                    command,
+                    krkr_core::DrawCommand::Image(image)
+                        if image.rect.width == 64.0 && image.rect.height == 48.0
+                )
+            }),
+            "the outgoing save image must not be republished on the visible page"
+        );
     }
 
     #[test]
@@ -18486,6 +18582,83 @@ mod tests {
             engine.tjs_runtime().object_member(tag_object, "gvolume"),
             Variant::Void
         );
+    }
+
+    /// KAGEX tag handlers receive the parser's tag dictionary and copy it
+    /// (`var dict = new Dictionary(); (Dictionary.assign incontextof dict)(elm,
+    /// 1)`) before testing attributes.  A bare `[syspage free]` attribute has to
+    /// reach that copy as the truthy string `"true"` the reference parser stores
+    /// (`kagparser.cpp` writes `TJS_W("true")` for an attribute without a value),
+    /// otherwise the handler's `free` arm — the only layer-clearing step of the
+    /// save screen's close — is skipped and the outgoing save image survives the
+    /// close transition.
+    ///
+    /// The arm chain that follows inside the game's handler (`if (dict.uiload)
+    /// ... else if (dict.clear) ... else if (dict.free)`) is pinned by krkr-tjs2:
+    /// a Dictionary instance carries no members of its own, so this copy answers
+    /// `clear` with void and the chain reaches the `free` attribute (see
+    /// `runtime::dictionary_tests::kagex_attribute_chain_reaches_the_free_arm`,
+    /// fixed by commit f4fd407 "Match Dictionary.assign to the reference").
+    #[test]
+    fn kag_bare_attribute_reaches_the_handler_dictionary_copy_as_true() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[syspage free page=back]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        // The engine hands `onTag` to the game's own handler object.  A class
+        // instance answers a missing member with member-not-found, so the
+        // handler's unqualified global reads fall back to the global object the
+        // way the game's KAGEX handlers do.
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class SyspageHandler {
+                    var seen = "";
+                    var copy = "";
+                    function onTag(elm) {
+                        this.seen = ("" + elm.free) + "/" + (typeof elm.free) + "/" + (elm.free ? "T" : "F") + "/" + ("" + elm.page);
+                        var dict = new Dictionary();
+                        (Dictionary.assign incontextof dict)(elm, 1);
+                        if (dict.layer === void) { dict.layer = "message1"; }
+                        this.copy = ("" + dict.free) + "/" + (dict.free ? "T" : "F") + "/" + ("" + dict.page) + "/" + ("" + dict.layer);
+                        return 1;
+                    }
+                }
+                return new SyspageHandler();
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine.tick().expect("tick");
+
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "seen"),
+            Variant::String("true/String/T/back".to_string()),
+            "the engine's tag dictionary carries a bare attribute as the truthy string \"true\""
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "copy"),
+            Variant::String("true/T/back/message1".to_string()),
+            "the handler's Dictionary.copy keeps the attribute and the layer default"
+        );
+        // The branch decision that follows in the game's handler is pinned by
+        // krkr-tjs2's Dictionary fix (commit f4fd407): a Dictionary instance has
+        // no members of its own, so this copy answers `clear` with void and the
+        // KAGEX arm chain reaches its `free` arm.  When this test landed,
+        // `Dictionary.assign` still kept the destination's native method members,
+        // so the chain answered `clear` — the copy's own method — instead of the
+        // `free` attribute (the reference clears the destination first,
+        // `tTJSDictionaryNI::Assign` -> `Owner->Clear()`).
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn force_timer_due(engine: &mut KrkrEngine, timer: ObjectHandle) {
