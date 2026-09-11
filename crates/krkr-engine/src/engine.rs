@@ -18584,6 +18584,74 @@ mod tests {
         );
     }
 
+    /// KAGEX tag handlers receive the parser's tag dictionary and copy it
+    /// (`var dict = new Dictionary(); (Dictionary.assign incontextof dict)(elm,
+    /// 1)`) before testing attributes.  A bare `[syspage free]` attribute has to
+    /// reach that copy as the truthy string `"true"` the reference parser stores
+    /// (`kagparser.cpp` writes `TJS_W("true")` for an attribute without a value),
+    /// otherwise the handler's `free` arm — the only layer-clearing step of the
+    /// save screen's close — is skipped and the outgoing save image survives the
+    /// close transition.
+    #[test]
+    fn kag_bare_attribute_reaches_the_handler_dictionary_copy_as_true() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[syspage free page=back]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        // The engine hands `onTag` to the game's own handler object.  A class
+        // instance answers a missing member with member-not-found, so the
+        // handler's unqualified global reads fall back to the global object the
+        // way the game's KAGEX handlers do.
+        let handler = match engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class SyspageHandler {
+                    var seen = "";
+                    var copy = "";
+                    function onTag(elm) {
+                        this.seen = ("" + elm.free) + "/" + (typeof elm.free) + "/" + (elm.free ? "T" : "F") + "/" + ("" + elm.page);
+                        var dict = new Dictionary();
+                        (Dictionary.assign incontextof dict)(elm, 1);
+                        if (dict.layer === void) { dict.layer = "message1"; }
+                        this.copy = ("" + dict.free) + "/" + (dict.free ? "T" : "F") + "/" + ("" + dict.page) + "/" + ("" + dict.layer);
+                        return 1;
+                    }
+                }
+                return new SyspageHandler();
+                "#,
+            )
+            .expect("handler")
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("expected handler object, got {other}"),
+        };
+        engine.set_kag_handler(handler);
+
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine.tick().expect("tick");
+
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "seen"),
+            Variant::String("true/String/T/back".to_string()),
+            "the engine's tag dictionary carries a bare attribute as the truthy string \"true\""
+        );
+        assert_eq!(
+            engine.tjs_runtime().object_member(handler, "copy"),
+            Variant::String("true/T/back/message1".to_string()),
+            "the handler's Dictionary.copy keeps the attribute and the layer default"
+        );
+        // The branch decision that follows in the game's handler is not pinned
+        // here: our `Dictionary.assign` (krkr-tjs2) keeps the destination's
+        // native method members, so the KAGEX arm chain currently answers
+        // `clear` — the copy's own `clear` method — instead of the `free`
+        // attribute; the reference clears the destination first
+        // (`tTJSDictionaryNI::Assign` -> `Owner->Clear()`).
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     fn force_timer_due(engine: &mut KrkrEngine, timer: ObjectHandle) {
         engine
             .tjs_runtime
