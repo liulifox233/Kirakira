@@ -31,8 +31,8 @@ use crate::{
     native::classes::{
         apply_completed_image_load, apply_completed_resource_loads, call_wave_status_changed,
         complete_layer_before_draw, complete_pending_layer_paints,
-        finish_completed_native_transitions, register_kag_layer_slots_from_tjs, set_wave_paused,
-        set_wave_status,
+        finish_completed_native_transitions, plain_member_object, register_kag_layer_slots_from_tjs,
+        set_wave_paused, set_wave_status,
     },
     native::{
         create_kag_parser_object, kag_to_tjs, refresh_kag_parser_object, tick_video_overlays,
@@ -1217,14 +1217,10 @@ impl KrkrEngine {
             return Some(kag);
         }
 
-        let Variant::Object(window_class) = self.tjs_runtime.global_member("Window") else {
-            return None;
-        };
-        let Variant::Object(window) = self.tjs_runtime.object_member(window_class, "mainWindow")
-        else {
-            return None;
-        };
-        Some(window)
+        // `Window.mainWindow` is the first constructed window
+        // (`TVPMainWindow`, `WindowIntf.cpp:1796`); the host records it when
+        // the window registers, which is also what the property getters read.
+        self.tjs_runtime.host().main_window()
     }
 
     fn active_modal_window(&self) -> Option<ObjectHandle> {
@@ -1988,18 +1984,13 @@ impl KrkrEngine {
         let Some(window) = self.runtime_window_object() else {
             return Ok(false);
         };
-        let focused_layer = match self.tjs_runtime.host().native_window_focused_layer(window) {
-            Some(layer) => layer,
-            None => {
-                let Variant::Object(focused_layer) =
-                    self.tjs_runtime.object_member(window, "focusedLayer")
-                else {
-                    return Ok(false);
-                };
-                self.tjs_runtime
-                    .bound_this(focused_layer)
-                    .unwrap_or(focused_layer)
-            }
+        let Some(focused_layer) = self
+            .tjs_runtime
+            .host()
+            .native_window_focused_layer(window)
+            .or_else(|| plain_member_object(&self.tjs_runtime, window, "focusedLayer"))
+        else {
+            return Ok(false);
         };
         if !self.tjs_runtime.object_valid(focused_layer) {
             return Ok(false);
@@ -2420,18 +2411,13 @@ impl KrkrEngine {
         let Some(window) = self.runtime_window_object() else {
             return Ok(());
         };
-        let focused_layer = match self.tjs_runtime.host().native_window_focused_layer(window) {
-            Some(layer) => layer,
-            None => {
-                let Variant::Object(focused_layer) =
-                    self.tjs_runtime.object_member(window, "focusedLayer")
-                else {
-                    return Ok(());
-                };
-                self.tjs_runtime
-                    .bound_this(focused_layer)
-                    .unwrap_or(focused_layer)
-            }
+        let Some(focused_layer) = self
+            .tjs_runtime
+            .host()
+            .native_window_focused_layer(window)
+            .or_else(|| plain_member_object(&self.tjs_runtime, window, "focusedLayer"))
+        else {
+            return Ok(());
         };
         if !self.tjs_runtime.object_valid(focused_layer)
             || matches!(
@@ -2518,14 +2504,7 @@ impl KrkrEngine {
         self.tjs_runtime
             .host()
             .native_layer_window(object)
-            .or_else(|| match self.tjs_runtime.object_member(object, "window") {
-                Variant::Object(layer_window) => Some(
-                    self.tjs_runtime
-                        .bound_this(layer_window)
-                        .unwrap_or(layer_window),
-                ),
-                _ => None,
-            })
+            .or_else(|| plain_member_object(&self.tjs_runtime, object, "window"))
             == Some(window)
     }
 
@@ -5255,7 +5234,13 @@ mod tests {
                 r#"
                 var window = new Window();
                 window.fullScreen = true;
-                return Window.mainWindow === window;
+                // `Window.mainWindow` hands out `tTJSVariant(dsp, dsp)`
+                // (`WindowIntf.cpp:1803`), so the comparison against the object
+                // itself is the identity comparison TJS2's `==` performs; `===`
+                // would also compare ObjThis, which the engine's `new` does not
+                // bind yet (`call_function`'s `VM_NEW` result is a plain
+                // object here).
+                return Window.mainWindow == window;
                 "#,
             )
             .expect("script");
@@ -5268,28 +5253,105 @@ mod tests {
     fn window_add_tracks_children_and_primary_layer() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
 
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.layer = new Layer(window, null);
+                window.add(layer);
+                window.add(layer);
+                "#,
+            )
+            .expect("add");
+
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window missing");
+        };
+        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
+            panic!("layer missing");
+        };
+        // `Window.children` has no official counterpart (M2 §5a): the child
+        // registry is engine-internal, reached through the host.
+        assert_eq!(engine.host().native_window_children(window), vec![layer]);
+        assert_eq!(
+            engine.host().native_window_primary_layer(window),
+            Some(layer)
+        );
+        assert_eq!(engine.host().native_window_focused_layer(window), None);
+
         let value = engine
             .execute_script(
                 "inline.tjs",
                 r#"
-                var window = new Window();
-                var layer = new Layer(window, null);
-                window.add(layer);
-                var before = window.children.count + ":" +
-                    (window.primaryLayer === layer) + ":" +
+                var before =
+                    (window.primaryLayer == layer) + ":" +
                     (window.focusedLayer === null) + ":" +
-                    (Window.mainWindow === window);
-                window.add(layer);
-                var deduped = window.children.count;
+                    (Window.mainWindow == window);
                 window.remove(layer);
-                return before + ":" + deduped + ":" + window.children.count + ":" +
-                    (window.primaryLayer === void) + ":" +
-                    (window.focusedLayer === null);
+                var noLayer = "";
+                // `GetPrimaryLayer()` throws `TVPWindowHasNoLayer`
+                // (`WindowIntf.cpp:1862`, "Window has no layer") once the
+                // window's primary layer is gone.
+                try { window.primaryLayer; } catch (e) { noLayer = e.message; }
+                return before + ":" + noLayer + ":" + (window.focusedLayer === null);
                 "#,
             )
             .expect("script");
 
-        assert_eq!(value, Variant::String("1:1:1:1:1:0:1:1".to_string()));
+        assert_eq!(
+            value,
+            Variant::String("1:1:1:Window has no layer:1".to_string())
+        );
+        assert!(engine.host().native_window_children(window).is_empty());
+        assert_eq!(engine.host().native_window_primary_layer(window), None);
+        assert_eq!(engine.host().native_window_focused_layer(window), None);
+        assert_eq!(engine.host().native_layer_window(layer), Some(window));
+    }
+
+    /// `Window.add`/`remove` take their argument through
+    /// `AsObjectClosureNoAddRef()` (`WindowIntf.cpp:829-847`), so the
+    /// self-bound values this engine hands out for `parent`/`children[i]` name
+    /// the layer they bind.
+    #[test]
+    fn window_add_and_remove_accept_self_bound_layer_values() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.root = new Layer(window, null);
+                global.child = new Layer(window, root);
+                // `child.parent` and `root.children[0]` are both
+                // `tTJSVariant(dsp, dsp)` (`LayerIntf.cpp:8490`, `:665`).
+                window.add(child.parent);
+                window.add(root.children[0]);
+                "#,
+            )
+            .expect("add");
+
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window missing");
+        };
+        let Variant::Object(root) = engine.tjs_runtime().global_member("root") else {
+            panic!("root missing");
+        };
+        let Variant::Object(child) = engine.tjs_runtime().global_member("child") else {
+            panic!("child missing");
+        };
+        assert_eq!(
+            engine.host().native_window_children(window),
+            vec![root, child]
+        );
+        assert_eq!(engine.host().native_layer_window(root), Some(window));
+        assert_eq!(engine.host().native_layer_window(child), Some(window));
+
+        engine
+            .execute_script("inline.tjs", "window.remove(child.parent);")
+            .expect("remove");
+        assert_eq!(engine.host().native_window_children(window), vec![child]);
+        assert_eq!(engine.host().native_window_primary_layer(window), None);
     }
 
     #[test]
@@ -5350,6 +5412,9 @@ mod tests {
                 var lazy = first.count;
                 var refreshed = parent.children.count;
                 var stable = (first === parent.children) + ":" + first.count;
+                // `TJS_DENY_NATIVE_PROP_SETTER` (`LayerIntf.cpp:8532`): the
+                // write fails with `TJS_E_ACCESSDENYED` (-1007) and the
+                // official text.
                 var denied = "";
                 try { parent.children = 0; } catch (e) { denied = e.message; }
                 return before + ":" + lazy + ":" + refreshed + ":" + stable +
@@ -5360,7 +5425,429 @@ mod tests {
 
         assert_eq!(
             value,
-            Variant::String("0:0:1:1:1:Access denied".to_string())
+            Variant::String(
+                "0:0:1:1:1:Invalid operation for Read-only or Write-only property".to_string()
+            )
+        );
+    }
+
+    /// Every official read-only `tTJSNI_BaseLayer` property is denied to
+    /// script (`TJS_DENY_NATIVE_PROP_SETTER`), and the refusal carries
+    /// `TJS_E_ACCESSDENYED` (-1007) with the reference's text.
+    #[test]
+    fn layer_read_only_properties_reject_script_writes() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.layer = new Layer(window, null);
+                layer.setSize(5, 6);
+                var names = [
+                    "children",
+                    "nodeVisible",
+                    "window",
+                    "isPrimary",
+                    "prevFocusable",
+                    "nextFocusable",
+                    "nodeFocusable",
+                    "focused",
+                    "nodeEnabled",
+                    "mainImageBuffer",
+                    "mainImageBufferForWrite",
+                    "mainImageBufferPitch",
+                    "provinceImageBuffer",
+                    "provinceImageBufferForWrite",
+                    "provinceImageBufferPitch"
+                ];
+                var denied = 0;
+                var message = "";
+                for (var i = 0; i < names.count; i++) {
+                    try { layer[names[i]] = 0; } catch (e) {
+                        denied++;
+                        message = e.message;
+                    }
+                }
+                // `font` is the one member that stays writable: KAGEX replaces
+                // a layer's font through the `TJS_IGNOREPROP` store, which the
+                // VM cannot separate from an ordinary store yet (see
+                // `LAYER_READ_ONLY_PROPERTIES`).
+                var hook = %[kind: "FontHook"];
+                layer.font = hook;
+                var hookRead = layer.font.kind == "FontHook";
+                // The denied writes left every value where it was: the layer
+                // still belongs to its window and keeps its size.
+                return denied + ":" + message + ":" + (layer.window == window) + ":" +
+                    layer.width + ":" + typeof layer.mainImageBuffer + ":" + hookRead;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String(
+                "15:Invalid operation for Read-only or Write-only property:1:5:void:1".to_string()
+            )
+        );
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window missing");
+        };
+        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
+            panic!("layer missing");
+        };
+        assert_eq!(engine.host().native_layer_window(layer), Some(window));
+    }
+
+    #[test]
+    fn window_and_bitmap_read_only_properties_reject_script_writes() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var layer = new Layer(window, null);
+                var bitmap = new Bitmap();
+                var denied = 0;
+                var message = "";
+                var windowNames = ["mainWindow", "primaryLayer", "layerTreeOwnerInterface"];
+                for (var i = 0; i < windowNames.count; i++) {
+                    try { window[windowNames[i]] = 0; } catch (e) {
+                        denied++;
+                        message = e.message;
+                    }
+                }
+                // The class-level `mainWindow` is read-only too.
+                try { Window.mainWindow = 0; } catch (e) {
+                    denied++;
+                    message = e.message;
+                }
+                var bitmapNames = ["buffer", "bufferForWrite", "bufferPitch", "loading"];
+                for (var j = 0; j < bitmapNames.count; j++) {
+                    try { bitmap[bitmapNames[j]] = 0; } catch (e) {
+                        denied++;
+                        message = e.message;
+                    }
+                }
+                return denied + ":" + message + ":" + (window.primaryLayer == layer) + ":" +
+                    (Window.mainWindow == window) + ":" + bitmap.width;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String(
+                "8:Invalid operation for Read-only or Write-only property:1:1:0".to_string()
+            )
+        );
+    }
+
+    /// The `tTJSVariant(dsp, dsp)` members hand out a value that carries its own
+    /// object as ObjThis (`LayerIntf.cpp:665`, `:8490`, `:8527`, `:8683`), so a
+    /// write through such a value runs on that object rather than on the
+    /// writer's `this`.
+    #[test]
+    fn layer_self_bound_members_carry_their_object_as_this() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Writer {
+                    var holder;
+                    function Writer(holder) { this.holder = holder; }
+                    function poke() {
+                        this.holder.parent.parentMarker = 1;
+                        this.holder.window.windowMarker = 2;
+                        this.holder.childrenArray.arrayMarker = 3;
+                        this.holder.childrenArray[0].elementMarker = 4;
+                    }
+                }
+                var window = new Window();
+                var parent = new Layer(window, null);
+                var child = new Layer(window, parent);
+                global.writer = new Writer(%[
+                    parent: child.parent,
+                    window: child.window,
+                    childrenArray: parent.children
+                ]);
+                writer.poke();
+                return parent.parentMarker + ":" + window.windowMarker + ":" +
+                    parent.children.arrayMarker + ":" + child.elementMarker + ":" +
+                    (typeof writer.parentMarker) + ":" + (typeof writer.windowMarker) + ":" +
+                    (typeof writer.arrayMarker);
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("1:2:3:4:undefined:undefined:undefined".to_string())
+        );
+    }
+
+    /// `Layer.order`/`Layer.absolute` are `GetOrderIndex()` and
+    /// `GetAbsoluteOrderIndex()` (`LayerIntf.cpp:8541`, `:8561`): live indices,
+    /// not stored numbers, with absolute order mode switching `absolute` to the
+    /// index the script set.
+    #[test]
+    fn layer_order_and_absolute_are_live_indices() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parent = new Layer();
+                var first = new Layer(null, parent);
+                var second = new Layer(null, parent);
+                var third = new Layer(null, parent);
+                var before = first.order + ":" + second.order + ":" + third.order;
+                var absoluteBefore = first.absolute;
+                first.order = 2;
+                var after = first.order + ":" + second.order + ":" + third.order;
+                // No parent: both indices report 0 (`LayerIntf.h:278`,
+                // `LayerIntf.cpp:1256`).
+                var detached = (new Layer()).order + ":" + (new Layer()).absolute;
+                parent.absoluteOrderMode = 1;
+                var mode = second.order + ":" + second.absolute;
+                second.absolute = 5;
+                var absoluteAfter = second.absolute + ":" + parent.absoluteOrderMode;
+                // Writing either index needs a parent:
+                // `TVPCannotMovePrimaryOrSiblingless` (`LayerIntf.cpp:1221`,
+                // `:1264`; `string_table_en.rc:128`).
+                var siblinglessOrder = "";
+                try { (new Layer()).order = 0; } catch (e) { siblinglessOrder = e.message; }
+                var siblinglessAbsolute = "";
+                try { (new Layer()).absolute = 1; } catch (e) {
+                    siblinglessAbsolute = e.message;
+                }
+                return before + ":" + absoluteBefore + ":" + after + ":" + detached + ":" +
+                    mode + ":" + absoluteAfter + ":" + siblinglessOrder + ":" +
+                    siblinglessAbsolute;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String(
+                "0:1:2:0:2:0:1:0:0:0:0:5:1:Cannot move primary or siblingless:\
+                 Cannot move primary or siblingless"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A layer placed with an absolute index keeps that index until an `order`
+    /// write; the render apply then has to follow the sibling order rather than
+    /// snap back to the stale absolute value (`apply_layer_properties_to_node`
+    /// prefers `absolute`).
+    #[test]
+    fn layer_order_write_clears_a_stale_absolute_placement() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                var parent = new Layer(window, null);
+                global.first = new Layer(null, parent);
+                global.second = new Layer(null, parent);
+                global.third = new Layer(null, parent);
+                first.absolute = 500;
+                first.order = 0;
+                // Any window move re-applies every layer to the render tree,
+                // which is when the stored keys are read back.
+                window.left = 5;
+                return first.order + ":" + second.order + ":" + third.order;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("0:1:2".to_string()));
+    }
+
+    /// `nodeFocusable`, `prevFocusable`, `nextFocusable` and `focused` are
+    /// computed on read (`LayerIntf.h:622`, `LayerIntf.cpp:3218`, `:3261`,
+    /// `:3300`) and follow the focus chain as it changes.
+    #[test]
+    fn layer_focus_chain_members_are_computed() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var root = new Layer(window, null);
+                var first = new Layer(window, root);
+                var second = new Layer(window, root);
+                var third = new Layer(window, root);
+                root.visible = true;
+                first.visible = true;
+                second.visible = true;
+                third.visible = true;
+                first.focusable = true;
+                second.focusable = true;
+                third.focusable = true;
+                // The reference walks the window's overall order, wrapping
+                // around (`LayerIntf.cpp:3243-3298`), so the last focusable
+                // layer's `nextFocusable` is the first and vice versa.
+                var chain = root.nodeFocusable + ":" + first.nodeFocusable + ":" +
+                    (second.prevFocusable == first) + ":" + (second.nextFocusable == third) +
+                    ":" + (third.nextFocusable == first) + ":" +
+                    (first.prevFocusable == third) + ":" + (root.nextFocusable == first);
+                second.focus();
+                var focus = first.focused + ":" + second.focused + ":" + third.focused;
+                first.focus();
+                var moved = first.focused + ":" + second.focused;
+                // `order` moves the layer inside the children vector, and the
+                // focus search walks that vector (`tTVPLayerManager::AllNodes`,
+                // `LayerManager.cpp:181-190`), not the creation order: after
+                // moving `first` to index 1 the cycle is
+                // `root, second, first, third`.
+                first.order = 1;
+                var reordered = (first.nextFocusable == third) + ":" +
+                    (first.prevFocusable == second) + ":" +
+                    (second.nextFocusable == first) + ":" +
+                    (third.nextFocusable == second);
+                // Leaving the focus chain removes a layer from the search.
+                second.joinFocusChain = false;
+                third.joinFocusChain = false;
+                var lonely = (first.nextFocusable === null) + ":" +
+                    (first.prevFocusable === null);
+                return chain + ":" + focus + ":" + moved + ":" + reordered + ":" + lonely;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("0:1:1:1:1:1:1:0:1:0:1:0:1:1:1:1:1:1".to_string())
+        );
+    }
+
+    /// `GetNodeVisible()` is `GetParentVisible() && Visible` (`LayerIntf.h:308`)
+    /// and, like `nodeEnabled` (`:651`), is computed on every read.
+    #[test]
+    fn layer_node_visible_follows_the_ancestor_chain() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var parent = new Layer();
+                var child = new Layer(null, parent);
+                parent.visible = true;
+                child.visible = true;
+                var before = child.nodeVisible;
+                parent.visible = false;
+                var hiddenParent = child.nodeVisible;
+                parent.visible = true;
+                child.visible = false;
+                var hiddenSelf = child.nodeVisible;
+                return before + ":" + hiddenParent + ":" + hiddenSelf;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(value, Variant::String("1:0:0".to_string()));
+    }
+
+    /// `Window.mainWindow` reads back on an instance (`WindowIntf.cpp:1796`),
+    /// and `Window.primaryLayer` throws `TVPWindowHasNoLayer` when the window
+    /// has none (`:1862`, "Window has no layer").
+    #[test]
+    fn window_main_window_and_primary_layer_reads() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var second = new Window();
+                var missing = "";
+                try { second.primaryLayer; } catch (e) { missing = e.message; }
+                var layer = new Layer(window, null);
+                return (second.mainWindow == window) + ":" + (Window.mainWindow == window) +
+                    ":" + missing + ":" + (window.primaryLayer == layer);
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("1:1:Window has no layer:1".to_string())
+        );
+    }
+
+    /// `Window.children` has no official counterpart (M2 §5a): script reads
+    /// fail with `Member "children" does not exist` while the engine keeps the
+    /// registry internally.
+    #[test]
+    fn window_children_is_not_a_script_member() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = new Window();
+                global.layer = new Layer(window, null);
+                window.add(layer);
+                var read = "";
+                try { window.children; } catch (e) { read = e.message; }
+                // TJS2 lets a script add a data member of that name, which is
+                // what the reference does for an unknown member of an ordinary
+                // object; it never becomes the engine's child registry.
+                window.children = 7;
+                return read + "|" + window.children;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("Member \"children\" does not exist|7".to_string())
+        );
+        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
+            panic!("window missing");
+        };
+        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
+            panic!("layer missing");
+        };
+        assert_eq!(engine.host().native_window_children(window), vec![layer]);
+    }
+
+    /// `LayerIntf.cpp:7835`: `assignImages` checks `numparams` before it looks
+    /// at the argument, so a zero-argument call reports `TJS_E_BADPARAMCOUNT`
+    /// (`Invalid argument count`) and a present non-Layer value reports
+    /// `TVPSpecifyLayer` (`Specify Layer class object`).
+    #[test]
+    fn layer_assign_images_checks_the_argument_count_first() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var dest = new Layer();
+                var noArgs = "";
+                try { dest.assignImages(); } catch (e) { noArgs = e.message; }
+                var notALayer = "";
+                try { dest.assignImages(1); } catch (e) { notALayer = e.message; }
+                var voidArg = "";
+                try { dest.assignImages(void); } catch (e) { voidArg = e.message; }
+                return noArgs + "|" + notALayer + "|" + voidArg;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String(
+                "Invalid argument count|Specify Layer class object|Specify Layer class object"
+                    .to_string()
+            )
         );
     }
 
@@ -6925,7 +7412,12 @@ mod tests {
                 under.setImageSize(120, 80);
                 under.fillRect(0, 0, 120, 80, 0xffffffff);
                 under.visible = true;
-                under.order = 100;
+                // The under layer has to be the topmost root for this test to
+                // mean anything. A parentless layer cannot be moved with
+                // `order` (`TVPCannotMovePrimaryOrSiblingless`,
+                // `LayerIntf.cpp:1220`), and `bringToFront` is the engine's
+                // pre-existing lenient path for exactly this fixture.
+                under.bringToFront();
                 under.onClick = function(x, y) { global.trace += "U"; };
 
                 global.modal = new Window();
@@ -10043,7 +10535,10 @@ mod tests {
             engine
                 .execute_expression(
                     "inline.tjs",
-                    "kag.fore.messages[0].parent === kag.fore.base && kag.fore.base.visible && win.focusedLayer === null"
+                    // `parent` and `focusedLayer` are `tTJSVariant(dsp, dsp)`
+                    // reads (`LayerIntf.cpp:8490`, `WindowIntf.cpp:1824`), so
+                    // identity is what `==` reports.
+                    "kag.fore.messages[0].parent == kag.fore.base && kag.fore.base.visible && win.focusedLayer === null"
                 )
                 .expect("message stays with its base and exchange blurs the old focus"),
             Variant::Integer(1)
@@ -10117,11 +10612,17 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("sync");
+        // `Layer.window` has no setter (`LayerIntf.cpp:8689`), so the KAG
+        // `transCount` relay is attached through the host the way the engine's
+        // own internals do.
+        engine
+            .execute_script("inline.tjs", "global.transWindow = %[transCount: 1];")
+            .expect("relay");
+        attach_layer_window(&mut engine, "kag.fore.base", "transWindow");
         engine
             .execute_script(
                 "inline.tjs",
                 r#"
-                kag.fore.base.window = %[transCount: 1];
                 kag.fore.base.inTransition = true;
                 kag.fore.base.beginTransition(
                     "crossfade",
@@ -11430,10 +11931,14 @@ mod tests {
                 r#"
                 global.source = new Layer();
                 source.loadImages("sprite.png");
-                global.dest = new Layer();
+                // `Layer.window` is read-only in the reference
+                // (`TJS_DENY_NATIVE_PROP_SETTER`, `LayerIntf.cpp:8689`), so the
+                // layer takes its window (here: the KAG `transCount` relay) in
+                // the constructor, exactly as KAG does.
+                global.transWindow = %[transCount: 1];
+                global.dest = new Layer(transWindow, null);
                 dest.visible = true;
                 dest.setSize(1, 1);
-                dest.window = %[transCount: 1];
                 dest.inTransition = true;
                 dest.beginTransition("crossfade", true, source, %[time: 1000]);
                 return dest.window.transCount + ":" + dest.inTransition + ":"
@@ -11583,10 +12088,10 @@ mod tests {
             .execute_script(
                 "inline.tjs",
                 r#"
-                global.dest = new Layer();
+                global.transWindow = %[completed: 0];
+                global.dest = new Layer(transWindow, null);
                 global.source = new Layer();
                 dest.visible = true;
-                dest.window = %[completed: 0];
                 dest.inTransition = true;
                 dest.onTransitionCompleted = function(d, s) {
                     this.window.completed++;
@@ -11685,11 +12190,11 @@ mod tests {
                 global.source = new Layer();
                 source.loadImages("new.png");
                 source.visible = true;
-                global.dest = new Layer();
+                global.transWindow = %[completed: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
                 dest.inTransition = true;
-                dest.window = %[completed: 0];
                 dest.onTransitionCompleted = function(d, s) {
                     this.inTransition = false;
                     this.window.completed++;
@@ -11770,11 +12275,11 @@ mod tests {
                 global.source = new Layer();
                 source.loadImages("new.png");
                 source.visible = true;
-                global.dest = new Layer();
+                global.transWindow = %[completed: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
                 dest.inTransition = true;
-                dest.window = %[completed: 0];
                 dest.onTransitionCompleted = function(d, s) {
                     this.inTransition = false;
                     this.window.completed++;
@@ -11834,11 +12339,11 @@ mod tests {
                 global.source = new Layer();
                 source.loadImages("new.png");
                 source.visible = true;
-                global.dest = new Layer();
+                global.transWindow = %[completed: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
                 dest.inTransition = true;
-                dest.window = %[completed: 0];
                 dest.onTransitionCompleted = function(d, s) {
                     this.inTransition = false;
                     this.window.completed++;
@@ -12139,8 +12644,10 @@ mod tests {
                 "inline.tjs",
                 r#"
                 global.window = %[transCount: 2, completed: 0, chained: 0];
+                // `Layer.window` is read-only (`LayerIntf.cpp:8689`); layers
+                // take their window in the constructor, as KAG's do.
                 function make() {
-                    var layer = new Layer();
+                    var layer = new Layer(window, null);
                     layer.loadImages("face.png");
                     layer.visible = true;
                     return layer;
@@ -12151,9 +12658,6 @@ mod tests {
                 global.secondSrc = make();
                 global.chainDest = make();
                 global.chainSrc = make();
-                firstDest.window = window;
-                secondDest.window = window;
-                chainDest.window = window;
                 firstDest.onTransitionCompleted = function(d, s) {
                     this.inTransition = false;
                     this.window.completed++;
@@ -12240,11 +12744,11 @@ mod tests {
                 global.source = new Layer();
                 source.loadImages("new.png");
                 source.visible = true;
-                global.dest = new Layer();
+                global.transWindow = %[completed: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
                 dest.inTransition = true;
-                dest.window = %[completed: 0];
                 dest.onTransitionCompleted = function(d, s) {
                     this.inTransition = false;
                     this.window.completed++;
@@ -12309,11 +12813,11 @@ mod tests {
                 global.source = new Layer();
                 source.loadImages("new.png");
                 source.visible = true;
-                global.dest = new Layer();
+                global.transWindow = %[completed: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
                 dest.inTransition = true;
-                dest.window = %[completed: 0];
                 dest.onTransitionCompleted = function(d, s) {
                     this.inTransition = false;
                     this.window.completed++;
@@ -12825,11 +13329,11 @@ mod tests {
                 r#"
                 var source = new Layer();
                 source.loadImages("new.png");
-                global.dest = new Layer();
+                global.transWindow = %[transCount: 1, completed: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
                 dest.inTransition = true;
-                dest.window = %[transCount: 1, completed: 0];
                 dest.onTransitionCompleted = function(destLayer, srcLayer) {
                     this.inTransition = false;
                     this.window.transCount--;
@@ -12897,9 +13401,10 @@ mod tests {
                 }
 
                 global.window = %[transCount: 1, completed: 0, inTransition: 0];
+                // The constructor already gave `dest` its window
+                // (`Layer.window` has no setter, `LayerIntf.cpp:8689`).
                 global.dest = new TransitionLayer(window);
                 var source = new Layer();
-                dest.window = window;
                 dest.inTransition = true;
                 dest.beginTransition("crossfade", false, source, %[time: 0]);
                 return window.completed + ":" + dest.inTransition + ":" + window.transCount;
@@ -12954,10 +13459,10 @@ mod tests {
             .execute_script(
                 "inline.tjs",
                 r#"
-                global.dest = new Layer();
+                global.transWindow = %[transCount: 0, completed: 0, lastSourceWidth: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
-                dest.window = %[transCount: 0, completed: 0, lastSourceWidth: 0];
                 dest.onTransitionCompleted = function(destLayer, srcLayer) {
                     this.window.completed++;
                     this.window.lastSourceWidth = srcLayer.imageWidth;
@@ -13070,7 +13575,9 @@ mod tests {
                 r#"
                 global.window = %[completed: 0, firstDone: -1, secondDone: -1];
                 function make() {
-                    var layer = new Layer();
+                    // `Layer.window` is read-only (`LayerIntf.cpp:8689`): the
+                    // window arrives in the constructor.
+                    var layer = new Layer(window, null);
                     layer.loadImages("face.png");
                     layer.visible = true;
                     layer.inTransition = true;
@@ -13083,7 +13590,6 @@ mod tests {
                     this.window.completed++;
                     this.window.firstDone = this.window.completed;
                 };
-                shortDest.window = window;
                 global.longDest = make();
                 global.longSrc = make();
                 longDest.onTransitionCompleted = function(dest, src) {
@@ -13091,7 +13597,6 @@ mod tests {
                     this.window.completed++;
                     this.window.secondDone = this.window.completed;
                 };
-                longDest.window = window;
                 shortDest.beginTransition("crossfade", true, shortSrc, %[time: 100]);
                 longDest.beginTransition("crossfade", true, longSrc, %[time: 500]);
                 "#,
@@ -13170,11 +13675,11 @@ mod tests {
                 r#"
                 var source = new Layer();
                 source.loadImages("new.png");
-                global.dest = new Layer();
+                global.transWindow = %[transCount: 1, completed: 0];
+                global.dest = new Layer(transWindow, null);
                 dest.loadImages("old.png");
                 dest.visible = true;
                 dest.inTransition = true;
-                dest.window = %[transCount: 1, completed: 0];
                 dest.onTransitionCompleted = function(destLayer, srcLayer) {
                     this.inTransition = false;
                     this.window.transCount--;
@@ -13400,6 +13905,14 @@ mod tests {
         // Writing from another object's method makes the caller's `this` the
         // writer, which is what the write falls back to when the font value
         // carries no ObjThis.
+        //
+        // `Layer.font` itself stays writable in this engine: the reference
+        // denies the *property* while letting the `TJS_IGNOREPROP` store
+        // `&layer.font = x` overwrite the member, and KAGEX replaces a layer's
+        // font that way (`sysscn/prerenderfontex.tjs`, `spds` at bytecode 58).
+        // The VM calls a native setter for both shapes, so the engines cannot
+        // deny one and allow the other yet -- see
+        // `LAYER_READ_ONLY_PROPERTIES` for the full note.
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let seen = engine
             .execute_script(
@@ -13467,8 +13980,12 @@ mod tests {
                 }
                 global.holder = new Holder();
                 global.base = new Base(holder);
-                return base.resultIsThis + "/" + (base.window === win) + "/"
-                    + (base.parent === holder) + "/" + (base instanceof "Layer");
+                // `window`/`parent` read back as `tTJSVariant(dsp, dsp)`
+                // (`LayerIntf.cpp:8490`, `:8683`), whose `===` also compares
+                // ObjThis; identity is what `==` reports, and the engine's
+                // `new` does not bind its result yet.
+                return base.resultIsThis + "/" + (base.window == win) + "/"
+                    + (base.parent == holder) + "/" + (base instanceof "Layer");
                 "#,
             )
             .expect("script")
@@ -14419,7 +14936,10 @@ mod tests {
                 child.onFocus = function() { events += "focus"; };
                 root.focus();
                 child.focus();
-                return (window.focusedLayer === child) + ":" + root.focused + ":" +
+                // `focusedLayer` is `tTJSVariant(dsp, dsp)`
+                // (`WindowIntf.cpp:1824`); `Layer.focused` reports
+                // `GetFocusedLayer() == this` (`LayerIntf.cpp:3218`).
+                return (window.focusedLayer == child) + ":" + root.focused + ":" +
                     child.focused + ":" + root.events + ":" + child.events;
                 "#,
             )
@@ -14554,7 +15074,7 @@ mod tests {
                 other.onFocus = function() { global.focuses++; };
                 page.focus();
                 page.parent = null;
-                return (window.focusedLayer === other) + ":" + global.blurs + ":" + global.focuses;
+                return (window.focusedLayer == other) + ":" + global.blurs + ":" + global.focuses;
                 "#,
             )
             .expect("script");
@@ -15232,7 +15752,11 @@ mod tests {
             .execute_script(
                 "inline.tjs",
                 r#"
-                global.layer = new Layer();
+                // `SetAbsoluteOrderIndex` needs a parent
+                // (`TVPCannotMovePrimaryOrSiblingless`, `LayerIntf.cpp:1263`)
+                // and switches that parent to absolute order mode.
+                global.parent = new Layer();
+                global.layer = new Layer(null, parent);
                 layer.absolute = 2000000;
                 "#,
             )
@@ -15514,7 +16038,7 @@ mod tests {
             engine
                 .execute_script(
                     "inline.tjs",
-                    "return (window.focusedLayer === second) + ':' + first.focused + ':' + second.focused;"
+                    "return (window.focusedLayer == second) + ':' + first.focused + ':' + second.focused;"
                 )
                 .expect("focused"),
             Variant::String("1:0:1".to_string())
@@ -18667,6 +19191,32 @@ mod tests {
             .host_mut()
             .scheduler_mut()
             .set_timer_next_fire_millis(timer, Some(0));
+    }
+
+    /// Attaches `window` to `layer` the way the engine's own internals do.
+    ///
+    /// A script write to `Layer.window` is refused with `TJS_E_ACCESSDENYED`
+    /// (`TJS_DENY_NATIVE_PROP_SETTER`, `LayerIntf.cpp:8689`), and KAG never
+    /// writes it either -- a layer receives its window in the constructor. The
+    /// transition tests use a plain object where KAG has its `MainWindow`, so
+    /// they can watch the `transCount` relay the engine keeps balanced there,
+    /// and wire it through the host storage the property getter reads.
+    fn attach_layer_window(engine: &mut KrkrEngine, layer: &str, window: &str) {
+        let layer = expression_object(engine, layer);
+        let window = expression_object(engine, window);
+        engine
+            .host_mut()
+            .set_native_layer_window(layer, Some(window), Variant::Object(window));
+    }
+
+    fn expression_object(engine: &mut KrkrEngine, expression: &str) -> ObjectHandle {
+        match engine
+            .execute_expression("inline.tjs", expression)
+            .unwrap_or_else(|error| panic!("{expression}: {error}"))
+        {
+            Variant::Object(handle) => handle,
+            other => panic!("{expression} is not an object: {other}"),
+        }
     }
 
     fn temp_root() -> PathBuf {

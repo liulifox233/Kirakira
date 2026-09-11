@@ -15,7 +15,9 @@ use krkr_core::{
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
     Result, TjsError, TjsErrorKind,
-    runtime::{Closure, ObjectHandle, Runtime, TjsHost, Variant},
+    runtime::{
+        Closure, NativeArgCount, NativePropertyAccess, ObjectHandle, Runtime, TjsHost, Variant,
+    },
 };
 
 use crate::host::{
@@ -211,6 +213,7 @@ fn install_native_properties(
     match class_name {
         "Layer" => install_layer_native_properties(runtime, handle, false),
         "Window" => install_window_native_properties(runtime, handle, false),
+        "Bitmap" => install_bitmap_native_properties(runtime, handle, false),
         "WaveSoundBuffer" => install_wave_native_properties(runtime, handle, false),
         "VideoOverlay" => install_video_native_properties(runtime, handle, false),
         "AsyncTrigger" => install_async_trigger_native_properties(runtime, handle, false),
@@ -226,6 +229,7 @@ fn install_instance_native_properties(
     match class_name {
         "Layer" => install_layer_native_properties(runtime, handle, true),
         "Window" => install_window_native_properties(runtime, handle, true),
+        "Bitmap" => install_bitmap_native_properties(runtime, handle, true),
         "WaveSoundBuffer" => install_wave_native_properties(runtime, handle, true),
         "VideoOverlay" => install_video_native_properties(runtime, handle, true),
         "AsyncTrigger" => install_async_trigger_native_properties(runtime, handle, true),
@@ -242,9 +246,10 @@ fn install_layer_native_properties(
         if preserve_script_properties && runtime.object_member_is_property(handle, property) {
             continue;
         }
-        let property_handle = runtime.register_object_native_property(
+        let property_handle = runtime.register_object_native_property_with_access(
             handle,
             property,
+            property_access(LAYER_READ_ONLY_PROPERTIES, property),
             move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
                 layer_native_property_get(runtime, this_obj, property)
             },
@@ -273,9 +278,10 @@ fn install_window_native_properties(
         if preserve_script_properties && runtime.object_member_is_property(handle, property) {
             continue;
         }
-        let property_handle = runtime.register_object_native_property(
+        let property_handle = runtime.register_object_native_property_with_access(
             handle,
             property,
+            property_access(WINDOW_READ_ONLY_PROPERTIES, property),
             move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
                 window_native_property_get(runtime, this_obj, property)
             },
@@ -292,6 +298,54 @@ fn install_window_native_properties(
                 Variant::Closure(Closure::new(property_handle, Some(handle))),
             );
         }
+    }
+}
+
+/// `tTJSNI_BaseBitmap`'s `TJS_DENY_NATIVE_PROP_SETTER` members
+/// (`BitmapIntf.cpp:452,467,482,496`). Kirakira has no bitmap buffer to hand
+/// out yet, so the getters answer `void`; the point of registering them as
+/// native properties is the denied write.
+fn install_bitmap_native_properties(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    preserve_script_properties: bool,
+) {
+    for &property in BITMAP_READ_ONLY_PROPERTIES {
+        if preserve_script_properties && runtime.object_member_is_property(handle, property) {
+            continue;
+        }
+        // The official getters report the pixel buffer address, its pitch and
+        // the async-load flag (`BitmapIntf.cpp:446-500`). Kirakira's Bitmap
+        // class has no native implementation behind it yet, so the engine
+        // answers `void` exactly as the spec placeholders did -- no script can
+        // write them, and reads stay the M2 §1/§2 gap rather than a fabricated
+        // pointer.
+        let property_handle = runtime.register_object_native_property_with_access(
+            handle,
+            property,
+            NativePropertyAccess::ReadOnly,
+            move |_runtime: &mut Runtime<KrkrHost>, _this_obj: Option<ObjectHandle>| {
+                Ok(Variant::Void)
+            },
+            move |_runtime: &mut Runtime<KrkrHost>,
+                  _this_obj: Option<ObjectHandle>,
+                  _value: Variant| { Ok(()) },
+        );
+        if preserve_script_properties {
+            runtime.set_object_member(
+                handle,
+                property,
+                Variant::Closure(Closure::new(property_handle, Some(handle))),
+            );
+        }
+    }
+}
+
+fn property_access(read_only: &[&str], name: &str) -> NativePropertyAccess {
+    if read_only.contains(&name) {
+        NativePropertyAccess::ReadOnly
+    } else {
+        NativePropertyAccess::ReadWrite
     }
 }
 
@@ -491,24 +545,23 @@ fn apply_constructor_defaults(
             runtime.set_object_member(handle, "fullScreen", Variant::Integer(0));
             set_window_property_storage(runtime, handle, "zoomNumer", Variant::Integer(100));
             set_window_property_storage(runtime, handle, "zoomDenom", Variant::Integer(100));
+            // The window's child registry is engine-internal: official `Window`
+            // has no `children` member (M2 §5a, M7 §7), so the array lives only
+            // behind `sync_children_array` and the host's window instance.
             let children = runtime.alloc_array_object(Vec::new());
             runtime
                 .host_mut()
                 .register_native_window(handle, Some(children));
-            set_window_property_storage(runtime, handle, "children", Variant::Object(children));
             let menu = alloc_menu_item_object(runtime, Some(handle), String::new());
             runtime.set_object_member(handle, "menu", Variant::Object(menu));
             let draw_device =
                 construct_native_instance(runtime, &BASIC_DRAW_DEVICE_CLASS, None, Vec::new())?;
             runtime.set_object_member(handle, "drawDevice", draw_device);
-            if let Variant::Object(window_class) = runtime.global_member("Window")
-                && matches!(
-                    runtime.object_member(window_class, "mainWindow"),
-                    Variant::Void
-                )
-            {
-                runtime.set_object_member(window_class, "mainWindow", Variant::Object(handle));
-            }
+            // `Window.mainWindow` is a native property on the class and on every
+            // instance (`WindowIntf.cpp:1796`, "static" in the reference);
+            // `register_native_window` above already recorded the first
+            // constructed window as the host's main window, which is what the
+            // getters report.
         }
         "MenuItem" => {
             let owner = args.first().cloned().unwrap_or_default();
@@ -653,7 +706,6 @@ fn apply_constructor_defaults(
                 );
                 runtime.set_object_member(handle, "focusable", Variant::Integer(0));
                 runtime.set_object_member(handle, "joinFocusChain", Variant::Integer(1));
-                runtime.set_object_member(handle, "focused", Variant::Integer(0));
                 set_layer_property_storage(runtime, handle, "cursor", Variant::Integer(0));
                 set_layer_property_storage(runtime, handle, "hint", Variant::String(String::new()));
                 set_layer_property_storage(runtime, handle, "showParentHint", Variant::Integer(1));
@@ -767,24 +819,33 @@ fn sync_children_array(
     };
     runtime.array_clear(array);
     for child in children {
-        runtime.array_push(array, Variant::Object(child));
+        runtime.array_push(array, children_array_entry(child));
     }
     Some(array)
 }
 
+/// The value a children array stores for one child.
+///
+/// Official inserts `tTJSVariant(dsp, dsp)` (`LayerIntf.cpp:665`), so
+/// `parent.children[0].focus()` runs with the child as its own objthis. The
+/// engine's own array writes (`Window.add`/`Window.remove`) must use the same
+/// shape or they cannot find an entry the rebuild created.
+fn children_array_entry(child: ObjectHandle) -> Variant {
+    self_bound(Variant::Object(child))
+}
+
+/// The engine-internal "the array a window/layer keeps its children in"
+/// accessor. Official `Layer.children` is the one script-visible view of this
+/// list; `Window` has no such member at all (M2 §5a), so `Window.add`/
+/// `Window.remove` and layer invalidation reach it through here.
 fn ensure_child_array(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> ObjectHandle {
     let handle = runtime.bound_this(handle).unwrap_or(handle);
     if let Some(children) = sync_children_array(runtime, handle) {
         return children;
     }
-    match runtime.object_member(handle, "children") {
-        Variant::Object(children) => children,
-        _ => {
-            let children = runtime.alloc_array_object(Vec::new());
-            runtime.set_object_member(handle, "children", Variant::Object(children));
-            children
-        }
-    }
+    let children = runtime.alloc_array_object(Vec::new());
+    runtime.host_mut().register_children_array(handle, children);
+    children
 }
 
 fn install_special_methods(
@@ -1168,13 +1229,7 @@ fn require_window_this(
 }
 
 fn is_main_window(runtime: &Runtime<KrkrHost>, window: ObjectHandle) -> bool {
-    let Variant::Object(window_class) = runtime.global_member("Window") else {
-        return false;
-    };
-    let Variant::Object(main_window) = runtime.object_member(window_class, "mainWindow") else {
-        return false;
-    };
-    runtime.bound_this(main_window).unwrap_or(main_window) == window
+    runtime.host().main_window() == Some(window)
 }
 
 fn window_add(
@@ -1184,12 +1239,15 @@ fn window_add(
 ) -> Result<Variant> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("Window.add requires this"))?;
     let item = args.first().cloned().unwrap_or_default();
-    let Variant::Object(item_handle) = item else {
+    // The reference takes the argument through `AsObjectClosureNoAddRef()`
+    // (`WindowIntf.cpp:829-847`), so a self-bound value -- `layer.parent`,
+    // `parent.children[0]` -- names the object it binds.
+    let Some(item_handle) = variant_object(&item) else {
         return Ok(Variant::Void);
     };
     let children = ensure_child_array(runtime, this);
-    runtime.array_remove_value(children, &Variant::Object(item_handle));
-    runtime.array_push(children, Variant::Object(item_handle));
+    runtime.array_remove_value(children, &children_array_entry(item_handle));
+    runtime.array_push(children, children_array_entry(item_handle));
     runtime
         .host_mut()
         .add_native_window_child(this, item_handle);
@@ -1222,17 +1280,23 @@ fn window_remove(
 ) -> Result<Variant> {
     let this = this_obj.ok_or_else(|| TjsError::runtime("Window.remove requires this"))?;
     let item = args.first().cloned().unwrap_or_default();
+    // See `window_add`: the argument is an object closure, and a self-bound
+    // value names the layer it binds.
+    let Some(item_handle) = variant_object(&item) else {
+        return Ok(Variant::Void);
+    };
     let children = ensure_child_array(runtime, this);
-    runtime.array_remove_value(children, &item);
-    if let Variant::Object(item_handle) = &item {
-        runtime
-            .host_mut()
-            .remove_native_window_child(this, *item_handle);
-    }
-    if runtime.object_member(this, "primaryLayer") == item {
+    runtime.array_remove_value(children, &children_array_entry(item_handle));
+    runtime
+        .host_mut()
+        .remove_native_window_child(this, item_handle);
+    // `primaryLayer`/`focusedLayer` are native properties whose value lives in
+    // the host instance, so the comparison runs against that storage rather
+    // than against the accessor the object member holds.
+    if runtime.host().native_window_primary_layer(this) == Some(item_handle) {
         set_window_property_storage(runtime, this, "primaryLayer", Variant::Void);
     }
-    if runtime.object_member(this, "focusedLayer") == item {
+    if runtime.host().native_window_focused_layer(this) == Some(item_handle) {
         set_window_property_storage(runtime, this, "focusedLayer", Variant::Null);
     }
     Ok(Variant::Void)
@@ -1390,7 +1454,17 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     );
     register_native_method_preserving_script(runtime, handle, "bringToFront", layer_bring_to_front);
     register_native_method_preserving_script(runtime, handle, "bringToBack", layer_bring_to_back);
-    register_native_method_preserving_script(runtime, handle, "assignImages", layer_assign_images);
+    // `if(numparams < 1) return TJS_E_BADPARAMCOUNT;` (`LayerIntf.cpp:7835`):
+    // the reference validates the argument *count* before it looks at the
+    // argument, so `assignImages()` reports "Invalid argument count" (-1004)
+    // and only a present non-Layer value reports `TVPSpecifyLayer`.
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "assignImages",
+        NativeArgCount::AtLeast(1),
+        layer_assign_images,
+    );
     register_native_method_preserving_script(runtime, handle, "exchangeInfo", layer_exchange_info);
     register_native_method_preserving_script(
         runtime,
@@ -1584,7 +1658,70 @@ const LAYER_NATIVE_PROPERTIES: &[&str] = &[
     "neutralColor",
     "hasImage",
     "font",
+    "prevFocusable",
+    "nextFocusable",
+    "nodeFocusable",
+    "focused",
+    "mainImageBuffer",
+    "mainImageBufferForWrite",
+    "mainImageBufferPitch",
+    "provinceImageBuffer",
+    "provinceImageBufferForWrite",
+    "provinceImageBufferPitch",
 ];
+
+/// Official `TJS_DENY_NATIVE_PROP_SETTER` members of `tTJSNI_BaseLayer`
+/// (`LayerIntf.cpp:8532 children`, `:8646 nodeVisible`, `:8689 window`,
+/// `:8703 isPrimary`, `:9229 prevFocusable`, `:9252 nextFocusable`,
+/// `:9286 nodeFocusable`, `:9300 focused`, `:9334 nodeEnabled`,
+/// `:9523/:9537/:9551 mainImageBuffer{,ForWrite,Pitch}`,
+/// `:9565/:9579/:9593 provinceImageBuffer{,ForWrite,Pitch}`). A script write
+/// fails with `TJS_E_ACCESSDENYED` (-1007) before any engine state is touched;
+/// the engine's own writes go through the host storage and the backing keys,
+/// which the access policy does not consult.
+///
+/// `font` (`:9449`) is *not* denied here, and that is a deliberate, measured
+/// exception. The reference makes the two store shapes behave differently:
+/// `layer.font = x` meets the denied setter, while the `TJS_IGNOREPROP` store
+/// `&layer.font = x` skips the property object entirely and overwrites the
+/// member (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1519-1552`). The VM
+/// cannot express that difference yet: `prop_set_handle` calls a native
+/// property's setter even for an ignore-prop store (see
+/// `Runtime::deny_native_property_writes`), so denying `font` refuses both
+/// shapes. KAGEX replaces a layer's font with a `FontHook` exactly through the
+/// second shape -- `sysscn/prerenderfontex.tjs`, `&a2.font = this` compiled to
+/// `spds` at bytecode 58 -- so a denied `font` aborts layer construction while
+/// the game boots (verified headless against GINKA). The engine's own font
+/// resolution already expects that replacement: it reads the font through TJS
+/// dispatch because a game may wrap it in a hook (`resolve_font_member`).
+/// Denying `font` needs the ignore-prop skip in the VM first.
+const LAYER_READ_ONLY_PROPERTIES: &[&str] = &[
+    "children",
+    "nodeVisible",
+    "window",
+    "isPrimary",
+    "prevFocusable",
+    "nextFocusable",
+    "nodeFocusable",
+    "focused",
+    "nodeEnabled",
+    "mainImageBuffer",
+    "mainImageBufferForWrite",
+    "mainImageBufferPitch",
+    "provinceImageBuffer",
+    "provinceImageBufferForWrite",
+    "provinceImageBufferPitch",
+];
+
+/// `WindowIntf.cpp:1813 mainWindow`, `:1872 primaryLayer`,
+/// `:1906 layerTreeOwnerInterface`.
+const WINDOW_READ_ONLY_PROPERTIES: &[&str] =
+    &["mainWindow", "primaryLayer", "layerTreeOwnerInterface"];
+
+/// `BitmapIntf.cpp:452 buffer`, `:467 bufferForWrite`, `:482 bufferPitch`,
+/// `:496 loading`.
+const BITMAP_READ_ONLY_PROPERTIES: &[&str] =
+    &["buffer", "bufferForWrite", "bufferPitch", "loading"];
 
 const WINDOW_NATIVE_PROPERTIES: &[&str] = &[
     "visible",
@@ -1594,9 +1731,10 @@ const WINDOW_NATIVE_PROPERTIES: &[&str] = &[
     "height",
     "innerWidth",
     "innerHeight",
-    "children",
     "primaryLayer",
     "focusedLayer",
+    "mainWindow",
+    "layerTreeOwnerInterface",
 ];
 
 fn window_native_property_get(
@@ -1607,10 +1745,41 @@ fn window_native_property_get(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
-    if name == "children" {
-        return Ok(sync_children_array(runtime, this)
-            .map(Variant::Object)
-            .unwrap_or(Variant::Void));
+    match name {
+        // `tTJSNI_BaseWindow::GetPrimaryLayer()` throws `TVPWindowHasNoLayer`
+        // when the draw device has no primary layer (`WindowIntf.cpp:1856-1868`,
+        // `IDS_TVP_WINDOW_HAS_NO_LAYER` = "Window has no layer"), otherwise the
+        // layer is handed out self-bound.
+        "primaryLayer" => {
+            let Some(layer) = runtime.host().native_window_primary_layer(this) else {
+                return Err(TjsError::runtime("Window has no layer"));
+            };
+            return Ok(self_bound(Variant::Object(layer)));
+        }
+        // `tTJSVariant(dsp, dsp)`, NULL when nothing is focused (`:1824`).
+        "focusedLayer" => {
+            return Ok(runtime
+                .host()
+                .native_window_focused_layer(this)
+                .map(|layer| self_bound(Variant::Object(layer)))
+                .unwrap_or(Variant::Null));
+        }
+        // `Window.mainWindow` is a class property in the reference
+        // (`WindowIntf.cpp:1796`, declared static); the TJS class-chain lookup
+        // makes the same getter reachable from an instance, which is why every
+        // `tTJSNI_Window` reports the process's main window here.
+        "mainWindow" => {
+            return Ok(runtime
+                .host()
+                .main_window()
+                .map(|window| self_bound(Variant::Object(window)))
+                .unwrap_or(Variant::Null));
+        }
+        // `reinterpret_cast<tjs_int64>(static_cast<iTVPLayerTreeOwner*>(_this))`
+        // (`:1896-1904`). The handle is the engine's identity for the object,
+        // which is what a script can compare or pass on.
+        "layerTreeOwnerInterface" => return Ok(Variant::Integer(this.0 as i64)),
+        _ => {}
     }
     Ok(runtime
         .host()
@@ -1627,13 +1796,6 @@ fn window_native_property_set(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(());
     };
-    if name == "children" {
-        // Read-only, like `Layer.children` in the reference
-        // (`TJS_DENY_NATIVE_PROP_SETTER`, `LayerIntf.cpp:8532`): a write used
-        // to replace the registered array and shadow the accessor, leaving the
-        // tree unreachable from script.
-        return Err(TjsError::runtime("Access denied"));
-    }
     let value = normalize_window_property_value(name, value)?;
     set_window_property_storage(runtime, this, name, value);
     Ok(())
@@ -1660,7 +1822,34 @@ fn set_window_property_storage(
     runtime
         .host_mut()
         .set_native_window_property(handle, name, value.clone());
-    runtime.set_object_member(handle, name, value);
+    // A denied accessor must survive the engine's own writes: replacing it with
+    // a plain member would re-open the property to script writes. Every other
+    // member is stored directly, which is what the engine's raw-member readers
+    // (and `Window.left`-style assertions) have always seen.
+    if !member_is_denied_property(runtime, handle, name) {
+        runtime.set_object_member(handle, name, value);
+    }
+}
+
+/// Whether `name` is a native property of `object` whose access policy refuses
+/// script writes (`TJS_DENY_NATIVE_PROP_SETTER`). The engine's internal stores
+/// use this to keep such an accessor in place.
+fn member_is_denied_property(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> bool {
+    let property = match runtime.object_member(object, name) {
+        Variant::Object(handle) => Some(handle),
+        Variant::Closure(closure) => Some(closure.object),
+        _ => None,
+    };
+    property.is_some_and(|property| {
+        matches!(
+            runtime.native_property_access(property),
+            Some(access) if !access.allows_set()
+        )
+    })
 }
 
 fn layer_native_property_get(
@@ -1671,29 +1860,88 @@ fn layer_native_property_get(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
-    if name == "children" {
-        return Ok(sync_children_array(runtime, this)
-            .map(Variant::Object)
-            .unwrap_or(Variant::Void));
-    }
-    if matches!(name, "cursorX" | "cursorY") {
-        return Ok(layer_cursor_position_value(runtime, this, name));
-    }
-    if name == "hasImage" {
-        return Ok(Variant::Integer(i64::from(layer_has_main_image(
-            runtime, this,
-        )?)));
-    }
-    if name == "nodeEnabled" {
+    match name {
+        // `GetChildrenArrayObjectNoAddRef()` (`LayerIntf.cpp:8527`): the cached
+        // array *is* the value's ObjThis, so `layer.children.clear()` runs
+        // against the array rather than against the layer.
+        "children" => {
+            return Ok(sync_children_array(runtime, this)
+                .map(|array| self_bound(Variant::Object(array)))
+                .unwrap_or(Variant::Void));
+        }
+        "cursorX" | "cursorY" => return Ok(layer_cursor_position_value(runtime, this, name)),
+        "hasImage" => {
+            return Ok(Variant::Integer(i64::from(layer_has_main_image(
+                runtime, this,
+            )?)));
+        }
         // `GetNodeEnabled()` is computed on every read (`LayerIntf.h:651`) and
         // the official property is read-only (`TJS_DENY_NATIVE_PROP_SETTER`,
         // `LayerIntf.cpp:9334`); KAGEX reads it while drawing to pick between
         // full and halved text alpha, so it has to follow an ancestor's
         // `enabled` immediately.
-        if let Some(layer_id) = runtime.host().native_layer(this) {
-            let enabled = runtime.host().layer_tree().node_enabled(layer_id);
-            return Ok(Variant::Integer(i64::from(enabled)));
+        "nodeEnabled" => {
+            if let Some(layer_id) = runtime.host().native_layer(this) {
+                let enabled = runtime.host().layer_tree().node_enabled(layer_id);
+                return Ok(Variant::Integer(i64::from(enabled)));
+            }
         }
+        // `GetNodeVisible()` is `GetParentVisible() && Visible`
+        // (`LayerIntf.h:308`), computed on every read like `nodeEnabled`;
+        // hiding an ancestor makes every descendant report 0.
+        "nodeVisible" => {
+            if let Some(layer_id) = runtime.host().native_layer(this) {
+                let visible = runtime.host().layer_tree().node_visible(layer_id);
+                return Ok(Variant::Integer(i64::from(visible)));
+            }
+        }
+        // `GetNodeFocusable()` (`LayerIntf.h:622`): focusable, visible,
+        // enabled, every ancestor visible/enabled and not disabled by mode.
+        "nodeFocusable" => {
+            return Ok(Variant::Integer(i64::from(layer_is_node_focusable(
+                runtime, this,
+            ))));
+        }
+        // `GetFocused()` is `Manager->GetFocusedLayer() == this`
+        // (`LayerIntf.cpp:3218`); the window's focused layer is the live state.
+        "focused" => {
+            let focused = layer_window_object(runtime, this)
+                .and_then(|window| focused_layer(runtime, window));
+            return Ok(Variant::Integer(i64::from(focused == Some(this))));
+        }
+        // `GetPrevFocusable()`/`GetNextFocusable()` (`LayerIntf.cpp:3261`,
+        // `:3300`): the nearest focus-chain member before/after this layer in
+        // the window's overall order, handed out self-bound, with the
+        // `onSearch*Focusable` event the reference posts to let a script
+        // redirect the search.
+        "prevFocusable" | "nextFocusable" => {
+            return layer_relative_focusable(runtime, this, name == "nextFocusable");
+        }
+        // `GetOrderIndex()` (`LayerIntf.cpp:8541`): the live sibling position,
+        // not a stored number.
+        "order" => {
+            return Ok(Variant::Integer(
+                runtime.host().native_layer_order_index(this).unwrap_or(0) as i64,
+            ));
+        }
+        // `GetAbsoluteOrderIndex()` (`:8561`): with no parent 0; in absolute
+        // order mode the index the script set, otherwise the sibling order.
+        "absolute" => {
+            return Ok(Variant::Integer(layer_absolute_order_index(runtime, this)));
+        }
+        // The official getters report the image's pixel buffer address and
+        // pitch (`LayerIntf.cpp:9517-9590`). The engine has no addressable
+        // bitmap behind those, so they answer `void`; registering them is what
+        // gives the read-only policy a member to protect.
+        "mainImageBuffer"
+        | "mainImageBufferForWrite"
+        | "mainImageBufferPitch"
+        | "provinceImageBuffer"
+        | "provinceImageBufferForWrite"
+        | "provinceImageBufferPitch" => {
+            return Ok(Variant::Void);
+        }
+        _ => {}
     }
     if matches!(
         name,
@@ -1707,34 +1955,43 @@ fn layer_native_property_get(
             _ => layer_property_i64(runtime, this, "imageTop", 0)?,
         }));
     }
-    Ok(self_bound_object(
-        LAYER_SELF_BOUND_PROPERTIES.contains(&name),
-        layer_property_value(runtime, this, name),
-    ))
+    let value = layer_property_value(runtime, this, name);
+    Ok(if LAYER_SELF_BOUND_PROPERTIES.contains(&name) {
+        self_bound(value)
+    } else {
+        value
+    })
 }
 
-/// `tTJSNI_BaseLayer`'s `font` getter hands the font object back as
-/// `tTJSVariant(dsp, dsp)` (`LayerIntf.cpp:8875`): the value carries the font
-/// itself as its ObjThis. TJS2 picks a call's or a write's objthis with
-/// `Object.ObjThis ? Object.ObjThis : ra[-1]`, so a script that reads
-/// `layer.font` and writes through it reaches the font object -- KAGEX relies
-/// on that when `objectHookInjection` replaces the font's `face` property and
-/// the injected setter runs against the font rather than against the writer's
-/// `this`.
+/// `tTJSNI_BaseLayer`'s `tTJSVariant(dsp, dsp)` members: `parent`
+/// (`LayerIntf.cpp:8490`), `children` (`:8527`) and each element it holds
+/// (`:665`), `window` (`:8683`), `prevFocusable` (`:9219`), `nextFocusable`
+/// (`:9242`) and `font` (`:9444`); `Window`'s `mainWindow` (`:1803`),
+/// `focusedLayer` (`:1824`) and `primaryLayer` (`:1865`) use the same form.
 ///
-/// The remaining `tTJSVariant(dsp, dsp)` members (`parent`, `children`,
-/// `window`, `prevFocusable`, `nextFocusable`, `Window.focusedLayer`,
-/// `Window.primaryLayer`, and `VM_NEW`'s own result) still need the same
-/// treatment; they are held back because the engine's readers pattern-match
-/// `Variant::Object` and would have to learn to unwrap a bound closure first.
-fn self_bound_object(bind: bool, value: Variant) -> Variant {
+/// The value carries its own object as ObjThis, which this engine models as a
+/// bound closure over the same object: TJS2 picks a call's or a write's
+/// objthis with `Object.ObjThis ? Object.ObjThis : ra[-1]`, so a member read
+/// through such a value acts on the object it came from. KAGEX relies on that
+/// when `objectHookInjection` replaces `layer.font`'s `face` property and the
+/// injected setter has to run against the font rather than against the
+/// writer's `this`.
+///
+/// One visibility rule follows from the same official line: the engine stores
+/// these properties' *values* (host storage and the `__nativeLayerProperty$*`
+/// keys) as plain objects, and only the script-facing getter binds them.
+/// Readers that need the object itself unwrap with
+/// [`variant_object_handle`]/[`variant_object`].
+fn self_bound(value: Variant) -> Variant {
     match value {
-        Variant::Object(handle) if bind => Variant::Closure(Closure::new(handle, Some(handle))),
+        Variant::Object(handle) => Variant::Closure(Closure::new(handle, Some(handle))),
         value => value,
     }
 }
 
-const LAYER_SELF_BOUND_PROPERTIES: &[&str] = &["font"];
+/// The literal `TJS_BEGIN_NATIVE_PROP_DECL(...)` names whose getters hand out
+/// `tTJSVariant(dsp, dsp)`.
+const LAYER_SELF_BOUND_PROPERTIES: &[&str] = &["parent", "window", "font"];
 
 // Layer.cursorX/cursorY report the current mouse cursor position in the
 // layer's local coordinate system, so they must be computed on read rather
@@ -1772,9 +2029,11 @@ fn layer_native_property_set(
     };
     if name == "children" {
         // `TJS_DENY_NATIVE_PROP_SETTER` (`LayerIntf.cpp:8532`): the array is
-        // the tree view and has no setter.  Storing the write would also
-        // corrupt the backing key `ensure_native_layer_attached` reads.
-        return Err(TjsError::runtime("Access denied"));
+        // the tree view and has no setter. A script write never gets this far
+        // (`NativePropertyAccess::ReadOnly` refuses it in dispatch, with the
+        // official `TJS_E_ACCESSDENYED`); storing one would also corrupt the
+        // backing key `ensure_native_layer_attached` reads.
+        return Err(TjsError::access_denied());
     }
     let previous_type = (name == "type")
         .then(|| {
@@ -1817,6 +2076,37 @@ fn layer_native_property_set(
         set_layer_geographical_height(runtime, this, value.to_integer()?)?;
         return Ok(());
     }
+    if name == "order" {
+        // `SetOrderIndex` (`LayerIntf.cpp:1218-1231`): the layer must have a
+        // parent, the parent drops absolute order mode, and the layer moves to
+        // the requested sibling position, clamped to the child count.
+        // `Layer.order` reports the live position, so the write has to move the
+        // tree rather than only store a number.
+        let requested = value.to_integer()?;
+        let Some(index) = set_layer_sibling_order(runtime, this, requested) else {
+            return Err(cannot_move_primary_or_siblingless());
+        };
+        set_layer_property_storage(runtime, this, "order", Variant::Integer(index));
+        return Ok(());
+    }
+    if name == "absolute" {
+        // `SetAbsoluteOrderIndex` (`:1262-1272`): the layer must have a parent,
+        // which switches to absolute order mode; this layer's index is stored
+        // verbatim -- KAG picks `absolute` values far above the child count on
+        // purpose.
+        let index = value.to_integer()?;
+        let Some(parent) = layer_parent_object(runtime, this) else {
+            return Err(cannot_move_primary_or_siblingless());
+        };
+        set_layer_absolute_order_mode(runtime, parent, true);
+        let index = Variant::Integer(index);
+        set_layer_property_storage(runtime, this, "absolute", index.clone());
+        return apply_layer_property_to_render(runtime, this, name, &index);
+    }
+    if name == "absoluteOrderMode" {
+        set_layer_absolute_order_mode(runtime, this, value.is_truthy());
+        return Ok(());
+    }
     set_layer_property_storage(runtime, this, name, value.clone());
     if name == "type" {
         let layer_type = value.to_integer()?;
@@ -1830,6 +2120,94 @@ fn layer_native_property_set(
         }
     }
     apply_layer_property_to_render(runtime, this, name, &value)
+}
+
+fn layer_parent_object(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Option<ObjectHandle> {
+    variant_object(&layer_property_value(runtime, layer, "parent"))
+        .map(|parent| runtime.bound_this(parent).unwrap_or(parent))
+}
+
+/// Official `GetAbsoluteOrderIndex()` (`LayerIntf.cpp:1253-1260`): no parent
+/// reports 0, a parent in absolute order mode reports the child's stored
+/// absolute index, and anywhere else `absolute` *is* the sibling order.
+fn layer_absolute_order_index(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> i64 {
+    let Some(parent) = layer_parent_object(runtime, layer) else {
+        return 0;
+    };
+    let live_order = || runtime.host().native_layer_order_index(layer).unwrap_or(0) as i64;
+    if !layer_property_value(runtime, parent, "absoluteOrderMode").is_truthy() {
+        return live_order();
+    }
+    match layer_property_value(runtime, layer, "absolute") {
+        Variant::Void => live_order(),
+        value => value.to_integer().unwrap_or_else(|_| live_order()),
+    }
+}
+
+/// `TVPCannotMovePrimaryOrSiblingless` (`LayerIntf.cpp:1221`, `:1264`;
+/// `IDS_TVP_CANNOT_MOVE_PRIMARY_OR_SIBLINGLESS`, `string_table_en.rc:128`): a
+/// primary or otherwise parentless layer has no sibling list to move through.
+fn cannot_move_primary_or_siblingless() -> TjsError {
+    TjsError::runtime("Cannot move primary or siblingless")
+}
+
+/// Moves a layer to `requested` among its siblings and reports the index it
+/// landed on, or `None` when it has no parent (the caller reports
+/// `TVPCannotMovePrimaryOrSiblingless`).
+///
+/// Official `ChildChangeOrder` (`LayerIntf.cpp:1120-1167`) rotates the children
+/// vector; the render tree orders siblings by `(z_order, id)`, so the new
+/// arrangement is written back as dense `z_order` values.
+///
+/// Every sibling's stored `order` *and* `absolute` follow, because
+/// `apply_layer_properties_to_node` reads those keys back into the render node
+/// on the next apply and prefers `absolute`. With absolute order mode off the
+/// two are the same index (`GetAbsoluteOrderIndex` returns `GetOrderIndex()`,
+/// `:1253-1260`), so updating both keeps a layer that was once placed with an
+/// absolute index from snapping back to it after an `order` write.
+fn set_layer_sibling_order(
+    runtime: &mut Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    requested: i64,
+) -> Option<i64> {
+    let parent = layer_parent_object(runtime, layer)?;
+    // `SetOrderIndex` leaves absolute order mode (`LayerIntf.cpp:1223`).
+    set_layer_absolute_order_mode(runtime, parent, false);
+    let index = runtime
+        .host_mut()
+        .reorder_native_layer(layer, requested)
+        .unwrap_or(0);
+    for child in runtime.host().native_layer_children(parent) {
+        let order =
+            Variant::Integer(runtime.host().native_layer_order_index(child).unwrap_or(0) as i64);
+        set_layer_property_storage(runtime, child, "order", order.clone());
+        set_layer_property_storage(runtime, child, "absolute", order);
+    }
+    Some(index)
+}
+
+/// Official `SetAbsoluteOrderMode` (`LayerIntf.cpp:1274-1294`): entering the
+/// mode snapshots every child's current sibling order as its absolute index;
+/// leaving it changes nothing else.
+fn set_layer_absolute_order_mode(
+    runtime: &mut Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    enabled: bool,
+) {
+    let was_enabled = layer_property_value(runtime, layer, "absoluteOrderMode").is_truthy();
+    set_layer_property_storage(
+        runtime,
+        layer,
+        "absoluteOrderMode",
+        Variant::Integer(i64::from(enabled)),
+    );
+    if !enabled || was_enabled {
+        return;
+    }
+    for child in runtime.host().native_layer_children(layer) {
+        let order = runtime.host().native_layer_order_index(child).unwrap_or(0) as i64;
+        set_layer_property_storage(runtime, child, "absolute", Variant::Integer(order));
+    }
 }
 
 fn layer_property_value(runtime: &Runtime<KrkrHost>, handle: ObjectHandle, name: &str) -> Variant {
@@ -1874,6 +2252,8 @@ fn set_layer_property_storage(
     runtime
         .host_mut()
         .set_native_layer_property(handle, name, value.clone());
+    // The backing key is how the engine reads a property without going through
+    // the accessor (`layer_property_value`), so it is always written.
     runtime.set_object_member(
         handle,
         layer_property_backing_key(name).into_owned(),
@@ -2711,10 +3091,30 @@ fn register_native_method_preserving_script(
     name: &'static str,
     function: NativeMethod,
 ) {
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        name,
+        NativeArgCount::Any,
+        function,
+    );
+}
+
+/// [`register_native_method_preserving_script`] with the method's declared
+/// argument-count contract: a call that breaks it fails with
+/// `TJS_E_BADPARAMCOUNT` (-1004) before the handler sees any argument, which is
+/// the order the official native declarations validate in (`numparams` first).
+fn register_native_method_preserving_script_with_arg_count(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &'static str,
+    arg_count: NativeArgCount,
+    function: NativeMethod,
+) {
     if matches!(runtime.object_member(handle, name), Variant::Closure(_)) {
         return;
     }
-    runtime.register_object_native(handle, name, function);
+    runtime.register_object_native_with_arg_count(handle, name, arg_count, function);
 }
 
 fn install_async_trigger_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -3198,6 +3598,8 @@ fn snapshot_layer_tjs_properties(
         "neutralColor",
         "name",
         "order",
+        "absolute",
+        "absoluteOrderMode",
         "enabled",
         "hitType",
         "hitThreshold",
@@ -6296,13 +6698,14 @@ fn layer_set_focus_to(
     }
 
     if let Some(previous) = previous {
-        runtime.set_object_member(previous, "focused", Variant::Integer(0));
+        // `Layer.focused` has no backing store any more: it reports
+        // `Manager->GetFocusedLayer() == this` (`LayerIntf.cpp:3218`) from the
+        // window's focused layer, which the write below moves.
         if !matches!(runtime.object_member(previous, "onBlur"), Variant::Void) {
             runtime.call_object_method(previous, "onBlur", vec![Variant::Object(target)])?;
         }
     }
 
-    runtime.set_object_member(target, "focused", Variant::Integer(1));
     set_window_property_storage(runtime, window, "focusedLayer", Variant::Object(target));
     if !matches!(runtime.object_member(target, "onFocus"), Variant::Void) {
         runtime.call_object_method(
@@ -6354,15 +6757,98 @@ fn focused_layer(runtime: &Runtime<KrkrHost>, window: ObjectHandle) -> Option<Ob
     runtime
         .host()
         .native_window_focused_layer(window)
-        .or_else(|| match runtime.object_member(window, "focusedLayer") {
-            Variant::Object(handle) => Some(runtime.bound_this(handle).unwrap_or(handle)),
-            _ => None,
-        })
+        .or_else(|| plain_member_object(runtime, window, "focusedLayer"))
+}
+
+/// The object a *data* member holds, for the engine's own readers.
+///
+/// Two shapes must not be mistaken for a value: a native property accessor
+/// (its value lives behind the getter -- host storage, a backing key, or a
+/// computed expression) and the bound `tTJSVariant(dsp, dsp)` closures the
+/// script-facing getters hand out. The accessor is skipped, the closure is
+/// unwrapped to the object it binds, so a reader never receives the property
+/// object itself.
+pub(crate) fn plain_member_object(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Option<ObjectHandle> {
+    let value = runtime.object_member(object, name);
+    if runtime.variant_is_property(&value) {
+        return None;
+    }
+    variant_object_handle(&value).map(|handle| runtime.bound_this(handle).unwrap_or(handle))
 }
 
 fn layer_window_object(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Option<ObjectHandle> {
     variant_object(&layer_property_value(runtime, layer, "window"))
         .map(|window| runtime.bound_this(window).unwrap_or(window))
+}
+
+/// The window's layers in official overall order (`tTVPLayerManager::AllNodes`,
+/// `LayerManager.cpp:181-190`: the primary layer's subtree, depth first, each
+/// node before its children).
+fn window_layers_in_order(
+    runtime: &Runtime<KrkrHost>,
+    window: ObjectHandle,
+    fallback_root: ObjectHandle,
+) -> Vec<ObjectHandle> {
+    let root = runtime
+        .host()
+        .native_window_primary_layer(window)
+        .or_else(|| plain_member_object(runtime, window, "primaryLayer"))
+        .unwrap_or(fallback_root);
+    let mut layers = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut focusable = Vec::new();
+    collect_layers(runtime, root, &mut visited, &mut layers, &mut focusable);
+    layers
+}
+
+/// Depth-first walk of one layer subtree that records every node and, in the
+/// same pass, the focus-chain members.
+///
+/// Children are visited in the reference's `Children` order, i.e. z-order:
+/// `tTVPLayerManager::AllNodes` is rebuilt from that vector
+/// (`LayerManager.cpp:181-190`) and `GetPrevFocusable`/`GetNextFocusable` walk
+/// the result, so a reorder has to move the focus search with it.
+fn collect_layers(
+    runtime: &Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    visited: &mut BTreeSet<ObjectHandle>,
+    all: &mut Vec<ObjectHandle>,
+    focusable: &mut Vec<ObjectHandle>,
+) {
+    let layer = runtime.bound_this(layer).unwrap_or(layer);
+    if !visited.insert(layer) {
+        return;
+    }
+    if layer_is_node_focusable(runtime, layer) && layer_joins_focus_chain(runtime, layer) {
+        focusable.push(layer);
+    }
+    all.push(layer);
+    for child in layer_children_in_draw_order(runtime, layer) {
+        collect_layers(runtime, child, visited, all, focusable);
+    }
+}
+
+/// [`layer_children`] sorted into the render tree's draw order --
+/// `LayerTree::sorted_children`'s `(z_order, id)` key, the engine's counterpart
+/// of the reference's `Children` vector.
+fn layer_children_in_draw_order(
+    runtime: &Runtime<KrkrHost>,
+    layer: ObjectHandle,
+) -> Vec<ObjectHandle> {
+    let mut children = layer_children(runtime, layer);
+    children.sort_by_key(|child| {
+        runtime
+            .host()
+            .native_layer(*child)
+            .and_then(|id| runtime.host().layer_tree().layer(id))
+            .map(|node| (node.z_order, node.id))
+            .unwrap_or((i32::MAX, 0))
+    });
+    children
 }
 
 fn focusable_layers_for_window(
@@ -6373,32 +6859,58 @@ fn focusable_layers_for_window(
     let root = runtime
         .host()
         .native_window_primary_layer(window)
-        .unwrap_or_else(|| match runtime.object_member(window, "primaryLayer") {
-            Variant::Object(root) => runtime.bound_this(root).unwrap_or(root),
-            _ => fallback_root,
-        });
-    let mut layers = Vec::new();
+        .or_else(|| plain_member_object(runtime, window, "primaryLayer"))
+        .unwrap_or(fallback_root);
+    let mut all = Vec::new();
+    let mut focusable = Vec::new();
     let mut visited = BTreeSet::new();
-    collect_focusable_layers(runtime, root, &mut visited, &mut layers);
-    layers
+    collect_layers(runtime, root, &mut visited, &mut all, &mut focusable);
+    focusable
 }
 
-fn collect_focusable_layers(
-    runtime: &Runtime<KrkrHost>,
+/// `tTJSNI_BaseLayer::GetPrevFocusable`/`GetNextFocusable`
+/// (`LayerIntf.cpp:3243-3319`): starting from the neighbouring node in the
+/// window's overall order, walk forward (or backward) until a node that is
+/// node-focusable and joins the focus chain turns up -- wrapping around the
+/// order, never answering `this` twice. The reference then posts
+/// `onSearchPrevFocusable`/`onSearchNextFocusable` with the candidate, which a
+/// script may replace through `onSearchWork`; the getter reports the result.
+fn layer_relative_focusable(
+    runtime: &mut Runtime<KrkrHost>,
     layer: ObjectHandle,
-    visited: &mut BTreeSet<ObjectHandle>,
-    layers: &mut Vec<ObjectHandle>,
-) {
-    let layer = runtime.bound_this(layer).unwrap_or(layer);
-    if !visited.insert(layer) {
-        return;
-    }
-    if layer_is_node_focusable(runtime, layer) && layer_joins_focus_chain(runtime, layer) {
-        layers.push(layer);
-    }
-    for child in layer_children(runtime, layer) {
-        collect_focusable_layers(runtime, child, visited, layers);
-    }
+    forward: bool,
+) -> Result<Variant> {
+    let Some(window) = layer_window_object(runtime, layer) else {
+        return Ok(Variant::Null);
+    };
+    let order = window_layers_in_order(runtime, window, layer);
+    let candidate = order
+        .iter()
+        .position(|entry| *entry == layer)
+        .and_then(|index| {
+            let count = order.len();
+            (1..count).find_map(|step| {
+                let position = if forward {
+                    (index + step) % count
+                } else {
+                    (index + count - step) % count
+                };
+                let entry = order[position];
+                (entry != layer
+                    && layer_is_node_focusable(runtime, entry)
+                    && layer_joins_focus_chain(runtime, entry))
+                .then_some(entry)
+            })
+        });
+    let method = if forward {
+        "onSearchNextFocusable"
+    } else {
+        "onSearchPrevFocusable"
+    };
+    let target = layer_focus_work(runtime, layer, method, candidate, Vec::new())?;
+    Ok(target
+        .map(|target| self_bound(Variant::Object(target)))
+        .unwrap_or(Variant::Null))
 }
 
 fn layer_children(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Vec<ObjectHandle> {
@@ -7421,7 +7933,8 @@ fn next_focusable_outside(
 
 fn blur_window_focus(runtime: &mut Runtime<KrkrHost>, window: ObjectHandle) -> Result<()> {
     if let Some(previous) = focused_layer(runtime, window) {
-        runtime.set_object_member(previous, "focused", Variant::Integer(0));
+        // `Layer.focused` reports the window's focused layer
+        // (`LayerIntf.cpp:3218`), so clearing the window's is what blurs it.
         if !matches!(runtime.object_member(previous, "onBlur"), Variant::Void) {
             runtime.call_object_method(previous, "onBlur", vec![Variant::Null])?;
         }
