@@ -273,6 +273,18 @@ impl TjsError {
         Self::new(TjsErrorKind::NativeClassCrash, "Invalid object context")
     }
 
+    /// `TJSRangeError`: `The value is out of the range`
+    /// (`string_table_en.rc:37`, `IDS_TJS_RANGE_ERROR`; no `%1`).
+    ///
+    /// The reference raises it with `TJS_eTJSError(TJSRangeError)`
+    /// (`tjsErrorInc.h:38` declares the message, `tjsInterCodeExec.cpp:75`
+    /// throws it for a string/octet index outside the value), which is a
+    /// plain script error without a `tjs_error` code, so the kind stays
+    /// `Runtime` -- the same modelling as [`TjsError::null_access`].
+    pub fn range_error() -> Self {
+        Self::new(TjsErrorKind::Runtime, "The value is out of the range")
+    }
+
     /// The reference's null-object failure, `Accessing to null object`
     /// (`string_table_en.rc:14`, `IDS_TJS_NULL_ACCESS`).
     ///
@@ -283,6 +295,24 @@ impl TjsError {
         Self::new(TjsErrorKind::Runtime, "Accessing to null object")
     }
 
+    /// The reference's conversion failure, `IDS_TJS_VARIANT_CONVERT_ERROR`:
+    /// `Cannot convert the variable type (%1 to %2)` (`string_table_en.rc:7`),
+    /// with `%1` rendered by `TJSVariantToReadableString` (`tjsUtils.cpp:50`)
+    /// and `%2` by `TJSVariantTypeToTypeString` (`tjsUtils.cpp:36-48`, whose
+    /// names are lower-case: `string`, `int`, `void`, ...).
+    ///
+    /// `TJSThrowVariantConvertError` (`tjsVariant.cpp:142-151`) raises it as a
+    /// plain script exception, so the kind stays `Runtime`.
+    pub fn variant_convert(value: &Variant, target_type: &str) -> Self {
+        Self::new(
+            TjsErrorKind::Runtime,
+            format!(
+                "Cannot convert the variable type ({} to {target_type})",
+                readable_value(value)
+            ),
+        )
+    }
+
     /// The reference's object-conversion failure: `Cannot convert the
     /// variable type (%1 to Object)` (`string_table_en.rc:8`,
     /// `IDS_TJS_VARIANT_CONVERT_ERROR_TO_OBJECT`), with `%1` rendered by
@@ -291,13 +321,7 @@ impl TjsError {
     /// `TJSThrowVariantConvertError` (`tjsVariant.cpp:142-151`) raises it as a
     /// plain script exception, so the kind stays `Runtime`.
     pub fn variant_convert_to_object(value: &Variant) -> Self {
-        Self::new(
-            TjsErrorKind::Runtime,
-            format!(
-                "Cannot convert the variable type ({} to Object)",
-                readable_value(value)
-            ),
-        )
+        Self::variant_convert(value, "Object")
     }
 
     /// Raised when the user quits an interactive debug session. It is never
