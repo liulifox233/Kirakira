@@ -273,6 +273,18 @@ impl TjsError {
         Self::new(TjsErrorKind::NativeClassCrash, "Invalid object context")
     }
 
+    /// `TJSRangeError`: `The value is out of the range`
+    /// (`string_table_en.rc:37`, `IDS_TJS_RANGE_ERROR`; no `%1`).
+    ///
+    /// The reference raises it with `TJS_eTJSError(TJSRangeError)`
+    /// (`tjsErrorInc.h:38` declares the message, `tjsInterCodeExec.cpp:75`
+    /// throws it for a string/octet index outside the value), which is a
+    /// plain script error without a `tjs_error` code, so the kind stays
+    /// `Runtime` -- the same modelling as [`TjsError::null_access`].
+    pub fn range_error() -> Self {
+        Self::new(TjsErrorKind::Runtime, "The value is out of the range")
+    }
+
     /// The reference's null-object failure, `Accessing to null object`
     /// (`string_table_en.rc:14`, `IDS_TJS_NULL_ACCESS`).
     ///
