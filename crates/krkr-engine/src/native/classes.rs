@@ -4297,6 +4297,31 @@ fn exchange_native_layer_info(
     Ok(Variant::Void)
 }
 
+/// The optional `selfupdate` / `callback` members of a `beginTransition`
+/// option object (`tTJSNI_BaseLayer::StartTransition`, `LayerIntf.cpp:6209-6234`).
+///
+/// `selfupdate` hands the update pass to the script (`TransSelfUpdate`), and
+/// `callback` replaces the idle hook's tick with a value the script returns
+/// (`GetTransTick`, `:6683`).  Both are only read when the member exists and is
+/// not void.
+fn transition_driver_options(
+    runtime: &mut Runtime<KrkrHost>,
+    options: Option<ObjectHandle>,
+) -> (bool, Option<Variant>) {
+    let Some(options) = options else {
+        return (false, None);
+    };
+    let self_update = match runtime.object_member(options, "selfupdate") {
+        Variant::Void => false,
+        value => value.is_truthy(),
+    };
+    let tick_callback = match runtime.object_member(options, "callback") {
+        Variant::Void => None,
+        value => Some(value),
+    };
+    (self_update, tick_callback)
+}
+
 /// The size `tTJSNI_BaseLayer::StartTransition` hands to the transition
 /// provider for one layer (`LayerIntf.cpp:6243`): the layer Rect when children
 /// are included, the main image's own size otherwise.
@@ -4395,6 +4420,8 @@ fn layer_begin_transition(
     };
     let (transition_params, rule_image_upload) =
         transition_params_from_options(runtime, &method, options)?;
+    // `options.selfupdate` / `options.callback` (`LayerIntf.cpp:6209-6234`).
+    let (self_update, tick_callback) = transition_driver_options(runtime, options);
     // `StartTransition` (`LayerIntf.cpp:6271`): without children the handler
     // blends the two main images, so both layers must have one.
     if !with_children
@@ -4467,7 +4494,8 @@ fn layer_begin_transition(
                 live_layer_overrides,
                 live_layer_restore,
                 dest_rect,
-                self_update: false,
+                self_update,
+                tick_callback,
                 completion: NativeTransitionCompletion {
                     dest: this,
                     source: Some(source),
@@ -6129,6 +6157,16 @@ fn layer_update(
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer.update requires this"))?;
+    // `tTJSNI_BaseLayer::UpdateByScript` (`LayerIntf.cpp:7638`) runs the
+    // layer's completion pass, which is what drives a `selfupdate` transition
+    // (`BeforeCompletion`, `LayerIntf.cpp:5056`).  The engine's pass is the
+    // frame itself, so the script-driven step is applied to the phase here.
+    if let Some(callback) = runtime.host().transition_tick_callback(this) {
+        let tick = runtime.call_function(callback, Vec::new())?.to_integer()?;
+        runtime.host_mut().set_transition_tick(this, tick);
+    } else {
+        runtime.host_mut().advance_self_updated_transition(this);
+    }
     set_layer_property_storage(runtime, this, "callOnPaint", Variant::Integer(1));
     if !runtime.host_mut().request_layer_paint(this) {
         set_layer_property_storage(runtime, this, "callOnPaint", Variant::Integer(0));

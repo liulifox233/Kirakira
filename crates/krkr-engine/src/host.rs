@@ -3183,6 +3183,8 @@ impl KrkrHost {
             dest_rect,
             native_completion: None,
             self_update: false,
+            tick_callback: None,
+            pending_delta: Duration::ZERO,
             completion_event_prevented: false,
         });
     }
@@ -3205,6 +3207,7 @@ impl KrkrHost {
             completion,
             dest_rect,
             self_update,
+            tick_callback,
         } = start;
         if duration.is_zero() || self.transition_policy == TransitionPolicy::Immediate {
             self.restore_transition_live_overrides(&live_layer_overrides, &live_layer_restore);
@@ -3228,6 +3231,8 @@ impl KrkrHost {
             dest_rect,
             native_completion: Some(completion),
             self_update,
+            tick_callback,
+            pending_delta: Duration::ZERO,
             completion_event_prevented: false,
         });
         true
@@ -3326,9 +3331,11 @@ impl KrkrHost {
     /// A transition whose completion event was prevented stops as soon as
     /// event dispatching is enabled again, and does not advance while it is
     /// prevented -- the official code returns before `Update()`, so the last
-    /// composited frame stays on screen.  Everything else advances by `delta`
-    /// and stops through the handler when it reaches its time or its
-    /// destination is no longer node-visible.
+    /// composited frame stays on screen.  A self-updated transition
+    /// (`TransSelfUpdate`) is not driven by the idle hook at all, so this pass
+    /// leaves its phase alone; `Layer.update()` moves it instead.  Everything
+    /// else advances by `delta` and stops through the handler when it reaches
+    /// its time or its destination is no longer node-visible.
     pub(crate) fn advance_transition(&mut self, delta: Duration) {
         let event_disabled = self.scheduler.event_disabled();
         let mut index = 0;
@@ -3346,13 +3353,88 @@ impl KrkrHost {
                 continue;
             }
             let transition = &mut self.active_transitions[index];
-            transition.elapsed = transition.elapsed.saturating_add(delta);
+            if transition.tick_callback.is_none() {
+                if transition.self_update {
+                    transition.pending_delta = transition.pending_delta.saturating_add(delta);
+                } else {
+                    transition.elapsed = transition.elapsed.saturating_add(delta);
+                }
+            }
             if !dest_visible || transition.elapsed >= transition.duration {
                 self.stop_transition_by_handler(index);
                 continue;
             }
             index += 1;
         }
+    }
+
+    /// Destinations whose transition reads its tick from a `callback` option.
+    /// The engine calls each closure once per pass and stores the result with
+    /// `set_transition_tick`, because only the runtime can invoke TJS code.
+    pub(crate) fn transition_tick_callbacks(&self) -> Vec<(ObjectHandle, Variant)> {
+        self.active_transitions
+            .iter()
+            .filter(|transition| !transition.self_update)
+            .filter_map(|transition| {
+                Some((
+                    transition.dest_handle()?,
+                    transition.tick_callback.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Stores the tick a `callback` option returned.
+    ///
+    /// `StartTransition` runs a dummy `StartProcess(0)` for a callback-driven
+    /// transition before anything else, so the handler's origin tick is zero
+    /// and the phase is simply `tick / time` (`TransIntf.cpp:544`).
+    pub(crate) fn set_transition_tick(&mut self, dest: ObjectHandle, tick: i64) {
+        if let Some(transition) = self
+            .active_transitions
+            .iter_mut()
+            .find(|transition| transition.dest_handle() == Some(dest))
+        {
+            transition.elapsed = Duration::from_millis(tick.max(0) as u64);
+        }
+    }
+
+    /// Advances a self-updated transition one script-driven step.
+    ///
+    /// Official `tTJSNI_BaseLayer::BeforeCompletion` (`LayerIntf.cpp:5056`)
+    /// takes `TransTick = GetTransTick()` when `TransSelfUpdate` is set, so a
+    /// `Layer.update()` on the destination moves the phase to the current
+    /// clock; the engine keeps the elapsed frame time until that happens.
+    pub(crate) fn advance_self_updated_transition(&mut self, dest: ObjectHandle) -> bool {
+        let Some(transition) = self
+            .active_transitions
+            .iter_mut()
+            .find(|transition| transition.dest_handle() == Some(dest))
+        else {
+            return false;
+        };
+        if !transition.self_update || transition.tick_callback.is_some() {
+            return false;
+        }
+        transition.elapsed = transition.elapsed.saturating_add(transition.pending_delta);
+        transition.pending_delta = Duration::ZERO;
+        true
+    }
+
+    /// The `callback` option of a running transition, so `Layer.update()` can
+    /// move a self-updated transition to the tick the script supplies.
+    pub(crate) fn transition_tick_callback(&self, dest: ObjectHandle) -> Option<Variant> {
+        self.active_transitions
+            .iter()
+            .find(|transition| transition.dest_handle() == Some(dest))
+            .and_then(|transition| transition.tick_callback.clone())
+    }
+
+    pub(crate) fn transition_self_update(&self, dest: ObjectHandle) -> bool {
+        self.active_transitions
+            .iter()
+            .find(|transition| transition.dest_handle() == Some(dest))
+            .is_some_and(|transition| transition.self_update)
     }
 
     /// Official `tTJSNI_BaseLayer::StopTransitionByHandler` (`LayerIntf.cpp:6440`):
@@ -3458,13 +3540,6 @@ impl KrkrHost {
         {
             transition.self_update = self_update;
         }
-    }
-
-    pub(crate) fn transition_self_update(&self, dest: ObjectHandle) -> bool {
-        self.active_transitions
-            .iter()
-            .find(|transition| transition.dest_handle() == Some(dest))
-            .is_some_and(|transition| transition.self_update)
     }
 
     /// Completes a transition that the handler decided to finish, respecting
@@ -3947,6 +4022,15 @@ struct ActiveTransition {
     /// `tTJSNI_BaseLayer::TransSelfUpdate` (`LayerIntf.cpp:6211`): the
     /// transition is advanced by user code, not by the idle hook.
     self_update: bool,
+    /// `tTJSNI_BaseLayer::TransTickCallback` (`LayerIntf.cpp:6222`): the
+    /// closure that supplies the tick instead of `TVPGetTickCount()`.
+    tick_callback: Option<Variant>,
+    /// Time that passed while a `selfupdate` transition waited for the script
+    /// to drive it.  The official handler only computes a phase inside
+    /// `BeforeCompletion` (`LayerIntf.cpp:5056`), so the clock keeps running
+    /// between two `Layer.update()` calls and the phase jumps to whatever the
+    /// tick difference is when the script finally asks.
+    pending_delta: Duration,
     /// `tTJSNI_BaseLayer::TransCompEventPrevented` (`LayerIntf.cpp:6451`):
     /// the handler asked to stop while event dispatching was disabled, so the
     /// stop is deferred until dispatching is enabled again.
@@ -3979,6 +4063,7 @@ pub(crate) struct NativeTransitionStart {
     pub completion: NativeTransitionCompletion,
     pub dest_rect: Option<Rect>,
     pub self_update: bool,
+    pub tick_callback: Option<Variant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
