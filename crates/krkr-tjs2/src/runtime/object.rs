@@ -442,13 +442,30 @@ pub enum ObjectKind {
 
 /// Which halves of a native property script code may use.
 ///
-/// The reference expresses this per property with `TJS_DENY_NATIVE_PROP_SETTER`
-/// (and a getter that reports the same code when a property is write-only),
-/// and a denied direction answers `TJS_E_ACCESSDENYED` (-1007) instead of
-/// running the accessor. The engine keeps its own write path for
-/// storage-backed properties (host writes go through
-/// [`crate::runtime::Runtime::set_object_member`], not through TJS dispatch),
-/// so marking a property read-only only takes the direction away from script.
+/// Only the denied-*setter* half has a reference counterpart: krkrz registers
+/// the official read-only properties with a setter that returns
+/// `TJS_E_ACCESSDENYED` (the `TJS_DENY_NATIVE_PROP_SETTER` macro,
+/// `tjsNative.h:463`), and a denied direction answers that code instead of
+/// running the accessor. No property *getter* in the reference reports
+/// `TJS_E_ACCESSDENYED`, so [`WriteOnly`](Self::WriteOnly) and
+/// [`NoAccess`](Self::NoAccess) are engine extensions rather than a modelling
+/// of reference behaviour.
+///
+/// The engine keeps its own write path for storage-backed properties (host
+/// writes go through [`crate::runtime::Runtime::set_object_member`], not
+/// through TJS dispatch), so marking a property read-only only takes the
+/// direction away from script.
+///
+/// Known gap: a script store that carries `TJS_IGNOREPROP` (a regmember-style
+/// `&obj.prop = v` or VM member store) still reaches
+/// [`crate::runtime::Runtime::register_object_native_property`]'s setter,
+/// because `prop_set_handle` keeps invoking native property setters under that
+/// flag. It therefore fails with -1007 on a denied property where the
+/// reference's `TJSDefaultPropSet` (`tjsObject.cpp:1435-1466`) skips the
+/// property and overwrites the member. The gap is unobservable while every
+/// property stays `ReadWrite`; see
+/// [`crate::runtime::Runtime::deny_native_property_writes`] for what a caller
+/// of the deny-list has to check.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NativePropertyAccess {
     /// Script may read and write (the default).

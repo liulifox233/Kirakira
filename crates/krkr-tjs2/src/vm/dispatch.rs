@@ -653,12 +653,25 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 // `*property` operator.
                 //
                 // This member-read path deliberately keeps handing the
-                // property object back instead, because the engine's KAGEX
-                // support reads a freshly defined setter-only property to get
-                // that object (`objectHookInjection`'s
-                // `var t1 = this.prop; ("property prop {...}")!;
-                //  l0[l5] = t1 incontextof l4`, pinned by
-                // `krkr-engine`'s `layer_font_reads_back_bound_to_the_font_like_krkr`).
+                // property object back instead, and that is a known deviation
+                // from the reference (`tTJSInterCodeContext::PropGet` answers
+                // TJS_E_ACCESSDENYED when `PropGetter` is null,
+                // `tjsInterCodeExec.cpp:3134-3140`, and `TJSDefaultPropGet`
+                // propagates it): the engine's KAGEX support reads a freshly
+                // defined setter-only property to get that object
+                // (`objectHookInjection`'s `var t1 = this.prop;
+                //  ("property prop {...}")!; l0[l5] = t1 incontextof l4`),
+                // pinned by `krkr-engine`'s
+                // `layer_font_reads_back_bound_to_the_font_like_krkr`
+                // (`engine.rs:13297`), which fails if -1007 is raised here.
+                //
+                // A follow-up engine mission owns the decision: the
+                // reference's sanctioned way to read the property object
+                // itself is `&obj.prop` (TJS_IGNOREPROP), which the engine
+                // already implements.  If real KAGEX uses that form, the
+                // engine test can be fixed and this path changed to
+                // `Err(TjsError::access_denied())` like `default_prop_get`
+                // above; until then the leniency stays, filed as a finding.
                 let Some(getter) = file.objects[object_index].prop_getter else {
                     return Ok(None);
                 };
