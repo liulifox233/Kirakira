@@ -850,6 +850,14 @@ if (wasmUrl) {
       scratch.clearRect(0, 0, canvas.width, canvas.height);
       scratch.translate(contentOffsetX, contentOffsetY);
       scratch.scale(contentScale, contentScale);
+      // The wgpu under target starts from the frame clear colour (the renderer
+      // clears it with `frame.clear_color`), and the main canvas fills the same
+      // colour over the content rect.  A transparent scratch would make
+      // `drawImage` fall back to source-over for pixels neither list covers --
+      // weight `progress * alpha` instead of `progress` -- so the old face would
+      // hold at full strength instead of fading toward the frame colour.
+      scratch.fillStyle = color(model);
+      scratch.fillRect(0, 0, contentWidth, contentHeight);
       drawCommands(scratch, transition.underDrawList, 1, transitionTextures);
       drawCommands(scratch, transition.sourceDrawList, 1, transitionTextures);
       return scratch;
