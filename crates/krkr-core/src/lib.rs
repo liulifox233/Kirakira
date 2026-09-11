@@ -1040,6 +1040,17 @@ pub struct FrameTransition {
     pub rule_image_upload: Option<ImageUpload>,
     pub frozen_draw_commands: Vec<DrawCommand>,
     pub frozen_image_uploads: Vec<ImageUpload>,
+    /// The incoming face (`tTVPDivisibleData::Src2`, `LayerIntf.cpp:6611`): the
+    /// source layer's own content, positioned where the destination draws.
+    ///
+    /// Official draws neither layer during the transition -- the handler
+    /// composites the destination's own bitmap (`Src1`) with the source's
+    /// (`Src2`, `TransSrc->Complete(destrect)`, `:6604`) and only the stop's
+    /// `Exchange`/`Swap` moves content between the objects.  The engine
+    /// therefore hands the renderer both faces instead of writing the source
+    /// into the destination layer.
+    pub source_draw_commands: Vec<DrawCommand>,
+    pub source_image_uploads: Vec<ImageUpload>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1660,6 +1671,120 @@ impl LayerTree {
             );
         }
         (model.commands, model.uploads)
+    }
+
+    /// The transition source face: the content of `roots`, shifted by `offset`.
+    ///
+    /// Official hands the handler the source layer's cached bitmap
+    /// (`tTJSNI_BaseLayer::Complete(rect)`, `LayerIntf.cpp:6104`) and
+    /// `tTransDrawable::DrawCompleted` (`:6596-6613`) aligns that bitmap with
+    /// the destination's, so the source face is the source subtree drawn where
+    /// the destination is.  `extra_roots` carries the rest of a KAG staging
+    /// page, whose layers are independent objects rather than one subtree.
+    ///
+    /// `source`'s own `Visible` is ignored: KAG transitions out of a page that
+    /// is never displayed directly (`fore.base` transitions from `back.base`),
+    /// and official renders that cache all the same.  Every other layer,
+    /// including the other staging-page layers, keeps its own visibility and
+    /// opacity exactly as the ordinary completion pass draws them.
+    pub fn source_face(
+        &self,
+        source: LayerId,
+        extra_roots: &[LayerId],
+        offset: Point,
+        with_children: bool,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        let suppressed_images = BTreeSet::new();
+        let mut model = LayerDrawModel {
+            suppressed_images: &suppressed_images,
+            commands: Vec::new(),
+            uploads: Vec::new(),
+        };
+        let clip = Rect::new(0.0, 0.0, f32::MAX / 4.0, f32::MAX / 4.0);
+        for (index, root) in std::iter::once(&source).chain(extra_roots).enumerate() {
+            let Some(node) = self.layers.get(root) else {
+                continue;
+            };
+            // The source layer's own state is the transition's; the rest of the
+            // page keeps its ordinary drawing rules.
+            let is_source = index == 0;
+            if !is_source && (!node.visible || node.opacity == 0) {
+                continue;
+            }
+            let origin = self
+                .absolute_position(*root)
+                .map(|origin| Point::new(origin.x + offset.x, origin.y + offset.y))
+                .unwrap_or(offset);
+            self.draw_source_face(
+                node.id,
+                // `draw_source_face` adds the node's own offset, so the walk
+                // starts from its origin minus that offset.
+                Point::new(
+                    origin.x - node.left - node.window_offset.x,
+                    origin.y - node.top - node.window_offset.y,
+                ),
+                clip,
+                1.0,
+                with_children,
+                &mut model,
+                is_source,
+            );
+        }
+        (model.commands, model.uploads)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_source_face(
+        &self,
+        id: LayerId,
+        parent_origin: Point,
+        parent_clip: Rect,
+        parent_opacity: f32,
+        with_children: bool,
+        model: &mut LayerDrawModel<'_>,
+        ignore_own_visibility: bool,
+    ) {
+        let Some(layer) = self.layers.get(&id) else {
+            return;
+        };
+        // `renderable` is an engine bookkeeping flag (a parted layer, or a KAG
+        // page that is not the displayed one), not an official drawing
+        // property: `tTJSNI_BaseLayer::Complete` (`LayerIntf.cpp:6104`) renders
+        // the source layer's cache whatever the engine thinks of its page.
+        if !ignore_own_visibility && (layer.opacity == 0 || !layer.visible) {
+            return;
+        }
+        let origin = Point::new(
+            parent_origin.x + layer.left + layer.window_offset.x,
+            parent_origin.y + layer.top + layer.window_offset.y,
+        );
+        let layer_rect = Rect::new(origin.x, origin.y, layer.width, layer.height);
+        let Some(clip) = intersect_rect(parent_clip, layer_rect) else {
+            return;
+        };
+        let opacity = parent_opacity * layer.opacity as f32 / 255.0;
+
+        if let Some(command) = layer.image_command(origin, clip, parent_opacity) {
+            model.commands.push(DrawCommand::Image(command));
+            if let Some(image) = &layer.image {
+                model.uploads.push(image.upload.clone());
+            }
+        }
+
+        if !with_children {
+            return;
+        }
+        for child in self.sorted_children(Some(id)) {
+            self.draw_source_face(
+                child.id,
+                origin,
+                clip,
+                opacity,
+                with_children,
+                model,
+                false,
+            );
+        }
     }
 
     fn draw_layer<F>(
@@ -2349,6 +2474,8 @@ impl Engine {
         for transition in &mut output.transitions {
             transition.frozen_image_uploads =
                 self.filter_new_image_uploads(std::mem::take(&mut transition.frozen_image_uploads));
+            transition.source_image_uploads =
+                self.filter_new_image_uploads(std::mem::take(&mut transition.source_image_uploads));
             if let Some(upload) = transition.rule_image_upload.take() {
                 let mut uploads = self.filter_new_image_uploads(vec![upload]);
                 transition.rule_image_upload = uploads.pop();
@@ -2358,6 +2485,7 @@ impl Engine {
         collect_image_texture_ids(&output.draw_commands, &mut referenced_textures);
         for transition in &output.transitions {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced_textures);
+            collect_image_texture_ids(&transition.source_draw_commands, &mut referenced_textures);
             if let Some(texture_id) = transition.rule_texture_id {
                 referenced_textures.insert(texture_id);
             }

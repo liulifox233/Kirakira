@@ -825,6 +825,7 @@ if (wasmUrl) {
       drawCommands(model.drawList, 1);
       for (const transition of transitions) {
         uploadTextures(transition.frozenUploads, transitionTextures);
+        uploadTextures(transition.sourceUploads, transitionTextures);
         uploadTextures(transition.ruleUploads, transitionTextures);
         const progress = Math.max(0, Math.min(1, Number(transition.progress ?? 1)));
         const rect = transition.destRect;
@@ -833,21 +834,26 @@ if (wasmUrl) {
         if (rect) {
           context.rect(rect.x, rect.y, rect.width, rect.height);
         } else {
-          context.rect(0, 0, canvas.width, canvas.height);
+          context.rect(0, 0, contentWidth, contentHeight);
         }
         context.clip();
-        // Canvas2D does not implement every KRKR transition shader. Rendering
-        // the frozen frame beneath the live frame is a deterministic crossfade
-        // fallback for universal/scroll/wave/etc., and, importantly, avoids the
-        // abrupt black/flash frame of the old fallback.
+        // Canvas2D implements no KRKR transition shader. The frozen face is the
+        // destination's own content and the source face is the source layer's
+        // (`tTVPDivisibleData::Src1`/`Src2`, LayerIntf.cpp:6592/6611), so
+        // crossfading them is a deterministic fallback that still shows both
+        // faces correctly and, importantly, avoids the abrupt black/flash frame
+        // of the old fallback. Clearing first makes the rectangle behave like
+        // the renderer's replace-in-place composite; where neither face draws
+        // the base is gone, exactly as a real crossfade of two transparent
+        // bitmaps would be.
         context.globalAlpha = 1;
         if (rect) {
           context.clearRect(rect.x, rect.y, rect.width, rect.height);
         } else {
-          context.clearRect(0, 0, canvas.width, canvas.height);
+          context.clearRect(0, 0, contentWidth, contentHeight);
         }
         drawCommands(transition.frozenDrawList, 1 - progress, transitionTextures);
-        drawCommands(model.drawList, progress);
+        drawCommands(transition.sourceDrawList, progress, transitionTextures);
         context.restore();
       }
     } else {

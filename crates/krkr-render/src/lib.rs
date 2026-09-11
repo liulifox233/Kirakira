@@ -354,15 +354,6 @@ impl Renderer {
                 frame.clip,
                 &prepared.draw_commands,
             );
-            let new_target = self.create_offscreen_target("Kirakira transition live target");
-            self.render_commands_to_view(
-                &mut encoder,
-                &new_target.view,
-                "Kirakira transition live pass",
-                frame.clear_color,
-                frame.clip,
-                &prepared.draw_commands,
-            );
             for transition in &prepared.transitions {
                 let old_target = self.create_offscreen_target("Kirakira transition frozen target");
                 self.render_commands_to_view(
@@ -372,6 +363,19 @@ impl Renderer {
                     frame.clear_color,
                     None,
                     &transition.frozen_draw_commands,
+                );
+                // The incoming face is the source layer's own content
+                // (`tTVPDivisibleData::Src2`, `LayerIntf.cpp:6611`), not the
+                // live frame: the destination layer is never written during a
+                // transition, so the live tree still shows its own content.
+                let new_target = self.create_offscreen_target("Kirakira transition source target");
+                self.render_commands_to_view(
+                    &mut encoder,
+                    &new_target.view,
+                    "Kirakira transition source pass",
+                    frame.clear_color,
+                    None,
+                    &transition.source_draw_commands,
                 );
                 self.render_transition_to_view(
                     &mut encoder,
@@ -535,6 +539,9 @@ impl Renderer {
                 let (frozen_draw_commands, mut frozen_image_uploads) =
                     self.prepare_commands(&transition.frozen_draw_commands);
                 frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
+                let (source_draw_commands, mut source_image_uploads) =
+                    self.prepare_commands(&transition.source_draw_commands);
+                source_image_uploads.extend(transition.source_image_uploads.iter().cloned());
                 FrameTransition {
                     method: transition.method.clone(),
                     progress: transition.progress,
@@ -544,6 +551,8 @@ impl Renderer {
                     rule_image_upload: transition.rule_image_upload.clone(),
                     frozen_draw_commands,
                     frozen_image_uploads,
+                    source_draw_commands,
+                    source_image_uploads,
                 }
             })
             .collect();
@@ -606,6 +615,7 @@ impl Renderer {
         self.upload_images(&frame.image_uploads);
         for transition in &frame.transitions {
             self.upload_images(&transition.frozen_image_uploads);
+            self.upload_images(&transition.source_image_uploads);
             if let Some(upload) = &transition.rule_image_upload {
                 self.upload_images(std::slice::from_ref(upload));
             }
@@ -686,6 +696,7 @@ impl Renderer {
         collect_image_texture_ids(&frame.draw_commands, &mut referenced);
         for transition in &frame.transitions {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced);
+            collect_image_texture_ids(&transition.source_draw_commands, &mut referenced);
             if let Some(texture_id) = transition.rule_texture_id {
                 referenced.insert(texture_id);
             }

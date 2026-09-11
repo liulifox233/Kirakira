@@ -9,7 +9,7 @@ use super::blend;
 
 use krkr_core::{
     AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerId, LayerImage, LayerNode,
-    ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
+    Point, ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
     TransitionScrollStay,
 };
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
@@ -3954,7 +3954,7 @@ fn transition_params_from_options(
         let Some(rule) =
             object_optional_string(runtime, options, "rule")?.filter(|rule| !rule.is_empty())
         else {
-            return Err(TjsError::runtime("Specify option: rule"));
+            return Err(TjsError::runtime("Specify option rule"));
         };
         match runtime.host_mut().load_image_storage(&rule) {
             Ok(image) => Some(image.upload),
@@ -4405,7 +4405,7 @@ fn layer_begin_transition(
         let source_size = transition_layer_size(runtime, source, with_children)?;
         if dest_size != source_size {
             return Err(TjsError::runtime(format!(
-                "Transition layer size mismatch: {}x{} and {}x{}",
+                "Transition layer size mismatch {}x{} and {}x{}",
                 source_size.0, source_size.1, dest_size.0, dest_size.1
             )));
         }
@@ -4420,7 +4420,7 @@ fn layer_begin_transition(
     // problem"), so it never runs an instantaneous exchange.
     let duration = if crossfade_family {
         let Some(time) = time else {
-            return Err(TjsError::runtime("Specify option: time"));
+            return Err(TjsError::runtime("Specify option time"));
         };
         time.max(2) as u64
     } else {
@@ -4439,35 +4439,56 @@ fn layer_begin_transition(
             "Transition source and destination must have image",
         ));
     }
+    let dest_layer_id = native_layer_id(runtime, this)?;
     let source_layer_id = native_layer_id(runtime, source)?;
     let mut suppressed_images = BTreeSet::new();
     if let Some(source_layer_id) = source_layer_id {
         suppressed_images.insert(source_layer_id);
     }
+    // `Src1` (`tTVPDivisibleData::Src1`, `LayerIntf.cpp:6592`) is the
+    // destination's own composite.
     let frozen = runtime
         .host()
         .layer_tree()
         .draw_model_suppressing_images(&suppressed_images);
+    // `Src2` (`:6611`) is the source layer's own cached bitmap
+    // (`TransSrc->Complete(destrect)`, `:6604`) aligned with the destination's.
+    // Neither layer is written while the transition runs: the destination keeps
+    // its own image, rect and pixels, and only the stop's `Exchange`/`Swap`
+    // moves content between the two objects
+    // (`tTJSNI_BaseLayer::InternalStopTransition`, `:6364`).
+    let mut source_page_layers = sync_kag_source_page(runtime, source)?;
+    let (source_draw_commands, source_image_uploads) = match source_layer_id {
+        Some(source_layer_id) => {
+            source_page_layers.retain(|layer_id| *layer_id != source_layer_id);
+            let host = runtime.host();
+            let offset = match (
+                host.layer_tree().absolute_position(source_layer_id),
+                dest_layer_id.and_then(|id| host.layer_tree().absolute_position(id)),
+            ) {
+                (Some(source_origin), Some(dest_origin)) => Point::new(
+                    dest_origin.x - source_origin.x,
+                    dest_origin.y - source_origin.y,
+                ),
+                _ => Point::new(0.0, 0.0),
+            };
+            host.layer_tree().source_face(
+                source_layer_id,
+                &source_page_layers,
+                offset,
+                with_children,
+            )
+        }
+        None => (Vec::new(), Vec::new()),
+    };
     let comp = variant_object(&runtime.object_member(this, "comp"))
         .map(|comp| runtime.bound_this(comp).unwrap_or(comp));
     let paired_comp = Some(runtime.bound_this(source).unwrap_or(source)) == comp;
-    if let Some(target) = render_layer_target(runtime, this)? {
-        // Official `tTransDrawable::DrawCompleted` (`LayerIntf.cpp:6567`) draws
-        // the destination's own composite as Src1 and the source's as Src2,
-        // leaving both layer trees untouched.  This engine renders the two
-        // faces from a frozen model plus the live tree, so the source content
-        // is materialized into the destination here and unwound by
-        // `restore_transition_live_overrides` once the transition ends.
-        materialize_kag_back_to_native(runtime, source)?;
-        copy_layer_images(runtime, this, &target, source)?;
-        let draws = render_target_draws(runtime, &target);
-        mutate_render_layer(runtime, &target, |layer| {
-            layer.renderable = draws;
-        });
-    }
-    let (live_layer_overrides, live_layer_restore) =
-        kag_base_children_transition_live_overrides(runtime, this, Some(source), with_children)?;
-    if duration == 0 {
+    // The engine's own `TransitionPolicy::Immediate` (debuggers and headless
+    // hosts set it) behaves like a zero-duration transition.
+    let immediate =
+        duration == 0 || runtime.host().transition_policy() == crate::TransitionPolicy::Immediate;
+    if immediate {
         if !paired_comp
             && let Some(source_layer_id) = source_layer_id
             && let Some(source_layer) = runtime
@@ -4478,14 +4499,11 @@ fn layer_begin_transition(
             source_layer.renderable = false;
         }
         finish_immediate_transition(runtime, this, Some(source), with_children)?;
-        runtime
-            .host_mut()
-            .restore_transition_live_overrides(&live_layer_overrides, &live_layer_restore);
     } else {
         // `tTransDrawable::DrawCompleted` (`LayerIntf.cpp:6575`) composites the
         // two faces inside the destination's own draw rectangle, which is what
         // lets unrelated layers keep drawing while this one transitions.
-        let dest_rect = native_layer_id(runtime, this)?.and_then(|layer_id| {
+        let dest_rect = dest_layer_id.and_then(|layer_id| {
             runtime
                 .host()
                 .transition_destination_rect(layer_id, with_children)
@@ -4498,9 +4516,9 @@ fn layer_begin_transition(
                 rule_image_upload,
                 frozen_draw_commands: frozen.0,
                 frozen_image_uploads: frozen.1,
+                source_draw_commands,
+                source_image_uploads,
                 suppressed_live_images: suppressed_images,
-                live_layer_overrides,
-                live_layer_restore,
                 dest_rect,
                 self_update,
                 tick_callback,
@@ -4515,109 +4533,93 @@ fn layer_begin_transition(
     Ok(Variant::Void)
 }
 
-fn materialize_kag_back_to_native(
-    runtime: &mut Runtime<KrkrHost>,
+fn layer_member_i64(
+    runtime: &Runtime<KrkrHost>,
     handle: ObjectHandle,
-) -> Result<()> {
-    let Some(LayerRenderTarget::Kag(slot)) = kag_layer_target(runtime, handle) else {
-        return Ok(());
-    };
-    if slot.page != "back" {
-        return Ok(());
-    }
-    let Some(layer_id) = native_layer_id(runtime, handle)? else {
-        return Ok(());
-    };
-    let Some(snapshot) = runtime.host().kag_layer(&slot.page, &slot.layer).cloned() else {
-        return Ok(());
-    };
-    if let Some(native_layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-        let renderable = native_layer.renderable;
-        native_layer.copy_render_state_from(&snapshot);
-        native_layer.renderable = renderable;
-    }
-    Ok(())
+    name: &str,
+    fallback: i64,
+) -> Result<i64> {
+    layer_property_i64(runtime, handle, name, fallback)
 }
 
-/// Builds the transition-time live view for a KAG page transition.
-///
-/// The official engine shows the incoming page through the transition handler,
-/// which draws the source tree next to the destination; the layer trees
-/// themselves are untouched until `Exchange` at the end
-/// (`tTJSNI_BaseLayer::InternalStopTransition`, `LayerIntf.cpp:6364`).  This
-/// engine projects that live view onto the render tree instead, so the
-/// overridden layers are also returned a copy of their pre-transition state:
-/// the override must not outlive the transition, or the outgoing page's layers
-/// keep the incoming page's picture and show it again at the next page swap.
-fn kag_base_children_transition_live_overrides(
+fn copy_render_state(dest: &mut LayerNode, source: &LayerNode) {
+    dest.copy_render_state_from(source);
+    dest.renderable = source.renderable;
+}
+
+fn apply_layer_node_state_to_script(
     runtime: &mut Runtime<KrkrHost>,
-    dest: ObjectHandle,
-    source: Option<ObjectHandle>,
-    with_children: bool,
-) -> Result<(BTreeMap<u64, LayerNode>, BTreeMap<u64, LayerNode>)> {
-    if !with_children {
-        return Ok((BTreeMap::new(), BTreeMap::new()));
+    handle: ObjectHandle,
+    layer: &LayerNode,
+) {
+    for (name, value) in [
+        ("left", layer.left.round() as i64),
+        ("top", layer.top.round() as i64),
+        ("width", layer.width.max(0.0).round() as i64),
+        ("height", layer.height.max(0.0).round() as i64),
+        ("imageLeft", layer.image_left.round() as i64),
+        ("imageTop", layer.image_top.round() as i64),
+        ("imageWidth", layer.image_width.max(0.0).round() as i64),
+        ("imageHeight", layer.image_height.max(0.0).round() as i64),
+        ("visible", i64::from(layer.visible)),
+        ("enabled", i64::from(layer.enabled)),
+        ("nodeEnabled", i64::from(layer.node_enabled)),
+        ("opacity", i64::from(layer.opacity)),
+        ("type", i64::from(layer.layer_type)),
+        ("face", i64::from(layer.face)),
+        ("hitType", i64::from(layer.hit_type)),
+        ("hitThreshold", i64::from(layer.hit_threshold)),
+    ] {
+        set_layer_property_storage(runtime, handle, name, Variant::Integer(value));
     }
-    if !matches!(
-        kag_layer_target(runtime, dest),
-        Some(LayerRenderTarget::Kag(slot)) if slot.page == "fore" && slot.layer == "base"
-    ) {
-        return Ok((BTreeMap::new(), BTreeMap::new()));
-    }
-    let Some(source) = source else {
-        return Ok((BTreeMap::new(), BTreeMap::new()));
+}
+
+/// Brings the source page's render nodes in line with the KAG page model.
+///
+/// `kag.back.*` is a staging page: `loadImages`, `setSizeToImageSize`,
+/// `left`/`top`/`visible` on those layer objects update the page model
+/// (`pending_kag_layers`), which only reaches the render tree through
+/// `apply_pending_kag_layers`.  The transition's incoming face is the source's
+/// own content (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`), so what
+/// the script wrote to the staging page has to be visible to the draw model
+/// first.  Only the source page is synced -- `tTransDrawable::DrawCompleted`
+/// writes neither layer (`:6567-6681`), so the destination is never touched.
+fn sync_kag_source_page(
+    runtime: &mut Runtime<KrkrHost>,
+    source: ObjectHandle,
+) -> Result<Vec<LayerId>> {
+    let Some(LayerRenderTarget::Kag(slot)) = kag_layer_target(runtime, source) else {
+        return Ok(Vec::new());
     };
-    if !matches!(
-        kag_layer_target(runtime, source),
-        Some(LayerRenderTarget::Kag(slot)) if slot.page == "back" && slot.layer == "base"
-    ) {
-        return Ok((BTreeMap::new(), BTreeMap::new()));
+    if slot.page != "back" {
+        return Ok(Vec::new());
     }
 
-    let mut overrides = BTreeMap::new();
-    let mut restore = BTreeMap::new();
-    let pending_layers = runtime.host().pending_kag_layer_names();
-    for layer_name in pending_layers {
-        if layer_name == "base" {
-            // Base itself is the transition target copied in layer_begin_transition.
-            // This path only projects staged child/message layers into the live tree.
-            continue;
+    let mut names = vec![slot.layer.clone()];
+    for name in runtime.host().pending_kag_layer_names() {
+        if !names.contains(&name) {
+            names.push(name);
         }
-        let Some(source_layer) = kag_layer_object_snapshot(runtime, "back", &layer_name)? else {
-            continue;
-        };
-        if let Some(back_handle) = kag_page_layer_handle(runtime, "back", &layer_name)
-            && let Some(back_layer_id) = native_layer_id(runtime, back_handle)?
-            && let Some(back_layer) = runtime.host_mut().layer_tree_mut().layer_mut(back_layer_id)
-        {
-            back_layer.copy_render_state_from(&source_layer);
-            back_layer.renderable = false;
-        }
-
-        let Some(fore_handle) = kag_page_layer_handle(runtime, "fore", &layer_name) else {
-            continue;
-        };
-        let Some(layer_id) = native_layer_id(runtime, fore_handle)? else {
-            continue;
-        };
-        let Some(original) = runtime.host().layer_tree().layer(layer_id).cloned() else {
-            continue;
-        };
-        let mut override_layer = original.clone();
-        // The projection only shows what is still in the layer tree: a parted
-        // fore layer must not come back for the length of the transition
-        // (`Part()`, `LayerIntf.cpp:589`).
-        let draws = runtime.host().render_layer_draws(layer_id);
-        override_layer.copy_render_state_from(&source_layer);
-        override_layer.renderable = draws;
-        if let Some(dest_layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-            dest_layer.copy_render_state_from(&source_layer);
-            dest_layer.renderable = draws;
-        }
-        restore.insert(layer_id, original);
-        overrides.insert(layer_id, override_layer);
     }
-    Ok((overrides, restore))
+    let mut layer_ids = Vec::new();
+    for name in names {
+        let Some(snapshot) = kag_layer_object_snapshot(runtime, &slot.page, &name)? else {
+            continue;
+        };
+        let Some(handle) = kag_page_layer_handle(runtime, &slot.page, &name) else {
+            continue;
+        };
+        let Some(layer_id) = native_layer_id(runtime, handle)? else {
+            continue;
+        };
+        if let Some(node) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+            let renderable = node.renderable;
+            node.copy_render_state_from(&snapshot);
+            node.renderable = renderable;
+        }
+        layer_ids.push(layer_id);
+    }
+    Ok(layer_ids)
 }
 
 fn kag_layer_object_snapshot(
@@ -4637,7 +4639,33 @@ fn kag_layer_object_snapshot(
     apply_script_layer_members(runtime, handle, &mut snapshot)?;
     Ok(Some(snapshot))
 }
+fn kag_page_layer_handle(
+    runtime: &Runtime<KrkrHost>,
+    page: &str,
+    layer: &str,
+) -> Option<ObjectHandle> {
+    let Variant::Object(kag) = runtime.global_member("kag") else {
+        return None;
+    };
+    let Variant::Object(page_object) = runtime.object_member(kag, page) else {
+        return None;
+    };
+    if layer == "base" || layer == "background" {
+        return variant_object(&runtime.object_member(page_object, "base"))
+            .map(|handle| runtime.bound_this(handle).unwrap_or(handle));
+    }
 
+    let (array_name, index) = if let Some(index) = layer.strip_prefix("message") {
+        ("messages", index)
+    } else {
+        ("layers", layer)
+    };
+    let Variant::Object(array) = runtime.object_member(page_object, array_name) else {
+        return None;
+    };
+    variant_object(&runtime.object_member(array, index))
+        .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+}
 fn apply_script_layer_members(
     runtime: &Runtime<KrkrHost>,
     handle: ObjectHandle,
@@ -4683,75 +4711,6 @@ fn apply_script_layer_members(
     )?
     .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     Ok(())
-}
-
-fn layer_member_i64(
-    runtime: &Runtime<KrkrHost>,
-    handle: ObjectHandle,
-    name: &str,
-    fallback: i64,
-) -> Result<i64> {
-    layer_property_i64(runtime, handle, name, fallback)
-}
-
-fn kag_page_layer_handle(
-    runtime: &Runtime<KrkrHost>,
-    page: &str,
-    layer: &str,
-) -> Option<ObjectHandle> {
-    let Variant::Object(kag) = runtime.global_member("kag") else {
-        return None;
-    };
-    let Variant::Object(page_object) = runtime.object_member(kag, page) else {
-        return None;
-    };
-    if layer == "base" || layer == "background" {
-        return variant_object(&runtime.object_member(page_object, "base"))
-            .map(|handle| runtime.bound_this(handle).unwrap_or(handle));
-    }
-
-    let (array_name, index) = if let Some(index) = layer.strip_prefix("message") {
-        ("messages", index)
-    } else {
-        ("layers", layer)
-    };
-    let Variant::Object(array) = runtime.object_member(page_object, array_name) else {
-        return None;
-    };
-    variant_object(&runtime.object_member(array, index))
-        .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
-}
-
-fn copy_render_state(dest: &mut LayerNode, source: &LayerNode) {
-    dest.copy_render_state_from(source);
-    dest.renderable = source.renderable;
-}
-
-fn apply_layer_node_state_to_script(
-    runtime: &mut Runtime<KrkrHost>,
-    handle: ObjectHandle,
-    layer: &LayerNode,
-) {
-    for (name, value) in [
-        ("left", layer.left.round() as i64),
-        ("top", layer.top.round() as i64),
-        ("width", layer.width.max(0.0).round() as i64),
-        ("height", layer.height.max(0.0).round() as i64),
-        ("imageLeft", layer.image_left.round() as i64),
-        ("imageTop", layer.image_top.round() as i64),
-        ("imageWidth", layer.image_width.max(0.0).round() as i64),
-        ("imageHeight", layer.image_height.max(0.0).round() as i64),
-        ("visible", i64::from(layer.visible)),
-        ("enabled", i64::from(layer.enabled)),
-        ("nodeEnabled", i64::from(layer.node_enabled)),
-        ("opacity", i64::from(layer.opacity)),
-        ("type", i64::from(layer.layer_type)),
-        ("face", i64::from(layer.face)),
-        ("hitType", i64::from(layer.hit_type)),
-        ("hitThreshold", i64::from(layer.hit_threshold)),
-    ] {
-        set_layer_property_storage(runtime, handle, name, Variant::Integer(value));
-    }
 }
 
 fn layer_stop_transition(
@@ -6169,11 +6128,27 @@ fn layer_update(
     // layer's completion pass, which is what drives a `selfupdate` transition
     // (`BeforeCompletion`, `LayerIntf.cpp:5056`).  The engine's pass is the
     // frame itself, so the script-driven step is applied to the phase here.
-    if let Some(callback) = runtime.host().transition_tick_callback(this) {
-        let tick = runtime.call_function(callback, Vec::new())?.to_integer()?;
-        runtime.host_mut().set_transition_tick(this, tick);
-    } else {
-        runtime.host_mut().advance_self_updated_transition(this);
+    // `UpdateTransDestinationOnSelfUpdate` (`:4828`) drives the *destination*
+    // when the source layer is the one being updated, so both ends are checked.
+    let mut destinations = Vec::new();
+    if runtime.host().transition_self_update(this) {
+        destinations.push(this);
+    } else if let Some(dest) = runtime.host().layer_transition_destination(this)
+        && runtime.host().transition_self_update(dest)
+    {
+        destinations.push(dest);
+    }
+    for dest in destinations {
+        // A non-self-updating transition already reads its tick once per frame
+        // in `refresh_transition_ticks`; only the self-updating ones are the
+        // script's to move (`BeforeCompletion` calls `GetTransTick` under
+        // `TransSelfUpdate` alone, `LayerIntf.cpp:5056`).
+        if let Some(callback) = runtime.host().transition_tick_callback(dest) {
+            let tick = runtime.call_function(callback, Vec::new())?.to_integer()?;
+            runtime.host_mut().set_transition_tick(dest, tick);
+        } else {
+            runtime.host_mut().advance_self_updated_transition(dest);
+        }
     }
     set_layer_property_storage(runtime, this, "callOnPaint", Variant::Integer(1));
     if !runtime.host_mut().request_layer_paint(this) {
@@ -7511,15 +7486,15 @@ fn finish_immediate_transition(
         .object_member(window, "transCount")
         .to_integer()
         .ok();
-    notify_transition_completed(runtime, layer, source)?;
+    // `InternalStopTransition` posts the event with `TVP_EPT_IMMEDIATE`
+    // (`LayerIntf.cpp:6420`), and `TVPPostEvent` drops it while event
+    // dispatching is disabled (`EventIntf.cpp:230-258`).
+    let deliver_event = !runtime.host().scheduler().event_disabled();
+    if deliver_event {
+        notify_transition_completed(runtime, layer, source)?;
+    }
     finish_kag_window_transition_if_pending(runtime, layer)?;
-    let callback_consumed_transition = trans_count_before.is_some_and(|before| {
-        runtime
-            .object_member(window, "transCount")
-            .to_integer()
-            .is_ok_and(|after| after != before)
-    });
-    if !callback_consumed_transition {
+    if deliver_event && !script_owns_transition_completion(runtime, window, trans_count_before) {
         runtime.set_object_member(layer, "inTransition", Variant::Integer(0));
         if let Some(trans_count) = trans_count_before {
             runtime.set_object_member(
@@ -7530,6 +7505,45 @@ fn finish_immediate_transition(
         }
     }
     Ok(())
+}
+
+/// Whether the script's own `onTransitionCompleted` relay took ownership of a
+/// completion.
+///
+/// KAG's relay decrements `window.transCount` (`KAGLayer.tjs`), so a plain
+/// counter comparison cannot tell "the callback consumed this completion" from
+/// "the callback consumed it and started a chained transition, restoring the
+/// counter" -- the net-zero case, where the fallback used to decrement a
+/// counter the script had already balanced and `waitTransition`
+/// (`MainWindow.tjs:3231`) then resumed early.  Ownership is therefore decided
+/// by a counter change *or* by another transition still running on the same
+/// window, which is what a chained `beginTransition` leaves behind.  Without
+/// ownership the engine keeps KAG's bookkeeping balanced on the script's
+/// behalf, which is the only way a transition no TJS class observes can finish
+/// a `[wt]`.
+fn script_owns_transition_completion(
+    runtime: &Runtime<KrkrHost>,
+    window: ObjectHandle,
+    trans_count_before: Option<i64>,
+) -> bool {
+    let window_of = |dest: ObjectHandle| {
+        variant_object(&layer_property_value(runtime, dest, "window"))
+            .map(|window| runtime.bound_this(window).unwrap_or(window))
+    };
+    if runtime
+        .host()
+        .transition_destinations()
+        .into_iter()
+        .any(|dest| window_of(dest) == Some(window))
+    {
+        return true;
+    }
+    trans_count_before.is_some_and(|before| {
+        runtime
+            .object_member(window, "transCount")
+            .to_integer()
+            .is_ok_and(|after| after != before)
+    })
 }
 
 pub(crate) fn finish_completed_native_transitions(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
@@ -7568,19 +7582,18 @@ pub(crate) fn finish_native_transition(
             .ok()
     });
 
-    notify_transition_completed(runtime, completion.dest, completion.source)?;
+    // `InternalStopTransition` posts the event with `TVP_EPT_IMMEDIATE`
+    // (`LayerIntf.cpp:6420`), and `TVPPostEvent` drops it while event
+    // dispatching is disabled (`EventIntf.cpp:230-258`).
+    let deliver_event = !runtime.host().scheduler().event_disabled();
+    if deliver_event {
+        notify_transition_completed(runtime, completion.dest, completion.source)?;
+    }
     finish_kag_window_transition_if_pending(runtime, completion.dest)?;
 
-    let callback_consumed_transition =
-        window
-            .zip(trans_count_before)
-            .is_some_and(|(window, before)| {
-                runtime
-                    .object_member(window, "transCount")
-                    .to_integer()
-                    .is_ok_and(|after| after != before)
-            });
-    if !callback_consumed_transition {
+    let owned = window
+        .is_some_and(|window| script_owns_transition_completion(runtime, window, trans_count_before));
+    if deliver_event && !owned {
         runtime.set_object_member(completion.dest, "inTransition", Variant::Integer(0));
         if let Some(window) = window
             && let Ok(trans_count) = runtime.object_member(window, "transCount").to_integer()
