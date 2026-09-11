@@ -1020,33 +1020,26 @@ impl Default for TransitionParams {
     }
 }
 
+/// One running transition as the presentation layer sees it.
+///
+/// Official KRKR keeps a transition per layer (`tTJSNI_BaseLayer::InTransition`,
+/// `LayerIntf.cpp:6334`) and the handler composites the destination and source
+/// bitmaps inside the destination layer's own rectangle
+/// (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6513-6540`).  `dest_rect` is that
+/// rectangle in frame coordinates, so unrelated layers can transition at the
+/// same time and each one only rewrites its own area.  `None` means the
+/// destination has no measurable geometry, and the composite then covers the
+/// whole frame (the engine's projection cannot confine it).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameTransition {
     pub method: String,
     pub progress: f32,
     pub params: TransitionParams,
+    pub dest_rect: Option<Rect>,
     pub rule_texture_id: Option<TextureId>,
     pub rule_image_upload: Option<ImageUpload>,
     pub frozen_draw_commands: Vec<DrawCommand>,
     pub frozen_image_uploads: Vec<ImageUpload>,
-}
-
-impl FrameTransition {
-    pub fn crossfade(
-        progress: f32,
-        frozen_draw_commands: Vec<DrawCommand>,
-        frozen_image_uploads: Vec<ImageUpload>,
-    ) -> Self {
-        Self {
-            method: "crossfade".to_string(),
-            progress: progress.clamp(0.0, 1.0),
-            params: TransitionParams::default(),
-            rule_texture_id: None,
-            rule_image_upload: None,
-            frozen_draw_commands,
-            frozen_image_uploads,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1059,7 +1052,9 @@ pub struct FrameOutput {
     /// can release their GPU/Canvas resources immediately instead of keeping
     /// every image ever seen by a long-running game.
     pub image_releases: Vec<TextureId>,
-    pub transition: Option<FrameTransition>,
+    /// Every transition running this frame, in start order.  Each entry is
+    /// composited inside its own `dest_rect` on top of `draw_commands`.
+    pub transitions: Vec<FrameTransition>,
 }
 
 impl FrameOutput {
@@ -1070,7 +1065,7 @@ impl FrameOutput {
             draw_commands,
             image_uploads: Vec::new(),
             image_releases: Vec::new(),
-            transition: None,
+            transitions: Vec::new(),
         }
     }
 
@@ -1084,8 +1079,8 @@ impl FrameOutput {
         self
     }
 
-    pub fn with_transition(mut self, transition: Option<FrameTransition>) -> Self {
-        self.transition = transition;
+    pub fn with_transitions(mut self, transitions: Vec<FrameTransition>) -> Self {
+        self.transitions = transitions;
         self
     }
 }
@@ -2285,21 +2280,20 @@ impl Engine {
         message: &MessageLayerModel,
         suppressed_images: &BTreeSet<LayerId>,
     ) -> FrameOutput {
-        let output =
-            self.running_layer_frame_output(input, layers, message, suppressed_images, None);
+        let output = self.running_layer_frame_output(input, layers, message, suppressed_images, None);
         self.finalize_frame_output(output)
     }
 
-    pub fn tick_running_with_layers_suppressing_images_and_transition(
+    pub fn tick_running_with_layers_suppressing_images_and_transitions(
         &mut self,
         input: FrameInput,
         layers: &LayerTree,
         message: &MessageLayerModel,
         suppressed_images: &BTreeSet<LayerId>,
-        transition: Option<FrameTransition>,
+        transitions: Vec<FrameTransition>,
     ) -> FrameOutput {
         let output =
-            self.running_layer_frame_output(input, layers, message, suppressed_images, transition);
+            self.running_layer_frame_output(input, layers, message, suppressed_images, transitions);
         self.finalize_frame_output(output)
     }
 
@@ -2309,7 +2303,7 @@ impl Engine {
         layers: &LayerTree,
         message: &MessageLayerModel,
         suppressed_images: &BTreeSet<LayerId>,
-        transition: Option<FrameTransition>,
+        transitions: impl IntoIterator<Item = FrameTransition>,
     ) -> FrameOutput {
         if !input.viewport_size.is_empty() {
             self.viewport_size = input.viewport_size;
@@ -2321,7 +2315,7 @@ impl Engine {
 
         FrameOutput::new(palette::RUNTIME_BACKGROUND, draw_commands)
             .with_image_uploads(image_uploads)
-            .with_transition(transition)
+            .with_transitions(transitions.into_iter().collect())
     }
 
     fn filter_new_image_uploads(&mut self, uploads: Vec<ImageUpload>) -> Vec<ImageUpload> {
@@ -2352,7 +2346,7 @@ impl Engine {
 
     fn finalize_frame_output(&mut self, mut output: FrameOutput) -> FrameOutput {
         output.image_uploads = self.filter_new_image_uploads(output.image_uploads);
-        if let Some(transition) = &mut output.transition {
+        for transition in &mut output.transitions {
             transition.frozen_image_uploads =
                 self.filter_new_image_uploads(std::mem::take(&mut transition.frozen_image_uploads));
             if let Some(upload) = transition.rule_image_upload.take() {
@@ -2362,7 +2356,7 @@ impl Engine {
         }
         let mut referenced_textures = BTreeSet::new();
         collect_image_texture_ids(&output.draw_commands, &mut referenced_textures);
-        if let Some(transition) = &output.transition {
+        for transition in &output.transitions {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced_textures);
             if let Some(texture_id) = transition.rule_texture_id {
                 referenced_textures.insert(texture_id);

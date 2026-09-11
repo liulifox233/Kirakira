@@ -676,7 +676,7 @@ fn prepare_terminal_frame(host: &KrkrHost, frame: &mut EngineFrame) {
         .filter(|command| matches!(command, DrawCommand::Image(_)))
         .collect();
     frame.output.image_uploads = image_uploads;
-    frame.output.transition = None;
+    frame.output.transitions.clear();
 }
 
 fn terminal_hidden_layer_ids(host: &KrkrHost) -> BTreeSet<LayerId> {

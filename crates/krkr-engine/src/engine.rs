@@ -1041,10 +1041,10 @@ impl KrkrEngine {
             .host_mut()
             .reapply_transition_live_layer_overrides();
         let suppressed_images = self.tjs_runtime.host().suppressed_transition_live_images();
-        let transition = self.tjs_runtime.host().frame_transition();
+        let transition = self.tjs_runtime.host().frame_transitions();
         let mut output = self
             .core_engine
-            .tick_running_with_layers_suppressing_images_and_transition(
+            .tick_running_with_layers_suppressing_images_and_transitions(
                 input.frame,
                 self.tjs_runtime.host().layer_tree(),
                 self.kag_session.message_layer(),
@@ -4805,7 +4805,7 @@ mod tests {
             )
             .expect("finish immediate transition");
 
-        assert!(frame.output.transition.is_none());
+        assert!(frame.output.transitions.is_empty());
         assert_eq!(
             engine
                 .execute_expression("inline.tjs", "win.completed")
@@ -8096,7 +8096,7 @@ mod tests {
         assert_eq!(frame.tick.state, KagTaskState::Finished);
         assert_eq!(engine.message_layer().lines, Vec::<String>::new());
         assert!(frame.output.image_uploads.is_empty());
-        assert!(frame.output.transition.is_none());
+        assert!(frame.output.transitions.is_empty());
         assert_eq!(
             engine.tjs_runtime().object_member(handler, "seen"),
             Variant::String("ch;image;trans;s;".to_string())
@@ -8652,7 +8652,7 @@ mod tests {
             .expect("start transition");
 
         assert_eq!(frame.tick.state, KagTaskState::WaitingTransition);
-        let transition = frame.output.transition.as_ref().expect("transition");
+        let transition = frame.output.transitions.first().expect("transition");
         assert_eq!(transition.method, "crossfade");
         assert_eq!(transition.progress, 0.0);
         assert!(transition.frozen_draw_commands.iter().any(|command| {
@@ -8680,8 +8680,8 @@ mod tests {
         assert_eq!(
             frame
                 .output
-                .transition
-                .as_ref()
+                .transitions
+                .first()
                 .map(|transition| transition.progress),
             Some(0.5)
         );
@@ -8693,7 +8693,7 @@ mod tests {
             )
             .expect("finish transition");
         assert_eq!(frame.tick.state, KagTaskState::Finished);
-        assert!(frame.output.transition.is_none());
+        assert!(frame.output.transitions.is_empty());
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -8729,7 +8729,7 @@ mod tests {
             )
             .expect("start transition");
 
-        let transition = frame.output.transition.as_ref().expect("transition");
+        let transition = frame.output.transitions.first().expect("transition");
         assert_eq!(transition.method, "universal");
         assert_eq!(
             transition.params.method,
@@ -8767,7 +8767,7 @@ mod tests {
             )
             .expect("start transition");
 
-        let transition = frame.output.transition.as_ref().expect("transition");
+        let transition = frame.output.transitions.first().expect("transition");
         assert_eq!(transition.method, "wave");
         assert_eq!(transition.params.method, krkr_core::TransitionMethod::Wave);
         assert_eq!(transition.params.wave_type, 2.0);
@@ -8816,7 +8816,7 @@ mod tests {
                     Duration::ZERO,
                 )
                 .expect("start transition");
-            let transition = frame.output.transition.as_ref().expect("transition");
+            let transition = frame.output.transitions.first().expect("transition");
             assert_eq!(transition.method, method);
             assert_eq!(transition.params.method, expected);
 
@@ -8849,7 +8849,7 @@ mod tests {
             .expect("start transition");
 
         assert_eq!(frame.tick.state, KagTaskState::WaitingTransition);
-        assert!(frame.output.transition.is_some());
+        assert!(!frame.output.transitions.is_empty());
         assert!(frame.output.draw_commands.iter().any(|command| {
             matches!(
                 command,
@@ -10117,7 +10117,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("transition frame");
-        let transition = frame.output.transition.as_ref().expect("transition");
+        let transition = frame.output.transitions.first().expect("transition");
         assert!(transition.frozen_draw_commands.iter().any(|command| {
             matches!(
                 command,
@@ -10196,7 +10196,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("transition frame");
-        let transition = frame.output.transition.as_ref().expect("transition");
+        let transition = frame.output.transitions.first().expect("transition");
         assert!(transition.frozen_draw_commands.iter().any(|command| {
             matches!(
                 command,
@@ -10274,7 +10274,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("transition frame");
-        let transition = frame.output.transition.as_ref().expect("transition");
+        let transition = frame.output.transitions.first().expect("transition");
         assert!(transition.frozen_draw_commands.iter().any(|command| {
             matches!(
                 command,
@@ -10340,7 +10340,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("transition frame");
-        let transition = frame.output.transition.as_ref().expect("transition");
+        let transition = frame.output.transitions.first().expect("transition");
         assert!(transition.frozen_draw_commands.iter().any(|command| {
             matches!(
                 command,
@@ -10427,7 +10427,7 @@ mod tests {
                 Duration::from_millis(1000),
             )
             .expect("complete transition");
-        assert!(frame.output.transition.is_none());
+        assert!(frame.output.transitions.is_empty());
         assert!(frame.output.draw_commands.iter().any(|command| {
             matches!(
                 command,
@@ -11395,7 +11395,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("update");
-        assert!(frame.output.transition.is_none());
+        assert!(frame.output.transitions.is_empty());
         assert_eq!(
             engine
                 .execute_expression(
@@ -11459,7 +11459,7 @@ mod tests {
                 Duration::from_millis(500),
             )
             .expect("mid update");
-        assert!(frame.output.transition.is_some());
+        assert!(!frame.output.transitions.is_empty());
         assert_eq!(
             engine
                 .execute_expression("inline.tjs", "dest.window.transCount")
@@ -11473,7 +11473,7 @@ mod tests {
                 Duration::from_millis(500),
             )
             .expect("finish update");
-        assert!(frame.output.transition.is_none());
+        assert!(frame.output.transitions.is_empty());
         assert_eq!(
             engine
                 .execute_expression(
@@ -11537,8 +11537,11 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// Official `tTJSNI_BaseLayer::StartTransition` (`LayerIntf.cpp:6188`): a
+    /// transition already running on the destination throws
+    /// `TVPCurrentTransitionMustBeStopping`, and the running one is untouched.
     #[test]
-    fn native_layer_replacing_transition_completes_previous_transition() {
+    fn native_layer_second_begin_transition_throws_while_one_is_running() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create temp root");
         write_png(root.join("old.png"), 1, 1, &[255, 0, 0, 255]);
@@ -11584,13 +11587,21 @@ mod tests {
                     dest.beginTransition("crossfade", true, source, %[time: 1000]);
                 }
                 startTransition("mid.png");
-                startTransition("new.png");
-                return dest.inTransition + ":" + dest.window.transCount + ":" + dest.window.completed + ":" + dest.imageWidth + ":" + dest.window.lastSourceWidth;
+                var thrown = "";
+                try {
+                    startTransition("new.png");
+                } catch(e) {
+                    thrown = e.message;
+                }
+                return dest.inTransition + ":" + dest.window.transCount + ":" + dest.window.completed + ":" + thrown;
                 "#,
             )
             .expect("script");
 
-        assert_eq!(result, Variant::String("1:1:1:3:2".to_string()));
+        assert_eq!(
+            result,
+            Variant::String("1:2:0:Current transition must be stopping".to_string())
+        );
 
         engine
             .update(
@@ -11605,7 +11616,139 @@ mod tests {
                     "dest.inTransition + ':' + dest.window.transCount + ':' + dest.window.completed + ':' + dest.window.lastSourceWidth"
                 )
                 .expect("completion"),
-            Variant::String("0:0:2:3".to_string())
+            Variant::String("1:1:1:2".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Official `tTJSNI_BaseLayer::StartTransition` (`LayerIntf.cpp:6193`):
+    /// starting a transition whose source is itself the destination of a
+    /// running transition throws `TVPTransitionMutualSource`.
+    #[test]
+    fn native_layer_mutual_source_transition_throws() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("face.png"), 2, 1, &[255; 8]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.front = new Layer();
+                front.loadImages("face.png");
+                front.visible = true;
+                global.back = new Layer();
+                back.loadImages("face.png");
+                back.visible = true;
+                front.beginTransition("crossfade", true, back, %[time: 1000]);
+                var thrown = "";
+                try {
+                    back.beginTransition("crossfade", true, front, %[time: 1000]);
+                } catch(e) {
+                    thrown = e.message;
+                }
+                return thrown;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            result,
+            Variant::String("Transition mutual source".to_string())
+        );
+        assert_eq!(engine.host().active_transition_count(), 1);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Two unrelated layers run their own transition at the same time
+    /// (`tTJSNI_BaseLayer::InTransition` is per layer, `LayerIntf.cpp:6334`),
+    /// each completing on its own clock.
+    #[test]
+    fn native_layers_transition_concurrently_on_separate_clocks() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("face.png"), 2, 1, &[255; 8]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.window = %[completed: 0, firstDone: -1, secondDone: -1];
+                function make() {
+                    var layer = new Layer();
+                    layer.loadImages("face.png");
+                    layer.visible = true;
+                    layer.inTransition = true;
+                    return layer;
+                }
+                global.shortDest = make();
+                global.shortSrc = make();
+                shortDest.onTransitionCompleted = function(dest, src) {
+                    this.inTransition = false;
+                    this.window.completed++;
+                    this.window.firstDone = this.window.completed;
+                };
+                shortDest.window = window;
+                global.longDest = make();
+                global.longSrc = make();
+                longDest.onTransitionCompleted = function(dest, src) {
+                    this.inTransition = false;
+                    this.window.completed++;
+                    this.window.secondDone = this.window.completed;
+                };
+                longDest.window = window;
+                shortDest.beginTransition("crossfade", true, shortSrc, %[time: 100]);
+                longDest.beginTransition("crossfade", true, longSrc, %[time: 500]);
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.05), Vec::new()),
+                Duration::from_millis(50),
+            )
+            .expect("first update");
+        assert_eq!(frame.output.transitions.len(), 2);
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.10), Vec::new()),
+                Duration::from_millis(50),
+            )
+            .expect("second update");
+        // Only the short transition is over; the long one keeps running on its
+        // own destination layer.
+        assert_eq!(frame.output.transitions.len(), 1);
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "window.completed + ':' + shortDest.inTransition + ':' + longDest.inTransition"
+                )
+                .expect("state"),
+            Variant::String("1:0:1".to_string())
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.55), Vec::new()),
+                Duration::from_millis(450),
+            )
+            .expect("third update");
+        assert!(frame.output.transitions.is_empty());
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "window.completed + ':' + window.firstDone + ':' + window.secondDone"
+                )
+                .expect("state"),
+            Variant::String("2:1:2".to_string())
         );
 
         fs::remove_dir_all(root).expect("cleanup");
@@ -11660,7 +11803,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("update");
-        assert!(frame.output.transition.is_none());
+        assert!(frame.output.transitions.is_empty());
 
         fs::remove_dir_all(root).expect("cleanup");
     }

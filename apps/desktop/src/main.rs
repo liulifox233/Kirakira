@@ -556,8 +556,8 @@ impl DesktopApp {
                 }
             }
             let transition = frame
-                .transition
-                .as_ref()
+                .transitions
+                .first()
                 .map(|value| (value.method.clone(), value.frozen_draw_commands.len()));
             let runtime_state = self.runtime.as_ref().map(|runtime| {
                 (

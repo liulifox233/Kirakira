@@ -332,34 +332,7 @@ impl Renderer {
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        if let Some(transition) = &prepared.transition {
-            let old_target = self.create_offscreen_target("Kirakira transition frozen target");
-            let new_target = self.create_offscreen_target("Kirakira transition live target");
-            self.render_commands_to_view(
-                &mut encoder,
-                &old_target.view,
-                "Kirakira transition frozen pass",
-                frame.clear_color,
-                None,
-                &transition.frozen_draw_commands,
-            );
-            self.render_commands_to_view(
-                &mut encoder,
-                &new_target.view,
-                "Kirakira transition live pass",
-                frame.clear_color,
-                frame.clip,
-                &prepared.draw_commands,
-            );
-            self.render_transition_to_view(
-                &mut encoder,
-                &view,
-                frame.clear_color,
-                &old_target.view,
-                &new_target.view,
-                transition,
-            );
-        } else {
+        if prepared.transitions.is_empty() {
             self.render_commands_to_view(
                 &mut encoder,
                 &view,
@@ -368,6 +341,47 @@ impl Renderer {
                 frame.clip,
                 &prepared.draw_commands,
             );
+        } else {
+            // The live tree is drawn first; each transition then replaces only
+            // its own destination rectangle (`tTVPDivisibleData::Dest`,
+            // `LayerIntf.cpp:6513`), so unrelated layers keep drawing normally
+            // while their neighbours transition.
+            self.render_commands_to_view(
+                &mut encoder,
+                &view,
+                "Kirakira render pass",
+                frame.clear_color,
+                frame.clip,
+                &prepared.draw_commands,
+            );
+            let new_target = self.create_offscreen_target("Kirakira transition live target");
+            self.render_commands_to_view(
+                &mut encoder,
+                &new_target.view,
+                "Kirakira transition live pass",
+                frame.clear_color,
+                frame.clip,
+                &prepared.draw_commands,
+            );
+            for transition in &prepared.transitions {
+                let old_target = self.create_offscreen_target("Kirakira transition frozen target");
+                self.render_commands_to_view(
+                    &mut encoder,
+                    &old_target.view,
+                    "Kirakira transition frozen pass",
+                    frame.clear_color,
+                    None,
+                    &transition.frozen_draw_commands,
+                );
+                self.render_transition_to_view(
+                    &mut encoder,
+                    &view,
+                    transition.dest_rect,
+                    &old_target.view,
+                    &new_target.view,
+                    transition,
+                );
+            }
         }
 
         let capture_path = self.capture_path.take();
@@ -514,20 +528,25 @@ impl Renderer {
 
         let (draw_commands, mut image_uploads) = self.prepare_commands(&frame.draw_commands);
         image_uploads.extend(frame.image_uploads.iter().cloned());
-        let transition = frame.transition.as_ref().map(|transition| {
-            let (frozen_draw_commands, mut frozen_image_uploads) =
-                self.prepare_commands(&transition.frozen_draw_commands);
-            frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
-            FrameTransition {
-                method: transition.method.clone(),
-                progress: transition.progress,
-                params: transition.params.clone(),
-                rule_texture_id: transition.rule_texture_id,
-                rule_image_upload: transition.rule_image_upload.clone(),
-                frozen_draw_commands,
-                frozen_image_uploads,
-            }
-        });
+        let transitions = frame
+            .transitions
+            .iter()
+            .map(|transition| {
+                let (frozen_draw_commands, mut frozen_image_uploads) =
+                    self.prepare_commands(&transition.frozen_draw_commands);
+                frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
+                FrameTransition {
+                    method: transition.method.clone(),
+                    progress: transition.progress,
+                    params: transition.params.clone(),
+                    dest_rect: transition.dest_rect,
+                    rule_texture_id: transition.rule_texture_id,
+                    rule_image_upload: transition.rule_image_upload.clone(),
+                    frozen_draw_commands,
+                    frozen_image_uploads,
+                }
+            })
+            .collect();
 
         FrameOutput {
             clear_color: frame.clear_color,
@@ -535,7 +554,7 @@ impl Renderer {
             draw_commands,
             image_uploads,
             image_releases: frame.image_releases.clone(),
-            transition,
+            transitions,
         }
     }
 
@@ -585,7 +604,7 @@ impl Renderer {
 
     fn upload_frame_images(&mut self, frame: &FrameOutput) {
         self.upload_images(&frame.image_uploads);
-        if let Some(transition) = &frame.transition {
+        for transition in &frame.transitions {
             self.upload_images(&transition.frozen_image_uploads);
             if let Some(upload) = &transition.rule_image_upload {
                 self.upload_images(std::slice::from_ref(upload));
@@ -665,7 +684,7 @@ impl Renderer {
     fn retain_frame_textures(&mut self, frame: &FrameOutput) {
         let mut referenced = BTreeSet::new();
         collect_image_texture_ids(&frame.draw_commands, &mut referenced);
-        if let Some(transition) = &frame.transition {
+        for transition in &frame.transitions {
             collect_image_texture_ids(&transition.frozen_draw_commands, &mut referenced);
             if let Some(texture_id) = transition.rule_texture_id {
                 referenced.insert(texture_id);
@@ -714,11 +733,21 @@ impl Renderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        clear_color: Color,
+        dest_rect: Option<Rect>,
         old_view: &wgpu::TextureView,
         new_view: &wgpu::TextureView,
         transition: &FrameTransition,
     ) {
+        // A transition whose destination has no measurable geometry covers the
+        // whole frame; otherwise only the destination layer's own area is
+        // rewritten and the live frame stays visible everywhere else.
+        let clip = match dest_rect {
+            Some(rect) => match self.physical_rect(rect) {
+                Some(clip) => Some(clip),
+                None => return,
+            },
+            None => None,
+        };
         let uniforms = transition_uniforms(
             transition,
             self.config.width.max(1) as f32,
@@ -777,7 +806,10 @@ impl Renderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu_color(clear_color)),
+                    // The live frame is already on the surface; the transition
+                    // only rewrites its destination rectangle, so the rest of
+                    // the frame survives untouched.
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -786,6 +818,9 @@ impl Renderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some(clip) = clip {
+            pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        }
         self.draw_transition_fullscreen(&mut pass, &bind_group);
     }
 

@@ -21,7 +21,7 @@ use krkr_tjs2::{
 
 use crate::host::{
     CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KagLayerSlot, KrkrHost,
-    LayerRenderTarget, NativeTransitionCompletion, TraceCategory,
+    LayerRenderTarget, NativeTransitionCompletion, NativeTransitionStart, TraceCategory,
 };
 use crate::resource_manager::decode_province_image;
 use crate::scheduler::AsyncTriggerMode;
@@ -4324,7 +4324,6 @@ fn layer_begin_transition(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    finish_current_transition(runtime)?;
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
@@ -4336,6 +4335,15 @@ fn layer_begin_transition(
         source.filter(|source| native_layer_id(runtime, *source).ok().flatten().is_some())
     else {
         return Err(TjsError::runtime("Specify layer"));
+    };
+    // `tTJSNI_BaseLayer::StartTransition` (`LayerIntf.cpp:6188-6196`): a
+    // transition already running on this layer, or one whose source is this
+    // layer, is a script error rather than an implicit replacement.
+    if runtime.host().layer_in_transition(this) {
+        return Err(TjsError::runtime("Current transition must be stopping"));
+    }
+    if runtime.host().layer_transition_source(source) == Some(this) {
+        return Err(TjsError::runtime("Transition mutual source"));
     };
     let with_children = args
         .get(1)
@@ -4439,21 +4447,34 @@ fn layer_begin_transition(
             .host_mut()
             .restore_transition_live_overrides(&live_layer_overrides, &live_layer_restore);
     } else {
-        runtime.host_mut().begin_native_transition(
-            Duration::from_millis(duration),
-            transition_params,
-            rule_image_upload,
-            frozen,
-            suppressed_images,
-            live_layer_overrides,
-            live_layer_restore,
-            NativeTransitionCompletion {
-                dest: this,
-                source: Some(source),
-                paired_comp,
-                with_children,
-            },
-        );
+        // `tTransDrawable::DrawCompleted` (`LayerIntf.cpp:6575`) composites the
+        // two faces inside the destination's own draw rectangle, which is what
+        // lets unrelated layers keep drawing while this one transitions.
+        let dest_rect = native_layer_id(runtime, this)?.and_then(|layer_id| {
+            runtime
+                .host()
+                .transition_destination_rect(layer_id, with_children)
+        });
+        runtime
+            .host_mut()
+            .begin_native_transition(NativeTransitionStart {
+                duration: Duration::from_millis(duration),
+                params: transition_params,
+                rule_image_upload,
+                frozen_draw_commands: frozen.0,
+                frozen_image_uploads: frozen.1,
+                suppressed_live_images: suppressed_images,
+                live_layer_overrides,
+                live_layer_restore,
+                dest_rect,
+                self_update: false,
+                completion: NativeTransitionCompletion {
+                    dest: this,
+                    source: Some(source),
+                    paired_comp,
+                    with_children,
+                },
+            });
     }
     Ok(Variant::Void)
 }
@@ -4705,7 +4726,7 @@ fn layer_stop_transition(
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer method requires this"))?;
-    runtime.host_mut().complete_native_transition_for(this);
+    runtime.host_mut().stop_transition_for(this);
     finish_completed_native_transitions(runtime)?;
     Ok(Variant::Void)
 }
@@ -7463,11 +7484,6 @@ fn finish_immediate_transition(
         }
     }
     Ok(())
-}
-
-fn finish_current_transition(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
-    runtime.host_mut().complete_active_transition();
-    finish_completed_native_transitions(runtime)
 }
 
 pub(crate) fn finish_completed_native_transitions(runtime: &mut Runtime<KrkrHost>) -> Result<()> {

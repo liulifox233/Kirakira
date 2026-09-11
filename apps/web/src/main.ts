@@ -817,17 +817,39 @@ if (wasmUrl) {
       }
       context.restore();
     };
-    const transition = model.transition;
-    if (transition) {
-      uploadTextures(transition.frozenUploads, transitionTextures);
-      uploadTextures(transition.ruleUploads, transitionTextures);
-      const progress = Math.max(0, Math.min(1, Number(transition.progress ?? 1)));
-      // Canvas2D does not implement every KRKR transition shader. Rendering
-      // the frozen frame beneath the live frame is a deterministic crossfade
-      // fallback for universal/scroll/wave/etc. and, importantly, avoids the
-      // abrupt black/flash frame of the old fallback.
-      drawCommands(transition.frozenDrawList, 1 - progress, transitionTextures);
-      drawCommands(model.drawList, progress);
+    const transitions = Array.isArray(model.transitions) ? model.transitions : [];
+    if (transitions.length > 0) {
+      // The live frame is the base; each transition then rewrites only its own
+      // destination rectangle, which keeps unrelated layers visible
+      // (`tTransDrawable::DrawCompleted`, LayerIntf.cpp:6575).
+      drawCommands(model.drawList, 1);
+      for (const transition of transitions) {
+        uploadTextures(transition.frozenUploads, transitionTextures);
+        uploadTextures(transition.ruleUploads, transitionTextures);
+        const progress = Math.max(0, Math.min(1, Number(transition.progress ?? 1)));
+        const rect = transition.destRect;
+        context.save();
+        context.beginPath();
+        if (rect) {
+          context.rect(rect.x, rect.y, rect.width, rect.height);
+        } else {
+          context.rect(0, 0, canvas.width, canvas.height);
+        }
+        context.clip();
+        // Canvas2D does not implement every KRKR transition shader. Rendering
+        // the frozen frame beneath the live frame is a deterministic crossfade
+        // fallback for universal/scroll/wave/etc., and, importantly, avoids the
+        // abrupt black/flash frame of the old fallback.
+        context.globalAlpha = 1;
+        if (rect) {
+          context.clearRect(rect.x, rect.y, rect.width, rect.height);
+        } else {
+          context.clearRect(0, 0, canvas.width, canvas.height);
+        }
+        drawCommands(transition.frozenDrawList, 1 - progress, transitionTextures);
+        drawCommands(model.drawList, progress);
+        context.restore();
+      }
     } else {
       transitionTextures.clear();
       drawCommands(model.drawList, 1);

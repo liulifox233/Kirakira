@@ -1137,41 +1137,59 @@ impl WebRuntime {
             "kagState",
             &format!("{:?}", frame.engine.tick.state),
         )?;
-        if let Some(transition) = &output.transition {
-            set_str(&model, "transitionMethod", &transition.method)?;
-            set_num(&model, "transitionProgress", transition.progress as f64)?;
+        if let Some(first) = output.transitions.first() {
+            set_str(&model, "transitionMethod", &first.method)?;
+            set_num(&model, "transitionProgress", first.progress as f64)?;
             set_num(
                 &model,
                 "transitionFrozenDraws",
-                transition.frozen_draw_commands.len() as f64,
+                first.frozen_draw_commands.len() as f64,
             )?;
-            let transition_model = js_sys::Object::new();
-            set_str(&transition_model, "method", &transition.method)?;
-            set_num(&transition_model, "progress", transition.progress as f64)?;
-            let frozen_draws = draw_commands_to_js(&transition.frozen_draw_commands)?;
-            js_sys::Reflect::set(
-                &transition_model,
-                &wasm_bindgen::JsValue::from_str("frozenDrawList"),
-                &frozen_draws,
-            )?;
-            let frozen_uploads = image_uploads_to_js(&transition.frozen_image_uploads)?;
-            js_sys::Reflect::set(
-                &transition_model,
-                &wasm_bindgen::JsValue::from_str("frozenUploads"),
-                &frozen_uploads,
-            )?;
-            if let Some(upload) = &transition.rule_image_upload {
-                let rule_uploads = image_uploads_to_js(std::slice::from_ref(upload))?;
+        }
+        if !output.transitions.is_empty() {
+            let transitions = js_sys::Array::new();
+            for transition in &output.transitions {
+                let transition_model = js_sys::Object::new();
+                set_str(&transition_model, "method", &transition.method)?;
+                set_num(&transition_model, "progress", transition.progress as f64)?;
+                if let Some(rect) = transition.dest_rect {
+                    let rect_model = js_sys::Object::new();
+                    set_num(&rect_model, "x", rect.x as f64)?;
+                    set_num(&rect_model, "y", rect.y as f64)?;
+                    set_num(&rect_model, "width", rect.width as f64)?;
+                    set_num(&rect_model, "height", rect.height as f64)?;
+                    js_sys::Reflect::set(
+                        &transition_model,
+                        &wasm_bindgen::JsValue::from_str("destRect"),
+                        &rect_model,
+                    )?;
+                }
+                let frozen_draws = draw_commands_to_js(&transition.frozen_draw_commands)?;
                 js_sys::Reflect::set(
                     &transition_model,
-                    &wasm_bindgen::JsValue::from_str("ruleUploads"),
-                    &rule_uploads,
+                    &wasm_bindgen::JsValue::from_str("frozenDrawList"),
+                    &frozen_draws,
                 )?;
+                let frozen_uploads = image_uploads_to_js(&transition.frozen_image_uploads)?;
+                js_sys::Reflect::set(
+                    &transition_model,
+                    &wasm_bindgen::JsValue::from_str("frozenUploads"),
+                    &frozen_uploads,
+                )?;
+                if let Some(upload) = &transition.rule_image_upload {
+                    let rule_uploads = image_uploads_to_js(std::slice::from_ref(upload))?;
+                    js_sys::Reflect::set(
+                        &transition_model,
+                        &wasm_bindgen::JsValue::from_str("ruleUploads"),
+                        &rule_uploads,
+                    )?;
+                }
+                transitions.push(&transition_model);
             }
             js_sys::Reflect::set(
                 &model,
-                &wasm_bindgen::JsValue::from_str("transition"),
-                &transition_model,
+                &wasm_bindgen::JsValue::from_str("transitions"),
+                &transitions,
             )?;
         }
         set_num(
