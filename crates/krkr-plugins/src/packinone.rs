@@ -1003,8 +1003,15 @@ mod tests {
         engine.register_plugin(PackinOnePlugin).expect("plugin");
         engine.set_external_resource_catalog(["title_first.func"]);
 
+        // `csvProbe` has to outlive this script: the calls below are separate
+        // executions and read it back through the global object.  An
+        // unqualified store cannot create a name (`tTJSCustomObject::PropSet`
+        // adds a member only under `TJS_MEMBERENSURE`, `tjsObject.cpp:1500-1505`,
+        // and the compiler emits flags 0 for it), so the global receiver is
+        // spelled out -- the same reason KRKR's own scripts write
+        // `global.foo = ...`.
         let result = engine
-            .execute_script("inline.tjs", "csvProbe = new CSVParser();")
+            .execute_script("inline.tjs", "global.csvProbe = new CSVParser();")
             .expect("CSV parser allocation");
         assert_eq!(result, Variant::Void);
         let result = engine
