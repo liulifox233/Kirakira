@@ -11407,6 +11407,223 @@ mod tests {
         );
     }
 
+    /// The visibility stop is driven by the destination layer, not by the
+    /// script-side completion payload, so the engine's own KAG page transition
+    /// obeys it too (`tTJSNI_BaseLayer::InvokeTransition`, `LayerIntf.cpp:6463`).
+    #[test]
+    fn kag_transition_stops_when_the_destination_layer_hides() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.host_mut().mutate_kag_layer("back", "base", |layer| {
+            layer.visible = true;
+            layer.width = 320.0;
+            layer.height = 240.0;
+        });
+        engine.host_mut().begin_kag_transition(
+            Duration::from_millis(1000),
+            TransitionParams::default(),
+            None,
+        );
+        assert!(engine.host().has_active_transition());
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.1), Vec::new()),
+                Duration::from_millis(100),
+            )
+            .expect("update");
+        assert_eq!(frame.output.transitions.len(), 1);
+
+        let dest_layer = engine
+            .host_mut()
+            .ensure_kag_layer("fore", "base");
+        engine
+            .host_mut()
+            .layer_tree_mut()
+            .layer_mut(dest_layer)
+            .expect("kag base layer")
+            .visible = false;
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.2), Vec::new()),
+                Duration::from_millis(100),
+            )
+            .expect("update");
+        assert!(frame.output.transitions.is_empty());
+        assert!(!engine.host().has_active_transition());
+    }
+
+    /// Official `tTJSNI_BaseLayer::StopTransitionByHandler` (`LayerIntf.cpp:6440`)
+    /// with `TVPEventDisabled` set (`System.eventDisabled`): the handler cannot
+    /// stop the transition yet, so the completion is deferred to the next update
+    /// that runs with event dispatching enabled (`InvokeTransition`, `:6455`).
+    #[test]
+    fn handler_stop_is_deferred_while_events_are_disabled() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 2, 1, &[255; 8]);
+        write_png(root.join("new.png"), 2, 1, &[0; 8]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.loadImages("new.png");
+                source.visible = true;
+                global.dest = new Layer();
+                dest.loadImages("old.png");
+                dest.visible = true;
+                dest.inTransition = true;
+                dest.window = %[completed: 0];
+                dest.onTransitionCompleted = function(d, s) {
+                    this.inTransition = false;
+                    this.window.completed++;
+                };
+                dest.beginTransition("crossfade", true, source, %[time: 100]);
+                System.eventDisabled = true;
+                "#,
+            )
+            .expect("script");
+
+        // The transition reaches its time while dispatching is disabled: the
+        // stop is prevented and nothing is fired.
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.2), Vec::new()),
+                Duration::from_millis(200),
+            )
+            .expect("update");
+        assert_eq!(frame.output.transitions.len(), 1);
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "dest.window.completed")
+                .expect("completion"),
+            Variant::Integer(0)
+        );
+
+        // A second disabled pass keeps it frozen instead of advancing.
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.3), Vec::new()),
+                Duration::from_millis(100),
+            )
+            .expect("update");
+        let transition = frame.output.transitions.first().expect("still running");
+        assert_eq!(transition.progress, 1.0);
+
+        engine
+            .execute_script("inline.tjs", "System.eventDisabled = false;")
+            .expect("enable events");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.4), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(frame.output.transitions.is_empty());
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "dest.window.completed + ':' + dest.inTransition"
+                )
+                .expect("completion"),
+            Variant::String("1:0".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `stopTransition()` runs `InternalStopTransition` directly
+    /// (`LayerIntf.cpp:6437`), so a disabled event gate does not defer it.
+    #[test]
+    fn manual_stop_transition_ignores_the_event_gate() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 2, 1, &[255; 8]);
+        write_png(root.join("new.png"), 2, 1, &[0; 8]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.loadImages("new.png");
+                source.visible = true;
+                global.dest = new Layer();
+                dest.loadImages("old.png");
+                dest.visible = true;
+                dest.inTransition = true;
+                dest.window = %[completed: 0];
+                dest.onTransitionCompleted = function(d, s) {
+                    this.inTransition = false;
+                    this.window.completed++;
+                };
+                dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                System.eventDisabled = true;
+                dest.stopTransition();
+                return dest.window.completed + ":" + dest.inTransition;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "dest.window.completed + ':' + dest.inTransition"
+                )
+                .expect("completion"),
+            Variant::String("1:0".to_string())
+        );
+        assert_eq!(engine.host().active_transition_count(), 0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A transition never leaves its destination layer's rectangle
+    /// (`tTransDrawable::DrawCompleted`, `LayerIntf.cpp:6575`), so the frame
+    /// carries the destination's own bounds and unrelated layers stay visible.
+    #[test]
+    fn native_layer_transition_is_confined_to_its_destination_rect() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 2, 1, &[255; 8]);
+        write_png(root.join("new.png"), 2, 1, &[0; 8]);
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.loadImages("new.png");
+                source.visible = true;
+                global.dest = new Layer();
+                dest.loadImages("old.png");
+                dest.visible = true;
+                dest.setPos(30, 40, 2, 1);
+                dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.1), Vec::new()),
+                Duration::from_millis(100),
+            )
+            .expect("update");
+        let transition = frame.output.transitions.first().expect("transition");
+        assert_eq!(
+            transition.dest_rect,
+            Some(krkr_core::Rect::new(30.0, 40.0, 2.0, 1.0))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn native_layer_timed_transition_completes_through_update() {
         let root = temp_root();

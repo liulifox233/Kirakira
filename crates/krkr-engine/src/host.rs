@@ -3348,7 +3348,7 @@ impl KrkrHost {
             let transition = &mut self.active_transitions[index];
             transition.elapsed = transition.elapsed.saturating_add(delta);
             if !dest_visible || transition.elapsed >= transition.duration {
-                self.stop_transition_at(index, TransitionStop::ByHandler);
+                self.stop_transition_by_handler(index);
                 continue;
             }
             index += 1;
