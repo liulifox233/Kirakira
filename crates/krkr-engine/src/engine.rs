@@ -11373,7 +11373,7 @@ mod tests {
         assert_eq!(
             result,
             Variant::String(
-                "Specify layer|Specify layer|Transition layer size mismatch: 2x1 and 32x32|\
+                "Specify Layer class object|Specify Layer class object|Transition layer size mismatch: 2x1 and 32x32|\
                  Transition source and destination must have image|Specify option: time|\
                  Specify option: rule"
                     .to_string()

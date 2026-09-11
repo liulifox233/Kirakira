@@ -14,8 +14,7 @@ use krkr_core::{
 };
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
-
-    Result, TjsError,
+    Result, TjsError, TjsErrorKind,
     runtime::{Closure, ObjectHandle, Runtime, TjsHost, Variant},
 };
 
@@ -1794,7 +1793,7 @@ fn layer_native_property_set(
         if let Some(parent) = parent
             && runtime.host().native_layer(parent).is_none()
         {
-            return Err(TjsError::runtime("Specify layer"));
+            return Err(TjsError::runtime("Specify Layer class object"));
         }
     }
     if name == "hasImage" {
@@ -3949,14 +3948,23 @@ fn transition_params_from_options(
     }
 
     // `tTVPUniversalTransHandlerProvider::GetTransitionObject`
-    // (`TransIntf.cpp:777`): the rule graphic is required.
+    // (`TransIntf.cpp:777`): the rule graphic is required and its load failure
+    // is reported as `TVPCannotLoadRuleGraphic` (`:784`).
     let rule_image_upload = if params.method == TransitionMethod::Universal {
         let Some(rule) =
             object_optional_string(runtime, options, "rule")?.filter(|rule| !rule.is_empty())
         else {
             return Err(TjsError::runtime("Specify option: rule"));
         };
-        Some(runtime.host_mut().load_image_storage(&rule)?.upload)
+        match runtime.host_mut().load_image_storage(&rule) {
+            Ok(image) => Some(image.upload),
+            Err(error) if error.kind == TjsErrorKind::ResourcePending => return Err(error),
+            Err(_) => {
+                return Err(TjsError::runtime(format!(
+                    "Cannot load rule graphics {rule}"
+                )));
+            }
+        }
     } else {
         None
     };
@@ -4222,7 +4230,7 @@ fn layer_assign_images(
         .and_then(variant_object)
         .filter(|source| native_layer_id(runtime, *source).ok().flatten().is_some())
     else {
-        return Err(TjsError::runtime("Specify layer"));
+        return Err(TjsError::runtime("Specify Layer class object"));
     };
     if let Some(target) = target {
         copy_layer_images(runtime, this, &target, source)?;
@@ -4359,7 +4367,7 @@ fn layer_begin_transition(
     let Some(source) =
         source.filter(|source| native_layer_id(runtime, *source).ok().flatten().is_some())
     else {
-        return Err(TjsError::runtime("Specify layer"));
+        return Err(TjsError::runtime("Specify Layer class object"));
     };
     // `tTJSNI_BaseLayer::StartTransition` (`LayerIntf.cpp:6188-6196`): a
     // transition already running on this layer, or one whose source is this
