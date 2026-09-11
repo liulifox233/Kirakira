@@ -28,10 +28,10 @@ pub(super) struct DispatchFlags {
     hidden: bool,
     no_bound_instance_fallback: bool,
     /// A lookup that may legitimately miss and wants `void` back instead of
-    /// the script-facing "member not found" error. Used by the class-chain and
-    /// proxy walks inside the dispatcher and by host-side reads
-    /// (`resolve_object_member`), which mirror the C++ side of KRKR and treat
-    /// `TJS_E_MEMBERNOTFOUND` as "absent".
+    /// the script-facing `Member "%1" does not exist` error. Used by the
+    /// class-chain and proxy walks inside the dispatcher and by host-side
+    /// reads (`resolve_object_member`), which mirror the C++ side of KRKR and
+    /// treat `TJS_E_MEMBERNOTFOUND` as "absent".
     probe: bool,
 }
 
@@ -349,8 +349,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     // A direct member call can resolve a lazy property getter
                     // before invoking the returned value.  When that getter
                     // suspends on an external resource, the dispatch layer
-                    // observes a temporary `void` callee and reports
-                    // "void is not callable".  Park the caller and retry the
+                    // observes a temporary `void` callee and reports the object
+                    // conversion failure.  Park the caller and retry the
                     // complete call instruction once the getter's nested
                     // stack has resumed, just like the property-read path
                     // above.  Native calls do not return an error while a
@@ -402,9 +402,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                             caught,
                             // Keep the structured call/member and stack
                             // context in debugger output. Printing only the
-                            // leaf message (`void is not callable`) hides
-                            // which callback or method supplied the bad
-                            // callee.
+                            // leaf message hides which callback or method
+                            // supplied the bad callee.
                             message: error.to_string(),
                         };
                         let object_index = match self.runtime.heap.get(call_frame.object_handle.0) {

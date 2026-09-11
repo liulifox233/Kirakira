@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::bytecode::{BytecodeContextType, CallArgs, CodeObject, Instruction};
 use crate::compiler::compile_source_to_bytecode;
-use crate::error::{Result, TjsError, TjsErrorKind, TjsMemberAccess, TjsMemberOperation};
+use crate::error::{Result, TjsError, TjsMemberAccess, TjsMemberOperation};
 use crate::runtime::builtins::{regexp_object_handle, regexp_regex};
 use crate::runtime::{
     Closure, Object, ObjectHandle, ObjectKind, TjsHost, Variant, split_delimited_string,
@@ -14,7 +14,8 @@ use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
 
 impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// Host-side member read that mirrors the C++ side of KRKR: a missing
-    /// member is `void`, never the script-facing "member not found" error.
+    /// member is `void`, never the script-facing `Member "%1" does not exist`
+    /// error.
     pub(crate) fn get_object_member_probe(
         &mut self,
         object: ObjectHandle,
@@ -32,8 +33,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         match self.materialize_code_object(value) {
             Variant::Object(handle) => Ok(handle),
             Variant::Closure(closure) => Ok(closure.object),
-            Variant::Null => Err(TjsError::runtime("null object access")),
-            other => Err(TjsError::runtime(format!("{other} is not an object"))),
+            Variant::Null => Err(TjsError::null_access()),
+            other => Err(TjsError::variant_convert_to_object(&other)),
         }
     }
 
@@ -44,8 +45,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         match self.materialize_code_object(value) {
             Variant::Object(handle) => Ok((handle, None)),
             Variant::Closure(closure) => Ok((closure.object, closure.this_obj)),
-            Variant::Null => Err(TjsError::runtime("null object access")),
-            other => Err(TjsError::runtime(format!("{other} is not an object"))),
+            Variant::Null => Err(TjsError::null_access()),
+            other => Err(TjsError::variant_convert_to_object(&other)),
         }
     }
 
@@ -387,8 +388,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .array_negative_index_after_wrap(name)
         {
             // `tTJSArrayObject::PropSetByNum` (`tjsArray.cpp:1634`) fails such
-            // a write instead of creating a member named `-n`.
-            return Err(TjsError::runtime(format!("member `{name}` not found")));
+            // a write instead of creating a member named `-n`, and it reports
+            // `TJS_E_MEMBERNOTFOUND`: the failure is a miss, not a storage
+            // error, so the kind is the one the class-chain walks branch on.
+            return Err(TjsError::member_not_found(name));
         }
         let value = self.materialize_code_object(value);
         self.runtime.heap[handle.0].set(name, value);
@@ -397,9 +400,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
 
     /// A read that fell through every lookup.  Official
     /// `tTJSCustomObject::PropGet` reports `TJS_E_MEMBERNOTFOUND`, which
-    /// `TJSThrowFrom_tjs_error` turns into the script error "member not
-    /// found" (`tjsError.cpp:238`); only a TJS `Dictionary` maps a missing
-    /// member back to void (`tTJSDictionaryObject::PropGet`,
+    /// `TJSThrowFrom_tjs_error` turns into the script error `Member "%1" does
+    /// not exist` (`tjsError.cpp:240-244`); only a TJS `Dictionary` maps a
+    /// missing member back to void (`tTJSDictionaryObject::PropGet`,
     /// `tjsDictionary.cpp:721`).  Host-side probes and the dispatcher's own
     /// chain walks raise `flags.probe` and get void, mirroring the C++ side of
     /// KRKR, which treats `TJS_E_MEMBERNOTFOUND` as "absent".
@@ -419,10 +422,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if is_dictionary && !flags.must_exist {
             return Ok(Variant::Void);
         }
-        Err(TjsError::new(
-            TjsErrorKind::MemberNotFound,
-            format!("member `{name}` not found"),
-        ))
+        Err(TjsError::member_not_found(name))
     }
 
     fn call_get_missing(&mut self, handle: ObjectHandle, name: &str) -> Result<Option<Variant>> {
@@ -556,9 +556,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     effective_this,
                 );
             }
-            return Err(TjsError::runtime("property has no getter"));
+            // A script `property` with no getter denies reads:
+            // `tTJSInterCodeContext::PropGet` answers `TJS_E_ACCESSDENYED`
+            // when `PropGetter` is null (`tjsInterCodeExec.cpp:3138`).
+            return Err(TjsError::access_denied());
         }
-        if let ObjectKind::NativeProperty { id } = kind {
+        if let ObjectKind::NativeProperty { id, access } = kind {
+            if !access.allows_get() {
+                // An official read-only or write-only property answers
+                // `TJS_E_ACCESSDENYED` without running the accessor
+                // (`tjsInterCodeExec.cpp:3138`).
+                return Err(TjsError::access_denied());
+            }
             let property = self
                 .runtime
                 .native_properties
@@ -593,9 +602,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 self.execute_file_object_with_this(file_id, setter, vec![value], effective_this)?;
                 return Ok(());
             }
-            return Err(TjsError::runtime("property has no setter"));
+            // `tTJSInterCodeContext::PropSet` answers `TJS_E_ACCESSDENYED`
+            // when `PropSetter` is null (`tjsInterCodeExec.cpp:3172`).
+            return Err(TjsError::access_denied());
         }
-        if let ObjectKind::NativeProperty { id } = kind {
+        if let ObjectKind::NativeProperty { id, access } = kind {
+            if !access.allows_set() {
+                return Err(TjsError::access_denied());
+            }
             let property = self
                 .runtime
                 .native_properties
@@ -631,6 +645,20 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 context: BytecodeContextType::Property,
             } => {
                 let file = self.runtime.script_file(file_id)?;
+                // A script `property` with no getter answers
+                // `TJS_E_ACCESSDENYED` through the default-property protocol
+                // (`TJSDefaultPropGet` forwards everything but
+                // NOTIMPL/INVALIDTYPE/INVALIDOBJECT, `tjsObject.cpp:1376-1379`),
+                // which is what [`Vm::default_prop_get`] implements for the
+                // `*property` operator.
+                //
+                // This member-read path deliberately keeps handing the
+                // property object back instead, because the engine's KAGEX
+                // support reads a freshly defined setter-only property to get
+                // that object (`objectHookInjection`'s
+                // `var t1 = this.prop; ("property prop {...}")!;
+                //  l0[l5] = t1 incontextof l4`, pinned by
+                // `krkr-engine`'s `layer_font_reads_back_bound_to_the_font_like_krkr`).
                 let Some(getter) = file.objects[object_index].prop_getter else {
                     return Ok(None);
                 };
@@ -642,7 +670,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     effective_this,
                 )?))
             }
-            ObjectKind::NativeProperty { id } => {
+            ObjectKind::NativeProperty { id, access } => {
+                if !access.allows_get() {
+                    return Err(TjsError::access_denied());
+                }
                 let property = self
                     .runtime
                     .native_properties
@@ -672,14 +703,22 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 context: BytecodeContextType::Property,
             } => {
                 let file = self.runtime.script_file(file_id)?;
+                // Same default-property protocol on the write side: a
+                // `property` with no setter denies the write
+                // (`TJSDefaultPropSet`, `tjsObject.cpp:1435-1438`,
+                // `tjsInterCodeExec.cpp:3172`) instead of letting the write
+                // overwrite the property object with a plain value.
                 let Some(setter) = file.objects[object_index].prop_setter else {
-                    return Ok(None);
+                    return Err(TjsError::access_denied());
                 };
                 let effective_this = self.effective_member_this(closure_this, caller_this)?;
                 self.execute_file_object_with_this(file_id, setter, vec![value], effective_this)?;
                 Ok(Some(()))
             }
-            ObjectKind::NativeProperty { id } => {
+            ObjectKind::NativeProperty { id, access } => {
+                if !access.allows_set() {
+                    return Err(TjsError::access_denied());
+                }
                 let property = self
                     .runtime
                     .native_properties
@@ -1104,6 +1143,22 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let bind_this = self.bound_super_this(handle, caller_this)?;
         let member = self.bind_proxy_value(member, bind_this);
         let callee_type = self.value_debug_type(&member);
+        // `TJSDefaultFuncCall` (`tjsObject.cpp:1280-1312`) forwards a member
+        // call only when the member *is* an object; every other value type is
+        // `TJS_E_INVALIDTYPE` (-1005).  Calling a value rather than a named
+        // member (`VM_CALL`) converts the callee instead
+        // (`tjsInterCodeExec.cpp:2365`), which is why the two call forms
+        // report different failures for the same non-object callee.
+        if !matches!(member, Variant::Closure(_) | Variant::Object(_)) {
+            return Err(
+                TjsError::invalid_type().with_member_access(TjsMemberAccess {
+                    operation: TjsMemberOperation::Calling,
+                    receiver_type,
+                    member_name: name.to_string(),
+                    callee_type: Some(callee_type),
+                }),
+            );
+        }
         // `CallFunctionDirect` (`tjsInterCodeExec.cpp:2406`) resolves the
         // member with `objthis = clo.ObjThis ? clo.ObjThis : ra[-1]` -- the
         // *object expression*'s own ObjThis, else the caller's `this`.  The
@@ -1713,7 +1768,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             Variant::Object(handle) => {
                 self.call_handle(handle, this_obj, args, is_new, continuation)
             }
-            other => Err(TjsError::runtime(format!("{other} is not callable"))),
+            // `VM_CALL` converts the callee with `AsObjectClosure()`
+            // (`tjsInterCodeExec.cpp:2365`), so a value that is not an object
+            // fails the conversion before any call happens; a null object
+            // closure (`clo.Object == NULL`) is the null-access failure
+            // (`tjsVariant.h:228-237`).  Only an *object* that is not callable
+            // reaches `tTJSCustomObject::FuncCall`, which answers
+            // `TJS_E_INVALIDTYPE` (-1005).
+            Variant::Null => Err(TjsError::null_access()),
+            other => Err(TjsError::variant_convert_to_object(&other)),
         }
     }
 
@@ -1734,6 +1797,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             } => {
                 if is_new {
                     self.create_new_inter_code(file_id, object_index, context, args, continuation)
+                } else if context == BytecodeContextType::Property {
+                    // A property object is not a function:
+                    // `tTJSInterCodeContext::FuncCall` with no member name
+                    // answers `TJS_E_INVALIDTYPE` for `ctProperty`
+                    // (`tjsInterCodeExec.cpp:3100-3101`).
+                    Err(TjsError::invalid_type())
                 } else if context == BytecodeContextType::Class {
                     if let Some(instance) = this_obj.filter(|handle| *handle != self.runtime.global)
                     {
@@ -1768,7 +1837,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     )?)))
                 }
             }
-            ObjectKind::NativeFunction { id, constructable } => {
+            ObjectKind::NativeFunction {
+                id,
+                constructable,
+                arg_count,
+            } => {
+                if !arg_count.accepts(args.len()) {
+                    // The declaration's argument-count contract is checked
+                    // before the handler runs, the way every official native
+                    // checks `numparams` first (`LayerIntf.cpp:7835`).
+                    return Err(TjsError::bad_param_count());
+                }
                 let function = self
                     .runtime
                     .native_functions
@@ -1788,7 +1867,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     continuation,
                 ))
             }
-            ObjectKind::VmNativeFunction { id } => {
+            ObjectKind::VmNativeFunction { id, arg_count } => {
+                if !arg_count.accepts(args.len()) {
+                    return Err(TjsError::bad_param_count());
+                }
                 let function = self
                     .runtime
                     .vm_native_functions
@@ -1816,8 +1898,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 }
             }
             ObjectKind::Ordinary | ObjectKind::Array { .. } | ObjectKind::NativeProperty { .. } => {
-                let object_type = self.object_debug_type(handle, "object");
-                Err(TjsError::runtime(format!("{object_type} is not callable")))
+                // A data object is not callable; the reference reports
+                // `TJS_E_INVALIDTYPE` (-1005) for the attempt.
+                Err(TjsError::invalid_type())
             }
         }
     }
@@ -2067,11 +2150,23 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             "toString" => Ok(Variant::String(value)),
             "escape" => Ok(Variant::String(escape_tjs_string_fragment(&value))),
             "sprintf" => Ok(Variant::String(sprintf_tjs_string(&value, &args)?)),
-            "toLowerCase" => Ok(Variant::String(string_to_ascii_lowercase(&value))),
-            "toUpperCase" => Ok(Variant::String(string_to_ascii_uppercase(&value))),
+            "toLowerCase" => {
+                // Official: `if(numargs != 0) TJSThrowFrom_tjs_error(
+                // TJS_E_BADPARAMCOUNT)` (`tjsInterCodeExec.cpp:2659`).
+                if !args.is_empty() {
+                    return Err(TjsError::bad_param_count());
+                }
+                Ok(Variant::String(string_to_ascii_lowercase(&value)))
+            }
+            "toUpperCase" => {
+                if !args.is_empty() {
+                    return Err(TjsError::bad_param_count());
+                }
+                Ok(Variant::String(string_to_ascii_uppercase(&value)))
+            }
             "charAt" => {
                 if args.len() != 1 {
-                    return Err(TjsError::runtime("String.charAt requires one argument"));
+                    return Err(TjsError::bad_param_count());
                 }
                 let index = args[0].to_integer()?;
                 let Some(ch) = usize::try_from(index)
@@ -2083,6 +2178,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 Ok(Variant::String(ch.to_string()))
             }
             "substr" | "substring" => {
+                // Official accepts one or two arguments
+                // (`tjsInterCodeExec.cpp:2697`).
+                if args.is_empty() || args.len() > 2 {
+                    return Err(TjsError::bad_param_count());
+                }
                 let start = args
                     .first()
                     .map(Variant::to_integer)
@@ -2100,6 +2200,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 ))
             }
             "replace" => {
+                // Official: `if(numargs < 2) TJSThrowFrom_tjs_error(
+                // TJS_E_BADPARAMCOUNT)` (`tjsInterCodeExec.cpp:2739`).
+                if args.len() < 2 {
+                    return Err(TjsError::bad_param_count());
+                }
                 let Some(pattern) = args.first() else {
                     return Ok(Variant::String(value));
                 };
@@ -2111,6 +2216,11 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 self.string_replace(&value, pattern, &replacement)
             }
             "indexOf" => {
+                // Official accepts one or two arguments
+                // (`tjsInterCodeExec.cpp:2612`).
+                if args.is_empty() || args.len() > 2 {
+                    return Err(TjsError::bad_param_count());
+                }
                 let needle = args
                     .first()
                     .map(Variant::to_tjs_string)
@@ -2138,10 +2248,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 Ok(Variant::Integer(string_last_index_of(&value, &needle, end)))
             }
             "split" => {
+                // Official: `if(numargs < 1) TJSThrowFrom_tjs_error(
+                // TJS_E_BADPARAMCOUNT)` (`tjsInterCodeExec.cpp:2761`).
                 let Some(pattern) = args.first() else {
-                    return Err(TjsError::runtime(
-                        "String.split requires a delimiter argument",
-                    ));
+                    return Err(TjsError::bad_param_count());
                 };
                 let purge_empty = args
                     .get(2)
@@ -2165,22 +2275,23 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 Ok(Variant::Object(array))
             }
             "trim" => {
+                // Official: `if(numargs != 0)` (`tjsInterCodeExec.cpp:2798`).
                 if !args.is_empty() {
-                    return Err(TjsError::runtime("String.trim does not accept arguments"));
+                    return Err(TjsError::bad_param_count());
                 }
                 Ok(Variant::String(trim_tjs_ascii_space(&value).to_string()))
             }
             "reverse" => {
+                // Official: `if(numargs != 0)` (`tjsInterCodeExec.cpp:2822`).
                 if !args.is_empty() {
-                    return Err(TjsError::runtime(
-                        "String.reverse does not accept arguments",
-                    ));
+                    return Err(TjsError::bad_param_count());
                 }
                 Ok(Variant::String(value.chars().rev().collect()))
             }
             "repeat" => {
+                // Official: `if(numargs != 1)` (`tjsInterCodeExec.cpp:2844`).
                 if args.len() != 1 {
-                    return Err(TjsError::runtime("String.repeat requires one argument"));
+                    return Err(TjsError::bad_param_count());
                 }
                 let count = args[0].to_integer()?;
                 if count <= 0 || value.is_empty() {
@@ -2188,9 +2299,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 }
                 Ok(Variant::String(value.repeat(count as usize)))
             }
-            _ => Err(TjsError::runtime(format!(
-                "string method `{name}` not found"
-            ))),
+            // `ProcessStringFunction` reports an unknown string method as
+            // `TJS_E_MEMBERNOTFOUND` with the member name
+            // (`tjsInterCodeExec.cpp:2869`), not as a method-specific error.
+            _ => Err(TjsError::member_not_found(name)),
         }
     }
 
@@ -2228,9 +2340,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         name: &str,
         _args: Vec<Variant>,
     ) -> Result<Variant> {
-        Err(TjsError::runtime(format!(
-            "octet method `{name}` not found"
-        )))
+        // `ProcessOctetFunction` mirrors the string path: an unknown octet
+        // method is `TJS_E_MEMBERNOTFOUND` with the member name
+        // (`tjsInterCodeExec.cpp:2896`).
+        Err(TjsError::member_not_found(name))
     }
 
     fn receiver_this(&self, handle: ObjectHandle) -> ObjectHandle {
@@ -2372,7 +2485,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             Variant::Object(handle) => Ok(Some(handle)),
             Variant::Closure(closure) => Ok(Some(closure.object)),
             Variant::Null => Ok(None),
-            other => Err(TjsError::runtime(format!("{other} is not an object"))),
+            other => Err(TjsError::variant_convert_to_object(&other)),
         }
     }
 
@@ -3010,4 +3123,439 @@ fn escape_tjs_string_fragment(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::compiler::compile_source_to_bytecode;
+    use crate::error::TjsErrorKind;
+    use crate::runtime::{NativeArgCount, NativePropertyAccess, NoHost, Runtime};
+
+    use super::*;
+
+    fn run(source: &str) -> Result<Variant> {
+        let file = compile_source_to_bytecode("dispatch-test.tjs", source).expect("compile");
+        Runtime::new().execute_file(&file)
+    }
+
+    fn run_with(runtime: &mut Runtime<NoHost>, source: &str) -> Result<Variant> {
+        let file = compile_source_to_bytecode("dispatch-test.tjs", source).expect("compile");
+        runtime.execute_file(&file)
+    }
+
+    fn failure(source: &str) -> TjsError {
+        run(source).expect_err("script should fail")
+    }
+
+    fn vm_with(runtime: &mut Runtime<NoHost>) -> Vm<'_, '_, NoHost> {
+        let file = compile_source_to_bytecode("dispatch-test.tjs", "return 0;").expect("compile");
+        let file_id = runtime.install_script_file(Arc::new(file));
+        Vm::new(file_id, runtime).expect("vm")
+    }
+
+    /// A VM-native handler needs a named function: a closure is not generic
+    /// over the VM's lifetimes, which is what [`VmNativeFunction`] requires.
+    /// [`NativeFunction`] is equally higher-ranked over `&mut Runtime`, so the
+    /// native handlers below are named functions too.
+    fn vm_native_void(
+        _vm: &mut Vm<'_, '_, NoHost>,
+        _this_obj: Option<ObjectHandle>,
+        _args: Vec<Variant>,
+    ) -> Result<Variant> {
+        Ok(Variant::Void)
+    }
+
+    fn native_void(
+        _runtime: &mut Runtime<NoHost>,
+        _this_obj: Option<ObjectHandle>,
+        _args: Vec<Variant>,
+    ) -> Result<Variant> {
+        Ok(Variant::Void)
+    }
+
+    #[test]
+    fn missing_member_read_reports_the_official_member_not_found_text() {
+        let error = failure("return no_such_global;");
+        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+        assert_eq!(error.tjs_error_code(), Some(-1001));
+        assert_eq!(error.message, "Member \"no_such_global\" does not exist");
+        assert!(error.is_member_not_found());
+    }
+
+    #[test]
+    fn negative_array_index_write_reports_member_not_found() {
+        // `tTJSArrayObject::PropSetByNum` (`tjsArray.cpp:1647`) reports the
+        // unwrappable index as TJS_E_MEMBERNOTFOUND, and the name the message
+        // carries is the index itself (`ThrowFrom_tjs_error_num`).
+        let error = failure("var a = new Array(); a[-1] = 5;");
+        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+        assert_eq!(error.message, "Member \"-1\" does not exist");
+        assert!(error.is_member_not_found());
+    }
+
+    #[test]
+    fn unknown_string_method_reports_member_not_found() {
+        let error = failure("return \"abc\".bogusMethod();");
+        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+        assert_eq!(error.message, "Member \"bogusMethod\" does not exist");
+    }
+
+    #[test]
+    fn unknown_octet_method_reports_member_not_found() {
+        let mut runtime = Runtime::new();
+        let mut vm = vm_with(&mut runtime);
+        let error = match vm.call_member_direct_cont(
+            Variant::Octet(vec![1, 2, 3]),
+            "bogusMethod",
+            Vec::new(),
+            None,
+            Continuation::Root,
+        ) {
+            Ok(_) => panic!("octet method should be missing"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+        assert_eq!(error.message, "Member \"bogusMethod\" does not exist");
+    }
+
+    #[test]
+    fn calling_a_non_function_value_reports_the_convert_error() {
+        // `VM_CALL` converts the callee with `AsObjectClosure()`
+        // (`tjsInterCodeExec.cpp:2365`), so a value that is not an object
+        // fails that conversion rather than reaching `FuncCall`.
+        let error = failure("var value = 5; return value();");
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((int)5 to Object)"
+        );
+        assert_eq!(error.tjs_error_code(), None);
+    }
+
+    #[test]
+    fn calling_a_null_value_reports_the_null_access() {
+        let error = failure("var value = null; return value();");
+        assert_eq!(error.message, "Accessing to null object");
+    }
+
+    #[test]
+    fn calling_a_property_object_reports_invalid_type() {
+        // `tTJSInterCodeContext::FuncCall` answers `TJS_E_INVALIDTYPE` for a
+        // property context (`tjsInterCodeExec.cpp:3100-3101`).
+        let error = failure(
+            "class Holder {\n\
+             \x20   property Value {\n\
+             \x20       setter(value) { this.stored = value; }\n\
+             \x20   }\n\
+             }\n\
+             var holder = new Holder();\n\
+             var accessor = holder.Value;\n\
+             return accessor();",
+        );
+        assert_eq!(error.kind, TjsErrorKind::InvalidType, "{}", error.message);
+        assert_eq!(
+            error.message,
+            "Not a function or invalid method/property type"
+        );
+    }
+
+    #[test]
+    fn calling_a_data_member_reports_invalid_type() {
+        let error = failure(
+            "class Holder { }\nvar holder = new Holder(); holder.member = 5;\nreturn holder.member();",
+        );
+        assert_eq!(error.kind, TjsErrorKind::InvalidType);
+        assert_eq!(
+            error.message,
+            "Not a function or invalid method/property type"
+        );
+    }
+
+    #[test]
+    fn null_member_access_reports_the_official_null_text() {
+        let error = failure("var value = null; return value.member;");
+        assert_eq!(error.message, "Accessing to null object");
+        assert_eq!(error.tjs_error_code(), None);
+    }
+
+    #[test]
+    fn non_object_member_access_reports_the_convert_error() {
+        // `TJSThrowVariantConvertError` renders the value with
+        // `TJSVariantToReadableString`, which tags the type.
+        let error = failure("var value = 5; return value.member;");
+        assert_eq!(
+            error.message,
+            "Cannot convert the variable type ((int)5 to Object)"
+        );
+    }
+
+    #[test]
+    fn readable_conversion_renders_each_value_shape() {
+        assert_eq!(
+            failure("var value = 1.5; return value.member;").message,
+            "Cannot convert the variable type ((real)1.5 to Object)"
+        );
+        // A write reaches the conversion for a void value too: only the read
+        // path treats a void target as an absent member.
+        assert_eq!(
+            failure("var value; value.member = 1;").message,
+            "Cannot convert the variable type ((void) to Object)"
+        );
+    }
+
+    #[test]
+    fn property_without_a_getter_denies_the_default_property_read() {
+        // The `*property` operator is the reference's default-property
+        // dereference (`VM_GETP`, `tjsInterCodeExec.cpp:1664` ->
+        // `PropGet(0, NULL, ...)`), and a script `property` with no getter
+        // answers `TJS_E_ACCESSDENYED` there
+        // (`tjsInterCodeExec.cpp:3138`).
+        let error = failure(
+            "class Holder {\n\
+             \x20   property Value {\n\
+             \x20       setter(value) { this.stored = value; }\n\
+             \x20   }\n\
+             }\n\
+             var holder = new Holder();\n\
+             var accessor = holder.Value;\n\
+             return *accessor;",
+        );
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
+        assert_eq!(error.tjs_error_code(), Some(-1007));
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
+
+        // A native property with a denied getter reaches the same check on the
+        // same dereference path.
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        let accessor = runtime.register_object_native_property_with_access(
+            target,
+            "children",
+            NativePropertyAccess::WriteOnly,
+            |_runtime, _this| Ok(Variant::Integer(7)),
+            |_runtime, _this, _value| Ok(()),
+        );
+        let file = compile_source_to_bytecode("dispatch-test.tjs", "return 0;").expect("compile");
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
+        let error = vm
+            .default_prop_get(Variant::Object(accessor), None)
+            .expect_err("denied read");
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
+    }
+
+    #[test]
+    fn property_without_a_setter_denies_the_default_property_write() {
+        // `VM_SETP` (`tjsInterCodeExec.cpp:1676`) is the reference's
+        // `PropSet(0, NULL, ...)`, which a property with a denied setter
+        // answers with `TJS_E_ACCESSDENYED`.  Script code cannot pass a
+        // property object through a local (`var a = &obj.prop;` re-reads the
+        // member and invokes the property), so the dereference is driven
+        // through the VM directly.
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        let accessor = runtime.register_object_native_property_with_access(
+            target,
+            "children",
+            NativePropertyAccess::ReadOnly,
+            |_runtime, _this| Ok(Variant::Integer(7)),
+            |_runtime, _this, _value| Ok(()),
+        );
+        let file = compile_source_to_bytecode("dispatch-test.tjs", "return 0;").expect("compile");
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
+        let error = vm
+            .default_prop_set(Variant::Object(accessor), Variant::Integer(5), None)
+            .expect_err("denied write");
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{}", error.message);
+        assert_eq!(error.tjs_error_code(), Some(-1007));
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
+    }
+
+    #[test]
+    fn member_read_hands_a_script_property_object_back() {
+        // Reading the member itself does not dereference the property: the
+        // engine hands the property object back, which is how KAGEX's
+        // `objectHookInjection` obtains the property it installs on another
+        // object (`krkr-engine`'s
+        // `layer_font_reads_back_bound_to_the_font_like_krkr` pins it).
+        let value = run("class Holder {\n\
+             \x20   property Value {\n\
+             \x20       setter(value) { this.stored = value; }\n\
+             \x20   }\n\
+             }\n\
+             var holder = new Holder();\n\
+             return holder.Value;")
+        .expect("read");
+        assert!(
+            matches!(value, Variant::Closure(_) | Variant::Object(_)),
+            "expected the property object, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn property_without_a_setter_denies_writes() {
+        let error = failure(
+            "class Holder {\n\
+             \x20   property Value {\n\
+             \x20       getter() { return 5; }\n\
+             \x20   }\n\
+             }\n\
+             var holder = new Holder();\n\
+             holder.Value = 5;",
+        );
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
+    }
+
+    #[test]
+    fn read_only_native_property_denies_script_writes() {
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        runtime.register_object_native_property_with_access(
+            target,
+            "children",
+            NativePropertyAccess::ReadOnly,
+            |_runtime, _this| Ok(Variant::Integer(7)),
+            |_runtime, _this, _value| Ok(()),
+        );
+
+        assert_eq!(
+            run_with(&mut runtime, "return target.children;").expect("read"),
+            Variant::Integer(7)
+        );
+        let error = run_with(&mut runtime, "target.children = 1;").expect_err("denied write");
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
+        assert_eq!(error.tjs_error_code(), Some(-1007));
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
+
+        // The denial is a script-facing policy, not a torn-down accessor:
+        // restoring the access gives the setter back.
+        let Variant::Object(property) = runtime.object_member(target, "children") else {
+            panic!("children should be a native property object");
+        };
+        assert_eq!(
+            runtime.native_property_access(property),
+            Some(NativePropertyAccess::ReadOnly)
+        );
+        assert!(runtime.set_native_property_access(property, NativePropertyAccess::ReadWrite));
+        run_with(&mut runtime, "target.children = 1;").expect("write after restoring access");
+    }
+
+    #[test]
+    fn write_only_native_property_denies_script_reads() {
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        runtime.register_object_native_property_with_access(
+            target,
+            "writeonly",
+            NativePropertyAccess::WriteOnly,
+            |_runtime, _this| Ok(Variant::Integer(1)),
+            |_runtime, _this, _value| Ok(()),
+        );
+        let error = run_with(&mut runtime, "return target.writeonly;").expect_err("denied read");
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
+        run_with(&mut runtime, "target.writeonly = 1;").expect("write");
+    }
+
+    #[test]
+    fn deny_list_marks_registered_properties_read_only() {
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        runtime.register_object_native_property(
+            target,
+            "children",
+            |_runtime, _this| Ok(Variant::Integer(1)),
+            |_runtime, _this, _value| Ok(()),
+        );
+        runtime.register_object_native_property(
+            target,
+            "nodeVisible",
+            |_runtime, _this| Ok(Variant::Integer(1)),
+            |_runtime, _this, _value| Ok(()),
+        );
+        runtime.set_object_member(target, "plain", Variant::Integer(0));
+
+        let unmatched = runtime
+            .deny_native_property_writes(target, &["children", "nodeVisible", "plain", "nope"]);
+        assert_eq!(unmatched, vec!["plain".to_string(), "nope".to_string()]);
+
+        for name in ["children", "nodeVisible"] {
+            let error =
+                run_with(&mut runtime, &format!("target.{name} = 1;")).expect_err("denied write");
+            assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{name}");
+        }
+        run_with(&mut runtime, "target.plain = 1;").expect("data members stay writable");
+        run_with(&mut runtime, "return target.children;").expect("getter still works");
+    }
+
+    #[test]
+    fn declared_argument_counts_fail_with_bad_param_count() {
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        runtime.register_object_native_with_arg_count(
+            target,
+            "assignImages",
+            NativeArgCount::AtLeast(1),
+            native_void,
+        );
+        runtime.register_object_native_with_arg_count(
+            target,
+            "exact",
+            NativeArgCount::Exactly(2),
+            native_void,
+        );
+        runtime.register_object_vm_native_with_arg_count(
+            target,
+            "vmMethod",
+            NativeArgCount::Exactly(1),
+            vm_native_void,
+        );
+
+        let error = run_with(&mut runtime, "target.assignImages();").expect_err("too few");
+        assert_eq!(error.kind, TjsErrorKind::BadParamCount);
+        assert_eq!(error.tjs_error_code(), Some(-1004));
+        assert_eq!(error.message, "Invalid argument count");
+
+        for source in [
+            "target.exact();",
+            "target.exact(1);",
+            "target.exact(1, 2, 3);",
+            "target.vmMethod();",
+            "target.vmMethod(1, 2);",
+        ] {
+            let error = run_with(&mut runtime, source).expect_err(source);
+            assert_eq!(error.kind, TjsErrorKind::BadParamCount, "{source}");
+            assert_eq!(error.message, "Invalid argument count", "{source}");
+        }
+
+        run_with(&mut runtime, "target.assignImages(1);").expect("declared minimum");
+        run_with(&mut runtime, "target.exact(1, 2);").expect("declared exact count");
+        run_with(&mut runtime, "target.vmMethod(1);").expect("declared vm count");
+    }
 }

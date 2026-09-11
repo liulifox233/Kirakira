@@ -608,7 +608,16 @@ mod tests {
         // `tTJSCustomObject::PropGet` instead of yielding void.  Two generated
         // programs read a member the other form does not, so the two runs
         // raise different messages and the pair no longer compares equal.
-        const KNOWN_FAILURES: usize = 34;
+        //
+        // 34 -> 33: error identity (official codes and texts).  Runs are
+        // compared by message (`fuzz.rs:534`), and the old text for calling a
+        // non-callable object embedded the receiver (`Array<Array>#60 is not
+        // callable`), so two runs that failed the same way compared unequal
+        // because their handles differed.  The official text names no
+        // receiver, so that pair now compares equal.  Measured by dumping the
+        // failure set before and after: exactly that one program (the
+        // `b.x |= [%[]](false)` corpus entry) left the set.
+        const KNOWN_FAILURES: usize = 33;
         let mut covered = BTreeSet::new();
         let mut failures = Vec::new();
         let mut total = 0usize;
@@ -636,6 +645,10 @@ mod tests {
         println!(
             "fuzz: corpus emitted {} distinct opcodes; never emitted: {missing:?}",
             covered.len()
+        );
+        println!(
+            "fuzz: {} failures against the recorded baseline of {KNOWN_FAILURES}",
+            failures.len()
         );
         for failure in failures.iter().take(3) {
             eprintln!("fuzz failure:\n{failure}");

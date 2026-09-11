@@ -13,7 +13,7 @@ pub mod object;
 pub(crate) mod tjs_ns0;
 pub mod value;
 
-pub use self::object::{Object, ObjectKind};
+pub use self::object::{NativeArgCount, NativePropertyAccess, Object, ObjectKind};
 pub use self::value::{Closure, ObjectHandle, Variant};
 
 pub(crate) fn split_delimited_string(
@@ -346,21 +346,59 @@ impl<H: TjsHost + 'static> Runtime<H> {
     where
         F: NativeFunction<H> + 'static,
     {
-        self.alloc_native(function, false)
+        self.alloc_native(function, false, NativeArgCount::Any)
+    }
+
+    /// Registers a native function together with its declared argument-count
+    /// contract; a call that breaks it fails with `TJS_E_BADPARAMCOUNT`
+    /// (-1004) before the handler runs.
+    pub fn alloc_native_function_with_arg_count<F>(
+        &mut self,
+        arg_count: NativeArgCount,
+        function: F,
+    ) -> ObjectHandle
+    where
+        F: NativeFunction<H> + 'static,
+    {
+        self.alloc_native(function, false, arg_count)
     }
 
     pub fn alloc_native_constructor<F>(&mut self, function: F) -> ObjectHandle
     where
         F: NativeFunction<H> + 'static,
     {
-        self.alloc_native(function, true)
+        self.alloc_native(function, true, NativeArgCount::Any)
+    }
+
+    /// See [`Runtime::alloc_native_function_with_arg_count`].
+    pub fn alloc_native_constructor_with_arg_count<F>(
+        &mut self,
+        arg_count: NativeArgCount,
+        function: F,
+    ) -> ObjectHandle
+    where
+        F: NativeFunction<H> + 'static,
+    {
+        self.alloc_native(function, true, arg_count)
     }
 
     pub fn alloc_vm_native_function<F>(&mut self, function: F) -> ObjectHandle
     where
         F: VmNativeFunction<H> + 'static,
     {
-        self.alloc_vm_native(function)
+        self.alloc_vm_native(function, NativeArgCount::Any)
+    }
+
+    /// See [`Runtime::alloc_native_function_with_arg_count`].
+    pub fn alloc_vm_native_function_with_arg_count<F>(
+        &mut self,
+        arg_count: NativeArgCount,
+        function: F,
+    ) -> ObjectHandle
+    where
+        F: VmNativeFunction<H> + 'static,
+    {
+        self.alloc_vm_native(function, arg_count)
     }
 
     pub fn register_global_native<F>(
@@ -371,7 +409,20 @@ impl<H: TjsHost + 'static> Runtime<H> {
     where
         F: NativeFunction<H> + 'static,
     {
-        let handle = self.alloc_native(function, false);
+        self.register_global_native_with_arg_count(name, NativeArgCount::Any, function)
+    }
+
+    /// See [`Runtime::alloc_native_function_with_arg_count`].
+    pub fn register_global_native_with_arg_count<F>(
+        &mut self,
+        name: impl Into<String>,
+        arg_count: NativeArgCount,
+        function: F,
+    ) -> ObjectHandle
+    where
+        F: NativeFunction<H> + 'static,
+    {
+        let handle = self.alloc_native(function, false, arg_count);
         let name = name.into();
         self.name_native_call(handle, self.global, &name);
         self.heap[self.global.0].set(name, Variant::Object(handle));
@@ -387,7 +438,24 @@ impl<H: TjsHost + 'static> Runtime<H> {
     where
         F: NativeFunction<H> + 'static,
     {
-        let handle = self.alloc_native(function, false);
+        self.register_object_native_with_arg_count(object, name, NativeArgCount::Any, function)
+    }
+
+    /// See [`Runtime::alloc_native_function_with_arg_count`]. Native methods
+    /// whose official declaration validates `numparams` belong here, so the
+    /// check is expressed once at the registration site instead of being
+    /// repeated inside every handler.
+    pub fn register_object_native_with_arg_count<F>(
+        &mut self,
+        object: ObjectHandle,
+        name: impl Into<String>,
+        arg_count: NativeArgCount,
+        function: F,
+    ) -> ObjectHandle
+    where
+        F: NativeFunction<H> + 'static,
+    {
+        let handle = self.alloc_native(function, false, arg_count);
         let name = name.into();
         self.name_native_call(handle, object, &name);
         self.heap[object.0].set(name, Variant::Object(handle));
@@ -403,7 +471,21 @@ impl<H: TjsHost + 'static> Runtime<H> {
     where
         F: VmNativeFunction<H> + 'static,
     {
-        let handle = self.alloc_vm_native(function);
+        self.register_object_vm_native_with_arg_count(object, name, NativeArgCount::Any, function)
+    }
+
+    /// See [`Runtime::register_object_native_with_arg_count`].
+    pub fn register_object_vm_native_with_arg_count<F>(
+        &mut self,
+        object: ObjectHandle,
+        name: impl Into<String>,
+        arg_count: NativeArgCount,
+        function: F,
+    ) -> ObjectHandle
+    where
+        F: VmNativeFunction<H> + 'static,
+    {
+        let handle = self.alloc_vm_native(function, arg_count);
         let name = name.into();
         self.name_native_call(handle, object, &name);
         self.heap[object.0].set(name, Variant::Object(handle));
@@ -423,7 +505,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
                     *slot = Some(qualified);
                 }
             }
-            ObjectKind::VmNativeFunction { id } => {
+            ObjectKind::VmNativeFunction { id, .. } => {
                 if let Some(slot) = self.native_call_trace.vm_native_names.get_mut(id) {
                     *slot = Some(qualified);
                 }
@@ -528,9 +610,100 @@ impl<H: TjsHost + 'static> Runtime<H> {
         G: Fn(&mut Runtime<H>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync + 'static,
         S: Fn(&mut Runtime<H>, Option<ObjectHandle>, Variant) -> Result<()> + Send + Sync + 'static,
     {
-        let handle = self.alloc_native_property(getter, setter);
+        self.register_object_native_property_with_access(
+            object,
+            name,
+            NativePropertyAccess::ReadWrite,
+            getter,
+            setter,
+        )
+    }
+
+    /// Registers a native property with an explicit script access policy.
+    ///
+    /// A denied direction never reaches the accessor: a script read of a
+    /// `WriteOnly` property and a script write to a `ReadOnly` one fail with
+    /// `TJS_E_ACCESSDENYED` (-1007) and the official text, exactly as the
+    /// reference's `TJS_DENY_NATIVE_PROP_SETTER` properties do. The accessors
+    /// stay in place for the engine's own use — host writes go through
+    /// [`Runtime::set_object_member`], which does not consult the policy.
+    pub fn register_object_native_property_with_access<G, S>(
+        &mut self,
+        object: ObjectHandle,
+        name: impl Into<String>,
+        access: NativePropertyAccess,
+        getter: G,
+        setter: S,
+    ) -> ObjectHandle
+    where
+        G: Fn(&mut Runtime<H>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync + 'static,
+        S: Fn(&mut Runtime<H>, Option<ObjectHandle>, Variant) -> Result<()> + Send + Sync + 'static,
+    {
+        let handle = self.alloc_native_property_with_access(getter, setter, access);
         self.heap[object.0].set(name, Variant::Object(handle));
         handle
+    }
+
+    /// The script access policy of a native property object, or `None` when
+    /// `property` is not one.
+    pub fn native_property_access(&self, property: ObjectHandle) -> Option<NativePropertyAccess> {
+        match self.heap.get(property.0).map(|object| &object.kind) {
+            Some(ObjectKind::NativeProperty { access, .. }) => Some(*access),
+            _ => None,
+        }
+    }
+
+    /// Changes the script access policy of an existing native property.
+    /// Returns false when `property` is not a native property.
+    pub fn set_native_property_access(
+        &mut self,
+        property: ObjectHandle,
+        access: NativePropertyAccess,
+    ) -> bool {
+        let Some(object) = self.heap.get_mut(property.0) else {
+            return false;
+        };
+        let ObjectKind::NativeProperty {
+            access: current, ..
+        } = &mut object.kind
+        else {
+            return false;
+        };
+        *current = access;
+        true
+    }
+
+    /// Declares a deny-list of read-only properties on `object`, the shape the
+    /// reference writes as `TJS_DENY_NATIVE_PROP_SETTER` in its class
+    /// registration — `Layer`, `Window`, `System` and the rest each carry one.
+    ///
+    /// Every named member that is a native property becomes
+    /// [`NativePropertyAccess::ReadOnly`]: script keeps its getter and a script
+    /// write fails with `TJS_E_ACCESSDENYED` (-1007), while the engine's own
+    /// writes (host-side member stores) are unaffected. Marking a namespace
+    /// after the class is assembled is what makes the list declarative: the
+    /// registration code does not have to repeat the policy for every
+    /// property.
+    ///
+    /// Returns the names that were not a native property of `object`, so the
+    /// caller can assert its deny-list still matches the class.
+    pub fn deny_native_property_writes(
+        &mut self,
+        object: ObjectHandle,
+        names: &[&str],
+    ) -> Vec<String> {
+        let mut unmatched = Vec::new();
+        for name in names {
+            let member = self.heap[object.0].get_raw(name);
+            let Some(Variant::Object(handle)) = member else {
+                unmatched.push((*name).to_string());
+                continue;
+            };
+            if !self.set_native_property_access(handle, NativePropertyAccess::ReadOnly) {
+                unmatched.push((*name).to_string());
+            }
+        }
+        unmatched
     }
 
     pub fn global_member(&self, name: &str) -> Variant {
@@ -548,8 +721,8 @@ impl<H: TjsHost + 'static> Runtime<H> {
     ///
     /// A missing member reads back as `void` the way the C++ side of KRKR sees
     /// `TJS_E_MEMBERNOTFOUND` from `PropGet`; script-level reads go through the
-    /// VM opcodes instead and raise "member not found"
-    /// (`tTJSCustomObject::PropGet`, `tjsError.cpp:238`).
+    /// VM opcodes instead and raise `Member "%1" does not exist`
+    /// (`tTJSCustomObject::PropGet`, `tjsError.cpp:240-244`).
     pub fn resolve_object_member(&mut self, object: ObjectHandle, name: &str) -> Result<Variant> {
         self.resolve_object_member_lenient(object, name)
     }
@@ -1125,7 +1298,12 @@ impl<H: TjsHost + 'static> Runtime<H> {
         }))
     }
 
-    pub(crate) fn alloc_native<F>(&mut self, function: F, constructable: bool) -> ObjectHandle
+    pub(crate) fn alloc_native<F>(
+        &mut self,
+        function: F,
+        constructable: bool,
+        arg_count: NativeArgCount,
+    ) -> ObjectHandle
     where
         F: NativeFunction<H> + 'static,
     {
@@ -1135,17 +1313,22 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.alloc_object(Object::new(ObjectKind::NativeFunction {
             id,
             constructable,
+            arg_count,
         }))
     }
 
-    pub(crate) fn alloc_vm_native<F>(&mut self, function: F) -> ObjectHandle
+    pub(crate) fn alloc_vm_native<F>(
+        &mut self,
+        function: F,
+        arg_count: NativeArgCount,
+    ) -> ObjectHandle
     where
         F: VmNativeFunction<H> + 'static,
     {
         let id = self.vm_native_functions.len();
         self.vm_native_functions.push(Arc::new(function));
         self.native_call_trace.vm_native_names.push(None);
-        self.alloc_object(Object::new(ObjectKind::VmNativeFunction { id }))
+        self.alloc_object(Object::new(ObjectKind::VmNativeFunction { id, arg_count }))
     }
 
     pub(crate) fn alloc_native_property<G, S>(&mut self, getter: G, setter: S) -> ObjectHandle
@@ -1153,10 +1336,23 @@ impl<H: TjsHost + 'static> Runtime<H> {
         G: Fn(&mut Runtime<H>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync + 'static,
         S: Fn(&mut Runtime<H>, Option<ObjectHandle>, Variant) -> Result<()> + Send + Sync + 'static,
     {
+        self.alloc_native_property_with_access(getter, setter, NativePropertyAccess::ReadWrite)
+    }
+
+    pub(crate) fn alloc_native_property_with_access<G, S>(
+        &mut self,
+        getter: G,
+        setter: S,
+        access: NativePropertyAccess,
+    ) -> ObjectHandle
+    where
+        G: Fn(&mut Runtime<H>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync + 'static,
+        S: Fn(&mut Runtime<H>, Option<ObjectHandle>, Variant) -> Result<()> + Send + Sync + 'static,
+    {
         let id = self.native_properties.len();
         self.native_properties
             .push(Arc::new(NativePropertyAccessors { getter, setter }));
-        self.alloc_object(Object::new(ObjectKind::NativeProperty { id }))
+        self.alloc_object(Object::new(ObjectKind::NativeProperty { id, access }))
     }
 
     pub(crate) fn alloc_value_property(&mut self, initial: Variant) -> ObjectHandle {

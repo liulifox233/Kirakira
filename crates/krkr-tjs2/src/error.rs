@@ -221,10 +221,7 @@ impl TjsError {
     /// `TJS_E_NOTIMPL` (-1002): `Called method is not implemented`
     /// (`string_table_en.rc:17`).
     pub fn not_implemented() -> Self {
-        Self::new(
-            TjsErrorKind::NotImpl,
-            "Called method is not implemented",
-        )
+        Self::new(TjsErrorKind::NotImpl, "Called method is not implemented")
     }
 
     /// `TJS_E_INVALIDPARAM` (-1003): `Invalid argument`
@@ -691,7 +688,10 @@ mod tests {
             (Variant::Real(1.5), "(real)1.5"),
             (Variant::Real(1.0 / 3.0), "(real)0.333333333333333"),
             (Variant::String("a\nb".to_string()), "(string)\"a\\nb\""),
-            (Variant::String("quote\"".to_string()), "(string)\"quote\\\"\""),
+            (
+                Variant::String("quote\"".to_string()),
+                "(string)\"quote\\\"\"",
+            ),
             (Variant::Octet(vec![0, 1, 255]), "(octet)<% 00 01 FF %>"),
         ] {
             assert_eq!(
