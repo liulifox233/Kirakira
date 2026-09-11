@@ -29,7 +29,7 @@
 use crate::bytecode::{BytecodeFile, DataSlot, DataSlotType};
 use crate::compiler::compile_source_to_bytecode;
 use crate::error::{Result, TjsError, TjsErrorKind};
-use crate::runtime::{Runtime, Variant};
+use crate::runtime::{NoHost, ObjectHandle, Runtime, Variant};
 
 fn run(source: &str) -> Result<Variant> {
     let file = compile_source_to_bytecode("closure-test.tjs", source).expect("compile");
@@ -225,6 +225,303 @@ fn per_iteration_state_travels_on_an_object() {
         "#),
         Variant::String("0:10:20".to_string())
     );
+}
+
+/// One receiver family per fixture.  Every unqualified read below compiles to
+/// a member access on `%-2` (`tjsInterCodeGen.cpp:2149-2166`), which
+/// `ExecuteAsFunction` fills with a two-object dispatch: the frame's `this`
+/// first, the global object second (`tjsInterCodeExec.cpp:789-806`).  The
+/// second object is reached only when the first answers
+/// `TJS_E_MEMBERNOTFOUND` (`tTJSObjectProxy::PropGet`,
+/// `tjsInterCodeExec.cpp:284`), so each fixture puts the reader on a receiver
+/// family the game's own KAGEX handlers run under and reads a name only the
+/// global carries.  A fallback that stops working for one family cannot hide
+/// behind another.
+#[test]
+fn bare_object_receiver_reads_the_global() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        class Bare {}
+        global.bare = new Bare();
+        global.bare.reader = function() { return q; };
+        return global.bare.reader();
+        "#),
+        Variant::Integer(100)
+    );
+}
+
+/// The receiver is an instance whose *class* carries the member surface, the
+/// `KAGWindow` shape: the instance's own map is empty and every method lives
+/// on the class, so the proxy's primary walk has to cross the class chain and
+/// still fall back for the name nobody has.
+#[test]
+fn class_instance_with_a_carrier_class_reads_the_global() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        class Carrier { var marker = 1; function pick() { return 2; } }
+        global.carrier = new Carrier();
+        global.carrier.reader = function() { return q; };
+        return global.carrier.reader();
+        "#),
+        Variant::Integer(100)
+    );
+}
+
+/// Native-backed chains are the live shape: in `KAGWindow` the class objects
+/// are native classes and only the instance's data members are script-side, so
+/// the miss has to be recognised after the native chain answers nothing.
+/// `Runtime::register_object_native` + `set_object_super_class` build exactly
+/// that (see the `WaveSoundBuffer` shape in `vm/mod.rs`).
+#[test]
+fn native_backed_class_chain_receiver_reads_the_global() {
+    let file = compile_source_to_bytecode(
+        "proxy-native-chain.tjs",
+        r#"
+        global.q = 100;
+        global.reader = function() { return q; };
+        return (global.reader incontextof global.window)();
+        "#,
+    )
+    .expect("compile");
+
+    let mut runtime = Runtime::new();
+    let class = runtime.alloc_ordinary_object();
+    runtime.register_object_native(
+        class,
+        "play",
+        |_runtime: &mut Runtime<NoHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
+            Ok(Variant::Void)
+        },
+    );
+    let instance = runtime.alloc_ordinary_object();
+    runtime.set_object_super_class(instance, class);
+    runtime.add_object_class_info(instance, "KAGWindow".to_string());
+    runtime.set_object_member(instance, "marker", Variant::Integer(1));
+    runtime.set_global_member("window", Variant::Object(instance));
+
+    assert_eq!(
+        runtime.execute_file(&file).expect("execute"),
+        Variant::Integer(100)
+    );
+}
+
+/// An Array receiver: its own miss rule is the plain `TJS_E_MEMBERNOTFOUND`
+/// (`tTJSArrayObject` inherits `tTJSCustomObject::PropGet`), so the fallback
+/// applies exactly like it does for a plain object.
+#[test]
+fn array_receiver_reads_the_global() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        var arr = [];
+        arr.reader = function() { return q; };
+        return arr.reader();
+        "#),
+        Variant::Integer(100)
+    );
+}
+
+/// The reader fetched off one object and called from another context: the
+/// fetch itself must not consume the read's fallback, and the call's own
+/// `this` (a second instance without the name) must reach the global too.
+#[test]
+fn detached_member_fetch_still_reads_the_global() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        class Holder {}
+        global.holder = new Holder();
+        global.holder.reader = function() { return q; };
+        global.caller = function() {
+            var borrowed = global.holder.reader;
+            return borrowed();
+        };
+        var other = new Holder();
+        other.caller = global.caller;
+        return other.caller();
+        "#),
+        Variant::Integer(100)
+    );
+}
+
+/// `incontextof` is the language's explicit `chgthis`: the bound ObjThis
+/// becomes the callee's `this` (`CallFunctionDirect`, `tjsInterCodeExec.cpp
+/// :2434-2438`), so the `%-2` proxy is built from it and the global fallback
+/// has to work from there as well.
+#[test]
+fn incontextof_receiver_reads_the_global() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        class Holder {}
+        var holder = new Holder();
+        var reader = (function() { return q; } incontextof holder);
+        return reader();
+        "#),
+        Variant::Integer(100)
+    );
+}
+
+/// An unqualified *call* is a member call on the same proxy, and the
+/// reference's `tTJSObjectProxy::FuncCall` (`tjsInterCodeExec.cpp:262-275`)
+/// looks the member up on the receiver first and calls it on the global
+/// object with `OBJ2` -- the caller's own `this` -- as the receiver.
+#[test]
+fn unqualified_call_reads_the_global_function_with_the_callers_this() {
+    assert_eq!(
+        ok(r#"
+        global.helper = function() { return this.marker; };
+        class Holder { var marker = 7; }
+        var holder = new Holder();
+        holder.run = (function() { return helper(); } incontextof holder);
+        return holder.run();
+        "#),
+        Variant::Integer(7)
+    );
+}
+
+/// The name exists on the receiver: it wins, the global is never consulted.
+#[test]
+fn receiver_member_wins_over_the_global() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        class Holder { var q = 7; }
+        global.holder = new Holder();
+        global.holder.reader = function() { return q; };
+        return global.holder.reader();
+        "#),
+        Variant::Integer(7)
+    );
+}
+
+/// A member that exists and holds void is a *hit*: `tTJSObjectProxy::PropGet`
+/// moves on only for `TJS_E_MEMBERNOTFOUND` (`tjsInterCodeExec.cpp:284`), and
+/// `tTJSCustomObject::PropGet` answers `TJS_S_OK` with the void value.  The
+/// dispatcher clears its internal `probe` flag for the primary walk exactly
+/// for this case.
+#[test]
+fn void_member_on_the_receiver_does_not_fall_back() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        class Holder {}
+        var holder = new Holder();
+        holder.q = void;
+        holder.reader = function() { return q; };
+        return holder.reader() === void;
+        "#),
+        Variant::Integer(1)
+    );
+}
+
+/// A Dictionary receiver answers void for a miss unless
+/// `TJS_MEMBERMUSTEXIST` is set (`tjsDictionary.cpp:727-731`), and a script
+/// `gpd` never sets it (`tjsInterCodeExec.cpp:1338`): the proxy stops at the
+/// first object and the global is not consulted.
+#[test]
+fn dictionary_receiver_stops_the_proxy_before_the_global() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        var d = %[];
+        d.reader = function() { return q; };
+        return d.reader() === void;
+        "#),
+        Variant::Integer(1)
+    );
+}
+
+/// `typeof <unqualified non-local name>` is *not* the must-exist member read:
+/// `GenNodeCode`'s `case T_TYPEOF` (`tjsInterCodeGen.cpp:1691-1730`) turns the
+/// child into `VM_TYPEOFD` only when the child node is already a `T_DOT` /
+/// `T_LBRACKET` / `T_WITHDOT`, and a bare symbol is rewritten to
+/// `T_THIS_PROXY . name` *inside* its own lowering, i.e. with an empty
+/// sub-parameter (`:2149-2166`, the synthetic `nodep.SetOpecode(T_DOT)`).
+/// The bare read is therefore a plain `gpd`, so the Dictionary keeps its void
+/// answer, and a name nobody carries raises instead of answering
+/// "undefined" -- which is why KRKR's own KAG scripts write
+/// `typeof global.SystemConfig` and never `typeof SystemConfig`
+/// (`sysscn/system.tjs`).
+#[test]
+fn typeof_bare_name_reads_like_a_plain_read() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        var d = %[];
+        d.t = function() { return typeof q; };
+        d.v = function() { return q; };
+        return d.t() + ":" + (d.v() === void);
+        "#),
+        Variant::String("void:1".to_string())
+    );
+}
+
+/// The misses that *do* get the must-exist treatment are the explicit member
+/// expressions: `VM_TYPEOFD` answers "undefined" for
+/// `TJS_E_MEMBERNOTFOUND` (`tjsInterCodeExec.cpp:2127-2143`).
+#[test]
+fn typeof_member_expression_answers_undefined_for_a_miss() {
+    assert_eq!(
+        ok(r#"
+        class Holder {}
+        var holder = new Holder();
+        holder.reader = function() { return typeof this.no_such_name; };
+        return holder.reader();
+        "#),
+        Variant::String("undefined".to_string())
+    );
+}
+
+/// A bare unqualified name is a plain read of the `%-2` proxy, so a name that
+/// only the global carries reads back through the fallback and `typeof`
+/// reports the value's type...
+#[test]
+fn typeof_bare_name_reads_the_global_through_the_proxy() {
+    assert_eq!(
+        ok(r#"
+        global.q = 100;
+        class Holder {}
+        var holder = new Holder();
+        var present = (function() { return typeof q; } incontextof holder);
+        return present();
+        "#),
+        Variant::String("Integer".to_string())
+    );
+}
+
+/// ... and one that nobody carries raises the official member error, exactly
+/// like any other bare read, because the plain `gpd` never sets
+/// `TJS_MEMBERMUSTEXIST`.
+#[test]
+fn typeof_bare_name_raises_when_nobody_carries_it() {
+    let error = failure(
+        r#"
+        class Holder {}
+        var holder = new Holder();
+        var absent = (function() { return typeof no_such_name; } incontextof holder);
+        return absent();
+        "#,
+    );
+    assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+    assert_eq!(error.message, "Member \"no_such_name\" does not exist");
+}
+
+/// A name nobody carries: the fallback ends at the global object and reports
+/// the official text (`TJSThrowFrom_tjs_error(TJS_E_MEMBERNOTFOUND, name)`,
+/// `tjsError.cpp:240-244`).
+#[test]
+fn proxy_miss_everywhere_reports_the_official_member_error() {
+    let error = failure(
+        r#"
+        function read() { return no_such_name; }
+        return read();
+        "#,
+    );
+    assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+    assert_eq!(error.message, "Member \"no_such_name\" does not exist");
 }
 
 /// Official bytecode fixtures. The builder writes the exact binary layout the
@@ -455,6 +752,87 @@ mod official {
             runtime.global_member("kag"),
             Variant::Object(_) | Variant::Closure(_)
         ));
+    }
+
+    /// The game's failing lookup as pure bytecode: `syspage`'s prologue reads
+    /// the unqualified global `kag` (`gpd %1, %-2.*6`,
+    /// `sysscn/system.tjs` object 177 at bytecode 0x54) with `this` = a
+    /// `KAGWindow`-shaped instance -- an object whose member surface lives on
+    /// a native-backed class chain and which carries no `kag` of its own.  The
+    /// `%-2` proxy has to walk the instance, the native class, and then the
+    /// global object (`tjsInterCodeExec.cpp:789-806`, `:284`).
+    #[test]
+    fn official_unqualified_global_read_with_a_native_backed_this() {
+        let file = official_bound_this_read_fixture();
+        let mut runtime = Runtime::new();
+        let instance = kag_window_shaped_instance(&mut runtime);
+        let expected = runtime.alloc_ordinary_object();
+        runtime.set_global_member("kag", Variant::Object(expected));
+
+        let result = runtime
+            .execute_file_with_this(&file, Some(instance))
+            .expect("execute fixture");
+        assert_eq!(result, Variant::Object(expected));
+    }
+
+    /// The same fixture with nothing on the global either: the read has to
+    /// end at the global object and report the official miss, not the
+    /// receiver's chain.
+    #[test]
+    fn official_unqualified_global_read_missing_everywhere_raises() {
+        let file = official_bound_this_read_fixture();
+        let mut runtime = Runtime::new();
+        let instance = kag_window_shaped_instance(&mut runtime);
+
+        let error = runtime
+            .execute_file_with_this(&file, Some(instance))
+            .expect_err("the name is on no object");
+        assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+        assert_eq!(error.message, "Member \"kag\" does not exist");
+    }
+
+    /// One `gpd %1, %-2.*0` object, so the tests above only differ in what
+    /// the runtime around it carries.
+    fn official_bound_this_read_fixture() -> BytecodeFile {
+        let mut fixture = Fixture::default();
+        let global_name = fixture.string("global");
+        let kag_name = fixture.string("kag");
+        let top_level = fixture.object(
+            FixtureObject::new(global_name, GLOBAL)
+                .frames(2)
+                .code(&[
+                    103, 1, -2, 0, // gpd %1, %-2.*0   // *0 = "kag"
+                    118, 1,   // srv %1
+                    119, // ret
+                ])
+                .data(vec![DataSlot {
+                    ty: DataSlotType::String,
+                    index: kag_name,
+                }]),
+        );
+        fixture.parse(top_level)
+    }
+
+    /// A `KAGWindow`-shaped `this`: data members on the instance, the method
+    /// surface on a native class object (`register_object_native`), and the
+    /// class chain the game's own window reports.
+    fn kag_window_shaped_instance(runtime: &mut Runtime<NoHost>) -> ObjectHandle {
+        let class = runtime.alloc_ordinary_object();
+        runtime.register_object_native(
+            class,
+            "getLayerFromElm",
+            |_runtime: &mut Runtime<NoHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
+                Ok(Variant::Void)
+            },
+        );
+        let instance = runtime.alloc_ordinary_object();
+        runtime.set_object_super_class(instance, class);
+        runtime.add_object_class_info(instance, "KAGWindow".to_string());
+        runtime.add_object_class_info(instance, "KAGWindowBase".to_string());
+        runtime.add_object_class_info(instance, "Window".to_string());
+        let tag_handlers = runtime.alloc_ordinary_object();
+        runtime.set_object_member(instance, "tagHandlers", Variant::Object(tag_handlers));
+        instance
     }
 
     /// `constructor` is a global class the fixture instantiates as the
