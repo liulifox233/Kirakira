@@ -11,15 +11,20 @@
 //! Loading is **plaintext-first**.  The header's encryption field (the low two
 //! bits of the u16 at 0x06) is a hint, not a claim: M2's own toolchain sets
 //! bit0 on plaintext documents (PARQUET's `.pimg` files are `flags=0x0001`
-//! despite carrying no ciphertext), so the structural parse always runs first
-//! and a document that parses is accepted whatever the flag says.  v3 headers
-//! are then validated against their own Adler-32 (bytes `0x08..0x28` against
-//! the u32 at `0x28`), which catches plaintext corruption no key could fix.
-//! Only a document whose structure genuinely fails *and* whose flag claims a
-//! cipher is reported as key-required — the one error a Phase-2 key store
-//! ([`PsbKeyStore`]) would convert into a real decode.  Everything else stays a
-//! plain malformed-document error.  See the M45 survey
-//! (`.tower/comms/inbox/20260912-psb-decrypt-study-*`) for the evidence.
+//! despite carrying no ciphertext), so nothing is rejected on the flag alone
+//! and a document that decodes is accepted whatever the flag says.  The v3
+//! header checksum (bytes `0x08..0x28` against the u32 at `0x28`) is probed
+//! before the structural parse and is what gives a *failure* its meaning: it
+//! fails only when the bytes are damaged or when the header-encryption bit
+//! (0x0001) is genuinely in effect, so a document whose checksum still holds —
+//! and whose body is not marked encrypted (bit 0x0002) — is *corrupt* when it
+//! will not decode, and is reported as malformed rather than blamed on a
+//! missing key.  Everything else that fails while claiming a cipher reports as
+//! key-required — the one error a Phase-2 key store ([`PsbKeyStore`]) would
+//! convert into a real decode.  See the M45 survey
+//! (`.tower/comms/inbox/20260912-psb-decrypt-study-*`) for the evidence, and
+//! `vendor/eluna/crates/eluna/src/psb/mod.rs:139-161, 676-720` for the flag
+//! semantics this classification mirrors.
 
 use std::{collections::BTreeMap, str};
 
@@ -38,9 +43,17 @@ pub(crate) const META: PluginMeta = PluginMeta {
     install: |engine| engine.register_plugin(PsbFilePlugin),
 };
 
-/// Bit set in the header's encryption field that makes a failing document
-/// report as key-required instead of malformed.
-const PSB_FLAG_ENCRYPTION_HINT: u16 = 0x0003;
+/// Header-encryption bit.  The cipher starts at byte 0x08, so the checksum word
+/// at 0x28 is ciphertext too while this bit is genuinely in effect; M2 sets it
+/// on plaintext documents as well, which is why it is treated as a hint.
+const PSB_FLAG_HEADER_ENCRYPTED: u16 = 0x0001;
+/// Body-encryption bit.  Only the payload is ciphered — the header, its
+/// offsets and its checksum stay plaintext (`eluna/…/psb/mod.rs:40-41,
+/// 716-720`), so this bit also marks the one case where a *verifying* checksum
+/// and an undecodable body are both expected.
+const PSB_FLAG_BODY_ENCRYPTED: u16 = 0x0002;
+/// Either bit means a key may be required to decode the document.
+const PSB_FLAG_ENCRYPTION_HINT: u16 = PSB_FLAG_HEADER_ENCRYPTED | PSB_FLAG_BODY_ENCRYPTED;
 /// The v3 header protects bytes 0x08..0x28 with an Adler-32 stored at 0x28.
 const PSB_V3_CHECKSUM_START: usize = 0x08;
 const PSB_V3_CHECKSUM_END: usize = 0x28;
@@ -196,14 +209,17 @@ pub fn debug_parse_psb(bytes: &[u8]) -> std::result::Result<PsbValue, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum PsbError {
-    /// The document is not a PSB of a supported version, its v3 header
-    /// checksum does not match, or its structure does not decode.
+    /// The document is not a PSB of a supported version, its plaintext header
+    /// fails the v3 checksum, or its structure does not decode — conditions no
+    /// key can recover.
     Malformed(String),
-    /// The document's structure does not decode *and* its header flags claim a
-    /// cipher: the payload needs the game's key, which this crate does not
-    /// have yet (Phase 2).
+    /// The document does not decode as plaintext while its header claims a
+    /// cipher: either the header (and with it the checksum word) is ciphered,
+    /// or the payload is.  The game's key would settle it, which this crate
+    /// does not have yet (Phase 2).
     KeyRequired {
-        /// The header's encryption field (low two bits select the cipher).
+        /// The header's encryption field: `0x0001` header-encrypted,
+        /// `0x0002` body-encrypted.
         flags: u16,
     },
 }
@@ -225,13 +241,14 @@ impl std::fmt::Display for PsbError {
 ///
 /// The mission that implements key-based PSB decryption adds a concrete store
 /// (keys read from `GameProfile`/config) and wires it into
-/// [`PsbDocument::load`]: call [`PsbDocument::load_plaintext`] first, then, on
+/// [`PsbDocument::load`]: run the plaintext path first, then, on
 /// [`PsbError::KeyRequired`], look up `flags` here and feed the decrypted bytes
 /// back through the plaintext path.  Nothing registers one today, so the
-/// plaintext path is the whole pipeline.  Note that in a genuinely encrypted
-/// header the Adler-32 at 0x28 is ciphertext too, so a key-less parse cannot
-/// tell truncation from ciphertext just by looking — which is why the checksum
-/// gate only rejects a document whose *structure* also parsed.
+/// plaintext path is the whole pipeline.  Two residuals stay ambiguous without
+/// a key and are therefore classified as key-required: a header-encrypted
+/// document (bit 0x0001) whose checksum word is ciphertext, and a body-only
+/// encrypted document (bit 0x0002) whose plaintext header verifies but whose
+/// payload cannot be decoded.
 #[allow(dead_code, reason = "Phase-2 seam: no key store exists yet")]
 #[doc(hidden)]
 pub trait PsbKeyStore {
@@ -289,7 +306,6 @@ enum PlaintextError {
 /// to their child values.
 struct PsbDocument<'a> {
     bytes: &'a [u8],
-    version: u16,
     names_offset: usize,
     strings_offset: usize,
     strings_data_offset: usize,
@@ -301,32 +317,49 @@ struct PsbDocument<'a> {
 }
 
 impl<'a> PsbDocument<'a> {
-    /// The plugin's entry point: plaintext first, header hint second.
+    /// The plugin's entry point: plaintext-first, with the header hint deciding
+    /// only what the failure *means*.
     ///
-    /// A flagged-but-plain document parses exactly like an unflagged one.
-    /// Only a document the plaintext reader *cannot* decode, and whose header
-    /// flags claim a cipher, is classified as key-required; every other
-    /// failure keeps its specific malformed reason.
+    /// A flagged-but-plain document parses exactly like an unflagged one.  When
+    /// the parse does fail, the classification is:
+    ///
+    /// * the v3 checksum still holds (so the header is provably plaintext) and
+    ///   the body is not marked encrypted ⇒ corruption, reported as malformed
+    ///   even though the flag claims a cipher — no key can repair it;
+    /// * otherwise, a document claiming a cipher ⇒ key-required, since either
+    ///   the checksum word is itself ciphertext (header bit) or the payload is
+    ///   (body bit), and only a Phase-2 key store could tell;
+    /// * every other failure keeps its specific malformed reason.
     fn load(bytes: &'a [u8]) -> std::result::Result<PsbValue, PsbError> {
-        let Some(header) = Self::parse_header(bytes) else {
-            return Err(PsbError::Malformed("not a PSB document".to_string()));
+        let header = match Self::parse_header(bytes) {
+            Ok(header) => header,
+            // Not a PSB at all, or a version this reader does not know: a
+            // foreign file must never be reported as key-required.
+            Err(reason) => return Err(PsbError::Malformed(reason)),
         };
+        // Probe the checksum before the structural parse: it is the one signal
+        // that survives a broken structure, and it is what tells a plaintext
+        // header from a ciphered one.
+        let header_is_plaintext = header_is_verified_plaintext(header, bytes);
         match Self::load_plaintext(bytes, header) {
             Ok(root) => Ok(root),
-            // A failed checksum is corruption, not ciphertext: no key can
-            // make the document match its own offset table again.
-            Err(PlaintextError::Integrity) => Err(PsbError::Malformed(
-                "PSB v3 header checksum does not match".to_string(),
-            )),
+            Err(PlaintextError::Integrity) => {
+                // The checksum word is ciphertext only while the header bit is
+                // really in effect, so this is either an encrypted header or a
+                // damaged one — a distinction only a key can settle.
+                Err(Self::failure_with_cipher_hint(header))
+            }
             Err(PlaintextError::Structure(reason)) => {
-                // Only a document that really looks like a PSB can claim a
-                // cipher: a foreign file with a byte pattern in the flag
-                // position must not be reported as key-required.
-                if header.flags & PSB_FLAG_ENCRYPTION_HINT != 0 {
+                if header_is_plaintext && header.flags & PSB_FLAG_BODY_ENCRYPTED == 0 {
+                    // A verifying checksum proves the header is plaintext, and
+                    // no bit claims the body is ciphered either: this document
+                    // is damaged, and no key would make it decode.
+                    Err(PsbError::Malformed(reason))
+                } else if header.flags & PSB_FLAG_ENCRYPTION_HINT != 0 {
                     // Not necessarily true ciphertext — the M45 survey found
-                    // M2 sets bit0 on plaintext `.pimg` documents — but it is
-                    // the only recoverable case, and the one a Phase-2 key
-                    // store (`PsbKeyStore`) exists to convert into a decode.
+                    // M2 sets bit0 on plaintext `.pimg` documents — but with
+                    // the checksum gone or the body marked encrypted, a key is
+                    // the only remaining explanation worth reporting.
                     Err(PsbError::KeyRequired {
                         flags: header.flags,
                     })
@@ -337,27 +370,39 @@ impl<'a> PsbDocument<'a> {
         }
     }
 
+    /// Turns a checksum failure into the error the header's flags support.
+    fn failure_with_cipher_hint(header: PsbHeader) -> PsbError {
+        if header.flags & PSB_FLAG_ENCRYPTION_HINT != 0 {
+            PsbError::KeyRequired {
+                flags: header.flags,
+            }
+        } else {
+            PsbError::Malformed("PSB v3 header checksum does not match".to_string())
+        }
+    }
+
     /// Parses the fixed 0x2c-byte v2/v3 header: magic, version, encryption
-    /// flags and the seven offsets.  Returns `None` when the bytes cannot be a
-    /// PSB at all, so a foreign file is never mistaken for a ciphered one.
-    fn parse_header(bytes: &[u8]) -> Option<PsbHeader> {
+    /// flags and the seven offsets.  The error names what is wrong with the
+    /// file — including the version it declares — so callers can report it
+    /// verbatim; a file this returns `Err` for is never treated as ciphered.
+    fn parse_header(bytes: &[u8]) -> std::result::Result<PsbHeader, String> {
         if bytes.len() < 0x28 || &bytes[..4] != b"PSB\0" {
-            return None;
+            return Err("not a PSB document".to_string());
         }
-        let version = read_u16(bytes, 4).ok()?;
+        let version = read_u16(bytes, 4)?;
         if !(2..=3).contains(&version) {
-            return None;
+            return Err(format!("unsupported PSB version {version}"));
         }
-        Some(PsbHeader {
+        Ok(PsbHeader {
             version,
-            flags: read_u16(bytes, 6).ok()?,
-            names_offset: read_u32(bytes, 0x0c).ok()? as usize,
-            strings_offset: read_u32(bytes, 0x10).ok()? as usize,
-            strings_data_offset: read_u32(bytes, 0x14).ok()? as usize,
-            chunk_offsets_offset: read_u32(bytes, 0x18).ok()? as usize,
-            chunk_lengths_offset: read_u32(bytes, 0x1c).ok()? as usize,
-            chunk_data_offset: read_u32(bytes, 0x20).ok()? as usize,
-            root_offset: read_u32(bytes, 0x24).ok()? as usize,
+            flags: read_u16(bytes, 6)?,
+            names_offset: read_u32(bytes, 0x0c)? as usize,
+            strings_offset: read_u32(bytes, 0x10)? as usize,
+            strings_data_offset: read_u32(bytes, 0x14)? as usize,
+            chunk_offsets_offset: read_u32(bytes, 0x18)? as usize,
+            chunk_lengths_offset: read_u32(bytes, 0x1c)? as usize,
+            chunk_data_offset: read_u32(bytes, 0x20)? as usize,
+            root_offset: read_u32(bytes, 0x24)? as usize,
         })
     }
 
@@ -371,7 +416,6 @@ impl<'a> PsbDocument<'a> {
     ) -> std::result::Result<PsbValue, PlaintextError> {
         let mut document = Self {
             bytes,
-            version: header.version,
             names_offset: header.names_offset,
             strings_offset: header.strings_offset,
             strings_data_offset: header.strings_data_offset,
@@ -381,14 +425,15 @@ impl<'a> PsbDocument<'a> {
             root_offset: header.root_offset,
             names: BTreeMap::new(),
         };
+        if !v3_checksum_holds(header.version, bytes) {
+            // The Adler-32 covers the offset table itself, so a mismatch means
+            // the header (or the whole document) was altered.  `load` decides
+            // whether that is corruption or the header bit doing its job.
+            return Err(PlaintextError::Integrity);
+        }
         document
             .validate_offsets()
             .map_err(PlaintextError::Structure)?;
-        if !document.integrity_checksum_holds() {
-            // The Adler-32 covers the offset table itself, so a mismatch means
-            // the document was altered — a condition no key can recover.
-            return Err(PlaintextError::Integrity);
-        }
         document.names = document.decode_names().map_err(PlaintextError::Structure)?;
         document
             .decode_value(document.root_offset, 0)
@@ -417,24 +462,6 @@ impl<'a> PsbDocument<'a> {
             return Err("PSB root is not an object".to_string());
         }
         Ok(())
-    }
-
-    /// PSB v3 protects the header bytes `0x08..0x28` with an Adler-32 stored as
-    /// a u32 at `0x28` — the same framing the format's own toolchain writes and
-    /// the check xp3-brute performs on the v3 header.  v2 has no other
-    /// integrity signal, so its documents keep going through the structural
-    /// checks alone.
-    fn integrity_checksum_holds(&self) -> bool {
-        if self.version != 3 {
-            return true;
-        }
-        let Ok(stored) = read_u32(self.bytes, PSB_V3_CHECKSUM_OFFSET) else {
-            return false;
-        };
-        let Some(protected) = self.bytes.get(PSB_V3_CHECKSUM_START..PSB_V3_CHECKSUM_END) else {
-            return false;
-        };
-        stored == adler32(protected)
     }
 
     fn decode_names(&self) -> std::result::Result<BTreeMap<u64, String>, String> {
@@ -713,9 +740,42 @@ fn read_u32(bytes: &[u8], offset: usize) -> std::result::Result<u32, String> {
         .ok_or_else(|| "PSB header is truncated".to_string())
 }
 
-/// Adler-32 as specified by RFC 1950 / zlib, which is the checksum PSB v3
-/// stores in its header (verified against PARQUET's plaintext `.pimg`
-/// documents, all 95 of which match).
+/// Does the document pass the header-integrity gate?
+///
+/// PSB v3 protects the header bytes `0x08..0x28` with an Adler-32 stored as a
+/// u32 at `0x28` (`eluna/…/psb/mod.rs:139-157`).  v2 carries no checksum word
+/// at all, so there is nothing to check — and nothing to reject.
+///
+/// Verified against every plaintext v3 document reachable here: M45's 55
+/// PARQUET `.pimg` plus the game's 18 `scn.xp3` scenarios (73 unique documents,
+/// re-derived independently in the R1 review).  xp3-brute's validator, by
+/// contrast, reads this word as an offset (`xp3-brute/src/validate.rs:1206-1212`
+/// per M45), which is why it cannot recover those documents.
+fn v3_checksum_holds(version: u16, bytes: &[u8]) -> bool {
+    if version != 3 {
+        return true;
+    }
+    let Ok(stored) = read_u32(bytes, PSB_V3_CHECKSUM_OFFSET) else {
+        return false;
+    };
+    let Some(protected) = bytes.get(PSB_V3_CHECKSUM_START..PSB_V3_CHECKSUM_END) else {
+        return false;
+    };
+    stored == adler32(protected)
+}
+
+/// Is the header *verifiably* plaintext?
+///
+/// Only a v3 checksum that holds proves that: its word is ciphertext while the
+/// header-encryption bit is genuinely in effect, so a matching word means the
+/// offsets below it were never ciphered.  A v2 document carries no checksum, so
+/// nothing is proven and its flags keep full diagnostic weight.
+fn header_is_verified_plaintext(header: PsbHeader, bytes: &[u8]) -> bool {
+    header.version == 3 && v3_checksum_holds(header.version, bytes)
+}
+
+/// Adler-32 as specified by RFC 1950 / zlib, the checksum PSB v3 stores in its
+/// header.
 fn adler32(data: &[u8]) -> u32 {
     let mut low = 1_u32;
     let mut high = 0_u32;
@@ -778,38 +838,52 @@ mod tests {
     /// Byte offsets inside [`minimal_document`]; the builder asserts every one
     /// of them, so a layout tweak cannot silently invalidate the constants.
     const NAMES_OFFSET: usize = 0x2c;
-    const NAMES_NODES_OFFSET: usize = 0x2f;
-    const NAME_INDEXES_OFFSET: usize = 0x32;
-    const STRINGS_OFFSET: usize = 0x35;
-    const STRINGS_DATA_OFFSET: usize = 0x38;
-    const CHUNK_OFFSETS_OFFSET: usize = 0x38;
-    const CHUNK_LENGTHS_OFFSET: usize = 0x3b;
-    const CHUNK_DATA_OFFSET: usize = 0x3e;
-    const ROOT_OFFSET: usize = 0x3e;
-    const ROOT_LENGTH: usize = 7;
+    const NAMES_NODES_OFFSET: usize = 0x30;
+    const NAME_INDEXES_OFFSET: usize = 0x75;
+    const STRINGS_OFFSET: usize = 0x79;
+    const STRINGS_DATA_OFFSET: usize = 0x7c;
+    const CHUNK_OFFSETS_OFFSET: usize = 0x7c;
+    const CHUNK_LENGTHS_OFFSET: usize = 0x7f;
+    const CHUNK_DATA_OFFSET: usize = 0x82;
+    const ROOT_OFFSET: usize = 0x82;
+    const ROOT_LENGTH: usize = 11;
 
     /// A complete PSB v3 the reader accepts, built the way the format's own
     /// toolchain lays a document out: the name trie is three packed arrays
-    /// (charset, parent-node references, then one index per key id), the
-    /// string table, then the resource tables, then the root object.
+    /// (charset, nameNodes, nameIndexes), then the string table, the resource
+    /// tables, and the root object.
     ///
-    /// This document has an empty root object and no keys, so it exercises the
-    /// whole admission path — magic, version, the header checksum, the packed
-    /// arrays, the string and resource tables, and value decoding — without
-    /// hand-encoding a name chain (M45's survey could not recover the trie's
-    /// exact chain grammar from the available samples, and a wrong guess here
-    /// would test the fixture instead of the reader).
+    /// The root is `{ "A" -> 42 }`, so the fixture pins the whole decode path —
+    /// the name chain, object keys/values and value decoding — not just the
+    /// admission gate.  The trie encodes the name the narrow way: the charset's
+    /// single entry is the base code point 0, so a node's index doubles as its
+    /// character code, and the chain is `nameIndexes[0] = 64` → node 65 → node
+    /// 0, yielding `65 - 0 == 0x41 == 'A'`.
     fn minimal_document(flags: u16) -> Vec<u8> {
-        // The three empty trie arrays: charset, namesData and nameIndexes.
-        let charset = vec![0x0d_u8, 0x00, 0x0c];
-        let names_data = vec![0x0d_u8, 0x00, 0x0c];
-        let name_indexes = vec![0x0d_u8, 0x00, 0x0c];
-        // One empty string pool and two empty resource tables.
-        let strings = vec![0x0d_u8, 0x00, 0x0c];
-        let chunk_offsets = vec![0x0d_u8, 0x00, 0x0c];
-        let chunk_lengths = vec![0x0d_u8, 0x00, 0x0c];
-        // Root object with no keys and no values.
-        let root = vec![0x21_u8, 0x0d, 0x00, 0x0c, 0x0d, 0x00, 0x0c];
+        // charset: one base code point (0).
+        let charset = [0x0d_u8, 0x01, 0x0d, 0x00];
+        // namesData: node 64 is the key's entry node; node 65 is the one
+        // character node, whose parent is node 0 — the index the reader treats
+        // as the end of the chain (and whose entry it never reads).
+        let mut nodes = [0x00_u8; 66];
+        nodes[64] = 65;
+        let mut names_data = vec![0x0d, nodes.len() as u8, 0x0d];
+        names_data.extend_from_slice(&nodes);
+        // nameIndexes: key 0's name begins at node 64.
+        let name_indexes = [0x0d_u8, 0x01, 0x0d, 64];
+        // No string values and no binary resources, so those three tables are
+        // all empty; chunkData is the empty range after them.
+        let strings = [0x0d_u8, 0x00, 0x0c];
+        let chunk_offsets = [0x0d_u8, 0x00, 0x0c];
+        let chunk_lengths = [0x0d_u8, 0x00, 0x0c];
+        // Root object: key id 0 (the name above) mapped to the integer 42.  The
+        // value array stores offsets relative to the byte after its header, so
+        // the integer marker sits directly behind the value table.
+        let root = [
+            0x21, 0x0d, 0x01, 0x0d, 0x00, // keys: one entry, key id 0
+            0x0d, 0x01, 0x0d, 0x00, // values: one entry, offset 0
+            0x05, 0x2a, // integer 42 (kind 0x05 = one-byte signed)
+        ];
 
         // Assemble the payload, recording where each table begins, so the
         // constants the tests use are checked against what actually lands in
@@ -864,15 +938,23 @@ mod tests {
             bytes[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes());
         }
         bytes.extend_from_slice(&payload);
-
-        let checksum = adler32(&bytes[PSB_V3_CHECKSUM_START..PSB_V3_CHECKSUM_END]);
-        bytes[PSB_V3_CHECKSUM_OFFSET..PSB_V3_CHECKSUM_OFFSET + 4]
-            .copy_from_slice(&checksum.to_le_bytes());
+        reseal_checksum(&mut bytes);
         bytes
     }
 
+    /// Rewrites the v3 header checksum so a mutated header still verifies.
+    ///
+    /// The Adler-32 covers only bytes `0x08..0x28`, so this is how a test
+    /// builds the interesting shape: a header that is provably plaintext and
+    /// intact, attached to a *body* that does not decode.
+    fn reseal_checksum(bytes: &mut [u8]) {
+        let checksum = adler32(&bytes[PSB_V3_CHECKSUM_START..PSB_V3_CHECKSUM_END]);
+        bytes[PSB_V3_CHECKSUM_OFFSET..PSB_V3_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
+    }
+
     fn minimal_root() -> PsbValue {
-        PsbValue::Object(BTreeMap::new())
+        PsbValue::Object(BTreeMap::from([("A".to_string(), PsbValue::Integer(42))]))
     }
 
     #[test]
@@ -894,22 +976,31 @@ mod tests {
             stored,
             adler32(&bytes[PSB_V3_CHECKSUM_START..PSB_V3_CHECKSUM_END])
         );
+        assert!(v3_checksum_holds(3, &bytes));
         let mut altered = bytes.clone();
         altered[0x0c] ^= 0x01;
-        assert_ne!(
-            stored,
-            adler32(&altered[PSB_V3_CHECKSUM_START..PSB_V3_CHECKSUM_END])
-        );
+        assert!(!v3_checksum_holds(3, &altered));
+        // v2 carries no checksum word, so nothing can fail this probe.
+        assert!(v3_checksum_holds(2, &altered));
     }
 
     #[test]
-    fn parseable_document_with_a_broken_header_checksum_is_malformed() {
-        let mut bytes = minimal_document(0x0001);
-        // Flip a bit in the header's chunkData offset — the checksum protects
-        // exactly this region, and the offset is unused here (the document has
-        // no resources), so the structure still parses and only the checksum
-        // fails.
-        bytes[0x20] ^= 0x01;
+    fn keyed_plaintext_document_decodes_its_root_object() {
+        let bytes = minimal_document(0x0000);
+        let PsbValue::Object(root) = PsbDocument::load(&bytes).expect("plaintext v3 loads") else {
+            panic!("a PSB root must be an object");
+        };
+        assert_eq!(root.len(), 1);
+        assert_eq!(root.get("A"), Some(&PsbValue::Integer(42)));
+    }
+
+    #[test]
+    fn checksum_mismatch_without_a_cipher_claim_is_malformed() {
+        let mut bytes = minimal_document(0x0000);
+        // Flipping a byte of the protected header region breaks the checksum
+        // while leaving the document parseable; with no encryption bit set,
+        // nothing about that is recoverable with a key.
+        bytes[0x1f] ^= 0x01;
         assert!(matches!(
             PsbDocument::load(&bytes),
             Err(PsbError::Malformed(reason)) if reason.contains("checksum")
@@ -917,10 +1008,71 @@ mod tests {
     }
 
     #[test]
+    fn checksum_mismatch_claiming_header_encryption_requires_a_key() {
+        let mut bytes = minimal_document(0x0001);
+        // The same damage on a document whose header bit is set: while that bit
+        // is genuinely in effect the checksum word is ciphertext too, so only a
+        // key can settle whether this is a ciphered document or a damaged one.
+        bytes[0x1f] ^= 0x01;
+        assert!(matches!(
+            PsbDocument::load(&bytes),
+            Err(PsbError::KeyRequired { flags: 0x0001 })
+        ));
+    }
+
+    #[test]
+    fn corrupt_flagged_document_is_malformed_not_key_required() {
+        for flags in [0x0000, 0x0001] {
+            let mut bytes = minimal_document(flags);
+            // A header that still verifies its checksum is provably plaintext;
+            // a body that then fails to decode is corruption, not ciphertext,
+            // whatever the (cosmetic) flag says.
+            bytes[0x24..0x28].copy_from_slice(&0_u32.to_le_bytes());
+            reseal_checksum(&mut bytes);
+            assert!(matches!(
+                PsbDocument::load(&bytes),
+                Err(PsbError::Malformed(reason)) if reason.contains("root")
+            ));
+        }
+    }
+
+    #[test]
+    fn body_encrypted_document_requires_a_key() {
+        let mut bytes = minimal_document(0x0002);
+        // Body-only encryption keeps the header (and its checksum) plaintext,
+        // so a verifying checksum plus an undecodable body is exactly what a
+        // key is for.
+        bytes[0x24..0x28].copy_from_slice(&0_u32.to_le_bytes());
+        reseal_checksum(&mut bytes);
+        assert!(matches!(
+            PsbDocument::load(&bytes),
+            Err(PsbError::KeyRequired { flags: 0x0002 })
+        ));
+    }
+
+    #[test]
+    fn v2_documents_keep_their_flag_as_the_only_signal() {
+        // v2 carries no checksum word, so nothing about the header can be
+        // proven: an intact document still loads (the flag is a hint), while a
+        // broken one that claims a cipher keeps reporting key-required, since
+        // the flag is then the only evidence there is.
+        let mut bytes = minimal_document(0x0001);
+        bytes[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(PsbDocument::load(&bytes), Ok(minimal_root()));
+
+        bytes[0x24..0x28].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            PsbDocument::load(&bytes),
+            Err(PsbError::KeyRequired { flags: 0x0001 })
+        ));
+    }
+
+    #[test]
     fn struct_corrupt_document_requiring_a_key_returns_key_required() {
         let mut bytes = minimal_document(0x0003);
-        // The root offset points at the magic instead of an object marker:
-        // genuine structural failure with the cipher flag set.
+        // The root offset points at the magic instead of an object marker, and
+        // the header is left unsealed: genuine structural failure with a valid
+        // cipher claim.
         bytes[0x24..0x28].copy_from_slice(&0_u32.to_le_bytes());
         assert!(matches!(
             PsbDocument::load(&bytes),
@@ -943,6 +1095,30 @@ mod tests {
     }
 
     #[test]
+    fn truncation_keeping_the_header_intact_is_malformed() {
+        // A prefix that keeps the header *and* its checksum: the payload is
+        // gone but the header is provably plaintext, including on a document
+        // whose flag claims a cipher (the M45 PIMG shape).
+        for flags in [0x0000, 0x0001] {
+            let bytes = minimal_document(flags);
+            assert!(matches!(
+                PsbDocument::load(&bytes[..CHUNK_LENGTHS_OFFSET]),
+                Err(PsbError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unsupported_version_names_the_version() {
+        let mut bytes = minimal_document(0x0001);
+        bytes[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        assert!(matches!(
+            PsbDocument::load(&bytes),
+            Err(PsbError::Malformed(reason)) if reason.contains("version 4")
+        ));
+    }
+
+    #[test]
     fn unprefixed_bytes_are_malformed_not_key_required() {
         // The encryption field is only trusted once the document claims to be
         // a PSB at all.
@@ -959,7 +1135,6 @@ mod tests {
         let bytes = [0x0d, 0x00, 0x0c];
         let document = PsbDocument {
             bytes: &bytes,
-            version: 0,
             names_offset: 0,
             strings_offset: 0,
             strings_data_offset: 0,
@@ -980,7 +1155,6 @@ mod tests {
         let bytes = [0x0d, 0x01, 0x0c];
         let document = PsbDocument {
             bytes: &bytes,
-            version: 0,
             names_offset: 0,
             strings_offset: 0,
             strings_data_offset: 0,
