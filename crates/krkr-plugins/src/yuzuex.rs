@@ -270,10 +270,13 @@ impl ProxyMedia {
     /// The name `name` is mapped to, or `None` when the script mapped nothing
     /// there.
     ///
-    /// The DLL lower-cases the name before its dictionary read
-    /// (`0x10001910` calls `tTJSString::ToLowerCase`, which folds ASCII
-    /// `A-Z`), so the lookup is exact and case-insensitive for the ASCII names
-    /// a storage path is made of.
+    /// The DLL lower-cases the **name it was handed** before its dictionary
+    /// read (`0x10001910` calls `tTJSString::ToLowerCase`, which folds ASCII
+    /// `A-Z`, and the value it reads back is not touched), so the lookup is an
+    /// exact comparison against the request as lower-cased. A script
+    /// therefore keyed its mappings in lower case — PARQUET's is
+    /// `./krmovie.dll` — and an upper-case key would be unreachable in the
+    /// reference too.
     fn resolve(&self, name: &str) -> Option<String> {
         self.table.get(&name.to_ascii_lowercase())
     }
