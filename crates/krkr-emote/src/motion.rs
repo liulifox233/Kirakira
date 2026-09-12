@@ -27,6 +27,16 @@ pub struct Motion {
     psb: PsbFile,
     normalized_data: Vec<u8>,
     normalize_report: NormalizeReport,
+    texture_resources: BTreeMap<u32, TextureResource>,
+}
+
+/// How to decode one icon's pixel resource.
+#[derive(Debug, Clone, PartialEq)]
+struct TextureResource {
+    width: u32,
+    height: u32,
+    palette_resource_index: Option<u32>,
+    compress: Option<String>,
 }
 
 impl Motion {
@@ -55,6 +65,7 @@ impl Motion {
 
         let sources = build_sources(&psb);
         let spec = psb.root.field_str("spec").map(str::to_owned);
+        let texture_resources = build_texture_resources(&sources);
 
         let mut adapted = psb.clone();
         let normalize_report = normalize_source_table(&mut adapted);
@@ -70,6 +81,7 @@ impl Motion {
             psb: adapted,
             normalized_data,
             normalize_report,
+            texture_resources,
         })
     }
 
@@ -132,13 +144,54 @@ impl Motion {
 
     /// Raw bytes of one PSB resource (the pixels of `MotionIcon`s, meshes, …).
     pub fn texture_bytes(&self, resource_index: u32) -> Option<&[u8]> {
+        self.resource_bytes(resource_index)
+    }
+
+    /// Raw bytes of any PSB resource, by index.
+    pub fn resource_bytes(&self, resource_index: u32) -> Option<&[u8]> {
         self.psb
             .resource_bytes(&self.normalized_data, resource_index as usize)
     }
 
+    /// One icon's pixels decoded to RGBA (the RL/palette decoder in
+    /// `src/decode.rs`).
+    ///
+    /// The resource's pixel format comes from the icon that references it: a
+    /// `pal` makes it 8-bit paletted, otherwise it is RGBA, and the `compress`
+    /// tag selects the RL codec. A resource that no icon references has no
+    /// known dimensions and is reported as
+    /// [`MotionError::UnknownTextureResource`].
+    pub fn texture_pixels(
+        &self,
+        resource_index: u32,
+    ) -> Result<crate::decode::DecodedTexture, MotionError> {
+        let info = self
+            .texture_resources
+            .get(&resource_index)
+            .ok_or(MotionError::UnknownTextureResource(resource_index))?;
+        let pixels = self
+            .resource_bytes(resource_index)
+            .ok_or(MotionError::MissingResource(resource_index))?;
+        let palette = match info.palette_resource_index {
+            Some(index) => Some(
+                self.resource_bytes(index)
+                    .ok_or(MotionError::MissingResource(index))?,
+            ),
+            None => None,
+        };
+        crate::decode::decode_icon(
+            pixels,
+            palette,
+            info.width,
+            info.height,
+            info.compress.as_deref(),
+        )
+        .map_err(MotionError::from)
+    }
+
     /// Samples `animation` at `ticks` and returns the draw list in draw order.
     ///
-    /// One tick is 1/60 s ([`EMOTE_TICKS_PER_SECOND`]); the caller advances its
+    /// One tick is 1/60 s ([`crate::EMOTE_TICKS_PER_SECOND`]); the caller advances its
     /// own clock and passes the accumulated ticks. Sampling past the animation
     /// duration wraps around it.
     pub fn draw_list(
@@ -201,6 +254,56 @@ impl Motion {
     /// Texture metadata for one adapted texture key (`"<source>/<icon>"`).
     pub fn texture_source(&self, name: &str) -> Option<&eluna::EmoteTextureSource> {
         self.schema.textures.get(name)
+    }
+}
+
+/// Indexes every icon's pixel resource so [`Motion::texture_pixels`] knows a
+/// resource's dimensions, palette and codec without walking the source table.
+///
+/// A resource shared by several icons takes the first icon's description; the
+/// file's own writers never mix formats for one resource.
+fn build_texture_resources(
+    sources: &BTreeMap<String, MotionSource>,
+) -> BTreeMap<u32, TextureResource> {
+    let mut resources = BTreeMap::new();
+    for source in sources.values() {
+        // A FreeMote source's icons are sub-rectangles of one texture: the
+        // resource's own dimensions are what decodes, and the icon rectangle
+        // travels as the draw item's `uv`.
+        if let Some(texture) = &source.texture {
+            resources.insert(
+                texture.resource_index,
+                TextureResource {
+                    width: pixel_dimension(texture.width),
+                    height: pixel_dimension(texture.height),
+                    palette_resource_index: None,
+                    compress: source
+                        .icons
+                        .values()
+                        .next()
+                        .and_then(|icon| icon.compress.clone()),
+                },
+            );
+        }
+        for icon in source.icons.values() {
+            resources
+                .entry(icon.resource_index)
+                .or_insert_with(|| TextureResource {
+                    width: pixel_dimension(icon.width),
+                    height: pixel_dimension(icon.height),
+                    palette_resource_index: icon.palette_resource_index,
+                    compress: icon.compress.clone(),
+                });
+        }
+    }
+    resources
+}
+
+fn pixel_dimension(value: f32) -> u32 {
+    if !value.is_finite() || value < 1.0 {
+        1
+    } else {
+        value.round() as u32
     }
 }
 

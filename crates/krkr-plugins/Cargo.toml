@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 krkr-engine.workspace = true
 krkr-tjs2.workspace = true
+# The E-mote motion adapter (`Motion`, RL/palette texture decode, software
+# draw-list rasteriser) that `motion_player.rs` exposes as the plugin surface.
+krkr-emote.workspace = true
 # The `lzfs` media decodes LZ4 frames with `lz4_flex`'s frame API (the same
 # crate `krkr-emote` already pulls into the workspace).
 lz4_flex = "0.11"
