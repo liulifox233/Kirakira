@@ -43,8 +43,11 @@
 //!   --watch-expr <expr>     evaluate a TJS expression every frame and log it
 //!                           whenever its value changes (repeatable)
 //!   --expr <expr>           evaluate a TJS expression after the frame loop
-//!   --shot <path>           write a composited screenshot PNG
-//!   --shot-frame <n>        capture draw commands at frame n (default last)
+//!   --shot <path>           write a screenshot PNG: the composited frame
+//!                           (live tree plus every active transition)
+//!   --shot-raw              write the historical raw view instead: draw
+//!                           commands only, no transition composite
+//!   --shot-frame <n>        capture frame output at frame n (default last)
 //!   --pixels                print per-image pixel statistics while running
 //!   --layers                dump the layer tree at the end
 //!   --dump-global <name>    dump a global variable's members at the end
@@ -90,7 +93,9 @@
 //!                           to the host log, so `logs "native call"` reads
 //!                           them back
 //!   resources                list pending image/script/external resources
-//!   shot <path>             write the last rendered frame as a PNG
+//!   shot [--raw] <path>      write the last rendered frame as a PNG; the
+//!                           default view composites active transitions,
+//!                           `--raw` keeps draw commands only
 //!   expr <tjs>              evaluate an expression in the global context
 //!   members [-a] [-f <substr>] <expr>
 //!                           list an object's data members (`-a` also shows
@@ -123,8 +128,8 @@ use std::{collections::VecDeque, io::Write, path::PathBuf, sync::Arc, thread, ti
 use krkr_assets::{NativeAssetStore, ProjectStorage};
 use krkr_audio::VirtualAudioSink;
 use krkr_core::{
-    AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, Point,
-    PointerButton, Size,
+    AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, FrameOutput,
+    Point, PointerButton, Size,
 };
 use krkr_debug::snapshot::TextureCache;
 use krkr_engine::{
@@ -154,6 +159,7 @@ struct Config {
     watch_exprs: Vec<String>,
     expr: Option<String>,
     shot: Option<String>,
+    shot_raw: bool,
     shot_frame: Option<usize>,
     pixels: bool,
     layers: bool,
@@ -252,6 +258,7 @@ fn parse_args() -> Config {
             "--watch-expr" => config.watch_exprs.push(next_arg(&mut args, "--watch-expr")),
             "--expr" => config.expr = Some(next_arg(&mut args, "--expr")),
             "--shot" => config.shot = Some(next_arg(&mut args, "--shot")),
+            "--shot-raw" => config.shot_raw = true,
             "--shot-frame" => {
                 config.shot_frame = Some(
                     next_arg(&mut args, "--shot-frame")
@@ -600,11 +607,15 @@ fn main() {
         .shot_frame
         .unwrap_or_else(|| config.max_frames.saturating_sub(1));
     let mut textures: TextureCache = TextureCache::new();
-    let mut shot_commands: Option<Vec<DrawCommand>> = None;
+    // The most recent frame output, kept whole (transitions included) so a
+    // `shot`/`draw` can show the composited frame rather than just the live
+    // draw list.
+    let mut last_frame_output: Option<FrameOutput> = None;
     let mut pending_audio_stops: Vec<AudioInstanceId> = Vec::new();
     let mut pending_interactive_releases = Vec::new();
     let mut pending_interactive_clicks = Vec::new();
-    let mut pending_interactive_shots = Vec::new();
+    // `(path, raw)`: a shot issued while no frame is available yet.
+    let mut pending_interactive_shots: Vec<(String, bool)> = Vec::new();
     let mut interactive_paused = interactive.is_some();
     let mut interactive_budget: Option<usize> = None;
     let mut interactive_auto_click = config.auto_click;
@@ -638,7 +649,7 @@ fn main() {
                             Err(_) => InteractiveCommand::Quit,
                         },
                     };
-                    if apply_interactive_control(
+                    if apply_interactive_control_with_frame(
                         command,
                         &mut interactive_paused,
                         &mut interactive_budget,
@@ -648,7 +659,7 @@ fn main() {
                         frame_index,
                         &mut runtime,
                         &mut textures,
-                        shot_commands.as_deref(),
+                        last_frame_output.as_ref(),
                         &mut interactive_auto_click,
                         &mut interactive_auto_point,
                     ) {
@@ -675,7 +686,7 @@ fn main() {
                             deferred_interactive_commands.push_back(command);
                             continue;
                         }
-                        if apply_interactive_control(
+                        if apply_interactive_control_with_frame(
                             command,
                             &mut interactive_paused,
                             &mut interactive_budget,
@@ -685,7 +696,7 @@ fn main() {
                             frame_index,
                             &mut runtime,
                             &mut textures,
-                            shot_commands.as_deref(),
+                            last_frame_output.as_ref(),
                             &mut interactive_auto_click,
                             &mut interactive_auto_point,
                         ) {
@@ -854,44 +865,25 @@ fn main() {
                     );
                 }
                 if config.shot.is_some() && frame_index == shot_frame {
-                    shot_commands = Some(frame.output.draw_commands.clone());
+                    last_frame_output = Some(frame.output.clone());
                 }
                 if interactive.is_some() {
                     // Keep the most recent frame available for an immediate
                     // `shot` command while paused between updates.
-                    shot_commands = Some(frame.output.draw_commands.clone());
+                    last_frame_output = Some(frame.output.clone());
                 }
                 let commands = runtime.take_audio_commands();
                 if config.virtual_audio {
                     queue_virtual_audio_completions(&commands, &mut pending_audio_stops);
                 }
-                for path in pending_interactive_shots.drain(..) {
-                    for layer in runtime.engine().host().layer_tree().layers() {
-                        if let Some(image) = &layer.image {
-                            textures.insert(
-                                image.upload.texture_id,
-                                (
-                                    image.upload.width,
-                                    image.upload.height,
-                                    Arc::clone(&image.upload.rgba),
-                                ),
-                            );
-                        }
-                    }
-                    let viewport = runtime
-                        .engine()
-                        .content_viewport_size()
-                        .unwrap_or(Size::new(1280.0, 720.0));
-                    let (width, height, rgba) = snapshot::composite_frame(
-                        viewport.width.max(1.0) as u32,
-                        viewport.height.max(1.0) as u32,
-                        &frame.output.draw_commands,
-                        &textures,
+                for (path, raw) in pending_interactive_shots.drain(..) {
+                    write_interactive_shot(
+                        &path,
+                        runtime.engine(),
+                        &frame.output,
+                        &mut textures,
+                        raw,
                     );
-                    match snapshot::write_png(&path, width, height, &rgba) {
-                        Ok(()) => println!("interactive screenshot={path}"),
-                        Err(error) => println!("interactive screenshot_error={path}: {error}"),
-                    }
                 }
                 if interactive.is_some() {
                     if let Some(budget) = interactive_budget.as_mut() {
@@ -1098,25 +1090,33 @@ fn main() {
         }
     }
     if let Some(path) = &config.shot {
-        // Live layer images take priority over cached uploads: a layer image
-        // can be updated in place without a new upload, which would leave the
-        // cached copy stale (e.g. an opaque black texture turned transparent).
-        for layer in runtime.engine().host().layer_tree().layers() {
-            if let Some(image) = &layer.image {
-                textures.insert(
-                    image.upload.texture_id,
-                    (
-                        image.upload.width,
-                        image.upload.height,
-                        Arc::clone(&image.upload.rgba),
-                    ),
+        match last_frame_output.take() {
+            Some(frame) => {
+                // Live layer images take priority over cached uploads: a layer
+                // image can be updated in place without a new upload, which
+                // would leave the cached copy stale (e.g. an opaque black
+                // texture turned transparent).
+                refresh_live_layer_images(runtime.engine(), &mut textures);
+                let viewport = runtime
+                    .engine()
+                    .content_viewport_size()
+                    .unwrap_or(Size::new(1280.0, 720.0));
+                let width = viewport.width.max(1.0) as u32;
+                let height = viewport.height.max(1.0) as u32;
+                let (width, height, rgba) = if config.shot_raw {
+                    snapshot::composite_frame(width, height, &frame.draw_commands, &textures)
+                } else {
+                    snapshot::composite_frame_output(width, height, &frame, &textures)
+                };
+                snapshot::write_png(path, width, height, &rgba).expect("write screenshot");
+                println!(
+                    "screenshot={path} size={width}x{height} transitions={} raw={}",
+                    frame.transitions.len(),
+                    config.shot_raw
                 );
             }
+            None => println!("screenshot_error={path}: no frame was rendered"),
         }
-        let commands = shot_commands.unwrap_or_default();
-        let (width, height, rgba) = snapshot::composite_frame(1280, 720, &commands, &textures);
-        snapshot::write_png(path, width, height, &rgba).expect("write screenshot");
-        println!("screenshot={path} commands={}", commands.len());
     }
 }
 
