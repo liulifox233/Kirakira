@@ -2260,29 +2260,32 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     // (`tjsInterCodeExec.cpp:3100-3101`).
                     Err(TjsError::invalid_type())
                 } else if context == BytecodeContextType::Class {
-                    if let Some(instance) = this_obj.filter(|handle| *handle != self.runtime.global)
-                    {
-                        // A plain call to a class object with an instance
-                        // `this` only runs the class body (member
-                        // initializers); krkrz performs superclass
-                        // initialization this way and never invokes the
-                        // constructor here. The constructor runs separately
-                        // through `new` or an explicit ctor call.
-                        self.initialize_inter_code_class_body(
-                            file_id,
-                            object_index,
-                            instance,
-                            continuation,
-                        )
-                    } else {
-                        self.create_new_inter_code(
-                            file_id,
-                            object_index,
-                            context,
-                            args,
-                            continuation,
-                        )
-                    }
+                    // A plain call to a class object only runs the class body
+                    // (member initializers) -- `tTJSInterCodeContext::FuncCall`
+                    // with no member name answers a class context with
+                    // `ExecuteAsFunction(objthis, ...)`
+                    // (`tjsInterCodeExec.cpp:3058-3060`) and never invokes the
+                    // constructor.  krkrz initializes a super class this way
+                    // (`gpd %r, %-2.Base; chgthis %r, %-1; call %r()` in the
+                    // compiler's class body), and KAGEX probes a class on its
+                    // temporary `__missing` object the same way.
+                    //
+                    // The body must therefore run on the *caller's* `this`:
+                    // constructing here would run it -- and the constructor --
+                    // on a throwaway instance, so the caller's object would
+                    // keep missing every member the body installs.  GINKA's
+                    // `SystemRegistory` class body owns `_map`/`_cached`, and
+                    // losing them raised `MemberNotFound: Member "_map" does
+                    // not exist` from `SystemManager.add` during boot.  A
+                    // missing `this` falls back to the global object, the way
+                    // the top-level case does (`:3045-3048`).
+                    let instance = this_obj.unwrap_or(self.runtime.global);
+                    self.initialize_inter_code_class_body(
+                        file_id,
+                        object_index,
+                        instance,
+                        continuation,
+                    )
                 } else {
                     Ok(CallOutcome::Frame(Box::new(self.create_call_frame(
                         file_id,

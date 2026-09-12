@@ -1238,3 +1238,66 @@ fn class_body_link_does_not_answer_for_other_receivers() {
         Variant::String("Integer/miss".to_string())
     );
 }
+
+/// A *plain* call of a class object runs the class body on the caller's `this`
+/// and never constructs.
+///
+/// `tTJSInterCodeContext::FuncCall` with no member name answers a class context
+/// with `ExecuteAsFunction(objthis, param, numparams, result, 0)`
+/// (`tjsInterCodeExec.cpp:3058-3060`), which is exactly how a derived class
+/// body initializes its parent -- GINKA's `sysscn/system.tjs` bytecode does
+/// `gpd %1, %-2.SystemRegistory; chgthis %1, %-1; call %0, %1()` for it -- and
+/// how KAGEX probes a class on its temporary `__missing` object.  Constructing
+/// instead (what this crate did when the caller's `this` was the global object)
+/// runs the body -- *and* the constructor -- on a throwaway instance, so the
+/// caller keeps missing every member the body installs.  GINKA's
+/// `SystemRegistory` body owns `_map`/`_cached`; losing them made the game's
+/// `SystemManager.add` raise `MemberNotFound: Member "_map" does not exist`
+/// from the bytecode at `system.tjs`'s top level before the title screen could
+/// load.
+#[test]
+fn plain_call_of_a_class_object_runs_the_body_on_the_callers_this() {
+    assert_eq!(
+        ok(r#"
+        class Base7 {
+            var _map = 7;
+            function Base7() { global.constructed = 1; }
+            function read() { return _map; }
+        }
+        global.constructed = void;
+        var body = Base7;
+        var result = body();
+        return global._map + "/" + (typeof global.constructed) + "/"
+            + (typeof global.read) + "/" + (typeof result);
+        "#),
+        // `typeof` reports the void value the class body's own `srv` leaves
+        // behind (`:3054-3069`), and the constructor never ran.
+        Variant::String("7/void/Object/void".to_string())
+    );
+}
+
+/// The same call with an explicit object receiver: the body installs its
+/// members there (the shape a derived class body's base-class initialization
+/// uses through `chgthis`), and the call still answers the body's own value.
+#[test]
+fn plain_call_of_a_class_object_installs_members_on_an_object_receiver() {
+    assert_eq!(
+        ok(r#"
+        class Base8 {
+            var _map = 8;
+            function Base8() { global.constructed = 1; }
+        }
+        class Derived8 extends Base8 {
+            function Derived8() { }
+        }
+        global.constructed = void;
+        var d = new Derived8();
+        var holder = %[];
+        var body = Base8;
+        var result = (body incontextof holder)();
+        return d._map + "/" + holder._map + "/" + (typeof global.constructed)
+            + "/" + (typeof result);
+        "#),
+        Variant::String("8/8/void/void".to_string())
+    );
+}
