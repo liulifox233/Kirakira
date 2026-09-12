@@ -3,9 +3,12 @@
 //! The shipped DLL provides the two native pieces the krkrz `k2compat/*.tjs`
 //! scripts need:
 //!
-//! - **`Window.TouchMouse`** — a `WindowTouchMouse`-shaped event source bound
-//!   onto the `Window` class object, with the `enabled` flag and five
+//! - **`Window.TouchMouse`** — the `WindowTouchMouse` class object bound onto
+//!   the `Window` class object, with the `enabled` flag and five
 //!   `onTouchMouse*` callbacks (`Down`, `Move`, `Up`, `Click`, `DblClick`).
+//!   The DLL binds a *class*: games construct it (`new Window.TouchMouse(kag)`)
+//!   and hand the instance to their own hook lists, so the shim binds a native
+//!   constructor whose instances carry the same members.
 //! - **`ModelessOwnerWindow`** — the class behind K2 modeless dialogs, built on
 //!   a hidden native owner window (`USER32`). The dossier could not recover its
 //!   member list.
@@ -14,8 +17,8 @@
 //! callbacks (`Window.onMouseDown/Move/Up`, `Layer.onMouse*`) — see
 //! `EngineEvent::TouchInput` in krkr-engine — and no engine code dispatches
 //! `onTouchMouse*`. A plugin module installs its surface at registration time
-//! and cannot hook that dispatch from here, so `TouchMouse` is declared and
-//! inert: `enabled` stores the flag and the five callbacks are callable no-ops.
+//! and cannot hook that dispatch from here, so `TouchMouse` is inert beyond its
+//! shape: `enabled` stores the flag and the five callbacks are callable no-ops.
 //! Handlers a script assigns to them are kept but never invoked.
 //! `ModelessOwnerWindow` is an empty class object, enough for the dossier's
 //! `typeof`-only probe; no member is claimed because none was recovered.
@@ -31,7 +34,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "Window.TouchMouse and ModelessOwnerWindow",
-    notes: "TouchMouse is declared and inert: `enabled` stores the flag and the five onTouchMouse* callbacks are callable no-ops the engine never invokes (Kirakira routes touch/mouse input to the KRKR pointer callbacks Window/Layer onMouseDown/Move/Up, and a plugin module cannot hook that dispatch). ModelessOwnerWindow is an empty class object: the dossier could not recover its member list, so none is claimed.",
+    notes: "TouchMouse is the WindowTouchMouse class object the DLL binds: `new Window.TouchMouse(owner)` yields an instance carrying `enabled` and the five onTouchMouse* callbacks (the class object carries them too, so a script can read `Window.TouchMouse.enabled` without constructing one). The surface is inert: `enabled` stores the flag and the callbacks are callable no-ops the engine never invokes (Kirakira routes touch/mouse input to the KRKR pointer callbacks Window/Layer onMouseDown/Move/Up, and a plugin module cannot hook that dispatch). ModelessOwnerWindow is an empty class object: the dossier could not recover its member list, so none is claimed.",
     install: |engine| engine.register_plugin(K2CompatPlugin),
 };
 pub struct K2CompatPlugin;
@@ -73,7 +76,20 @@ fn install_window_touch_mouse(runtime: &mut Runtime<KrkrHost>) {
     {
         return;
     }
-    let touch_mouse = runtime.alloc_ordinary_object();
+    // The DLL's binder binds the *class object* of `WindowTouchMouse` under
+    // `Window.TouchMouse` (`docs/plugins/k2compat.md`), and games construct it:
+    // GINKA's `sysscn/gesture.tjs` runs `new Window.TouchMouse(kag)` and hands
+    // the result to its hook list. A plain object is not callable, so that
+    // `new` fails with `TJS_E_INVALIDTYPE` and the boot stops before the first
+    // scenario. The class object carries the members too, because scripts read
+    // `Window.TouchMouse.enabled` without constructing anything.
+    let touch_mouse = runtime.alloc_native_constructor(
+        |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, _args: Vec<Variant>| {
+            let instance = bound_instance(runtime, this_obj, "WindowTouchMouse");
+            install_touch_mouse_members(runtime, instance);
+            Ok(Variant::Object(instance))
+        },
+    );
     runtime.add_object_class_info(touch_mouse, "WindowTouchMouse");
     install_touch_mouse_members(runtime, touch_mouse);
     runtime.set_object_member(window, "TouchMouse", Variant::Object(touch_mouse));
@@ -200,6 +216,41 @@ mod tests {
                 "Window.TouchMouse.{event} is missing"
             );
         }
+    }
+
+    /// The DLL's binder binds the `WindowTouchMouse` *class object* under
+    /// `Window.TouchMouse`, and games construct it: GINKA's
+    /// `sysscn/gesture.tjs` runs `new Window.TouchMouse(kag)` inside
+    /// `MouseGestureBase` and hands the instance to its hook list. A bare
+    /// ordinary object is not callable, so that `new` raises
+    /// `TJS_E_INVALIDTYPE` and the boot stops before the first scenario (the
+    /// `1c1c754` regression).
+    #[test]
+    fn the_touch_mouse_is_the_constructible_class_object() {
+        let mut engine = engine();
+        let value = engine
+            .execute_script(
+                "probe.tjs",
+                r#"
+                var instance = new Window.TouchMouse(0);
+                var declared = 0;
+                if (typeof instance.onTouchMouseDown != "undefined") declared++;
+                if (typeof instance.onTouchMouseMove != "undefined") declared++;
+                if (typeof instance.onTouchMouseUp != "undefined") declared++;
+                if (typeof instance.onTouchMouseClick != "undefined") declared++;
+                if (typeof instance.onTouchMouseDblClick != "undefined") declared++;
+                var before = instance.enabled;
+                instance.enabled = true;
+                var callable = typeof instance.onTouchMouseDown(0, 0) == "void";
+                return typeof Window.TouchMouse + "|" + typeof instance + "|" +
+                    before + "|" + instance.enabled + "|" + declared + "|" + callable;
+                "#,
+            )
+            .expect("construct Window.TouchMouse");
+        assert_eq!(
+            value,
+            Variant::String("Object|Object|0|1|5|1".to_string())
+        );
     }
 
     #[test]
