@@ -256,3 +256,51 @@ fn chop_storage_ext(name: &str) -> String {
         .map(|index| name[..index].to_string())
         .unwrap_or_else(|| name.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use krkr_tjs2::runtime::Variant;
+
+    use crate::engine::{EngineConfig, KrkrEngine};
+
+    /// Evaluates `Storages.getFullPath(<name>)` the way a script reaches it.
+    fn full_path(engine: &mut KrkrEngine, name: &str) -> String {
+        let source = format!("return Storages.getFullPath({name:?});");
+        match engine
+            .execute_script("getFullPath-probe.tjs", &source)
+            .expect("script")
+        {
+            Variant::String(value) => value,
+            other => panic!("Storages.getFullPath returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_full_path_keeps_the_reference_trailing_delimiter() {
+        // krkrz's `getFullPath` is `TVPNormalizeStorageName`
+        // (`StorageIntf.cpp:1391-1402`, `:549`); its compression loop
+        // (`:400-453`) deletes a delimiter only when another one follows, so a
+        // trailing `/` survives. GINKA's `addAutoPathRecursive` feeds the
+        // result to `Storages.isExistentDirectory`/`dirlist`, whose fstat
+        // override demands the trailing `/` (`fstat/Main.cpp:759-762`).
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        assert_eq!(full_path(&mut engine, "a/b/"), "a/b/");
+        assert_eq!(full_path(&mut engine, "a/b"), "a/b");
+        assert_eq!(full_path(&mut engine, "a/b//"), "a/b/");
+        assert_eq!(full_path(&mut engine, "./setup/debug/"), "setup/debug/");
+        assert_eq!(full_path(&mut engine, "setup\\debug\\"), "setup/debug/");
+        assert_eq!(full_path(&mut engine, "setup/debug/../"), "setup/");
+        assert_eq!(
+            full_path(&mut engine, "archive.xp3>DIR/"),
+            "archive.xp3>dir/"
+        );
+        // The delimiter in front of `>` is a duplicated one for the reference
+        // and disappears (`StorageIntf.cpp:392-398`, `:405`, `:409-413`).
+        assert_eq!(
+            full_path(&mut engine, "archive.xp3/>DIR/"),
+            "archive.xp3>dir/"
+        );
+        assert_eq!(full_path(&mut engine, "/"), "/");
+        assert_eq!(full_path(&mut engine, ""), "");
+    }
+}
