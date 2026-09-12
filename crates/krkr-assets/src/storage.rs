@@ -1308,27 +1308,22 @@ impl ProjectStorage {
         }
 
         let candidates = self.storage_candidates(name).map_err(tjs_error_to_io)?;
+        // Candidates are ordered the way the reference searches: the requested
+        // name itself (the project folder) first, then one candidate per auto
+        // path in *reverse* declaration order, so the last `Storages.addAutoPath`
+        // wins. A candidate is resolved against every layer it can reach -- the
+        // filesystem, or the one mount an `archive.xp3>` name pins -- before the
+        // walk moves on. Resolving all filesystem candidates in a separate pass
+        // first would let a folder auto path declared *before* a patch archive
+        // shadow the archive's copy; the reference keeps one auto-path table
+        // entry per basename and the latest declaration replaces it
+        // (`tTJSHashTable::Add`, `krkrz/src/core/tjs2/tjsHashSearch.h`),
+        // whether that declaration names a folder or an archive.
         for candidate in &candidates {
-            if split_archive_candidate(candidate).is_some() {
-                continue;
-            }
-            let relative = clean_relative_path(candidate).map_err(tjs_error_to_io)?;
-            if let Some(storage) = self.find_fs_candidate(candidate, &relative)? {
-                self.cache_lookup(name, Some(storage.clone()));
-                return Ok(storage);
-            }
-        }
-
-        // KRKR's auto-path table is the authoritative archive index, and an
-        // `archive.xp3>` entry addresses exactly one mount. Honor those before
-        // the name-only scan, otherwise an archive registered late (a patch
-        // overlay) loses to whichever mount happens to sort last.
-        if let Some(provider) = &self.inner.xp3_provider {
-            for candidate in &candidates {
-                let Some((archive, member)) = split_archive_candidate(candidate) else {
-                    continue;
-                };
-                if let Some(entry) = provider.get_entry_in(archive, member) {
+            if let Some((archive, member)) = split_archive_candidate(candidate) {
+                if let Some(provider) = &self.inner.xp3_provider
+                    && let Some(entry) = provider.get_entry_in(archive, member)
+                {
                     let storage = LocatedResource::Xp3 {
                         storage_name: candidate.clone(),
                         archive: Some(archive.to_string()),
@@ -1338,7 +1333,21 @@ impl ProjectStorage {
                     self.cache_lookup(name, Some(storage.clone()));
                     return Ok(storage);
                 }
+                continue;
             }
+            let relative = clean_relative_path(candidate).map_err(tjs_error_to_io)?;
+            if let Some(storage) = self.find_fs_candidate(candidate, &relative)? {
+                self.cache_lookup(name, Some(storage.clone()));
+                return Ok(storage);
+            }
+        }
+
+        // The name-only scan is the engine's fallback for archives the game
+        // never declared as an auto path. It runs after every declared
+        // candidate so a later declaration always wins, and
+        // `Xp3ResourceProvider::get_entry` walks the mounts in reverse, so the
+        // later mount wins for a duplicate member.
+        if let Some(provider) = &self.inner.xp3_provider {
             for candidate in &candidates {
                 if split_archive_candidate(candidate).is_some() {
                     continue;
@@ -2959,6 +2968,233 @@ mod tests {
                 "data.xp3",
                 "patch.xp3"
             ]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Minimal XP3 container writer for resolver fixtures: magic, one raw
+    /// segment per entry, then a raw (uncompressed) index block. Mirrors the
+    /// layout `krkr-xp3/src/parse.rs` reads, in the same shape as that crate's
+    /// own `build_archive` test fixture.
+    fn build_xp3_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        fn push_chunk(output: &mut Vec<u8>, name: &[u8; 4], body: &[u8]) {
+            output.extend_from_slice(name);
+            output.extend_from_slice(&u64::try_from(body.len()).expect("chunk fits").to_le_bytes());
+            output.extend_from_slice(body);
+        }
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&krkr_xp3::XP3_MAGIC);
+        let index_pointer_offset = archive.len();
+        archive.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut built = Vec::new();
+        for (name, data) in entries {
+            let offset = archive.len() as u64;
+            archive.extend_from_slice(data);
+            built.push((*name, offset, data.len() as u64));
+        }
+        let index_offset = archive.len() as u64;
+
+        let mut index = Vec::new();
+        for (name, offset, size) in &built {
+            let mut file = Vec::new();
+            let mut info = Vec::new();
+            info.extend_from_slice(&0u32.to_le_bytes());
+            info.extend_from_slice(&size.to_le_bytes());
+            info.extend_from_slice(&size.to_le_bytes());
+            let units = name.encode_utf16().collect::<Vec<_>>();
+            info.extend_from_slice(
+                &u16::try_from(units.len())
+                    .expect("entry name fits")
+                    .to_le_bytes(),
+            );
+            for unit in units {
+                info.extend_from_slice(&unit.to_le_bytes());
+            }
+            push_chunk(&mut file, b"info", &info);
+
+            let mut segm = Vec::new();
+            segm.extend_from_slice(&0u32.to_le_bytes());
+            segm.extend_from_slice(&offset.to_le_bytes());
+            segm.extend_from_slice(&size.to_le_bytes());
+            segm.extend_from_slice(&size.to_le_bytes());
+            push_chunk(&mut file, b"segm", &segm);
+
+            push_chunk(&mut file, b"adlr", &0u32.to_le_bytes());
+            push_chunk(&mut index, b"File", &file);
+        }
+
+        archive.push(0); // raw index block
+        archive.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        archive.extend_from_slice(&index);
+        archive[index_pointer_offset..index_pointer_offset + 8]
+            .copy_from_slice(&index_offset.to_le_bytes());
+        archive
+    }
+
+    /// Two archives that both hold `dup.bin`, plus one member only each. The
+    /// mount list is sorted (`a.xp3` before `z.xp3`), so a name-only lookup
+    /// falls back to `z.xp3` and any other outcome comes from auto paths.
+    fn project_with_two_archives(prefix: &str) -> PathBuf {
+        let root = temp_root(prefix);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("a.xp3"),
+            build_xp3_archive(&[("dup.bin", b"from-a"), ("a-only.bin", b"a-only")]),
+        )
+        .expect("write a.xp3");
+        fs::write(
+            root.join("z.xp3"),
+            build_xp3_archive(&[("dup.bin", b"from-z"), ("z-only.bin", b"z-only")]),
+        )
+        .expect("write z.xp3");
+        root
+    }
+
+    /// Ground truth, krkrz `TVPGetPlacedPath` (`StorageIntf.cpp:1164-1195`):
+    /// the current folder is probed first, then the auto path table by
+    /// basename. `TVPAddAutoPath` appends to `TVPAutoPathList`
+    /// (`StorageIntf.cpp:999-1015`) and `TVPRebuildAutoPathTable` fills
+    /// `TVPAutoPathTable` in that order (`:1035-1141`); `tTJSHashTable::Add`
+    /// replaces a duplicate key's value (`src/core/tjs2/tjsHashSearch.h`), so
+    /// **the last declaration wins**. KAG3's `Initialize.tjs` documents and
+    /// relies on it ("later specified is used with higher priority"), adding
+    /// `patch.xp3>` after every shipped archive. GINKA's `Initialize.tjs`
+    /// does the same, and its boot chain declares `GINKA.xp3>` even later.
+    #[test]
+    fn auto_path_declaration_order_decides_between_mounts() {
+        let root = project_with_two_archives("declared-order");
+
+        // Declaring `z.xp3>` first and `a.xp3>` second: the later `a.xp3>`
+        // wins even though the mount list would pick `z.xp3` for a plain name.
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage.add_auto_path("z.xp3>");
+        storage.add_auto_path("a.xp3>");
+        assert_eq!(
+            storage.read_binary_vec("dup.bin").expect("declared copy"),
+            b"from-a".as_slice()
+        );
+        assert_eq!(
+            storage.resolved_storage_name("dup.bin").as_deref(),
+            Some("a.xp3>dup.bin")
+        );
+
+        // Reversed declaration flips the served copy.
+        let reversed = ProjectStorage::for_root(&root).expect("storage");
+        reversed.add_auto_path("a.xp3>");
+        reversed.add_auto_path("z.xp3>");
+        assert_eq!(
+            reversed
+                .read_binary_vec("dup.bin")
+                .expect("later declaration"),
+            b"from-z".as_slice()
+        );
+        assert_eq!(
+            reversed.resolved_storage_name("dup.bin").as_deref(),
+            Some("z.xp3>dup.bin")
+        );
+
+        // Dropping the later declaration restores the other archive's copy;
+        // this is the GINKA `title.pbd` probe in miniature.
+        reversed.remove_auto_path("z.xp3>");
+        assert_eq!(
+            reversed.read_binary_vec("dup.bin").expect("restored copy"),
+            b"from-a".as_slice()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A folder auto path and an archive auto path are entries in the same
+    /// ordered list, so the later declaration wins regardless of which backend
+    /// serves the member. The filesystem-first pass was letting a folder
+    /// declared *before* a patch archive shadow the archive's copy, which the
+    /// reference's single auto-path table cannot do.
+    #[test]
+    fn later_declared_archive_beats_an_earlier_folder_auto_path() {
+        let root = project_with_two_archives("folder-before-archive");
+        fs::create_dir_all(root.join("overlay")).expect("create overlay dir");
+        fs::write(root.join("overlay/dup.bin"), b"from-folder").expect("write overlay copy");
+
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage.add_auto_path("overlay/");
+        storage.add_auto_path("z.xp3>");
+        assert_eq!(
+            storage.read_binary_vec("dup.bin").expect("archive copy"),
+            b"from-z".as_slice()
+        );
+
+        // The reverse declaration keeps the loose folder copy in front.
+        let folder_last = ProjectStorage::for_root(&root).expect("storage");
+        folder_last.add_auto_path("z.xp3>");
+        folder_last.add_auto_path("overlay/");
+        assert_eq!(
+            folder_last.read_binary_vec("dup.bin").expect("folder copy"),
+            b"from-folder".as_slice()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// An `archive.xp3>member` name addresses exactly one mount
+    /// (`TVPIsExistentStorageNoSearchNoNormalize`, `StorageIntf.cpp:799-830`),
+    /// so no auto path can shadow it.
+    #[test]
+    fn explicit_archive_member_address_stays_pinned() {
+        let root = project_with_two_archives("explicit-pin");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage.add_auto_path("z.xp3>");
+        storage.add_auto_path("a.xp3>");
+
+        assert_eq!(
+            storage
+                .read_binary_vec("z.xp3>dup.bin")
+                .expect("pinned z.xp3"),
+            b"from-z".as_slice()
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("a.xp3>dup.bin")
+                .expect("pinned a.xp3"),
+            b"from-a".as_slice()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Without a declaration the engine still serves archive members; the
+    /// mount-wide scan resolves a duplicate through the later mount
+    /// (`Xp3ResourceProvider::get_entry` scans the mount list in reverse).
+    #[test]
+    fn duplicate_member_without_auto_paths_serves_the_later_mount() {
+        let root = project_with_two_archives("mount-order");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+
+        assert_eq!(
+            storage.read_binary_vec("dup.bin").expect("later mount"),
+            b"from-z".as_slice()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Members that only one archive holds keep resolving from it whatever the
+    /// auto path order is.
+    #[test]
+    fn non_duplicate_members_resolve_from_their_only_archive() {
+        let root = project_with_two_archives("unique-members");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage.add_auto_path("z.xp3>");
+        storage.add_auto_path("a.xp3>");
+
+        assert_eq!(
+            storage.read_binary_vec("a-only.bin").expect("a member"),
+            b"a-only".as_slice()
+        );
+        assert_eq!(
+            storage.read_binary_vec("z-only.bin").expect("z member"),
+            b"z-only".as_slice()
+        );
+        assert_eq!(
+            storage.resolved_storage_name("z-only.bin").as_deref(),
+            Some("z.xp3>z-only.bin")
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
