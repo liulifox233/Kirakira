@@ -70,11 +70,14 @@
 //! producer emitted before the tap was armed was never captured, and a read over
 //! those coordinates reports zero [`PcmTapSnapshot::available_frames`]: silence,
 //! never audio from somewhere else. The same holds for coordinates the producer
-//! never published (a gap left by a dropped publish or a stalled producer), for
-//! coordinates already overwritten, for a window before the stream start or past
-//! the end of a non-looping sound, and for every read after
-//! [`PcmTapFeed::stop`]. This mirrors `GetVisBuffer`'s "return how many samples
-//! were written, 0 when the sound is not playing"
+//! never published — a gap left by a dropped publish, or by a producer that
+//! skips coordinates; a stall does *not* leave a gap as long as the producer
+//! keeps publishing its silence, which is what [`ChannelPcmDecoder`] does, so a
+//! stalled stream reads as available zeros — for coordinates already
+//! overwritten, for a window before the stream start or past the end of a
+//! non-looping sound, and for every read after [`PcmTapFeed::stop`]. This
+//! mirrors `GetVisBuffer`'s "return how many samples were written, 0 when the
+//! sound is not playing"
 //! (`krkrz/src/core/sound/win32/WaveImpl.cpp:3274`).
 //!
 //! # Concurrency
@@ -644,10 +647,14 @@ impl TapInstance {
         // ring.
         let chunk_skip = frames.saturating_sub(capacity);
         let end = first_frame.saturating_add(frames);
-        if first_frame != buffers.write_head {
-            // The publish does not continue the previous range: everything
-            // older belongs to a hole that must never read as audio. A
-            // contiguous publish must keep the older range readable.
+        let advances = end > buffers.write_head;
+        if advances && first_frame != buffers.write_head {
+            // The publish moves the range forward without continuing it:
+            // everything older belongs to a hole that must never read as audio.
+            // A contiguous publish keeps the older range readable, and a publish
+            // entirely behind the write head rewrites only its own coordinates:
+            // lowering the bound for it would re-expose a hole an earlier gap
+            // closed.
             buffers.valid_from = first_frame;
         }
         let mut head = first_frame.saturating_add(chunk_skip);

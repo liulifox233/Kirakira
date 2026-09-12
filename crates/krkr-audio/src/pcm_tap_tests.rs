@@ -358,6 +358,33 @@ fn a_contended_publish_is_dropped_without_blocking() {
 }
 
 #[test]
+fn a_publish_behind_the_write_head_does_not_reopen_a_gap() {
+    let (tap, feed) = registered(64);
+    let _ = tap.read(ID, PcmTapWindow::ahead(0));
+    feed.push_at(0, &stereo(0..64));
+    // A gap: coordinates 64..200 were never published.
+    feed.push_at(200, &stereo(200..232));
+    // A publish entirely behind the write head rewrites its own coordinates but
+    // must not make the closed hole readable again.
+    feed.push_at(100, &stereo(100..108));
+
+    feed.set_source_position(168);
+    let snapshot = tap.read(ID, PcmTapWindow::ahead(1)).expect("snapshot");
+    assert_eq!(snapshot.first_frame, 168);
+    assert_eq!(
+        snapshot.available_frames, 0,
+        "the closed hole must stay silent"
+    );
+    assert_eq!(snapshot.frames, vec![0.0; 2]);
+
+    // The still-valid published range is unaffected.
+    feed.set_source_position(208);
+    let snapshot = tap.read(ID, PcmTapWindow::ahead(1)).expect("snapshot");
+    assert_eq!(snapshot.available_frames, 1);
+    assert_eq!(snapshot.frames, [208.0, 1208.0]);
+}
+
+#[test]
 fn register_replaces_the_instance_and_remove_clears_it() {
     let tap = PcmTap::new(8);
     let first = tap.register(ID, spec(2));

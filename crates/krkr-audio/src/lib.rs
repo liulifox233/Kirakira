@@ -1734,4 +1734,90 @@ mod tests {
         feed.stop();
         assert_eq!(tap.state(id), Some(PcmTapState::Stopped));
     }
+
+    /// Pins the producer half of the live-PCM tap contract: the decoder tags
+    /// every frame it hands to kira with its stream coordinate — chunk samples
+    /// and the silence blocks it emits while the producer stalls alike — so the
+    /// tap's coordinates stay in `SoundHandle::position()`'s frame space. A
+    /// regression here (not advancing on the stall path, or counting interleaved
+    /// samples instead of frames) would silently reintroduce the round-1
+    /// misalignment.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_live_pcm_decoder_publishes_coordinates_through_a_stall() {
+        use kira::sound::streaming::Decoder as _;
+        use krkr_core::{PcmAudioChunk, PcmStream, PcmStreamSource};
+
+        struct ScriptedStream {
+            step: usize,
+        }
+
+        impl PcmStream for ScriptedStream {
+            fn next_chunk(&mut self) -> Option<PcmAudioChunk> {
+                let step = self.step;
+                self.step += 1;
+                let samples: Vec<f32> = match step {
+                    0 => (0..8)
+                        .flat_map(|index| [index as f32, index as f32 + 1000.0])
+                        .collect(),
+                    1 => return None,
+                    _ => (0..8)
+                        .flat_map(|index| [100.0 + index as f32, 1100.0 + index as f32])
+                        .collect(),
+                };
+                Some(PcmAudioChunk {
+                    pts_ms: 0,
+                    samples: Arc::from(samples),
+                })
+            }
+        }
+
+        let tap = PcmTap::new(16_384);
+        let id = AudioInstanceId(88);
+        let spec = PcmAudioSpec {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let source = PcmStreamSource::new(spec, 0, Box::new(ScriptedStream { step: 0 }));
+        let feed = tap.register(id, spec);
+        let mut decoder = ChannelPcmDecoder::new(source, Some(feed.clone()));
+
+        // An unread tap ignores publishes, so arm it first.
+        let _ = tap.read(id, PcmTapWindow::ahead(0));
+
+        assert_eq!(decoder.decode().expect("first chunk").len(), 8);
+        let snapshot = tap.read(id, PcmTapWindow::ahead(8)).expect("snapshot");
+        assert_eq!(snapshot.cursor, 0);
+        assert_eq!(snapshot.available_frames, 8);
+        assert_eq!(
+            snapshot.frames,
+            (0..8)
+                .flat_map(|index| [index as f32, index as f32 + 1000.0])
+                .collect::<Vec<f32>>()
+        );
+
+        // Stall: the silence kira renders is published at its own coordinate, so
+        // the frames of the following chunk do not slide forward.
+        assert_eq!(
+            decoder.decode().expect("stall silence").len(),
+            STALL_SILENCE_FRAMES
+        );
+        feed.set_source_position(8);
+        let snapshot = tap.read(id, PcmTapWindow::ahead(2_000)).expect("snapshot");
+        assert_eq!(snapshot.available_frames, 2_000);
+        assert!(snapshot.frames.iter().all(|sample| *sample == 0.0));
+
+        let resumed_at = 8 + STALL_SILENCE_FRAMES as u64;
+        assert_eq!(decoder.decode().expect("resumed chunk").len(), 8);
+        feed.set_source_position(resumed_at);
+        let snapshot = tap.read(id, PcmTapWindow::ahead(8)).expect("snapshot");
+        assert_eq!(snapshot.first_frame, resumed_at);
+        assert_eq!(snapshot.available_frames, 8);
+        assert_eq!(
+            snapshot.frames,
+            (0..8)
+                .flat_map(|index| [100.0 + index as f32, 1100.0 + index as f32])
+                .collect::<Vec<f32>>()
+        );
+    }
 }
