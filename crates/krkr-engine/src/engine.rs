@@ -5250,10 +5250,10 @@ mod tests {
                 snapshot.piledCopy(0, 0, base, 0, 0, 4, 2);
 
                 var thumb = new Layer();
-                thumb.setImageSize(2, 1);
+                thumb.setImageSize(4, 1);
                 thumb.face = dfAlpha;
                 thumb.stretchCopy(
-                    0, 0, 2, 1, snapshot,
+                    0, 0, 4, 1, snapshot,
                     0, 0, snapshot.imageWidth, snapshot.imageHeight, stLinear);
                 thumb.saveLayerImage(System.dataPath + "thumb-pipeline.bmp", "bmp24");
                 "#,
@@ -5262,10 +5262,17 @@ mod tests {
 
         let bytes = fs::read(root.join("savedata/thumb-pipeline.bmp")).expect("bmp");
         assert_eq!(&bytes[0..2], b"BM");
-        assert_eq!(bytes.len(), 54 + 8);
-        // `alpha_blend_func` uses the official packed `>> 8` rounding
-        // (`blend_functor_c.h:64`), so a full-alpha blend lands on 254.
-        assert_eq!(&bytes[54..62], &[255, 0, 0, 0, 0, 254, 0, 0]);
+        assert_eq!(bytes.len(), 54 + 12);
+        // The pile is the opaque blue base with the child alpha-blended over its
+        // right half (`BltImage` picks `bmAlpha` for an `ltAlpha` child on a
+        // non-alpha destination), whose `alpha_blend` packed rounding lands a
+        // full-alpha blend on 254 (`blend_functor_c.h:64`). The vertical 2:1
+        // shrink resamples each column to the exact average of its two rows:
+        // blue, blue, 254-red, 254-red (BGR24).
+        assert_eq!(
+            &bytes[54..66],
+            &[255, 0, 0, 255, 0, 0, 0, 0, 254, 0, 0, 254]
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -11776,11 +11783,15 @@ mod tests {
         assert_eq!(&nearest[8..12], &[0, 0, 255, 255]);
         assert_eq!(&nearest[12..16], &[0, 0, 255, 255]);
 
-        // Bilinear blends the two source columns in the middle.
+        // Bilinear's tap window is the reference's
+        // `left = floor(cx - range)` … `right - 1 = floor(cx + range) - 1`
+        // (`gl/ResampleImage.cpp:303-317`), so for a 2x magnification the first
+        // two destination pixels stay on the first source pixel and the third
+        // mixes both; the channel values are truncated, not rounded (`:428`).
         let linear = pixels(&mut engine, "linear");
         assert_eq!(&linear[..4], &[255, 0, 0, 255]);
-        assert!(linear[4] > 0 && linear[6] > 0, "{linear:?}");
-        assert!(linear[8] > 0 && linear[10] > 0, "{linear:?}");
+        assert_eq!(&linear[4..8], &[255, 0, 0, 255]);
+        assert_eq!(&linear[8..12], &[63, 0, 191, 255]);
         assert_eq!(&linear[12..16], &[0, 0, 255, 255]);
     }
 
@@ -14678,6 +14689,401 @@ mod tests {
             }
         }
         assert_eq!(image.upload.rgba.as_ref(), expected.as_slice());
+    }
+
+    /// `tTJSNI_BaseLayer::convertType` (`LayerIntf.cpp:7624`) →
+    /// `ConvertLayerType` (`:1703-1727`): the `dfAlpha`/`dfAddAlpha` pixel
+    /// rewrites, their round trip and where the conversion is lossy.
+    #[test]
+    fn native_layer_convert_type_rewrites_alpha_representations() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(2, 1);
+                layer.setMainPixel(0, 0, 0x00123456);
+                layer.setMaskPixel(0, 0, 0x80);
+                layer.setMainPixel(1, 0, 0x00ffffff);
+                layer.setMaskPixel(1, 0, 0xff);
+
+                layer.type = ltAddAlpha;                  // dfAddAlpha destination
+                layer.convertType(dfAlpha);               // premultiply
+                var premultiplied = layer.getMainPixel(0, 0) + ":" +
+                    layer.getMaskPixel(0, 0) + ":" + layer.getMainPixel(1, 0);
+
+                // The target representation is the layer's own draw face, so
+                // the way back switches the layer type first (`:1707-1717`).
+                layer.type = ltAlpha;
+                layer.convertType(dfAddAlpha);            // unpremultiply again
+                var roundtrip = layer.getMainPixel(0, 0) + ":" +
+                    layer.getMaskPixel(0, 0) + ":" + layer.getMainPixel(1, 0);
+                return premultiplied + "/" + roundtrip;
+                "#,
+            )
+            .expect("script")
+            .to_tjs_string()
+            .expect("string");
+        // 0x12/0x34/0x56 at alpha 0x80 scale to 0x09/0x1a/0x2b. The `>> 8`
+        // truncation makes the premultiply lossy even at full alpha (0xff
+        // becomes 0xfe, `blend_functor_c.h:871-876`), and coming back through
+        // `TVPDivTable` (`visual/tvpgl.c:251-260`) gives 9*255/128 = 17,
+        // 26*255/128 = 51 and 43*255/128 = 85.
+        assert_eq!(
+            value,
+            "596523:128:16711422/1127253:128:16711422".to_string()
+        );
+    }
+
+    /// `ConvertLayerType` throws `TVPCannotConvertLayerTypeUsingGivenDirection`
+    /// for every pairing that is not `dfAlpha -> dfAddAlpha` or back
+    /// (`LayerIntf.cpp:1718-1722`), needs an argument (`:7628`), and does
+    /// nothing but flag the layer on a layer whose image was freed (`:1710`).
+    #[test]
+    fn native_layer_convert_type_error_surface() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(1, 1);
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "layer.convertType();",
+            // The default `new Layer()` is `ltAlpha` (`dfAlpha`), so asking it
+            // to convert a `dfAlpha` image has no direction.
+            "layer.convertType(dfAlpha);",
+        ] {
+            let error = engine.execute_script("inline.tjs", call).expect_err(call);
+            assert!(
+                error.message.contains("Cannot convert layer type")
+                    || error.message.contains("Invalid argument count"),
+                "{call}: {}",
+                error.message
+            );
+        }
+        // `ltOpaque` resolves to `dfOpaque`, which has no conversion either way.
+        let error = engine
+            .execute_script(
+                "inline.tjs",
+                "layer.type = ltOpaque; layer.convertType(dfAlpha);",
+            )
+            .expect_err("dfOpaque has no conversion");
+        assert!(
+            error.message.contains("Cannot convert layer type"),
+            "{}",
+            error.message
+        );
+        // A freed image is not converted and not resurrected.
+        engine
+            .execute_script(
+                "inline.tjs",
+                "layer.type = ltAddAlpha; layer.freeImage(); layer.convertType(dfAlpha);",
+            )
+            .expect("an image-less layer converts nothing");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "layer.hasImage")
+                .expect("hasImage")
+                .to_integer()
+                .expect("integer"),
+            0
+        );
+    }
+
+    /// Every blit family refuses a destination whose image was freed instead of
+    /// allocating one (`TVPNotDrawableLayerType`; `LayerIntf.cpp:4111`
+    /// `PiledCopy`, `:4159` `CopyRect`, `:4245` `StretchCopy`, `:4287`
+    /// `AffineCopy`, `:4376` `OperateRect`, `:4417` `OperateStretch`, `:4453`
+    /// `OperateAffine`).
+    #[test]
+    fn native_layer_blits_reject_a_destination_without_an_image() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                source.fillRect(0, 0, 2, 2, 0xffff0000);
+
+                global.target = new Layer();
+                target.setSize(4, 4);
+                target.freeImage();
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "target.copyRect(0, 0, source, 0, 0, 2, 2);",
+            "target.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);",
+            "target.stretchCopy(0, 0, 4, 4, source, 0, 0, 2, 2, stNearest);",
+            "target.operateStretch(0, 0, 4, 4, source, 0, 0, 2, 2, omAlpha);",
+            "target.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 4, 0, 0, 4);",
+            "target.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 4, 0, 0, 4, omAlpha);",
+            "target.piledCopy(0, 0, source, 0, 0, 2, 2);",
+            // The fill family takes the same check (`:3866`, `:3936`).
+            "target.fillRect(0, 0, 1, 1, 0xffff0000);",
+            "target.colorRect(0, 0, 1, 1, 0xffff0000);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("a freed bitmap cannot be a blit target");
+            assert!(
+                error.message.contains("Not drawable layer type"),
+                "{call}: {}",
+                error.message
+            );
+        }
+        // None of those calls may have fabricated a bitmap.
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "target.hasImage")
+                .expect("hasImage")
+                .to_integer()
+                .expect("integer"),
+            0
+        );
+    }
+
+    /// `piledCopy` requires a main image on the destination *and* on the source
+    /// layer (`LayerIntf.cpp:4111-4112`).
+    #[test]
+    fn native_layer_piled_copy_requires_both_images() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                dest.setImageSize(2, 2);
+                global.source = new Layer();
+                source.setSize(2, 2);
+                source.freeImage();
+                "#,
+            )
+            .expect("script");
+        let error = engine
+            .execute_script("inline.tjs", "dest.piledCopy(0, 0, source, 0, 0, 2, 2);")
+            .expect_err("an image-less source cannot be piled");
+        assert!(
+            error.message.contains("Source layer has no image"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// `BltImage`'s per-child rules inside a pile (`LayerIntf.cpp:5164-5364`):
+    /// the blt method follows the child's `DisplayType` while the
+    /// `OnAlpha`/`hda` selection follows the *destination* bitmap's layer type
+    /// (`:5191-5203`, `:5255-5257`), and an `ltBinder` child draws nothing
+    /// (`:5185-5187`).
+    #[test]
+    fn native_layer_piled_copy_uses_the_destination_layer_type() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var base = new Layer();
+                base.type = ltOpaque;               // a non-alpha destination
+                base.visible = true;
+                base.setSize(2, 2);
+                base.setImageSize(2, 2);
+                base.fillRect(0, 0, 2, 2, 0xff00ff00);
+
+                var child = new Layer(null, base);
+                child.type = ltOpaque;
+                child.visible = true;
+                child.setSize(1, 1);
+                child.setImageSize(1, 1);
+                child.fillRect(0, 0, 1, 1, 0x80ff0000);   // half-transparent red
+
+                var binder = new Layer(null, base);
+                binder.visible = true;
+                binder.setPos(1, 1);
+                binder.setSize(1, 1);
+                binder.setImageSize(1, 1);
+                binder.fillRect(0, 0, 1, 1, 0xff0000ff);
+                binder.type = ltBinder;                   // must not be blitted
+
+                var dest = new Layer();
+                dest.setImageSize(2, 2);
+                dest.piledCopy(0, 0, base, 0, 0, 2, 2);
+                return dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
+                    dest.getMainPixel(1, 1) + ":" + dest.getMaskPixel(1, 1);
+                "#,
+            )
+            .expect("script")
+            .to_tjs_string()
+            .expect("string");
+        // `bmCopy` (`LayerIntf.cpp:5189-5196`) copies the child's planes
+        // verbatim for an `ltOpaque` child over a non-alpha parent, so the
+        // half-transparent red keeps its 0x80 alpha (the old `DF_ALPHA`
+        // hard-coding kept the destination's opaque alpha instead), and the
+        // `ltBinder` child contributes nothing.
+        assert_eq!(value, "16711680:128:65280:255".to_string());
+    }
+
+    /// The pile is composited over *transparency* and then copied plane for
+    /// plane into the destination
+    /// (`MainImage->CopyRect(..., TVP_BB_COPY_MAIN|TVP_BB_COPY_MASK)`,
+    /// `LayerIntf.cpp:4120-4122`), so a transparent pile pixel clears whatever
+    /// the destination had there.
+    #[test]
+    fn native_layer_piled_copy_overwrites_the_destination() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.visible = true;
+                source.setSize(2, 1);
+                source.setImageSize(2, 1);
+                source.fillRect(0, 0, 1, 1, 0xff112233);
+                source.fillRect(1, 0, 1, 1, 0x00000000);   // fully transparent
+
+                var dest = new Layer();
+                dest.setImageSize(2, 1);
+                dest.fillRect(0, 0, 2, 1, 0xff00ff00);
+                dest.piledCopy(0, 0, source, 0, 0, 2, 1);
+                return dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
+                    dest.getMainPixel(1, 0) + ":" + dest.getMaskPixel(1, 0);
+                "#,
+            )
+            .expect("script")
+            .to_tjs_string()
+            .expect("string");
+        assert_eq!(value, "1122867:255:0:0".to_string());
+    }
+
+    /// The filtered stretch path uses the reference resampler's kernel: the tap
+    /// window is `left = floor(cx - range)` … `floor(cx + range) - 1`
+    /// (`visual/gl/ResampleImage.cpp:301-317`), shrinking widens it by the
+    /// ratio and scales the distances (`:328`, `:357`), and the channels are
+    /// truncated rather than rounded (`:428-431`).
+    #[test]
+    fn native_layer_stretch_copy_uses_the_reference_resampler() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 1);
+                source.fillRect(0, 0, 2, 1, 0xffff0000);
+                source.fillRect(2, 0, 2, 1, 0xff0000ff);
+
+                global.dest = new Layer();
+                dest.setImageSize(2, 1);
+                dest.stretchCopy(0, 0, 2, 1, source, 0, 0, 4, 1, stLinear);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image");
+        // Destination 0 samples taps -1, 0 and 1 of a 2x-wide window:
+        // 0.25 at tap -1 (folded onto tap 0), 0.75 at tap 0 and 0.75 at tap 1,
+        // normalized to [0.5, 0.375, 0.125]; the channel values truncate, so
+        // the red 0.875 * 255 = 223 and the blue 0.125 * 255 = 31. Destination 1
+        // samples taps 1..3, i.e. [0.125, 0.375, 0.5] of red, blue, blue.
+        assert_eq!(&image.upload.rgba[..4], &[223, 0, 31, 255]);
+        assert_eq!(&image.upload.rgba[4..8], &[31, 0, 223, 255]);
+    }
+
+    /// `ClipDestPointAndSrcRect` (`LayerIntf.cpp:3762-3779`) moves the clipped
+    /// destination point *and* trims the source rectangle by the same amount, so
+    /// a `piledCopy` whose destination starts outside `ClipRect` keeps its
+    /// alignment.
+    #[test]
+    fn native_layer_piled_copy_clips_the_source_with_the_destination_point() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.visible = true;
+                source.setSize(2, 1);
+                source.setImageSize(2, 1);
+                source.fillRect(0, 0, 1, 1, 0xffff0000);
+                source.fillRect(1, 0, 1, 1, 0xff0000ff);
+
+                var dest = new Layer();
+                dest.setImageSize(2, 1);
+                dest.setClip(0, 0, 2, 1);
+                dest.piledCopy(-1, 0, source, 0, 0, 2, 1);
+                return dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
+                    dest.getMainPixel(1, 0) + ":" + dest.getMaskPixel(1, 0);
+                "#,
+            )
+            .expect("script")
+            .to_tjs_string()
+            .expect("string");
+        // Destination pixel 0 is where the source rectangle's pixel 1 lands, so
+        // it receives the blue pixel; pixel 1 stays outside the copied width.
+        assert_eq!(value, "255:255:16777215:0".to_string());
+    }
+
+    /// `affineCopy`'s matrix form builds its points from the source rectangle's
+    /// *corners* (`(-0.5,-0.5)`, `(rp-0.5,-0.5)`, `(-0.5,bp-0.5)`,
+    /// `LayerBitmapIntf.cpp:3494-3513`), which `InternalAffineBlt` reads as
+    /// `refrect.*.65536 - 32768` (`:2711-2718`); a destination pixel's sample is
+    /// `floor(u * sw)` over that frame.
+    #[test]
+    fn native_layer_affine_copy_matrix_uses_the_source_corner_convention() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let read = |engine: &mut KrkrEngine, name: &str| -> Vec<u8> {
+            let layer_id = engine
+                .execute_expression("inline.tjs", &format!("{name}.__nativeLayerId"))
+                .expect("layer id")
+                .to_integer()
+                .expect("integer layer id") as u64;
+            engine
+                .host()
+                .layer_tree()
+                .layer(layer_id)
+                .and_then(|layer| layer.image.as_ref())
+                .expect("layer image")
+                .upload
+                .rgba
+                .to_vec()
+        };
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 1);
+                source.fillRect(0, 0, 1, 1, 0xffff0000);
+                source.fillRect(1, 0, 1, 1, 0xff0000ff);
+
+                // A half-pixel translation: only destination pixels 0 and 1
+                // fall inside the transformed source rectangle.
+                global.half = new Layer();
+                half.setImageSize(4, 1);
+                half.affineCopy(source, 0, 0, 2, 1, true, 1, 0, 0, 1, 0.5, 0, stNearest);
+                "#,
+            )
+            .expect("script");
+        let half = read(&mut engine, "half");
+        assert_eq!(&half[..4], &[255, 0, 0, 255]);
+        assert_eq!(&half[4..8], &[0, 0, 255, 255]);
+        // `setImageSize` fills the rest with the layer's `neutralColor`
+        // (`0x00ffffff` for a non-primary layer, `LayerIntf.cpp:635-644`).
+        assert_eq!(&half[8..12], &[255, 255, 255, 0]);
+        assert_eq!(&half[12..16], &[255, 255, 255, 0]);
     }
 
     #[test]

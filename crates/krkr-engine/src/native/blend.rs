@@ -143,6 +143,54 @@ pub(crate) fn operation_mode_to_blt(mode: i64, draw_face: i64) -> Option<Blt> {
     Some(blt)
 }
 
+/// `TVPIsTypeUsingAlpha` (`visual/drawable.h:55-75`): `ltAlpha` and the
+/// Photoshop blend family carry straight alpha.
+fn layer_type_uses_alpha(layer_type: i64) -> bool {
+    layer_type == 2 || (13..=28).contains(&layer_type)
+}
+
+/// `TVPIsTypeUsingAddAlpha` (`visual/drawable.h:77-80`): `ltAddAlpha` is the
+/// only premultiplied-alpha layer type.
+fn layer_type_uses_add_alpha(layer_type: i64) -> bool {
+    layer_type == 12
+}
+
+/// `TVPIsTypeUsingAlphaChannel` (`visual/drawable.h:82-87`).
+fn layer_type_uses_alpha_channel(layer_type: i64) -> bool {
+    layer_type_uses_add_alpha(layer_type) || layer_type_uses_alpha(layer_type)
+}
+
+/// The destination face `BltImage` and `operation_mode_to_blt` see for a
+/// destination bitmap of the given layer type: the reference asks
+/// `TVPIsTypeUsingAlpha` / `TVPIsTypeUsingAddAlpha` (`LayerIntf.cpp:5191-5203`).
+fn draw_face_for_layer_type(layer_type: i64) -> i64 {
+    if layer_type_uses_alpha(layer_type) {
+        0
+    } else if layer_type_uses_add_alpha(layer_type) {
+        4
+    } else {
+        1
+    }
+}
+
+/// `tTJSNI_BaseLayer::BltImage` (`LayerIntf.cpp:5164-5364`): how a child layer
+/// of type `draw_type` is composited into a bitmap that belongs to a layer of
+/// type `dest_type`, plus the `hda` flag that call passes to
+/// `tTVPBaseBitmap::Blt` (`:5363`). `None` mirrors the reference's early
+/// returns: `ltBinder` children draw nothing (`:5185-5187`) and a type outside
+/// the `tTVPLayerType` table has no case at all (`:5359-5360`).
+pub(crate) fn blt_image_for_layer_type(draw_type: i64, dest_type: i64) -> Option<(Blt, bool)> {
+    if draw_type == 0 {
+        return None;
+    }
+    let blt = operation_mode_to_blt(draw_type, draw_face_for_layer_type(dest_type))?;
+    // Only the additive and Photoshop families take `hda` from the destination
+    // having an alpha channel (`:5211`-`:5257`); `ltOpaque`/`ltAlpha`/
+    // `ltAddAlpha` pick `OnAlpha`/`OnAddAlpha` variants by face instead.
+    let hda = matches!(draw_type, 3..=11 | 13..=28) && layer_type_uses_alpha_channel(dest_type);
+    Some((blt, hda))
+}
+
 /// One row of `tTVPBaseBitmap::Blt`. `opacity` is the official `opa`
 /// (0..=255) and `hda` is `HoldAlpha` ("hold destination alpha").
 pub(crate) fn blt_row(dest: &mut [u8], src: &[u8], blt: Blt, opacity: u32, hda: bool) {
@@ -365,6 +413,37 @@ fn mul_color(color: u32, fac: u32) -> u32 {
 /// `alpha_to_additive_alpha` (`blend_util_func.h:93`).
 fn alpha_to_additive_alpha(a: u32) -> u32 {
     mul_color(a, a >> 24).wrapping_add(a & 0xff00_0000)
+}
+
+/// `TVPDivTable` (`visual/tvpgl.c:251-260`): `b * 255 / a`, truncated and
+/// capped at 255, and 0 for a zero divisor.
+fn div_table(alpha: u32, value: u32) -> u32 {
+    if alpha == 0 {
+        0
+    } else {
+        (value * 255 / alpha).min(255)
+    }
+}
+
+/// `convet_alpha_to_premulalpha_functor` (`blend_functor_c.h:871`), the
+/// `tvpgl.c`-installed `TVPConvertAlphaToAdditiveAlpha` (`:585` →
+/// `TVP_convet_alpha_to_premulalpha` `blend_function.cpp:147`): rewrite one
+/// straight-alpha pixel as a premultiplied ("additive alpha") one. Its body is
+/// `alpha_and_color_to_premulalpha_func` (`blend_util_func.h:133`), which is
+/// the per-pixel form of `alpha_to_additive_alpha` above.
+pub(crate) fn alpha_pixel_to_additive_alpha(px: u32) -> u32 {
+    alpha_to_additive_alpha(px)
+}
+
+/// `convet_premulalpha_to_alpha_functor` (`blend_functor_c.h:861`), installed
+/// as `TVPConvertAdditiveAlphaToAlpha` (`blend_function.cpp:584`): colour =
+/// `colour * 255 / alpha` through `TVPDivTable`, alpha byte kept.
+pub(crate) fn alpha_pixel_to_alpha(px: u32) -> u32 {
+    let alpha = px >> 24;
+    (px & 0xff00_0000)
+        | (div_table(alpha, (px >> 16) & 0xff) << 16)
+        | (div_table(alpha, (px >> 8) & 0xff) << 8)
+        | div_table(alpha, px & 0xff)
 }
 
 /// `alpha_blend_a_functor` (`blend_functor_c.h:76`): plain alpha source mixed
@@ -781,8 +860,19 @@ pub(crate) fn const_alpha_fill_blend_a(d: u32, color: u32, opacity: u32) -> u32 
 }
 
 /// `tTVPBBStretchType` (`LayerBitmapIntf.h:61`), collapsed to the kernels the
-/// resamplers implement. The `stFast*` variants share their precise
-/// counterpart's kernel (the official difference is fixed-point rounding).
+/// resamplers implement.
+///
+/// Every `stFast*` variant shares its precise counterpart's *weight* function —
+/// `stFastCubic`/`stFastLanczos2`/… dispatch to the same `TWeightFunc` through
+/// the fixed-point resampler (`ResampleImage.cpp:741-764`) — and so do
+/// `stLinear` and `stSemiFastLinear`: the plain C path sends both to
+/// `BilinearWeight` (`:711-712`, `:738-739`) and the shipped SSE2 path sends
+/// `stLinear` to `TVPWeightResampleSSE2<BilinearWeightSSE>` and
+/// `stSemiFastLinear` to `TVPWeightResampleSSE2Fix<BilinearWeightSSE>`
+/// (`ResampleImageSSE2.cpp:1151-1158`), which differ only in the fixed-point
+/// weight arithmetic this engine does not model. `stNearest`/`stFastNearest`
+/// never reach the resampler at all — `StretchBlt` routes every type below
+/// `stLinear` to `AffineBlt` (`LayerBitmapIntf.cpp:1857-1875`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StretchType {
     Nearest,
@@ -895,6 +985,156 @@ fn stretch_range(kind: StretchType) -> f64 {
         StretchType::Lanczos3 | StretchType::Spline36 => 3.0,
         StretchType::BlackmanSinc => 4.0,
     }
+}
+
+/// The reference resampler's tap window and normalized weights for one axis
+/// (`AxisParamCalculateAxis`, `visual/gl/ResampleImage.cpp:283-368`, followed by
+/// the edge fold and normalization of `AxisParamCalculateWeight`, `:232-280`).
+///
+/// `dest_index` is the destination pixel's index inside the destination
+/// rectangle; the reference samples at the source position
+/// `cx = (dst + 0.5) * src_len / dst_len + src_start` (`:302`) counted in an
+/// edge frame where source pixel `i` covers `[i, i+1)` and its centre sits at
+/// `i + 0.5`, and weights tap `left + k` by
+/// `func(|left + k + 0.5 - cx|)` (`:317-322`). Magnification
+/// (`src_len <= dst_len`) uses the plain kernel; shrinking widens it by the
+/// ratio and scales the distances by `delta = dst_len / src_len` (`:328`,
+/// `:357`). The reference computes all of this in `float`s, so the ports below
+/// keep `f32` for the window arithmetic.
+fn resample_axis_weights(
+    source_start: i64,
+    source_end: i64,
+    source_length: i64,
+    dest_length: i64,
+    dest_index: i64,
+    kind: StretchType,
+) -> Option<(i64, Vec<f64>)> {
+    let tap = stretch_range(kind) as f32;
+    let cx = (dest_index as f32 + 0.5) * source_length as f32 / dest_length as f32
+        + source_start as f32;
+    let (range, delta) = if source_length <= dest_length {
+        (tap, 1.0f32)
+    } else {
+        (
+            tap * source_length as f32 / dest_length as f32,
+            dest_length as f32 / source_length as f32,
+        )
+    };
+    let left = (cx - range).floor() as i64;
+    let right = (cx + range).floor() as i64;
+    let count = right - left;
+    if count <= 0 {
+        return None;
+    }
+    let mut weights = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let distance = ((left + index) as f32 + 0.5 - cx) * delta;
+        weights.push(stretch_weight(kind, f64::from(distance)));
+    }
+    // Taps before `srcstart` fold onto the first in-range tap, taps at or past
+    // `srcend` onto the last (`:235-257`).
+    let left_edge = (source_start - left).clamp(0, count);
+    let start = left + left_edge;
+    if start >= source_end {
+        return None;
+    }
+    let mut folded: Vec<f64> = weights[left_edge as usize..].to_vec();
+    if left_edge > 0 {
+        folded[0] += weights[..left_edge as usize].iter().sum::<f64>();
+    }
+    let right_edge = (right - source_end).clamp(0, folded.len() as i64);
+    if right_edge > 0 {
+        let keep = folded.len() as i64 - right_edge;
+        if keep <= 0 {
+            return None;
+        }
+        let folded_sum: f64 = folded[keep as usize..].iter().sum();
+        folded.truncate(keep as usize);
+        *folded.last_mut().expect("non-empty") += folded_sum;
+    }
+    let sum: f64 = folded.iter().sum();
+    if sum.abs() <= f64::EPSILON {
+        return None;
+    }
+    for weight in &mut folded {
+        *weight /= sum;
+    }
+    Some((start, folded))
+}
+
+/// `TVPResampleImage`'s sampler: the separable two-pass weight application of
+/// `tTVPSampler::samplingVertical` / `samplingHorizontal`
+/// (`visual/gl/ResampleImage.cpp:407-466`) with the fixed-point-free channel
+/// clamping of `:428-431`.
+///
+/// `source_rect` is the source rectangle in pixels, which is where the
+/// reference's kernel folds; the destination size decides whether the kernel is
+/// widened for a shrink, and `dest_offset` is the destination pixel's index
+/// inside the destination rectangle (its source sample position follows the
+/// reference's `cx` formula for that index).
+pub(crate) fn sample_resample_rgba(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    source_rect: (i64, i64, i64, i64),
+    dest_size: (i64, i64),
+    dest_offset: (i64, i64),
+    kind: StretchType,
+) -> Option<[u8; 4]> {
+    let (left, top, right, bottom) = source_rect;
+    if right <= left || bottom <= top {
+        return None;
+    }
+    if kind == StretchType::AreaAvg {
+        // `stAreaAvg` runs its own accumulator (`TVPCalculateAxisAreaAvg`,
+        // `visual/gl/ResampleImage.cpp:374-379` + `:468-506`); this engine keeps
+        // its box average over the sample cell as an approximation, so the
+        // weighted path below is not used for it.
+        let cx = (dest_offset.0 as f32 + 0.5) * (right - left) as f32 / dest_size.0 as f32
+            + left as f32;
+        let cy = (dest_offset.1 as f32 + 0.5) * (bottom - top) as f32 / dest_size.1 as f32
+            + top as f32;
+        return sample_rgba(
+            source,
+            source_width,
+            source_height,
+            f64::from(cx) - 0.5,
+            f64::from(cy) - 0.5,
+            kind,
+        );
+    }
+    let (start_x, weights_x) =
+        resample_axis_weights(left, right, right - left, dest_size.0, dest_offset.0, kind)?;
+    let (start_y, weights_y) =
+        resample_axis_weights(top, bottom, bottom - top, dest_size.1, dest_offset.1, kind)?;
+
+    let mut sums = [0f64; 4];
+    for (index_y, weight_y) in weights_y.iter().enumerate() {
+        let source_y = start_y + index_y as i64;
+        if source_y < 0 || source_y >= i64::from(source_height) {
+            continue;
+        }
+        for (index_x, weight_x) in weights_x.iter().enumerate() {
+            let source_x = start_x + index_x as i64;
+            if source_x < 0 || source_x >= i64::from(source_width) {
+                continue;
+            }
+            let weight = weight_x * weight_y;
+            let index = ((source_y as u32 * source_width + source_x as u32) * 4) as usize;
+            if index + 4 > source.len() {
+                continue;
+            }
+            for (channel, sum) in sums.iter_mut().enumerate() {
+                *sum += f64::from(source[index + channel]) * weight;
+            }
+        }
+    }
+    Some([
+        sums[0].clamp(0.0, 255.0) as u8,
+        sums[1].clamp(0.0, 255.0) as u8,
+        sums[2].clamp(0.0, 255.0) as u8,
+        sums[3].clamp(0.0, 255.0) as u8,
+    ])
 }
 
 /// Resample one source pixel at a fractional source coordinate. `None` means
@@ -1371,5 +1611,198 @@ fn alpha_functors_match_the_reference_over_every_alpha() {
     assert_eq!(aa_o, 0x66e7_ec54_9869_3e00, "TVPAdditiveAlphaBlend_ao");
     assert_eq!(fill_a, 0x154f_814a_e2d4_0000, "TVPConstColorAlphaBlend_a");
     assert_eq!(const_d, 0xa9d2_ca77_1491_d8c0, "TVPConstAlphaBlend_d");
+}
+
+/// `TVPConvertAlphaToAdditiveAlpha` / `TVPConvertAdditiveAlphaToAlpha`
+/// (`blend_function.cpp:584-585`): the two directions of the
+/// `dfAlpha` <-> `dfAddAlpha` pixel rewrite `tTJSNI_BaseLayer::convertType`
+/// applies (`LayerIntf.cpp:1703-1727`). Rows are
+/// `(input, alpha -> additive alpha, additive alpha -> alpha)`, produced by the
+/// same generator as `TRUTH` (which also builds `TVPDivTable` exactly as
+/// `visual/tvpgl.c:251-260` does).
+const CONVERT_TRUTH: &[(u32, u32, u32)] = &[
+    (0x00000000, 0x00000000, 0x00000000),
+    (0xff000000, 0xff000000, 0xff000000),
+    (0xffffffff, 0xfffefefe, 0xffffffff),
+    (0x80ffffff, 0x807f7f7f, 0x80ffffff),
+    (0x80808080, 0x80404040, 0x80ffffff),
+    (0x01020304, 0x01000000, 0x01ffffff),
+    (0xff123456, 0xff113355, 0xff123456),
+    (0x7f7f7f7f, 0x7f3f3f3f, 0x7fffffff),
+    (0x40c0a080, 0x40302820, 0x40ffffff),
+    (0x0000ffff, 0x00000000, 0x00000000),
+    (0xcc00ff00, 0xcc00cb00, 0xcc00ff00),
+    (0x33669900, 0x33141e00, 0x33ffff00),
+];
+
+/// The reference resampler's per-axis tap window and normalized weights for a
+/// grid of source/destination lengths, with and without a sub-rectangle source
+/// offset. Rows are `(src_start, src_len, dst_len, dest_index, start,
+/// &weights)`, produced by the same generator as `TRUTH`: it instantiates the
+/// real `BilinearWeight` from `visual/gl/WeightFunctor.h` (with the `RANGE`
+/// definitions of `WeightFunctor.cpp:22`) inside a verbatim transliteration of
+/// `AxisParamCalculateAxis` (`gl/ResampleImage.cpp:283-368`) and
+/// `AxisParamCalculateWeight` (`:232-280`). The generator works in the
+/// reference's `float`s, so the comparison below allows 1e-6.
+const RESAMPLE_AXIS_TRUTH: &[(i64, i64, i64, i64, i64, &[f64])] = &[
+    (0, 1, 1, 0, 0, &[1.000000000]),
+    (0, 1, 2, 0, 0, &[1.000000000]),
+    (0, 1, 2, 1, 0, &[1.000000000]),
+    (0, 1, 3, 0, 0, &[1.000000000]),
+    (0, 1, 3, 1, 0, &[1.000000000]),
+    (0, 1, 3, 2, 0, &[1.000000000]),
+    (0, 1, 4, 0, 0, &[1.000000000]),
+    (0, 1, 4, 1, 0, &[1.000000000]),
+    (0, 1, 4, 2, 0, &[1.000000000]),
+    (0, 1, 4, 3, 0, &[1.000000000]),
+    (0, 1, 8, 0, 0, &[1.000000000]),
+    (0, 1, 8, 1, 0, &[1.000000000]),
+    (0, 1, 8, 2, 0, &[1.000000000]),
+    (0, 1, 8, 3, 0, &[1.000000000]),
+    (0, 1, 8, 4, 0, &[1.000000000]),
+    (0, 1, 8, 5, 0, &[1.000000000]),
+    (0, 1, 8, 6, 0, &[1.000000000]),
+    (0, 1, 8, 7, 0, &[1.000000000]),
+    (0, 2, 1, 0, 0, &[0.500000000, 0.500000000]),
+    (0, 2, 2, 0, 0, &[1.000000000]),
+    (0, 2, 2, 1, 0, &[0.000000000, 1.000000000]),
+    (0, 2, 3, 0, 0, &[1.000000000]),
+    (0, 2, 3, 1, 0, &[0.500000000, 0.500000000]),
+    (0, 2, 3, 2, 0, &[0.000000000, 1.000000000]),
+    (0, 2, 4, 0, 0, &[1.000000000]),
+    (0, 2, 4, 1, 0, &[1.000000000]),
+    (0, 2, 4, 2, 0, &[0.250000000, 0.750000000]),
+    (0, 2, 4, 3, 0, &[0.000000000, 1.000000000]),
+    (0, 2, 8, 0, 0, &[1.000000000]),
+    (0, 2, 8, 1, 0, &[1.000000000]),
+    (0, 2, 8, 2, 0, &[1.000000000]),
+    (0, 2, 8, 3, 0, &[1.000000000]),
+    (0, 2, 8, 4, 0, &[0.375000000, 0.625000000]),
+    (0, 2, 8, 5, 0, &[0.125000000, 0.875000000]),
+    (0, 2, 8, 6, 0, &[0.000000000, 1.000000000]),
+    (0, 2, 8, 7, 0, &[0.000000000, 1.000000000]),
+    (0, 3, 1, 0, 0, &[0.333333313, 0.333333343, 0.333333313]),
+    (0, 3, 2, 0, 0, &[0.666666627, 0.333333343]),
+    (0, 3, 2, 1, 0, &[0.000000000, 0.375000030, 0.625000000]),
+    (0, 3, 3, 0, 0, &[1.000000000]),
+    (0, 3, 3, 1, 0, &[0.000000000, 1.000000000]),
+    (0, 3, 3, 2, 1, &[0.000000000, 1.000000000]),
+    (0, 3, 4, 0, 0, &[1.000000000]),
+    (0, 3, 4, 1, 0, &[0.375000000, 0.625000000]),
+    (0, 3, 4, 2, 0, &[0.000000000, 1.000000000]),
+    (0, 3, 4, 3, 1, &[0.000000000, 1.000000000]),
+    (0, 3, 8, 0, 0, &[1.000000000]),
+    (0, 3, 8, 1, 0, &[1.000000000]),
+    (0, 3, 8, 2, 0, &[1.000000000]),
+    (0, 3, 8, 3, 0, &[0.187500000, 0.812500000]),
+    (0, 3, 8, 4, 0, &[0.000000000, 1.000000000]),
+    (0, 3, 8, 5, 1, &[0.437500000, 0.562500000]),
+    (0, 3, 8, 6, 1, &[0.062500000, 0.937500000]),
+    (0, 3, 8, 7, 1, &[0.000000000, 1.000000000]),
+    (0, 4, 1, 0, 0, &[0.281250000, 0.218750000, 0.218750000, 0.281250000]),
+    (0, 4, 2, 0, 0, &[0.500000000, 0.375000000, 0.125000000]),
+    (0, 4, 2, 1, 1, &[0.125000000, 0.375000000, 0.500000000]),
+    (0, 4, 3, 0, 0, &[0.727272689, 0.272727281]),
+    (0, 4, 3, 1, 0, &[0.000000000, 0.500000000, 0.500000000]),
+    (0, 4, 3, 2, 1, &[0.000000000, 0.300000042, 0.699999928]),
+    (0, 4, 4, 0, 0, &[1.000000000]),
+    (0, 4, 4, 1, 0, &[0.000000000, 1.000000000]),
+    (0, 4, 4, 2, 1, &[0.000000000, 1.000000000]),
+    (0, 4, 4, 3, 2, &[0.000000000, 1.000000000]),
+    (0, 4, 8, 0, 0, &[1.000000000]),
+    (0, 4, 8, 1, 0, &[1.000000000]),
+    (0, 4, 8, 2, 0, &[0.250000000, 0.750000000]),
+    (0, 4, 8, 3, 0, &[0.000000000, 1.000000000]),
+    (0, 4, 8, 4, 1, &[0.250000000, 0.750000000]),
+    (0, 4, 8, 5, 1, &[0.000000000, 1.000000000]),
+    (0, 4, 8, 6, 2, &[0.250000000, 0.750000000]),
+    (0, 4, 8, 7, 2, &[0.000000000, 1.000000000]),
+    (0, 8, 1, 0, 0, &[0.195312500, 0.085937500, 0.101562500, 0.117187500, 0.117187500, 0.101562500, 0.085937500, 0.195312500]),
+    (0, 8, 2, 0, 0, &[0.281250000, 0.218750000, 0.218750000, 0.156250000, 0.093750000, 0.031250000]),
+    (0, 8, 2, 1, 2, &[0.031250000, 0.093750000, 0.156250000, 0.218750000, 0.218750000, 0.281250000]),
+    (0, 8, 3, 0, 0, &[0.372093022, 0.348837197, 0.209302321, 0.069767468]),
+    (0, 8, 3, 1, 1, &[0.024390243, 0.170731708, 0.317073166, 0.317073166, 0.170731708]),
+    (0, 8, 3, 2, 3, &[0.000000000, 0.069767468, 0.209302351, 0.348837227, 0.372092992]),
+    (0, 8, 4, 0, 0, &[0.500000000, 0.375000000, 0.125000000]),
+    (0, 8, 4, 1, 1, &[0.125000000, 0.375000000, 0.375000000, 0.125000000]),
+    (0, 8, 4, 2, 3, &[0.125000000, 0.375000000, 0.375000000, 0.125000000]),
+    (0, 8, 4, 3, 5, &[0.125000000, 0.375000000, 0.500000000]),
+    (0, 8, 8, 0, 0, &[1.000000000]),
+    (0, 8, 8, 1, 0, &[0.000000000, 1.000000000]),
+    (0, 8, 8, 2, 1, &[0.000000000, 1.000000000]),
+    (0, 8, 8, 3, 2, &[0.000000000, 1.000000000]),
+    (0, 8, 8, 4, 3, &[0.000000000, 1.000000000]),
+    (0, 8, 8, 5, 4, &[0.000000000, 1.000000000]),
+    (0, 8, 8, 6, 5, &[0.000000000, 1.000000000]),
+    (0, 8, 8, 7, 6, &[0.000000000, 1.000000000]),
+    (3, 4, 3, 0, 3, &[0.727272630, 0.272727311]),
+    (5, 2, 7, 0, 5, &[1.000000000]),
+    (3, 4, 3, 1, 3, &[0.000000000, 0.500000000, 0.500000000]),
+    (5, 2, 7, 1, 5, &[1.000000000]),
+    (3, 4, 3, 2, 4, &[0.000000000, 0.300000191, 0.699999809]),
+    (5, 2, 7, 2, 5, &[1.000000000]),
+    (3, 4, 3, 3, 6, &[1.000000000]),
+    (5, 2, 7, 3, 5, &[0.500000000, 0.500000000]),
+];
+
+#[test]
+fn resample_axis_windows_match_the_reference() {
+    for &(source_start, source_len, dest_len, dest_index, start, weights) in RESAMPLE_AXIS_TRUTH {
+        let (actual_start, actual_weights) = resample_axis_weights(
+            source_start,
+            source_start + source_len,
+            source_len,
+            dest_len,
+            dest_index,
+            StretchType::Bilinear,
+        )
+        .expect("weights");
+        assert_eq!(
+            actual_start, start,
+            "start for src_start={source_start} src={source_len} dst={dest_len} dest={dest_index}"
+        );
+        assert_eq!(
+            actual_weights.len(),
+            weights.len(),
+            "tap count for src_start={source_start} src={source_len} dst={dest_len} dest={dest_index}"
+        );
+        for (index, (actual, expected)) in actual_weights.iter().zip(weights).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "tap {index} for src_start={source_start} src={source_len} dst={dest_len} \
+                 dest={dest_index}: {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn convert_functors_match_the_reference() {
+    for &(input, to_additive, to_alpha) in CONVERT_TRUTH {
+        assert_eq!(
+            alpha_pixel_to_additive_alpha(input),
+            to_additive,
+            "alpha -> additive alpha of {input:#010x}"
+        );
+        assert_eq!(
+            alpha_pixel_to_alpha(input),
+            to_alpha,
+            "additive alpha -> alpha of {input:#010x}"
+        );
+    }
+    // The `TVPDivTable`-driven direction over every alpha with one colour.
+    let mut to_additive: u64 = 0;
+    let mut to_alpha: u64 = 0;
+    for alpha in 0..256u32 {
+        let px = (alpha << 24) | 0x0010_2030;
+        to_additive = to_additive
+            .wrapping_mul(1_000_003)
+            .wrapping_add(u64::from(alpha_pixel_to_additive_alpha(px)));
+        to_alpha = to_alpha
+            .wrapping_mul(1_000_003)
+            .wrapping_add(u64::from(alpha_pixel_to_alpha(px)));
+    }
+    assert_eq!(to_additive, 0x3779_017b_c9b0_dfd0, "TVPConvertAlphaToAdditiveAlpha");
+    assert_eq!(to_alpha, 0xc798_3edc_6480_0432, "TVPConvertAdditiveAlphaToAlpha");
 }
 }

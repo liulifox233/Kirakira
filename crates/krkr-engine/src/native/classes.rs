@@ -1527,6 +1527,7 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     );
     register_native_method_preserving_script(runtime, handle, "getLayerAt", layer_get_layer_at);
     register_native_method_preserving_script(runtime, handle, "update", layer_update);
+    register_native_method_preserving_script(runtime, handle, "convertType", layer_convert_type);
     register_native_method_preserving_script(runtime, handle, "focus", layer_focus);
     register_native_method_preserving_script(runtime, handle, "focusPrev", layer_focus_prev);
     register_native_method_preserving_script(runtime, handle, "focusNext", layer_focus_next);
@@ -2169,6 +2170,10 @@ fn layer_type_can_have_image(layer_type: i64) -> bool {
     !matches!(layer_type, 0 | 6 | 7)
 }
 
+/// `tTVPLayerType` (`visual/drawable.h:20-53`) values this module names.
+const LT_BINDER: i64 = 0;
+const LT_OPAQUE: i64 = 1;
+
 fn layer_parent_object(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Option<ObjectHandle> {
     variant_object(&layer_property_value(runtime, layer, "parent"))
         .map(|parent| runtime.bound_this(parent).unwrap_or(parent))
@@ -2427,6 +2432,22 @@ fn neutral_color_for_layer_type(layer_type: i64) -> i64 {
 
 fn not_drawable_layer_type() -> TjsError {
     TjsError::runtime("Not drawable layer type")
+}
+
+/// The reference's `TVPNotDrawableLayerType` check: every blit family refuses a
+/// destination without a main image instead of allocating one
+/// (`LayerIntf.cpp:4111` `PiledCopy`, `:4159` `CopyRect`, `:4245`/`:4253`
+/// `StretchCopy`, `:4287`/`:4296` `AffineCopy`, `:4376` `OperateRect`,
+/// `:4417` `OperateStretch`, `:4453` `OperateAffine`).
+fn require_drawable_layer_image(
+    runtime: &Runtime<KrkrHost>,
+    target: &LayerRenderTarget,
+) -> Result<()> {
+    if render_layer_snapshot(runtime, target).is_some_and(|layer| layer.image.is_some()) {
+        Ok(())
+    } else {
+        Err(not_drawable_layer_type())
+    }
 }
 
 /// `TVPNotDrawableFaceType` (`string_table_en.rc:135`, "Not drawble face
@@ -5775,6 +5796,11 @@ fn layer_fill_rect(
     // is how KAGEX stand compositing (`PSDLayer.redrawRect` /
     // `AffineSourceBMPBase.redrawImage`) clears a canvas without painting a
     // solid plate over the background.
+    // Every face but `dfProvince` needs the destination bitmap
+    // (`LayerIntf.cpp:3866`/`:3873`/`:3880`).
+    if face != DF_PROVINCE {
+        require_drawable_layer_image(runtime, &target)?;
+    }
     match face {
         DF_PROVINCE => {
             fill_layer_province(runtime, &target, x, y, width, height, (color & 0xff) as u8);
@@ -5848,7 +5874,11 @@ fn layer_color_rect(
 
     // `tTJSNI_BaseLayer::ColorRect` dispatches on the resolved draw face; only
     // the alpha faces ever touch the destination alpha, and a negative opacity
-    // erases opacity instead of painting.
+    // erases opacity instead of painting. Every face but `dfProvince` needs the
+    // destination bitmap (`LayerIntf.cpp:3936`/`:3949`/`:3962`/`:3969`).
+    if face != DF_PROVINCE {
+        require_drawable_layer_image(runtime, &target)?;
+    }
     match face {
         DF_PROVINCE => {
             fill_layer_province(
@@ -5952,8 +5982,8 @@ fn layer_piled_copy(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
-    // `PiledCopy` is not face-dispatched in the reference: it only requires a
-    // main image on both layers and always copies `MAIN|MASK`
+    // `PiledCopy` is not face-dispatched in the reference: it requires a main
+    // image on both layers and always copies `MAIN|MASK`
     // (`LayerIntf.cpp:4102-4142`), so a `dfProvince` layer composes normally.
     let dx = optional_integer(&args, 0)?.unwrap_or(0);
     let dy = optional_integer(&args, 1)?.unwrap_or(0);
@@ -5970,8 +6000,18 @@ fn layer_piled_copy(
     let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
-
+    // `if(!MainImage) TVPThrowExceptionMessage(TVPNotDrawableLayerType);`
+    // (`LayerIntf.cpp:4111`).
+    require_drawable_layer_image(runtime, &dest_target)?;
     complete_layer_subtree_before_draw(runtime, source_object, &mut BTreeSet::new())?;
+    let Some(source_target) = render_layer_target(runtime, source_object)? else {
+        return Ok(Variant::Void);
+    };
+    // `if(!src->MainImage) TVPThrowExceptionMessage(TVPSourceLayerHasNoImage);`
+    // (`LayerIntf.cpp:4112`).
+    if !render_layer_snapshot(runtime, &source_target).is_some_and(|layer| layer.image.is_some()) {
+        return Err(TjsError::runtime("Source layer has no image"));
+    }
     register_kag_layer_slots_from_tjs(runtime);
     let mut layers = Vec::new();
     let mut visited = BTreeSet::new();
@@ -5982,7 +6022,9 @@ fn layer_piled_copy(
         0.0,
         None,
         1.0,
+        piled_layer_target_type(runtime, source_object),
         false,
+        true,
         &mut visited,
         &mut layers,
     );
@@ -6003,31 +6045,56 @@ fn layer_piled_copy(
     if x1 <= x0 || y1 <= y0 {
         return Ok(Variant::Void);
     }
-    let (dx, dy, width, height) = (
-        x0 as i64,
-        y0 as i64,
-        (x1 - x0) as i64,
-        (y1 - y0) as i64,
-    );
+    let (copy_x, copy_y) = (x0 as i64, y0 as i64);
+    let width = (x1 - x0) as i64;
+    let height = (y1 - y0) as i64;
+    // `ClipDestPointAndSrcRect` moves the clipped destination point *and* trims
+    // the source rectangle by the same amount (`LayerIntf.cpp:3762-3779`), so
+    // the two stay aligned: the source pixel that lands on `copy_x` is the one
+    // the original `dx` would have taken.
+    let sx = sx.saturating_add(copy_x - dx);
+    let sy = sy.saturating_add(copy_y - dy);
+
+    // `src->Complete(rect)` (like every layer completion) builds the pile in an
+    // offscreen bitmap: `CopySelf` puts the source layer's own image in first
+    // and the children are then blitted over it with `BltImage`
+    // (`LayerIntf.cpp:5164-5364` via `DrawCompleted` `:5920-5934`), which is a
+    // composition over *transparency* rather than over the destination. The
+    // finished pile is then copied plane-for-plane into this layer
+    // (`MainImage->CopyRect(..., TVP_BB_COPY_MAIN|TVP_BB_COPY_MASK)`, `:4121`),
+    // so a pile pixel that is transparent clears the destination pixel instead
+    // of leaving it be.
+    let mut pile = vec![0u8; width as usize * height as usize * 4];
+    for layer in &layers {
+        composite_piled_layer(&mut pile, width as u32, height as u32, layer, sx, sy, width, height);
+    }
     mutate_layer_pixels_min(
         runtime,
         &dest_target,
-        dest_min_extent(dx, width),
-        dest_min_extent(dy, height),
+        dest_min_extent(copy_x, width),
+        dest_min_extent(copy_y, height),
         |pixels, image_width, image_height| {
-            for layer in &layers {
-                composite_piled_layer(
-                    pixels,
-                    image_width,
-                    image_height,
-                    layer,
-                    dx,
-                    dy,
-                    sx,
-                    sy,
-                    width,
-                    height,
-                );
+            let dest_stride = image_width as usize * 4;
+            let pile_stride = width as usize * 4;
+            for row in 0..height {
+                let dest_y = copy_y + row;
+                if dest_y < 0 || dest_y >= image_height as i64 {
+                    continue;
+                }
+                let dest_x = copy_x.max(0);
+                let span_width = (width - (dest_x - copy_x)).min(image_width as i64 - dest_x);
+                if span_width <= 0 {
+                    continue;
+                }
+                let pile_x = (dest_x - copy_x) as usize * 4;
+                let dest_start = dest_y as usize * dest_stride + dest_x as usize * 4;
+                let pile_start = row as usize * pile_stride + pile_x;
+                let span = span_width as usize * 4;
+                if dest_start + span > pixels.len() || pile_start + span > pile.len() {
+                    continue;
+                }
+                pixels[dest_start..dest_start + span]
+                    .copy_from_slice(&pile[pile_start..pile_start + span]);
             }
         },
     )?;
@@ -6124,6 +6191,26 @@ fn stretch_copy_impl(
     let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
+    // Official TJS `operateStretch` (`LayerIntf.cpp:7315`): `omAuto` becomes the
+    // source layer's `GetOperationModeFromType()`; `stretchCopy` has no mode and
+    // always uses the destination face's copy method. The blt lookup runs before
+    // the `MainImage` check (`:4410-4418`), so it comes first here too.
+    let blt = if operate {
+        let mut mode = optional_integer(&args, 9)?.unwrap_or(OM_AUTO);
+        if mode == OM_AUTO {
+            let source_type = layer_property_value(runtime, source_object, "type")
+                .to_integer()
+                .unwrap_or(2);
+            mode = operation_mode_from_layer_type(source_type);
+        }
+        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
+            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
+    } else {
+        copy_blt_for_layer(runtime, this)
+    };
+    // `StretchCopy`/`OperateStretch` require the destination bitmap
+    // (`LayerIntf.cpp:4245`/`:4417`).
+    require_drawable_layer_image(runtime, &dest_target)?;
     complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
         return Ok(Variant::Void);
@@ -6149,19 +6236,6 @@ fn stretch_copy_impl(
         )?;
     }
 
-    let blt = if operate {
-        let mut mode = optional_integer(&args, 9)?.unwrap_or(OM_AUTO);
-        if mode == OM_AUTO {
-            let source_type = layer_property_value(runtime, source_object, "type")
-                .to_integer()
-                .unwrap_or(2);
-            mode = operation_mode_from_layer_type(source_type);
-        }
-        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
-            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
-    } else {
-        copy_blt_for_layer(runtime, this)
-    };
     let opacity = if operate {
         optional_integer(&args, 10)?.unwrap_or(255).clamp(0, 255)
     } else {
@@ -6283,6 +6357,47 @@ fn affine_copy_impl(
     let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
+    // `tTVPBaseBitmap::AffineBlt`'s matrix entry point builds the three points
+    // as the images of the source rectangle's *corners* — `(-0.5,-0.5)`,
+    // `(rp-0.5,-0.5)` and `(-0.5,bp-0.5)` in the source rectangle's own frame
+    // (`LayerBitmapIntf.cpp:3494-3513`); `InternalAffineBlt` then reads the
+    // source rectangle as `refrect.*.65536 - 32768` (`:2711-2718`). The point
+    // form's callers already pass that convention (KAG's
+    // `AffineSourceBMPBase.drawAffine` subtracts 0.5 from every transformed
+    // corner), so the matrix form has to subtract it too.
+    let points = if affine {
+        let (a, b, c, d, tx, ty) = (
+            values[0], values[1], values[2], values[3], values[4], values[5],
+        );
+        let corner = |x: f64, y: f64| (a * x + c * y + tx, b * x + d * y + ty);
+        [
+            corner(-0.5, -0.5),
+            corner(source_width as f64 - 0.5, -0.5),
+            corner(-0.5, source_height as f64 - 0.5),
+        ]
+    } else {
+        [
+            (values[0], values[1]),
+            (values[2], values[3]),
+            (values[4], values[5]),
+        ]
+    };
+    let blt = if operate {
+        let mut mode = optional_integer(&args, 12)?.unwrap_or(OM_AUTO);
+        if mode == OM_AUTO {
+            let source_type = layer_property_value(runtime, source_object, "type")
+                .to_integer()
+                .unwrap_or(2);
+            mode = operation_mode_from_layer_type(source_type);
+        }
+        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
+            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
+    } else {
+        copy_blt_for_layer(runtime, this)
+    };
+    // `AffineCopy`/`OperateAffine` require the destination bitmap
+    // (`LayerIntf.cpp:4287`/`:4453`).
+    require_drawable_layer_image(runtime, &dest_target)?;
     complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
         return Ok(Variant::Void);
@@ -6305,35 +6420,6 @@ fn affine_copy_impl(
         texture_width,
         texture_height,
     )?;
-    let points = if affine {
-        let (a, b, c, d, tx, ty) = (
-            values[0], values[1], values[2], values[3], values[4], values[5],
-        );
-        [
-            (tx, ty),
-            (a * source_width as f64 + tx, b * source_width as f64 + ty),
-            (c * source_height as f64 + tx, d * source_height as f64 + ty),
-        ]
-    } else {
-        [
-            (values[0], values[1]),
-            (values[2], values[3]),
-            (values[4], values[5]),
-        ]
-    };
-    let blt = if operate {
-        let mut mode = optional_integer(&args, 12)?.unwrap_or(OM_AUTO);
-        if mode == OM_AUTO {
-            let source_type = layer_property_value(runtime, source_object, "type")
-                .to_integer()
-                .unwrap_or(2);
-            mode = operation_mode_from_layer_type(source_type);
-        }
-        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
-            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
-    } else {
-        copy_blt_for_layer(runtime, this)
-    };
     let opacity = if operate {
         optional_integer(&args, 13)?.unwrap_or(255).clamp(0, 255)
     } else {
@@ -6369,6 +6455,51 @@ fn affine_copy_impl(
             stretch_type,
         );
     })?;
+    mark_image_modified(runtime, this);
+    Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseLayer::convertType` (`LayerIntf.cpp:7624`) →
+/// `ConvertLayerType` (`:1703`): rewrite the stored `MainImage` between the
+/// straight-alpha and premultiplied ("additive alpha") pixel representations.
+/// `fromtype` names the representation the pixels are in *now* and the layer's
+/// own `DrawFace` is the one they are converted *to*, so only
+/// `dfAlpha -> dfAddAlpha` (premultiply) and `dfAddAlpha -> dfAlpha`
+/// (unpremultiply, "this may loose additive stuff", `:1714`) exist; every other
+/// pairing throws `TVPCannotConvertLayerTypeUsingGivenDirection` (`:1721`).
+fn layer_convert_type(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    if args.is_empty() {
+        return Err(TjsError::bad_param_count());
+    }
+    let from_face = args[0].to_integer()?;
+    let (this, target) = this_render_layer_target(runtime, this_obj)?;
+    let convert: fn(u32) -> u32 = match (effective_draw_face(runtime, this), from_face) {
+        (DF_ADD_ALPHA, DF_ALPHA) => blend::alpha_pixel_to_additive_alpha,
+        (DF_ALPHA, DF_ADD_ALPHA) => blend::alpha_pixel_to_alpha,
+        _ => {
+            return Err(TjsError::runtime(
+                "Cannot convert layer type using given direction",
+            ));
+        }
+    };
+    // `ConvertLayerType` only touches an existing `MainImage` (`:1710`/`:1716`)
+    // but flags the layer modified and updates it either way (`:1724-1726`);
+    // an image-less layer must not have one fabricated for it.
+    let has_image = target.as_ref().is_some_and(|target| {
+        render_layer_snapshot(runtime, target).is_some_and(|layer| layer.image.is_some())
+    });
+    if has_image && let Some(target) = target {
+        mutate_layer_pixels(runtime, &target, |pixels, _width, _height| {
+            for pixel in pixels.chunks_exact_mut(4) {
+                let packed = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                pixel.copy_from_slice(&convert(packed).to_le_bytes());
+            }
+        })?;
+    }
     mark_image_modified(runtime, this);
     Ok(Variant::Void)
 }
@@ -6566,15 +6697,6 @@ fn copy_rect_impl(
         return Ok(Variant::Void);
     }
 
-    let Some(source_image) =
-        render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
-    else {
-        return Ok(Variant::Void);
-    };
-    let source_pixels = source_image.upload.rgba.as_ref().to_vec();
-    let source_width = source_image.upload.width;
-    let source_height = source_image.upload.height;
-
     // Official TJS `operateRect` (`LayerIntf.cpp:7207`): `omAuto` becomes
     // the source layer's `GetOperationModeFromType()`. `copyRect` does not
     // take a mode; its flags come from the destination face and `HoldAlpha`.
@@ -6594,6 +6716,19 @@ fn copy_rect_impl(
                 .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
         }
     };
+    // `CopyRect` and `OperateRect` both require the destination bitmap
+    // (`LayerIntf.cpp:4159`/`:4376`); the face dispatch above runs first.
+    require_drawable_layer_image(runtime, &dest_target)?;
+
+    let Some(source_image) =
+        render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
+    else {
+        return Ok(Variant::Void);
+    };
+    let source_pixels = source_image.upload.rgba.as_ref().to_vec();
+    let source_width = source_image.upload.width;
+    let source_height = source_image.upload.height;
+
     let opacity = match kind {
         LayerCopyKind::Operate => optional_integer(&args, 8)?.unwrap_or(255).clamp(0, 255),
         LayerCopyKind::Copy => 255,
@@ -9232,12 +9367,21 @@ fn affine_copy_pixels(
     );
     for dy in min_y..max_y {
         for dx in min_x..max_x {
-            // KRKR's AffineBlt receives points in pixel coordinates.  The
-            // point at (0, 0) is the centre of the first destination pixel,
-            // not the left edge of its cell.  AffineSourceBMPBase also
-            // subtracts 0.5 from transformed corners to preserve this
-            // convention, so adding 0.5 here shifts every sample by one
-            // source pixel and drops the last row/column.
+            // The affine points are the images of the source rectangle's
+            // *corners*: `InternalAffineBlt` shifts the rectangle to
+            // `refrect.*.65536 - 32768` (`LayerBitmapIntf.cpp:2711-2718`) while
+            // `AffineBlt`'s matrix entry point builds them from `(-0.5,-0.5)`,
+            // `(rp-0.5,-0.5)` and `(-0.5,bp-0.5)` (`:3494-3513`), and KAG's
+            // `AffineSourceBMPBase.drawAffine` passes its transformed corners
+            // minus 0.5. Solving `dest = p0 + u*(p1-p0) + v*(p2-p0)` therefore
+            // puts `u`/`v` in the rectangle's corner frame (`u = 0` is the
+            // left edge), and the nearest sample for a destination pixel is
+            // `src + floor(u * len)`: the reference reads
+            // `floor(σ + 0.5)` with `σ = src - 0.5 + u * len`
+            // (`TVPDoAffineLoop`'s `+0.5`, `:2398-2399`), which is the same
+            // index. `u, v ∈ [0,1)` is the reference's drawn set as well: a
+            // sample outside `[src, src + len)` is dropped there
+            // (`:2407-2438`), and `u < 0` or `u >= 1` always lands outside.
             let px = dx as f64 - x0;
             let py = dy as f64 - y0;
             let u = (px * vy - py * vx) / determinant;
@@ -9421,6 +9565,13 @@ struct PiledRenderLayer {
     origin_y: f32,
     clip: PiledClip,
     opacity: f32,
+    /// The layer type of the bitmap this entry is composited into
+    /// (`BltImage`'s `destlayertype`), i.e. the nearest non-binder ancestor's
+    /// type (`LayerIntf.cpp:5164-5197`, `:5834`).
+    dest_type: i64,
+    /// The source layer of the `piledCopy` itself: its own image is copied into
+    /// the pile (`CopySelf`, `LayerIntf.cpp:5561-5583`) rather than blitted.
+    root: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9431,7 +9582,9 @@ fn collect_piled_render_layers(
     parent_origin_y: f32,
     parent_clip: Option<PiledClip>,
     parent_opacity: f32,
+    dest_type: i64,
     include_position: bool,
+    root: bool,
     visited: &mut BTreeSet<ObjectHandle>,
     output: &mut Vec<PiledRenderLayer>,
 ) {
@@ -9479,13 +9632,22 @@ fn collect_piled_render_layers(
         return;
     }
     output.push(PiledRenderLayer {
-        layer,
+        layer: layer.clone(),
         origin_x,
         origin_y,
         clip,
         opacity,
+        dest_type,
+        root,
     });
 
+    // `GetTargetLayerType` (`LayerIntf.cpp:5834`): a child of an `ltBinder`
+    // layer draws into the bitmap of the nearest non-binder ancestor.
+    let child_dest_type = if i64::from(layer.layer_type) == LT_BINDER {
+        dest_type
+    } else {
+        i64::from(layer.layer_type)
+    };
     let mut children = layer_children(runtime, handle)
         .into_iter()
         .enumerate()
@@ -9505,11 +9667,37 @@ fn collect_piled_render_layers(
             origin_y,
             Some(clip),
             opacity,
+            child_dest_type,
             true,
+            false,
             visited,
             output,
         );
     }
+}
+
+/// `tTJSNI_BaseLayer::GetTargetLayerType` (`LayerIntf.cpp:5834`): the layer
+/// type of the bitmap a layer's children are composited into is the layer's own
+/// `DisplayType`, or its parent's for an `ltBinder` layer (walked up for nested
+/// binders; `ltOpaque` when the chain runs out, `:5837`).
+fn piled_layer_target_type(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> i64 {
+    let mut current = handle;
+    for _ in 0..64 {
+        let Some(target) = registered_render_layer_target(runtime, current) else {
+            break;
+        };
+        let Some(layer) = render_layer_snapshot(runtime, &target) else {
+            break;
+        };
+        if i64::from(layer.layer_type) != LT_BINDER {
+            return i64::from(layer.layer_type);
+        }
+        let Some(parent) = layer_parent_object(runtime, current) else {
+            break;
+        };
+        current = parent;
+    }
+    LT_OPAQUE
 }
 
 fn layer_effective_width(layer: &LayerNode) -> f32 {
@@ -9530,14 +9718,17 @@ fn layer_effective_height(layer: &LayerNode) -> f32 {
     layer.height.max(layer.image_height).max(image_height)
 }
 
+/// Composite one entry of a `piledCopy` source pile into the pile bitmap. The
+/// pile is in *source-rectangle* coordinates: the pixel at `sx, sy` lands at
+/// `(0, 0)`, which is how the reference's `Complete()` builds its offscreen
+/// bitmap before `CopyRect` writes it into the destination (`LayerIntf.cpp`
+/// `:4120-4122`).
 #[allow(clippy::too_many_arguments)]
 fn composite_piled_layer(
     dest: &mut [u8],
     dest_width: u32,
     dest_height: u32,
     layer: &PiledRenderLayer,
-    dx: i64,
-    dy: i64,
     sx: i64,
     sy: i64,
     width: i64,
@@ -9564,10 +9755,26 @@ fn composite_piled_layer(
         return;
     }
 
+    // `BltImage` (`LayerIntf.cpp:5164-5364`): the method comes from this
+    // layer's own `DisplayType` and the `OnAlpha`/`OnAddAlpha` selection and
+    // the blend families' `hda` flag come from the type of the bitmap the blit
+    // lands in. `ltBinder` children draw nothing (`:5185-5187`).
+    let blt = if layer.root {
+        // The source layer's own image is *copied* into the pile
+        // (`CopySelfForRect` → `dest->CopyRect(destx, desty, MainImage, cr)`,
+        // `LayerIntf.cpp:5445-5448`), not blended.
+        None
+    } else {
+        match blend::blt_image_for_layer_type(i64::from(layer.layer.layer_type), layer.dest_type) {
+            Some(blt) => Some(blt),
+            None => return,
+        }
+    };
+
     let dest_stride = dest_width as usize * 4;
     let source_stride = source_width as usize * 4;
     for root_y in copy_y0..copy_y1 {
-        let dest_y = dy + root_y - sy;
+        let dest_y = root_y - sy;
         if dest_y < 0 || dest_y >= dest_height as i64 {
             continue;
         }
@@ -9576,7 +9783,7 @@ fn composite_piled_layer(
             continue;
         }
         for root_x in copy_x0..copy_x1 {
-            let dest_x = dx + root_x - sx;
+            let dest_x = root_x - sx;
             if dest_x < 0 || dest_x >= dest_width as i64 {
                 continue;
             }
@@ -9590,19 +9797,11 @@ fn composite_piled_layer(
                 continue;
             }
             let source_pixel = &source[source_index..source_index + 4];
-            // Official `Complete()` builds the source cache with `BltImage`,
-            // which picks the blt method from the child layer's type and holds
-            // the destination alpha for the blend families
-            // (`LayerIntf.cpp:5164-5364`): `hda` is
-            // `TVPIsTypeUsingAlphaChannel(destlayertype)`, and the destination
-            // this engine composites into is an alpha-using layer (the
-            // `DF_ALPHA` below). A plain alpha blend ignores `ltOpaque` and the
-            // blend modes.
-            let blt = blend::operation_mode_to_blt(
-                operation_mode_from_layer_type(i64::from(layer.layer.layer_type)),
-                DF_ALPHA,
-            )
-            .unwrap_or(blend::Blt::AlphaOnAlpha);
+            if blt.is_none() {
+                dest[dest_index..dest_index + 4].copy_from_slice(source_pixel);
+                continue;
+            }
+            let (blt, hda) = blt.expect("checked above");
             let opacity = (layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
             let d = u32::from_le_bytes([
                 dest[dest_index],
@@ -9616,7 +9815,7 @@ fn composite_piled_layer(
                 source_pixel[2],
                 source_pixel[3],
             ]);
-            let out = blend::blt_pixel(d, s, blt, opacity, true);
+            let out = blend::blt_pixel(d, s, blt, opacity, hda);
             dest[dest_index..dest_index + 4].copy_from_slice(&out.to_le_bytes());
         }
     }
@@ -9708,8 +9907,9 @@ fn stretch_copy_pixels(
         } else {
             dest_y - dy
         };
-        let source_y = sx_scaled_coordinate(sy, rel_y, source_rect_height, dest_rect_height);
-        if source_y < 0 || source_y >= source_texture_height as i64 {
+        let nearest = stretch_type == blend::StretchType::Nearest;
+        let source_y = sy + ((2 * rel_y + 1) * source_rect_height) / (2 * dest_rect_height);
+        if nearest && (source_y < 0 || source_y >= source_texture_height as i64) {
             continue;
         }
         for dest_x in dest_x0..dest_x1 {
@@ -9722,8 +9922,14 @@ fn stretch_copy_pixels(
             if dest_index + 4 > dest.len() {
                 continue;
             }
-            let sample = if stretch_type == blend::StretchType::Nearest {
-                let source_x = sx_scaled_coordinate(sx, rel_x, source_rect_width, dest_rect_width);
+            let sample = if nearest {
+                // A `type < stLinear` stretch is `AffineBlt` with the corners
+                // `destrect.* - 0.5` (`LayerBitmapIntf.cpp:1866-1875`), whose
+                // nearest sample for a destination pixel is
+                // `src + floor((rel + 0.5) * src_len / dst_len)`
+                // (`InternalAffineBlt` + the `+0.5` rounding of
+                // `TVPDoAffineLoop`, `:2398-2399`).
+                let source_x = sx + ((2 * rel_x + 1) * source_rect_width) / (2 * dest_rect_width);
                 if source_x < 0 || source_x >= source_texture_width as i64 {
                     continue;
                 }
@@ -9738,20 +9944,18 @@ fn stretch_copy_pixels(
                     source[source_index + 3],
                 ]
             } else {
-                // Filtered sampling maps destination pixel centres into the
-                // source rectangle.
-                let fx = sx as f64
-                    + (rel_x as f64 + 0.5) * (source_rect_width as f64 / dest_rect_width as f64)
-                    - 0.5;
-                let fy = sy as f64
-                    + rel_y as f64 * (source_rect_height as f64 / dest_rect_height as f64)
-                    - 0.5;
-                let Some(sample) = blend::sample_rgba(
+                // Filtered sampling: the reference's resampler positions
+                // destination pixel `d` at the source coordinate
+                // `cx = (d + 0.5) * srclength / dstlength + srcstart`
+                // (`gl/ResampleImage.cpp:302`), folds its kernel at the source
+                // rectangle and widens the kernel for a shrink.
+                let Some(sample) = blend::sample_resample_rgba(
                     source,
                     source_texture_width,
                     source_texture_height,
-                    fx,
-                    fy,
+                    (sx, sy, sx + source_rect_width, sy + source_rect_height),
+                    (dest_rect_width, dest_rect_height),
+                    (rel_x, rel_y),
                     stretch_type,
                 ) else {
                     continue;
@@ -9769,16 +9973,6 @@ fn stretch_copy_pixels(
             dest[dest_index..dest_index + 4].copy_from_slice(&out.to_le_bytes());
         }
     }
-}
-
-fn sx_scaled_coordinate(
-    source_origin: i64,
-    dest_offset: i64,
-    source_len: i64,
-    dest_len: i64,
-) -> i64 {
-    let scaled = (dest_offset as i128 * source_len as i128) / dest_len as i128;
-    source_origin.saturating_add(scaled as i64)
 }
 
 fn dest_min_extent(offset: i64, length: i64) -> u32 {
