@@ -1081,3 +1081,160 @@ mod official {
         fixture.parse(top_level)
     }
 }
+
+/// A native class that registers one constant, shaped like the plugins whose
+/// constants a class body reads -- `win32dialog.dll`'s `ES_LEFT`/`WS_*`
+/// family, which PARQUET's and GINKA's `WIN32DialogEX` initialisers build
+/// their `DefaultStyles` dictionaries from.
+fn native_class_with_constant(
+    name: &str,
+    constant: &str,
+    value: i64,
+) -> (Runtime<NoHost>, ObjectHandle) {
+    let mut runtime = Runtime::new();
+    let class = runtime.alloc_native_constructor(
+        |runtime: &mut Runtime<NoHost>, this_obj: Option<ObjectHandle>, _args: Vec<Variant>| {
+            let instance = this_obj.unwrap_or_else(|| runtime.alloc_ordinary_object());
+            Ok(Variant::Object(instance))
+        },
+    );
+    runtime.add_object_class_info(class, name.to_string());
+    runtime.register_object_native(
+        class,
+        "finalize",
+        |_runtime: &mut Runtime<NoHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
+            Ok(Variant::Void)
+        },
+    );
+    runtime.set_object_member(class, constant, Variant::Integer(value));
+    runtime.set_global_member(name, Variant::Object(class));
+    (runtime, class)
+}
+
+/// A class body's field initialiser reads an unqualified constant that only
+/// the *native* super class carries.
+///
+/// M35's minimal reproduction: `class Sub extends WIN32Dialog { var p =
+/// ES_LEFT; }` raised `MemberNotFound: Member "ES_LEFT" does not exist` at
+/// `WIN32DialogEX [Class] bytecode 21` in PARQUET, and GINKA's
+/// `system/win32dialog.tjs` class body failed the same way.  A body's
+/// unqualified reads compile to this-proxy reads on the under-construction
+/// instance (`gpd %r, %-2.*N`), and krkrz reaches the native super class
+/// through the class context's superclass getter
+/// (`tTJSInterCodeContext::PropGet`, `tjsInterCodeExec.cpp:3144`).
+#[test]
+fn class_body_field_reads_an_inherited_native_constant() {
+    let (mut runtime, _class) = native_class_with_constant("W32", "ES_LEFT", 7);
+    let file = compile_source_to_bytecode(
+        "class-body-native-const.tjs",
+        r#"
+        class Sub extends W32 { var probe = ES_LEFT; }
+        var s = new Sub();
+        return s.probe;
+        "#,
+    )
+    .expect("compile");
+    assert_eq!(
+        runtime.execute_file(&file).expect("execute"),
+        Variant::Integer(7)
+    );
+}
+
+/// The same read through `this`, which is the shape `WIN32DialogEX`'s
+/// initialiser uses (`this.DefaultStyles = %[...]` with unqualified `WS_*`
+/// entries).
+#[test]
+fn class_body_this_assignment_reads_an_inherited_native_constant() {
+    let (mut runtime, _class) = native_class_with_constant("W32", "WS_BORDER", 11);
+    let file = compile_source_to_bytecode(
+        "class-body-native-const-this.tjs",
+        r#"
+        class Sub2 extends W32 { this.probe = WS_BORDER; }
+        var s = new Sub2();
+        return s.probe;
+        "#,
+    )
+    .expect("compile");
+    assert_eq!(
+        runtime.execute_file(&file).expect("execute"),
+        Variant::Integer(11)
+    );
+}
+
+/// A class body's own member still wins over the native super class's name:
+/// the instance's own map is consulted before the class link, so a shadowing
+/// declaration never picks up the plugin constant.
+#[test]
+fn class_body_own_member_shadows_the_inherited_native_constant() {
+    let (mut runtime, _class) = native_class_with_constant("W32", "ES_LEFT", 7);
+    let file = compile_source_to_bytecode(
+        "class-body-native-shadow.tjs",
+        r#"
+        class Sub3 extends W32 { var ES_LEFT = 99; var probe = ES_LEFT; }
+        var s = new Sub3();
+        return s.probe;
+        "#,
+    )
+    .expect("compile");
+    assert_eq!(
+        runtime.execute_file(&file).expect("execute"),
+        Variant::Integer(99)
+    );
+}
+
+/// A name a *script* class in the chain declares is not answered from the
+/// class link: the class's own body installs it (a derived class runs it as
+/// `super.Base()`), and its initialisers must still run.  This is the
+/// `SystemRegistory` shape from GINKA's `sysscn/system.tjs`, where the base
+/// body owns `_map`.
+#[test]
+fn script_super_class_member_is_installed_by_its_body_not_the_link() {
+    let (mut runtime, _class) = native_class_with_constant("W32", "WS_BORDER", 11);
+    let file = compile_source_to_bytecode(
+        "class-body-script-base.tjs",
+        r#"
+        class Base {
+            var value = 40;
+            function Base() { value += 2; }
+            function getValue() { return value; }
+        }
+        class Sub5 extends W32 { var probe = WS_BORDER; }
+        class Child extends Base {
+            function Child() { super.Base(); }
+            function getValue() { return value; }
+        }
+        var c = new Child();
+        return c.getValue() + "/" + (new Sub5()).probe;
+        "#,
+    )
+    .expect("compile");
+    assert_eq!(
+        runtime.execute_file(&file).expect("execute"),
+        Variant::String("42/11".to_string())
+    );
+}
+
+/// The class link does not outlive the body it describes: an instance whose
+/// body finished resolves the same name through its own super class, and an
+/// unrelated object reports the reference's miss.
+#[test]
+fn class_body_link_does_not_answer_for_other_receivers() {
+    let (mut runtime, _class) = native_class_with_constant("W32", "ES_LEFT", 7);
+    let file = compile_source_to_bytecode(
+        "class-body-link-scope.tjs",
+        r#"
+        class Sub4 extends W32 { function probe() { return typeof ES_LEFT; } }
+        var s = new Sub4();
+        var plain = new global.Array();
+        plain.probe = function() { return typeof ES_LEFT; };
+        var plainResult;
+        try { plainResult = plain.probe(); } catch (e) { plainResult = "miss"; }
+        return s.probe() + "/" + plainResult;
+        "#,
+    )
+    .expect("compile");
+    assert_eq!(
+        runtime.execute_file(&file).expect("execute"),
+        Variant::String("Integer/miss".to_string())
+    );
+}

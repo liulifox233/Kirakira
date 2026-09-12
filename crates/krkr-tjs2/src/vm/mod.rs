@@ -46,6 +46,9 @@ pub struct Vm<'bc, 'rt, H: TjsHost = NoHost> {
     // has declared its own fields.  Keep a nesting count so field
     // initializers can still create members while any class body is active.
     class_initialization_depth: BTreeMap<usize, usize>,
+    // The class a running class body belongs to, keyed by the instance it is
+    // initializing; see `Vm::class_body_class`.
+    class_body_class: BTreeMap<usize, ObjectHandle>,
     _file_lifetime: PhantomData<&'bc BytecodeFile>,
 }
 
@@ -59,6 +62,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             runtime,
             code_handles,
             class_initialization_depth: BTreeMap::new(),
+            class_body_class: BTreeMap::new(),
             _file_lifetime: PhantomData,
         };
         Ok(vm)
@@ -85,11 +89,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.runtime.heap[self.runtime.global.0].get(name)
     }
 
-    pub(super) fn begin_class_initialization(&mut self, instance: ObjectHandle) {
+    pub(super) fn begin_class_initialization(
+        &mut self,
+        instance: ObjectHandle,
+        class_handle: ObjectHandle,
+    ) {
         *self
             .class_initialization_depth
             .entry(instance.0)
             .or_default() += 1;
+        self.class_body_class.insert(instance.0, class_handle);
     }
 
     pub(super) fn end_class_initialization(&mut self, instance: ObjectHandle) {
@@ -98,9 +107,23 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         };
         if *depth <= 1 {
             self.class_initialization_depth.remove(&instance.0);
+            self.class_body_class.remove(&instance.0);
         } else {
             *depth -= 1;
         }
+    }
+
+    /// The class object a running class body belongs to, for an instance that
+    /// does not carry its own `super_class` link yet.
+    ///
+    /// `initialize_inter_code_class_body` deliberately leaves the instance
+    /// without its class while the body runs -- the reference attaches that
+    /// link once the body has finished, at `REGMEMBER` time -- so a class-body
+    /// name lookup cannot use `Object::super_class`.  krkrz resolves such a
+    /// name through the *class context's* superclass getter instead
+    /// (`tTJSInterCodeContext::PropGet`, `tjsInterCodeExec.cpp:3144`).
+    pub(super) fn class_body_class(&self, instance: ObjectHandle) -> Option<ObjectHandle> {
+        self.class_body_class.get(&instance.0).copied()
     }
 
     pub(super) fn is_class_initializing(&self, instance: ObjectHandle) -> bool {
