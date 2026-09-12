@@ -6377,9 +6377,9 @@ fn copy_rect_blt(dest_face: i64, hold_alpha: bool) -> blend::Blt {
 /// zero-fill the destination plane when the source has none.
 ///
 /// The reference hands `ClipDestPointAndSrcRect`'s rectangle to
-/// `ProvinceImage->Fill` / `ProvinceImage->CopyRect`, so the zero-fill lands on
-/// the clipped *source* rectangle in the destination plane; the port keeps
-/// that placement.
+/// `ProvinceImage->Fill` / `ProvinceImage->CopyRect`; the zero-fill therefore
+/// lands on the clipped *source* rectangle in the destination plane, which is
+/// what the port reproduces.
 fn copy_province_rect(
     runtime: &mut Runtime<KrkrHost>,
     dest_target: &LayerRenderTarget,
@@ -6391,26 +6391,55 @@ fn copy_province_rect(
     width: i64,
     height: i64,
 ) {
-    let clip = layer_clip_bounds(runtime, dest_target);
-    let Some((dx, dy, sx, sy, width, height)) = clipped_copy_rect(
-        dx,
-        dy,
-        sx,
-        sy,
-        width,
-        height,
-        i64::MAX,
-        i64::MAX,
-        i64::MAX,
-        i64::MAX,
-        clip,
-    ) else {
-        return;
-    };
+    // `ClipDestPointAndSrcRect` (`LayerIntf.cpp:3754-3789`): trim the source
+    // rectangle to the destination's `ClipRect`, moving the destination point
+    // with it (the right/bottom edges are computed from the *untrimmed*
+    // origin, exactly as the reference does). A layer without a stored clip is
+    // the `ResetClip` state, whose rectangle is the whole image.
+    let clip = layer_clip_bounds(runtime, dest_target).or_else(|| {
+        render_layer_snapshot(runtime, dest_target).and_then(|layer| {
+            layer.image.map(|image| {
+                (
+                    0,
+                    0,
+                    image.upload.width as i64,
+                    image.upload.height as i64,
+                )
+            })
+        })
+    });
+    let (mut dx, mut dy) = (dx, dy);
+    let (mut left, mut top) = (sx, sy);
+    let (mut right, mut bottom) = (sx.saturating_add(width), sy.saturating_add(height));
+    if let Some((cx0, cy0, cx1, cy1)) = clip {
+        let right_limit = dx.saturating_add(right - left);
+        let bottom_limit = dy.saturating_add(bottom - top);
+        if dx < cx0 {
+            left += cx0 - dx;
+            dx = cx0;
+        }
+        if right_limit > cx1 {
+            right -= right_limit - cx1;
+        }
+        if right <= left {
+            return;
+        }
+        if dy < cy0 {
+            top += cy0 - dy;
+            dy = cy0;
+        }
+        if bottom_limit > cy1 {
+            bottom -= bottom_limit - cy1;
+        }
+        if bottom <= top {
+            return;
+        }
+    }
+    let (width, height) = (right - left, bottom - top);
     mutate_render_layer(runtime, dest_target, |layer| {
         let Some(source) = source_province else {
             if let Some(province) = layer.province.as_mut() {
-                province.fill_rect(sx, sy, width, height, 0);
+                province.fill_rect(left, top, width, height, 0);
             }
             return;
         };
@@ -6434,8 +6463,8 @@ fn copy_province_rect(
         };
         for row in 0..height {
             for column in 0..width {
-                let source_x = sx + column;
-                let source_y = sy + row;
+                let source_x = left + column;
+                let source_y = top + row;
                 if source_x < 0
                     || source_y < 0
                     || source_x >= source.width as i64
