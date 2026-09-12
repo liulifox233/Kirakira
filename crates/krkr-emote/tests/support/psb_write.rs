@@ -1,10 +1,14 @@
-//! A minimal PSB v3/v4 writer for the synthetic-motion tests.
-//!
-//! It writes just enough of the container eluna's reader needs: the fixed
-//! header, a prefix-trie name table, the string table, the resource offset and
-//! length arrays with their data pool, and the root value bytecode.
-//!
-//! Container layout reference: `vendor/eluna/crates/eluna/src/psb/mod.rs`.
+// A minimal PSB v3/v4 writer for the synthetic-motion tests: it writes just
+// enough of the container eluna's reader needs — the fixed header, a
+// prefix-trie name table, the string table, the resource offset and length
+// arrays with their data pool, and the root value bytecode.
+//
+// Container layout reference: `vendor/eluna/crates/eluna/src/psb/mod.rs`.
+//
+// The block above is a plain comment rather than a module doc because
+// `crates/krkr-plugins/src/motion_player.rs`'s tests include this file verbatim
+// (the same writer must build both sides' containers), and an included file
+// cannot carry inner doc comments.
 
 // PSB container constants. eluna keeps these private; the writer mirrors the
 // layout of `vendor/eluna/crates/eluna/src/psb/mod.rs`.

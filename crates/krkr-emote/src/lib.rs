@@ -45,33 +45,43 @@
 //!
 //! ## Follow-up (motionplayer plugin) seam
 //!
-//! The plugin should call, in order:
+//! The plugin calls, in order:
 //!
 //! 1. [`Motion::from_bytes`] with the storage bytes of the `.mtn` file,
 //! 2. [`Motion::animations`] / [`Motion::sources`] to implement the
 //!    `ResourceManager` metadata and motion/label listings,
-//! 3. [`Motion::draw_list`] (or [`Motion::draw_list_with_variables`]) per frame
-//!    and [`Motion::texture_bytes`] to upload each item's texture — the draw
-//!    list is already z/draw-index sorted,
-//! 4. [`Motion::scene_at`] / [`Motion::psb`] / [`Motion::schema`] when it needs
-//!    the raw eluna view (passes, mesh patches, stencil metadata).
+//! 3. [`Motion::draw_list`] (or [`Motion::draw_list_with_variables`]) per frame,
+//! 4. [`TextureCache`] + [`render_draw_list`] to composite that list into the
+//!    layer's RGBA bitmap (a [`Canvas`] over the layer's pixels),
+//! 5. [`Motion::scene_at`] / [`Motion::psb`] / [`Motion::schema`] when it needs
+//!    the raw eluna view (passes, mesh patches, stencil metadata) — the passes
+//!    and mesh patches [`render_draw_list`] does not yet draw are counted in
+//!    its [`RenderReport`].
 //!
-//! Wiring this crate into `crates/krkr-plugins/src/motion_player.rs` and
-//! rasterising the draw list into a canvas is explicitly out of scope here.
+//! `crates/krkr-plugins/src/motion_player.rs` implements the TJS surface
+//! (`Motion`/`Motion.Player`/`Motion.EmotePlayer`/`Motion.ResourceManager`)
+//! on top of this seam; the end-to-end test in that module drives a synthetic
+//! motion through those classes into a layer bitmap.
 
+mod decode;
 mod error;
 mod model;
 mod motion;
 mod normalize;
 mod reference;
+mod render;
 
+pub use decode::{DecodeError, DecodedTexture, decode_icon, decode_rle};
 pub use error::MotionError;
 pub use model::{
     MotionAnimation, MotionBinding, MotionClipRect, MotionDrawItem, MotionFrame, MotionIcon,
-    MotionLayer, MotionSource,
+    MotionLayer, MotionSource, MotionSourceTexture,
 };
 pub use motion::Motion;
 pub use normalize::NormalizeReport;
+pub use render::{
+    Canvas, RenderReport, TextureCache, Tint, render_draw_list, render_draw_list_into,
+};
 
 /// The eluna API this crate builds on, re-exported so consumers do not have to
 /// name the vendored path dependency for the types that appear in our

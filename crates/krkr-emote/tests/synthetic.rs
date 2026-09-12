@@ -89,6 +89,10 @@ fn freemote_source(pixel: &Value) -> Value {
 }
 
 /// `content` of one frame: full opacity at the given coordinate.
+///
+/// `opa` is the file's 0..255 opacity byte (`motionplayer_nod3d.dll`'s
+/// `FUN_1001d000` keeps it as `value & 0xff`, defaulting to `0xff`), so 255 is
+/// fully opaque and an absent field means the same.
 fn content(src: &'static str, coord: [i64; 3]) -> Value {
     object(vec![
         ("src", text(src)),
@@ -98,7 +102,7 @@ fn content(src: &'static str, coord: [i64; 3]) -> Value {
         ),
         ("ox", int(0)),
         ("oy", int(0)),
-        ("opa", int(10)),
+        ("opa", int(255)),
     ])
 }
 
@@ -224,13 +228,15 @@ fn parquet_flavor_motion_loads() {
     assert_eq!(binding.icon, "body");
     assert_eq!(binding.resource_index, 0);
 
-    // The adaptation: one synthetic texture per icon.
+    // The adaptation: one synthetic texture per icon, and the file's 0..255
+    // `opa` rescaled into eluna's 0..10 scale.
     let report = motion.normalize_report();
     assert_eq!(report.sources, 1);
     assert_eq!(report.synthesized_textures, 2);
     assert_eq!(report.rewritten_contents, 2);
     assert_eq!(report.unresolved_icon_references, 0);
     assert_eq!(report.icons_without_pixel, 0);
+    assert_eq!(report.rescaled_opacity, 2);
     assert!(motion.schema().textures.contains_key("hero/body"));
     assert!(motion.schema().textures.contains_key("hero/face"));
 
@@ -344,4 +350,71 @@ fn rejects_non_psb_bytes() {
         Err(MotionError::Psb(_))
     ));
     assert!(matches!(Motion::from_bytes(&[]), Err(MotionError::Psb(_))));
+}
+
+/// In the FreeMote flavor an icon is a sub-rectangle of a shared texture, so
+/// the *resource* decodes at the texture's dimensions and the icon rectangle
+/// travels as the draw item's `uv`.
+#[test]
+fn freemote_sub_rect_icons_decode_their_shared_texture() {
+    /// The eluna-native source with one icon that is a sub-rectangle of the
+    /// texture rather than the whole of it.
+    fn sub_rect_source(pixel: &Value, left: i64, top: i64, width: i64, height: i64) -> Value {
+        object(vec![
+            ("type", text("psb")),
+            (
+                "texture",
+                object(vec![
+                    ("pixel", pixel.clone()),
+                    ("width", int(16)),
+                    ("height", int(16)),
+                ]),
+            ),
+            (
+                "icon",
+                object(vec![(
+                    "face",
+                    object(vec![
+                        ("left", float(left as f32)),
+                        ("top", float(top as f32)),
+                        ("width", float(width as f32)),
+                        ("height", float(height as f32)),
+                        ("originX", int(0)),
+                        ("originY", int(0)),
+                        ("resolution", int(1)),
+                    ]),
+                )]),
+            ),
+        ])
+    }
+
+    let mut writer = PsbWriter::default();
+    let pixels = writer.add_resource(vec![3u8; 16 * 16 * 4]);
+    let root = motion_root(
+        sub_rect_source(&pixels, 4, 8, 8, 4),
+        "hero",
+        "hero",
+        Some("face"),
+    );
+    let bytes = writer.finish(4, &root);
+    let motion = Motion::from_bytes(&bytes).expect("freemote motion loads");
+
+    let decoded = motion
+        .texture_pixels(0)
+        .expect("the shared texture decodes");
+    assert_eq!(
+        (decoded.width, decoded.height),
+        (16, 16),
+        "the resource decodes at the texture's size, not the icon's"
+    );
+    assert_eq!(decoded.rgba.len(), 16 * 16 * 4);
+
+    let items = motion.draw_list("idle", 0.0).expect("idle samples");
+    assert!(!items.is_empty());
+    assert_eq!(
+        items[0].uv,
+        [0.25, 0.5, 0.75, 0.75],
+        "the icon travels as its sub-rectangle of the texture"
+    );
+    assert_eq!(items[0].size, [8.0, 4.0], "the icon's own size");
 }

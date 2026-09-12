@@ -13,7 +13,7 @@
 use std::io::Read as _;
 use std::path::PathBuf;
 
-use krkr_emote::Motion;
+use krkr_emote::{Canvas, Motion, TextureCache, Tint, render_draw_list};
 
 const DEFAULT_PARQUET_DIR: &str = "/Users/ruri/Downloads/PARQUET";
 
@@ -26,6 +26,21 @@ fn parquet_data_xp3() -> Option<PathBuf> {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PARQUET_DIR));
     let path = dir.join("data.xp3");
     path.is_file().then_some(path)
+}
+
+/// Reads one `.mtn` member out of the game's `data.xp3`.
+fn parquet_motion<R>(archive: &krkr_xp3::Xp3Archive<R>, name: &str) -> Motion
+where
+    R: std::io::Read + std::io::Seek + Send,
+{
+    let mut bytes = Vec::new();
+    archive
+        .open_by_name(name)
+        .expect("member open")
+        .unwrap_or_else(|| panic!("{name} exists"))
+        .read_to_end(&mut bytes)
+        .expect("member read");
+    Motion::from_bytes(&bytes).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 
 #[test]
@@ -225,4 +240,172 @@ fn parses_every_parquet_mtn() {
         unresolved.is_empty(),
         "{unresolved:?} reference icons the source table does not have"
     );
+}
+
+/// Every icon of every `.mtn` decodes to exactly its own dimensions.
+///
+/// The resources are M2 `RL` streams (8-bit paletted for the icons that carry
+/// a `pal`, RGBA otherwise); the decode is what the plugin's `draw` feeds into
+/// the layer bitmap, so a wrong alignment or codec rule shows up here as a
+/// size mismatch on the game's own art.
+#[test]
+fn decodes_every_parquet_icon() {
+    let Some(path) = parquet_data_xp3() else {
+        eprintln!(
+            "skipping: {} not found (override with KRKR_EMOTE_PARQUET_DIR)",
+            DEFAULT_PARQUET_DIR
+        );
+        return;
+    };
+    let archive = krkr_xp3::Xp3Archive::open_file(&path).expect("data.xp3 opens");
+    let names = [
+        "motion/sd/sd101.mtn",
+        "motion/splash.mtn",
+        "motion/m2logo.mtn",
+    ];
+
+    let mut decoded = 0usize;
+    let mut opaque_icons = 0usize;
+    for name in names {
+        let motion = parquet_motion(&archive, name);
+        for (source_name, source) in motion.sources() {
+            for icon in source.icons.values() {
+                let texture = motion
+                    .texture_pixels(icon.resource_index)
+                    .unwrap_or_else(|error| panic!("{name}: {source_name}/{}: {error}", icon.name));
+                assert_eq!(
+                    (texture.width, texture.height),
+                    (icon.width as u32, icon.height as u32),
+                    "{name}: {source_name}/{} dimensions",
+                    icon.name
+                );
+                assert_eq!(
+                    texture.rgba.len(),
+                    texture.width as usize * texture.height as usize * 4,
+                    "{name}: {source_name}/{} buffer size",
+                    icon.name
+                );
+                if texture
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0)
+                {
+                    opaque_icons += 1;
+                }
+                decoded += 1;
+            }
+        }
+    }
+    println!("decoded {decoded} icons, {opaque_icons} with opaque pixels");
+    assert!(
+        decoded >= 50,
+        "expected the game's icon tables, got {decoded}"
+    );
+    assert!(
+        opaque_icons * 10 >= decoded * 9,
+        "most icons carry visible pixels ({opaque_icons}/{decoded})"
+    );
+}
+
+/// The `opa` scale, measured on the game's own fade: `sd101.mtn`'s
+/// `ef_moya/bgef1` carries `opa: 192` on its frame at tick 90, so the layer
+/// fades to 192/255 ≈ 0.7529 — the reference's `value & 0xff` reading, not
+/// eluna's `/10` (which clamps every value ≥ 10 to fully opaque).
+///
+/// This also pins the second half of the same chain: PARQUET writes
+/// `parameterize: null` on non-parameterised layers, and before the adapter
+/// dropped it the layer was frozen at local time 0 and this frame never
+/// activated at any tick.
+#[test]
+fn opa_is_an_eight_bit_alpha_on_the_games_fade() {
+    let Some(path) = parquet_data_xp3() else {
+        eprintln!(
+            "skipping: {} not found (override with KRKR_EMOTE_PARQUET_DIR)",
+            DEFAULT_PARQUET_DIR
+        );
+        return;
+    };
+    let archive = krkr_xp3::Xp3Archive::open_file(&path).expect("data.xp3 opens");
+    let motion = parquet_motion(&archive, "motion/sd/sd101.mtn");
+
+    assert_eq!(
+        motion.normalize_report().rescaled_opacity,
+        1,
+        "sd101's single `opa` value is rescaled"
+    );
+    assert!(
+        motion.normalize_report().dropped_null_parameterize > 0,
+        "PARQUET's `parameterize: null` fields are dropped"
+    );
+
+    let opacity_at = |ticks: f32| -> f32 {
+        motion
+            .draw_list("ef_moya", ticks)
+            .unwrap_or_else(|error| panic!("ef_moya @ {ticks}: {error}"))
+            .into_iter()
+            .find(|item| item.label.as_deref() == Some("bgef1"))
+            .unwrap_or_else(|| panic!("ef_moya @ {ticks} draws bgef1"))
+            .opacity
+    };
+    let expected = 192.0 / 255.0;
+    assert!(
+        (opacity_at(90.0) - expected).abs() < 1e-5,
+        "opa 192 renders as 192/255, got {}",
+        opacity_at(90.0)
+    );
+    assert!(
+        (opacity_at(150.0) - expected).abs() < 1e-5,
+        "the fade holds until the next keyframe"
+    );
+    assert_eq!(opacity_at(0.0), 1.0, "before tick 90 the layer is opaque");
+}
+
+/// Rendering a real motion writes pixels: `sd101.mtn`'s `SD101AA` covers a
+/// good part of a 1500x900 canvas at tick 0, and nothing is skipped for a
+/// missing texture.
+#[test]
+fn renders_a_real_motion_into_a_canvas() {
+    let Some(path) = parquet_data_xp3() else {
+        eprintln!(
+            "skipping: {} not found (override with KRKR_EMOTE_PARQUET_DIR)",
+            DEFAULT_PARQUET_DIR
+        );
+        return;
+    };
+    let archive = krkr_xp3::Xp3Archive::open_file(&path).expect("data.xp3 opens");
+    let motion = parquet_motion(&archive, "motion/sd/sd101.mtn");
+    let items = motion.draw_list("SD101AA", 0.0).expect("sample");
+    assert!(!items.is_empty(), "the animation draws something");
+
+    let mut canvas = Canvas::new(1500, 900);
+    let mut textures = TextureCache::new(std::sync::Arc::new(motion.clone()));
+    let report = render_draw_list(&mut canvas, &items, &mut textures, Tint::IDENTITY);
+    println!("{report:?} over {} items", items.len());
+    assert_eq!(report.skipped_missing_texture, 0, "every texture decodes");
+    assert!(report.drawn > 0, "items are composited");
+    let covered = canvas
+        .pixels()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[3] > 0)
+        .count();
+    assert!(
+        covered > 1000,
+        "the character covers the canvas, got {covered} pixels"
+    );
+
+    // A plane of the wrong size is left alone rather than partially drawn.
+    let mut wrong = vec![0u8; 16];
+    let mut textures = TextureCache::new(std::sync::Arc::new(motion));
+    let report =
+        krkr_emote::render_draw_list_into(&mut wrong, 8, 8, &items, &mut textures, Tint::IDENTITY);
+    assert_eq!(
+        report,
+        Default::default(),
+        "a wrongly sized plane draws nothing"
+    );
+    assert!(wrong.iter().all(|byte| *byte == 0));
 }

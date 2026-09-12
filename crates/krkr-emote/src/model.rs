@@ -15,7 +15,20 @@ pub struct MotionSource {
     pub name: String,
     /// `source.<name>.type`, copied verbatim (PARQUET writes an int here).
     pub kind: Option<PsbValue>,
+    /// The source's shared texture in the FreeMote flavor, where every icon is
+    /// a sub-rectangle of one resource. PARQUET's flavor hangs the resource on
+    /// each icon instead and leaves this `None`.
+    pub texture: Option<MotionSourceTexture>,
     pub icons: BTreeMap<String, MotionIcon>,
+}
+
+/// `source.<name>.texture`: the pixel resource a FreeMote source's icons carve
+/// up, at its own pixel dimensions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MotionSourceTexture {
+    pub resource_index: u32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// One drawable icon of a source.
@@ -24,6 +37,9 @@ pub struct MotionIcon {
     pub name: String,
     /// Index into the PSB resource table; `Motion::texture_bytes` reads it.
     pub resource_index: u32,
+    /// Index of the icon's palette resource, for an 8-bit paletted icon
+    /// (`pal` in the file). `None` means the resource is RGBA already.
+    pub palette_resource_index: Option<u32>,
     /// Pixel size before [`MotionIcon::resolution`] scaling.
     pub width: f32,
     pub height: f32,
@@ -70,6 +86,11 @@ pub struct MotionAnimation {
     pub name: String,
     /// `lastTime`/`loopTime`, or the largest layer frame time when absent.
     pub duration_ticks: f32,
+    /// The file's `loopTime`: the tick the animation loops back to. `None`
+    /// when the file carries no `loopTime` (PARQUET writes `-1` for a motion
+    /// that plays once), which is what the plugin's `Player.loopTime` reports
+    /// and what decides whether playback ends or wraps.
+    pub loop_time: Option<f32>,
     pub layers: Vec<MotionLayer>,
 }
 
@@ -144,6 +165,11 @@ pub struct MotionFrame {
     /// `src`/`icon` resolved against the source table.
     pub binding: Option<MotionBinding>,
     pub coord: Option<[f32; 3]>,
+    /// Verbatim `content.opa`: the file's 0..255 opacity byte
+    /// (`motionplayer_nod3d.dll` `FUN_1001d000` keeps it as `value & 0xff`,
+    /// defaulting to `0xff`, i.e. fully opaque). This is the raw file value,
+    /// kept for diagnostics — the scene applies it as `opa / 255`, and
+    /// `src/normalize.rs` rescales it into the scale eluna divides by.
     pub opacity: Option<f32>,
 }
 
@@ -159,7 +185,8 @@ pub struct MotionBinding {
 /// One item of a sampled draw list, already in draw order.
 ///
 /// This is the engine-facing shape of eluna's `EmoteStaticSprite`: the plugin
-/// uploads `texture_bytes(resource_index)`, cuts `uv` out of it and places the
+/// decodes the pixels of `resource_index` (see
+/// [`crate::Motion::texture_pixels`]), cuts `uv` out of them and places the
 /// quad at `center` with `size`/`scale`/`world_transform`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MotionDrawItem {
@@ -173,6 +200,9 @@ pub struct MotionDrawItem {
     pub size: [f32; 2],
     pub scale: [f32; 2],
     pub rotation_degrees: f32,
+    /// The sprite's opacity, `0..=1`. The file's `opa` byte is scaled by
+    /// 1/255 (`src/normalize.rs`), so 192 becomes ≈0.75 exactly as the
+    /// reference renders it.
     pub opacity: f32,
     pub z: f32,
     pub visible: bool,
@@ -219,9 +249,10 @@ fn build_source(name: &str, value: &PsbValue) -> MotionSource {
     // FreeMote puts the resource on the source's `texture` and the icons are
     // sub-rectangles of it; PARQUET puts it on each icon. Either way the model
     // reports the resource the icon's pixels live in.
-    let texture_pixel = value
-        .field("texture")
-        .and_then(|texture| texture.field_u32("pixel"));
+    let texture = value.field("texture");
+    let texture_pixel = texture.and_then(|texture| texture.field_u32("pixel"));
+    let texture_size = texture
+        .and_then(|texture| Some((texture.field_f32("width")?, texture.field_f32("height")?)));
 
     let mut icons = BTreeMap::new();
     if let Some(entries) = value.field("icon").and_then(PsbValue::as_object) {
@@ -235,6 +266,14 @@ fn build_source(name: &str, value: &PsbValue) -> MotionSource {
     MotionSource {
         name: name.to_owned(),
         kind: value.field("type").cloned(),
+        texture: match (texture_pixel, texture_size) {
+            (Some(resource_index), Some((width, height))) => Some(MotionSourceTexture {
+                resource_index,
+                width,
+                height,
+            }),
+            _ => None,
+        },
         icons,
     }
 }
@@ -243,6 +282,7 @@ fn build_icon(name: &str, value: &PsbValue, texture_pixel: Option<u32>) -> Optio
     Some(MotionIcon {
         name: name.to_owned(),
         resource_index: value.field_u32("pixel").or(texture_pixel)?,
+        palette_resource_index: value.field_u32("pal"),
         width: value.field_f32("width")?,
         height: value.field_f32("height")?,
         origin_x: value.field_f32("originX").unwrap_or(0.0),
@@ -281,9 +321,12 @@ pub(crate) fn build_animations(
         .iter()
         .map(|(name, motion)| {
             let layers = build_layers(motion, sources);
+            let loop_time = motion
+                .field_f32("loopTime")
+                .filter(|loop_time| loop_time.is_finite());
             let mut duration = motion
                 .field_f32("lastTime")
-                .or_else(|| motion.field_f32("loopTime"))
+                .or(loop_time)
                 .filter(|duration| duration.is_finite())
                 .unwrap_or(0.0)
                 .max(0.0);
@@ -297,6 +340,7 @@ pub(crate) fn build_animations(
             MotionAnimation {
                 name: name.clone(),
                 duration_ticks: duration,
+                loop_time,
                 layers,
             }
         })
