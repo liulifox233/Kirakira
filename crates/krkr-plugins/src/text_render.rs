@@ -175,10 +175,11 @@ fn set_option(
     let Some(this) = bound_this(runtime, this_obj) else {
         return Ok(Variant::Void);
     };
-    let Some(Variant::Object(options)) = args.first() else {
+    // The layout dictionary may be a `new` result (a self-bound closure).
+    let Some(options) = args.first().and_then(Variant::object_handle) else {
         return Ok(Variant::Void);
     };
-    if let Ok(vertical) = runtime.resolve_object_member(*options, "vertical") {
+    if let Ok(vertical) = runtime.resolve_object_member(options, "vertical") {
         runtime.set_object_member(this, "vertical", vertical);
     }
     Ok(Variant::Void)
@@ -242,23 +243,22 @@ fn render(
     let Some(this) = bound_this(runtime, this_obj) else {
         return Ok(Variant::Integer(0));
     };
-    let text = match args.first() {
-        Some(Variant::Object(message)) => runtime
-            .object_member(*message, "text")
+    // The message model may be a `new` result (a self-bound closure).
+    let text = match args.first().and_then(Variant::object_handle) {
+        Some(message) => runtime
+            .object_member(message, "text")
             .to_tjs_string()
             .unwrap_or_default(),
-        Some(value) => value.to_tjs_string()?,
-        None => String::new(),
+        None => args.first().cloned().unwrap_or_default().to_tjs_string()?,
     };
     // textrender.dll measures every glyph through TextRender.onGetTextWidth:
     // the callback sets `this.font.height` and calls Font.getEscWidthX (or
     // Font.getTextWidth).  `font` belongs to the TextRender instance, not the
     // render arguments.  Using `font_size / 2` here was especially wrong for
     // full-width Japanese glyphs and caused progressive line-wrap drift.
-    let font = match runtime.object_member(this, "font") {
-        Variant::Object(font) => Some(font),
-        _ => None,
-    };
+    // `setFont` stores the game's font object, which a script may have taken
+    // from a self-bound member such as `Layer.font`.
+    let font = runtime.object_member(this, "font").object_handle();
     // GINKA passes the target layer's native Font to setFont(), whose glyph
     // size lives in the native `height` property; plain script font-info
     // objects carry `size` instead.  Resolve through the TJS dispatch path so
@@ -599,11 +599,16 @@ mod tests {
                 var render = new ProbeRender();
                 var before = render.readVertical();
                 render.setOption(%["vertical" => 1]);
-                return "" + before + "/" + render.readVertical();
+                var literal = render.readVertical();
+                // The script-built dictionary arrives as a self-bound closure.
+                var options = new Dictionary();
+                options.vertical = 2;
+                render.setOption(options);
+                return "" + before + "/" + literal + "/" + render.readVertical();
                 "#,
             )
             .expect("script");
 
-        assert_eq!(value.to_tjs_string().expect("string"), "0/1");
+        assert_eq!(value.to_tjs_string().expect("string"), "0/1/2");
     }
 }
