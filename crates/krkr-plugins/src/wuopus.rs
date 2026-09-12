@@ -417,7 +417,9 @@ mod tests {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            for event in audio.drain_events() {
+            // Both event kinds end the smoke, so only the first pending event
+            // of a poll tick can matter.
+            if let Some(event) = audio.drain_events().into_iter().next() {
                 match event {
                     AudioEvent::PlaybackStopped { .. } => return DecodeSmoke::Decoded,
                     AudioEvent::Status(status) => {
