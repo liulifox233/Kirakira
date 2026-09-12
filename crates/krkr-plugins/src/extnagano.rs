@@ -64,9 +64,9 @@
 //! | name | options (recovered names; defaults/clamps as the binary reads them) |
 //! |---|---|
 //! | `3duniversal` | `rule` (**required**: an image object or a filename), `type` (a string compared against `HSB`), `type2` (a string), `bound1`/`bound2` (ints), `accel1`/`speed1`/`accel2`/`speed2` (reals) with the aliases `a1`/`s1`/`a2`/`s2`, `time` |
-//! | `blurfade` | `blur1`, `blur2` (ints, 0), `blur1x`/`blur1y` (default *`blur1`*), `blur2x`/`blur2y` (default *`blur2`*), `exponent` (real), `type` (0/1/2), `prerender` (flag), `time` |
-//! | `book` | `dir` (0/1 selects the LR/RL handler; **absent draws `rand() & 1`**), `time` |
-//! | `flutter` | `back` (a real read by `FUN_10005f40`), `slip` (int, clamped to `0..min(width, height)`), `alpha` (int, kept as a byte), `time` |
+//! | `blurfade` | `blur1`, `blur2` (ints, 0), `blur1x`/`blur1y` (default *`blur1`*), `blur2x`/`blur2y` (default *`blur2`*), `exponent` (real, 1.0), `type` (0/1/2), `prerender` (flag), `time` |
+//! | `book` | `dir` (int, 0; `1` picks the LR handler and anything else the RL one, and the sentinel **`-1` draws `rand() & 1`**), `time` |
+//! | `flutter` | `back` (an int read by `FUN_10005f40`, 0), `slip` (8, clamped to `0..min(width, height)`), `alpha` (255, kept as a byte), `time` |
 //! | `honeyturn` | `size`, `twist`, `order` (ints, **all three required**), `time` |
 //! | `imagewipe` | `rule` (**required**: a filename loaded through the image provider at 32 bpp), `dir` (int), `time` |
 //! | `morphing` | `before`, `after` (objects carrying `Array` and `count`; six `tjs_int` per patch, at most 256), `time` |
@@ -74,7 +74,7 @@
 //! | `rgbfade` | `delayR`, `delayG`, `delayB`, `delayA` (ints clamped to `0..=255`), `time` |
 //! | `scanline` | `time` only |
 //! | `spin` | `type1` (0), `type2` (1), `time` |
-//! | `zoomfade` | `zoom1` (200), `zoom2` (100), `time` |
+//! | `zoomfade` | `zoom1` (100), `zoom2` (200), `time` |
 //!
 //! `time` is the transition clock in milliseconds and is **required by every
 //! one of the twelve**: each factory reads it first and returns
@@ -159,8 +159,11 @@
 //!
 //! [`ScanlineHandler`] is `tTVPScanLineTransHandler` (`0x10017c60`,
 //! `0x100178d0`, `0x100179d0`): the split starts at 0 and advances to the
-//! image width as `width * progress / 255`, and each row is composed from the
-//! two faces with the *wrap-around* the reference writes —
+//! image width as `width * elapsed / time` — one division, at full precision,
+//! the value `StartProcess` stores in the handler and `Process`/`EndProcess`
+//! read back (the factory's separate `elapsed * 255 / time` progress is never
+//! consulted by the pass) — and each row is composed from the two faces with
+//! the *wrap-around* the reference writes —
 //!
 //! * an even row takes its first `split` pixels from `Src2`'s **right** end
 //!   (`Src2[x + width - split]`) and the rest from `Src1` (`Src1[x - split]`);
@@ -351,6 +354,13 @@ impl TransitionHandlerProvider for ExtNaganoProvider {
 /// `time` in milliseconds, which all twelve factories read first and fail on:
 /// an absent member, or one that is not a number, returns `TJS_E_FAIL`
 /// (`0xffffffff`) and the layer reports the official handler error.
+///
+/// The value is bounded to the reference's own range. `FUN_10001810` reads the
+/// option as a `tjs_int` and every factory keeps it in a 32-bit slot, widening
+/// it only inside 64-bit multiplies; a port that took an unbounded `i64` would
+/// overflow those products (the workspace's dev and test profiles check
+/// arithmetic), so the clock is clamped the way the reference's storage clamps
+/// it.
 fn require_time(
     name: &str,
     options: &TransitionOptions,
@@ -358,7 +368,7 @@ fn require_time(
     options
         .integer("time")
         .filter(|time| *time >= 0)
-        .map(|time| time as u64)
+        .map(|time| (time as u64).min(i32::MAX as u64))
         .ok_or_else(|| TransitionHandlerError::new(format!("extNagano {name} needs option `time`")))
 }
 
@@ -390,7 +400,8 @@ enum ProviderOptions {
         accel2: Option<f64>,
     },
     /// `0x10004160`: `blur1`/`blur2` and their per-axis overrides, the
-    /// `exponent` real, the `type` selector and the `prerender` flag.
+    /// `exponent` real (the reader's own default is 1.0), the `type` selector
+    /// and the `prerender` flag.
     BlurFade {
         blur1: i64,
         blur1x: i64,
@@ -400,18 +411,17 @@ enum ProviderOptions {
         blur2y: i64,
         kind: i64,
         prerender: bool,
-        exponent: Option<f64>,
+        exponent: f64,
     },
-    /// `0x10005420`: `dir`; absent means the factory draws `rand() & 1` and
-    /// picks the LR or RL handler with it.
-    Book { dir: Option<i64> },
-    /// `0x100061a0`: the `back` real, `slip` clamped to `0..=min(width,
-    /// height)` and `alpha` kept as a byte.
-    Flutter {
-        back: Option<f64>,
-        slip: i64,
-        alpha: i64,
-    },
+    /// `0x10005420`: `dir`, default 0. The factory picks the LR handler when the
+    /// value is exactly 1 and the RL one otherwise, and only the sentinel `-1`
+    /// takes the `rand() & 1` branch (`cmpl $-1`, `0x10005507`).
+    Book { dir: i64 },
+    /// `0x100061a0`: the `back` int (read through
+    /// `tTJSVariant::operator tTVInteger` by `FUN_10005f40`, default 0),
+    /// `slip` (default 8) clamped to `0..=min(width, height)`, and `alpha`
+    /// (default 255) kept as a byte.
+    Flutter { back: i64, slip: i64, alpha: i64 },
     /// `0x10006ec0`: `size`, `twist` and `order`, all three required — the
     /// factory's nested reads fail the whole call when one is missing.
     HoneyTurn { size: i64, twist: i64, order: i64 },
@@ -443,7 +453,9 @@ enum ProviderOptions {
     /// `0x100188d0`: `type1` (0) and `type2` (1) pick between the handler's
     /// per-column table builders.
     Spin { type1: i64, type2: i64 },
-    /// `0x10019190`: the two zoom percentages, 200 and 100.
+    /// `0x10019190`: the two zoom percentages, `zoom1` 100 and `zoom2` 200
+    /// (the factory pushes `$0x64` for the first read and `$0xc8` for the
+    /// second).
     ZoomFade { zoom1: i64, zoom2: i64 },
 }
 
@@ -490,21 +502,20 @@ fn parse_options(
                 blur2y: integer("blur2y", blur2),
                 kind: integer("type", 0),
                 prerender: options.flag("prerender"),
-                exponent: options.number("exponent"),
+                exponent: options.number("exponent").unwrap_or(1.0),
             })
         }
-        // `dir` is optional: the factory replaces an absent member with a
-        // random bit (`_rand() & 1`) and picks the LR handler when the value is
-        // exactly 1, the RL one otherwise.
+        // `dir` keeps the reader's default 0; only the value -1 reaches the
+        // factory's random branch, and only 1 selects the LR handler.
         "book" => Ok(ProviderOptions::Book {
-            dir: options.integer("dir"),
+            dir: integer("dir", 0),
         }),
         "flutter" => {
             let cap = i64::from(request.dest_size.0.min(request.dest_size.1));
             Ok(ProviderOptions::Flutter {
-                back: options.number("back"),
-                slip: integer("slip", 0).clamp(0, cap),
-                alpha: integer("alpha", 0),
+                back: integer("back", 0),
+                slip: integer("slip", 8).clamp(0, cap),
+                alpha: integer("alpha", 255),
             })
         }
         "honeyturn" => {
@@ -555,8 +566,8 @@ fn parse_options(
             type2: integer("type2", 1),
         }),
         "zoomfade" => Ok(ProviderOptions::ZoomFade {
-            zoom1: integer("zoom1", 200),
-            zoom2: integer("zoom2", 100),
+            zoom1: integer("zoom1", 100),
+            zoom2: integer("zoom2", 200),
         }),
         _ => Err(TransitionHandlerError::new(format!(
             "extNagano has no provider named {name}"
@@ -732,15 +743,19 @@ impl ScanlineHandler {
         Self { time_ms }
     }
 
-    /// `StartProcess` (`0x100178d0`): `progress = elapsed * 255 / time`, and
-    /// the split is `width * progress / 255`; past `time` the split is the
-    /// whole width and the progress is 255.
+    /// `StartProcess` (`0x100178d0`): the split is `width * elapsed / time` —
+    /// **one** `__allmul`/`__aulldiv` pair, stored in the handler's own field
+    /// and read as the split by `Process` (`0x100179d0`, both the even and the
+    /// odd branch) and by `EndProcess` (`0x10017970`). The factory also keeps a
+    /// separate `elapsed * 255 / time` progress, but `Process` never reads it,
+    /// so the split must not be derived from it: truncating twice moves the
+    /// boundary early for most of the clock. Past `time` the split is the whole
+    /// width.
     fn split(&self, elapsed_ms: u64, width: usize) -> usize {
         if elapsed_ms >= self.time_ms {
             return width;
         }
-        let progress = (elapsed_ms * 255 / self.time_ms) as usize;
-        (width * progress / 255).min(width)
+        (width as u64 * elapsed_ms / self.time_ms) as usize
     }
 }
 
@@ -1148,9 +1163,44 @@ mod tests {
         );
     }
 
-    /// The recovered `scanline` split and its alternating rows: at
-    /// `progress = 127` of an 8-wide image the split is 3, so even rows lead
-    /// with `Src2`'s right end and odd rows with `Src1`'s.
+    /// The reference keeps `time` in a 32-bit `tjs_int` and widens it only
+    /// inside 64-bit multiplies; a script value past that range is bounded the
+    /// same way, so the handler's products cannot overflow (the workspace's dev
+    /// and test profiles check arithmetic, and an unbounded clock panicked
+    /// inside `start_transition`).
+    #[test]
+    fn an_absurd_clock_is_bounded_like_the_reference_int32() {
+        assert_eq!(
+            require_time("rgbfade", &options(&[("time", integer(i64::MAX))])).expect("time"),
+            i32::MAX as u64
+        );
+        assert_eq!(
+            require_time(
+                "rgbfade",
+                &options(&[("time", integer(i64::from(i32::MAX) + 1))])
+            )
+            .expect("time"),
+            i32::MAX as u64,
+            "one past the reference's range saturates instead of overflowing"
+        );
+        assert!(require_time("rgbfade", &options(&[("time", integer(-1))])).is_err());
+        assert!(require_time("rgbfade", &options(&[])).is_err());
+
+        // The constructor's own products stay inside `i64` at the bound.
+        let handler = RgbFadeHandler::new(i32::MAX as u64, [255; 4]);
+        assert_eq!(handler.delay_ms, [i64::from(i32::MAX); 4]);
+        assert_eq!(handler.span_ms, 1);
+        assert_eq!(handler.progress(0), [0, 0, 0, 0]);
+        assert_eq!(
+            handler.progress(i64::from(i32::MAX) as u64 + 1000),
+            [255, 255, 255, 255],
+            "past the last channel's delay the span of 1 takes every channel to 255"
+        );
+    }
+
+    /// The recovered `scanline` split and its alternating rows: at tick 50 of a
+    /// 100 ms clock on an 8-wide image the split is `8 * 50 / 100` = 4, so even
+    /// rows lead with `Src2`'s right end and odd rows with `Src1`'s.
     #[test]
     fn scanline_splits_each_row_against_the_alternating_face() {
         let mut engine = engine();
@@ -1185,7 +1235,9 @@ mod tests {
         update(&mut engine, Duration::from_millis(50));
         let composed = pixels(&mut engine, "dest");
 
-        // The split is `8 * (50 * 255 / 100) / 255` = 3.
+        // The split is `8 * 50 / 100` = 4 (`0x100178d0` divides once, at full
+        // precision; the handler's `elapsed * 255 / time` progress is never the
+        // split).
         let from_dest =
             |column: usize, row: usize| [column as u8, row as u8, 255 - column as u8, 255];
         let from_source =
@@ -1194,14 +1246,14 @@ mod tests {
         // Row 0 is even: its first `split` columns come from `Src2`'s right end
         // (`Src2[column + width - split]`) and the rest from `Src1[column -
         // split]`.
-        for (column, source_column) in [(0usize, 5usize), (2, 7)] {
+        for (column, source_column) in [(0usize, 4usize), (3, 7)] {
             assert_eq!(
                 pixel(&composed, column, 0),
                 from_source(source_column, 0),
                 "even row {column} should come from `Src2` at {source_column}"
             );
         }
-        for (column, dest_column) in [(3usize, 0usize), (7, 4)] {
+        for (column, dest_column) in [(4usize, 0usize), (7, 3)] {
             assert_eq!(
                 pixel(&composed, column, 0),
                 from_dest(dest_column, 0),
@@ -1210,14 +1262,14 @@ mod tests {
         }
         // Row 1 is odd: its first `width - split` columns come from `Src1`'s
         // right end (`Src1[column + split]`), the rest from `Src2`'s left edge.
-        for (column, dest_column) in [(0usize, 3usize), (4, 7)] {
+        for (column, dest_column) in [(0usize, 4usize), (3, 7)] {
             assert_eq!(
                 pixel(&composed, column, 1),
                 from_dest(dest_column, 1),
                 "odd row {column} should come from `Src1` at {dest_column}"
             );
         }
-        for (column, source_column) in [(5usize, 0usize), (7, 2)] {
+        for (column, source_column) in [(4usize, 0usize), (7, 3)] {
             assert_eq!(
                 pixel(&composed, column, 1),
                 from_source(source_column, 1),
@@ -1239,9 +1291,14 @@ mod tests {
 
         let handler = ScanlineHandler::new(100);
         assert_eq!(handler.split(0, 8), 0);
-        assert_eq!(handler.split(50, 8), 3);
+        assert_eq!(handler.split(50, 8), 4);
         assert_eq!(handler.split(99, 8), 8 - 1);
         assert_eq!(handler.split(100, 8), 8);
+        // One division, not two: `width * (elapsed * 255 / time) / 255` would
+        // give 637 here where the reference gives 640, and the deviation is
+        // systematic for most of the clock (up to 5 columns at 1280 wide).
+        assert_eq!(ScanlineHandler::new(1000).split(500, 1280), 640);
+        assert_eq!(ScanlineHandler::new(1000).split(1, 1280), 1);
     }
 
     /// An option the reference requires aborts `StartTransition`, and the
@@ -1289,6 +1346,31 @@ mod tests {
                     .to_string()
             ),
             "honeyturn's size/twist/order are required, as the factory's nested reads are"
+        );
+    }
+
+    /// The same guard end to end: a script clock past the reference's 32-bit
+    /// range starts the transition and composes a pass instead of panicking
+    /// inside `start_transition` or `process`.
+    #[test]
+    fn an_absurd_script_clock_starts_and_composes() {
+        let mut engine = engine();
+        run(&mut engine, FADE_PAIR);
+        run(
+            &mut engine,
+            r#"dest.beginTransition("rgbfade", true, source,
+                %[time: 9223372036854775807, delayR: 255, delayG: 255, delayB: 255, delayA: 255]);"#,
+        );
+        assert_eq!(
+            pixel(&pixels(&mut engine, "dest"), 0, 0),
+            [100, 100, 100, 255],
+            "the bounded clock keeps the handler's own arithmetic finite"
+        );
+        update(&mut engine, Duration::from_millis(10));
+        assert_eq!(
+            pixel(&pixels(&mut engine, "dest"), 0, 0),
+            [100, 100, 100, 255],
+            "the delay is the whole clock, so the pass still hands back `Src1`"
         );
     }
 
@@ -1356,15 +1438,16 @@ mod tests {
         assert_eq!(
             parse("zoomfade", &[]),
             ProviderOptions::ZoomFade {
-                zoom1: 200,
-                zoom2: 100
-            }
+                zoom1: 100,
+                zoom2: 200
+            },
+            "the factory pushes `$0x64` for `zoom1` and `$0xc8` for `zoom2`"
         );
         assert_eq!(
             parse("zoomfade", &[("zoom1", integer(50))]),
             ProviderOptions::ZoomFade {
                 zoom1: 50,
-                zoom2: 100
+                zoom2: 200
             }
         );
         assert_eq!(
@@ -1386,9 +1469,9 @@ mod tests {
                 blur2y: 0,
                 kind: 0,
                 prerender: false,
-                exponent: None,
+                exponent: 1.0,
             },
-            "the per-axis overrides keep `blur1`/`blur2` when they are absent"
+            "the per-axis overrides keep `blur1`/`blur2` when they are absent, and `exponent` keeps the reader's 1.0"
         );
         assert_eq!(
             parse(
@@ -1411,17 +1494,33 @@ mod tests {
                 blur2y: 9,
                 kind: 0,
                 prerender: true,
-                exponent: Some(1.5),
+                exponent: 1.5,
             }
         );
         assert_eq!(
-            parse("flutter", &[("slip", integer(99)), ("alpha", integer(200))]),
+            parse(
+                "flutter",
+                &[
+                    ("back", integer(1)),
+                    ("slip", integer(99)),
+                    ("alpha", integer(200)),
+                ]
+            ),
             ProviderOptions::Flutter {
-                back: None,
+                back: 1,
                 slip: 8,
                 alpha: 200
             },
-            "`slip` saturates at `min(width, height)`, `alpha` is kept"
+            "`slip` (reader default 8) saturates at `min(width, height)`, `alpha` (255) is kept"
+        );
+        assert_eq!(
+            parse("flutter", &[]),
+            ProviderOptions::Flutter {
+                back: 0,
+                slip: 8,
+                alpha: 255
+            },
+            "an empty object keeps the reader's own defaults"
         );
         assert_eq!(
             parse(
@@ -1487,12 +1586,18 @@ mod tests {
         );
         assert_eq!(
             parse("book", &[]),
-            ProviderOptions::Book { dir: None },
-            "an absent `dir` is the factory's random draw, not a fixed direction"
+            ProviderOptions::Book { dir: 0 },
+            "an absent `dir` keeps the reader's 0, which the factory turns into the RL handler"
         );
         assert_eq!(
             parse("book", &[("dir", integer(1))]),
-            ProviderOptions::Book { dir: Some(1) }
+            ProviderOptions::Book { dir: 1 },
+            "1 selects the LR handler"
+        );
+        assert_eq!(
+            parse("book", &[("dir", integer(-1))]),
+            ProviderOptions::Book { dir: -1 },
+            "-1 is the sentinel the factory replaces with `rand() & 1`"
         );
         assert_eq!(
             parse("morphing", &[]),
