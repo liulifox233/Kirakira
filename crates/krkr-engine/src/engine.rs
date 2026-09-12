@@ -14995,8 +14995,11 @@ mod tests {
                 var first = dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
                     dest.getMainPixel(1, 0) + ":" + dest.getMaskPixel(1, 0);
 
-                // A binder with opacity 0 must not hide its children either: it
-                // draws no bitmap of its own and forwards theirs.
+                // A binder's own opacity must not *scale* its children's blits
+                // (every child is blitted with its own `Opacity`, so the
+                // grandchild lands at full strength), but its `IsSeen()` gate
+                // still applies: `Opacity == 0` hides the whole subtree
+                // (`LayerIntf.h:304`, `LayerIntf.cpp:5537`/`:5600`).
                 var root2 = new Layer();
                 root2.visible = true;
                 root2.setSize(2, 1);
@@ -15007,7 +15010,7 @@ mod tests {
                 binder.visible = true;
                 binder.setPos(1, 0);
                 binder.setSize(1, 1);
-                binder.opacity = 0;
+                binder.opacity = 128;
                 binder.type = ltBinder;
 
                 var sub = new Layer(null, binder);
@@ -15020,18 +15023,32 @@ mod tests {
                 var second = new Layer();
                 second.setImageSize(2, 1);
                 second.piledCopy(0, 0, root2, 0, 0, 2, 1);
-                return first + "/" + second.getMainPixel(0, 0) + ":" +
-                    second.getMaskPixel(0, 0) + ":" + second.getMainPixel(1, 0) + ":" +
-                    second.getMaskPixel(1, 0);
+                var scaled = second.getMainPixel(0, 0) + ":" + second.getMaskPixel(0, 0) + ":" +
+                    second.getMainPixel(1, 0) + ":" + second.getMaskPixel(1, 0);
+
+                binder.opacity = 0;
+                var third = new Layer();
+                third.setImageSize(2, 1);
+                third.piledCopy(0, 0, root2, 0, 0, 2, 1);
+                var hidden = third.getMainPixel(0, 0) + ":" + third.getMaskPixel(0, 0) + ":" +
+                    third.getMainPixel(1, 0) + ":" + third.getMaskPixel(1, 0);
+
+                return first + "/" + scaled + "/" + hidden;
                 "#,
             )
             .expect("script")
             .to_tjs_string()
             .expect("string");
         // The base's own opaque black is copied raw and the `ltOpaque` child is
-        // copied verbatim on top (not faded to 128, which is what folding the
-        // source's opacity in would do); the binder's grandchild still lands.
-        assert_eq!(value, "0:255:16711680:255/0:255:65280:255".to_string());
+        // copied verbatim on top — not faded to 128, which is what folding the
+        // source's opacity into the child's blit would do. The binder at 128
+        // leaves its grandchild at full green (its opacity is a gate, not a
+        // scale factor), while at 0 the same gate hides the subtree and the
+        // pixel keeps the root's black.
+        assert_eq!(
+            value,
+            "0:255:16711680:255/0:255:65280:255/0:255:0:255".to_string()
+        );
     }
 
     /// The filtered stretch path uses the reference resampler's kernel: the tap

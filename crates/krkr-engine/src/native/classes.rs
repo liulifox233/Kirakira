@@ -9604,12 +9604,21 @@ fn collect_piled_render_layers(
     let Some(layer) = render_layer_snapshot(runtime, &target) else {
         return;
     };
-    // A binder draws no bitmap of its own (`BltImage` returns for `ltBinder`,
-    // `LayerIntf.cpp:5185-5187`) and forwards its children's own
-    // `type`/`opacity` (`:5848-5854`), so its own `Opacity` and its lack of an
-    // image must not cut the subtree out of the pile.
+    // The gate is the reference's `IsSeen()` (`Visible && Opacity != 0`,
+    // `LayerIntf.h:304`) as every *child* sees it: `Draw(..., true)` returns for
+    // an unseen layer (`LayerIntf.cpp:5537`) and every child loop passes `true`
+    // (`:5600`, `:5729`, `:5800`), so a zero-opacity binder hides its whole
+    // subtree even though it draws no bitmap of its own.
+    //
+    // The *source layer of the `piledCopy` itself* is a known difference here:
+    // the reference consults neither `Visible` nor `Opacity` for it — `PiledCopy`
+    // only needs `MainImage` (`:4111-4112`) and `Complete()` renders the
+    // source's own cache without an `IsSeen()` test (`:6104-6160`, the image
+    // itself through `DrawSelf` `:5366`), which is why `PiledCopy` bypasses the
+    // ordinary child draw path. This engine applies the child gate to the root
+    // as well; filed as a follow-up rather than changed in place.
     let binder = i64::from(layer.layer_type) == LT_BINDER;
-    if !layer.renderable || !layer.visible || (layer.opacity == 0 && !binder) {
+    if !layer.renderable || !layer.visible || layer.opacity == 0 {
         return;
     }
 
