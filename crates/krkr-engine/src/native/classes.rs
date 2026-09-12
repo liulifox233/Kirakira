@@ -22,8 +22,11 @@ use krkr_tjs2::{
 
 use crate::host::{
     CompletedImageLoad, ImageLoadRequest, ImageLoadTarget, KagLayerSlot, KrkrHost,
-    LayerRenderTarget, NativeTransitionCompletion, NativeTransitionStart, TraceCategory,
-    TransitionFaceLists, TransitionFaces,
+    LayerRenderTarget, NativeTransitionCompletion, NativeTransitionStart, ProviderTransition,
+    TraceCategory, TransitionFaceLists, TransitionFaces,
+};
+use crate::plugin_api::transition::{
+    TransitionHandlerProvider, TransitionOptions, TransitionRequest,
 };
 use crate::resource_manager::decode_province_image;
 use crate::scheduler::AsyncTriggerMode;
@@ -4369,17 +4372,25 @@ pub(crate) const TRANSITION_MIN_MILLIS: u64 = 2;
 /// (`KrkrPlugin::name`, the name the host records) and the exact names its
 /// provider registers through `TVPAddTransHandlerProvider` (`TransIntf.h:112`).
 ///
-/// The reference resolves a name only while some loaded plugin's provider
-/// answers to it (`TVPFindTransHandlerProvider`, `TransIntf.cpp:341-359`), so
-/// these names are not *unknown* while their plugin is linked.  This build's
-/// plugin host has no provider registry yet, so the closest projection is the
-/// plugin shim's own degrade -- `crossfade` -- which is what the shim modules
-/// record (`krkr-plugins/src/extnagano.rs`, `glitch_effect.rs`).  The table is
-/// the twelve extNagano providers (`docs/plugins/transitions.md` §3, the DLL's
-/// string table) and GlitchEffect's three re-derived names (§4.2).  KaichoTrans
-/// registers extra `beginTransition` methods too, but neither its source nor a
-/// binary on disk names them, so a kaicho-only name stays unknown -- which is
-/// what the reference does while no provider has registered it.
+/// **Interim projection.**  The real path is
+/// [`crate::plugin_api::transition`]: the reference resolves a name only while
+/// some registered provider answers to it (`TVPFindTransHandlerProvider`,
+/// `TransIntf.cpp:341-359`), and a plugin registers its providers from
+/// `V2Link`.  This engine reaches that registry *first* — a registered
+/// provider's name resolves to its handler — and this table is the fallback
+/// for the two plugin families whose modules are still marker shims:
+/// extNagano's twelve (`docs/plugins/transitions.md` §3, the DLL's string
+/// table) and GlitchEffect's three (§4.2) degrade to the shim's own
+/// `crossfade` while their plugin is linked, which is the closest projection
+/// of "official resolves only while a provider is registered".
+/// KaichoTrans registers extra `beginTransition` methods too, but neither its
+/// source nor a binary on disk names them, so a kaicho-only name stays unknown
+/// -- which is what the reference does while no provider has registered it.
+///
+/// The table goes away once `crates/krkr-plugins`' extnagano/glitch_effect
+/// modules register their providers through `plugin_api::transition`: a
+/// registered provider is consulted first, so its names never reach this
+/// fallback, and their tests then pin the registry instead of the projection.
 const PLUGIN_TRANSITION_NAMES: &[(&str, &[&str])] = &[
     (
         "extNagano.dll",
@@ -4401,30 +4412,52 @@ const PLUGIN_TRANSITION_NAMES: &[(&str, &[&str])] = &[
     ("GlitchEffect.dll", &["fadeglitch", "glitch", "loopglitch"]),
 ];
 
-/// The reference's provider lookup for one script- or tag-supplied name.
+/// What one transition name resolved to.
+pub(crate) enum ResolvedTransition {
+    /// A name this build has a kernel for (`krkr_core::TRANSITION_PROVIDER_NAMES`:
+    /// the reference's three built-ins and extrans' seven), or the interim
+    /// projection of a linked plugin shim (`PLUGIN_TRANSITION_NAMES`).
+    Kernel(TransitionMethod),
+    /// A provider a plugin registered through
+    /// [`crate::plugin_api::transition`] — the reference's
+    /// `iTVPTransHandlerProvider`.
+    Provider(Arc<dyn TransitionHandlerProvider>),
+}
+
+/// The reference's provider lookup for one script- or tag-supplied name
+/// (`TVPFindTransHandlerProvider`, `TransIntf.cpp:341-359`).
 ///
-/// `TVPFindTransHandlerProvider` (`TransIntf.cpp:341-359`) is an exact,
-/// case-sensitive find over the registered providers and throws
-/// `TVPCannotFindTransHander` (`:354`) on a miss, before any option is read
-/// (`LayerIntf.cpp:6206`).  `"Wave"` is therefore *not* `"wave"`, and an
+/// The find is exact and case-sensitive over the registered providers, and it
+/// throws `TVPCannotFindTransHander` (`:354`) on a miss, before any option is
+/// read (`LayerIntf.cpp:6206`).  `"Wave"` is therefore *not* `"wave"`, and an
 /// unknown name is a script error rather than a silent crossfade.  The miss is
 /// returned as `UnknownTransitionName` and the call sites report it as the
 /// message-only `eTJSError` the reference raises (no numeric code, no trace).
-pub(crate) fn resolve_transition_method(
+///
+/// Resolution order: the engine's own kernels first (the built-ins are
+/// registered at the reference's first lookup, `TransIntf.cpp:343-349`, and
+/// extrans registers at load, so they are always present here — which is also
+/// why [`KrkrHost::register_transition_provider`] refuses those names), then a
+/// plugin provider registered through `plugin_api::transition`, then the
+/// interim linked-shim projection, then the official miss.
+pub(crate) fn resolve_transition(
     runtime: &Runtime<KrkrHost>,
     name: &str,
-) -> std::result::Result<TransitionMethod, UnknownTransitionName> {
+) -> std::result::Result<ResolvedTransition, UnknownTransitionName> {
     let unknown = match TransitionMethod::try_from_name(name) {
-        Ok(method) => return Ok(method),
+        Ok(method) => return Ok(ResolvedTransition::Kernel(method)),
         Err(unknown) => unknown,
     };
+    if let Some(provider) = runtime.host().transition_provider(name) {
+        return Ok(ResolvedTransition::Provider(provider));
+    }
     // A linked plugin shim answers for its own names (`PLUGIN_TRANSITION_NAMES`);
     // an unlinked one registered no provider, so its names stay unknown.
     let answers_for_name = PLUGIN_TRANSITION_NAMES
         .iter()
         .any(|(plugin, names)| names.contains(&name) && plugin_is_linked(runtime, plugin));
     if answers_for_name {
-        return Ok(TransitionMethod::Crossfade);
+        return Ok(ResolvedTransition::Kernel(TransitionMethod::Crossfade));
     }
     Err(unknown)
 }
@@ -4987,8 +5020,19 @@ fn layer_begin_transition(
     // size check, which lives inside `pro->StartTransition` (`:6241`).  The
     // lookup is exact and case-sensitive, and a miss is a script error, so a
     // `void` name is the empty name the reference cannot find too.
-    let method = resolve_transition_method(runtime, &name)
+    let resolved = resolve_transition(runtime, &name)
         .map_err(|unknown| TjsError::runtime(unknown.message()))?;
+    // A registered plugin provider owns the transition: its handler composites
+    // the two layer bitmaps itself (`plugin_api::transition`), so none of the
+    // kernel machinery below runs for it.
+    let method = match resolved {
+        ResolvedTransition::Kernel(method) => method,
+        ResolvedTransition::Provider(provider) => {
+            let options = args.get(3).and_then(variant_object);
+            begin_provider_transition(runtime, provider, this, source, with_children, options)?;
+            return Ok(Variant::Void);
+        }
+    };
     // The three providers the reference registers (`TVPRegisterDefaultTransHandlerProvider`,
     // `TransIntf.cpp:1196`) and the rules they impose on their options.
     let crossfade_family = matches!(
@@ -5128,9 +5172,147 @@ fn layer_begin_transition(
                     paired_comp,
                     with_children,
                 },
+                provider: None,
             });
     }
     Ok(Variant::Void)
+}
+
+/// Starts the transition of a name a registered plugin provider answered --
+/// the reference's `pro->StartTransition` + `Update(true)` after it
+/// (`LayerIntf.cpp:6236-6344`).
+///
+/// The provider's handler owns the pixels: the engine hands it the two layers'
+/// own bitmaps (`Src1`/`Src2`) and replaces the destination layer's image with
+/// each pass's output (`process_provider_transition`), so none of the kernel
+/// machinery -- `TransitionParams`, the rule graphic, the frozen faces -- is
+/// involved.  The guards `StartTransition` applies have already run, so the
+/// call only fails the way the reference's provider call does: a factory
+/// failure is `TVPTransHandlerError` (`:6246`), and a layer without its own
+/// bitmap is `TVPTransitionSourceAndDestinationMustHaveImage` (`:6271-6278`);
+/// this channel needs the two images whatever `withchildren` says, because it
+/// does not walk child draws the way `tTransDrawable::DrawCompleted` does
+/// (`plugin_api::transition`, "What this channel does not model").
+fn begin_provider_transition(
+    runtime: &mut Runtime<KrkrHost>,
+    provider: Arc<dyn TransitionHandlerProvider>,
+    dest: ObjectHandle,
+    source: ObjectHandle,
+    with_children: bool,
+    options: Option<ObjectHandle>,
+) -> Result<()> {
+    let (Some(dest_layer_id), Some(source_layer_id)) = (
+        native_layer_id(runtime, dest)?,
+        native_layer_id(runtime, source)?,
+    ) else {
+        return Err(TjsError::runtime(
+            "Transition source and destination must have image",
+        ));
+    };
+    let has_image = |image: &LayerImage| image.upload.width > 0 && image.upload.height > 0;
+    let Some(dest_snapshot) = layer_main_image(runtime, dest).filter(has_image) else {
+        return Err(TjsError::runtime(
+            "Transition source and destination must have image",
+        ));
+    };
+    let Some(source_size) = layer_main_image(runtime, source)
+        .filter(has_image)
+        .map(|image| (image.upload.width, image.upload.height))
+    else {
+        return Err(TjsError::runtime(
+            "Transition source and destination must have image",
+        ));
+    };
+    let dest_layer_type = runtime
+        .host()
+        .layer_tree()
+        .layer(dest_layer_id)
+        .map(|layer| layer.layer_type)
+        .unwrap_or(0);
+    let request = TransitionRequest {
+        options: TransitionOptions::snapshot(runtime, options),
+        dest_layer_type,
+        dest_size: (dest_snapshot.upload.width, dest_snapshot.upload.height),
+        source_size: Some(source_size),
+    };
+    let handler = provider.start_transition(&request).map_err(|error| {
+        // `TVPTransHandlerError` + the detail text `LayerIntf.cpp:6246` passes
+        // (`IDS_TVP_TRANS_HANDLER_ERROR`): the script sees the official
+        // message, the provider's own reason goes to the host log the way the
+        // reference discards the returned `tjs_error`.
+        runtime.host_mut().log(&format!(
+            "transition provider `{}` failed to start: {error}",
+            provider.name()
+        ));
+        TjsError::runtime(
+            "Transition handler error iTVPTransHandlerProvider::StartTransition failed",
+        )
+    })?;
+    let (self_update, tick_callback) = transition_driver_options(runtime, options);
+    // Every provider clamps its own `time` option to the reference's 2 ms floor
+    // (`TRANSITION_MIN_MILLIS`); an absent `time` leaves no clock to run the
+    // handler on, so the call keeps the engine's immediate projection.
+    let duration = request
+        .options
+        .integer("time")
+        .map(|time| time.max(TRANSITION_MIN_MILLIS as i64) as u64)
+        .unwrap_or(0);
+    let comp = variant_object(&runtime.object_member(dest, "comp"))
+        .map(|comp| runtime.bound_this(comp).unwrap_or(comp));
+    let paired_comp = Some(runtime.bound_this(source).unwrap_or(source)) == comp;
+    let immediate =
+        duration == 0 || runtime.host().transition_policy() == crate::TransitionPolicy::Immediate;
+    if immediate {
+        if !paired_comp
+            && let Some(source_layer) = runtime
+                .host_mut()
+                .layer_tree_mut()
+                .layer_mut(source_layer_id)
+        {
+            source_layer.renderable = false;
+        }
+        return finish_immediate_transition(runtime, dest, Some(source), with_children);
+    }
+    // `Src2` must not draw over the composite the handler writes into the
+    // destination layer's bitmap; the destination itself keeps drawing live,
+    // because that bitmap is the composite.
+    let mut suppressed_images = BTreeSet::new();
+    suppressed_images.insert(source_layer_id);
+    runtime
+        .host_mut()
+        .begin_native_transition(NativeTransitionStart {
+            duration: Duration::from_millis(duration),
+            // A provider transition runs no kernel, so `frame_transitions`
+            // never reports this; the field still carries the clock the
+            // kernels would read, exactly the clamped `time`.
+            params: TransitionParams {
+                method: TransitionMethod::Crossfade,
+                duration_millis: duration as f32,
+                ..TransitionParams::default()
+            },
+            rule_image_upload: None,
+            faces: TransitionFaces::Frozen(TransitionFaceLists::default()),
+            suppressed_live_images: suppressed_images,
+            completion: NativeTransitionCompletion {
+                dest,
+                source: Some(source),
+                paired_comp,
+                with_children,
+            },
+            dest_rect: None,
+            self_update,
+            tick_callback,
+            provider: Some(ProviderTransition::new(
+                handler,
+                request.options,
+                dest_snapshot,
+                source_layer_id,
+            )),
+        });
+    // `StartTransition` ends with `Update(true)` (`LayerIntf.cpp:6344`): the
+    // first pass composes the frame at tick zero.
+    runtime.host_mut().process_provider_transition(dest);
+    Ok(())
 }
 
 fn layer_member_i64(

@@ -31,8 +31,8 @@ use crate::{
     native::classes::{
         apply_completed_image_load, apply_completed_resource_loads, call_wave_status_changed,
         complete_layer_before_draw, complete_pending_layer_paints,
-        finish_completed_native_transitions, plain_member_object, register_kag_layer_slots_from_tjs,
-        set_wave_paused, set_wave_status,
+        finish_completed_native_transitions, mark_image_modified, plain_member_object,
+        register_kag_layer_slots_from_tjs, set_wave_paused, set_wave_status,
     },
     native::{
         create_kag_parser_object, kag_to_tjs, refresh_kag_parser_object, tick_video_overlays,
@@ -1294,6 +1294,18 @@ impl KrkrEngine {
         self.tjs_runtime.host_mut().advance_transition(delta);
         if let Err(error) = finish_completed_native_transitions(&mut self.tjs_runtime) {
             self.handle_callback_error("transition completion callback", error)?;
+        }
+        // A provider transition's pass replaced a layer's bitmap from the host
+        // clock, where no runtime is in scope; `ImageModified = true`
+        // (`LayerIntf.cpp:6597`) is set here, with the runtime in hand.
+        let modified_layers = self
+            .tjs_runtime
+            .host_mut()
+            .take_provider_image_modifications();
+        for layer in modified_layers {
+            if self.tjs_runtime.object_valid(layer) {
+                mark_image_modified(&mut self.tjs_runtime, layer);
+            }
         }
         let transition_active = self.tjs_runtime.host().has_active_transition();
         // A parked VM keeps the resource wait alive even for requests the
@@ -4221,8 +4233,17 @@ fn kag_transition_spec(
     // option (`LayerIntf.cpp:6206`) and the lookup is exact: a tag whose method
     // is not registered stops the scenario with the official message instead
     // of degrading to a crossfade.
-    let method = crate::native::classes::resolve_transition_method(runtime, name)
-        .map_err(|unknown| TjsError::runtime(unknown.message()))?;
+    let method = match crate::native::classes::resolve_transition(runtime, name) {
+        Ok(crate::native::classes::ResolvedTransition::Kernel(method)) => method,
+        // The `[trans]` tag is the engine's own whole-tree projection
+        // (`begin_kag_transition`): it has no destination/source layer pair to
+        // hand a plugin handler, whose channel is a CPU composite over two
+        // bitmaps (`plugin_api::transition`).  A registered provider's name
+        // therefore keeps the projection's crossfade, which is what the name
+        // degraded to while the plugin-shim table answered it.
+        Ok(crate::native::classes::ResolvedTransition::Provider(_)) => TransitionMethod::Crossfade,
+        Err(unknown) => return Err(TjsError::runtime(unknown.message())),
+    };
     let mut params = TransitionParams {
         method,
         ..TransitionParams::default()

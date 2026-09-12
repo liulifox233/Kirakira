@@ -15,7 +15,7 @@ use krkr_core::{
     AssetKind, AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef,
     DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
     LifecycleState, Point, ProjectStoragePort, Rect, ResourceData, StorageMediaProvider,
-    StoragePort, TextInputEvent, TextureId, TransitionParams,
+    StoragePort, TextInputEvent, TextureId, TransitionMethod, TransitionParams,
 };
 use krkr_font::FontSystem;
 use krkr_kag::KagParser;
@@ -28,6 +28,10 @@ use krkr_video::{UnavailableVideoFactory, VideoDecoderFactory};
 use crate::{
     KrkrPlugin,
     native::video::VideoOverlayState,
+    plugin_api::transition::{
+        TransitionFace, TransitionFrame, TransitionHandler, TransitionHandlerProvider,
+        TransitionOptions,
+    },
     resource_manager::{
         DecodedImageData, ResourceCompletion, ResourceManager, ResourceTaskId, decode_image_bytes,
     },
@@ -408,6 +412,13 @@ pub struct KrkrHost {
     /// returns early for an already-loaded module, so a repeated link must not
     /// re-register anything.
     script_linked_plugins: BTreeSet<String>,
+    /// Transition handler providers a plugin registered through
+    /// `plugin_api::transition` — the reference's `TVPTransHandlerProviders`
+    /// table (`TransIntf.cpp:302-304`), keyed by the exact, case-sensitive name
+    /// each provider answers to (`GetName`).  Providers stay registered until
+    /// the plugin's `unregister` removes them (`V2Unlink`), and a running
+    /// transition keeps the handler it started even then.
+    transition_providers: BTreeMap<String, Arc<dyn TransitionHandlerProvider>>,
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
     kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
     layer_tree: LayerTree,
@@ -432,6 +443,10 @@ pub struct KrkrHost {
     /// (`tTJSNI_BaseLayer::InTransition`, `LayerIntf.cpp:6334`).
     active_transitions: Vec<ActiveTransition>,
     completed_native_transitions: Vec<NativeTransitionCompletion>,
+    /// Layer objects whose bitmap a provider transition pass replaced; the
+    /// engine sets `imageModified` on them once the runtime is available
+    /// again (`ImageModified = true`, `LayerIntf.cpp:6597`).
+    provider_image_modifications: Vec<ObjectHandle>,
     current_kag_page: String,
     current_kag_layer: String,
     image_cache: LayerImageCache,
@@ -513,6 +528,7 @@ impl Default for KrkrHost {
             linked_plugins: BTreeSet::new(),
             plugin_registry: Vec::new(),
             script_linked_plugins: BTreeSet::new(),
+            transition_providers: BTreeMap::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
             layer_tree: LayerTree::new(),
@@ -528,6 +544,7 @@ impl Default for KrkrHost {
             transition_policy: TransitionPolicy::Animated,
             active_transitions: Vec::new(),
             completed_native_transitions: Vec::new(),
+            provider_image_modifications: Vec::new(),
             current_kag_page: "fore".to_string(),
             current_kag_layer: "base".to_string(),
             image_cache: LayerImageCache::new(
@@ -742,6 +759,75 @@ impl KrkrHost {
             .as_ref()
             .map(|storage| storage.storage_media_names())
             .unwrap_or_default()
+    }
+
+    /// Registers a plugin-owned transition handler provider
+    /// (`TVPAddTransHandlerProvider`, `krkrz/src/core/visual/TransIntf.cpp:307-324`),
+    /// the hook [`crate::KrkrPlugin::register`] calls through
+    /// [`crate::plugin_api::transition::register_transition_provider`].
+    ///
+    /// The provider answers to its own `name()`, matched by the exact,
+    /// case-sensitive find the script path runs (`TransIntf.cpp:351`). A name
+    /// that is already registered — including a name one of the engine's own
+    /// kernel providers answers to (`krkr_core::TRANSITION_PROVIDER_NAMES`:
+    /// the three built-ins and extrans' seven), because those are the
+    /// reference's always-present default registrations — fails with the
+    /// official `TVPTransAlreadyRegistered` text. Handing in the **same**
+    /// provider object twice is a no-op: the engine runs
+    /// `KrkrPlugin::register` at boot and again when `Plugins.link` installs
+    /// the module, unlike the reference's single `V2Link`.
+    pub fn register_transition_provider(
+        &mut self,
+        provider: Arc<dyn TransitionHandlerProvider>,
+    ) -> Result<()> {
+        let name = provider.name().to_string();
+        if let Some(existing) = self.transition_providers.get(&name) {
+            if Arc::ptr_eq(existing, &provider) {
+                return Ok(());
+            }
+            // `TVPTransAlreadyRegistered`: "Transition %1 already registerd"
+            // (`vc2012/string_table_en.rc`, the reference's spelling).
+            return Err(TjsError::runtime(format!(
+                "Transition {name} already registerd"
+            )));
+        }
+        if TransitionMethod::try_from_name(&name).is_ok() {
+            return Err(TjsError::runtime(format!(
+                "Transition {name} already registerd"
+            )));
+        }
+        self.transition_providers.insert(name, provider);
+        Ok(())
+    }
+
+    /// Removes the transition handler provider registered under `name`
+    /// (`TVPRemoveTransHandlerProvider`, `TransIntf.cpp:326-338`). Returns
+    /// whether one was registered. The reference's `Delete` is silent on a
+    /// miss, and a transition already running keeps the handler it started.
+    pub fn unregister_transition_provider(&mut self, name: &str) -> bool {
+        self.transition_providers.remove(name).is_some()
+    }
+
+    /// Names of the registered transition providers, sorted. The reference has
+    /// no enumerator; this exists for host diagnostics and tests.
+    pub fn transition_provider_names(&self) -> Vec<String> {
+        self.transition_providers.keys().cloned().collect()
+    }
+
+    /// The provider registered under `name`, for the engine's transition-name
+    /// resolution (`TVPFindTransHandlerProvider`, `TransIntf.cpp:341-359`).
+    pub(crate) fn transition_provider(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn TransitionHandlerProvider>> {
+        self.transition_providers.get(name).cloned()
+    }
+
+    /// Layer objects whose bitmap a provider transition pass replaced, drained
+    /// once per frame so the engine can set `imageModified` with the runtime in
+    /// hand (`ImageModified = true`, `LayerIntf.cpp:6597`).
+    pub(crate) fn take_provider_image_modifications(&mut self) -> Vec<ObjectHandle> {
+        std::mem::take(&mut self.provider_image_modifications)
     }
 
     /// Returns browser-memory storage writes accumulated by the engine. Native
@@ -3377,6 +3463,7 @@ impl KrkrHost {
             tick_callback: None,
             pending_delta: Duration::ZERO,
             completion_event_prevented: false,
+            provider: None,
         });
     }
 
@@ -3396,6 +3483,7 @@ impl KrkrHost {
             dest_rect,
             self_update,
             tick_callback,
+            provider,
         } = start;
         let dest_layer = self.native_layer(completion.dest);
         self.active_transitions.push(ActiveTransition {
@@ -3414,6 +3502,7 @@ impl KrkrHost {
             tick_callback,
             pending_delta: Duration::ZERO,
             completion_event_prevented: false,
+            provider,
         });
     }
 
@@ -3501,6 +3590,81 @@ impl KrkrHost {
             }
             index += 1;
         }
+        // A provider transition composes its own pixels every frame it is
+        // still running (`InvokeTransition` -> `Update` -> `DrawCompleted`,
+        // `LayerIntf.cpp:6455-6490`); the kernel face machinery does not apply
+        // to it.
+        let providers = self
+            .active_transitions
+            .iter()
+            .filter(|transition| !transition.self_update && transition.provider.is_some())
+            .filter_map(ActiveTransition::dest_handle)
+            .collect::<Vec<_>>();
+        for dest in providers {
+            self.process_provider_transition(dest);
+        }
+    }
+
+    /// One [`ProviderTransition`] pass: run the started handler over the two
+    /// layer faces and replace the destination layer's bitmap with the result.
+    ///
+    /// The handler is only called while the destination still has an image —
+    /// a script that freed it mid-transition must not get it resurrected
+    /// (`Not drawable layer type`, `LayerIntf.cpp:2594-2596`) — and the source
+    /// face is re-read every pass, so a source layer whose image went away
+    /// reads as a null `Src2`.
+    pub(crate) fn process_provider_transition(&mut self, dest: ObjectHandle) {
+        let Some(index) = self
+            .active_transitions
+            .iter()
+            .position(|transition| transition.dest_handle() == Some(dest))
+        else {
+            return;
+        };
+        let Some(transition) = self.active_transitions.get_mut(index) else {
+            return;
+        };
+        let Some(provider) = transition.provider.as_mut() else {
+            return;
+        };
+        let Some(layer_id) = transition.dest_layer else {
+            return;
+        };
+        let (width, height) = provider.dest_size();
+        if width == 0 || height == 0 {
+            return;
+        }
+        // A destination that lost its image mid-transition (a script
+        // `freeImage`) must not get one resurrected
+        // (`Not drawable layer type`, `LayerIntf.cpp:2594-2596`).
+        if self
+            .layer_tree
+            .layer(layer_id)
+            .is_none_or(|layer| layer.image.is_none())
+        {
+            return;
+        }
+        let progress = if transition.duration.is_zero() {
+            1.0
+        } else {
+            (transition.elapsed.as_secs_f32() / transition.duration.as_secs_f32()).clamp(0.0, 1.0)
+        };
+        let tick = transition.elapsed;
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        {
+            // Disjoint fields: the faces borrow the tree, the handler the
+            // transition slot.
+            let source = provider.source_face(&self.layer_tree);
+            provider.process(tick, progress, source, &mut pixels);
+        }
+        let texture_id = provider.texture_id;
+        let Some(layer) = self.layer_tree.layer_mut(layer_id) else {
+            return;
+        };
+        layer.image = Some(LayerImage::new(texture_id, width, height, pixels.into()));
+        if let Some(dest) = self.active_transitions[index].dest_handle() {
+            self.provider_image_modifications.push(dest);
+        }
     }
 
     /// Destinations whose transition reads its tick from a `callback` option.
@@ -3525,12 +3689,20 @@ impl KrkrHost {
     /// transition before anything else, so the handler's origin tick is zero
     /// and the phase is simply `tick / time` (`TransIntf.cpp:544`).
     pub(crate) fn set_transition_tick(&mut self, dest: ObjectHandle, tick: i64) {
+        let mut provider = false;
         if let Some(transition) = self
             .active_transitions
             .iter_mut()
             .find(|transition| transition.dest_handle() == Some(dest))
         {
             transition.elapsed = Duration::from_millis(tick.max(0) as u64);
+            // A self-updated transition is driven by `Layer.update()` alone
+            // (`LayerIntf.cpp:5056`), so its pass runs here; the idle path's
+            // pass in `advance_transition` covers the rest.
+            provider = transition.self_update && transition.provider.is_some();
+        }
+        if provider {
+            self.process_provider_transition(dest);
         }
     }
 
@@ -3553,6 +3725,9 @@ impl KrkrHost {
         }
         transition.elapsed = transition.elapsed.saturating_add(transition.pending_delta);
         transition.pending_delta = Duration::ZERO;
+        if transition.provider.is_some() {
+            self.process_provider_transition(dest);
+        }
         true
     }
 
@@ -3670,9 +3845,15 @@ impl KrkrHost {
         self.active_transitions.len()
     }
 
+    /// The kernel transitions the renderer composites this frame.
+    ///
+    /// A provider transition is composed CPU-side into its destination layer's
+    /// own bitmap (`process_provider_transition`), so it presents through the
+    /// live layer tree and has no `FrameTransition` to run a kernel over.
     pub(crate) fn frame_transitions(&self) -> Vec<FrameTransition> {
         self.active_transitions
             .iter()
+            .filter(|transition| transition.provider.is_none())
             .map(|transition| {
                 let progress = if transition.duration.is_zero() {
                     1.0
@@ -4244,6 +4425,101 @@ struct ActiveTransition {
     /// the handler asked to stop while event dispatching was disabled, so the
     /// stop is deferred until dispatching is enabled again.
     completion_event_prevented: bool,
+    /// `Some` for a transition a registered plugin provider runs: the handler
+    /// composes the destination layer's own bitmap CPU-side every pass instead
+    /// of the renderer running a kernel over the frozen faces.  `frame_transitions`
+    /// skips such a transition, so the renderer never sees it.
+    provider: Option<ProviderTransition>,
+}
+
+/// A running transition a registered plugin provider owns
+/// (`plugin_api::transition`, the reference's `iTVPDivisibleTransHandler`).
+#[derive(Clone)]
+pub(crate) struct ProviderTransition {
+    /// The started per-playback handler.  `Arc<Mutex<_>>` because `KrkrHost`
+    /// is `Clone` and every running transition clones with it; the engine
+    /// drives the handler from the transition clock alone, so the lock is
+    /// uncontended and a panic inside `process` only poisons this cell.
+    handler: Arc<std::sync::Mutex<Box<dyn TransitionHandler>>>,
+    /// `Src1` (`LayerIntf.cpp:6592`): the destination layer's own bitmap when
+    /// the transition started, re-presented to every pass unchanged.
+    dest_before: LayerImage,
+    /// The options snapshot `start_transition` received
+    /// (`tTVPSimpleOptionProvider`'s members, captured once).
+    options: TransitionOptions,
+    /// The texture id the destination layer's image keeps across passes, so
+    /// the renderer re-uploads replaced pixels instead of leaking a texture
+    /// per tick.
+    texture_id: TextureId,
+    /// The transition source layer (`Src2`, `LayerIntf.cpp:6611`).
+    source_layer: LayerId,
+}
+
+impl ProviderTransition {
+    pub(crate) fn new(
+        handler: Box<dyn TransitionHandler>,
+        options: TransitionOptions,
+        dest_before: LayerImage,
+        source_layer: LayerId,
+    ) -> Self {
+        Self {
+            handler: Arc::new(std::sync::Mutex::new(handler)),
+            texture_id: dest_before.upload.texture_id,
+            dest_before,
+            options,
+            source_layer,
+        }
+    }
+
+    /// The size of `Src1`, which is also the pass's output buffer size: the
+    /// destination layer's own bitmap.
+    fn dest_size(&self) -> (u32, u32) {
+        (
+            self.dest_before.upload.width,
+            self.dest_before.upload.height,
+        )
+    }
+
+    /// `Src2`: the source layer's image as the render tree currently holds it
+    /// (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`).  `None` when the
+    /// layer lost its image mid-transition, which the reference passes on as a
+    /// null `data.Src2`.
+    fn source_face<'a>(&self, layer_tree: &'a LayerTree) -> Option<TransitionFace<'a>> {
+        let image = layer_tree.layer(self.source_layer)?.image.as_ref()?;
+        Some(TransitionFace {
+            pixels: image.upload.rgba.as_ref(),
+            width: image.upload.width,
+            height: image.upload.height,
+        })
+    }
+
+    /// One `Process` pass (`transhandler.h:255`) into `dest`, which starts as
+    /// a copy of `Src1` so a handler that writes nothing keeps the frame.
+    fn process(
+        &self,
+        tick: Duration,
+        progress: f32,
+        source: Option<TransitionFace<'_>>,
+        dest: &mut [u8],
+    ) {
+        dest.copy_from_slice(self.dest_before.upload.rgba.as_ref());
+        let frame = TransitionFrame {
+            tick,
+            progress,
+            options: &self.options,
+            dest_before: TransitionFace {
+                pixels: self.dest_before.upload.rgba.as_ref(),
+                width: self.dest_before.upload.width,
+                height: self.dest_before.upload.height,
+            },
+            source,
+        };
+        let mut handler = self
+            .handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handler.process(frame, dest);
+    }
 }
 
 impl ActiveTransition {
@@ -4273,6 +4549,11 @@ pub(crate) struct NativeTransitionStart {
     pub dest_rect: Option<Rect>,
     pub self_update: bool,
     pub tick_callback: Option<Variant>,
+    /// The started plugin handler when a registered provider answered the
+    /// name; `None` for the engine's own kernels.  A provider transition
+    /// ignores `params`/`rule_image_upload`/`faces`/`dest_rect` — its pixels
+    /// come from the handler, not from a render kernel.
+    pub provider: Option<ProviderTransition>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
