@@ -1,0 +1,15 @@
+[package]
+name = "eluna"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Rust parser and rendering primitives for Emote/PSB reverse engineering"
+
+[lib]
+name = "eluna"
+path = "src/lib.rs"
+
+
+[dependencies]
+flate2 = "1"
+lz4_flex = "0.11"
