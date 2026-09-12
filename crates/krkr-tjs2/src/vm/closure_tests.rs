@@ -1238,3 +1238,44 @@ fn class_body_link_does_not_answer_for_other_receivers() {
         Variant::String("Integer/miss".to_string())
     );
 }
+
+/// A member read hands back the *stored* value, binding and all.
+///
+/// `tTJSCustomObject::PropGet` (`tjsObject.cpp:1392`) copies the member
+/// variant unchanged -- `TJSDefaultPropGet` (`:1347`) only applies
+/// `TJS_SELECT_OBJTHIS` (`:1367`) before its `result->CopyRef(targ)` (`:1386`)
+/// -- and `tTJSObjectProxy::PropGet` (`tjsInterCodeExec.cpp:289-299`, the
+/// forward at `:295`) merely dispatches the read onward, so a value
+/// that was written with an ObjThis -- the self-bound `new Dictionary()`
+/// result the reference hands out (`tjsInterCodeExec.cpp:2384`) -- still
+/// carries that ObjThis when it comes back out.  Rebinding it to the reading
+/// `this` changes what `(Dictionary.assign incontextof dest)(src)` copies,
+/// because the native prefers `clo.ObjThis` over `clo.Object`
+/// (`tjsDictionary.cpp:179-184`).
+///
+/// GINKA's `system/uiloader.tjs` stores its extra-command table that way
+/// (`UIListParser.ExtraType = System._uiloadExtraType`), reads it back inside
+/// the class's constructor and copies it onto the parser instance.  A rebound
+/// read made that copy take the *instance's* members instead, so the table
+/// came out empty and every `remove`/`clear` command in a `.func` UI layout
+/// file silently did nothing: the first-play title menu kept the AFTER/NEXT
+/// entries its `title_first.func` removes and drew CONTINUE on top of NEXT.
+#[test]
+fn member_read_keeps_a_stored_values_own_this() {
+    let value = ok(r#"
+        class Base { }
+        var sharedTable = new Dictionary();
+        sharedTable.marker = 7;
+        Base.sharedTable = sharedTable;
+        class Reader extends Base {
+            var copied = new Dictionary();
+            function Reader() { refill(); }
+            function refill() {
+                (Dictionary.assign incontextof copied)(Base.sharedTable, 0);
+            }
+        }
+        var reader = new Reader();
+        return reader.copied.marker;
+        "#);
+    assert_eq!(value, Variant::Integer(7));
+}
