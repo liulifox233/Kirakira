@@ -109,7 +109,8 @@
 //! src1w, src1h, &ruleimg)`, `dim.cpp:421`) — 8bpp grayscale, scaled to the
 //! transition's size (`TransIntf.cpp:139-162`, `TVPLoadGraphic(...,
 //! glmGrayscale)`). The plugin box-blurs that mono plane (`DoBoxBlur`,
-//! `:585-636`), negates it if `neg` (`:427-429`, `:639-652`), and then runs the
+//! `:585-636`), negates it when `neg` is present (`:427-429`, `:639-652`; the
+//! reference tests the option, never its value), and then runs the
 //! engine's universal transition: `Phase = CurRatio * (255 + Vague)` (`:175`),
 //! the opacity table (`TVPInitUnivTransBlendTable`, `visual/tvpgl.c:2847-2866`)
 //! and the per-pixel rule blend (`:267-320` → `TVPUnivTransBlend[_switch][_d|_a]`,
@@ -244,13 +245,24 @@ fn option_real(
     })
 }
 
-/// A `bool`-shaped option: the reference's `((tjs_int)tmp != 0)`
-/// (`blur.cpp:665-666`) and its `neg` twin (`dim.cpp:427-429`).
+/// A value-shaped boolean: the reference's `((tjs_int)tmp != 0)`
+/// (`blur.cpp:665-666`, `blur`'s `dynamic`). `dim`'s `neg` is *not* one of
+/// these — it negates on presence ([`option_present`]).
 fn option_flag(
     options: &TransitionOptions,
     name: &str,
 ) -> std::result::Result<Option<bool>, TransitionHandlerError> {
     Ok(option_integer(options, name)?.map(|value| value != 0))
+}
+
+/// Whether the option is present and not `void` — the same
+/// `TJS_SUCCEEDED(GetValue(name, &tmp)) && tmp.Type() != tvtVoid` guard
+/// [`option_integer`] applies, for an option the reference reads *without*
+/// looking at its value (`dim.cpp:427-429`'s `neg`).
+fn option_present(options: &TransitionOptions, name: &str) -> bool {
+    options
+        .value(name)
+        .is_some_and(|value| !matches!(value, Variant::Void))
 }
 
 /// `GetAsString` (`TransIntf.cpp:78-98`): `None` when the member is absent,
@@ -735,6 +747,16 @@ fn lerp_byte(s1: u8, s2: u8, opa: i32) -> u8 {
     (i32::from(s1) + (((i32::from(s2) - i32::from(s1)) * opa) >> 8)) as u8
 }
 
+/// `TVPNegativeMulTable[source << 8 | destination]` (`visual/tvpgl.c:213-214`):
+/// `255 - (255 - destination) * (255 - source) / 255`, the resulting opacity of
+/// the same pair. `TVPUnivTransBlend_switch_d` reads it for the destination
+/// alpha (`:3252-3253`); the non-switch `TVPUnivTransBlend_d` lerps instead
+/// (`:3113`).
+fn negative_mul_table(destination: i32, source: i32) -> u32 {
+    let value = 255 - (255 - destination) * (255 - source) / 255;
+    value.clamp(0, 255) as u32
+}
+
 /// `TVPOpacityOnOpacityTable[source << 8 | destination]`
 /// (`visual/tvpgl.c:186-214`): the weight a source of opacity `source` gets
 /// over a destination of opacity `destination`.
@@ -769,11 +791,14 @@ fn opacity_on_opacity_table(destination: i32, source: i32) -> u32 {
 /// | `xblur` / `yblur` | 16 / 16, each overrides `blur` | `:403-408` |
 /// | `accel` | 1.0 | `:409-412` |
 /// | `rule` | required — a failed `GetAsString` throws | `:414-419` |
-/// | `neg` | false | `:427-429` |
+/// | `neg` | **present ⇒ negate**, whatever the value | `:427-429` |
 ///
-/// The `blur`/`xblur`/`yblur` order is the mirror image of the `blur`
+/// The `blur`/`xblur`/`blur1y` order is the mirror image of the `blur`
 /// provider's `blur1`/`blur1x`/`blur1y`: there the whole-radius option is read
-/// last and wins, here the per-axis options are.
+/// last and wins, here the per-axis options are. `neg` is a *presence* test:
+/// `dim.cpp:427-429` guards only on `GetValue` succeeding and the value not
+/// being `tvtVoid`, so `neg=0` and `neg="false"` negate too — unlike `blur`'s
+/// `dynamic`, which reads `((tjs_int)tmp != 0)` (`blur.cpp:665-666`).
 #[derive(Clone, Debug, PartialEq)]
 struct DimOptions {
     time: i64,
@@ -781,6 +806,7 @@ struct DimOptions {
     x_blur: u32,
     y_blur: u32,
     accel: f64,
+    /// True when `neg` was present and not `void` — see the table above.
     neg: bool,
     rule: String,
 }
@@ -811,7 +837,7 @@ impl DimOptions {
         // argument into the message, which is the text the port uses.
         let rule = option_string(options, "rule")
             .ok_or_else(|| TransitionHandlerError::new("オプション rule を指定してください"))?;
-        let neg = option_flag(options, "neg")?.unwrap_or(false);
+        let neg = option_present(options, "neg");
 
         Ok(Self {
             time,
@@ -1008,8 +1034,8 @@ impl TransitionHandlerProvider for DimProvider {
             ));
         }
         let (width, height) = request.dest_size;
-        // `DoBoxBlur(ruleimg, xblur, yblur)` then, if `neg`, `NegateGrayImage`
-        // (`dim.cpp:425-429`) — in that order.
+        // `DoBoxBlur(ruleimg, xblur, yblur)` then, when `neg` is present,
+        // `NegateGrayImage` (`dim.cpp:425-429`) — in that order.
         let mut rule = load_rule_image(&options.rule, width, height)?;
         box_blur_gray(&mut rule, options.x_blur, options.y_blur);
         if options.neg {
@@ -1100,6 +1126,11 @@ impl TransitionHandler for DimHandler {
         let vague = self.options.vague;
         let alpha_aware = uses_alpha(self.layer_type);
         let add_alpha = self.layer_type == LT_ADD_ALPHA;
+        let family = if vague >= 512 {
+            BlendFamily::Table
+        } else {
+            BlendFamily::Switch
+        };
         for y in 0..height as usize {
             let row_start = y * row_bytes;
             for x in 0..width as usize {
@@ -1117,16 +1148,20 @@ impl TransitionHandler for DimHandler {
                     source.pixels[base + 2],
                     source.pixels[base + 3],
                 ];
-                let pixel = if vague >= 512 {
-                    // `TVPUnivTransBlend[_d|_a]` (`dim.cpp:269-290`): the rule
-                    // value only picks a table entry.
+                let blends = || {
                     blend_rule(
                         src1,
                         src2,
                         self.table[rule as usize] as i32,
                         alpha_aware,
                         add_alpha,
+                        family,
                     )
+                };
+                let pixel = if family == BlendFamily::Table {
+                    // `TVPUnivTransBlend[_d|_a]` (`dim.cpp:269-290`): the rule
+                    // value only picks a table entry.
+                    blends()
                 } else if i32::from(rule) >= phase {
                     // `TVPUnivTransBlend_switch`: `>= src1lv` is `Src1`.
                     src1
@@ -1134,13 +1169,7 @@ impl TransitionHandler for DimHandler {
                     // `< src2lv` is `Src2` (`dim.cpp:292-293`).
                     src2
                 } else {
-                    blend_rule(
-                        src1,
-                        src2,
-                        self.table[rule as usize] as i32,
-                        alpha_aware,
-                        add_alpha,
-                    )
+                    blends()
                 };
                 dest[base..base + 4].copy_from_slice(&pixel);
             }
@@ -1183,33 +1212,55 @@ fn uses_alpha(layer_type: i32) -> bool {
     layer_type == LT_ALPHA || (13..=28).contains(&layer_type)
 }
 
-/// One pixel of `TVPUnivTransBlend[_d|_a]` (`visual/tvpgl.c:2881-3400`); `opa`
-/// is already `table[rule]`.
+/// Which `TVPUnivTransBlend` family a pass runs (`dim.cpp:268`): `Vague >= 512`
+/// takes the non-switch functions, everything else the `_switch` ones — and the
+/// two write *different* alpha lanes in the `_d` pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlendFamily {
+    /// `TVPUnivTransBlend[_d|_a]` (`visual/tvpgl.c:2881-2954`, `:3087-3183`,
+    /// `:3337-3361`).
+    Table,
+    /// `TVPUnivTransBlend_switch[_d|_a]` (`visual/tvpgl.c:2956-3335`).
+    Switch,
+}
+
+/// One pixel of `TVPUnivTransBlend[_d|_a]`; `opa` is already `table[rule]`.
 ///
-/// * `_d` (`:3087-3183`) weights the RGB lanes by the opacity-on-opacity table
-///   of the two alphas and lerps the alpha byte by `opa` itself
-///   (`s1_ |= (a1 + ((a2 - a1)*opa >> 8)) << 24`, `:3113`).
+/// * `_d` weights the RGB lanes by the opacity-on-opacity table of the two
+///   alphas. Its alpha lane is the one place the two families disagree: the
+///   non-switch function writes the lerp
+///   `a1 + ((a2 - a1)*opa >> 8)` (`visual/tvpgl.c:3113`), while the switch
+///   function — the one `Vague < 512` uses, i.e. the default —
+///   writes `TVPNegativeMulTable[addr]` over the same index
+///   (`:3252-3253`, table at `:213-214`).
 /// * `_a` (`:3337-3361`) is `TVPBlendARGB` — all four lanes lerped
-///   (`blend_util_func.h:149-156`).
-/// * the plain family (`:2881-2954`) lerps the B/G/R lanes and leaves the alpha
-///   byte zero, the same mask shape as `blur`'s plain composite.
+///   (`blend_util_func.h:149-156`), the same in both families.
+/// * the plain family (`:2881-2954`, `:2956-…`) lerps the B/G/R lanes and
+///   leaves the alpha byte zero, the same mask shape as `blur`'s plain
+///   composite.
 fn blend_rule(
     before: [u8; 4],
     after: [u8; 4],
     opa: i32,
     alpha_aware: bool,
     add_alpha: bool,
+    family: BlendFamily,
 ) -> [u8; 4] {
     if alpha_aware {
         let a1 = i32::from(before[3]);
         let a2 = i32::from(after[3]);
         let addr = ((a2 * opa) & 0xff00) + ((a1 * (256 - opa)) >> 8);
-        let alpha = opacity_on_opacity_table(addr & 0xff, (addr >> 8) & 0xff) as i32;
+        let (destination, source) = (addr & 0xff, (addr >> 8) & 0xff);
+        let alpha = opacity_on_opacity_table(destination, source) as i32;
+        let alpha_lane = match family {
+            BlendFamily::Switch => negative_mul_table(destination, source) as u8,
+            BlendFamily::Table => (a1 + (((a2 - a1) * opa) >> 8)) as u8,
+        };
         [
             lerp_byte(before[0], after[0], alpha),
             lerp_byte(before[1], after[1], alpha),
             lerp_byte(before[2], after[2], alpha),
-            (a1 + (((a2 - a1) * opa) >> 8)) as u8,
+            alpha_lane,
         ]
     } else if add_alpha {
         [
@@ -1345,6 +1396,15 @@ mod tests {
             (32, 32, false)
         );
 
+        // `dynamic` is a *value* test here — `((tjs_int)tmp != 0)`
+        // (`blur.cpp:665-666`) — unlike `dim`'s presence-driven `neg`.
+        let parsed = BlurOptions::parse(&options(&[
+            ("time", Variant::Integer(10)),
+            ("dynamic", Variant::Integer(0)),
+        ]))
+        .expect("falsy dynamic parses");
+        assert!(!parsed.dynamic);
+
         // `time` is required and clamped to the 2 ms floor (`:642-646`).
         assert_eq!(
             BlurOptions::parse(&options(&[]))
@@ -1398,6 +1458,19 @@ mod tests {
         assert_eq!(parsed.vague, 20);
         assert!(parsed.neg);
         assert_eq!(parsed.accel, -2.0);
+
+        // `neg` negates on *presence*: `dim.cpp:427-429` guards only on the
+        // read succeeding and the value not being `tvtVoid`, so `neg=0` and a
+        // non-numeric string negate too.
+        for value in [Variant::Integer(0), Variant::String("false".to_string())] {
+            let parsed = DimOptions::parse(&options(&[
+                ("time", Variant::Integer(10)),
+                ("rule", rule.clone()),
+                ("neg", value),
+            ]))
+            .expect("present neg parses");
+            assert!(parsed.neg, "a present, non-void `neg` negates");
+        }
 
         // `rule` is required (`dim.cpp:417-419`) — absent or void alike, and
         // the message formats the argument into the reference's format string.
@@ -1702,12 +1775,11 @@ mod tests {
         assert_eq!(dest, source);
     }
 
-    #[test]
-    fn the_alpha_layer_blend_carries_the_opacity_table_into_the_alpha_lane() {
-        // Same rule and clock as above, but on the default `ltAlpha` layer, so
-        // `TVPUnivTransBlend_switch_d` runs (`dim.cpp:295-299`): the RGB lanes
-        // use `TVPOpacityOnOpacityTable` of the two alphas and the alpha lane
-        // is lerped by `opa` itself (`visual/tvpgl.c:3113-3114`).
+    /// One `dim` pass at half the clock over a single rule pixel of 127, on the
+    /// default `ltAlpha` layer: `table[127]` is 128 in both families and the
+    /// opacity-on-opacity weight is 169, so the RGB lanes answer 168 either way.
+    /// Only the alpha lane differs, which is what the two tests below pin.
+    fn alpha_lane_pass(vague: i32) -> Vec<u8> {
         let rule = RuleImage {
             width: 1,
             height: 1,
@@ -1719,7 +1791,7 @@ mod tests {
         let mut handler = DimHandler {
             options: DimOptions {
                 time: 1000,
-                vague: 128,
+                vague,
                 x_blur: 0,
                 y_blur: 0,
                 accel: 1.0,
@@ -1745,12 +1817,30 @@ mod tests {
             ),
             &mut dest,
         );
-        // `table[127] = 128`; both alphas are 255, so the index's weights are
-        // `(255*128) >> 8 = 127` for the source and `(255*128) >> 8 = 127` for
-        // the destination, and the table answers 169 for that pair (the test
-        // above) — so the RGB midpoint here is `(255*169) >> 8 = 168`, not the
-        // plain family's 127. The alpha lane is `255 + (255-255)*128 >> 8`.
-        assert_eq!(dest, vec![168, 168, 168, 255]);
+        dest
+    }
+
+    #[test]
+    fn the_switch_family_writes_the_negative_mul_alpha_lane() {
+        // `Vague < 512` takes `TVPUnivTransBlend_switch_d` (`dim.cpp:295-299` —
+        // the default `vague = 64`), whose alpha lane is
+        // `TVPNegativeMulTable[addr] << 24` (`visual/tvpgl.c:3252-3253`), *not*
+        // the non-switch family's lerp (`:3113`). With `Phase = 0.5 * 383 = 191`
+        // and `table[127] = 128`, two alphas of 255 give the index `0x7f7f`, so
+        // the lane is `255 - 128*128/255 = 191` while the RGB lanes take the
+        // opacity-on-opacity weight 169 and answer `(255*169) >> 8 = 168`.
+        assert_eq!(alpha_lane_pass(128), vec![168, 168, 168, 191]);
+    }
+
+    #[test]
+    fn the_non_switch_family_lerps_the_alpha_lane() {
+        // `Vague >= 512` takes the non-switch `TVPUnivTransBlend_d`
+        // (`dim.cpp:268-290`), whose alpha lane is the lerp
+        // `a1 + (a2 - a1) * opa >> 8` (`visual/tvpgl.c:3113`) — 255 for two
+        // opaque faces. `Phase = 0.5 * (255 + 512) = 383` still leaves
+        // `table[127] = 255 - (127 + 129) * 255 / 512 = 128`, so the RGB lanes
+        // stay at 168 and only the alpha lane moves.
+        assert_eq!(alpha_lane_pass(512), vec![168, 168, 168, 255]);
     }
 
     // ---- engine --------------------------------------------------------
