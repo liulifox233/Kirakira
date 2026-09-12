@@ -14,7 +14,7 @@ use std::{
 
 use krkr_core::{DrawCommand, Point, Size};
 use krkr_engine::{KagTaskState, KrkrEngine, KrkrHost, RuntimeSession, SystemPaths};
-use krkr_tjs2::runtime::{Runtime, Variant};
+use krkr_tjs2::runtime::{ObjectHandle, Runtime, Variant};
 
 use crate::snapshot::{self, TextureCache};
 
@@ -461,6 +461,63 @@ pub fn evaluate_interactive_expression(
     Ok(value)
 }
 
+/// Lists the members of a script-visible value for the `members` command.
+///
+/// The value is unwrapped through `object_handle()`: a value the game stored
+/// from `this` or from `new` is a self-bound closure whose script-visible
+/// identity is the object behind it. A native property member stores its
+/// accessor rather than the value, so those are resolved through the TJS
+/// dispatch path before printing.
+pub fn member_lines(
+    engine: &mut KrkrEngine,
+    value: &Variant,
+    expression: &str,
+    filter: Option<&str>,
+    all: bool,
+) -> Result<Vec<String>, String> {
+    let Some(object) = value.object_handle() else {
+        return Err(format!(
+            "not-an-object kind={}",
+            variant_kind(engine, value)
+        ));
+    };
+    let members = engine.tjs_runtime().object_members(object);
+    let total = members.len();
+    let shown = members
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let target = value.object_handle();
+            let callable =
+                target.is_some_and(|handle| engine.tjs_runtime().object_is_callable(handle));
+            let property =
+                target.is_some_and(|handle| engine.tjs_runtime().object_is_native_property(handle));
+            let keep = (all || !callable)
+                && filter.is_none_or(|needle| name.to_ascii_lowercase().contains(needle));
+            keep.then_some((name, value, property))
+        })
+        .collect::<Vec<_>>();
+    let mut lines = vec![format!(
+        "interactive members expression={expression:?} count={} total={total}",
+        shown.len()
+    )];
+    for (name, value, property) in shown {
+        let value = if property {
+            engine
+                .tjs_runtime_mut()
+                .resolve_object_member(object, &name)
+                .unwrap_or(value)
+        } else {
+            value
+        };
+        lines.push(format!(
+            "member {name}={} value={}",
+            variant_kind(engine, &value),
+            display_value(engine, &value)
+        ));
+    }
+    Ok(lines)
+}
+
 pub fn apply_interactive_control(
     command: InteractiveCommand,
     paused: &mut bool,
@@ -652,7 +709,10 @@ pub fn apply_interactive_control(
         }
         InteractiveCommand::Expression(expression) => {
             match evaluate_interactive_expression(runtime, &expression) {
-                Ok(value) => println!("interactive expression={value}"),
+                Ok(value) => println!(
+                    "interactive expression={}",
+                    display_value(runtime.engine(), &value)
+                ),
                 Err(error) => println!("interactive expression_error={error}"),
             }
         }
@@ -662,53 +722,22 @@ pub fn apply_interactive_control(
             all,
         } => {
             match evaluate_interactive_expression(runtime, &expression) {
-                Ok(Variant::Object(object)) => {
-                    let tjs = runtime.engine().tjs_runtime();
-                    let members = tjs.object_members(object);
-                    let total = members.len();
-                    let shown = members
-                        .into_iter()
-                        .filter_map(|(name, value)| {
-                            let target = match &value {
-                                Variant::Object(handle) => Some(*handle),
-                                Variant::Closure(closure) => Some(closure.object),
-                                _ => None,
-                            };
-                            let callable =
-                                target.is_some_and(|handle| tjs.object_is_callable(handle));
-                            let property =
-                                target.is_some_and(|handle| tjs.object_is_native_property(handle));
-                            let keep = (all || !callable)
-                                && filter.as_deref().is_none_or(|needle| {
-                                    name.to_ascii_lowercase().contains(needle)
-                                });
-                            keep.then_some((name, value, property))
-                        })
-                        .collect::<Vec<_>>();
-                    println!(
-                        "interactive members expression={expression:?} count={} total={total}",
-                        shown.len()
-                    );
-                    for (name, value, property) in shown {
-                        // A native property member stores its accessor, not the
-                        // value; printing the accessor tells the reader nothing
-                        // about the object's state.
-                        let value = if property {
-                            runtime
-                                .engine_mut()
-                                .tjs_runtime_mut()
-                                .resolve_object_member(object, &name)
-                                .unwrap_or(value)
-                        } else {
-                            value
-                        };
-                        println!("member {name}={} value={value}", variant_kind(&value));
+                Ok(value) => {
+                    match member_lines(
+                        runtime.engine_mut(),
+                        &value,
+                        &expression,
+                        filter.as_deref(),
+                        all,
+                    ) {
+                        Ok(lines) => {
+                            for line in lines {
+                                println!("{line}");
+                            }
+                        }
+                        Err(message) => println!("interactive members_error={message}"),
                     }
                 }
-                Ok(value) => println!(
-                    "interactive members_error=not-an-object kind={}",
-                    variant_kind(&value)
-                ),
                 Err(error) => println!("interactive members_error={error}"),
             }
         }
@@ -1081,7 +1110,37 @@ pub fn apply_trace_command(runtime: &mut Runtime<KrkrHost>, command: TraceComman
     );
 }
 
-pub fn variant_kind(value: &Variant) -> &'static str {
+/// The object a script-visible value carries when that value is a plain
+/// object rather than a function.
+///
+/// Under the `this`/`new` value model a script-visible object is a closure
+/// over the object (`tTJSVariant(objthis, objthis)`); a method read off a
+/// receiver is a closure whose object is the inter-code context, and that is
+/// the only shape a script sees as callable. The console used to print the
+/// first shape as `<object #h>` and should keep doing so, or every data
+/// member of the game's own objects would read `closure` again.
+fn object_valued_closure(engine: &KrkrEngine, value: &Variant) -> Option<ObjectHandle> {
+    let handle = value.object_handle()?;
+    match value {
+        Variant::Closure(_) if !engine.tjs_runtime().object_is_callable(handle) => Some(handle),
+        _ => None,
+    }
+}
+
+/// Renders a script-visible value the way a script sees it: an object-valued
+/// closure prints as its object (`<object #h>`), everything else through
+/// `Display`.
+pub fn display_value(engine: &KrkrEngine, value: &Variant) -> String {
+    match object_valued_closure(engine, value) {
+        Some(handle) => Variant::Object(handle).to_string(),
+        None => value.to_string(),
+    }
+}
+
+pub fn variant_kind(engine: &KrkrEngine, value: &Variant) -> &'static str {
+    if object_valued_closure(engine, value).is_some() {
+        return "object";
+    }
     match value {
         Variant::Void => "void",
         Variant::Null => "null",
