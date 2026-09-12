@@ -282,13 +282,13 @@ mod tests {
     #[test]
     fn watch_publishes_or_adopts_the_global_and_keeps_one_table() {
         let mut engine = engine();
-        let table = watch_storage_dictionary(&mut engine.tjs_runtime_mut(), "WatchTarget");
+        let table = watch_storage_dictionary(engine.tjs_runtime_mut(), "WatchTarget");
         let handle = dictionary_handle(&engine, "WatchTarget").expect("global object");
         assert!(engine.tjs_runtime().is_dictionary_instance(handle));
 
         // A second watch of the same name returns the same table, so the media
         // built around the first one keeps seeing every refresh.
-        let again = watch_storage_dictionary(&mut engine.tjs_runtime_mut(), "WatchTarget");
+        let again = watch_storage_dictionary(engine.tjs_runtime_mut(), "WatchTarget");
         assert!(Arc::ptr_eq(&table, &again));
         assert_eq!(
             engine.tjs_runtime().host().storage_script_table_names(),
@@ -301,7 +301,7 @@ mod tests {
         engine
             .execute_script("adopt.tjs", r#"WatchTarget = %["a" => "b"];"#)
             .expect("script");
-        let adopted = watch_storage_dictionary(&mut engine.tjs_runtime_mut(), "WatchTarget");
+        let adopted = watch_storage_dictionary(engine.tjs_runtime_mut(), "WatchTarget");
         assert!(Arc::ptr_eq(&table, &adopted));
         assert_eq!(adopted.get("a"), Some("b".to_string()));
         let adopted_handle = dictionary_handle(&engine, "WatchTarget").expect("global object");
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn refresh_mirrors_string_members_only() {
         let mut engine = engine();
-        let table = watch_storage_dictionary(&mut engine.tjs_runtime_mut(), "Mixed");
+        let table = watch_storage_dictionary(engine.tjs_runtime_mut(), "Mixed");
         engine
             .execute_script(
                 "mixed.tjs",
@@ -325,7 +325,7 @@ mod tests {
                    Mixed["a"] = %["k" => 1];"#,
             )
             .expect("script");
-        refresh_storage_tables(&mut engine.tjs_runtime_mut());
+        refresh_storage_tables(engine.tjs_runtime_mut());
 
         assert_eq!(
             table.entries(),
@@ -342,23 +342,23 @@ mod tests {
     #[test]
     fn a_non_object_global_clears_the_table() {
         let mut engine = engine();
-        let table = watch_storage_dictionary(&mut engine.tjs_runtime_mut(), "Replaced");
+        let table = watch_storage_dictionary(engine.tjs_runtime_mut(), "Replaced");
         engine
             .execute_script("old.tjs", r#"Replaced["./x"] = "./y";"#)
             .expect("script");
-        refresh_storage_tables(&mut engine.tjs_runtime_mut());
+        refresh_storage_tables(engine.tjs_runtime_mut());
         assert_eq!(table.get("./x"), Some("./y".to_string()));
 
         engine
             .execute_script("new.tjs", r#"Replaced = %["./x" => "./z"];"#)
             .expect("script");
-        refresh_storage_tables(&mut engine.tjs_runtime_mut());
+        refresh_storage_tables(engine.tjs_runtime_mut());
         assert_eq!(table.get("./x"), Some("./z".to_string()));
 
         engine
             .execute_script("gone.tjs", r#"Replaced = 3;"#)
             .expect("script");
-        refresh_storage_tables(&mut engine.tjs_runtime_mut());
+        refresh_storage_tables(engine.tjs_runtime_mut());
         assert!(table.is_empty());
     }
 
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn refresh_without_watches_is_a_no_op() {
         let mut engine = engine();
-        refresh_storage_tables(&mut engine.tjs_runtime_mut());
+        refresh_storage_tables(engine.tjs_runtime_mut());
         assert!(
             engine
                 .tjs_runtime()

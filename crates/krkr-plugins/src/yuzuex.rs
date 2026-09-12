@@ -307,7 +307,7 @@ impl StorageMediaProvider for ProxyMedia {
     /// `cannot open proxyfile:%1` when either step fails.
     fn open(&self, name: &str) -> io::Result<Box<dyn ResourceStream>> {
         let target = self.resolve(name).ok_or_else(|| open_error(name))?;
-        let storage = self.storage().ok_or_else(|| no_storage_error())?;
+        let storage = self.storage().ok_or_else(no_storage_error)?;
         storage.open(&target).map_err(|_| open_error(name))
     }
 
@@ -318,7 +318,7 @@ impl StorageMediaProvider for ProxyMedia {
     /// there.
     fn write(&self, name: &str, mode: &str, bytes: &[u8]) -> io::Result<()> {
         let target = self.resolve(name).ok_or_else(|| open_error(name))?;
-        let storage = self.storage().ok_or_else(|| no_storage_error())?;
+        let storage = self.storage().ok_or_else(no_storage_error)?;
         storage
             .write_binary_storage(&target, mode, bytes)
             .map_err(|_| open_error(name))
