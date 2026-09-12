@@ -13,6 +13,12 @@ use krkr_core::{
 };
 use krkr_font::FontSystem;
 use wgpu::util::DeviceExt;
+
+/// The `wave` kernel's CPU mirror: the executable specification the shader is
+/// held to by the tests in this crate.  It ships only in test builds -- the
+/// renderer's implementation of a transition kernel is the WGSL.
+#[cfg(test)]
+mod wave;
 #[cfg(feature = "winit-surface")]
 pub use winit::dpi::PhysicalSize;
 #[cfg(feature = "winit-surface")]
@@ -385,12 +391,32 @@ impl Renderer {
                         ),
                     }
                 }
+                // Kernels that write a vacated region as a colour have to
+                // composite that colour over the scene *beneath* the
+                // destination layer, which the incoming face cannot supply (it
+                // already has the source drawn over it).  Render the under face
+                // on its own only for those kernels.
+                let under_target = wave_under_face_needed(transition.params.method).then(|| {
+                    let target = self.create_offscreen_target("Kirakira transition under target");
+                    self.render_commands_to_view(
+                        &mut encoder,
+                        &target.view,
+                        "Kirakira transition under face",
+                        frame.clear_color,
+                        None,
+                        &transition.under_draw_commands,
+                    );
+                    target
+                });
                 self.render_transition_to_view(
                     &mut encoder,
                     &view,
                     transition.dest_rect,
-                    &old_target.view,
-                    &new_target.view,
+                    TransitionFaceViews {
+                        old: &old_target.view,
+                        new: &new_target.view,
+                        under: under_target.as_ref().map(|target| &target.view),
+                    },
                     transition,
                 );
             }
@@ -795,10 +821,14 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         dest_rect: Option<Rect>,
-        old_view: &wgpu::TextureView,
-        new_view: &wgpu::TextureView,
+        faces: TransitionFaceViews<'_>,
         transition: &FrameTransition,
     ) {
+        let TransitionFaceViews {
+            old: old_view,
+            new: new_view,
+            under: under_view,
+        } = faces;
         // A transition whose destination has no measurable geometry covers the
         // whole frame; otherwise only the destination layer's own area is
         // rewritten and the live frame stays visible everywhere else.
@@ -809,10 +839,14 @@ impl Renderer {
             },
             None => None,
         };
+        let content_size = self.content_size.unwrap_or_else(|| self.logical_size());
         let uniforms = transition_uniforms(
             transition,
             self.config.width.max(1) as f32,
             self.config.height.max(1) as f32,
+            self.render_transform(),
+            content_size,
+            under_view.is_some(),
         );
         let uniform_buffer = self
             .device
@@ -826,6 +860,9 @@ impl Renderer {
             .and_then(|texture_id| self.textures.get(&texture_id))
             .map(|texture| &texture._view)
             .unwrap_or(old_view);
+        // Kernels without an under face still have to bind a texture there;
+        // `data[9].w` tells them it is not the scene beneath the destination.
+        let under_view = under_view.unwrap_or(new_view);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Kirakira transition bind group"),
             layout: &self.transition_pipeline.bind_group_layout,
@@ -856,6 +893,14 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.texture_pipeline.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(under_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: wgpu::BindingResource::Sampler(&self.texture_pipeline.sampler),
                 },
             ],
@@ -1281,6 +1326,11 @@ impl TransitionPipelineResources {
                 },
                 texture_bind_group_layout_entry(5),
                 sampler_bind_group_layout_entry(6),
+                // The under face (`under_draw_commands`): the scene beneath the
+                // destination layer, which the kernels that fill a vacated
+                // region with a colour need in order to composite it (`wave`).
+                texture_bind_group_layout_entry(7),
+                sampler_bind_group_layout_entry(8),
             ],
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("transition.wgsl"));
@@ -1360,6 +1410,17 @@ struct CachedTexture {
     height: u32,
 }
 
+/// The face textures one composite reads: the frozen scene (binding 0), the
+/// incoming face (binding 2) and, for the kernels that need the scene beneath
+/// the destination layer, the under face (binding 7; see
+/// `wave_under_face_needed`).  `under` is `None` for every other kernel, and
+/// `data[9].w` tells the shader so.
+struct TransitionFaceViews<'a> {
+    old: &'a wgpu::TextureView,
+    new: &'a wgpu::TextureView,
+    under: Option<&'a wgpu::TextureView>,
+}
+
 struct OffscreenTarget {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -1419,7 +1480,7 @@ struct TexturedVertex {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct TransitionUniforms {
-    data: [[f32; 4]; 8],
+    data: [[f32; 4]; 12],
 }
 
 /// One of the three faces a transition is composed from.
@@ -1505,10 +1566,34 @@ fn transition_face_label(face: TransitionFace) -> &'static str {
     }
 }
 
+/// Whether the kernel needs the under face as its own texture.
+///
+/// The reference's handlers composite into the destination layer's *own*
+/// bitmap, so a region they overwrite with a colour (`TVPFillARGB`) shows that
+/// colour over the scene beneath the layer once the layer manager composites it
+/// (`LayerIntf.cpp:6513-6540`).  The incoming face cannot stand in for that
+/// scene: it already has the source layer drawn over it.  `wave` is the kernel
+/// with such a region (`extrans/wave.cpp:203-221`); its strip must composite
+/// `bgcolor` over the under face, which is what the renderer binds at
+/// `transition.wgsl`'s binding 7.
+fn wave_under_face_needed(method: TransitionMethod) -> bool {
+    matches!(method, TransitionMethod::Wave)
+}
+
+/// Everything `transition.wgsl` reads for one composite.
+///
+/// The first eight slots are the option/parameter block; `data[8..11]` carry the
+/// geometry and clock the extrans kernels need on top of it (the destination
+/// layer's rectangle, the logical-to-physical transform, and the transition's
+/// duration in milliseconds) -- see the accessors at the top of
+/// `transition.wgsl`.
 fn transition_uniforms(
     transition: &FrameTransition,
     viewport_width: f32,
     viewport_height: f32,
+    transform: RenderTransform,
+    content_size: Size,
+    under_available: bool,
 ) -> TransitionUniforms {
     let params = &transition.params;
     let primary_bg_color = if matches!(
@@ -1519,6 +1604,15 @@ fn transition_uniforms(
     } else {
         params.bg_color1
     };
+    // `tTVPDivisibleData::Dest` (`LayerIntf.cpp:6513-6540`) in logical frame
+    // pixels.  A destination without measurable geometry makes the composite
+    // cover the whole frame, and the reference's handlers then work on the
+    // whole layer bitmap, which is the frame's content size here.
+    let image_rect = transition
+        .dest_rect
+        .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
+        .map(|rect| [rect.x, rect.y, rect.width, rect.height])
+        .unwrap_or([0.0, 0.0, content_size.width.max(1.0), content_size.height.max(1.0)]);
     TransitionUniforms {
         data: [
             [
@@ -1563,12 +1657,43 @@ fn transition_uniforms(
                 params.max_drift.max(0.0),
                 0.0,
             ],
+            image_rect,
+            [
+                transform.x_scale,
+                transform.x_offset,
+                transform.y_offset,
+                if under_available { 1.0 } else { 0.0 },
+            ],
+            [params.duration_millis.max(0.0), 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
         ],
     }
 }
 
 fn color_uniform(color: Color) -> [f32; 4] {
     [color.r, color.g, color.b, color.a]
+}
+
+impl TransitionUniforms {
+    /// The `wave` kernel's view of this uniform block, for the CPU mirror
+    /// (`wave.rs`) and its tests: the same slots the shader's accessors read.
+    #[cfg(test)]
+    fn wave_frame(&self) -> wave::WaveFrame {
+        wave::WaveFrame {
+            progress: self.data[0][0],
+            duration_millis: self.data[10][0],
+            viewport: [self.data[1][0], self.data[1][1]],
+            scale: self.data[9][0],
+            origin: [self.data[9][1], self.data[9][2]],
+            image_rect: self.data[8],
+            wave_type: self.data[2][1],
+            max_h: self.data[2][2],
+            max_omega: self.data[2][3],
+            bg_color1: self.data[3],
+            bg_color2: self.data[4],
+            under_available: self.data[9][3] >= 0.5,
+        }
+    }
 }
 
 impl TexturedVertex {
@@ -1695,6 +1820,509 @@ mod tests {
             source_draw_commands: source,
             source_image_uploads: Vec::new(),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The `wave` kernel: the GPU path against the CPU mirror, and the CPU
+    // mirror against the reference C++ (`wave.rs` holds the latter tests).
+    // ---------------------------------------------------------------------
+
+    const WAVE_WIDTH: u32 = 64;
+    const WAVE_HEIGHT: u32 = 16;
+
+    /// The same bitmaps the CPU fidelity test uses (`wave.rs`), so both sides
+    /// read identical inputs.
+    fn wave_dest_pixel(x: i32, y: i32) -> [u8; 4] {
+        [(x * 27) as u8, (y * 41) as u8, (128 + x * 7) as u8, 255]
+    }
+
+    fn wave_source_pixel(x: i32, y: i32) -> [u8; 4] {
+        [
+            (255 - x * 23) as u8,
+            (255 - y * 31) as u8,
+            (x * 11 + y * 3) as u8,
+            255,
+        ]
+    }
+
+    fn wave_uploads(bitmap: fn(i32, i32) -> [u8; 4]) -> Vec<u8> {
+        let mut data = Vec::with_capacity((WAVE_WIDTH * WAVE_HEIGHT * 4) as usize);
+        for y in 0..WAVE_HEIGHT as i32 {
+            for x in 0..WAVE_WIDTH as i32 {
+                data.extend_from_slice(&bitmap(x, y));
+            }
+        }
+        data
+    }
+
+    /// Drives the device-request futures in this module's test to completion.
+    ///
+    /// The renderer is async, a test cannot be, and the two requests resolve on
+    /// wgpu's own threads: poll them until they are ready instead of pulling in
+    /// an executor dependency for it.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(Waker::noop());
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+    }
+
+    /// A headless device for the shader-level test.  `None` where the host has
+    /// no adapter, so the test reports that instead of failing.
+    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Kirakira transition kernel test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .ok()
+    }
+
+    fn wave_transition(progress: f32) -> FrameTransition {
+        FrameTransition {
+            method: "wave".to_string(),
+            progress,
+            params: TransitionParams {
+                method: TransitionMethod::Wave,
+                wave_type: 0.0,
+                max_h: 50.0,
+                max_omega: 0.2,
+                // `wave`'s own default: transparent black (`wave.cpp:327-331`).
+                bg_color1: Color::new(0.0, 0.0, 0.0, 0.0),
+                bg_color2: Color::new(0.0, 0.0, 0.0, 0.0),
+                duration_millis: 1000.0,
+                ..TransitionParams::default()
+            },
+            dest_rect: Some(Rect::new(
+                0.0,
+                0.0,
+                WAVE_WIDTH as f32,
+                WAVE_HEIGHT as f32,
+            )),
+            rule_texture_id: None,
+            rule_image_upload: None,
+            frozen_draw_commands: Vec::new(),
+            frozen_image_uploads: Vec::new(),
+            under_draw_commands: Vec::new(),
+            under_image_uploads: Vec::new(),
+            source_draw_commands: Vec::new(),
+            source_image_uploads: Vec::new(),
+        }
+    }
+
+    /// The GPU path is the one that ships: this renders the composite pass with
+    /// `transition.wgsl`'s `transition_wave` on a real device and compares every
+    /// output pixel against the CPU mirror, which the tests in `wave.rs` pin
+    /// against the reference C++ in turn.  Hosts without an adapter report the
+    /// skip instead of failing.
+    #[test]
+    fn wave_shader_matches_the_cpu_kernel_on_the_gpu() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no wgpu adapter: the wave kernel's GPU path was not verified on this host");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let pipeline = TransitionPipelineResources::new(&device, format);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Kirakira transition kernel test sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let upload = |bitmap: fn(i32, i32) -> [u8; 4], label: &str| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: WAVE_WIDTH,
+                    height: WAVE_HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &wave_uploads(bitmap),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(WAVE_WIDTH * 4),
+                    rows_per_image: Some(WAVE_HEIGHT),
+                },
+                wgpu::Extent3d {
+                    width: WAVE_WIDTH,
+                    height: WAVE_HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+            );
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let old_view = upload(wave_dest_pixel, "Kirakira test wave old face");
+        let new_view = upload(wave_source_pixel, "Kirakira test wave new face");
+        let under_data: [u8; 4] = [51, 102, 153, 255];
+        let under_view = {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Kirakira test wave under face"),
+                size: wgpu::Extent3d {
+                    width: WAVE_WIDTH,
+                    height: WAVE_HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &under_data.repeat((WAVE_WIDTH * WAVE_HEIGHT) as usize),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(WAVE_WIDTH * 4),
+                    rows_per_image: Some(WAVE_HEIGHT),
+                },
+                wgpu::Extent3d {
+                    width: WAVE_WIDTH,
+                    height: WAVE_HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+            );
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+
+        let expected_under = [
+            under_data[0] as f32 / 255.0,
+            under_data[1] as f32 / 255.0,
+            under_data[2] as f32 / 255.0,
+            under_data[3] as f32 / 255.0,
+        ];
+        let transform = RenderTransform {
+            x_scale: 1.0,
+            y_scale: 1.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+        };
+        let bitmaps = [wave_dest_pixel, wave_source_pixel];
+        let sample = |bitmap: fn(i32, i32) -> [u8; 4], uv: [f32; 2]| -> [f32; 4] {
+            let x = (uv[0] * WAVE_WIDTH as f32 - 0.5).round() as i32;
+            let y = (uv[1] * WAVE_HEIGHT as f32 - 0.5).round() as i32;
+            if x < 0 || y < 0 || x >= WAVE_WIDTH as i32 || y >= WAVE_HEIGHT as i32 {
+                return [0.0, 0.0, 0.0, 0.0];
+            }
+            let pixel = bitmap(x, y);
+            [
+                pixel[0] as f32 / 255.0,
+                pixel[1] as f32 / 255.0,
+                pixel[2] as f32 / 255.0,
+                pixel[3] as f32 / 255.0,
+            ]
+        };
+
+        let mut max_deviation = 0.0f32;
+        // `(progress, duration_millis)`: the progress sweep on a 1 s clock, plus
+        // the clamped-duration cases -- `1 ms` must run as the reference's 2 ms
+        // (`wave.cpp:336`) in the shader too, and `0` is the untimed fallback.
+        let cases = [(0.5f32, 1.0f32), (0.5, 2.0), (0.5, 0.0)]
+            .into_iter()
+            .chain((0..=10).map(|step| (step as f32 / 10.0, 1000.0)));
+        for (progress, duration_millis) in cases {
+            let mut transition = wave_transition(progress);
+            transition.params.duration_millis = duration_millis;
+            let uniforms = transition_uniforms(
+                &transition,
+                WAVE_WIDTH as f32,
+                WAVE_HEIGHT as f32,
+                transform,
+                Size::new(WAVE_WIDTH as f32, WAVE_HEIGHT as f32),
+                true,
+            );
+            let frame = uniforms.wave_frame();
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Kirakira test wave uniforms"),
+                contents: bytemuck::cast_slice(&[uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Kirakira test wave bind group"),
+                layout: &pipeline.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&old_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&new_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&old_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&under_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Kirakira test wave target"),
+                size: wgpu::Extent3d {
+                    width: WAVE_WIDTH,
+                    height: WAVE_HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Kirakira test wave readback"),
+                size: u64::from(WAVE_WIDTH * 4 * WAVE_HEIGHT),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Kirakira test wave encoder"),
+                });
+                let tint = [1.0, 1.0, 1.0, 1.0];
+                let vertices = [
+                    TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint, 0.0),
+                    TexturedVertex::new([1.0, 1.0], [1.0, 0.0], tint, 0.0),
+                    TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint, 0.0),
+                    TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint, 0.0),
+                    TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint, 0.0),
+                    TexturedVertex::new([-1.0, -1.0], [0.0, 1.0], tint, 0.0),
+                ];
+                let vertex_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Kirakira test wave vertices"),
+                        contents: bytemuck::cast_slice(&vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Kirakira test wave pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+                drop(pass);
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &target,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(WAVE_WIDTH * 4),
+                            rows_per_image: Some(WAVE_HEIGHT),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: WAVE_WIDTH,
+                        height: WAVE_HEIGHT,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([encoder.finish()]);
+            }
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            rx.recv().expect("map").expect("mapped");
+            let mapped = slice.get_mapped_range().to_vec();
+            readback.unmap();
+
+            for y in 0..WAVE_HEIGHT {
+                for x in 0..WAVE_WIDTH {
+                    let index = ((y * WAVE_WIDTH + x) * 4) as usize;
+                    let gpu = [
+                        mapped[index] as f32 / 255.0,
+                        mapped[index + 1] as f32 / 255.0,
+                        mapped[index + 2] as f32 / 255.0,
+                        mapped[index + 3] as f32 / 255.0,
+                    ];
+                    let uv = [
+                        (x as f32 + 0.5) / WAVE_WIDTH as f32,
+                        (y as f32 + 0.5) / WAVE_HEIGHT as f32,
+                    ];
+                    let cpu = wave::wave_pixel(
+                        &frame,
+                        uv,
+                        &|uv| sample(bitmaps[0], uv),
+                        &|uv| sample(bitmaps[1], uv),
+                        &|_| expected_under,
+                    );
+                    for channel in 0..4 {
+                        let deviation = (gpu[channel] - cpu[channel]).abs();
+                        max_deviation = max_deviation.max(deviation);
+                        // The device quantizes to Rgba8Unorm, so one 8-bit step is
+                        // the ceiling; the measured maximum is half of that.
+                        assert!(
+                            deviation <= 1.0 / 255.0,
+                            "progress {}: pixel ({x}, {y}) channel {channel}: gpu {} vs cpu {}",
+                            transition.progress,
+                            gpu[channel],
+                            cpu[channel]
+                        );
+                    }
+                }
+            }
+        }
+        println!("wave shader vs CPU mirror: max per-channel deviation {max_deviation:.5}");
+    }
+
+    /// The shader text and the CPU mirror must carry the same constants and the
+    /// same branch conditions; the GPU test proves the formula, this catches the
+    /// two texts drifting apart in the parts a text check can see.
+    #[test]
+    fn wave_shader_carries_the_cpu_kernel_constants() {
+        let source = include_str!("transition.wgsl");
+        let body = |name: &str| -> &str {
+            let (_, tail) = source
+                .split_once(name)
+                .unwrap_or_else(|| panic!("transition.wgsl has {name}"));
+            &tail[..tail.find("\n}").expect("the function has an end")]
+        };
+        let kernel = body("fn transition_wave(");
+        let ratio = body("fn wave_blend_ratio(");
+        for marker in [
+            "3.14159265359",
+            "floor(local.y)",
+            "trunc(sin(rad) * cur_h)",
+            "let src_x = local.x - d;",
+            "floor(image.w * 0.5)",
+            "bg.rgb * bg.a + under.rgb * (1.0 - bg.a)",
+            "under_available()",
+            "duration_millis()",
+            "image_rect()",
+        ] {
+            assert!(
+                kernel.contains(marker),
+                "the shader's wave kernel lost `{marker}`; wave.rs carries it"
+            );
+        }
+        for marker in ["255.0", "256.0"] {
+            assert!(
+                ratio.contains(marker),
+                "the shader's wave blend ratio lost `{marker}`"
+            );
+        }
+        // The shader's π literal, parsed back from its own text, is the mirror's
+        // constant bit for bit.
+        let pi = "3.14159265359";
+        assert!(
+            kernel.contains(pi),
+            "the shader's wave kernel lost its π literal"
+        );
+        assert_eq!(
+            wave::WAVE_PI.to_bits(),
+            pi.parse::<f32>().expect("a float literal").to_bits()
+        );
+        assert_eq!(wave::WAVE_RATIO_STEPS, 255.0);
+        assert_eq!(wave::WAVE_RATIO_DIVISOR, 256.0);
+    }
+
+    /// Only the kernels that fill a vacated region with the background colour
+    /// need the under face; today that is `wave` (`extrans/wave.cpp:203-221`).
+    #[test]
+    fn only_wave_asks_for_the_under_face() {
+        for method in [
+            TransitionMethod::Crossfade,
+            TransitionMethod::Universal,
+            TransitionMethod::Scroll,
+            TransitionMethod::Mosaic,
+            TransitionMethod::Turn,
+            TransitionMethod::RotateZoom,
+            TransitionMethod::RotateVanish,
+            TransitionMethod::RotateSwap,
+            TransitionMethod::Ripple,
+        ] {
+            assert!(!wave_under_face_needed(method), "{method:?}");
+        }
+        assert!(wave_under_face_needed(TransitionMethod::Wave));
     }
 
     fn image(texture_id: TextureId) -> DrawCommand {
