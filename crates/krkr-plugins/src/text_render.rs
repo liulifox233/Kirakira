@@ -185,7 +185,8 @@ enum MemberKind {
         handler: NativeMethod,
         /// Arguments the reference command needs to do anything; ncbind pads
         /// arguments a caller leaves out, so this is a lower bound, not an
-        /// exact count (`PARQUET` calls the 5-argument `render` with 3).
+        /// exact count (the reference `render` command declares five, and both
+        /// in-repo games pass five).
         required_args: usize,
     },
     /// `ncbNativeClassProperty<PropertyCommand<...>>` — an accessor pair.
@@ -1455,9 +1456,9 @@ fn calc_line_offset(
 
 /// `calcShowCount(elapsed)` (`FUN_10011080`) — how many characters are visible
 /// after `elapsed` milliseconds: the DLL walks its records backwards and
-/// answers `index + 1` for the first record whose display time (`record time x
-/// timeScale`) has come, and 0 before the first character. The game drives its
-/// typewriter with this (`sysscn/rendermsgwin.tjs` `onUpdate`:
+/// answers `index + 1` for the first record whose display time
+/// (`record delay x timeScale`) has come, and 0 before the first character. The
+/// game drives its typewriter with this (`sysscn/rendermsgwin.tjs` `onUpdate`:
 /// `calcShowCount(System.getTickCount() - startTime)`, `calcShowCount(0)` at
 /// start).
 fn calc_show_count(
@@ -1475,8 +1476,11 @@ fn calc_show_count(
         let Some(record) = record.object_handle() else {
             continue;
         };
-        let time = runtime.object_member(record, "time").to_real().unwrap_or(0.0);
-        if time * time_scale <= elapsed {
+        let display_time = runtime
+            .object_member(record, "delay")
+            .to_real()
+            .unwrap_or(0.0);
+        if display_time * time_scale <= elapsed {
             shown += 1;
         } else {
             break;
@@ -1566,13 +1570,16 @@ fn get_link_of_position(
 /// effect selection and delegates glyph painting to `Layer.drawText`; the
 /// native side owns line layout and character geometry.
 ///
-/// Three call shapes are accepted, matching the observed `textrender.dll` usage:
-/// - `render(textString, ...)`
-/// - `render(msgObject, size, ...)` where the object carries a `text` member
-///   (GINKA's scenario message model; it may contain `[ruby,count]` inline
-///   annotations, where the ruby covers the following `count + 1` characters)
-/// - `render(elm, diff, 0)` — PARQUET's KAGEX path, whose argument 1 is the
-///   font size to lay the line out with.
+/// The text is the first argument: a string, or an object carrying a `text`
+/// member (the KAGEX message element; it may contain `[ruby,count]` inline
+/// annotations, where the ruby covers the following `count + 1` characters).
+/// The reference command takes four more arguments and both in-repo games pass
+/// five (`system/TextRender.tjs` → `TextRenderBase.render(a3, a4, a7, a8, 0)`,
+/// `system/LangRender.tjs` → `_TextRenderBase.render(text, indent, …)`); their
+/// meaning was not recovered from the DLL, so they are accepted and unused —
+/// in particular argument 1 is *not* a font size (PARQUET puts the auto-indent
+/// there, 1 by default, which would lay every glyph out one pixel wide). The
+/// size comes from the instance font, else `defaultFontSize`.
 ///
 /// The DLL's command returns bool; so does this one, with `renderCount`/the
 /// character array carrying the numbers.
@@ -1610,7 +1617,7 @@ fn render(
     // so reading it as a font size would lay every glyph out one pixel wide.
     // The size comes from the instance font, else the active/default font size.
     let font_size = font
-        .and_then(|font| resolve_font_int(runtime, font, &["height", "size"]))
+        .and_then(|font| resolve_font_size(runtime, font))
         .unwrap_or_else(|| effective_real(runtime, this, "defaultFontSize") as i64)
         .max(1);
     let font_scale = value_real(runtime, this, "fontScale");
@@ -1707,19 +1714,22 @@ fn render(
         runtime.set_object_member(record, "shadowDiff", Variant::Integer(shadow_diff));
         runtime.set_object_member(record, "edge", Variant::Integer(i64::from(edge)));
         runtime.set_object_member(record, "edgeColor", Variant::Integer(edge_color));
-        // Character timing: `delay` is this glyph's own wait and `time` the wait
-        // accumulated through it, so nothing is visible at elapsed 0 — the shape
-        // `calcShowCount` reads. `width_time_scale` charges the wait by advance
-        // width instead of one tick per glyph; `renderDelay` reports the total
-        // wait times `timeScale` (the DLL's `[+0x220] x timeScale`).
+        // Character timing: `delay` is this glyph's *display time* — the wait
+        // accumulated through it — which is the field the DLL's layout writes
+        // (`record[+0x64] = accumulator + char_delay`, 0x10013ac3), registers
+        // as the character property `delay` (FUN_100035d0 at 0x100039a0) and
+        // compares with the elapsed time in `FUN_10011080`; the game paces on it
+        // (`rendermsgwin.tjs`: `updateTimerInterval(l1.delay - elapsed)`).
+        // Nothing is visible at elapsed 0. `width_time_scale` charges the wait
+        // by advance width instead of one tick per glyph; `renderDelay` reports
+        // the total wait times `timeScale` (the DLL's `[+0x220] x timeScale`).
         let char_delay = if width_time_scale {
             char_width as f64
         } else {
             1.0
         };
         delay += char_delay;
-        runtime.set_object_member(record, "delay", Variant::Real(char_delay));
-        runtime.set_object_member(record, "time", Variant::Real(delay));
+        runtime.set_object_member(record, "delay", Variant::Real(delay));
         runtime.set_object_member(record, "link", Variant::Integer(0));
         runtime.set_object_member(record, "linkName", Variant::String(String::new()));
         runtime.set_object_member(record, "left", Variant::Integer(x));
@@ -2019,21 +2029,46 @@ fn measure_character_width(
 ///
 /// A member the font object does not have reads back as `Void`, and
 /// `Variant::to_integer` maps `Void` to 0 — so a missing `color` would paint
-/// every glyph black instead of falling back to `defaultChColor`, and a missing
-/// `height` would size the glyphs at 0. Skip absent values the way the engine's
-/// `resolve_font_member` does before converting.
+/// every glyph black instead of falling back to `defaultChColor`. Skip absent
+/// values the way the engine's `resolve_font_member` does before converting.
 fn resolve_font_int(
     runtime: &mut Runtime<KrkrHost>,
     font: ObjectHandle,
     names: &[&str],
 ) -> Option<i64> {
-    for name in names {
-        if let Ok(value) = runtime.resolve_object_member(font, name)
-            && !matches!(value, Variant::Void | Variant::Null)
-            && let Ok(value) = value.to_integer()
-        {
-            return Some(value);
+    names
+        .iter()
+        .find_map(|name| resolve_font_member_int(runtime, font, name))
+}
+
+/// One font attribute, `None` when the member is absent rather than zero.
+fn resolve_font_member_int(
+    runtime: &mut Runtime<KrkrHost>,
+    font: ObjectHandle,
+    name: &str,
+) -> Option<i64> {
+    let value = runtime.resolve_object_member(font, name).ok()?;
+    if matches!(value, Variant::Void | Variant::Null) {
+        return None;
+    }
+    value.to_integer().ok()
+}
+
+/// The glyph size a font object asks for: `height` first, then `size` for plain
+/// script font-info objects. A height of 0 means "unset" — a `new Font()` starts
+/// at 0 — and a negative one is a pixel size, exactly the mapping the engine's
+/// own font resolution applies (`font_spec_from_object`); a font that never had
+/// its height set therefore falls back to `defaultFontSize` like one that lacks
+/// the member, instead of laying the glyphs out one pixel wide.
+fn resolve_font_size(runtime: &mut Runtime<KrkrHost>, font: ObjectHandle) -> Option<i64> {
+    for name in ["height", "size"] {
+        let Some(value) = resolve_font_member_int(runtime, font, name) else {
+            continue;
+        };
+        if value == 0 {
+            continue;
         }
+        return Some(value.unsigned_abs().max(1) as i64);
     }
     None
 }
@@ -2517,8 +2552,11 @@ mod tests {
     }
 
     /// `calcShowCount(elapsed)` (`FUN_10011080`) is the typewriter clock: the
-    /// number of characters whose display time — the per-character wait times
-    /// `timeScale` — has come at `elapsed` milliseconds.
+    /// number of characters whose display time — the record's `delay`, the wait
+    /// accumulated through the glyph — times `timeScale` has come at `elapsed`
+    /// milliseconds. `delay` is the character's absolute display time, as the
+    /// DLL's layout writes it (`record[+0x64]`, the field the character-object
+    /// builder registers as `delay`).
     #[test]
     fn calc_show_count_reveals_characters_over_elapsed_time() {
         let value = run(
@@ -2533,16 +2571,21 @@ mod tests {
             var one = render.calcShowCount(1);
             var two = render.calcShowCount(2);
             var all = render.calcShowCount(100);
-            var waits = render.getCharacters()[1].time;
+            var chars = render.getCharacters(0, 0);
+            var display_times = chars[0].delay + "/" + chars[1].delay + "/" + chars[3].delay;
+            // The DLL's character objects have no `time` (that name belongs to
+            // the keyWait entries), and a Dictionary miss reads as void.
+            var stray_time_key = chars[0].time === void ? 1 : 0;
             render.timeScale = 2;
             var scaled = render.calcShowCount(2);
-            return start + "/" + one + "/" + two + "/" + all + "/" + waits + "/" + scaled + "/"
-                + render.renderDelay;
+            return start + "/" + one + "/" + two + "/" + all + "/" + display_times + "/"
+                + stray_time_key + "/" + scaled + "/" + render.renderDelay;
             "#,
         );
-        // Each glyph waits one unit, so at 2 the third is still pending; with
+        // Each glyph waits one unit, so at 2 the third is still pending and the
+        // records carry display times 1/2/4 with no extra `time` key; with
         // `timeScale` 2 only one character has arrived at 2.
-        assert_eq!(value, "0/1/2/4/2/1/8");
+        assert_eq!(value, "0/1/2/4/1/2/4/1/1/8");
     }
 
     /// `render`'s remaining arguments are not a font size: PARQUET passes the
@@ -2568,13 +2611,18 @@ mod tests {
     /// A font object that lacks a member must fall back, not read 0: a missing
     /// `color` used to paint every glyph black (the game hands `layer.font`, a
     /// self-bound native Font with no `color`) because `Void.to_integer()` is 0,
-    /// and a missing `height`/`size` would size the glyphs at 0.
+    /// and a missing `height`/`size` would size the glyphs at 0. A *present*
+    /// height of 0 counts as unset too — a `new Font()` starts at 0, and the
+    /// engine's own font path maps that to the default height.
     #[test]
     fn missing_font_members_fall_back_instead_of_reading_zero() {
         let value = run(
             r#"
             class SizedFont {
                 function SizedFont() { this.height = 20; }
+            }
+            class ZeroFont {
+                function ZeroFont() { this.height = 0; }
             }
             class BareFont {
             }
@@ -2583,17 +2631,28 @@ mod tests {
             render.setRenderSize(400, 0);
             render.render("a");
             var sized = render.getCharacters(0, 0)[0];
-            render.setFont(new BareFont());
+            render.setFont(new ZeroFont());
             render.render("b");
+            var zero = render.getCharacters(0, 0)[0];
+            render.setFont(new BareFont());
+            render.render("c");
             var bare = render.getCharacters(0, 0)[0];
-            return sized.size + "/" + sized.color + "/" + bare.size + "/" + bare.color + "/"
-                + render.defaultChColor;
+            render.setFont(new Font());
+            render.render("d");
+            var native = render.getCharacters(0, 0)[0];
+            // A negative height is a pixel size in the engine's own font
+            // resolution, so `-20` must lay out at 20, not fall back.
+            render.font.height = -20;
+            render.render("e");
+            var negative = render.getCharacters(0, 0)[0];
+            return sized.size + "/" + sized.color + "/" + zero.size + "/" + bare.size + "/"
+                + native.size + "/" + negative.size + "/" + bare.color + "/" + render.defaultChColor;
             "#,
         );
         // The colour falls back to `defaultChColor` (0xffffffff) instead of 0,
-        // and the size to `defaultFontSize` (24) when only one of the two font
-        // objects carries one.
-        assert_eq!(value, "20/4294967295/24/4294967295/4294967295");
+        // and the size to `defaultFontSize` (24) whenever the font carries no
+        // usable height — absent, 0, or a fresh `new Font()`.
+        assert_eq!(value, "20/4294967295/24/24/24/20/4294967295/4294967295");
     }
 
     /// A ruby annotation count read out of message text is clamped instead of
