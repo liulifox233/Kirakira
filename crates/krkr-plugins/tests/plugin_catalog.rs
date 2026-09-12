@@ -106,16 +106,33 @@ fn a_profile_built_from_aliases_installs_the_canonical_plugins() {
 
 #[test]
 fn a_case_variant_link_reaches_the_registered_plugin() {
+    // A link that reached the registered plugin re-installs it, and the only
+    // module-side evidence a link can leave is the "not implemented" report a
+    // placeholder emits — so the subject has to be an entry that is still
+    // missing. Take whichever one that is instead of pinning a name a later
+    // mission implements: k2compat held this spot until M44 implemented it, and
+    // windowEx, csvParser, scriptsEx, saveStruct, fstat, wuvorbis and wuopus
+    // are being implemented in parallel missions right now.
+    let Some(entry) = missing_plugins().next() else {
+        // Every catalog entry is implemented, so no module reports itself and
+        // this check has no evidence left to read. Name resolution is still
+        // covered by the catalog tests above and `crates/krkr-plugins/src`.
+        return;
+    };
+
     let mut engine = test_engine();
-    register_profile_plugins(&mut engine, &GameProfile::only(["k2compat.dll"])).expect("register");
-    let before = placeholder_reports(&engine, "k2compat.dll");
+    register_profile_plugins(&mut engine, &GameProfile::only([entry.name])).expect("register");
+    let before = placeholder_reports(&engine, entry.name);
 
     engine
-        .execute_expression("link.tjs", r#"Plugins.link("K2COMPAT.DLL")"#)
+        .execute_expression(
+            "link.tjs",
+            &format!(r#"Plugins.link("{}")"#, entry.name.to_ascii_uppercase()),
+        )
         .expect("link");
 
     assert_eq!(
-        placeholder_reports(&engine, "k2compat.dll"),
+        placeholder_reports(&engine, entry.name),
         before + 1,
         "Plugins.link did not reach the registered plugin"
     );
