@@ -678,13 +678,6 @@ impl KrkrEngine {
         self.execute_storage("startup.tjs")
     }
 
-    /// Starts a project using the same contract on every host.
-    ///
-    /// A KRKR project owns its opening flow: `startup.tjs` may construct a
-    /// KAG window/parser and dispatch first-run/logo/title scripts.  The
-    /// engine only provides the conventional `startup.ks` fallback when no
-    /// parser was created.  Hosts must call this method instead of guessing
-    /// scenario names such as `first.ks` or `title.ks`.
     /// Runs a loose `patch.tjs` sitting beside the game data before the
     /// startup script.  kirikiri2/z have no such hook, but kirikiroid2 boots
     /// one and repacks rely on it to hook `Scripts.execStorage` and register
@@ -702,8 +695,55 @@ impl KrkrEngine {
                 .host_mut()
                 .log(&format!("patch.tjs failed: {}", error.message));
         }
+        self.restore_plugin_class_surface();
     }
 
+    /// Republishes every registered plugin class after the boot patch.
+    ///
+    /// A K2-era `patch.tjs` boots *in place of* the KRKRZ plugin layer it
+    /// predates: kirikiri2/z never execute the file, and a repack's patch
+    /// declares `class WIN32Dialog { … }` because that engine's internal
+    /// plugin stub left the name free.  Kirakira boots both layers, so the
+    /// patch's class replaces the native one and `K2Compat`'s guard
+    /// (`if (!(typeof global.WIN32Dialog == "Object")) { delete
+    /// global.WIN32Dialog, loadPlugin("win32dialog.dll"); }`) then skips the
+    /// link, leaving the game's `WIN32DialogEX` instance initializer without
+    /// the plugin's `Header`/`Items` nested classes.
+    ///
+    /// Kirikiroid2 solves the same collision by registering its internal
+    /// plugin class before the game runs; here the plugin surface simply
+    /// takes the name back once the boot patch has had its say, so the patch
+    /// keeps working (its own archives, storages and stubs) while the KRKRZ
+    /// chain finds the plugin class it expects.  Re-registering is what the
+    /// reference's `Plugins.link` installs, class replacement included, so no
+    /// merge semantics are invented.
+    fn restore_plugin_class_surface(&mut self) {
+        if self.plugins.is_empty() {
+            return;
+        }
+        self.tjs_runtime
+            .host_mut()
+            .log("project startup: restoring plugin class surface after patch.tjs");
+        let plugins = std::mem::take(&mut self.plugins);
+        for plugin in &plugins {
+            if let Err(error) = plugin.register(&mut self.tjs_runtime) {
+                self.tjs_runtime.host_mut().log(&format!(
+                    "plugin `{}` re-registration after patch.tjs failed: {}",
+                    plugin.name(),
+                    error.message
+                ));
+            }
+        }
+        self.plugins = plugins;
+    }
+
+    /// Starts a project using the same contract on every host.
+    ///
+    /// A KRKR project owns its opening flow: `startup.tjs` may construct a
+    /// KAG window/parser and dispatch first-run/logo/title scripts.  The
+    /// engine only provides the conventional `startup.ks` fallback when no
+    /// parser was created.  Hosts must call this method instead of guessing
+    /// scenario names such as `first.ks` or `title.ks`.
     pub fn start_project(&mut self) -> Result<()> {
         self.execute_boot_patch();
         let has_startup_tjs = self.tjs_runtime.host().storage_exists("startup.tjs");
@@ -18920,6 +18960,66 @@ mod tests {
             value,
             Variant::String("eval:global.changed = 1".to_string())
         );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A Kirikiroid2 boot patch must not leave its own class stub in place of
+    /// a registered plugin's class on a KRKRZ-shaped boot.
+    ///
+    /// GINKA's loose `patch.tjs` declares `class WIN32Dialog { … }` before
+    /// `startup.tjs` runs; K2Compat's guard then sees an object in
+    /// `global.WIN32Dialog` and skips `loadPlugin("win32dialog.dll")`, so the
+    /// game's `WIN32DialogEX` instance initializer never finds the plugin's
+    /// `Header`/`Items` nested classes.  The boot patch keeps its own
+    /// behaviour, and the plugin surface is re-published afterwards, the way
+    /// Kirikiroid2's internal plugin stub survives a repack that ships the
+    /// same stub.
+    #[test]
+    fn boot_patch_does_not_shadow_a_registered_plugin_class() {
+        struct ClassPlugin;
+
+        impl KrkrPlugin for ClassPlugin {
+            fn name(&self) -> &str {
+                "classplugin.dll"
+            }
+
+            fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+                let class = runtime.alloc_ordinary_object();
+                runtime.add_object_class_info(class, "Stub".to_string());
+                runtime.set_object_member(class, "Header", Variant::Integer(1));
+                runtime.set_global_member("Stub", Variant::Object(class));
+                Ok(())
+            }
+        }
+
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("patch.tjs"),
+            "class Stub { function messageBox(a, b, c) { return 0; } }",
+        )
+        .expect("write patch");
+        fs::write(root.join("startup.tjs"), "return 0;").expect("write startup");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .register_plugin(ClassPlugin)
+            .expect("register plugin");
+        engine
+            .execute_script("inline.tjs", "class Stub { function only() { return 1; } }")
+            .expect("script");
+
+        // The patch's replacement is what the K2 hook produced; the boot then
+        // restores the plugin's class the way `Plugins.link` installs it.
+        engine.start_project().expect("start project");
+
+        let stub = match engine.tjs_runtime().global_member("Stub") {
+            Variant::Object(handle) => handle,
+            other => panic!("Stub is not an object: {other:?}"),
+        };
+        let value = engine.tjs_runtime().object_member(stub, "Header");
+        assert_eq!(value, Variant::Integer(1));
 
         fs::remove_dir_all(root).expect("cleanup");
     }

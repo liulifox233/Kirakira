@@ -174,6 +174,34 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             {
                 return Ok(Variant::Closure(Closure::new(handle, Some(this_obj))));
             }
+            // A class body's unqualified names compile to this-proxy reads on
+            // the under-construction instance (`gpd %r, %-2.*N`), and the
+            // instance does not carry its class yet: the reference attaches
+            // that link only after the body has finished.  krkrz resolves
+            // such a name through the *class context's* superclass getter
+            // instead (`tTJSInterCodeContext::PropGet`, `tjsInterCodeExec.cpp:3144`),
+            // which is how a class body reads a *native* super class's
+            // members -- the `ES_LEFT`/`WS_*` constants PARQUET's and GINKA's
+            // `WIN32DialogEX` initialisers build their `DefaultStyles`
+            // dictionaries from.
+            //
+            // Only a native provider is served from the link: a name a
+            // *script* class in the chain declares is installed by that
+            // class's own body (a derived class runs it as `super.Base()`),
+            // and answering it here would skip that body's initialisers.
+            if let Some(class_handle) = self.class_body_class(handle)
+                && class_handle != handle
+                && self
+                    .class_chain_owner(class_handle, name)?
+                    .is_some_and(|owner| !self.is_bytecode_class(owner))
+            {
+                match self.prop_get_handle(class_handle, name, flags.without_probe(), Some(handle))
+                {
+                    Ok(value) => return Ok(self.bind_proxy_value(value, Some(handle))),
+                    Err(error) if error.is_member_not_found() => {}
+                    Err(error) => return Err(error),
+                }
+            }
             if let Some(class_handle) = self.super_class_handle(handle)? {
                 let receiver = self.inherited_member_this(handle, caller_this);
                 // `tTJSInterCodeContext::PropGet` (`tjsInterCodeExec.cpp:3144`)
@@ -2394,7 +2422,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if context == BytecodeContextType::Class {
             self.add_class_info(instance, name.clone());
             let class_handle = code_handles[object_index];
-            self.begin_class_initialization(instance);
+            self.begin_class_initialization(instance, class_handle);
             let frame = self.create_call_frame(
                 file_id,
                 object_index,
@@ -2446,11 +2474,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.add_class_info(instance, name.clone());
         }
         let class_handle = code_handles[object_index];
-        self.begin_class_initialization(instance);
-        // The superclass link is only attached once the class body has run
-        // (see Continuation::ClassBody): while the body is executing, member
-        // lookups on the under-construction instance must miss so that they
-        // fall back to the global object, matching krkrz regmember semantics.
+        self.begin_class_initialization(instance, class_handle);
+        // The instance's `super_class` link is still only attached once the
+        // class body has run (see Continuation::ClassBody): a name the class
+        // does not declare keeps falling through to the global object while
+        // the body executes, matching krkrz regmember semantics.  A name a
+        // *native* super class declares is reachable through
+        // `class_body_class` (see `prop_get_handle`), which the reference
+        // resolves with the class context's superclass getter.
         let frame = self.create_call_frame(
             file_id,
             object_index,
