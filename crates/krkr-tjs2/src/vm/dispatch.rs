@@ -2929,7 +2929,28 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         };
         match self.materialize_code_object(value) {
             Variant::Closure(mut closure) => {
-                closure.this_obj = Some(this_obj);
+                // A value that already carries an ObjThis keeps it: the
+                // reference copies the stored variant unchanged on a member
+                // read -- `tTJSCustomObject::PropGet` (`tjsObject.cpp:1392`)
+                // hands the stored value to `TJSDefaultPropGet` (`:1347`),
+                // which only applies `TJS_SELECT_OBJTHIS` (`:1367`) before
+                // `result->CopyRef(targ)` (`:1386`), and
+                // `tTJSObjectProxy::PropGet` (`tjsInterCodeExec.cpp:289-299`,
+                // the forward at `:295`) merely dispatches onward -- so a
+                // self-bound value such as the `new Dictionary()` result
+                // (`tjsInterCodeExec.cpp:2384`) is still self-bound when it
+                // comes back out.  GINKA's UIListParser stores its extra
+                // command table that way and `setExtraType` copies it with
+                // `(Dictionary.assign incontextof extratype)(tab, 0)` -- which
+                // the reference runs on `clo.ObjThis`, the table itself.
+                // Overwriting the binding with the reading `this` made that
+                // `assign` copy the reading instance's members instead, so
+                // every `remove`/`clear` command in a `.func` layout file
+                // silently did nothing and the first-play title menu kept the
+                // AFTER/NEXT buttons it is meant to drop.
+                if closure.this_obj.is_none() {
+                    closure.this_obj = Some(this_obj);
+                }
                 Variant::Closure(closure)
             }
             Variant::Object(handle) => {
