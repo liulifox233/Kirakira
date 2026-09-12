@@ -29,6 +29,11 @@
 //! - Directory creation and `selectDirectory` need storage-layer and shell
 //!   support the engine does not have; they return the reference's failure
 //!   value (0) and log once.
+//! - `isExistentDirectory` takes a directory name with or without the trailing
+//!   `/` the reference demands (`Main.cpp:759-762`): this engine's
+//!   `getFullPath` drops the delimiter the reference's keeps, so scripts that
+//!   probe `getFullPath` results would otherwise be rejected for asking about
+//!   a directory that is plainly there.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -758,8 +763,18 @@ fn storages_is_existent_directory(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
+    // The reference does check for the trailing `/` here as well
+    // (`Main.cpp:759-762`), but it never sees a slash-less name on this path:
+    // scripts probe the result of `Storages.getFullPath`, whose normalization
+    // keeps the delimiter it was handed (`StorageIntf.cpp:549`, `:1391-1402`;
+    // `tTVPFileMedia::NormalizePathName` only lower-cases). This engine's
+    // `getFullPath` normalizes the delimiter away, and the engine's own
+    // `Storages.isExistentDirectory` binding never asked for one, so honoring
+    // the reference's check here would only turn a plain existence probe into
+    // a boot-stopping throw. GINKA's `addAutoPathRecursive` probes the
+    // optional `setup/debug/` exactly that way. Both spellings resolve through
+    // `storage_is_directory`, so accept them and report 0/1 as before.
     let directory = required_string(&args, 0, "Storages.isExistentDirectory")?;
-    require_trailing_slash(&directory)?;
     Ok(Variant::Integer(i64::from(
         runtime.host().storage_is_directory(&directory),
     )))
@@ -1449,7 +1464,6 @@ mod tests {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine.register_plugin(FstatPlugin).expect("plugin");
         for call in [
-            "Storages.isExistentDirectory(\"savedata\")",
             "Storages.createDirectory(\"savedata\")",
             "Storages.removeDirectory(\"savedata\")",
             "Storages.changeDirectory(\"savedata\")",
@@ -1462,6 +1476,33 @@ mod tests {
                 "{call}"
             );
         }
+    }
+
+    #[test]
+    fn is_existent_directory_accepts_a_slash_less_name() {
+        let root = test_root("fstat-is-existent-directory");
+        fs::create_dir_all(root.join("folder")).expect("create directory");
+        fs::write(root.join("probe.txt"), b"probe").expect("write probe");
+
+        let mut engine = test_engine(&root);
+        engine.register_plugin(FstatPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     return Storages.isExistentDirectory(\"folder\") + \":\" +\n\
+                         Storages.isExistentDirectory(\"folder/\") + \":\" +\n\
+                         Storages.isExistentDirectory(\"probe.txt\") + \":\" +\n\
+                         Storages.isExistentDirectory(\"absent\");\n\
+                 })()",
+            )
+            .expect("probe directories");
+
+        // The reference's `getFullPath` keeps the trailing `/` that scripts
+        // build their probes from; this engine normalizes it away, so an
+        // existing directory must answer 1 either way.
+        assert_eq!(value, Variant::String("1:1:0:0".to_string()));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
