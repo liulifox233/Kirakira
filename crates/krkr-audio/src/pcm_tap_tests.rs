@@ -306,7 +306,10 @@ fn arming_mid_playback_starts_the_clock_at_the_arming_point() {
     assert!(!instance_of(&tap).ring_allocated());
 
     let snapshot = tap.read(ID, PcmTapWindow::ahead(1)).expect("snapshot");
-    assert_eq!(snapshot.cursor, 0, "the clock starts where the tap was armed");
+    assert_eq!(
+        snapshot.cursor, 0,
+        "the clock starts where the tap was armed"
+    );
     assert_eq!(snapshot.available_frames, 0);
 
     // Frames decoded from here on are readable at the new origin.
