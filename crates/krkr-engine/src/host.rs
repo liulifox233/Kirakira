@@ -1,4 +1,5 @@
 use std::{
+    any::{Any, TypeId},
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque, btree_map::Entry},
     io,
     path::PathBuf,
@@ -411,6 +412,13 @@ pub struct KrkrHost {
     kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
     layer_tree: LayerTree,
     native_layers: BTreeMap<ObjectHandle, LayerInstance>,
+    /// Typed plugin state attached to a layer (`plugin_api::layer::layer_extension*`),
+    /// keyed by the layer object.  Part B §B.3.3 of
+    /// `docs/plugins/plugin-facing-engine-facilities.md`: the reference's
+    /// `layerEx*` family keeps per-layer native instances (GDI+ surfaces,
+    /// accumulators, AVI bookkeeping) and those die with the layer, so
+    /// [`KrkrHost::invalidate_native_object`] prunes the slot.
+    layer_extensions: BTreeMap<ObjectHandle, BTreeMap<TypeId, Arc<dyn Any + Send + Sync>>>,
     native_windows: BTreeMap<ObjectHandle, WindowInstance>,
     kag_layer_slots: BTreeMap<ObjectHandle, KagLayerSlot>,
     native_text_draw_events: Vec<NativeTextDrawEvent>,
@@ -509,6 +517,7 @@ impl Default for KrkrHost {
             kag_parser_revisions: BTreeMap::new(),
             layer_tree: LayerTree::new(),
             native_layers: BTreeMap::new(),
+            layer_extensions: BTreeMap::new(),
             native_windows: BTreeMap::new(),
             kag_layer_slots: BTreeMap::new(),
             native_text_draw_events: Vec::new(),
@@ -2014,6 +2023,65 @@ impl KrkrHost {
             .map(|instance| instance.render_target.clone())
     }
 
+    /// The per-layer plugin state attached to `layer` under type `T`, if any.
+    ///
+    /// Part B §B.3.3 of `docs/plugins/plugin-facing-engine-facilities.md`:
+    /// `layerEx*` ported plugins keep their per-layer native state (GDI+
+    /// surfaces, long-exposure accumulators, AVI bookkeeping) here instead of
+    /// in a TJS member.  The slot is keyed by layer object *and* `TypeId`, so
+    /// unrelated plugins never collide, and it is pruned by
+    /// [`KrkrHost::invalidate_native_object`] when the layer is destroyed.
+    ///
+    /// The value is an `Arc`; plugin code takes it out before a pixel closure
+    /// runs and keeps its own interior mutability (`Mutex`, atomics) inside,
+    /// so the closure never needs a borrow of the host.
+    pub fn layer_extension<T: Any + Send + Sync>(&self, layer: ObjectHandle) -> Option<Arc<T>> {
+        self.layer_extensions
+            .get(&layer)?
+            .get(&TypeId::of::<T>())?
+            .clone()
+            .downcast::<T>()
+            .ok()
+    }
+
+    /// The per-layer plugin state of type `T`, creating it with `init` when
+    /// the layer has none.
+    ///
+    /// The host keeps its own handle on the value, so the state stays
+    /// reachable across calls even if the plugin drops the returned `Arc`.
+    pub fn layer_extension_or_insert_with<T: Any + Send + Sync>(
+        &mut self,
+        layer: ObjectHandle,
+        init: impl FnOnce() -> T,
+    ) -> Arc<T> {
+        let slots = self.layer_extensions.entry(layer).or_default();
+        if let Some(existing) = slots
+            .get(&TypeId::of::<T>())
+            .and_then(|value| Arc::clone(value).downcast::<T>().ok())
+        {
+            return existing;
+        }
+        let value = Arc::new(init());
+        let stored: Arc<dyn Any + Send + Sync> = value.clone();
+        slots.insert(TypeId::of::<T>(), stored);
+        value
+    }
+
+    /// Removes the per-layer plugin state of type `T`, returning it when it
+    /// was attached.  Layer invalidation prunes every slot on its own; this is
+    /// for a plugin that wants to drop its state earlier.
+    pub fn remove_layer_extension<T: Any + Send + Sync>(
+        &mut self,
+        layer: ObjectHandle,
+    ) -> Option<Arc<T>> {
+        let slots = self.layer_extensions.get_mut(&layer)?;
+        let value = slots.remove(&TypeId::of::<T>())?;
+        if slots.is_empty() {
+            self.layer_extensions.remove(&layer);
+        }
+        value.downcast::<T>().ok()
+    }
+
     pub(crate) fn replace_kag_layer_slots(&mut self, slots: BTreeMap<ObjectHandle, KagLayerSlot>) {
         if self.kag_layer_slots == slots {
             return;
@@ -2173,6 +2241,11 @@ impl KrkrHost {
     }
 
     pub(crate) fn invalidate_native_object(&mut self, handle: ObjectHandle) {
+        // Plugin state attached to the destroyed object goes with it (Part B
+        // §B.3.3 of `docs/plugins/plugin-facing-engine-facilities.md`): the
+        // reference's `layerEx*` native instance dies with the layer, so its
+        // caches must not outlive the object that owns them.
+        self.layer_extensions.remove(&handle);
         self.cleanup_invalidated_handle(handle);
         self.modal_windows.retain(|window| *window != handle);
 
