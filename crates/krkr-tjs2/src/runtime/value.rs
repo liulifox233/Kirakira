@@ -44,6 +44,34 @@ pub enum Variant {
 }
 
 impl Variant {
+    /// The reference's `tTJSVariant(dsp, dsp)`: an object-like value that
+    /// carries its own object as ObjThis.  Official TJS2 produces this shape
+    /// for `this` (`tjsInterCodeExec.cpp:839`), for the result of `new`
+    /// (`:2384`) and for the members whose getters are declared that way
+    /// (`Layer.parent`/`children`/`window`/`font`, `Window.mainWindow`, ...),
+    /// and calls and property writes pick the object to act on with
+    /// `Object.ObjThis ? Object.ObjThis : ra[-1]`.
+    pub const fn self_bound(object: ObjectHandle) -> Self {
+        Self::Closure(Closure::new(object, Some(object)))
+    }
+
+    /// The object a host-side reader acts on, ignoring any bound `this` --
+    /// the counterpart of the reference's `AsObjectNoAddRef()`, which reads
+    /// the object pointer out of a `tTJSVariant(dsp, dsp)` unchanged.
+    ///
+    /// Script values carry their `ObjThis` with them now (`this`, `new`'s
+    /// result, a member stored from either), so an engine reader that needs
+    /// the object *identity* -- the value behind a dictionary key, a layer, a
+    /// font -- has to unwrap here.  The VM's own member dispatch goes through
+    /// the binding instead (`Vm::closure_parts`).
+    pub fn object_handle(&self) -> Option<ObjectHandle> {
+        match self {
+            Self::Object(handle) => Some(*handle),
+            Self::Closure(closure) => Some(closure.object),
+            _ => None,
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::Void => "void",
@@ -221,22 +249,16 @@ impl Variant {
             (Self::Octet(lhs), Self::Octet(rhs)) => lhs == rhs,
             (Self::Object(lhs), Self::Object(rhs)) => lhs == rhs,
             (Self::Closure(lhs), Self::Closure(rhs)) => lhs == rhs,
-            // TEMPORARY, until `this` and `new` results carry their binding
-            // (`tTJSVariant(objthis, objthis)`, `tjsInterCodeExec.cpp:839`,
-            // `:2384`): an object and a closure over that same object bound to
-            // itself -- or not bound at all -- are one value here, because this
-            // engine cannot tell the reference's `(h, h)` from its `(h, NULL)`:
-            // a host hands a self-bound member out as a plain object.  Script
-            // meets both spellings in `===`, so `new X() === x.selfBoundMember`
-            // holds, and a closure bound to *another* object (or over another
-            // handle) still differs.  The reference does distinguish `(h, h)`
-            // from `(h, NULL)` (`tTJSVariant::DiscernCompare`,
-            // `tjsVariant.cpp:775-778`), so this arm answers true in that one
-            // window; retire it when the literal self-binding lands (the
-            // engine's `variant_object` helpers already unwrap closures).
+            // The reference is one `tvtObject` under two engine spellings: a
+            // plain object and an unbound closure are both `(h, NULL)`, while
+            // a closure bound to the object itself is `(h, h)` and a closure
+            // bound to another object is `(h, other)` -- and
+            // `tTJSVariant::DiscernCompare` compares both `Object.Object` and
+            // `Object.ObjThis` (`tjsVariant.cpp:775-778`), so only the
+            // NULL-ObjThis spelling collides.
             (Self::Object(handle), Self::Closure(closure))
             | (Self::Closure(closure), Self::Object(handle)) => {
-                handle == &closure.object && closure.this_obj.is_none_or(|this| this == *handle)
+                *handle == closure.object && closure.this_obj.is_none()
             }
             (Self::CodeObject(lhs), Self::CodeObject(rhs)) => lhs == rhs,
             _ => false,
@@ -684,29 +706,33 @@ pub fn real_to_string(value: f64) -> String {
 mod tests {
     use super::*;
 
-    /// `===` on the two spellings of one object: `tTJSVariant(objthis, objthis)`
-    /// and a handle-only object.  Only a binding that names the object itself
-    /// (or none at all) compares equal; a binding to a *different* object keeps
-    /// the two values distinct, which is what `tTJSVariant::DiscernCompare`
-    /// checks (`tjsVariant.cpp:778-780`).
+    /// `===` follows `tTJSVariant::DiscernCompare` (`tjsVariant.cpp:775-778`):
+    /// both `Object.Object` and `Object.ObjThis` have to match, so the
+    /// reference's `(h, h)` -- `this`, `new`'s result -- differs from its
+    /// `(h, NULL)`, which this engine spells either `Object(h)` or
+    /// `Closure(h, None)`.
     #[test]
-    fn discern_eq_reconciles_the_spellings_of_a_self_bound_object() {
+    fn discern_eq_compares_the_object_and_its_binding() {
         let handle = ObjectHandle(7);
         let other = ObjectHandle(8);
         let plain = Variant::Object(handle);
         let self_bound = Variant::Closure(Closure::new(handle, Some(handle)));
         let unbound = Variant::Closure(Closure::new(handle, None));
 
-        assert!(plain.discern_eq(&self_bound));
-        assert!(self_bound.discern_eq(&plain));
         assert!(plain.discern_eq(&unbound));
         assert!(unbound.discern_eq(&plain));
         assert!(self_bound.discern_eq(&self_bound));
+
+        // `(h, NULL)` is not `(h, h)`.
+        assert!(!plain.discern_eq(&self_bound));
+        assert!(!self_bound.discern_eq(&plain));
+        assert!(!self_bound.discern_eq(&unbound));
 
         assert!(!plain.discern_eq(&Variant::Object(other)));
         assert!(!plain.discern_eq(&Variant::Closure(Closure::new(other, None))));
         assert!(!plain.discern_eq(&Variant::Closure(Closure::new(handle, Some(other)))));
         assert!(!plain.discern_eq(&Variant::Closure(Closure::new(other, Some(other)))));
+        assert!(!self_bound.discern_eq(&Variant::Closure(Closure::new(handle, Some(other)))));
     }
 
     #[test]

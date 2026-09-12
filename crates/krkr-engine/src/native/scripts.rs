@@ -166,10 +166,10 @@ fn normalize_kag_system_variable_struct(
     if !name.ends_with("sc.ksd") {
         return;
     }
-    let Variant::Object(scflags) = value else {
+    let Some(scflags) = value.object_handle() else {
         return;
     };
-    let Variant::Object(se_flags) = runtime.object_member(*scflags, "se") else {
+    let Some(se_flags) = runtime.object_member(scflags, "se").object_handle() else {
         return;
     };
     let count = runtime
@@ -188,7 +188,7 @@ fn normalize_kag_system_variable_struct(
         elements.pop();
     }
     let normalized = runtime.alloc_array_object(elements);
-    runtime.set_object_member(*scflags, "se", Variant::Object(normalized));
+    runtime.set_object_member(scflags, "se", Variant::Object(normalized));
 }
 
 fn scripts_compile_storage(
@@ -208,10 +208,7 @@ fn scripts_exec(
 ) -> Result<Variant> {
     let source = required_arg_string(&args, 0, "Scripts.exec")?;
     let name = arg_string(&args, 1)?.unwrap_or_else(|| "inline.tjs".to_string());
-    let context = match args.get(3) {
-        Some(Variant::Object(handle)) => Some(*handle),
-        _ => None,
-    };
+    let context = args.get(3).and_then(Variant::object_handle);
     execute_script_on_runtime_with_this(runtime, &name, &source, context)
 }
 
@@ -222,10 +219,7 @@ fn scripts_eval(
 ) -> Result<Variant> {
     let source = required_arg_string(&args, 0, "Scripts.eval")?;
     let name = arg_string(&args, 1)?.unwrap_or_else(|| "inline.tjs".to_string());
-    let context = match args.get(3) {
-        Some(Variant::Object(handle)) => Some(*handle),
-        _ => None,
-    };
+    let context = args.get(3).and_then(Variant::object_handle);
     execute_expression_on_runtime_with_this(runtime, &name, &source, context)
         .or_else(|error| {
             // KAG3's `applyInlineStringVariableExtract` generates an
@@ -314,9 +308,9 @@ fn scripts_foreach(
     let Some(func) = args.get(1).cloned() else {
         return Ok(Variant::Void);
     };
-    let entries = match &collection {
-        Variant::Object(handle) => {
-            if let Some(items) = runtime.array_elements(*handle) {
+    let entries = match collection.object_handle() {
+        Some(handle) => {
+            if let Some(items) = runtime.array_elements(handle) {
                 items
                     .iter()
                     .cloned()
@@ -325,14 +319,14 @@ fn scripts_foreach(
                     .collect::<Vec<_>>()
             } else {
                 runtime
-                    .object_members(*handle)
+                    .object_members(handle)
                     .into_iter()
                     .filter(|(key, _)| !is_hidden_member_name(key))
                     .map(|(key, value)| (Variant::String(key), value))
                     .collect()
             }
         }
-        _ => Vec::new(),
+        None => Vec::new(),
     };
     for (key, value) in entries {
         let mut call_args = vec![key, value];

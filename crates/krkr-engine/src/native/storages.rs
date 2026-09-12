@@ -62,7 +62,7 @@ fn storages_set_text_encoding(
 ) -> Result<Variant> {
     if let Some(encoding) = arg_string(&args, 0)? {
         runtime.host_mut().set_text_encoding(encoding.clone());
-        if let Variant::Object(scripts) = runtime.global_member("Scripts") {
+        if let Some(scripts) = runtime.global_member("Scripts").object_handle() {
             runtime.set_object_member(scripts, "textEncoding", Variant::String(encoding));
         }
     }

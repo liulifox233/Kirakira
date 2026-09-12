@@ -344,7 +344,7 @@ fn kag_restore(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let Some(Variant::Object(snapshot_object)) = args.first().cloned() else {
+    let Some(snapshot_object) = args.first().and_then(Variant::object_handle) else {
         return Err(TjsError::runtime(
             "KAGParser.restore requires a snapshot object",
         ));
@@ -662,7 +662,7 @@ fn sync_parser_from_members(
         &runtime.object_member(handle, "debugLevel"),
     )?);
 
-    if let Variant::Object(macros) = runtime.object_member(handle, "macros") {
+    if let Some(macros) = runtime.object_member(handle, "macros").object_handle() {
         let definitions = runtime
             .object_members(macros)
             .into_iter()
@@ -1078,21 +1078,24 @@ fn macros_from_snapshot_object(
     parser: &KagParser,
     snapshot_object: ObjectHandle,
 ) -> Vec<(String, String)> {
-    match runtime.object_member(snapshot_object, "macros") {
-        Variant::Object(macros) => runtime
+    let macros = runtime.object_member(snapshot_object, "macros");
+    if let Some(macros) = macros.object_handle() {
+        return runtime
             .object_members(macros)
             .into_iter()
             .filter_map(|(name, value)| match value {
                 Variant::String(source) => Some((name, source)),
                 _ => None,
             })
-            .collect(),
-        Variant::Void => parser
+            .collect();
+    }
+    if matches!(macros, Variant::Void) {
+        return parser
             .macro_definitions()
             .map(|(name, source)| (name.to_string(), source.to_string()))
-            .collect(),
-        _ => Vec::new(),
+            .collect();
     }
+    Vec::new()
 }
 
 fn condition_state_from_object(
@@ -1152,17 +1155,14 @@ fn object_array_objects(
     object: ObjectHandle,
     name: &str,
 ) -> Vec<ObjectHandle> {
-    let Variant::Object(array) = runtime.object_member(object, name) else {
+    let Some(array) = runtime.object_member(object, name).object_handle() else {
         return Vec::new();
     };
     runtime
         .array_elements(array)
         .unwrap_or_default()
         .iter()
-        .filter_map(|value| match value {
-            Variant::Object(object) => Some(*object),
-            _ => None,
-        })
+        .filter_map(Variant::object_handle)
         .collect()
 }
 
@@ -1176,22 +1176,21 @@ fn apply_snapshot_macros_from_object(
         return;
     }
 
-    match runtime.object_member(snapshot_object, "macros") {
-        Variant::Object(macros) => {
-            let definitions = runtime.object_members(macros).into_iter().filter_map(
-                |(name, value)| match value {
-                    Variant::String(source) => Some((name, source)),
-                    _ => None,
-                },
-            );
-            snapshot.set_macro_definitions(definitions);
-        }
-        Variant::Void => snapshot.set_macro_definitions(
+    let macros = runtime.object_member(snapshot_object, "macros");
+    if let Some(macros) = macros.object_handle() {
+        let definitions = runtime.object_members(macros).into_iter().filter_map(
+            |(name, value)| match value {
+                Variant::String(source) => Some((name, source)),
+                _ => None,
+            },
+        );
+        snapshot.set_macro_definitions(definitions);
+    } else if matches!(macros, Variant::Void) {
+        snapshot.set_macro_definitions(
             parser
                 .macro_definitions()
                 .map(|(name, source)| (name.to_string(), source.to_string())),
-        ),
-        _ => {}
+        );
     }
 }
 

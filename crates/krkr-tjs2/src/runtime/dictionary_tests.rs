@@ -478,6 +478,30 @@ fn assign_struct_copies_data_members_including_method_named_keys() {
 }
 
 #[test]
+fn assign_struct_deep_clones_a_self_bound_member() {
+    // A member stored from `new` (`source.child = new Dictionary()`) carries
+    // its binding, and the deep copy has to clone the object behind it rather
+    // than copy the bound value, or the destination would alias the source.
+    assert_eq!(
+        run(
+            "dictionary.tjs",
+            r#"
+            var source = %[];
+            source.name = "outer";
+            source.child = new Dictionary();
+            source.child.name = "inner";
+            var dest = %[];
+            (Dictionary.assignStruct incontextof dest)(source);
+            dest.child.name = "changed";
+            return (dest.child !== source.child) + ":" + source.child.name + ":" +
+                dest.name;
+            "#,
+        ),
+        Variant::String("1:inner:outer".into())
+    );
+}
+
+#[test]
 fn kagex_attribute_chain_reaches_the_free_arm() {
     // The shape of the game's `syspage` handler, in official bytecode: the
     // handler copies its attribute dictionary and walks

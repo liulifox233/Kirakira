@@ -402,7 +402,13 @@ impl KrkrEngine {
     }
 
     fn sync_kag_system_state_for_persist(&mut self, window: ObjectHandle) {
-        let Variant::Object(scflags) = self.tjs_runtime.object_member(window, "scflags") else {
+        // A KAG object stored by script arrives bound to itself
+        // (`Variant::self_bound`); the engine's own readers want the object.
+        let Some(scflags) = self
+            .tjs_runtime
+            .object_member(window, "scflags")
+            .object_handle()
+        else {
             return;
         };
 
@@ -422,10 +428,14 @@ impl KrkrEngine {
     }
 
     fn sync_kag_bgm_system_state(&mut self, window: ObjectHandle, scflags: ObjectHandle) {
-        let Variant::Object(bgm) = self.tjs_runtime.object_member(window, "bgm") else {
+        let Some(bgm) = self.tjs_runtime.object_member(window, "bgm").object_handle() else {
             return;
         };
-        let Variant::Object(buffer) = self.tjs_runtime.object_member(bgm, "currentBuffer") else {
+        let Some(buffer) = self
+            .tjs_runtime
+            .object_member(bgm, "currentBuffer")
+            .object_handle()
+        else {
             return;
         };
         let Some(volume2) = self
@@ -446,7 +456,7 @@ impl KrkrEngine {
     }
 
     fn sync_kag_se_system_state(&mut self, window: ObjectHandle, scflags: ObjectHandle) {
-        let Variant::Object(se) = self.tjs_runtime.object_member(window, "se") else {
+        let Some(se) = self.tjs_runtime.object_member(window, "se").object_handle() else {
             return;
         };
         let count = self
@@ -462,7 +472,10 @@ impl KrkrEngine {
         let mut volumes = vec![None; count];
         let mut last_live_index = None;
         for (index, volume_slot) in volumes.iter_mut().enumerate() {
-            let Variant::Object(buffer) = self.tjs_runtime.object_member(se, &index.to_string())
+            let Some(buffer) = self
+                .tjs_runtime
+                .object_member(se, &index.to_string())
+                .object_handle()
             else {
                 continue;
             };
@@ -507,7 +520,11 @@ impl KrkrEngine {
     }
 
     fn sync_kag_sflags_audio_state(&mut self, window: ObjectHandle) {
-        let Variant::Object(sflags) = self.tjs_runtime.object_member(window, "sflags") else {
+        let Some(sflags) = self
+            .tjs_runtime
+            .object_member(window, "sflags")
+            .object_handle()
+        else {
             return;
         };
 
@@ -526,12 +543,14 @@ impl KrkrEngine {
     }
 
     fn kag_bgm_volume2(&self, window: ObjectHandle) -> Option<i64> {
-        let Variant::Object(bgm) = self.tjs_runtime.object_member(window, "bgm") else {
-            return None;
-        };
-        let Variant::Object(buffer) = self.tjs_runtime.object_member(bgm, "currentBuffer") else {
-            return None;
-        };
+        let bgm = self
+            .tjs_runtime
+            .object_member(window, "bgm")
+            .object_handle()?;
+        let buffer = self
+            .tjs_runtime
+            .object_member(bgm, "currentBuffer")
+            .object_handle()?;
         self.tjs_runtime
             .host()
             .native_audio_buffer(buffer)
@@ -539,12 +558,14 @@ impl KrkrEngine {
     }
 
     fn kag_se_volume2(&self, window: ObjectHandle, index: usize) -> Option<i64> {
-        let Variant::Object(se) = self.tjs_runtime.object_member(window, "se") else {
-            return None;
-        };
-        let Variant::Object(buffer) = self.tjs_runtime.object_member(se, &index.to_string()) else {
-            return None;
-        };
+        let se = self
+            .tjs_runtime
+            .object_member(window, "se")
+            .object_handle()?;
+        let buffer = self
+            .tjs_runtime
+            .object_member(se, &index.to_string())
+            .object_handle()?;
         self.tjs_runtime
             .host()
             .native_audio_buffer(buffer)
@@ -1211,7 +1232,7 @@ impl KrkrEngine {
             return Some(window);
         }
 
-        if let Variant::Object(kag) = self.tjs_runtime.global_member("kag")
+        if let Some(kag) = self.tjs_runtime.global_member("kag").object_handle()
             && has_window_state_member(&self.tjs_runtime, kag)
         {
             return Some(kag);
@@ -1379,13 +1400,13 @@ impl KrkrEngine {
     }
 
     fn sync_scheduler_event_disabled(&mut self) {
-        let disabled = match self.tjs_runtime.global_member("System") {
-            Variant::Object(system) => self
+        let disabled = match self.tjs_runtime.global_member("System").object_handle() {
+            Some(system) => self
                 .tjs_runtime
                 .resolve_object_member(system, "eventDisabled")
                 .map(|value| value.is_truthy())
                 .unwrap_or(false),
-            _ => false,
+            None => false,
         };
         self.tjs_runtime
             .host_mut()
@@ -2295,7 +2316,7 @@ impl KrkrEngine {
     }
 
     fn fire_kag_primary_click(&mut self, keyboard: bool) -> Result<()> {
-        let Variant::Object(kag) = self.tjs_runtime.global_member("kag") else {
+        let Some(kag) = self.tjs_runtime.global_member("kag").object_handle() else {
             return Ok(());
         };
         let method = if keyboard
@@ -2314,7 +2335,7 @@ impl KrkrEngine {
     }
 
     fn fire_kag_secondary_click(&mut self) -> Result<()> {
-        if let Variant::Object(kag) = self.tjs_runtime.global_member("kag")
+        if let Some(kag) = self.tjs_runtime.global_member("kag").object_handle()
             && !matches!(
                 self.tjs_runtime.object_member(kag, "onPrimaryRightClick"),
                 Variant::Void
@@ -3315,11 +3336,11 @@ impl KagSession {
         push_unique_handler(&mut candidates, self.handler);
         push_unique_handler(&mut candidates, Some(owner));
 
-        if let Variant::Object(kag) = runtime.global_member("kag") {
-            if let Variant::Object(conductor) = runtime.object_member(kag, "conductor") {
+        if let Some(kag) = runtime.global_member("kag").object_handle() {
+            if let Some(conductor) = runtime.object_member(kag, "conductor").object_handle() {
                 push_unique_handler(&mut candidates, Some(conductor));
             }
-            if let Variant::Object(conductor) = runtime.object_member(kag, "mainConductor") {
+            if let Some(conductor) = runtime.object_member(kag, "mainConductor").object_handle() {
                 push_unique_handler(&mut candidates, Some(conductor));
             }
             push_unique_handler(&mut candidates, Some(kag));
@@ -4024,7 +4045,7 @@ fn tag_millis(tag: &Tag, name: &str) -> Option<Duration> {
 }
 
 fn kag_auto_mode(runtime: &Runtime<KrkrHost>) -> bool {
-    let Variant::Object(kag) = runtime.global_member("kag") else {
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
         return false;
     };
     runtime.object_member(kag, "autoMode").is_truthy()
@@ -4039,7 +4060,7 @@ fn kag_auto_page_wait(runtime: &Runtime<KrkrHost>) -> Duration {
 }
 
 fn kag_auto_wait(runtime: &Runtime<KrkrHost>, name: &str, default_millis: u64) -> Duration {
-    let Variant::Object(kag) = runtime.global_member("kag") else {
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
         return Duration::from_millis(default_millis);
     };
     let millis = runtime
@@ -4051,7 +4072,7 @@ fn kag_auto_wait(runtime: &Runtime<KrkrHost>, name: &str, default_millis: u64) -
 }
 
 fn cancel_kag_auto_mode(runtime: &mut Runtime<KrkrHost>) {
-    let Variant::Object(kag) = runtime.global_member("kag") else {
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
         return;
     };
     runtime.set_object_member(kag, "autoMode", Variant::Integer(0));
@@ -4372,7 +4393,7 @@ fn pointer_button_vk_code(button: PointerButton) -> Option<i64> {
 }
 
 fn install_system_metrics(runtime: &mut Runtime<KrkrHost>, metrics: SystemMetrics) {
-    let Variant::Object(system) = runtime.global_member("System") else {
+    let Some(system) = runtime.global_member("System").object_handle() else {
         return;
     };
     for (name, value) in [
@@ -4392,7 +4413,7 @@ fn ensure_object_member(
     object: ObjectHandle,
     name: &str,
 ) -> ObjectHandle {
-    if let Variant::Object(handle) = runtime.object_member(object, name) {
+    if let Some(handle) = runtime.object_member(object, name).object_handle() {
         return handle;
     }
     let handle = runtime.alloc_ordinary_object();
@@ -4815,6 +4836,50 @@ mod tests {
         );
     }
 
+    /// The transition-completed event hands the destination and the source out
+    /// as `tTJSVariant(TransDestObj, TransDestObj)` /
+    /// `(TransSrcObj, TransSrcObj)` (`LayerIntf.cpp:6411-6418`), so a handler's
+    /// `===` against the layers the script holds is true.
+    #[test]
+    fn transition_completed_hands_out_self_bound_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .host_mut()
+            .set_transition_policy(crate::TransitionPolicy::Immediate);
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.win = new Window();
+                global.source = new Layer(win);
+                global.dest = new Layer(win);
+                global.record = "";
+                dest.visible = true;
+                source.visible = true;
+                dest.onTransitionCompleted = function(destArg, srcArg) {
+                    global.record = "" + (destArg === global.dest) + ":" +
+                        (srcArg === global.source) + ":" + (destArg === srcArg);
+                };
+                dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                "#,
+            )
+            .expect("begin transition");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("finish immediate transition");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "global.record")
+                .expect("record"),
+            Variant::String("1:1:0".to_string())
+        );
+    }
+
     #[test]
     fn scripts_eval_runs_in_engine() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -5020,6 +5085,35 @@ mod tests {
 
         assert_eq!(result, Variant::String("42:kirakira".to_string()));
         assert!(root.join("savedata/vars.ksd").is_file());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `SaveStruct` serializes what `tTJSVariantClosure::SelectObjectNoAddRef`
+    /// selects -- ObjThis when there is one (`tjsVariant.h:194`,
+    /// `tjsDictionary.cpp:457`) -- so a bound array method serializes the array
+    /// behind it rather than the function object.
+    #[test]
+    fn save_struct_serializes_the_object_behind_a_bound_method() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var list = [1, 2, 3];
+                var holder = %[];
+                holder.entry = list.push;
+                var path = System.dataPath + "bound.ksd";
+                (Dictionary.saveStruct incontextof holder)(path, "c");
+                var loaded = Scripts.evalStorage(path, "c");
+                return loaded.entry.count + ":" + loaded.entry[2];
+                "#,
+            )
+            .expect("save and load");
+
+        assert_eq!(result, Variant::String("3:3".to_string()));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -5265,12 +5359,8 @@ mod tests {
             )
             .expect("add");
 
-        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
-            panic!("window missing");
-        };
-        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
-            panic!("layer missing");
-        };
+        let window = object_handle(&engine, "window");
+        let layer = object_handle(&engine, "layer");
         // `Window.children` has no official counterpart (M2 §5a): the child
         // registry is engine-internal, reached through the host.
         assert_eq!(engine.host().native_window_children(window), vec![layer]);
@@ -5331,15 +5421,9 @@ mod tests {
             )
             .expect("add");
 
-        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
-            panic!("window missing");
-        };
-        let Variant::Object(root) = engine.tjs_runtime().global_member("root") else {
-            panic!("root missing");
-        };
-        let Variant::Object(child) = engine.tjs_runtime().global_member("child") else {
-            panic!("child missing");
-        };
+        let window = object_handle(&engine, "window");
+        let root = object_handle(&engine, "root");
+        let child = object_handle(&engine, "child");
         assert_eq!(
             engine.host().native_window_children(window),
             vec![root, child]
@@ -5459,7 +5543,8 @@ mod tests {
                     "mainImageBufferPitch",
                     "provinceImageBuffer",
                     "provinceImageBufferForWrite",
-                    "provinceImageBufferPitch"
+                    "provinceImageBufferPitch",
+                    "font"
                 ];
                 var denied = 0;
                 var message = "";
@@ -5469,12 +5554,12 @@ mod tests {
                         message = e.message;
                     }
                 }
-                // `font` is the one member that stays writable: KAGEX replaces
-                // a layer's font through the `TJS_IGNOREPROP` store, which the
-                // VM cannot separate from an ordinary store yet (see
-                // `LAYER_READ_ONLY_PROPERTIES`).
+                // The `TJS_IGNOREPROP` store skips the property object and
+                // overwrites the member (`tTJSCustomObject::PropSet`,
+                // `tjsObject.cpp:1519-1552`), which is how KAGEX installs a
+                // font hook (`&a2.font = this`).
                 var hook = %[kind: "FontHook"];
-                layer.font = hook;
+                &layer.font = hook;
                 var hookRead = layer.font.kind == "FontHook";
                 // The denied writes left every value where it was: the layer
                 // still belongs to its window and keeps its size.
@@ -5487,15 +5572,11 @@ mod tests {
         assert_eq!(
             value,
             Variant::String(
-                "15:Invalid operation for Read-only or Write-only property:1:5:void:1".to_string()
+                "16:Invalid operation for Read-only or Write-only property:1:5:void:1".to_string()
             )
         );
-        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
-            panic!("window missing");
-        };
-        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
-            panic!("layer missing");
-        };
+        let window = object_handle(&engine, "window");
+        let layer = object_handle(&engine, "layer");
         assert_eq!(engine.host().native_layer_window(layer), Some(window));
     }
 
@@ -5810,12 +5891,8 @@ mod tests {
             value,
             Variant::String("Member \"children\" does not exist|7".to_string())
         );
-        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
-            panic!("window missing");
-        };
-        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
-            panic!("layer missing");
-        };
+        let window = object_handle(&engine, "window");
+        let layer = object_handle(&engine, "layer");
         assert_eq!(engine.host().native_window_children(window), vec![layer]);
     }
 
@@ -5864,12 +5941,8 @@ mod tests {
                 "#,
             )
             .expect("script");
-        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
-            panic!("window missing");
-        };
-        let Variant::Object(layer) = engine.tjs_runtime().global_member("layer") else {
-            panic!("layer missing");
-        };
+        let window = object_handle(&engine, "window");
+        let layer = object_handle(&engine, "layer");
         assert_eq!(
             engine.host().native_window_primary_layer(window),
             Some(layer)
@@ -6368,10 +6441,7 @@ mod tests {
             engine.tjs_runtime().global_member("afterImage"),
             Variant::Integer(1)
         );
-        let layer = match engine.tjs_runtime().global_member("layer") {
-            Variant::Object(layer) => layer,
-            value => panic!("unexpected layer value: {value:?}"),
-        };
+        let layer = object_handle(&engine, "layer");
         let layer_id = engine.host().native_layer(layer).expect("native layer");
         let node = engine
             .host()
@@ -6735,9 +6805,7 @@ mod tests {
             Variant::String("before".to_string())
         );
 
-        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
-            panic!("modal window missing");
-        };
+        let modal = object_handle(&engine, "modal");
         engine
             .tjs_runtime_mut()
             .call_object_method(modal, "close", Vec::new())
@@ -6782,9 +6850,7 @@ mod tests {
             )
             .expect("visible frame");
 
-        let Variant::Object(layer) = engine.tjs_runtime().global_member("dialogLayer") else {
-            panic!("dialog layer missing");
-        };
+        let layer = object_handle(&engine, "dialogLayer");
         let layer_id = engine.host().native_layer(layer).expect("native layer");
         assert!(
             engine
@@ -6795,9 +6861,7 @@ mod tests {
                 .visible
         );
 
-        let Variant::Object(dialog) = engine.tjs_runtime().global_member("dialog") else {
-            panic!("dialog missing");
-        };
+        let dialog = object_handle(&engine, "dialog");
         engine
             .tjs_runtime_mut()
             .call_object_method(dialog, "close", Vec::new())
@@ -6841,9 +6905,7 @@ mod tests {
             )
             .expect("script");
         assert!(engine.tjs_runtime().is_suspended());
-        let Variant::Object(timer_probe) = engine.tjs_runtime().global_member("timerProbe") else {
-            panic!("timerProbe missing");
-        };
+        let timer_probe = object_handle(&engine, "timerProbe");
         force_timer_due(&mut engine, timer_probe);
 
         engine
@@ -6857,9 +6919,7 @@ mod tests {
             Variant::String(String::new())
         );
 
-        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
-            panic!("modal window missing");
-        };
+        let modal = object_handle(&engine, "modal");
         engine
             .tjs_runtime_mut()
             .call_object_method(modal, "close", Vec::new())
@@ -6913,13 +6973,8 @@ mod tests {
                 "#,
             )
             .expect("script");
-        let Variant::Object(first_timer) = engine.tjs_runtime().global_member("firstTimer") else {
-            panic!("firstTimer missing");
-        };
-        let Variant::Object(second_timer) = engine.tjs_runtime().global_member("secondTimer")
-        else {
-            panic!("secondTimer missing");
-        };
+        let first_timer = object_handle(&engine, "firstTimer");
+        let second_timer = object_handle(&engine, "secondTimer");
         force_timer_due(&mut engine, first_timer);
         force_timer_due(&mut engine, second_timer);
 
@@ -6935,9 +6990,7 @@ mod tests {
             Variant::String("A".to_string())
         );
 
-        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
-            panic!("modal window missing");
-        };
+        let modal = object_handle(&engine, "modal");
         engine
             .tjs_runtime_mut()
             .call_object_method(modal, "close", Vec::new())
@@ -6990,9 +7043,7 @@ mod tests {
             )
             .expect("sync frame");
 
-        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
-            panic!("window missing");
-        };
+        let window = object_handle(&engine, "window");
         assert_eq!(
             engine.tjs_runtime().object_member(window, "left"),
             Variant::Integer(20)
@@ -7001,9 +7052,7 @@ mod tests {
             engine.tjs_runtime().object_member(window, "top"),
             Variant::Integer(30)
         );
-        let Variant::Object(root) = engine.tjs_runtime().global_member("root") else {
-            panic!("root layer missing");
-        };
+        let root = object_handle(&engine, "root");
         let layer_id = engine.host().native_layer(root).expect("native layer");
         let position = engine
             .host()
@@ -7232,9 +7281,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("sync frame");
-        let Variant::Object(button) = engine.tjs_runtime().global_member("button") else {
-            panic!("button missing");
-        };
+        let button = object_handle(&engine, "button");
         let button_id = engine.host().native_layer(button).expect("native button");
         let node = engine
             .host()
@@ -7293,15 +7340,9 @@ mod tests {
                 "#,
             )
             .expect("script");
-        let Variant::Object(source) = engine.tjs_runtime().global_member("source") else {
-            panic!("source missing");
-        };
-        let Variant::Object(dest) = engine.tjs_runtime().global_member("dest") else {
-            panic!("destination missing");
-        };
-        let Variant::Object(identity) = engine.tjs_runtime().global_member("identity") else {
-            panic!("identity destination missing");
-        };
+        let source = object_handle(&engine, "source");
+        let dest = object_handle(&engine, "dest");
+        let identity = object_handle(&engine, "identity");
         let source_id = engine.host().native_layer(source).expect("native source");
         let dest_id = engine
             .host()
@@ -7499,9 +7540,7 @@ mod tests {
         );
         assert!(engine.message_layer().lines.is_empty());
 
-        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
-            panic!("modal window missing");
-        };
+        let modal = object_handle(&engine, "modal");
         engine
             .tjs_runtime_mut()
             .call_object_method(modal, "close", Vec::new())
@@ -7880,9 +7919,7 @@ mod tests {
         let first = engine.next_kag_tag().expect("next tag").expect("character");
         assert_eq!(first.literal_attr("text"), Some("A"));
 
-        let Variant::Object(stored) = engine.tjs_runtime().global_member("callbackStored") else {
-            panic!("stored snapshot should be an object");
-        };
+        let stored = object_handle(&engine, "callbackStored");
         assert_eq!(
             engine.tjs_runtime().global_member("callbackLabel"),
             Variant::String("*start".to_string())
@@ -8490,7 +8527,7 @@ mod tests {
         .expect("write scenario");
 
         let mut engine = KrkrEngine::for_project(&root).expect("engine");
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 r#"
@@ -8505,10 +8542,8 @@ mod tests {
                 "#,
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
 
         engine.set_kag_handler(handler);
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -8536,7 +8571,7 @@ mod tests {
         fs::write(root.join("first.ks"), "[syspage storage=title][s]").expect("write scenario");
 
         let mut engine = image_test_engine(&root);
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 r#"
@@ -8549,10 +8584,8 @@ mod tests {
                 "#,
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
         engine.set_kag_handler(handler);
 
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -8579,7 +8612,7 @@ mod tests {
         .expect("write scenario");
 
         let mut engine = image_test_engine(&root);
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 r#"
@@ -8593,10 +8626,8 @@ mod tests {
                 "#,
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
         engine.set_kag_handler(handler);
 
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -8626,7 +8657,7 @@ mod tests {
         fs::write(root.join("first.ks"), "[ch text=A][s]").expect("write scenario");
 
         let mut engine = image_test_engine(&root);
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 &format!(
@@ -8642,10 +8673,8 @@ mod tests {
                 ),
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
         engine.set_kag_handler(handler);
 
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -8767,7 +8796,7 @@ mod tests {
             .expect("write scenario");
 
         let mut engine = image_test_engine(&root);
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 r#"
@@ -8781,10 +8810,8 @@ mod tests {
                 "#,
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
         engine.set_kag_handler(handler);
 
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -8851,7 +8878,7 @@ mod tests {
         fs::write(root.join("first.ks"), "[waitclick][ch text=A]").expect("write scenario");
 
         let mut engine = image_test_engine(&root);
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 r#"
@@ -8864,10 +8891,8 @@ mod tests {
                 "#,
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
         engine.set_kag_handler(handler);
 
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -8891,7 +8916,7 @@ mod tests {
         fs::write(root.join("first.ks"), "[ch text=A]").expect("write scenario");
 
         let mut engine = image_test_engine(&root);
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 r#"
@@ -8910,10 +8935,8 @@ mod tests {
                 "#,
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
         engine.set_kag_handler(handler);
 
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -9587,12 +9610,8 @@ mod tests {
             )
             .expect("script");
 
-        let Variant::Object(parent) = engine.tjs_runtime().global_member("parentProbe") else {
-            panic!("parent missing");
-        };
-        let Variant::Object(child) = engine.tjs_runtime().global_member("childProbe") else {
-            panic!("child missing");
-        };
+        let parent = object_handle(&engine, "parentProbe");
+        let child = object_handle(&engine, "childProbe");
         let parent_id = engine
             .host()
             .native_layer(parent)
@@ -10238,34 +10257,14 @@ mod tests {
             )
             .expect("script");
 
-        let Variant::Object(kag) = engine.tjs_runtime().global_member("kag") else {
-            panic!("kag missing");
-        };
-        let Variant::Object(fore) = engine.tjs_runtime().object_member(kag, "fore") else {
-            panic!("fore missing");
-        };
-        let Variant::Object(back) = engine.tjs_runtime().object_member(kag, "back") else {
-            panic!("back missing");
-        };
-        let Variant::Object(fore_base) = engine.tjs_runtime().object_member(fore, "base") else {
-            panic!("fore base missing");
-        };
-        let Variant::Object(back_layers) = engine.tjs_runtime().object_member(back, "layers")
-        else {
-            panic!("back layers missing");
-        };
-        let Variant::Object(back_layer0) = engine.tjs_runtime().object_member(back_layers, "0")
-        else {
-            panic!("back layer missing");
-        };
-        let Variant::Object(back_messages) = engine.tjs_runtime().object_member(back, "messages")
-        else {
-            panic!("back messages missing");
-        };
-        let Variant::Object(back_message0) = engine.tjs_runtime().object_member(back_messages, "0")
-        else {
-            panic!("back message missing");
-        };
+        let kag = object_handle(&engine, "kag");
+        let fore = member_object(&engine, kag, "fore");
+        let back = member_object(&engine, kag, "back");
+        let fore_base = member_object(&engine, fore, "base");
+        let back_layers = member_object(&engine, back, "layers");
+        let back_layer0 = member_object(&engine, back_layers, "0");
+        let back_messages = member_object(&engine, back, "messages");
+        let back_message0 = member_object(&engine, back_messages, "0");
 
         let fore_base_slot = engine.host().kag_layer_slot(fore_base).expect("fore slot");
         assert_eq!(fore_base_slot.page, "fore");
@@ -13078,12 +13077,11 @@ mod tests {
             )
             .expect("sync");
 
-        let Variant::Object(fore_base) = engine
+        let fore_base = engine
             .execute_expression("inline.tjs", "kag.fore.base")
             .expect("page base")
-        else {
-            panic!("page base is a layer object");
-        };
+            .object_handle()
+            .expect("page base is a layer object");
         engine.host_mut().begin_kag_transition(
             Duration::from_millis(1000),
             TransitionParams::default(),
@@ -13906,13 +13904,13 @@ mod tests {
         // writer, which is what the write falls back to when the font value
         // carries no ObjThis.
         //
-        // `Layer.font` itself stays writable in this engine: the reference
-        // denies the *property* while letting the `TJS_IGNOREPROP` store
-        // `&layer.font = x` overwrite the member, and KAGEX replaces a layer's
-        // font that way (`sysscn/prerenderfontex.tjs`, `spds` at bytecode 58).
-        // The VM calls a native setter for both shapes, so the engines cannot
-        // deny one and allow the other yet -- see
-        // `LAYER_READ_ONLY_PROPERTIES` for the full note.
+        // The two store shapes follow the reference: `layer.font = x` meets
+        // the denied setter (`TJS_DENY_NATIVE_PROP_SETTER`, `:9449`), while
+        // the `TJS_IGNOREPROP` store `&layer.font = x` skips the property and
+        // overwrites the member -- which is how KAGEX replaces a layer's font
+        // (`sysscn/prerenderfontex.tjs`, `spds` at bytecode 58).  The stored
+        // value carries its own `ObjThis` (`tTJSVariant(objthis, objthis)`),
+        // so the hook's setter still runs against the font, not the writer.
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let seen = engine
             .execute_script(
@@ -13935,14 +13933,69 @@ mod tests {
                 global.fontLike = new FontLike();
                 fontLike.probe = build() incontextof null;
                 global.layer = new Layer();
-                layer.font = fontLike;
+                var denied = 0;
+                try { layer.font = fontLike; } catch (e) {
+                    denied = (e.message == "Invalid operation for Read-only or Write-only property");
+                }
+                &layer.font = fontLike;
                 global.writer = new Writer(layer);
                 writer.poke();
-                return fontLike.seen + "/" + (typeof writer.seen);
+                return denied + "/" + fontLike.seen + "/" + (typeof writer.seen);
                 "#,
             )
             .expect("script");
-        assert_eq!(seen.to_tjs_string().expect("string"), "set:456/undefined");
+        assert_eq!(seen.to_tjs_string().expect("string"), "1/set:456/undefined");
+    }
+
+    /// The KAGEX font-hook shape end to end, with a real native font behind the
+    /// hook: `&layer.font = hook` installs it, a write from another object's
+    /// method (`layer.font.height = v`) runs the hook's injected setter with
+    /// the *hook* as `this` -- so its unqualified `fontSetter(...)` resolves --
+    /// and the engine's own font resolution reads back through the hook.
+    #[test]
+    fn layer_font_hook_installed_with_ignore_prop_runs_on_the_hook() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class FontHook {
+                    var seen;
+                    var inner;
+                    function FontHook(inner) { this.inner = inner; }
+                    function fontSetter(v) { inner.height = v; this.seen = "set:" + v; }
+                    property height {
+                        getter { this.seen = "get:" + inner.height; return inner.height; }
+                        setter(v) { fontSetter(v); }
+                    }
+                }
+                class Writer {
+                    var holder;
+                    function Writer(holder) { this.holder = holder; }
+                    function paint(v) { this.holder.font.height = v; }
+                }
+                var inner = new Font();
+                inner.height = 24;
+                global.hook = new FontHook(inner);
+                global.textLayer = new Layer();
+                textLayer.setSize(96, 48);
+                var denied = 0;
+                try { textLayer.font = hook; } catch (e) {
+                    denied = (e.message == "Invalid operation for Read-only or Write-only property");
+                }
+                &textLayer.font = hook;
+                var installed = (textLayer.font === hook);
+                (new Writer(textLayer)).paint(-32);
+                var afterSet = hook.seen + ":" + inner.height;
+                textLayer.drawText(4, 4, "A", 0xffffff, 255);
+                return denied + ":" + installed + ":" + afterSet + ":" + hook.seen;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value.to_tjs_string().expect("string"),
+            "1:1:set:-32:-32:get:-32"
+        );
     }
 
     #[test]
@@ -13958,6 +14011,12 @@ mod tests {
         // the call fail with `void is not callable`; binding it to the class
         // object would have attached the window to the class instead of the
         // instance.
+        //
+        // The call itself answers void: `tTJSNativeClassConstructor::FuncCall`
+        // clears the result before it runs `Process` (`tjsNative.cpp:113-134`)
+        // and the constructor never writes it (`LayerIntf.cpp:6717-6720`), so
+        // the script asks whether the value is void rather than comparing it
+        // with the caller's object.
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let value = engine
             .execute_script(
@@ -13971,20 +14030,19 @@ mod tests {
                 class Mixin { function Mixin() {} }
                 class Base extends Mixin, Layer {
                     var _Layer = global.Layer;
-                    var resultIsThis = 0;
+                    var resultIsVoid = 0;
                     function Base(a0) {
                         var t1 = a0.window;
                         var r = _Layer.Layer(t1, a0);
-                        this.resultIsThis = (r === this);
+                        this.resultIsVoid = (r === void);
                     }
                 }
                 global.holder = new Holder();
                 global.base = new Base(holder);
                 // `window`/`parent` read back as `tTJSVariant(dsp, dsp)`
                 // (`LayerIntf.cpp:8490`, `:8683`), whose `===` also compares
-                // ObjThis; identity is what `==` reports, and the engine's
-                // `new` does not bind its result yet.
-                return base.resultIsThis + "/" + (base.window == win) + "/"
+                // ObjThis; identity is what `==` reports.
+                return base.resultIsVoid + "/" + (base.window == win) + "/"
                     + (base.parent == holder) + "/" + (base instanceof "Layer");
                 "#,
             )
@@ -14054,9 +14112,7 @@ mod tests {
                 "#,
             )
             .expect("script");
-        let Variant::Object(child) = engine.tjs_runtime().global_member("child") else {
-            panic!("child missing");
-        };
+        let child = object_handle(&engine, "child");
         let child_layer = engine.host().native_layer(child).expect("child layer");
 
         assert_eq!(
@@ -14169,12 +14225,8 @@ mod tests {
                 "#,
             )
             .expect("script");
-        let Variant::Object(root) = engine.tjs_runtime().global_member("root") else {
-            panic!("root missing");
-        };
-        let Variant::Object(child) = engine.tjs_runtime().global_member("child") else {
-            panic!("child missing");
-        };
+        let root = object_handle(&engine, "root");
+        let child = object_handle(&engine, "child");
         assert!(engine.host().native_layer(root).is_some());
         assert!(engine.host().native_layer(child).is_some());
         assert!(engine.host().has_pending_window_update(child));
@@ -14316,9 +14368,7 @@ mod tests {
                 "#,
             )
             .expect("script");
-        let Variant::Object(dest) = engine.tjs_runtime().global_member("dest") else {
-            panic!("dest missing");
-        };
+        let dest = object_handle(&engine, "dest");
         let dest_id = engine
             .host()
             .native_layer(dest)
@@ -14948,6 +14998,57 @@ mod tests {
         assert_eq!(value, Variant::String("1:0:1:blur:focus".to_string()));
     }
 
+    /// The focus events hand their layer arguments out as
+    /// `tTJSVariant(Owner, Owner)`: the candidate and the previously focused
+    /// layer for `onBeforeFocus` (`LayerIntf.cpp:3385-3401`), the newly focused
+    /// layer for `onBlur` (`:3353-3365`), the old one for `onFocus`
+    /// (`:3369-3381`).  The candidate a handler answers with is read back
+    /// through its binding, so an override that calls
+    /// `onSearchNextFocusable(layer)` (`SetFocusWork`, `LayerIntf.h:608-609`)
+    /// moves the focus.
+    #[test]
+    fn focus_events_hand_out_self_bound_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var root = new Layer(window, null);
+                var first = new Layer(window, root);
+                var second = new Layer(window, root);
+                root.visible = true;
+                first.visible = true;
+                second.visible = true;
+                root.focusable = true;
+                first.focusable = true;
+                second.focusable = true;
+                global.record = "";
+                first.onBlur = function(focused) {
+                    global.record += "/blur:" + (focused === second) + ":" +
+                        (root.children.find(focused) != -1);
+                };
+                second.onFocus = function(prev, direction) {
+                    global.record += "/focus:" + (prev === first) + ":" + direction;
+                };
+                second.onBeforeFocus = function(layer, prev, direction) {
+                    global.record += "/before:" + (layer === second) + ":" +
+                        (prev === first) + ":" + direction;
+                    layer.onSearchNextFocusable(second);
+                };
+                first.focus();
+                second.focus();
+                return global.record + "/focused:" + second.focused;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("/before:1:1:1/blur:1:1/focus:1:1/focused:1".to_string())
+        );
+    }
+
     /// `NotifyPart` -> `RemoveTreeModalState` (`LayerManager.cpp:168`,
     /// `:894`): a dialog that leaves the tree must give up the layers it
     /// disabled, otherwise the screen stays unclickable with nothing on it.
@@ -14971,12 +15072,8 @@ mod tests {
             )
             .expect("script");
 
-        let Variant::Object(window) = engine.tjs_runtime().global_member("window") else {
-            panic!("window");
-        };
-        let Variant::Object(lower) = engine.tjs_runtime().global_member("lower") else {
-            panic!("lower");
-        };
+        let window = object_handle(&engine, "window");
+        let lower = object_handle(&engine, "lower");
         let lower_id = engine.host().native_layer(lower).expect("lower layer");
         assert!(engine.host().current_modal_layer(Some(window)).is_some());
         assert!(engine.host().layer_tree().is_disabled_by_mode(lower_id));
@@ -17816,9 +17913,7 @@ mod tests {
                 .len(),
             1
         );
-        let Variant::Object(timer) = engine.tjs_runtime().global_member("timerProbe") else {
-            panic!("timerProbe should be an object");
-        };
+        let timer = object_handle(&engine, "timerProbe");
         force_timer_due(&mut engine, timer);
 
         engine
@@ -17938,9 +18033,7 @@ mod tests {
                 "#,
             )
             .expect("script");
-        let Variant::Object(timer_probe) = engine.tjs_runtime().global_member("timerProbe") else {
-            panic!("timerProbe missing");
-        };
+        let timer_probe = object_handle(&engine, "timerProbe");
         force_timer_due(&mut engine, timer_probe);
 
         engine
@@ -17982,9 +18075,7 @@ mod tests {
             )
             .expect("update");
 
-        let Variant::Object(owner) = engine.tjs_runtime().global_member("actionOwner") else {
-            panic!("action owner missing");
-        };
+        let owner = object_handle(&engine, "actionOwner");
         assert_eq!(
             engine.tjs_runtime().object_member(owner, "count"),
             Variant::Integer(11)
@@ -18064,9 +18155,7 @@ mod tests {
                 Duration::from_millis(16),
             )
             .expect("update");
-        let Variant::Object(owner) = engine.tjs_runtime().global_member("continuousOwner") else {
-            panic!("continuous owner missing");
-        };
+        let owner = object_handle(&engine, "continuousOwner");
         assert_eq!(
             engine.tjs_runtime().object_member(owner, "count"),
             Variant::Integer(1)
@@ -18236,9 +18325,7 @@ mod tests {
         })
         .expect("engine");
 
-        let Variant::Object(system) = engine.tjs_runtime().global_member("System") else {
-            panic!("System should be an object");
-        };
+        let system = object_handle(&engine, "System");
         assert_eq!(
             engine.tjs_runtime().object_member(system, "screenWidth"),
             Variant::Integer(2560)
@@ -18733,9 +18820,7 @@ mod tests {
             Variant::String("A".to_string())
         );
 
-        let Variant::Object(modal) = engine.tjs_runtime().global_member("modal") else {
-            panic!("modal window missing");
-        };
+        let modal = object_handle(&engine, "modal");
         engine
             .tjs_runtime_mut()
             .call_object_method(modal, "close", Vec::new())
@@ -19033,9 +19118,7 @@ mod tests {
             engine.tjs_runtime().global_member("paused"),
             Variant::Integer(1)
         );
-        let Variant::Object(buffer) = engine.tjs_runtime().global_member("buffer") else {
-            panic!("buffer missing");
-        };
+        let buffer = object_handle(&engine, "buffer");
         assert_eq!(
             engine.tjs_runtime().object_member(buffer, "posX"),
             Variant::Real(1.0)
@@ -19134,7 +19217,7 @@ mod tests {
         // instance answers a missing member with member-not-found, so the
         // handler's unqualified global reads fall back to the global object the
         // way the game's KAGEX handlers do.
-        let handler = match engine
+        let handler = engine
             .execute_script(
                 "inline.tjs",
                 r#"
@@ -19154,10 +19237,8 @@ mod tests {
                 "#,
             )
             .expect("handler")
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("expected handler object, got {other}"),
-        };
+            .object_handle()
+            .unwrap_or_else(|| panic!("expected handler object"));
         engine.set_kag_handler(handler);
 
         engine.load_kag_scenario("first.ks").expect("load scenario");
@@ -19209,14 +19290,16 @@ mod tests {
             .set_native_layer_window(layer, Some(window), Variant::Object(window));
     }
 
+    /// The object a test expression evaluates to. Script values that came from
+    /// `this` or `new` are self-bound (`Variant::Closure`), so the tests' own
+    /// readers unwrap the binding the way the engine's readers do
+    /// (`Variant::object_handle`).
     fn expression_object(engine: &mut KrkrEngine, expression: &str) -> ObjectHandle {
-        match engine
+        engine
             .execute_expression("inline.tjs", expression)
             .unwrap_or_else(|error| panic!("{expression}: {error}"))
-        {
-            Variant::Object(handle) => handle,
-            other => panic!("{expression} is not an object: {other}"),
-        }
+            .object_handle()
+            .unwrap_or_else(|| panic!("{expression} is not an object"))
     }
 
     fn temp_root() -> PathBuf {
@@ -19348,11 +19431,28 @@ mod tests {
         writer.write_image_data(indices).expect("png indices");
     }
 
+    /// The object a global holds, for the tests' own readers: a script value
+    /// stored from `this` or `new` is self-bound (`Variant::Closure`), so
+    /// unwrap the binding the way the engine's readers do.
     fn object_handle(engine: &KrkrEngine, name: &str) -> ObjectHandle {
-        match engine.tjs_runtime().global_member(name) {
-            Variant::Object(handle) => handle,
-            _ => panic!("{name} missing"),
-        }
+        engine
+            .tjs_runtime()
+            .global_member(name)
+            .object_handle()
+            .unwrap_or_else(|| panic!("{name} missing"))
+    }
+
+    /// The object a member holds, for the tests' own readers.
+    fn member_object(
+        engine: &KrkrEngine,
+        object: ObjectHandle,
+        name: &str,
+    ) -> ObjectHandle {
+        engine
+            .tjs_runtime()
+            .object_member(object, name)
+            .object_handle()
+            .unwrap_or_else(|| panic!("{name} missing"))
     }
 
     fn image_command_count(frame: &EngineFrame) -> usize {

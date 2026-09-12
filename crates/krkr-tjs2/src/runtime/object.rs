@@ -456,18 +456,10 @@ pub enum ObjectKind {
 /// through TJS dispatch), so marking a property read-only only takes the
 /// direction away from script.
 ///
-/// Known gap, deferred to the self-bound value model mission: a script store
-/// that carries `TJS_IGNOREPROP` (a regmember-style `&obj.prop = v` or VM
-/// member store) still reaches
-/// [`crate::runtime::Runtime::register_object_native_property`]'s setter,
-/// because `prop_set_handle` keeps invoking native property setters under that
-/// flag. It therefore fails with -1007 on a denied property where the
-/// reference's `TJSDefaultPropSet` (`tjsObject.cpp:1435-1466`) skips the
-/// property and overwrites the member. The gap is unobservable while every
-/// property stays `ReadWrite`; see
-/// [`crate::runtime::Runtime::deny_native_property_writes`] for what a caller
-/// of the deny-list has to check, and for why the skip waits for `this` and
-/// `new` results to be self-bound.
+/// Only the plain store shape meets the denial: a store that carries
+/// `TJS_IGNOREPROP` skips the property object and overwrites the member
+/// (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1519-1541`), exactly like the
+/// reference's `TJSDefaultPropSet` (`:1435-1466`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NativePropertyAccess {
     /// Script may read and write (the default).
