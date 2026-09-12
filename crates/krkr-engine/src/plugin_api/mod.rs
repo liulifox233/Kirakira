@@ -8,6 +8,11 @@
 //! * [`storage`] registers a storage media (`psb`, `lzfs`, `proxy`, `steam`,
 //!   `var`, `zip`) on the project storage — the engine-side counterpart of
 //!   `TVPRegisterStorageMedia` (`krkrz/src/core/base/StorageIntf.cpp:530-538`).
+//! * [`transition`] registers a transition handler provider under a name —
+//!   the counterpart of `TVPAddTransHandlerProvider`
+//!   (`krkrz/src/core/visual/TransIntf.cpp:307-324`): a provider owns its
+//!   transition names and composes the two layer bitmaps CPU-side, instead of
+//!   the engine carrying a name table for the plugin.
 //! * [`layer`] reads and writes a layer's main and province bitmaps through
 //!   scoped views — what the `layerEx*` family gets from
 //!   `Layer.mainImageBuffer*` in the reference (`LayerIntf.cpp:9513-9553`).
@@ -30,5 +35,10 @@
 
 pub mod layer;
 pub mod storage;
+pub mod transition;
 
 pub use krkr_core::{ProjectStoragePort, ResourceData, ResourceStream, StorageMediaProvider};
+pub use transition::{
+    TransitionFace, TransitionFrame, TransitionHandler, TransitionHandlerError,
+    TransitionHandlerProvider, TransitionOptions, TransitionRequest,
+};
