@@ -622,33 +622,42 @@ fn hex_value(byte: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // shrinkCopy / layerExImage / layerExRaster surface on Layer (no-op)
 
+/// The `shrinkCopy`/`layerExImage`/`layerExRaster`/`LayerExBTOA` names the
+/// bundle fills in.
+const LAYER_EFFECT_METHODS: [&str; 18] = [
+    "shrinkCopy",
+    "shrinkCopyFast",
+    "doLine",
+    "light",
+    "colorize",
+    "modulate",
+    "noise",
+    "generateWhiteNoise",
+    "gaussianBlur",
+    "copyRaster",
+    "copyRightBlueToLeftAlpha",
+    "copyBottomBlueToTopAlpha",
+    "fillAlpha",
+    "copyAlphaToProvince",
+    "clipAlphaRect",
+    "overwrapRect",
+    "fillByProvince",
+    "fillToProvince",
+];
+
 fn install_layer_effects(runtime: &mut Runtime<KrkrHost>) {
     let layer = match runtime.global_member("Layer") {
         Variant::Object(handle) => handle,
         _ => return,
     };
-    for method in [
-        "shrinkCopy",
-        "shrinkCopyFast",
-        "doLine",
-        "light",
-        "colorize",
-        "modulate",
-        "noise",
-        "generateWhiteNoise",
-        "gaussianBlur",
-        "copyRaster",
-        "copyRightBlueToLeftAlpha",
-        "copyBottomBlueToTopAlpha",
-        "fillAlpha",
-        "copyAlphaToProvince",
-        "clipAlphaRect",
-        "overwrapRect",
-        "fillByProvince",
-        "fillToProvince",
-    ] {
-        // Do not clobber script-side overrides.
-        if !matches!(runtime.object_member(layer, method), Variant::Closure(_)) {
+    for method in LAYER_EFFECT_METHODS {
+        // Only fill a slot nothing owns. The bundle registers before the
+        // layerEx* modules in catalog order, but `Plugins.link("packinone.dll")`
+        // re-runs this registration, and their implementations are
+        // `Variant::Object` natives -- not the `Closure`s this used to skip --
+        // so a blanket overwrite reverted the real filters to no-ops.
+        // An override a script made is not `Void` either and stays untouched.
+        if matches!(runtime.object_member(layer, method), Variant::Void) {
             runtime.register_object_native(layer, method, native_void);
         }
     }
@@ -1241,6 +1250,168 @@ mod tests {
             )
             .expect("csv parser target");
         assert_eq!(value, Variant::String("1:a:b|2:c:d lines=2".to_owned()));
+    }
+
+    /// `Plugins.link("packinone.dll")` runs the bundle's `register` again
+    /// (`krkr-engine/src/host.rs::plugin_to_install`). Catalog order puts the
+    /// bundle before the layerEx* modules, so by the time a game links it the
+    /// layer effects are the real implementations — `Variant::Object` natives,
+    /// not the `Closure`s the old guard skipped, so the fill-in reverted them
+    /// to no-ops (measured: `light(10, 0)` over `0x80404040` gave `0x4a4a4a`
+    /// before the link and `0x404040` after).
+    #[test]
+    fn linking_the_bundle_keeps_the_real_layer_ex_natives() {
+        let mut engine = layer_ex_engine();
+        let members = layer_effect_members(&engine);
+        let before = layer_probe(&mut engine);
+        assert_eq!(before, LAYER_PROBE, "the layerEx* natives ran");
+
+        engine
+            .execute_script("link.tjs", r#"Plugins.link("packinone.dll");"#)
+            .expect("link");
+
+        assert_eq!(
+            layer_probe(&mut engine),
+            LAYER_PROBE,
+            "the link reverted a real native to a no-op"
+        );
+        assert_eq!(
+            layer_effect_members(&engine),
+            members,
+            "the link replaced a Layer member"
+        );
+    }
+
+    /// When only the bundle is registered every name in the list is a member
+    /// nothing owns, so the fill-in still has to cover them: the no-op is what
+    /// keeps a game's `light` from failing with `Member "light" does not
+    /// exist`. The link runs the same registration again and must not drop it.
+    #[test]
+    fn layer_effect_fill_in_still_covers_members_nothing_owns() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+
+        let filled = |engine: &KrkrEngine| {
+            layer_effect_members(engine)
+                .iter()
+                .all(|member| !matches!(member, Variant::Void))
+        };
+        assert!(filled(&engine), "the fill-in covers the absent members");
+
+        engine
+            .execute_script("link.tjs", r#"Plugins.link("packinone.dll");"#)
+            .expect("link");
+        assert!(filled(&engine), "the link re-runs the fill-in");
+
+        // Callable, and harmless: the pixels keep their fill.
+        assert_eq!(light_pixel(&mut engine), 0x404040);
+        assert_eq!(alpha_value(&mut engine), 0x80);
+    }
+
+    /// The bundle then the layerEx* modules, in catalog order.
+    fn layer_ex_engine() -> KrkrEngine {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("packinone");
+        engine
+            .register_plugin(crate::layer_ex_btoa::LayerExBtoaPlugin)
+            .expect("layerExBTOA");
+        engine
+            .register_plugin(crate::layer_ex_image::LayerExImagePlugin)
+            .expect("layerExImage");
+        engine
+            .register_plugin(crate::layer_ex_raster::LayerExRasterPlugin)
+            .expect("layerExRaster");
+        engine
+    }
+
+    /// The raw `Layer` member each filled-in name holds, so a link that swaps
+    /// one is visible even where no plugin implements the name.
+    fn layer_effect_members(engine: &KrkrEngine) -> Vec<Variant> {
+        let runtime = engine.tjs_runtime();
+        let Variant::Object(layer) = runtime.global_member("Layer") else {
+            panic!("the engine registers a Layer class object");
+        };
+        LAYER_EFFECT_METHODS
+            .iter()
+            .map(|method| runtime.object_member(layer, method))
+            .collect()
+    }
+
+    /// The pixels a run of the three layer effect families leaves behind:
+    /// `light`, `copyRaster` and `fillAlpha`.
+    fn layer_probe(engine: &mut KrkrEngine) -> (i64, i64, i64) {
+        (
+            light_pixel(engine),
+            raster_pixel(engine),
+            alpha_value(engine),
+        )
+    }
+
+    /// `LayerExImage.cpp:48-59` with brightness 10 over `0x80404040`:
+    /// `clamp(channel + 10)` per channel. A no-op leaves the fill's `0x404040`.
+    fn light_pixel(engine: &mut KrkrEngine) -> i64 {
+        engine
+            .execute_script(
+                "probe-light.tjs",
+                r#"
+                global.probe = new Layer();
+                probe.setImageSize(2, 1);
+                probe.fillRect(0, 0, 2, 1, 0x80404040);
+                probe.light(10, 0);
+                "#,
+            )
+            .expect("light");
+        read_integer(engine, "probe.getMainPixel(0, 0)")
+    }
+
+    /// `layerExRaster`'s `main.cpp:61-78` with `maxh = 0` and `time = 0`, which
+    /// shifts every row by zero: a plain copy of `0x112233` onto transparent
+    /// black. A no-op leaves the destination's `0x000000`.
+    fn raster_pixel(engine: &mut KrkrEngine) -> i64 {
+        engine
+            .execute_script(
+                "probe-raster.tjs",
+                r#"
+                global.rasterSource = new Layer();
+                rasterSource.setImageSize(5, 2);
+                rasterSource.fillRect(0, 0, 5, 2, 0x80112233);
+                global.probe = new Layer();
+                probe.setImageSize(5, 2);
+                probe.fillRect(0, 0, 5, 2, 0x80000000);
+                probe.copyRaster(rasterSource, 0, 4, 4, 0);
+                "#,
+            )
+            .expect("copyRaster");
+        read_integer(engine, "probe.getMainPixel(0, 0)")
+    }
+
+    /// `layerExBTOA`'s `fillAlpha` (`main.cpp:128-140`) raises the clip box's
+    /// alpha byte to `0xff`. A no-op leaves the fill's `0x80`.
+    fn alpha_value(engine: &mut KrkrEngine) -> i64 {
+        engine
+            .execute_script(
+                "probe-alpha.tjs",
+                r#"
+                global.probe = new Layer();
+                probe.setImageSize(2, 1);
+                probe.fillRect(0, 0, 2, 1, 0x80112233);
+                probe.fillAlpha();
+                "#,
+            )
+            .expect("fillAlpha");
+        read_integer(engine, "probe.getMaskPixel(0, 0)")
+    }
+
+    /// `light` + `copyRaster` + `fillAlpha`, each with its real
+    /// implementation's result.
+    const LAYER_PROBE: (i64, i64, i64) = (0x4a4a4a, 0x112233, 0xff);
+
+    fn read_integer(engine: &mut KrkrEngine, expression: &str) -> i64 {
+        engine
+            .execute_expression("read.tjs", expression)
+            .expect("expression")
+            .to_integer()
+            .expect("integer")
     }
 
     fn test_engine(root: &Path) -> KrkrEngine {
