@@ -434,6 +434,52 @@ fn dictionary_receiver_stops_the_proxy_before_the_global() {
     );
 }
 
+/// A bare *call* is a different operation from a bare read, and the official
+/// compiler keeps them apart: `GenNodeCode`'s `T_LPARENTHESIS` case computes
+/// `hasnonlocalsymbol` for a `T_SYMBOL` callee -- a name that is not a local
+/// of the current namespace -- and then generates it with `stFuncCall`
+/// (`tjsInterCodeGen.cpp:1752-1813`), which lands on `VM_CALLD` for the
+/// rewritten `T_THIS_PROXY . name` node (`:2003-2022`).  `iTJSDispatch2::FuncCall`
+/// has no "answer void for a miss" rule: only `tTJSDictionaryObject::PropGet`
+/// maps a miss to void (`tjsDictionary.cpp:720-731`), while `FuncCall` stays
+/// with `tTJSCustomObject::FuncCall` and reports `TJS_E_MEMBERNOTFOUND`
+/// (`tjsObject.cpp:1316-1340`), so the `%-2` proxy walks on to the global
+/// object.  A global function called with a Dictionary `this` therefore
+/// resolves, even though the same name read back through `gpd` answers void
+/// (`dictionary_receiver_stops_the_proxy_before_the_global`).  GINKA's
+/// `title.ks` depends on this: `Scripts.eval` runs an inline-string source
+/// whose `${GetBgmTitleImageFile(file)}` is a bare call, evaluated with the
+/// caller's `%[file: ...]` Dictionary as the context.
+#[test]
+fn dictionary_this_resolves_a_bare_call_through_the_proxy() {
+    assert_eq!(
+        ok(r#"
+        function globalFn() { return "ok"; }
+        var d = %[];
+        d.reader = function() { return globalFn(); };
+        return d.reader();
+        "#),
+        Variant::String("ok".to_string())
+    );
+}
+
+/// The same call shape with the name missing everywhere still reports the
+/// official member error rather than the void-to-Object conversion: the
+/// proxy's fallback ends at the global object, and the miss surfaces from the
+/// `FuncCall` walk (`TJSThrowFrom_tjs_error(TJS_E_MEMBERNOTFOUND, name)`).
+#[test]
+fn dictionary_this_bare_call_miss_reports_the_member_error() {
+    let error = failure(
+        r#"
+        var d = %[];
+        d.reader = function() { return no_such_fn(); };
+        return d.reader();
+        "#,
+    );
+    assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
+    assert_eq!(error.message, "Member \"no_such_fn\" does not exist");
+}
+
 /// `typeof <unqualified non-local name>` is *not* the must-exist member read:
 /// `GenNodeCode`'s `case T_TYPEOF` (`tjsInterCodeGen.cpp:1691-1730`) turns the
 /// child into `VM_TYPEOFD` only when the child node is already a `T_DOT` /

@@ -5061,6 +5061,40 @@ mod tests {
         );
     }
 
+    /// GINKA's `title.ks` inline-string path, reduced: `drawTitle` builds a
+    /// `%[file: ...]` Dictionary and hands it to KAGEX's
+    /// `applyInlineStringVariableExtract`, which wraps the format into an
+    /// `@'...'` source and runs `Scripts.eval(source, void, void, context)`.
+    /// The `${GetBgmTitleImageFile(file)}` placeholder is a bare call of a
+    /// *global* function with the Dictionary as the eval context, so the call
+    /// has to be the reference's direct `VM_CALLD` on the `%-2` proxy: a
+    /// `FuncCall` miss walks past the Dictionary to the global object
+    /// (`tTJSDictionaryObject::FuncCall` keeps `TJS_E_MEMBERNOTFOUND`,
+    /// `tjsDictionary.cpp:713-722`), while a property read would stop there
+    /// with void and the call would die as
+    /// `Cannot convert the variable type ((void) to Object)`.  The trailing
+    /// empty `${}` is the sentinel the game appends and must evaluate to
+    /// nothing.
+    #[test]
+    fn scripts_eval_resolves_a_bare_global_call_with_a_dictionary_context() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        assert_eq!(
+            engine
+                .execute_script(
+                    "inline.tjs",
+                    r#"
+                    function GetBgmTitleImageFile(file) { return file; }
+                    var context = new Dictionary();
+                    context.file = "bgm001";
+                    return Scripts.eval("@'bgmtitle_${GetBgmTitleImageFile(file)}${}'", void, void, context);
+                    "#,
+                )
+                .expect("inline string eval"),
+            Variant::String("bgmtitle_bgm001".to_string())
+        );
+    }
+
     #[test]
     fn scripts_object_keys_match_scriptsex_enumeration_shape() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
