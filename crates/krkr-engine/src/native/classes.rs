@@ -8790,8 +8790,9 @@ fn script_owns_transition_completion(
 /// scope, so the call is queued and delivered here — on the script thread, in
 /// the same tick the pass ran (`engine.rs` calls this right after
 /// `advance_transition`; `Layer.update()` drains its own destination
-/// directly).  A callback that throws stops the drain and is reported like any
-/// other transition callback error.
+/// directly).  A callback that throws stops its own destination's queue; every
+/// other destination still drains, and the first error is what the caller
+/// reports like any other transition callback error.
 pub(crate) fn drain_transition_script_calls(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
     let destinations = runtime.host().transition_destinations();
     let mut first_error = None;
@@ -8812,6 +8813,11 @@ pub(crate) fn drain_transition_script_calls(runtime: &mut Runtime<KrkrHost>) -> 
 /// transitions are active elsewhere.  The queue lives in the layer's extension
 /// slot (`TransitionScriptCallQueue`); a destination without one has nothing
 /// queued.
+///
+/// A call that throws stops *this* destination's queue and is returned: the
+/// remaining calls are more invocations of the same hook, so running them
+/// after one failure would only pile up exceptions the engine discards — the
+/// reported first error is the useful one.
 fn drain_transition_script_calls_for(
     runtime: &mut Runtime<KrkrHost>,
     dest: ObjectHandle,
@@ -8822,18 +8828,10 @@ fn drain_transition_script_calls_for(
     else {
         return Ok(());
     };
-    let mut first_error = None;
     for call in queue.take() {
-        if let Err(error) = runtime.call_function(call.callee, call.args)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
+        runtime.call_function(call.callee, call.args)?;
     }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 pub(crate) fn finish_completed_native_transitions(runtime: &mut Runtime<KrkrHost>) -> Result<()> {

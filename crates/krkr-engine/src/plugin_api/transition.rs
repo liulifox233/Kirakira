@@ -443,12 +443,19 @@ impl<'a> TransitionContext<'a> {
         ))
     }
 
-    /// An opaque handle for the script closure `callee` — a callable member of
-    /// the options object, the reference's dispatch-object hook
+    /// An opaque handle for the script hook `callee` — the member the
+    /// reference reaches through the option object's dispatch
     /// (`iTVPSimpleOptionProvider::GetDispatchObject`, `transhandler.h:135-139`;
     /// `tTVPSimpleOptionProvider::GetDispatchObject`, `TransIntf.cpp:116-129`).
     ///
-    /// `None` for a value that is not callable (a number, a string, `void`).
+    /// `None` for a value that is not an object — a number, a string, an octet,
+    /// `Null`, `Void`.  Any object value is accepted, because the engine
+    /// cannot tell a callable one from a data object cheaply: a proxy's target
+    /// is only resolved by the call itself (`Vm::call_handle`).  The reference
+    /// leaves the same division of labour to `FuncCall`, so an object that
+    /// cannot be called fails when the engine runs the queued call, like any
+    /// other transition callback error.
+    ///
     /// The returned handle may be stored in the handler and called from any
     /// pass; the call is queued and the engine runs it on the script thread
     /// (see [`TransitionScriptCallback`]).
