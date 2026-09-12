@@ -2054,8 +2054,15 @@ mod tests {
         };
 
         let mut max_deviation = 0.0f32;
-        for step in 0..=10 {
-            let transition = wave_transition(step as f32 / 10.0);
+        // `(progress, duration_millis)`: the progress sweep on a 1 s clock, plus
+        // the clamped-duration cases -- `1 ms` must run as the reference's 2 ms
+        // (`wave.cpp:336`) in the shader too, and `0` is the untimed fallback.
+        let cases = [(0.5f32, 1.0f32), (0.5, 2.0), (0.5, 0.0)]
+            .into_iter()
+            .chain((0..=10).map(|step| (step as f32 / 10.0, 1000.0)));
+        for (progress, duration_millis) in cases {
+            let mut transition = wave_transition(progress);
+            transition.params.duration_millis = duration_millis;
             let uniforms = transition_uniforms(
                 &transition,
                 WAVE_WIDTH as f32,
@@ -2231,8 +2238,10 @@ mod tests {
                     for channel in 0..4 {
                         let deviation = (gpu[channel] - cpu[channel]).abs();
                         max_deviation = max_deviation.max(deviation);
+                        // The device quantizes to Rgba8Unorm, so one 8-bit step is
+                        // the ceiling; the measured maximum is half of that.
                         assert!(
-                            deviation <= 2.0 / 255.0,
+                            deviation <= 1.0 / 255.0,
                             "progress {}: pixel ({x}, {y}) channel {channel}: gpu {} vs cpu {}",
                             transition.progress,
                             gpu[channel],

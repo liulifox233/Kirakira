@@ -221,6 +221,11 @@ fn duration_millis() -> f32 {
     return max(uniforms.data[10].x, 0.0);
 }
 
+// The kernel's clock: `0` means the caller supplied no duration and the phase
+// comes from `progress` alone; otherwise this is the provider-clamped duration,
+// `>= 2` ms (`wave.cpp:336`).  The clamp is applied again at the use site so a
+// caller that hands over a shorter value cannot divide by a zero half-time.
+
 // `BlendRatio = CurTime * 255 / Time` (`extrans/wave.cpp:156`).  `Blend` scales
 // by 1/256 rather than 1/255 (`common.h:18-31`), so the blend factor is the
 // reference's integer ratio over 256.  Without the millisecond clock the phase
@@ -237,7 +242,11 @@ fn wave_blend_ratio(timed: bool, cur_time: f32, total: f32, p: f32) -> f32 {
 // vacated strip on the row becomes the animated `bgcolor1 -> bgcolor2` colour,
 // and the covered span lerps `Src1` into `Src2` at `BlendRatio`
 // (`tTVPWaveTransHandler::Process`, `wave.cpp:173-261`).  Options: `maxh` (50),
-// `maxomega` (0.2), `bgcolor1`/`bgcolor2` (0), `wavetype` (0).
+// `maxomega` (0.2), `bgcolor1`/`bgcolor2` (0), `wavetype` (0), `time` in
+// milliseconds clamped to at least 2 (`:336`); the image extent is the
+// destination rectangle in logical frame pixels, where the reference uses the
+// destination layer's bitmap size (`src1w`/`src1h`, `:319-320`, `:355`) -- equal
+// unless the layer's bitmap is scaled inside its rect.
 //
 // Deviations the M36 port records rather than hides:
 //   * the reference runs on the integer millisecond clock (`CurTime =
@@ -271,9 +280,14 @@ fn transition_wave(uv: vec2<f32>) -> vec4<f32> {
     // `StartProcess` (`wave.cpp:120-166`).
     let time = duration_millis();
     let timed = time > 0.0;
-    let total = select(1.0, time, timed);
+    // `if(time < 2) time = 2;` (`wave.cpp:336`, the ctor call is `:355`): every
+    // extrans provider clamps `time` before it builds the handler, because a
+    // shorter duration would make `HalfTime = Time / 2` zero.  `0` stays the
+    // "no clock supplied" case and runs on `progress` alone.
+    let total = select(1.0, max(time, 2.0), timed);
     let cur_time = select(p, p * total, timed);
-    // `HalfTime = Time / 2` is integer division (`wave.cpp:47`).
+    // `HalfTime = Time / 2` is integer division (`wave.cpp:47`); with the clamp
+    // above it is at least 1.
     let half = select(0.5, floor(total * 0.5), timed);
     var t = clamp(cur_time, 0.0, total);
     if (t >= half) {

@@ -1207,12 +1207,21 @@ pub struct TransitionParams {
     pub max_drift: f32,
     /// The transition's duration in milliseconds: exactly the `time` option the
     /// reference constructs its handler with (`tTVPWaveTransHandler::Time`,
-    /// `wave.cpp:324-336`; the crossfade family clamps it to >= 2,
-    /// `TransIntf.cpp:528`).  Milliseconds, whole number, non-negative, no wrap
+    /// `wave.cpp:324-355`).  Milliseconds, whole number, non-negative, no wrap
     /// (the reference stores it in a `tjs_uint64`); `f32` holds every duration a
     /// game can specify (`2^24` ms is over four and a half hours, and above that
     /// only sub-millisecond precision is lost, which the reference's integer
     /// clock never needs).
+    ///
+    /// **Invariant: `0.0`, or at least `2.0`.**  Every provider clamps `time`
+    /// before it builds its handler -- `if(time < 2) time = 2;`
+    /// (`extrans/wave.cpp:336`, the ctor call at `:355`; the same idiom in
+    /// `mosaic.cpp`, `turn.cpp`, `rotatetrans.cpp`, `ripple.cpp`), and the
+    /// crossfade family clamps at `TransIntf.cpp:528`.  A handler therefore
+    /// never runs on a duration below 2 ms, and `HalfTime = Time / 2`
+    /// (`wave.cpp:47`) is never zero.  The kernels clamp again so that a caller
+    /// which stores the raw option cannot produce a division by zero, but a
+    /// caller reading this field may rely on the invariant.
     ///
     /// The extrans kernels need it because their ramps run on the millisecond
     /// clock (`CurTime = tick - StartTick`, `wave.cpp:130-160`;
