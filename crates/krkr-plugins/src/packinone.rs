@@ -1231,10 +1231,7 @@ mod tests {
                 })()"#,
             )
             .expect("csv parser target");
-        assert_eq!(
-            value,
-            Variant::String("1:a:b|2:c:d lines=2".to_owned())
-        );
+        assert_eq!(value, Variant::String("1:a:b|2:c:d lines=2".to_owned()));
     }
 
     fn test_engine(root: &Path) -> KrkrEngine {
