@@ -3384,6 +3384,14 @@ impl KrkrHost {
     /// `[trans]` projection (`apply_pending_kag_layers`).  Script layer objects
     /// never come through here for their own pixels -- they own their bitmap,
     /// see [`Self::replace_kag_layer_slots`].
+    ///
+    /// The two worlds are deliberately separate and do not see each other's
+    /// content: a script layer object cannot read what `[backlay]` /
+    /// `[image page=back]` staged here, and nothing staged here reaches a
+    /// script object's node.  Games that drive their own pages (KAGEX, and this
+    /// title's `MainWindow.tjs`) exchange pixels between their own layer
+    /// objects; only a game that mixes tag-driven pages with script page
+    /// objects would need the two brought back together.
     pub(crate) fn mutate_kag_layer<R>(
         &mut self,
         page: &str,

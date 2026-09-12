@@ -10677,6 +10677,71 @@ mod tests {
         )));
     }
 
+    /// The engine's own page slots and the game's script layer objects are
+    /// separate worlds, and this test pins the seam: a `[backlay]`/`[image
+    /// page=back]` write goes into the engine's staged page (published by the
+    /// `[trans]` projection), while a script layer writes its own node and
+    /// never reads the staging back.  Games that drive their own pages (KAGEX
+    /// and this title's `MainWindow.tjs`) therefore exchange pixels through
+    /// their layer objects; a game whose script page object is expected to pick
+    /// up tag-staged content would need the two brought back together.
+    #[test]
+    fn kag_engine_page_staging_and_script_layer_objects_stay_separate() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(null, kag.fore.base), layers: [], messages: []];
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(64, 64);
+                kag.back.base.visible = true;
+                kag.back.base.setSize(64, 64);
+                "#,
+            )
+            .expect("setup");
+
+        // The engine's own page write stages into `pending_kag_layers`.
+        engine.host_mut().mutate_kag_layer("back", "base", |layer| {
+            layer.visible = true;
+            layer.width = 64.0;
+            layer.height = 64.0;
+        });
+        let staged = engine
+            .host()
+            .kag_layer("back", "base")
+            .expect("staged page");
+        assert_eq!((staged.left, staged.width), (0.0, 64.0));
+
+        // A script layer object holds its own bitmap: its write lands on its own
+        // node and leaves the engine's staged page exactly as it was.
+        engine
+            .execute_script("inline.tjs", "kag.back.base.left = 7;")
+            .expect("script write");
+        let kag = object_handle(&engine, "kag");
+        let back = member_object(&engine, kag, "back");
+        let back_base = member_object(&engine, back, "base");
+        let back_node = engine
+            .host()
+            .native_layer(back_base)
+            .expect("back base node");
+        assert_eq!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(back_node)
+                .map(|layer| layer.left),
+            Some(7.0)
+        );
+        let staged = engine
+            .host()
+            .kag_layer("back", "base")
+            .expect("staged page");
+        assert_eq!(staged.left, 0.0);
+    }
+
     #[test]
     fn native_kag_fore_message_draw_text_renders_once() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
