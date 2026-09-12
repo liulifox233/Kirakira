@@ -452,7 +452,7 @@ pub const CATALOG: &[PluginEntry] = &[
         family: PluginFamily::Layer,
         source: "https://github.com/krkrz/krkrz/tree/last_hodgepodge_repository/src/plugins/win32/layerExPerspective",
         parquet: false,
-        meta: crate::perspective::META,
+        meta: crate::layer_ex_perspective::META,
     },
     PluginEntry {
         name: "psd.dll",
@@ -1029,7 +1029,7 @@ mod tests {
             "layerExSave.dll" => crate::layer_ex_save::META,
             "layerExShimmer.dll" => crate::layer_ex_shimmer::META,
             "multiimage.dll" => crate::multi_image::META,
-            "perspective.dll" => crate::perspective::META,
+            "perspective.dll" => crate::layer_ex_perspective::META,
             "psd.dll" => crate::psd::META,
             "shrinkCopy.dll" => crate::shrink_copy::META,
             "emoteplayer.dll" => crate::emoteplayer::META,
