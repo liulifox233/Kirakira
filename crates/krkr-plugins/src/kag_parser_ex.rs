@@ -3,12 +3,12 @@
 //! The DLL (`krkrz/src/plugins/win32/kagparserex/`) is a copy of the core KAG
 //! parser plus three extensions; `V2Link` swaps the engine's global
 //! `KAGParser` class object for the plugin's, `V2Unlink` puts the original
-//! back (`Main.cpp:15-55`).
+//! back (`Main.cpp:19-62`).
 //!
 //! 1. **`taglist`** — every tag dictionary `getNextTag` returns carries an
 //!    insertion-ordered array of its member names, tag name included
-//!    (`KAGParser.cpp:1335-1342`, filled by `ArgValue::add` `:1310-1325` with
-//!    the tag name added at `:1808-1812`). This is the part games consume, and
+//!    (`KAGParser.cpp:1333-1341`, filled by `ArgValue::add` `:1308-1326` with
+//!    the tag name added at `:1803-1806`). This is the part games consume, and
 //!    **the engine already emits it** for every KAG tag dictionary:
 //!    `tag_to_dictionary` in `crates/krkr-engine/src/kag.rs` attaches
 //!    `taglist` with `tagname` first and the attributes in scenario order.
@@ -17,7 +17,7 @@
 //! 2. **`paramMacros`** — a read-only per-instance Dictionary built in the
 //!    ctor (`:395-406`), denied to script assignment (`:2820-2833`), copied by
 //!    `assign` (`:446-451`) and round-tripped by `store`/`restore`
-//!    (`:537, 773-780`). It changes parsing: `EntryParam` (`:1544-1613`) looks
+//!    (`:537, 773-780`). It changes parsing: `EntryParam` (`:1551-1633`) looks
 //!    the lowercased attribute name up in the dictionary, and when the value
 //!    is an object it walks it in pairs, strips a leading `&`/`%` per value to
 //!    mark it entity/macro-arg, recurses (a macro entry may name another
@@ -28,11 +28,12 @@
 //!    with `processSpecialTags = false` they are ordinary tags.
 //! 3. **`multiLineTagEnabled`** — read-write, default false (`:402,
 //!    2915-2933`). While set, an attribute loop that reaches a line-final `\`
-//!    splices the next line into the current one (`:2345-2380`), requiring
+//!    splices the next line into the current one (`:2345-2373`), requiring
 //!    that line to start with `;` (a missing `;`, or running past the last
 //!    line, raises `TVPKAGSyntaxError`), drops both the `\` and the `;`, then
 //!    resumes after the consumed lines and logs `ignore after multi-line tag`
-//!    at `debugLevel >= tkdlSimple` (`:1835-1846`).
+//!    (`:1869`, inside the `TVP_KAG_STEP_NEXT` macro `:1864-1884`) at
+//!    `debugLevel >= tkdlSimple` (`:1867`).
 //!
 //! The two parsing behaviours are engine capabilities, not plugin ones. The
 //! parser that decides them is `krkr_kag::KagParser`
@@ -64,11 +65,11 @@
 //!
 //! A TJS class compiled at registration time and installed as the global
 //! `KAGParser` is the one route left open to this module, and it was rejected:
-//! it would reach only the parsers game scripts build by subclassing (the
-//! engine's own KAG session calls `KagParser::next_tag_with` directly), it
-//! would have to reimplement the attribute grammar — expansion order, `cond`,
-//! `&`/`%` evaluation — in script, and it would break the moment a game
-//! defines its own `getNextTag` or `onScenarioLoad`.
+//! it would have to reimplement the attribute grammar — expansion order,
+//! `cond`, `&`/`%` evaluation — in script, it would break the moment a game
+//! defines its own `getNextTag` or `onScenarioLoad`, and the engine's own KAG
+//! session would stay outside it either way, because that session calls
+//! `KagParser::next_tag_with` directly instead of going through the class.
 //!
 //! `kagparser_ex_members_are_absent_rather_than_inert` and
 //! `multi_line_tags_and_kag_message_texts_await_the_engine_support` pin the
@@ -282,7 +283,7 @@ mod tests {
 
     /// What a multi-line tag does today, both spellings. The DLL splices the
     /// continuation into the tag while `multiLineTagEnabled` is set
-    /// (`KAGParser.cpp:2345-2380`) and raises `TVPKAGSyntaxError` when the
+    /// (`KAGParser.cpp:2345-2373`) and raises `TVPKAGSyntaxError` when the
     /// continuation line does not start with `;`; our parser has neither the
     /// option nor those texts, so the bracketed form ends as an unclosed tag
     /// and the `@` form reads the trailing `\` as an attribute name. Replace
