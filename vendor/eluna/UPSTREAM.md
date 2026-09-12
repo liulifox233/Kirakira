@@ -36,6 +36,21 @@ reports only this file, the added licence texts and the pruned directory.
   longer matches it. Re-adding it means copying the directory back from the
   fork and adding nothing else.
 
+## Working in the vendored tree
+
+The crate builds on its own (`cargo build --manifest-path
+vendor/eluna/Cargo.toml -p eluna`), but cargo rewrites `vendor/eluna/Cargo.lock`
+while running there, because the pruned `eluna_player` is still named in the
+upstream lock. Use `CARGO_TARGET_DIR=<our target>/...` for build output and
+restore the lock afterwards (`git checkout -- vendor/eluna/Cargo.lock`) so the
+vendored tree stays byte-identical.
+
+Upstream's own `cargo test -p eluna` does not compile at this pin (a stale unit
+test at `crates/eluna/src/emote.rs:1980` is missing the `draw_frame_info`
+field), so eluna's tests are not part of our suite — `krkr-emote`'s tests cover
+the same parser/schema paths, and the vendored tree is excluded from our
+workspace.
+
 ## Licence
 
 Upstream ships **no licence files** — only the SPDX `license` field in each
