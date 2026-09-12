@@ -194,6 +194,10 @@ struct PlayerState {
     /// The plain string members (`project`, `motionKey`, `stealthChara`,
     /// `stealthMotion`), kept so a script that writes one reads it back.
     strings: BTreeMap<String, String>,
+    /// The reference's plain instance data (`preview`, the camera/mesh values
+    /// and the rest): stored verbatim so a script that writes one reads it
+    /// back, with a one-time warning that no behaviour consumes it here.
+    values: BTreeMap<String, Variant>,
 }
 
 impl PlayerState {
@@ -232,15 +236,37 @@ thread_local! {
     static WARNED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
 }
 
-/// Logs a member's "not implemented" warning once per `Class.member`.
-fn warn_unsupported(runtime: &mut Runtime<KrkrHost>, member: &str) {
-    let first = WARNED.with(|warned| warned.borrow_mut().insert(member.to_owned()));
+/// Logs a member's warning once per `Class.member`.
+fn warn_once(runtime: &mut Runtime<KrkrHost>, key: &str, message: &str) {
+    let first = WARNED.with(|warned| warned.borrow_mut().insert(key.to_owned()));
     if first {
-        runtime.host_mut().log(&format!(
+        runtime.host_mut().log(message);
+    }
+}
+
+/// Logs a member's "not implemented" warning once per `Class.member`: the call
+/// reaches nothing.
+fn warn_unsupported(runtime: &mut Runtime<KrkrHost>, member: &str) {
+    warn_once(
+        runtime,
+        member,
+        &format!(
             "WARN motionplayer.dll: {member} is not implemented yet — the call is ignored \
              (see crates/krkr-plugins/src/motion_player.rs for what is wired)"
-        ));
-    }
+        ),
+    );
+}
+
+/// Logs the softer warning of a member the port *stores* but nothing consumes.
+fn warn_stored_but_unused(runtime: &mut Runtime<KrkrHost>, member: &str) {
+    warn_once(
+        runtime,
+        member,
+        &format!(
+            "WARN motionplayer.dll: {member} is stored but nothing consumes it in this port \
+             (the camera/mesh subsystems are not implemented)"
+        ),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -366,8 +392,9 @@ const PLAYER_MEMBERS: &[&str] = &[
     "variableKeys",
 ];
 
-/// Members with a plain fixed default: a readable, writable value the port
-/// keeps verbatim but no behaviour depends on it being anything else.
+/// Members with a plain fixed default: instance data the reference carries and
+/// the port seeds with this value, then stores and returns whatever a script
+/// writes. No behaviour depends on them here, so the first access warns once.
 const PLAYER_PLAIN_DEFAULTS: &[(&str, i64)] = &[
     // `useD3D` is intentionally absent (see the module docs).
     ("preview", 0),
@@ -385,11 +412,13 @@ const PLAYER_PLAIN_DEFAULTS: &[(&str, i64)] = &[
 ];
 
 /// Value-shaped members of the D3D camera / mesh path (`zoomX`, `slantY`, the
-/// camera vectors). They are readable and writable — the port keeps whatever a
-/// script writes — but nothing consumes them, so the first read warns. The
-/// *verbs* among the unimplemented members (`setZoom`, `startWind`,
-/// `playTimeline`, …) are registered as methods instead, because a script calls
-/// them the way it calls the reference's.
+/// camera vectors). The reference keeps them as plain instance data, and so
+/// does the port: a script write is stored and read back verbatim, while the
+/// value reaches no behaviour here (the D3D render path and the mesh
+/// subsystem are not implemented), so the first access warns once. The *verbs*
+/// among the unimplemented members (`setZoom`, `startWind`, `playTimeline`, …)
+/// are registered as methods instead, because a script calls them the way it
+/// calls the reference's.
 const PLAYER_CAMERA_MEMBERS: &[&str] = &[
     "cameraTarget",
     "cameraPosition",
@@ -1142,8 +1171,13 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
 
     for (name, default) in PLAYER_PLAIN_DEFAULTS {
         if !registered.contains(name) {
-            let value = *default;
-            runtime.set_object_member(handle, *name, Variant::Integer(value));
+            register_stored_value_member(
+                runtime,
+                handle,
+                name,
+                format!("{class_name}.{name}"),
+                Variant::Integer(*default),
+            );
         }
     }
     for name in PLAYER_MEMBERS {
@@ -1167,14 +1201,11 @@ fn register_unsupported_player_member(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
     class_name: &'static str,
-    name: &str,
+    name: &'static str,
 ) {
     let member = format!("{class_name}.{name}");
     if PLAYER_CAMERA_MEMBERS.contains(&name) {
-        // Camera/system members are storable values in the reference; keep the
-        // member readable and warn on first access instead of answering a
-        // number the port cannot back.
-        warn_member_on_read(runtime, handle, member);
+        register_stored_value_member(runtime, handle, name, member, Variant::Void);
         return;
     }
     runtime.register_object_native_with_arg_count(
@@ -1190,20 +1221,42 @@ fn register_unsupported_player_member(
     );
 }
 
-/// A camera/system member: readable (holding whatever was written) with the
-/// first *read* warning, since the port stores but never consumes them.
-fn warn_member_on_read(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle, member: String) {
+/// A plain instance-data member: the setter stores what the script writes, the
+/// getter returns it (or `default` before any write), and the first access —
+/// read or write — logs the one-time "nothing consumes this here" warning.
+fn register_stored_value_member(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    name: &'static str,
+    member: String,
+    default: Variant,
+) {
     runtime.register_object_native_property(
         handle,
-        member.rsplit('.').next().unwrap_or(&member).to_owned(),
+        name,
         {
             let member = member.clone();
-            move |runtime: &mut Runtime<KrkrHost>, _this_obj: Option<ObjectHandle>| {
-                warn_unsupported(runtime, &member);
-                Ok(Variant::Void)
+            move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
+                warn_stored_but_unused(runtime, &member);
+                Ok(
+                    with_player(this_obj, |state| state.values.get(name).cloned())
+                        .flatten()
+                        .unwrap_or_else(|| default.clone()),
+                )
             }
         },
-        |_runtime: &mut Runtime<KrkrHost>, _this_obj: Option<ObjectHandle>, _value: Variant| Ok(()),
+        {
+            let member = member.clone();
+            move |runtime: &mut Runtime<KrkrHost>,
+                  this_obj: Option<ObjectHandle>,
+                  value: Variant| {
+                warn_stored_but_unused(runtime, &member);
+                with_player_mut(this_obj, |state| {
+                    state.values.insert(name.to_owned(), value);
+                });
+                Ok(())
+            }
+        },
     );
 }
 
@@ -1564,6 +1617,11 @@ fn advance_player(state: &mut PlayerState, ticks: f64) -> bool {
     };
     if loop_time >= 0.0 {
         if state.tick >= duration {
+            // The reference loops back to the motion's `loopTime`; PARQUET
+            // writes `loopTime: 0` on every looping motion (measured over all
+            // six animations of `sd101.mtn`), so wrapping at the duration
+            // lands on the same tick today. A file with a mid-animation loop
+            // point would need this to loop to `loop_time` instead.
             state.tick = state.tick.rem_euclid(duration);
         }
         return false;
@@ -1938,22 +1996,34 @@ fn player_set_scale(
     Ok(Variant::Void)
 }
 
-/// `setDrawAffineTranslateMatrix(m11, m21, m12, m22, tx, ty)` — the game passes
-/// the layer matrix's columns (`AffineSourceMotion.tjs:3172-3200`) and this
-/// port reads them in the model's own row order.
+/// `setDrawAffineTranslateMatrix(m11, m21, m12, m22, tx, ty)`: the layer
+/// matrix that places the model in the target layer.
+///
+/// The argument order is the game's own, and it is *column* order for the two
+/// off-diagonal terms: `AffineSourceMotion.tjs` passes
+/// `setDrawAffineTranslateMatrix(a.m11, a.m21, a.m12, a.m22, a.m14, a.m24)` in
+/// its `Transform`-matrix branch (`:3143-3151`) and `(a, c, b, d, tx, ty)` in
+/// the live branch (`:3172`), where the forward matrix is
+/// `[[a, b], [c, d]]` — its `revmtx` inverse is spelled out one line later as
+/// `a = d/det, b = -c/det, c = -b/det, d = a/det` with `det = a*d - b*c`, which
+/// only holds for that reading. A transposed read applies the inverse rotation
+/// and leaves pure scale/translate/mirror matrices correct, which is exactly
+/// what `affine_matrix_rotates_by_the_games_argument_order` pins down.
 fn player_set_affine(
     _runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let mut matrix = [0.0f64; 6];
-    for (index, slot) in matrix.iter_mut().enumerate() {
+    let mut arg = [0.0f64; 6];
+    for (index, slot) in arg.iter_mut().enumerate() {
         *slot = args
             .get(index)
             .map(Variant::to_real)
             .transpose()?
             .unwrap_or(0.0);
     }
+    // [m11, m21, m12, m22, tx, ty] in, [m11, m12, m21, m22, tx, ty] stored.
+    let matrix = [arg[0], arg[2], arg[1], arg[3], arg[4], arg[5]];
     with_player_mut(this_obj, |state| state.affine = Some(matrix));
     Ok(Variant::Void)
 }
@@ -2857,8 +2927,57 @@ mod tests {
             .execute_script(
                 "shapes.tjs",
                 "p.setZoom(1); p.startWind(0, 1, 1, 0, 1); p.getLayerNames(); \
-                 p.meshDivisionRatio = 1;",
+                 p.meshDivisionRatio = 1; \
+                 p.zoomX = 3.5; global.zoom = p.zoomX; \
+                 p.preview = 7; global.preview = p.preview; \
+                 p.cameraTarget = 0;",
             )
             .expect("the verb-shaped stubs are callable");
+        // The value-shaped members keep what a script writes, exactly as the
+        // reference's plain instance data does.
+        assert_eq!(real(&mut engine, "zoom"), 3.5);
+        assert_eq!(integer(&mut engine, "preview"), 7);
+    }
+
+    /// `setDrawAffineTranslateMatrix` takes the game's argument order
+    /// `(m11, m21, m12, m22, tx, ty)` — column order for the off-diagonal pair
+    /// (`AffineSourceMotion.tjs:3143-3151` and the live branch at `:3172`,
+    /// pinned by the `revmtx` inverse one line later). A transposed read
+    /// applies the inverse rotation, which every diagonal-only matrix (scale,
+    /// translate, mirror — all the other tests use) hides.
+    #[test]
+    fn affine_matrix_rotates_by_the_games_argument_order() {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [12, 12], 255),
+                -1,
+            ),
+        )]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script(
+                "affine.tjs",
+                // 90° (`cos 0, sin 1`) about the origin, then translate by
+                // (32, 0), spelled the way the game spells it.
+                "player.play(\"idle\"); \
+                 player.setDrawAffineTranslateMatrix(0, 1, -1, 0, 32, 0); \
+                 player.draw(layer);",
+            )
+            .expect("draw through the affine");
+        // The sprite covers (10..14, 10..14); +90° about the origin maps that
+        // to (18..22, 10..14) and the translation slides it there. The
+        // transposed read would send y negative and draw nothing at all.
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(20, 12)"),
+            0x00ff_ffff,
+            "the rotation lands where the game's argument order puts it"
+        );
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(12, 12)"),
+            0,
+            "the un-rotated position is empty"
+        );
     }
 }
