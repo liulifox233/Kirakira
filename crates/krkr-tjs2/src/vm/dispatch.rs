@@ -3919,8 +3919,12 @@ mod tests {
     fn calling_a_non_function_value_reports_the_convert_error() {
         // `VM_CALL` converts the callee with `AsObjectClosure()`
         // (`tjsInterCodeExec.cpp:2365`), so a value that is not an object
-        // fails that conversion rather than reaching `FuncCall`.
-        let error = failure("var value = 5; return value();");
+        // fails that conversion rather than reaching `FuncCall`.  The callee
+        // is a *local*, i.e. a register value: a top-level `var` is a member
+        // on `this` instead (`AddLocalVariable`,
+        // `tjsInterCodeGen.cpp:2653-2700`) and goes through the direct call
+        // below.
+        let error = failure("function call() { var value = 5; return value(); } return call();");
         assert_eq!(
             error.message,
             "Cannot convert the variable type ((int)5 to Object)"
@@ -3930,8 +3934,38 @@ mod tests {
 
     #[test]
     fn calling_a_null_value_reports_the_null_access() {
-        let error = failure("var value = null; return value();");
+        let error = failure("function call() { var value = null; return value(); } return call();");
         assert_eq!(error.message, "Accessing to null object");
+    }
+
+    /// The same shape with the declaration at the top level: `value` is not a
+    /// local of the context (`AddLocalVariable` puts it on `this`,
+    /// `tjsInterCodeGen.cpp:2653-2700`), so the callee is a `T_THIS_PROXY`
+    /// member and the official compiler emits a direct call
+    /// (`:1752-1813`).  The member is found and holds a non-object, which
+    /// `TJSDefaultFuncCall` reports as `TJS_E_INVALIDTYPE`
+    /// (`tjsObject.cpp:1280-1313`) rather than converting it.
+    #[test]
+    fn calling_a_top_level_non_function_value_reports_invalid_type() {
+        let error = failure("var value = 5; return value();");
+        assert_eq!(error.kind, TjsErrorKind::InvalidType);
+        assert_eq!(
+            error.message,
+            "Not a function or invalid method/property type"
+        );
+    }
+
+    /// `null` at the top level is a member holding the null object, and
+    /// `TJSDefaultFuncCall` answers `TJS_E_INVALIDTYPE` for it too: the null
+    /// variant has no dispatch to call (`tjsObject.cpp:1280-1313`).
+    #[test]
+    fn calling_a_top_level_null_value_reports_invalid_type() {
+        let error = failure("var value = null; return value();");
+        assert_eq!(error.kind, TjsErrorKind::InvalidType);
+        assert_eq!(
+            error.message,
+            "Not a function or invalid method/property type"
+        );
     }
 
     #[test]

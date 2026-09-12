@@ -3628,6 +3628,34 @@ impl ObjectBuilder {
                 });
                 tasks.push(ExprTask::Expr(expr));
             }
+            syntax::ExprKind::Identifier(ident) => {
+                // A symbol callee that is not a local of the current namespace
+                // makes the call a *direct* one: `T_LPARENTHESIS` marks it
+                // `hasnonlocalsymbol` (`tjsInterCodeGen.cpp:1752-1791`) and
+                // `GenNodeCode` rewrites the symbol into `T_THIS_PROXY . name`
+                // with `stFuncCall` (`:2149-2166`), which emits `VM_CALLD`
+                // (`:2003-2022`).  That matters beyond code shape:
+                // `iTJSDispatch2::FuncCall` has no "answer void for a miss"
+                // rule, so a Dictionary `this` lets the `%-2` proxy walk on to
+                // the global object, while a `gpd` would stop at the
+                // Dictionary with a void answer and call nothing
+                // (`tjsDictionary.cpp:720-731`).  A callee that *is* a local
+                // stays in its register and is called with `VM_CALL`.
+                if let Some(slot) = self.resolve_local_ident_slot(lowerer, ident)? {
+                    call_targets.push(CallTarget::Value(Value::Slot(slot)));
+                } else {
+                    let object = if self.force_global_context {
+                        self.global_value()
+                    } else {
+                        Value::Slot(SlotId::ThisProxy)
+                    };
+                    call_targets.push(CallTarget::Member {
+                        object,
+                        key: MemberKey::Direct(lowerer.intern_string(&ident.name)),
+                        flags: FLAGS_DEFAULT_GET,
+                    });
+                }
+            }
             _ => {
                 tasks.push(ExprTask::CallTargetValueAfter);
                 tasks.push(ExprTask::Expr(callee));

@@ -624,7 +624,23 @@ mod tests {
         // same 31.  The per-program failure set (`seed/index`, dumped on both
         // trees) is identical, so the mission added no failure -- recording
         // the measurement keeps the net tight for the work that follows.
-        const KNOWN_FAILURES: usize = 31;
+        //
+        // 31 -> 34: unqualified calls now compile the way the official
+        // compiler emits them -- `VM_CALLD` on the `%-2` this-proxy for a
+        // callee that is not a local (`tjsInterCodeGen.cpp:1752-1813`), not a
+        // `gpd` read followed by `VM_CALL`.  A call whose member holds a
+        // plain value now fails through `TJSDefaultFuncCall`
+        // (`tjsObject.cpp:1280-1313`, `TJS_E_INVALIDTYPE`, the official "Not
+        // a function or invalid method/property type") where the value call
+        // keeps the `AsObjectClosure` conversion error, so three generated
+        // programs now report different texts on the two sides: the
+        // decompiler hoists a constant callee into a top-level temp
+        // (`return (-20)();` becomes `var t1 = -20; return t1();`), and the
+        // two runs call the value through different instructions.  Measured
+        // by dumping the divergence pairs (`A=`/`B=` outcomes) on both trees:
+        // exactly those three programs appeared, none left, and the
+        // unhandled-fragment class stayed at 16.
+        const KNOWN_FAILURES: usize = 34;
         let mut covered = BTreeSet::new();
         let mut failures = Vec::new();
         let mut total = 0usize;
