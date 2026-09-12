@@ -12,6 +12,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "Window/MenuItem/Pad/Debug.console/System/Scripts extensions",
+    notes: "No-op member surface attached to the engine's existing classes.",
+    install: |engine| engine.register_plugin(WindowExPlugin),
+};
+
 pub struct WindowExPlugin;
 
 impl KrkrPlugin for WindowExPlugin {

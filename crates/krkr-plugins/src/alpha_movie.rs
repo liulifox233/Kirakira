@@ -12,6 +12,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "AlphaMovie (NI_AlphaMovie / CMoviePlayer / NI_LayerProxy)",
+    notes: "nene.dll is the same binary as AlphaMovie.dll (same build stamp and PDB path per the M24 census), so it is an alias rather than a second plugin. Validates the movie file and reports a finished one-frame movie so polling wrappers terminate; no playback.",
+    install: |engine| engine.register_plugin(AlphaMoviePlugin),
+};
+
 pub struct AlphaMoviePlugin;
 
 impl KrkrPlugin for AlphaMoviePlugin {

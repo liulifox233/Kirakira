@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "Steamworks integration",
+    notes: "Not implemented; achievements/API calls need a Steamworks binding.",
+    install: |engine| engine.register_plugin(KrkrSteamPlugin),
+};
+
 crate::placeholder::placeholder_plugin!(KrkrSteamPlugin, "krkrsteam.dll");

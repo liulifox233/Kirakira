@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "Movie drawn into a layer image",
+    notes: "Not implemented; would sit on top of the engine's native video decode.",
+    install: |engine| engine.register_plugin(LayerExMoviePlugin),
+};
+
 crate::placeholder::placeholder_plugin!(LayerExMoviePlugin, "layerExMovie.dll");

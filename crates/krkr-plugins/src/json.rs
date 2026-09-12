@@ -31,6 +31,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Implemented,
+    feature: "Scripts.evalJSON / evalJSONStorage / saveJSON / toJSONString",
+    notes: "Functional lenient JSON parser and serializer.",
+    install: |engine| engine.register_plugin(JsonPlugin),
+};
+
 /// Single error the reference throws for any parse failure
 /// (`TVPThrowExceptionMessage(TJS_W("JSONファイル のパースに失敗しました"))`);
 /// the detailed cause only goes to the log there, so it is dropped here too.

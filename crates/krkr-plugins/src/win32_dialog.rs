@@ -13,6 +13,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "WIN32Dialog",
+    notes: "No-op dialog classes (WIN32Dialog plus Header/Items/Bitmap/SolidBrush/DrawItem/Notify/Blob) with the constants scripts reference; open() reports immediately.",
+    install: |engine| engine.register_plugin(Win32DialogPlugin),
+};
+
 pub struct Win32DialogPlugin;
 
 impl KrkrPlugin for Win32DialogPlugin {

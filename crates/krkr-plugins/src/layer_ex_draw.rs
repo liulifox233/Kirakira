@@ -14,6 +14,15 @@ use krkr_tjs2::{
     runtime::{NativeFunction, ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "Layer drawing methods / GdiPlus namespace",
+    notes: "GdiPlus PointF/RectF/Matrix are functional geometry; draw* methods paint nothing and return a zeroed update RectF.",
+    install: |engine| engine.register_plugin(LayerExDrawPlugin),
+};
+
 pub struct LayerExDrawPlugin;
 
 impl KrkrPlugin for LayerExDrawPlugin {

@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "Vorbis/OGG codec registration",
+    notes: "Not implemented; the engine decodes Vorbis through krkr-audio/symphonia, but the plugin's own surface is absent.",
+    install: |engine| engine.register_plugin(WuVorbisPlugin),
+};
+
 crate::placeholder::placeholder_plugin!(WuVorbisPlugin, "wuvorbis.dll");

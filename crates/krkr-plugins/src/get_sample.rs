@@ -12,6 +12,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "WaveSoundBuffer.getSample / sampleValue / sampleCount / sampleAhead",
+    notes: "Reports silence (0 / 0.0) so lip-sync scripts stay idle.",
+    install: |engine| engine.register_plugin(GetSamplePlugin),
+};
+
 pub struct GetSamplePlugin;
 
 impl KrkrPlugin for GetSamplePlugin {

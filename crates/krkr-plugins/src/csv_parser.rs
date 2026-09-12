@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "CSVParser class",
+    notes: "Not implemented as a plugin: PackinOne already bundles a working CSVParser, so linking this file would add nothing new.",
+    install: |engine| engine.register_plugin(CsvParserPlugin),
+};
+
 crate::placeholder::placeholder_plugin!(CsvParserPlugin, "csvParser.dll");

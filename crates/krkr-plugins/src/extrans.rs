@@ -10,6 +10,15 @@
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{Result, runtime::Runtime};
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "wave / mosaic / turn / rotatezoom / rotatevanish / rotateswap / ripple transitions",
+    notes: "Marker: krkr-core degrades these transition names to crossfade.",
+    install: |engine| engine.register_plugin(ExtransPlugin),
+};
+
 pub struct ExtransPlugin;
 
 impl KrkrPlugin for ExtransPlugin {

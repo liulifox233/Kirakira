@@ -9,8 +9,12 @@
 //! [`CATALOG`] therefore lists every plugin identity with its canonical
 //! `name` (what `KrkrPlugin::name` reports and what a profile selects), the
 //! other spellings it is known by (`aliases`), the engine area it hooks
-//! (`family`), how much of it exists today (`status`), where its behaviour is
-//! documented (`source`), and whether PARQUET ships the DLL (`parquet`).
+//! (`family`), where its behaviour is documented (`source`), and whether
+//! PARQUET ships the DLL (`parquet`). What this crate has *built* of the
+//! plugin — [`PluginStatus`], the engine `feature` it covers, `notes`, and the
+//! `install` fn — is not spelled here: each entry carries its module's own
+//! [`PluginMeta`] as `meta`, so that state has one home (`src/<plugin>.rs`)
+//! while this table still shows all of it at once.
 //! Name resolution ([`resolve`], [`canonical_name`], [`is_same_plugin`]) is
 //! case-insensitive and covers aliases, so profiles and hosts can select a
 //! plugin by any spelling. [`GIST_PLUGIN_NAMES`] and [`PARQUET_PLUGIN_FILES`]
@@ -21,29 +25,16 @@
 //!
 //! A [`PluginStatus::Missing`] entry has a module under `src/<plugin>.rs`
 //! whose body is a `placeholder_plugin!` invocation: it installs no TJS
-//! surface and reports itself through the engine log. To implement it, replace
-//! that invocation with a real `KrkrPlugin` impl and update the entry's
-//! `status`/`notes` here.
+//! surface and reports itself through the engine log. Implementing the plugin
+//! is a change to that one file — replace the invocation with a real
+//! `KrkrPlugin` impl, set `META.status` to `Shim` or `Implemented`, and
+//! update `META.notes` (and `META.feature` when the surface grew). Nothing
+//! here has to move, so parallel implementations never share a file.
 
 use krkr_engine::{KrkrEngine, KrkrHost};
 use krkr_tjs2::{Result, runtime::Runtime};
 
-use crate::{
-    AddFontPlugin, AlphaMoviePlugin, CsvParserPlugin, DirlistPlugin, DmmCloudPlugin,
-    DrawDeviceD3DPlugin, DrawDeviceD3DZPlugin, EmotePlayerPlugin, ExpatPlugin, ExtKagParserPlugin,
-    ExtNaganoPlugin, ExtransPlugin, FftGraphPlugin, FstatPlugin, GamepadPlugin, GetAboutPlugin,
-    GetLangNamePlugin, GetSamplePlugin, GfxEffectPlugin, GlitchEffectPlugin, HttpRequestPlugin,
-    JsonPlugin, K2CompatPlugin, KagParserExPlugin, KagParserExbPlugin, KagexOptPlugin,
-    KaichoTransPlugin, Kirikiroid2Plugin, KrkrSteamPlugin, KrmoviePlugin, LayerExAlphaPlugin,
-    LayerExAreaAveragePlugin, LayerExBtoaPlugin, LayerExDrawPlugin, LayerExImagePlugin,
-    LayerExMoviePlugin, LayerExRasterPlugin, LayerExSavePlugin, LayerExShimmerPlugin, LzfsPlugin,
-    MenuPlugin, MinizipPlugin, MotionPlayerPlugin, MultiImagePlugin, PackinOnePlugin,
-    PerspectivePlugin, PluginMapping, PsbFilePlugin, PsdPlugin, SaveStructPlugin, ScriptsExPlugin,
-    ShrinkCopyPlugin, Sqlite3Plugin, SteamDrawDevicePlugin, TextRenderPlugin, UtilGenericPlugin,
-    UtilGraphPlugin, UtilSystemPlugin, VarfilePlugin, WfBasicEffectPlugin, WfTypicalDspPlugin,
-    Win32DialogPlugin, Win32OlePlugin, WindowExPlugin, WuOpusPlugin, WuVorbisPlugin, WutcwfPlugin,
-    Xp3FilterPlugin, YuzuExPlugin,
-};
+use crate::PluginMapping;
 
 /// Which part of the engine a plugin hooks — i.e. which code a mission
 /// implementing it has to understand.
@@ -107,7 +98,27 @@ pub enum PluginStatus {
     Missing,
 }
 
-/// One plugin identity.
+/// Implementation state of one plugin: everything that changes when the
+/// plugin is implemented. Every plugin module (`src/<plugin>.rs`) exposes its
+/// own as a `pub(crate) const META`, and [`CATALOG`] reads it from there, so
+/// implementing a plugin is a one-file change — see [`crate::placeholder`].
+///
+/// Identity fields (name spellings, [`PluginFamily`], upstream `source`,
+/// PARQUET shipping) are *not* here: they describe what the plugin is and
+/// change only when the upstream census does, so they stay in the entry.
+#[derive(Clone, Copy, Debug)]
+pub struct PluginMeta {
+    /// How much of the plugin exists today.
+    pub status: PluginStatus,
+    /// What the plugin extends in the engine — what a later mission builds.
+    pub feature: &'static str,
+    /// Coverage in this crate today, and what is left to do.
+    pub notes: &'static str,
+    /// Installs the module. One plugin per entry; see [`install_plugin`].
+    pub install: fn(&mut KrkrEngine) -> Result<()>,
+}
+
+/// One plugin identity, as the name contract sees it.
 #[derive(Clone, Copy, Debug)]
 pub struct PluginEntry {
     /// Canonical DLL name: what `KrkrPlugin::name` reports, what
@@ -116,25 +127,19 @@ pub struct PluginEntry {
     /// Other spellings of the same plugin seen in the wild.
     pub aliases: &'static [&'static str],
     pub family: PluginFamily,
-    pub status: PluginStatus,
     /// Where the plugin's behaviour is documented (upstream source, or the
     /// note that only a binary exists).
     pub source: &'static str,
     /// Whether PARQUET ships the DLL (under this name or an alias).
     pub parquet: bool,
-    /// What the plugin extends in the engine — what a later mission builds.
-    pub feature: &'static str,
-    /// Coverage in this crate today, and what is left to do.
-    pub notes: &'static str,
-    /// Installs the module. One plugin per entry; see
-    /// [`install_plugin`].
-    pub install: fn(&mut KrkrEngine) -> Result<()>,
+    /// The module's own implementation state (`crate::<module>::META`).
+    pub meta: PluginMeta,
 }
 
 impl PluginEntry {
     /// True when the entry's module installs nothing and only reports itself.
     pub fn is_placeholder(&self) -> bool {
-        self.status == PluginStatus::Missing
+        self.meta.status == PluginStatus::Missing
     }
 
     /// True when `name` names this plugin in any spelling.
@@ -148,29 +153,30 @@ impl PluginEntry {
 
     pub fn mapping(&self) -> PluginMapping {
         PluginMapping {
-            feature: self.feature,
+            feature: self.meta.feature,
             provider: crate::PluginOrigin::Plugin,
             plugin_name: Some(self.name),
-            notes: self.notes,
+            notes: self.meta.notes,
         }
     }
 }
 
-/// Every plugin identity, in registration order.
+/// Every plugin identity, in registration order, each carrying the `META` of
+/// the module named by its canonical name.
 ///
-/// The fifteen entries first are the modules that existed before this catalog
-/// and keep their original install order; the rest follow grouped by family.
+/// The modules that existed before this catalog keep their original install
+/// order: the fourteen entries first, then `lzfs.dll` — the KaichoTrans
+/// placeholder between them installs nothing, so no real module changed
+/// position. The entries after `lzfs.dll` are the census tail, grouped by
+/// family as far as the two source lists allowed.
 pub const CATALOG: &[PluginEntry] = &[
     PluginEntry {
         name: "addFont.dll",
         aliases: &["AddFont.dll"],
         family: PluginFamily::Font,
-        status: PluginStatus::Implemented,
         source: "https://github.com/wtnbgo/addFont",
         parquet: false,
-        feature: "System.addFont",
-        notes: "Registers fonts from game storage through the engine font system.",
-        install: |engine| engine.register_plugin(AddFontPlugin),
+        meta: crate::add_font::META,
     },
     PluginEntry {
         name: "motionplayer.dll",
@@ -180,738 +186,537 @@ pub const CATALOG: &[PluginEntry] = &[
             "MotionPlayer_nod3D.dll",
         ],
         family: PluginFamily::Movie,
-        status: PluginStatus::Shim,
         source: "(no public source; PARQUET ships motionplayer.dll and the no-D3D build)",
         parquet: true,
-        feature: "Motion / Motion.Player / Motion.EmotePlayer",
-        notes: "Motion.Player/EmotePlayer constructors exist and report idle/zero state; no motion playback.",
-        install: |engine| engine.register_plugin(MotionPlayerPlugin),
+        meta: crate::motion_player::META,
     },
     PluginEntry {
         name: "win32dialog.dll",
         aliases: &["Win32Dialog.dll"],
         family: PluginFamily::System,
-        status: PluginStatus::Shim,
         source: "https://github.com/wtnbgo/win32dialog",
         parquet: true,
-        feature: "WIN32Dialog",
-        notes: "No-op dialog classes (WIN32Dialog plus Header/Items/Bitmap/SolidBrush/DrawItem/Notify/Blob) with the constants scripts reference; open() reports immediately.",
-        install: |engine| engine.register_plugin(Win32DialogPlugin),
+        meta: crate::win32_dialog::META,
     },
     PluginEntry {
         name: "windowEx.dll",
         aliases: &["WindowEx.dll"],
         family: PluginFamily::System,
-        status: PluginStatus::Shim,
         source: "https://github.com/wtnbgo/windowEx",
         parquet: true,
-        feature: "Window/MenuItem/Pad/Debug.console/System/Scripts extensions",
-        notes: "No-op member surface attached to the engine's existing classes.",
-        install: |engine| engine.register_plugin(WindowExPlugin),
+        meta: crate::window_ex::META,
     },
     PluginEntry {
         name: "json.dll",
         aliases: &["Json.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Implemented,
         source: "https://github.com/wtnbgo/json",
         parquet: true,
-        feature: "Scripts.evalJSON / evalJSONStorage / saveJSON / toJSONString",
-        notes: "Functional lenient JSON parser and serializer.",
-        install: |engine| engine.register_plugin(JsonPlugin),
+        meta: crate::json::META,
     },
     PluginEntry {
         name: "PackinOne.dll",
         aliases: &["packinone.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Shim,
         source: "PackinOne bundle (csvParser, scriptsEx, saveStruct, fstat, shrinkCopy, layerEx*, process)",
         parquet: true,
-        feature: "CSVParser, Scripts.loadDataPack, Storages.saveOctet, System.getOSVersion, Layer effects",
-        notes: "CSVParser, storages octet I/O, URL codecs and Scripts.loadDataPack/clone are functional; the rest of the bundle is no-op surface.",
-        install: |engine| engine.register_plugin(PackinOnePlugin),
+        meta: crate::packinone::META,
     },
     PluginEntry {
         name: "layerExDraw.dll",
         aliases: &["LayerExDraw.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Shim,
         source: "https://github.com/wtnbgo/layerExDraw",
         parquet: true,
-        feature: "Layer drawing methods / GdiPlus namespace",
-        notes: "GdiPlus PointF/RectF/Matrix are functional geometry; draw* methods paint nothing and return a zeroed update RectF.",
-        install: |engine| engine.register_plugin(LayerExDrawPlugin),
+        meta: crate::layer_ex_draw::META,
     },
     PluginEntry {
         name: "textrender.dll",
         aliases: &["TextRender.dll", "textRender.dll"],
         family: PluginFamily::Text,
-        status: PluginStatus::Implemented,
         source: "(no public source; TextRenderBase is subclassed by the game's own TextRender.tjs)",
         parquet: true,
-        feature: "TextRenderBase",
-        notes: "Line layout, character geometry and ruby grouping are implemented; glyph painting goes through Layer.drawText.",
-        install: |engine| engine.register_plugin(TextRenderPlugin),
+        meta: crate::text_render::META,
     },
     PluginEntry {
         name: "psbfile.dll",
         aliases: &["PSBFile.dll", "psbFile.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Implemented,
         source: "(no public source; M2 PSB container format)",
         parquet: true,
-        feature: "PSBFile / PSBValueClass",
-        notes: "Decodes PSB object trees into TJS dictionaries/arrays/octets and mounts embedded resources.",
-        install: |engine| engine.register_plugin(PsbFilePlugin),
+        meta: crate::psb_file::META,
     },
     PluginEntry {
         name: "AlphaMovie.dll",
         aliases: &["alphamovie.dll", "nene.dll", "Nene.dll"],
         family: PluginFamily::Movie,
-        status: PluginStatus::Shim,
         source: "http://kaede-software.com/krlm/plugin/alphamovie.zip",
         parquet: true,
-        feature: "AlphaMovie (NI_AlphaMovie / CMoviePlayer / NI_LayerProxy)",
-        notes: "nene.dll is the same binary as AlphaMovie.dll (same build stamp and PDB path per the M24 census), so it is an alias rather than a second plugin. Validates the movie file and reports a finished one-frame movie so polling wrappers terminate; no playback.",
-        install: |engine| engine.register_plugin(AlphaMoviePlugin),
+        meta: crate::alpha_movie::META,
     },
     PluginEntry {
         name: "getSample.dll",
         aliases: &["GetSample.dll"],
         family: PluginFamily::Audio,
-        status: PluginStatus::Shim,
         source: "https://github.com/wtnbgo/getSample",
         parquet: true,
-        feature: "WaveSoundBuffer.getSample / sampleValue / sampleCount / sampleAhead",
-        notes: "Reports silence (0 / 0.0) so lip-sync scripts stay idle.",
-        install: |engine| engine.register_plugin(GetSamplePlugin),
+        meta: crate::get_sample::META,
     },
     PluginEntry {
         name: "KAGParserEx.dll",
         aliases: &["kagparserex.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Shim,
         source: "https://github.com/wtnbgo/KAGParserEx",
         parquet: true,
-        feature: "KAGParser tag dictionaries expose taglist",
-        notes: "Marker: the engine already attaches the ordered taglist to every KAG tag dictionary; paramMacros/pmacro/multiLineTagEnabled are not implemented.",
-        install: |engine| engine.register_plugin(KagParserExPlugin),
+        meta: crate::kag_parser_ex::META,
     },
     PluginEntry {
         name: "extrans.dll",
         aliases: &["Extrans.dll"],
         family: PluginFamily::Transition,
-        status: PluginStatus::Shim,
         source: "https://github.com/krkrz/SamplePlugin/tree/master/extrans",
         parquet: true,
-        feature: "wave / mosaic / turn / rotatezoom / rotatevanish / rotateswap / ripple transitions",
-        notes: "Marker: krkr-core degrades these transition names to crossfade.",
-        install: |engine| engine.register_plugin(ExtransPlugin),
+        meta: crate::extrans::META,
     },
     PluginEntry {
         name: "extNagano.dll",
         aliases: &["ExtNagano.dll"],
         family: PluginFamily::Transition,
-        status: PluginStatus::Shim,
         source: "https://web.archive.org/web/20120604091809fw_/http://ymtkyk.sakura.ne.jp/krkr.STG/plugin/extNagano.html",
         parquet: true,
-        feature: "zoomfade / blurfade / scanline / 3duniversal / rgbfade / spin / flutter / imagewipe / book / honeyturn / morphing / multiripple transitions",
-        notes: "Marker: krkr-core degrades these transition names to crossfade.",
-        install: |engine| engine.register_plugin(ExtNaganoPlugin),
+        meta: crate::extnagano::META,
     },
     PluginEntry {
         name: "KaichoTrans.dll",
         aliases: &["kaichotrans.dll"],
         family: PluginFamily::Transition,
-        status: PluginStatus::Missing,
         source: "http://keepcreating.g2.xrea.com/krkrplugins/KaichoTrans/KaichoTrans.zip",
         parquet: false,
-        feature: "Extra Layer.beginTransition methods (kaicho family)",
-        notes: "Not implemented; transition names currently degrade to crossfade in krkr-core, so scripts keep running with the wrong effect.",
-        install: |engine| engine.register_plugin(KaichoTransPlugin),
+        meta: crate::kaicho_trans::META,
     },
     PluginEntry {
         name: "lzfs.dll",
         aliases: &["Lzfs.dll"],
         family: PluginFamily::Archive,
-        status: PluginStatus::Shim,
         source: "(no public source; lzfs archive reader)",
         parquet: true,
-        feature: "lzfs archive support",
-        notes: "Marker: no TJS surface, and the engine has no lzfs reader yet, so .lzfs archives stay unreadable.",
-        install: |engine| engine.register_plugin(LzfsPlugin),
+        meta: crate::lzfs::META,
     },
     PluginEntry {
         name: "minizip.dll",
         aliases: &[],
         family: PluginFamily::Archive,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/minizip",
         parquet: false,
-        feature: "ZIP archive reading and writing",
-        notes: "Not implemented; ZIP support would have to reach the storage layer, not just the script surface.",
-        install: |engine| engine.register_plugin(MinizipPlugin),
+        meta: crate::minizip::META,
     },
     PluginEntry {
         name: "varfile.dll",
         aliases: &[],
         family: PluginFamily::Archive,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/varfile",
         parquet: false,
-        feature: "Virtual/bundled data files mounted as storages",
-        notes: "Not implemented; overlaps the engine's external-resource provision path.",
-        install: |engine| engine.register_plugin(VarfilePlugin),
+        meta: crate::varfile::META,
     },
     PluginEntry {
         name: "xp3filter.dll",
         aliases: &["Xp3Filter.dll"],
         family: PluginFamily::Archive,
-        status: PluginStatus::Missing,
         source: "(no public source; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "XP3 read filtering",
-        notes: "Not implemented; archive filtering would have to happen inside krkr-xp3's read path.",
-        install: |engine| engine.register_plugin(Xp3FilterPlugin),
+        meta: crate::xp3_filter::META,
     },
     PluginEntry {
         name: "fftgraph.dll",
         aliases: &[],
         family: PluginFamily::Audio,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/fftgraph",
         parquet: false,
-        feature: "FFT spectrum graph of playing audio",
-        notes: "Not implemented; the engine already exposes sample data through getSample's stub, not through FFT.",
-        install: |engine| engine.register_plugin(FftGraphPlugin),
+        meta: crate::fft_graph::META,
     },
     PluginEntry {
         name: "wuopus.dll",
         aliases: &[],
         family: PluginFamily::Audio,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Opus codec registration",
-        notes: "Not implemented; the engine decodes Opus in krkr-audio behind the optional `opus` feature, but the plugin's own surface is absent.",
-        install: |engine| engine.register_plugin(WuOpusPlugin),
+        meta: crate::wuopus::META,
     },
     PluginEntry {
         name: "wuvorbis.dll",
         aliases: &[],
         family: PluginFamily::Audio,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Vorbis/OGG codec registration",
-        notes: "Not implemented; the engine decodes Vorbis through krkr-audio/symphonia, but the plugin's own surface is absent.",
-        install: |engine| engine.register_plugin(WuVorbisPlugin),
+        meta: crate::wuvorbis::META,
     },
     PluginEntry {
         name: "gamepad.dll",
         aliases: &[],
         family: PluginFamily::Input,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Gamepad input",
-        notes: "Not implemented; input reaches the engine through krkr-core's input events only.",
-        install: |engine| engine.register_plugin(GamepadPlugin),
+        meta: crate::gamepad::META,
     },
     PluginEntry {
         name: "GlitchEffect.dll",
         aliases: &["glitcheffect.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Glitch/CRT layer effect",
-        notes: "Not implemented; PARQUET ships it, so its usage should be checked before the effect is built.",
-        install: |engine| engine.register_plugin(GlitchEffectPlugin),
+        meta: crate::glitch_effect::META,
     },
     PluginEntry {
         name: "gfxEffect.dll",
         aliases: &[],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "http://kaede-software.com/krlm/plugin/gfx_effect.zip",
         parquet: false,
-        feature: "Kaede layer effects (blur/glow family)",
-        notes: "Not implemented; the engine's Layer has no effect pipeline to hang these on yet.",
-        install: |engine| engine.register_plugin(GfxEffectPlugin),
+        meta: crate::gfx_effect::META,
     },
     PluginEntry {
         name: "layerExAlpha.dll",
         aliases: &["LayerExAlpha.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "(no public source; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "Layer alpha channel operations",
-        notes: "Not implemented; alpha extract/replace has no engine-side entry point.",
-        install: |engine| engine.register_plugin(LayerExAlphaPlugin),
+        meta: crate::layer_ex_alpha::META,
     },
     PluginEntry {
         name: "layerExAreaAverage.dll",
         aliases: &["LayerExAreaAverage.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/layerExAreaAverage",
         parquet: false,
-        feature: "Average colour of a layer image area",
-        notes: "Not implemented; needs layer pixel access, which the engine already has internally.",
-        install: |engine| engine.register_plugin(LayerExAreaAveragePlugin),
+        meta: crate::layer_ex_area_average::META,
     },
     PluginEntry {
         name: "layerExBTOA.dll",
         aliases: &["LayerExBTOA.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/layerExBTOA",
         parquet: false,
-        feature: "Layer image operator/alpha blit",
-        notes: "Not implemented; exact member list still to be confirmed from the census.",
-        install: |engine| engine.register_plugin(LayerExBtoaPlugin),
+        meta: crate::layer_ex_btoa::META,
     },
     PluginEntry {
         name: "layerExImage.dll",
         aliases: &["LayerExImage.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/layerExImage",
         parquet: false,
-        feature: "Layer image load/blit helpers",
-        notes: "Not implemented; the two spellings in the plugin list (`LayerExImage.dll`, `layerExImage.dll`) are one plugin.",
-        install: |engine| engine.register_plugin(LayerExImagePlugin),
+        meta: crate::layer_ex_image::META,
     },
     PluginEntry {
         name: "layerExMovie.dll",
         aliases: &["LayerExMovie.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkrz/tree/last_hodgepodge_repository/src/plugins/win32/layerExMovie",
         parquet: false,
-        feature: "Movie drawn into a layer image",
-        notes: "Not implemented; would sit on top of the engine's native video decode.",
-        install: |engine| engine.register_plugin(LayerExMoviePlugin),
+        meta: crate::layer_ex_movie::META,
     },
     PluginEntry {
         name: "layerExRaster.dll",
         aliases: &["LayerExRaster.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/layerExRaster",
         parquet: false,
-        feature: "Rasterisation (polygon/line) onto a layer image",
-        notes: "Not implemented; overlaps the drawing surface layerExDraw still lacks.",
-        install: |engine| engine.register_plugin(LayerExRasterPlugin),
+        meta: crate::layer_ex_raster::META,
     },
     PluginEntry {
         name: "layerExSave.dll",
         aliases: &["LayerExSave.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/layerExSave",
         parquet: false,
-        feature: "Save layer images to image files",
-        notes: "Not implemented; image encoding has no path from layer pixels yet.",
-        install: |engine| engine.register_plugin(LayerExSavePlugin),
+        meta: crate::layer_ex_save::META,
     },
     PluginEntry {
         name: "layerExShimmer.dll",
         aliases: &["LayerExShimmer.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "http://keepcreating.g2.xrea.com/krkrplugins/ShimmerPlugin/layerExShimmer.zip",
         parquet: false,
-        feature: "Shimmer/hologram layer effect",
-        notes: "Not implemented; a shader-backed effect would land in krkr-render.",
-        install: |engine| engine.register_plugin(LayerExShimmerPlugin),
+        meta: crate::layer_ex_shimmer::META,
     },
     PluginEntry {
         name: "multiimage.dll",
         aliases: &["MultiImage.dll"],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "(no public source; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "Image sheet split into several layer images",
-        notes: "Not implemented; sheet splitting is expressible with the engine's existing blits.",
-        install: |engine| engine.register_plugin(MultiImagePlugin),
+        meta: crate::multi_image::META,
     },
     PluginEntry {
         name: "perspective.dll",
         aliases: &[],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkrz/tree/last_hodgepodge_repository/src/plugins/win32/layerExPerspective",
         parquet: false,
-        feature: "Four-corner perspective transform of layer images",
-        notes: "Not implemented; krkr-render has no perspective blit yet.",
-        install: |engine| engine.register_plugin(PerspectivePlugin),
+        meta: crate::perspective::META,
     },
     PluginEntry {
         name: "psd.dll",
         aliases: &[],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Photoshop PSD loading",
-        notes: "Not implemented; PSD parsing plus layer reconstruction is needed before layer names/opacity can be honoured.",
-        install: |engine| engine.register_plugin(PsdPlugin),
+        meta: crate::psd::META,
     },
     PluginEntry {
         name: "shrinkCopy.dll",
         aliases: &[],
         family: PluginFamily::Layer,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/shrinkCopy",
         parquet: false,
-        feature: "Downscaled blit onto layers",
-        notes: "Not implemented; the engine's stretch blits cover the pixels, the plugin's own members are absent.",
-        install: |engine| engine.register_plugin(ShrinkCopyPlugin),
+        meta: crate::shrink_copy::META,
     },
     PluginEntry {
         name: "emoteplayer.dll",
         aliases: &["EmotePlayer.dll"],
         family: PluginFamily::Movie,
-        status: PluginStatus::Missing,
         source: "(no public source; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "EmotePlayer (MPEG emote playback)",
-        notes: "Not implemented; the motionplayer shim already installs a Motion.EmotePlayer class, so scripts see the name but not the playback.",
-        install: |engine| engine.register_plugin(EmotePlayerPlugin),
+        meta: crate::emoteplayer::META,
     },
     PluginEntry {
         name: "krmovie.dll",
         aliases: &[],
         family: PluginFamily::Movie,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkrz",
         parquet: true,
-        feature: "MoviePlayer / VideoOverlay",
-        notes: "Not implemented; movies already play through the engine's native VideoOverlay (krkr-video), but the plugin's TJS classes are not installed.",
-        install: |engine| engine.register_plugin(KrmoviePlugin),
+        meta: crate::krmovie::META,
     },
     PluginEntry {
         name: "DrawDeviceD3D.dll",
         aliases: &["drawdeviceD3D.dll"],
         family: PluginFamily::Render,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkr2/tree/master/kirikiri2/trunk/kirikiri2/src/plugins/win32/drawdeviceD3D",
         parquet: false,
-        feature: "Direct3D draw device",
-        notes: "Not implemented; Kirakira renders through wgpu, so the draw-device surface would be a compatibility marker.",
-        install: |engine| engine.register_plugin(DrawDeviceD3DPlugin),
+        meta: crate::draw_device_d3d::META,
     },
     PluginEntry {
         name: "DrawDeviceD3DZ.dll",
         aliases: &[],
         family: PluginFamily::Render,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkrz/tree/last_hodgepodge_repository/src/plugins/win32/drawdeviceD3D",
         parquet: false,
-        feature: "krkrz Direct3D draw device",
-        notes: "Not implemented; same as DrawDeviceD3D.dll — the engine's renderer replaces it.",
-        install: |engine| engine.register_plugin(DrawDeviceD3DZPlugin),
+        meta: crate::draw_device_d3dz::META,
     },
     PluginEntry {
         name: "SteamDrawDevice.dll",
         aliases: &["steamdrawdevice.dll", "DualDrawDevice.dll"],
         family: PluginFamily::Render,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it — built from the DualDrawDevice project per the M24 census)",
         parquet: true,
-        feature: "Draw device (DrawDeviceClass<tTVPBasicDrawDevice<K2/KZInterfaceTypes>>)",
-        notes: "Not implemented; only matters if PARQUET's Steam build requires it for overlay rendering.",
-        install: |engine| engine.register_plugin(SteamDrawDevicePlugin),
+        meta: crate::steam_draw_device::META,
     },
     PluginEntry {
         name: "csvParser.dll",
         aliases: &["CSVParser.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/csvParser",
         parquet: false,
-        feature: "CSVParser class",
-        notes: "Not implemented as a plugin: PackinOne already bundles a working CSVParser, so linking this file would add nothing new.",
-        install: |engine| engine.register_plugin(CsvParserPlugin),
+        meta: crate::csv_parser::META,
     },
     PluginEntry {
         name: "dirlist.dll",
         aliases: &[],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkrz/tree/last_hodgepodge_repository/src/plugins/win32/dirlist",
         parquet: false,
-        feature: "Storage directory listing",
-        notes: "Not implemented; the engine can already list storages, so this is a matter of the plugin's own member names.",
-        install: |engine| engine.register_plugin(DirlistPlugin),
+        meta: crate::dirlist::META,
     },
     PluginEntry {
         name: "expat.dll",
         aliases: &[],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkrz/tree/last_hodgepodge_repository/src/plugins/win32/expat",
         parquet: false,
-        feature: "XML (expat) parsing",
-        notes: "Not implemented; needs an XML parser behind the plugin's class surface.",
-        install: |engine| engine.register_plugin(ExpatPlugin),
+        meta: crate::expat::META,
     },
     PluginEntry {
         name: "ExtKAGParser.dll",
         aliases: &["extKAGParser.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "http://keepcreating.g2.xrea.com/krkrplugins/ExtKAGParser/ExtKAGParser-0143.zip",
         parquet: false,
-        feature: "Extra KAGParser helpers",
-        notes: "Not implemented; check whether PARQUET's KAG scripts need its tag dictionary extensions.",
-        install: |engine| engine.register_plugin(ExtKagParserPlugin),
+        meta: crate::ext_kag_parser::META,
     },
     PluginEntry {
         name: "fstat.dll",
         aliases: &[],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/fstat",
         parquet: false,
-        feature: "File statistics for storages and placed files",
-        notes: "Not implemented; the engine's storage layer exposes existence and listing, not the plugin's stat members.",
-        install: |engine| engine.register_plugin(FstatPlugin),
+        meta: crate::fstat::META,
     },
     PluginEntry {
         name: "KAGParserExb.dll",
         aliases: &["kagparserexb.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/sakano/krkr_archives/tree/master/kagex_plugin/KAGParserExb",
         parquet: false,
-        feature: "KAGParserExb variant",
-        notes: "Not implemented; a separate plugin from KAGParserEx.dll, not an alias of it.",
-        install: |engine| engine.register_plugin(KagParserExbPlugin),
+        meta: crate::kag_parser_exb::META,
     },
     PluginEntry {
         name: "k2compat.dll",
         aliases: &[],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "kirikiroid2 compatibility layer",
-        notes: "Not implemented; relevant because PARQUET also ships kirikiroid2.dll and may expect its compat globals.",
-        install: |engine| engine.register_plugin(K2CompatPlugin),
+        meta: crate::k2compat::META,
     },
     PluginEntry {
         name: "kagexopt.dll",
         aliases: &[],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it — exports only GetOptionDesc per the M24 census)",
         parquet: true,
-        feature: "KAG option description resource (GetOptionDesc export; vomstyle/overlay/mixer/layer/… option names)",
-        notes: "Not implemented; it is a resource plugin rather than a TJS surface, so the option descriptions have to reach KAG's config handling.",
-        install: |engine| engine.register_plugin(KagexOptPlugin),
+        meta: crate::kagexopt::META,
     },
     PluginEntry {
         name: "kirikiroid2.dll",
         aliases: &[],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "(no public source; the kirikiroid2 port's own module)",
         parquet: false,
-        feature: "kirikiroid2 runtime module",
-        notes: "Not implemented; Kirakira is a desktop engine, so the port-specific globals it adds are only needed if a game probes for them.",
-        install: |engine| engine.register_plugin(Kirikiroid2Plugin),
+        meta: crate::kirikiroid2::META,
     },
     PluginEntry {
         name: "savestruct.dll",
         aliases: &["saveStruct.dll", "SaveStruct.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/saveStruct",
         parquet: false,
-        feature: "TJS object graph (de)serialization",
-        notes: "Not implemented; games that use it cannot save nested structures until it lands.",
-        install: |engine| engine.register_plugin(SaveStructPlugin),
+        meta: crate::save_struct::META,
     },
     PluginEntry {
         name: "scriptsEx.dll",
         aliases: &["ScriptsEx.dll"],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/wtnbgo/scriptsEx",
         parquet: false,
-        feature: "Extra Scripts/System helper methods",
-        notes: "Not implemented; PackinOne bundles part of this surface already.",
-        install: |engine| engine.register_plugin(ScriptsExPlugin),
+        meta: crate::scripts_ex::META,
     },
     PluginEntry {
         name: "sqlite3.dll",
         aliases: &[],
         family: PluginFamily::Script,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/krkrz/tree/last_hodgepodge_repository/src/plugins/win32/sqlite3",
         parquet: false,
-        feature: "SQLite access",
-        notes: "Not implemented; would need a Rust SQLite dependency and the plugin's class surface.",
-        install: |engine| engine.register_plugin(Sqlite3Plugin),
+        meta: crate::sqlite3::META,
     },
     PluginEntry {
         name: "yuzuex.dll",
         aliases: &["proxyfs.dll"],
         family: PluginFamily::Archive,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it — built from the proxyfs project per the M24 census)",
         parquet: true,
-        feature: "ProxyStorageMap / proxyfs storage remapping",
-        notes: "Not implemented; it is a storage-media plugin (no TJS surface), so the remap has to happen where archives are resolved.",
-        install: |engine| engine.register_plugin(YuzuExPlugin),
+        meta: crate::yuzuex::META,
     },
     PluginEntry {
         name: "dmmcloud.dll",
         aliases: &[],
         family: PluginFamily::System,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "DMM GAMES platform integration (cloud save / account)",
-        notes: "Not implemented; platform-locked, so PARQUET only reaches it on a DMM build.",
-        install: |engine| engine.register_plugin(DmmCloudPlugin),
+        meta: crate::dmmcloud::META,
     },
     PluginEntry {
         name: "getabout.dll",
         aliases: &[],
         family: PluginFamily::System,
-        status: PluginStatus::Missing,
         source: "(no public source; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "About/build information surface",
-        notes: "Not implemented; launcher scripts that print build info will not find its members.",
-        install: |engine| engine.register_plugin(GetAboutPlugin),
+        meta: crate::get_about::META,
     },
     PluginEntry {
         name: "getLangName.dll",
         aliases: &["getlangname.dll"],
         family: PluginFamily::System,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "OS/user language name",
-        notes: "Not implemented; PARQUET ships it, so a language-selection path may depend on it.",
-        install: |engine| engine.register_plugin(GetLangNamePlugin),
+        meta: crate::get_lang_name::META,
     },
     PluginEntry {
         name: "httprequest.dll",
         aliases: &[],
         family: PluginFamily::System,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "HTTP(S) requests from scripts",
-        notes: "Not implemented; needs a network stack and a decision about what a game's requests should do offline.",
-        install: |engine| engine.register_plugin(HttpRequestPlugin),
+        meta: crate::http_request::META,
     },
     PluginEntry {
         name: "krkrsteam.dll",
         aliases: &[],
         family: PluginFamily::System,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Steamworks integration",
-        notes: "Not implemented; achievements/API calls need a Steamworks binding.",
-        install: |engine| engine.register_plugin(KrkrSteamPlugin),
+        meta: crate::krkrsteam::META,
     },
     PluginEntry {
         name: "menu.dll",
         aliases: &[],
         family: PluginFamily::System,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Native menu (menu bar / context menu)",
-        notes: "Not implemented; the windowed shells have no menu surface yet.",
-        install: |engine| engine.register_plugin(MenuPlugin),
+        meta: crate::menu::META,
     },
     PluginEntry {
         name: "win32ole.dll",
         aliases: &[],
         family: PluginFamily::System,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it)",
         parquet: true,
-        feature: "Win32 OLE automation",
-        notes: "Not implemented; Windows-only by nature, so other platforms can only degrade.",
-        install: |engine| engine.register_plugin(Win32OlePlugin),
+        meta: crate::win32ole::META,
     },
     PluginEntry {
         name: "util_generic.dll",
         aliases: &[],
         family: PluginFamily::Unknown,
-        status: PluginStatus::Missing,
         source: "(no source and no binary anywhere; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "(unidentified surface)",
-        notes: "Not implemented; nothing to census. Implement from observed KAGEX usage and keep the surface marked unverified.",
-        install: |engine| engine.register_plugin(UtilGenericPlugin),
+        meta: crate::util_generic::META,
     },
     PluginEntry {
         name: "util_graph.dll",
         aliases: &[],
         family: PluginFamily::Unknown,
-        status: PluginStatus::Missing,
         source: "(no source and no binary anywhere; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "(unidentified surface)",
-        notes: "Not implemented; nothing to census. Implement from observed KAGEX usage and keep the surface marked unverified.",
-        install: |engine| engine.register_plugin(UtilGraphPlugin),
+        meta: crate::util_graph::META,
     },
     PluginEntry {
         name: "util_system.dll",
         aliases: &[],
         family: PluginFamily::Unknown,
-        status: PluginStatus::Missing,
         source: "(no source and no binary anywhere; in the kirikiroid2 plugin list)",
         parquet: false,
-        feature: "(unidentified surface)",
-        notes: "Not implemented; nothing to census. Implement from observed KAGEX usage and keep the surface marked unverified.",
-        install: |engine| engine.register_plugin(UtilSystemPlugin),
+        meta: crate::util_system::META,
     },
     PluginEntry {
         name: "wfBasicEffect.dll",
         aliases: &[],
         family: PluginFamily::Audio,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it — class names recovered by the M24 census)",
         parquet: true,
-        feature: "GraphicEqualizer / StkFreeVerb / WaveDelay filters on WaveSoundBuffer",
-        notes: "Not implemented; needs DSP hooks in krkr-audio that WaveSoundBuffer can drive.",
-        install: |engine| engine.register_plugin(WfBasicEffectPlugin),
+        meta: crate::wf_basic_effect::META,
     },
     PluginEntry {
         name: "wfTypicalDSP.dll",
         aliases: &[],
         family: PluginFamily::Audio,
-        status: PluginStatus::Missing,
         source: "(no public source; PARQUET ships it — class names recovered by the M24 census)",
         parquet: true,
-        feature: "WaveDSPFilter (tTJSNC_WaveDSPFilter / tTJSNI_WaveDSPFilter) on WaveSoundBuffer",
-        notes: "Not implemented; PARQUET ships it, so check whether the game uses it before the DSP chain is built.",
-        install: |engine| engine.register_plugin(WfTypicalDspPlugin),
+        meta: crate::wf_typical_dsp::META,
     },
     PluginEntry {
         name: "wutcwf.dll",
         aliases: &[],
         family: PluginFamily::Unknown,
-        status: PluginStatus::Missing,
         source: "https://github.com/krkrz/SamplePlugin/tree/master/wutcwf",
         parquet: false,
-        feature: "(surface still to be read from the plugin's source)",
-        notes: "Not implemented; source exists in krkrz's SamplePlugin tree (plus a Kirikiroid2 port), so read it before implementing.",
-        install: |engine| engine.register_plugin(WutcwfPlugin),
+        meta: crate::wutcwf::META,
     },
 ];
 
@@ -919,7 +724,8 @@ pub const CATALOG: &[PluginEntry] = &[
 /// (<https://gist.github.com/uyjulian/060e6d7e4a0ca50916182b351590867b>),
 /// verbatim — including the duplicate spellings (`LayerExImage.dll` /
 /// `layerExImage.dll`, `savestruct.dll` / `saveStruct.dll`) that the alias
-/// list has to absorb.
+/// list has to absorb. Kept in alphabetical order rather than the gist's own
+/// order; the tests compare it as a set, so the order carries no meaning.
 pub const GIST_PLUGIN_NAMES: &[&str] = &[
     "AlphaMovie.dll",
     "DrawDeviceD3D.dll",
@@ -1057,9 +863,10 @@ pub fn plugin_mappings() -> impl Iterator<Item = PluginMapping> {
         .chain(CATALOG.iter().map(PluginEntry::mapping))
 }
 
-/// Installs one catalog entry into `engine`.
+/// Installs one catalog entry into `engine` through the module that owns it
+/// (`entry.meta.install`).
 pub fn install_plugin(engine: &mut KrkrEngine, entry: &PluginEntry) -> Result<()> {
-    (entry.install)(engine)
+    (entry.meta.install)(engine)
 }
 
 /// Reports a plugin that has no implementation. Called by the placeholder
@@ -1173,10 +980,170 @@ mod tests {
                 entry.name
             );
             assert!(
-                entry.status == PluginStatus::Missing,
+                entry.meta.status == PluginStatus::Missing,
                 "{} is a placeholder but not marked as one",
                 entry.name
             );
+        }
+    }
+
+    /// The `META` each plugin module exposes, keyed by canonical name. The
+    /// table is spelled out here rather than derived from `CATALOG` so that it
+    /// is an independent copy: an entry that carries a duplicated or
+    /// neighbouring `META` instead of its own module's fails the comparison
+    /// below, and a module whose `META` is not in the table at all is caught
+    /// by the reverse check in the same test.
+    fn module_meta(name: &str) -> PluginMeta {
+        match name {
+            "addFont.dll" => crate::add_font::META,
+            "motionplayer.dll" => crate::motion_player::META,
+            "win32dialog.dll" => crate::win32_dialog::META,
+            "windowEx.dll" => crate::window_ex::META,
+            "json.dll" => crate::json::META,
+            "PackinOne.dll" => crate::packinone::META,
+            "layerExDraw.dll" => crate::layer_ex_draw::META,
+            "textrender.dll" => crate::text_render::META,
+            "psbfile.dll" => crate::psb_file::META,
+            "AlphaMovie.dll" => crate::alpha_movie::META,
+            "getSample.dll" => crate::get_sample::META,
+            "KAGParserEx.dll" => crate::kag_parser_ex::META,
+            "extrans.dll" => crate::extrans::META,
+            "extNagano.dll" => crate::extnagano::META,
+            "KaichoTrans.dll" => crate::kaicho_trans::META,
+            "lzfs.dll" => crate::lzfs::META,
+            "minizip.dll" => crate::minizip::META,
+            "varfile.dll" => crate::varfile::META,
+            "xp3filter.dll" => crate::xp3_filter::META,
+            "fftgraph.dll" => crate::fft_graph::META,
+            "wuopus.dll" => crate::wuopus::META,
+            "wuvorbis.dll" => crate::wuvorbis::META,
+            "gamepad.dll" => crate::gamepad::META,
+            "GlitchEffect.dll" => crate::glitch_effect::META,
+            "gfxEffect.dll" => crate::gfx_effect::META,
+            "layerExAlpha.dll" => crate::layer_ex_alpha::META,
+            "layerExAreaAverage.dll" => crate::layer_ex_area_average::META,
+            "layerExBTOA.dll" => crate::layer_ex_btoa::META,
+            "layerExImage.dll" => crate::layer_ex_image::META,
+            "layerExMovie.dll" => crate::layer_ex_movie::META,
+            "layerExRaster.dll" => crate::layer_ex_raster::META,
+            "layerExSave.dll" => crate::layer_ex_save::META,
+            "layerExShimmer.dll" => crate::layer_ex_shimmer::META,
+            "multiimage.dll" => crate::multi_image::META,
+            "perspective.dll" => crate::perspective::META,
+            "psd.dll" => crate::psd::META,
+            "shrinkCopy.dll" => crate::shrink_copy::META,
+            "emoteplayer.dll" => crate::emoteplayer::META,
+            "krmovie.dll" => crate::krmovie::META,
+            "DrawDeviceD3D.dll" => crate::draw_device_d3d::META,
+            "DrawDeviceD3DZ.dll" => crate::draw_device_d3dz::META,
+            "SteamDrawDevice.dll" => crate::steam_draw_device::META,
+            "csvParser.dll" => crate::csv_parser::META,
+            "dirlist.dll" => crate::dirlist::META,
+            "expat.dll" => crate::expat::META,
+            "ExtKAGParser.dll" => crate::ext_kag_parser::META,
+            "fstat.dll" => crate::fstat::META,
+            "KAGParserExb.dll" => crate::kag_parser_exb::META,
+            "k2compat.dll" => crate::k2compat::META,
+            "kagexopt.dll" => crate::kagexopt::META,
+            "kirikiroid2.dll" => crate::kirikiroid2::META,
+            "savestruct.dll" => crate::save_struct::META,
+            "scriptsEx.dll" => crate::scripts_ex::META,
+            "sqlite3.dll" => crate::sqlite3::META,
+            "yuzuex.dll" => crate::yuzuex::META,
+            "dmmcloud.dll" => crate::dmmcloud::META,
+            "getabout.dll" => crate::get_about::META,
+            "getLangName.dll" => crate::get_lang_name::META,
+            "httprequest.dll" => crate::http_request::META,
+            "krkrsteam.dll" => crate::krkrsteam::META,
+            "menu.dll" => crate::menu::META,
+            "win32ole.dll" => crate::win32ole::META,
+            "util_generic.dll" => crate::util_generic::META,
+            "util_graph.dll" => crate::util_graph::META,
+            "util_system.dll" => crate::util_system::META,
+            "wfBasicEffect.dll" => crate::wf_basic_effect::META,
+            "wfTypicalDSP.dll" => crate::wf_typical_dsp::META,
+            "wutcwf.dll" => crate::wutcwf::META,
+            other => panic!("catalog entry {other} has no module of its own"),
+        }
+    }
+
+    #[test]
+    fn every_entry_carries_the_meta_of_the_module_named_by_its_canonical_name() {
+        for entry in CATALOG {
+            let module = module_meta(entry.name);
+            assert_eq!(
+                entry.meta.status, module.status,
+                "{}: the entry's status is not its module's META",
+                entry.name
+            );
+            assert_eq!(
+                entry.meta.feature, module.feature,
+                "{}: the entry's feature is not its module's META",
+                entry.name
+            );
+            assert_eq!(
+                entry.meta.notes, module.notes,
+                "{}: the entry's notes are not its module's META",
+                entry.name
+            );
+        }
+    }
+
+    /// The `META` of a module that still is a `placeholder_plugin!`
+    /// invocation says `Missing`, and installing such an entry is what puts
+    /// the "not implemented" warning in the log; an entry that is no longer
+    /// missing must not report itself. This pins the split from the other
+    /// side, through the engine instead of through the table: a module whose
+    /// status and behaviour disagree fails here.
+    #[test]
+    fn every_entry_installs_the_plugin_it_names_and_only_a_placeholder_reports_itself() {
+        let mut engine = KrkrEngine::new(krkr_engine::EngineConfig::default()).expect("engine");
+        for entry in CATALOG {
+            let needle = format!("not implemented: {}", entry.name);
+            assert!(
+                !engine
+                    .host()
+                    .linked_plugins()
+                    .any(|linked| linked == entry.name),
+                "{} was linked before its install",
+                entry.name
+            );
+            let reports_before = engine
+                .host()
+                .logs()
+                .iter()
+                .filter(|line| line.contains(&needle))
+                .count();
+
+            install_plugin(&mut engine, entry).expect("install catalog entry");
+
+            assert!(
+                engine
+                    .host()
+                    .linked_plugins()
+                    .any(|linked| linked == entry.name),
+                "{} installs a module that does not register that name",
+                entry.name
+            );
+            let reports = engine
+                .host()
+                .logs()
+                .iter()
+                .filter(|line| line.contains(&needle))
+                .count()
+                - reports_before;
+            match entry.meta.status {
+                PluginStatus::Missing => assert_eq!(
+                    reports, 1,
+                    "{}: a missing module must report itself exactly once",
+                    entry.name
+                ),
+                _ => assert_eq!(
+                    reports, 0,
+                    "{}: an implemented module must not report itself as missing",
+                    entry.name
+                ),
+            }
         }
     }
 

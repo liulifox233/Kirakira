@@ -4,6 +4,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Implemented,
+    feature: "System.addFont",
+    notes: "Registers fonts from game storage through the engine font system.",
+    install: |engine| engine.register_plugin(AddFontPlugin),
+};
+
 pub struct AddFontPlugin;
 
 impl KrkrPlugin for AddFontPlugin {

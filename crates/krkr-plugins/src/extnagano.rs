@@ -10,6 +10,15 @@
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{Result, runtime::Runtime};
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "zoomfade / blurfade / scanline / 3duniversal / rgbfade / spin / flutter / imagewipe / book / honeyturn / morphing / multiripple transitions",
+    notes: "Marker: krkr-core degrades these transition names to crossfade.",
+    install: |engine| engine.register_plugin(ExtNaganoPlugin),
+};
+
 pub struct ExtNaganoPlugin;
 
 impl KrkrPlugin for ExtNaganoPlugin {

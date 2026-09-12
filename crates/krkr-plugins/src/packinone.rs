@@ -31,6 +31,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, TjsHost, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "CSVParser, Scripts.loadDataPack, Storages.saveOctet, System.getOSVersion, Layer effects",
+    notes: "CSVParser, storages octet I/O, URL codecs and Scripts.loadDataPack/clone are functional; the rest of the bundle is no-op surface.",
+    install: |engine| engine.register_plugin(PackinOnePlugin),
+};
+
 pub struct PackinOnePlugin;
 
 impl KrkrPlugin for PackinOnePlugin {

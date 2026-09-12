@@ -5,7 +5,9 @@
 //! Registration goes through [`register_reference_plugins`] (installs every
 //! catalog entry) or [`register_profile_plugins`] with a [`GameProfile`] that
 //! selects a subset by any spelling of a plugin's name. Each plugin lives in
-//! its own module, and a plugin that has no implementation yet is a module
+//! its own module together with its implementation state
+//! ([`catalog::PluginMeta`], the module's `META`), so implementing one is a
+//! single-file change; a plugin that has no implementation yet is a module
 //! that installs no TJS surface at all and reports itself through the engine
 //! log — an unimplemented plugin stays visible instead of silently absent.
 
@@ -88,9 +90,9 @@ use krkr_engine::KrkrEngine;
 pub use add_font::AddFontPlugin;
 pub use alpha_movie::AlphaMoviePlugin;
 pub use catalog::{
-    CATALOG, GIST_PLUGIN_NAMES, PARQUET_PLUGIN_FILES, PluginEntry, PluginFamily, PluginStatus,
-    canonical_name, install_plugin, is_same_plugin, missing_plugins, parquet_plugin_names,
-    plugin_mappings, resolve,
+    CATALOG, GIST_PLUGIN_NAMES, PARQUET_PLUGIN_FILES, PluginEntry, PluginFamily, PluginMeta,
+    PluginStatus, canonical_name, install_plugin, is_same_plugin, missing_plugins,
+    parquet_plugin_names, plugin_mappings, resolve,
 };
 pub use csv_parser::CsvParserPlugin;
 pub use dirlist::DirlistPlugin;

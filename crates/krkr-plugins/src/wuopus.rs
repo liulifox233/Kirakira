@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "Opus codec registration",
+    notes: "Not implemented; the engine decodes Opus in krkr-audio behind the optional `opus` feature, but the plugin's own surface is absent.",
+    install: |engine| engine.register_plugin(WuOpusPlugin),
+};
+
 crate::placeholder::placeholder_plugin!(WuOpusPlugin, "wuopus.dll");

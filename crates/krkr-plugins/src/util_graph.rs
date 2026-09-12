@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "(unidentified surface)",
+    notes: "Not implemented; nothing to census. Implement from observed KAGEX usage and keep the surface marked unverified.",
+    install: |engine| engine.register_plugin(UtilGraphPlugin),
+};
+
 crate::placeholder::placeholder_plugin!(UtilGraphPlugin, "util_graph.dll");

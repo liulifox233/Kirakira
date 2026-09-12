@@ -12,6 +12,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Implemented,
+    feature: "TextRenderBase",
+    notes: "Line layout, character geometry and ruby grouping are implemented; glyph painting goes through Layer.drawText.",
+    install: |engine| engine.register_plugin(TextRenderPlugin),
+};
+
 pub struct TextRenderPlugin;
 
 impl KrkrPlugin for TextRenderPlugin {

@@ -9,11 +9,19 @@
 //!
 //! Implementing a plugin means replacing the `placeholder_plugin!` invocation
 //! in its module (`src/<plugin>.rs`) with a real `KrkrPlugin` impl, then
-//! updating that entry's `status` and `notes` in [`crate::catalog`].
+//! flipping that module's `META.status` to [`PluginStatus::Shim`] or
+//! [`PluginStatus::Implemented`] and updating `META.notes` (and
+//! `META.feature` when the surface grew) beside it. `crate::catalog` holds
+//! only the plugin's identity and is never part of an implementation, so
+//! parallel implementations do not share a file.
+//!
+//! [`PluginStatus::Shim`]: crate::catalog::PluginStatus::Shim
+//! [`PluginStatus::Implemented`]: crate::catalog::PluginStatus::Implemented
+//! [`META`]: crate::catalog::PluginMeta
 
 /// Declares the placeholder plugin for one catalog entry. Keeping one module
-/// per plugin means a later mission can implement that plugin by editing that
-/// file alone.
+/// per plugin — with the module's `META` next to this invocation — means a
+/// later mission can implement that plugin by editing that file alone.
 macro_rules! placeholder_plugin {
     ($plugin:ident, $name:literal) => {
         /// Self-reporting placeholder for a plugin with no implementation yet.

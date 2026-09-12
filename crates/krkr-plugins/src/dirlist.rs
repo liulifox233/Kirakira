@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "Storage directory listing",
+    notes: "Not implemented; the engine can already list storages, so this is a matter of the plugin's own member names.",
+    install: |engine| engine.register_plugin(DirlistPlugin),
+};
+
 crate::placeholder::placeholder_plugin!(DirlistPlugin, "dirlist.dll");

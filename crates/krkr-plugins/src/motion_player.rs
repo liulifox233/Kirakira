@@ -4,6 +4,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "Motion / Motion.Player / Motion.EmotePlayer",
+    notes: "Motion.Player/EmotePlayer constructors exist and report idle/zero state; no motion playback.",
+    install: |engine| engine.register_plugin(MotionPlayerPlugin),
+};
+
 pub struct MotionPlayerPlugin;
 
 impl KrkrPlugin for MotionPlayerPlugin {

@@ -7,4 +7,13 @@
 //! itself through the engine log when it is registered. See
 //! [`crate::catalog`] for the plugin's entry.
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Missing,
+    feature: "XP3 read filtering",
+    notes: "Not implemented; archive filtering would have to happen inside krkr-xp3's read path.",
+    install: |engine| engine.register_plugin(Xp3FilterPlugin),
+};
+
 crate::placeholder::placeholder_plugin!(Xp3FilterPlugin, "xp3filter.dll");

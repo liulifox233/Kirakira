@@ -8,6 +8,15 @@
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{Result, runtime::Runtime};
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Shim,
+    feature: "lzfs archive support",
+    notes: "Marker: no TJS surface, and the engine has no lzfs reader yet, so .lzfs archives stay unreadable.",
+    install: |engine| engine.register_plugin(LzfsPlugin),
+};
+
 pub struct LzfsPlugin;
 
 impl KrkrPlugin for LzfsPlugin {

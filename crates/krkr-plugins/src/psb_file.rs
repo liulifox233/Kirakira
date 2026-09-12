@@ -16,6 +16,15 @@ use krkr_tjs2::{
     runtime::{ObjectHandle, Runtime, Variant},
 };
 
+use crate::catalog::{PluginMeta, PluginStatus};
+
+pub(crate) const META: PluginMeta = PluginMeta {
+    status: PluginStatus::Implemented,
+    feature: "PSBFile / PSBValueClass",
+    notes: "Decodes PSB object trees into TJS dictionaries/arrays/octets and mounts embedded resources.",
+    install: |engine| engine.register_plugin(PsbFilePlugin),
+};
+
 pub struct PsbFilePlugin;
 
 impl KrkrPlugin for PsbFilePlugin {
