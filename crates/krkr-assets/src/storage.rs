@@ -2420,7 +2420,10 @@ pub fn normalize_storage_separators(path: &str) -> String {
 /// separators are `/`, duplicate and `.` segments collapse, and `..` may
 /// remove a prior segment but cannot escape the logical project root. XP3's
 /// `>` delimiter is preserved while its in-archive path receives the same
-/// normalization and KRKR's case-insensitive spelling.
+/// normalization and KRKR's case-insensitive spelling. A trailing `/` is
+/// part of the name: the reference's compression loop only deletes a
+/// delimiter that is followed by another one (`StorageIntf.cpp:409-413`), so
+/// `"dir/"` normalizes to `"dir/"` and `"dir//"` to `"dir/"`.
 pub fn normalize_storage_name(path: &str) -> Result<String> {
     let path = normalize_storage_separators(path);
     let (outer, inner) = path
@@ -2436,6 +2439,12 @@ pub fn normalize_storage_name(path: &str) -> Result<String> {
 
 fn normalize_logical_path(path: &str, lower_case: bool) -> Result<String> {
     let absolute = path.starts_with('/');
+    // TVPNormalizeStorageName's compression loop (`StorageIntf.cpp:400-453`)
+    // collapses duplicated delimiters but keeps a trailing one: the only
+    // deletion is of a delimiter that is itself followed by a delimiter
+    // (`:409-413`). `getFullPath("dir/")` therefore stays `"dir/"`, while
+    // `"dir//"` collapses to `"dir/"`.
+    let trailing_delimiter = path.ends_with('/');
     let mut parts = Vec::new();
     for component in path.split('/') {
         if component.is_empty() || component == "." {
@@ -2456,11 +2465,18 @@ fn normalize_logical_path(path: &str, lower_case: bool) -> Result<String> {
         });
     }
     let mut result = parts.join("/");
-    if absolute {
-        result.insert(0, '/');
-    }
-    if result.is_empty() && absolute {
-        result.push('/');
+    if result.is_empty() {
+        // The logical root keeps the reference's single leading delimiter.
+        if absolute {
+            result.push('/');
+        }
+    } else {
+        if absolute {
+            result.insert(0, '/');
+        }
+        if trailing_delimiter && !result.ends_with('/') {
+            result.push('/');
+        }
     }
     Ok(result)
 }
@@ -2634,6 +2650,65 @@ mod tests {
             "archive.xp3>foo/baz"
         );
         assert!(normalize_storage_name("../escape").is_err());
+    }
+
+    /// Ground truth: the compression loop of `TVPNormalizeStorageName`
+    /// (`krkrz/src/core/base/StorageIntf.cpp:400-453`, run over the path after
+    /// the media/domain split and `tTVPFileMedia::NormalizePathName`,
+    /// `win32/StorageImpl.cpp:81-92`). Its only delimiter deletion targets a
+    /// delimiter followed by another one (`:409-413`), so a trailing `/`
+    /// survives; duplicated interior delimiters collapse; a `..` that lands on
+    /// a delimiter keeps that delimiter. The trailing-slash rows were also
+    /// reproduced by running that loop verbatim in a C++ harness.
+    #[test]
+    fn normalization_keeps_the_reference_trailing_delimiter() {
+        // A trailing delimiter survives, and a run of them collapses to one.
+        assert_eq!(normalize_storage_name("dir/").unwrap(), "dir/");
+        assert_eq!(normalize_storage_name("dir").unwrap(), "dir");
+        assert_eq!(normalize_storage_name("dir//").unwrap(), "dir/");
+        assert_eq!(normalize_storage_name("dir///").unwrap(), "dir/");
+        assert_eq!(normalize_storage_name("a/b//").unwrap(), "a/b/");
+        assert_eq!(normalize_storage_name("./dir/").unwrap(), "dir/");
+        assert_eq!(normalize_storage_name("dir\\").unwrap(), "dir/");
+        assert_eq!(normalize_storage_name("dir/./").unwrap(), "dir/");
+        // The reference keeps the delimiter a `..` collapses onto, so the
+        // parent of the removed segment keeps its trailing slash.
+        assert_eq!(normalize_storage_name("a/b/../").unwrap(), "a/");
+        assert_eq!(normalize_storage_name("a/b/../c/").unwrap(), "a/c/");
+        assert_eq!(normalize_storage_name("/").unwrap(), "/");
+        assert_eq!(normalize_storage_name("//").unwrap(), "/");
+        // The empty name stays empty (the reference returns it early,
+        // `StorageIntf.cpp:262`). A name whose segments all collapse keeps
+        // this engine's existing empty spelling of the root instead of
+        // inventing the absolute `"/"`; the trailing delimiter is only part
+        // of a name that still has a segment to hang it on.
+        assert_eq!(normalize_storage_name("").unwrap(), "");
+        assert_eq!(normalize_storage_name("./").unwrap(), "");
+        // XP3's `>` delimiter: the in-archive part keeps its trailing slash
+        // exactly like the outer path (its `NormalizeInArchiveStorageName`,
+        // `StorageIntf.cpp:601-642`, also collapses duplicated slashes but
+        // keeps the last one).
+        assert_eq!(
+            normalize_storage_name("archive.xp3>DIR/").unwrap(),
+            "archive.xp3>dir/"
+        );
+        assert_eq!(
+            normalize_storage_name("archive.xp3>DIR//").unwrap(),
+            "archive.xp3>dir/"
+        );
+        assert_eq!(
+            normalize_storage_name("archive.xp3>").unwrap(),
+            "archive.xp3>"
+        );
+        // Media-qualified names keep their trailing delimiter too. The
+        // `media://` spelling itself is folded to `media:/` by this
+        // normalizer, a divergence `crates/krkr-assets/src/media.rs:66-70`
+        // already records for the auto-path machinery; the trailing
+        // delimiter is this normalization's contract.
+        assert_eq!(
+            normalize_storage_name("psb://container.psb/inner/").unwrap(),
+            "psb:/container.psb/inner/"
+        );
     }
 
     #[test]
