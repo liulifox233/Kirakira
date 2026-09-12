@@ -52,7 +52,10 @@ image = { version = "0.25.8", default-features = false, features = ["bmp", "jpeg
 icy_sixel = "0.5.0"
 libtlg-rs = { version = "0.2.4", default-features = false }
 fontdb = "0.23.0"
-kira = { version = "=0.12.0", default-features = false, features = ["cpal", "mp3", "ogg", "vorbis", "wav", "flac", "aac", "isomp4"] }
+# `wav` enables the RIFF demuxer only: the PCM codec is symphonia's separate
+# `pcm` feature, which kira's default feature set carries but this explicit
+# list has to keep (without it every ordinary PCM `.wav` fails to decode).
+kira = { version = "=0.12.0", default-features = false, features = ["cpal", "mp3", "ogg", "vorbis", "pcm", "wav", "flac", "aac", "isomp4"] }
 memmap2 = "0.9.9"
 png = "0.18.1"
 pollster = "0.4.0"
@@ -60,7 +63,7 @@ rfd = "=0.17.2"
 swash = "0.2.7"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-symphonia = { version = "=0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+symphonia = { version = "=0.5.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 terminal_size = "0.4.4"
 wgpu = "=29.0.1"
 winit = "=0.30.13"
