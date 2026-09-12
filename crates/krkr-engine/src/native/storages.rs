@@ -87,6 +87,11 @@ fn storages_get_placed_path(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
+    // A script-thread storage entry point refreshes the watched script
+    // dictionaries first, so a mapping written earlier in the same script
+    // block is already live for this probe (see
+    // `plugin_api::storage::refresh_storage_tables`).
+    crate::plugin_api::storage::refresh_storage_tables(runtime);
     let name = arg_string(&args, 0)?.ok_or_else(|| {
         krkr_tjs2::TjsError::runtime("Storages.getPlacedPath requires a storage name")
     })?;
@@ -133,6 +138,9 @@ fn storages_exists(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
+    // The live-refresh path: `Storages.isExistentStorage` sees a mapping a
+    // script wrote earlier in the same block (`refresh_storage_tables`).
+    crate::plugin_api::storage::refresh_storage_tables(runtime);
     let exists =
         arg_string(&args, 0)?.is_some_and(|name| runtime.host().storage_exists_exact(&name));
     Ok(Variant::Integer(i64::from(exists)))
@@ -143,6 +151,8 @@ fn storages_is_directory(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
+    // See `storages_exists`: the script-thread probes refresh first.
+    crate::plugin_api::storage::refresh_storage_tables(runtime);
     let exists =
         arg_string(&args, 0)?.is_some_and(|name| runtime.host().storage_is_directory(&name));
     Ok(Variant::Integer(i64::from(exists)))
@@ -153,6 +163,8 @@ fn storages_dirlist(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
+    // See `storages_exists`: the script-thread probes refresh first.
+    crate::plugin_api::storage::refresh_storage_tables(runtime);
     let Some(name) = arg_string(&args, 0)? else {
         return Err(krkr_tjs2::TjsError::runtime(
             "Storages.dirlist requires a directory",
