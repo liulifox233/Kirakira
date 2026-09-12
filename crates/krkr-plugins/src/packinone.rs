@@ -292,10 +292,13 @@ fn csv_parse_storage(
 /// FuncCall failures. `currentLineNumber` is updated before each call so it
 /// reflects the row being fired and ends at the total row count.
 fn csv_fire_do_line(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) {
-    let target = match runtime.object_member(this, "target") {
-        Variant::Object(handle) => handle,
-        _ => this,
-    };
+    // The game assigns `target` from `new`/`this` results, which are
+    // self-bound closures; the object behind the binding is the callback
+    // target.
+    let target = runtime
+        .object_member(this, "target")
+        .object_handle()
+        .unwrap_or(this);
     let has_do_line = runtime
         .resolve_object_member(target, "doLine")
         .is_ok_and(|value| !matches!(value, Variant::Void));
@@ -776,16 +779,18 @@ fn clone_scripts_value(
     value: &Variant,
     cloned: &mut BTreeMap<ObjectHandle, ObjectHandle>,
 ) -> Result<Variant> {
-    let Variant::Object(source) = value else {
+    // `Scripts.clone(new Dictionary())` and every `this`-born argument arrive
+    // as self-bound closures; clone the object behind the binding.
+    let Some(source) = value.object_handle() else {
         return Ok(value.clone());
     };
-    if let Some(dest) = cloned.get(source) {
+    if let Some(dest) = cloned.get(&source) {
         return Ok(Variant::Object(*dest));
     }
 
-    if let Some(elements) = runtime.array_elements(*source).map(Vec::from) {
+    if let Some(elements) = runtime.array_elements(source).map(Vec::from) {
         let dest = runtime.alloc_array_object(Vec::new());
-        cloned.insert(*source, dest);
+        cloned.insert(source, dest);
         for element in elements {
             let element = clone_scripts_value(runtime, &element, cloned)?;
             runtime.array_push(dest, element);
@@ -794,16 +799,20 @@ fn clone_scripts_value(
     }
 
     let is_dictionary = runtime
-        .object_class_infos(*source)
+        .object_class_infos(source)
         .iter()
         .any(|class| class == "Dictionary");
     if is_dictionary {
+        // The Dictionary constructor answers a self-bound instance.
         let constructor = runtime.global_member("Dictionary");
-        let Variant::Object(dest) = runtime.call_function(constructor, Vec::new())? else {
+        let Some(dest) = runtime
+            .call_function(constructor, Vec::new())?
+            .object_handle()
+        else {
             return Ok(value.clone());
         };
-        cloned.insert(*source, dest);
-        for (name, member) in runtime.object_members(*source) {
+        cloned.insert(source, dest);
+        for (name, member) in runtime.object_members(source) {
             if scripts_clone_builtin_member(&name) {
                 continue;
             }
@@ -813,8 +822,8 @@ fn clone_scripts_value(
         return Ok(Variant::Object(dest));
     }
 
-    if !matches!(runtime.object_member(*source, "clone"), Variant::Void)
-        && let Ok(result) = runtime.call_object_method(*source, "clone", Vec::new())
+    if !matches!(runtime.object_member(source, "clone"), Variant::Void)
+        && let Ok(result) = runtime.call_object_method(source, "clone", Vec::new())
     {
         return Ok(result);
     }
@@ -1167,6 +1176,64 @@ mod tests {
             )
             .expect("bound closure"),
             Variant::Integer(0)
+        );
+    }
+
+    /// `Scripts.clone` receives its argument through the VM, so a `new
+    /// Dictionary()` (and every `this`-born object) arrives as a self-bound
+    /// closure; the clone must copy the object behind the binding instead of
+    /// returning the argument unchanged.
+    #[test]
+    fn scripts_clone_copies_objects_born_from_new() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var source = new Dictionary();
+                    source.answer = 2;
+                    source.nested = new Dictionary();
+                    source.nested.answer = 3;
+                    var copy = Scripts.clone(source);
+                    copy.answer = 7;
+                    copy.nested.answer = 9;
+                    return source.answer + ":" + copy.answer + ":" +
+                        source.nested.answer + ":" + copy.nested.answer;
+                })()"#,
+            )
+            .expect("clone dictionary");
+        assert_eq!(value, Variant::String("2:7:3:9".to_owned()));
+    }
+
+    /// `CSVParser.target` is normally assigned by the game, so it reads back
+    /// as a script-born value; `doLine` has to be looked up on the object
+    /// behind the binding, not fall back to the parser itself.
+    #[test]
+    fn csv_parser_fires_do_line_on_a_script_assigned_target() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    // A nested function addresses enclosing names through the
+                    // this-proxy, so the collector lives on the global object.
+                    global.__csvRows = [];
+                    var target = new Dictionary();
+                    target.doLine = function(fields, line) {
+                        global.__csvRows.push(line + ":" + fields[0] + ":" + fields[1]);
+                    };
+                    var parser = new CSVParser();
+                    parser.target = target;
+                    parser.parse("a,b\nc,d\n");
+                    return global.__csvRows.join("|") + " lines=" + parser.currentLineNumber;
+                })()"#,
+            )
+            .expect("csv parser target");
+        assert_eq!(
+            value,
+            Variant::String("1:a:b|2:c:d lines=2".to_owned())
         );
     }
 

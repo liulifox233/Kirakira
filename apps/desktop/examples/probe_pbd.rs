@@ -177,35 +177,53 @@ fn summarize_value(
         Variant::Real(f) => format!("real({f})"),
         Variant::String(s) => format!("str({})", s.chars().take(40).collect::<String>()),
         Variant::Octet(b) => format!("octet({})", b.len()),
-        Variant::Object(_) if depth == 0 => "{...}".into(),
-        Variant::Object(h) => {
-            if let Some(elements) = engine.tjs_runtime().array_elements(*h) {
-                let parts = elements
-                    .iter()
-                    .take(24)
-                    .map(|value| summarize_value(engine, value, depth - 1))
-                    .collect::<Vec<_>>();
-                let suffix = if elements.len() > parts.len() {
-                    ", ..."
-                } else {
-                    ""
-                };
-                return format!("[{}{suffix}]", parts.join(", "));
-            }
-            let members: Vec<(String, Variant)> = engine.tjs_runtime().object_members(*h);
-            let parts = members
-                .iter()
-                .take(40)
-                .map(|(k, v)| format!("{k}: {}", summarize_value(engine, v, depth - 1)))
-                .collect::<Vec<_>>();
-            let suffix = if members.len() > parts.len() {
-                ", ..."
-            } else {
-                ""
-            };
-            format!("{{ {}{suffix} }}", parts.join(", "))
+        // A value the script stored from `this` or from `new` is a self-bound
+        // closure (`tTJSVariant(dsp, dsp)`); the probe's job is to show the
+        // object behind the binding. A method read off a receiver keeps that
+        // receiver as its `this` while the function stays the object, and is
+        // reported as a closure.
+        Variant::Closure(closure) if closure.this_obj == Some(closure.object) => {
+            summarize_object(engine, closure.object, depth)
         }
         Variant::Closure(_) => "closure".into(),
+        Variant::Object(_) if depth == 0 => "{...}".into(),
+        Variant::Object(handle) => summarize_object(engine, *handle, depth),
         Variant::CodeObject(_) => "codeobject".into(),
     }
+}
+
+fn summarize_object(
+    engine: &KrkrEngine,
+    handle: krkr_tjs2::runtime::ObjectHandle,
+    depth: usize,
+) -> String {
+    use krkr_tjs2::runtime::Variant;
+    if depth == 0 {
+        return "{...}".into();
+    }
+    if let Some(elements) = engine.tjs_runtime().array_elements(handle) {
+        let parts = elements
+            .iter()
+            .take(24)
+            .map(|value| summarize_value(engine, value, depth - 1))
+            .collect::<Vec<_>>();
+        let suffix = if elements.len() > parts.len() {
+            ", ..."
+        } else {
+            ""
+        };
+        return format!("[{}{suffix}]", parts.join(", "));
+    }
+    let members: Vec<(String, Variant)> = engine.tjs_runtime().object_members(handle);
+    let parts = members
+        .iter()
+        .take(40)
+        .map(|(k, v)| format!("{k}: {}", summarize_value(engine, v, depth - 1)))
+        .collect::<Vec<_>>();
+    let suffix = if members.len() > parts.len() {
+        ", ..."
+    } else {
+        ""
+    };
+    format!("{{ {}{suffix} }}", parts.join(", "))
 }

@@ -129,9 +129,9 @@ use krkr_core::{
     PointerButton, Size,
 };
 use krkr_engine::{
-    EngineConfig, EngineInput, KagTaskState, KrkrEngine, RuntimeSession, TransitionPolicy,
+    EngineConfig, EngineInput, KagTaskState, KrkrEngine, KrkrHost, RuntimeSession, TransitionPolicy,
 };
-use krkr_tjs2::runtime::{ObjectHandle, Variant};
+use krkr_tjs2::runtime::{ObjectHandle, Runtime, Variant};
 use krkr_debug::snapshot::TextureCache;
 
 use krkr_debug::cli::{BreakpointSpec, CliDebugger, parse_breakpoint_spec};
@@ -353,10 +353,12 @@ const KAG_CLICK_SOURCE: &str = r#"
 /// nest `waitClick` calls until the VM runs out of frames.
 fn kag_awaits_click(engine: &KrkrEngine) -> bool {
     let runtime = engine.tjs_runtime();
-    let Variant::Object(kag) = runtime.global_member("kag") else {
+    // The game builds `global.kag` and its members from `new` results, so the
+    // reader has to unwrap the self-bound closure to reach the object identity.
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
         return false;
     };
-    let Variant::Object(conductor) = runtime.object_member(kag, "conductor") else {
+    let Some(conductor) = runtime.object_member(kag, "conductor").object_handle() else {
         return false;
     };
     if !matches!(
@@ -365,7 +367,7 @@ fn kag_awaits_click(engine: &KrkrEngine) -> bool {
     ) {
         return false;
     }
-    let Variant::Object(wait_until) = runtime.object_member(conductor, "waitUntil") else {
+    let Some(wait_until) = runtime.object_member(conductor, "waitUntil").object_handle() else {
         return false;
     };
     runtime
@@ -380,9 +382,10 @@ fn kag_awaits_click(engine: &KrkrEngine) -> bool {
 /// reflects what the player actually sees.
 fn semantic_kag_state(engine: &KrkrEngine) -> Option<String> {
     let runtime = engine.tjs_runtime();
-    let Variant::Object(kag) = runtime.global_member("kag") else {
-        return None;
-    };
+    // The game stores `global.kag`, the conductor and the wait set as `new`
+    // results (self-bound closures); each step needs the object behind the
+    // binding, not the raw member shape.
+    let kag = runtime.global_member("kag").object_handle()?;
     let member = |object: ObjectHandle, name: &str| runtime.object_member(object, name);
     let as_int = |object: ObjectHandle, name: &str| match member(object, name) {
         Variant::Integer(value) => Some(value),
@@ -392,10 +395,7 @@ fn semantic_kag_state(engine: &KrkrEngine) -> Option<String> {
         Variant::String(value) => Some(value),
         _ => None,
     };
-    let conductor = match member(kag, "conductor") {
-        Variant::Object(object) => Some(object),
-        _ => None,
-    };
+    let conductor = member(kag, "conductor").object_handle();
     let status = conductor
         .and_then(|object| as_int(object, "status"))
         .unwrap_or(-1);
@@ -406,10 +406,7 @@ fn semantic_kag_state(engine: &KrkrEngine) -> Option<String> {
         .and_then(|object| as_int(object, "timerEnabled"))
         .unwrap_or(-1);
     let waits: Vec<String> = conductor
-        .and_then(|object| match member(object, "waitUntil") {
-            Variant::Object(wait_until) => Some(wait_until),
-            _ => None,
-        })
+        .and_then(|object| member(object, "waitUntil").object_handle())
         .map(|wait_until| {
             runtime
                 .object_members(wait_until)
@@ -438,6 +435,21 @@ fn status_name(status: i64) -> String {
         2 => "wait(2)".to_string(),
         other => format!("{other}"),
     }
+}
+
+/// Resolves a `--dump-globals` path (`kag.conductor.waitUntil`). Every step
+/// unwraps through `object_handle()`: a value the game stored from `this` or
+/// from `new` is a self-bound closure, not a plain object.
+fn global_member_path(runtime: &Runtime<KrkrHost>, name: &str) -> Variant {
+    let mut parts = name.split('.');
+    let mut current = runtime.global_member(parts.next().unwrap());
+    for part in parts {
+        let Some(object) = current.object_handle() else {
+            break;
+        };
+        current = runtime.object_member(object, part);
+    }
+    current
 }
 
 fn main() {
@@ -972,7 +984,7 @@ fn main() {
             .engine_mut()
             .execute_expression("krkr_debug_inline.tjs", expression)
         {
-            Ok(value) => println!("expression={value}"),
+            Ok(value) => println!("expression={}", display_value(runtime.engine(), &value)),
             Err(error) => println!("expression_error={error}\n---debug---\n{error:?}"),
         }
     }
@@ -1025,32 +1037,21 @@ fn main() {
     }
     for name in &config.dump_globals {
         println!("---global {name}---");
-        let mut current = runtime.engine().tjs_runtime().global_member(name);
-        if name.contains('.') {
-            let mut parts = name.split('.');
-            current = runtime
-                .engine()
-                .tjs_runtime()
-                .global_member(parts.next().unwrap());
-            for part in parts {
-                let Variant::Object(object) = current else {
-                    break;
-                };
-                current = runtime.engine().tjs_runtime().object_member(object, part);
-            }
-        }
-        match current {
-            Variant::Object(object) => {
-                for (member, value) in runtime.engine().tjs_runtime().object_members(object) {
+        let engine = runtime.engine();
+        let tjs = engine.tjs_runtime();
+        let current = global_member_path(tjs, name);
+        match current.object_handle() {
+            Some(object) => {
+                for (member, value) in tjs.object_members(object) {
                     match &value {
                         Variant::Integer(_) | Variant::Real(_) | Variant::String(_) => {
                             println!("{member}={value}")
                         }
-                        _ => println!("{member}={}", variant_kind(&value)),
+                        _ => println!("{member}={}", variant_kind(engine, &value)),
                     }
                 }
             }
-            value => println!("{name}={}", variant_kind(&value)),
+            None => println!("{name}={}", variant_kind(engine, &current)),
         }
     }
     if config.kag_state {
@@ -1261,5 +1262,72 @@ mod tests {
         ));
         assert!(parse_interactive_command("until layer").is_err());
         assert!(parse_interactive_command("until running 1 2").is_err());
+    }
+
+    /// A script-born `global.kag` (and its conductor/wait members) is a
+    /// self-bound closure under the `this`/`new` value model, which is the
+    /// shape that made `--kag-state` print nothing and `--kag-auto-click`
+    /// never fire. Every reader that needs the object identity has to unwrap
+    /// it, so the same fixture is read through all three fixed paths.
+    #[test]
+    fn kag_readers_unwrap_script_born_globals() {
+        let mut engine =
+            krkr_engine::KrkrEngine::new(krkr_engine::EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "probe.tjs",
+                r#"
+                global.kag = new Dictionary();
+                global.kag.currentStorage = "custom.ks";
+                global.kag.currentLabel = "*logo";
+                global.kag.inSleep = 0;
+                global.kag.clickWaiting = 1;
+                global.kag.conductor = new Dictionary();
+                global.kag.conductor.status = 2;
+                global.kag.conductor.curLine = 144;
+                global.kag.conductor.timerEnabled = 0;
+                global.kag.conductor.waitUntil = new Dictionary();
+                global.kag.conductor.waitUntil.click = 1;
+                global.kag.conductor.waitUntil.timeout = 1;
+                "#,
+            )
+            .expect("script stores global.kag");
+
+        // Guard the fixture: a plain object would not exercise the unwrap.
+        assert!(matches!(
+            engine.tjs_runtime().global_member("kag"),
+            krkr_tjs2::runtime::Variant::Closure(_)
+        ));
+
+        let state = super::semantic_kag_state(&engine).expect("kag state");
+        assert!(state.contains("custom.ks@*logo:144 st=wait(2)"), "{state}");
+        assert!(state.contains("wait=[click,timeout]"), "{state}");
+        assert!(super::kag_awaits_click(&engine));
+
+        let wait_until = super::global_member_path(engine.tjs_runtime(), "kag.conductor.waitUntil");
+        let Some(wait_until) = wait_until.object_handle() else {
+            panic!("waitUntil path did not resolve to an object");
+        };
+        assert!(engine.tjs_runtime().has_object_member(wait_until, "click"));
+
+        let value = engine
+            .execute_expression("probe.tjs", "global.kag")
+            .expect("read global.kag");
+        // The console renders the bound value the way a script sees it.
+        assert_eq!(krkr_debug::console::variant_kind(&engine, &value), "object");
+        assert!(
+            krkr_debug::console::display_value(&engine, &value).starts_with("<object #"),
+            "{}",
+            krkr_debug::console::display_value(&engine, &value)
+        );
+        let lines =
+            krkr_debug::console::member_lines(&mut engine, &value, "global.kag", None, false)
+                .expect("member lines");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("member conductor=object")),
+            "{lines:?}"
+        );
     }
 }

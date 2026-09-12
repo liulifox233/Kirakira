@@ -26,8 +26,14 @@ impl KrkrPlugin for AlphaMoviePlugin {
 }
 
 fn install_alpha_movie(runtime: &mut Runtime<KrkrHost>) {
-    // Keep a script-provided AlphaMovie class untouched.
-    if matches!(runtime.global_member("AlphaMovie"), Variant::Object(_)) {
+    // Keep a script-provided AlphaMovie class untouched; a class a script
+    // installed may read back as a self-bound closure under the `new`/`this`
+    // value model, so unwrap before deciding it is occupied.
+    if runtime
+        .global_member("AlphaMovie")
+        .object_handle()
+        .is_some()
+    {
         return;
     }
     let handle = runtime.alloc_native_constructor(

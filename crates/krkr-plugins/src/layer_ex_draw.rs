@@ -437,9 +437,10 @@ fn this_rect(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> [f6
 }
 
 fn variant_rect(runtime: &Runtime<KrkrHost>, value: Option<&Variant>) -> [f64; 4] {
-    match value {
-        Some(Variant::Object(handle)) => this_rect(runtime, Some(*handle)),
-        _ => [0.0; 4],
+    // RectF arguments may be `new` results (self-bound closures).
+    match value.and_then(Variant::object_handle) {
+        Some(handle) => this_rect(runtime, Some(handle)),
+        None => [0.0; 4],
     }
 }
 
@@ -557,8 +558,8 @@ fn rect_union(
     let top = a[1].min(b[1]);
     let width = (a[0] + a[2]).max(b[0] + b[2]) - left;
     let height = (a[1] + a[3]).max(b[1] + b[3]) - top;
-    if let Some(Variant::Object(dst)) = args.first() {
-        store_rect(runtime, *dst, [left, top, width, height]);
+    if let Some(dst) = args.first().and_then(Variant::object_handle) {
+        store_rect(runtime, dst, [left, top, width, height]);
     }
     Ok(Variant::Integer(i64::from(width > 0.0 && height > 0.0)))
 }
@@ -682,9 +683,9 @@ fn matrix_equals(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let matrix = this_matrix(runtime, this_obj);
-    let other = match args.first() {
-        Some(Variant::Object(handle)) => this_matrix(runtime, Some(*handle)),
-        _ => [f64::NAN; 6],
+    let other = match args.first().and_then(Variant::object_handle) {
+        Some(handle) => this_matrix(runtime, Some(handle)),
+        None => [f64::NAN; 6],
     };
     Ok(Variant::Integer(i64::from(matrix == other)))
 }
@@ -763,8 +764,8 @@ fn matrix_multiply(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    if let Some(Variant::Object(other)) = args.first() {
-        let transform = this_matrix(runtime, Some(*other));
+    if let Some(other) = args.first().and_then(Variant::object_handle) {
+        let transform = this_matrix(runtime, Some(other));
         matrix_premultiply(runtime, this_obj, transform);
     }
     Ok(Variant::Void)
@@ -1018,9 +1019,10 @@ fn appearance_add_brush(
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    if let Some(Variant::Object(brush)) = args.first() {
+    // The brush dictionary may be a `new` result (a self-bound closure).
+    if let Some(brush) = args.first().and_then(Variant::object_handle) {
         let brush_type = runtime
-            .object_member(*brush, "type")
+            .object_member(brush, "type")
             .to_integer()
             .unwrap_or(0);
         if !(0..=4).contains(&brush_type) {
@@ -1315,13 +1317,11 @@ fn this_real(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, name: 
 }
 
 fn variant_real(runtime: &Runtime<KrkrHost>, value: Option<&Variant>, name: &str) -> f64 {
-    match value {
-        Some(Variant::Object(handle)) => runtime
-            .object_member(*handle, name)
-            .to_real()
-            .unwrap_or(0.0),
-        _ => 0.0,
-    }
+    // PointF/MatrixF arguments may be `new` results (self-bound closures).
+    value
+        .and_then(Variant::object_handle)
+        .map(|handle| runtime.object_member(handle, name).to_real().unwrap_or(0.0))
+        .unwrap_or(0.0)
 }
 
 /// Setter for read-only native properties: ignores the assigned value.
@@ -1370,4 +1370,40 @@ fn native_void(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Void)
+}
+
+#[cfg(test)]
+mod tests {
+    use krkr_engine::{EngineConfig, KrkrEngine};
+
+    use super::LayerExDrawPlugin;
+
+    /// PointF/RectF/Matrix arguments arrive from the VM, so a `new
+    /// GdiPlus.PointF(...)` is a self-bound closure rather than a plain
+    /// object; the geometry readers have to unwrap it before reading members.
+    #[test]
+    fn geometry_reads_script_born_arguments() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(LayerExDrawPlugin).expect("plugin");
+        let value = engine
+            .execute_script(
+                "probe.tjs",
+                r#"
+                var a = new GdiPlus.PointF(3, 4);
+                var b = new GdiPlus.PointF(3, 4);
+                var c = new GdiPlus.PointF(9, 4);
+                var left = new GdiPlus.RectF(0, 0, 4, 4);
+                var right = new GdiPlus.RectF(2, 2, 3, 3);
+                left.Union(left, left, right);
+                var m = new GdiPlus.Matrix(2, 0, 0, 2, 0, 0);
+                var t = new GdiPlus.Matrix(1, 0, 0, 1, 3, 4);
+                var same = m.Equals(m);
+                m.Multiply(t);
+                return "" + a.Equals(b) + "/" + a.Equals(c) + "/" + same + "/" +
+                    left.width + "x" + left.height + "/" + m.OffsetX() + "," + m.OffsetY();
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value.to_tjs_string().expect("string"), "1/0/1/5x5/6,8");
+    }
 }
