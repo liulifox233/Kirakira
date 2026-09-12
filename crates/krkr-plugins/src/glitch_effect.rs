@@ -39,6 +39,14 @@
 //! reference's `mainImageBufferForWrite`) and repaint through
 //! `Layer.update()`.
 //!
+//! The call shapes follow the reference's invokers: `doGlitch(sourceLayer,
+//! optionsObject)` type-checks **two** objects (`0x10002fb0`) and answers
+//! `TJS_E_BADPARAMCOUNT` otherwise, while `glitchCopy(sourceLayer, options?)`
+//! requires its layer object and defaults every option name it reads. The
+//! layer the call goes through is the destination in both, so
+//! `layer.doGlitch(layer, %[…])` distorts in place and
+//! `dest.glitchCopy(src, %[…])` copies through the distortion.
+//!
 //! **Mapped, not implemented**: the three transition names. Registering a
 //! transition provider needs an engine-side registry that accepts a plugin's
 //! own name and kernel; this engine has none yet, and its name lookup degrades
@@ -58,13 +66,13 @@
 //! | name | default | where the default lives | role |
 //! |---|---|---|---|
 //! | `noise` | 4.0 | `.rdata` `0x10016770` | per-row displacement amplitude |
-//! | `sft_x` | 16.0 | `0x10016780` | per-block x displacement |
-//! | `sft_y` | 8.0 | `0x10016778` | per-block y displacement |
-//! | `sft_col` | 8.0 | `0x10016778` | per-block colour displacement |
-//! | `per_x` | 0.5 | `0x10016758` | probability a block takes its x displacement |
-//! | `per_y` | 0.25 | `0x10016750` | probability a block takes its y displacement |
-//! | `per_col` | 0.05 | `0x10016748` | probability a block takes its colour split |
-//! | `per_reset` | 0.02 | `0x10016740` | probability a taken displacement is dropped again |
+//! | `sft_x` | 16.0 | `0x10016780` | per-block x walk step scale |
+//! | `sft_y` | 8.0 | `0x10016778` | per-block y walk step scale |
+//! | `sft_col` | 8.0 | `0x10016778` | per-block colour walk step scale |
+//! | `per_x` | 0.5 | `0x10016758` | probability an entry adds its x step |
+//! | `per_y` | 0.25 | `0x10016750` | probability an entry adds its y step |
+//! | `per_col` | 0.05 | `0x10016748` | probability an entry adds its colour step |
+//! | `per_reset` | 0.02 | `0x10016740` | probability the running walk is reset to zero |
 //!
 //! `0x10004b00` reads three more option names around the same pass: `size`
 //! (default 16; `cmovle` clamps `<= 0` back to 16), `seed` (absent →
@@ -79,31 +87,44 @@
 //!   `0xBF58476D1CE4E5B9` (shift 30) and `0x94D049BB133111EB` (shift 27),
 //!   finalized by `>> 31`. `0x10002420` seeds the tables from two such draws
 //!   into a 128-bit state at `+0x40`; a second generator (`0x10005ba0`, a
-//!   128-bit shift-register stream) then feeds the table fills. This port
-//!   keeps the seeding and draws the tables from the splitmix64 stream
-//!   directly, so runs are reproducible from `seed` but the bit stream is not
-//!   bit-identical to the reference's.
+//!   128-bit shift-register stream) then feeds the fills, and the displacements
+//!   themselves come from the **Marsaglia polar normal sampler** at
+//!   `0x10002980` (two uniforms into `[-1, 1)`, reject until `u1² + u2² ∈
+//!   (0, 1)`, `sqrt(-2 ln s / s)` scaled by both, the second value cached in
+//!   the sampler object — `0x1000298c`-`0x1000299d`).  The cache is cleared
+//!   before each fill (`0x10005dfa`, `0x10005e57`), so every table gets its
+//!   own sampler.  This port reproduces the sampler
+//!   and the seeding over its splitmix64 stream, so runs are reproducible from
+//!   `seed` but the bit stream is not bit-identical to the reference's.
 //! * **Block tables** — `0x10005dc0` fills three per-block tables through
 //!   `0x10002250`, one per parameter triple: `(per_x, sft_x)`, `(per_y,
-//!   sft_y)`, `(per_col, sft_col)`, each gated by `per_reset`. `0x10002250`
-//!   draws a uniform, accumulates `rand * scale` only while it is under the
-//!   probability, and multiplies the result by `0.0` (`.rdata` `0x10016738`)
-//!   when a second uniform is under the reset probability. Two draws per
-//!   entry, in that order, is what this port reproduces.
+//!   sft_y)`, `(per_col, sft_col)`, each gated by `per_reset`.  `0x10002250`
+//!   walks the table with a **running accumulator** (`0x1000225f` initialises
+//!   it once for the whole fill, `0x100022c8`/`0x100022cd` add a normal step to
+//!   it while a uniform is under the probability, `0x10002314`/`0x1000231c`
+//!   multiply it by `0.0` (`.rdata` `0x10016738`) when a second uniform is
+//!   under `per_reset`, and `0x10002321` stores the current value): the tables
+//!   are resetting random walks, not independent per-block values, so a
+//!   displacement can accumulate past its `sft_*` scale.  Two draws per entry,
+//!   in that order, is what this port reproduces.
 //! * **Row table** — `0x10005fc0` fills one value per row as
-//!   `rand * noise` (`[edi]` is `params.noise`, i.e. struct offset 0), with
-//!   no probability gate: every row jitters.
+//!   `normal * noise` (`[edi]` is `params.noise`, i.e. struct offset 0), with
+//!   no probability gate and no accumulator: every row jitters on its own.
 //! * **The pass** — `0x100048f0` walks the destination rows; a row's source
 //!   pointer is displaced by the row table plus the block x table, the block
 //!   y table moves which source row is read, and the block colour table
-//!   displaces the colour samples. `0x10004f40` copies a run one pixel at a
-//!   time from **three** source pointers — `out[0]` from the first, `out[1]`
-//!   and `out[3]` from the second, `out[2]` from the third
-//!   (`0x10005045`-`0x10005057`) — i.e. R, G and B are sampled at three
-//!   different horizontal positions, the chromatic split `sft_col` drives.
-//!   Source pointers are clamped into the bitmap
-//!   (`0x10004f76`/`0x10004fd2`), which is the edge-clamp this port samples
-//!   with.
+//!   displaces the colour samples. `0x10004f40` copies one **run** — the part
+//!   of a `size` block that falls inside the clip — at a time, byte for byte,
+//!   from **three** source pointers, `out[0]` from the first, `out[1]` and
+//!   `out[3]` from the second, `out[2]` from the third
+//!   (`0x10005045`-`0x10005057`), where the first and third are the centre
+//!   pointer `∓ 4 * channelOffset` (`0x10004fb1`-`0x10004ffa`): R, G and B are
+//!   read from three horizontal positions, the chromatic split `sft_col`
+//!   drives.  Each run's start pointer is clamped **once**, linearly into
+//!   `[begin, end - 4 * length]` (`0x10004f76`-`0x10004f8a`) — a run whose
+//!   displacement would start outside the plane is pulled wholly inside it,
+//!   not clamped pixel by pixel — and the run then reads a contiguous span
+//!   (`begin + 4 * x + stride * y`, `0x10004f4e`-`0x10004f61`).
 //! * **Byte order** — the reference indexes its BGRA buffers from byte 0; the
 //!   engine's views are RGBA, so the port's channel order is R, G, B, A
 //!   (`docs/plugins/plugin-facing-engine-facilities.md` §B.3.4).
@@ -124,7 +145,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "Layer.doGlitch / Layer.glitchCopy pixel glitch, and the glitch / fadeglitch / loopglitch transition names",
-    notes: "The two Layer members are real pixel work: the recovered splitmix64-seeded block/row/colour displacement (defaults noise 4, sft_x 16, sft_y 8, sft_col 8, per_x 0.5, per_y 0.25, per_col 0.05, per_reset 0.02, size 16, coef 1) runs over the scoped layer bitmap views and repaints. The three transition providers are not implemented — the engine has no plugin transition-provider registry, so its lookup maps the name to crossfade while GlitchEffect.dll is linked — and the handler-only options (time, block, break, nofade, fadein, gamma_in, gamma_out, color) are therefore read by nothing.",
+    notes: "The two Layer members are real pixel work: the recovered splitmix64-seeded block/row/colour displacement — a Marsaglia-polar normal step per entry, accumulated into a running walk that `per_reset` zeroes (defaults noise 4, sft_x 16, sft_y 8, sft_col 8, per_x 0.5, per_y 0.25, per_col 0.05, per_reset 0.02, size 16, coef 1) — runs over the scoped layer bitmap views and repaints; `doGlitch` takes its two object arguments as the reference invoker type-checks them. The three transition providers are not implemented — the engine has no plugin transition-provider registry, so its lookup maps the name to crossfade while GlitchEffect.dll is linked — and the handler-only options (time, block, break, nofade, fadein, gamma_in, gamma_out, color) are therefore read by nothing.",
     install: |engine| engine.register_plugin(GlitchEffectPlugin),
 };
 
@@ -337,16 +358,42 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    /// A uniform in `[0, 1)`, the range `0x10002250` compares its
-    /// probabilities against (it builds the double from the top 53 bits).
+    /// A uniform in `[0, 1)`, the range the reference's probability gates
+    /// compare against (it builds the double from the top 53 bits).
     fn uniform01(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
+}
 
-    /// A signed displacement in `[-1, 1]`, the shape the block tables
-    /// accumulate before scaling.
-    fn bipolar(&mut self) -> f64 {
-        self.uniform01() * 2.0 - 1.0
+/// The standard-normal sampler at `0x10002980`: the Marsaglia polar method.
+/// Two uniforms are drawn into `[-1, 1)` (`* 2.0 - 1.0`, `.rdata`
+/// `0x10016768` is 2.0) and rejected until `s = u1² + u2²` lands in `(0, 1)`
+/// (`0x10002a40`/`0x10002a50`); then `sqrt(-2 ln s / s)` is formed and
+/// multiplied by both uniforms, one returned and the other kept in the
+/// object's cache (`0x1000298c`-`0x1000299d`).  Every table fill starts with a
+/// cleared cache (`0x10005dfa`, `0x10005e57`), which is why this port gives
+/// each table its own sampler.
+#[derive(Default)]
+struct NormalSampler {
+    cached: Option<f64>,
+}
+
+impl NormalSampler {
+    fn next(&mut self, rng: &mut SplitMix64) -> f64 {
+        if let Some(value) = self.cached.take() {
+            return value;
+        }
+        loop {
+            let u1 = rng.uniform01() * 2.0 - 1.0;
+            let u2 = rng.uniform01() * 2.0 - 1.0;
+            let s = u1 * u1 + u2 * u2;
+            if s >= 1.0 || s == 0.0 {
+                continue;
+            }
+            let factor = (-2.0 * s.ln() / s).sqrt();
+            self.cached = Some(factor * u2);
+            return factor * u1;
+        }
     }
 }
 
@@ -370,21 +417,31 @@ impl GlitchTables {
         let rows = height.div_ceil(size);
         let mut rng = SplitMix64::new(options.seed);
 
-        // The row table has no probability gate in the reference: every row
-        // is filled with `rand * noise` (`0x10005fc0` reads `params.noise`).
-        let line = (0..height).map(|_| rng.bipolar() * options.noise).collect();
+        // The row table has no probability gate and no accumulator in the
+        // reference: every row is filled with `normal * noise` (`0x10005fc0`
+        // reads `params.noise` and calls the sampler once per entry).
+        let mut line_sampler = NormalSampler::default();
+        let line = (0..height)
+            .map(|_| line_sampler.next(&mut rng) * options.noise)
+            .collect();
 
+        // `0x10002250` walks the table with one accumulator that outlives the
+        // individual entries: a gated entry adds a normal step to the running
+        // value, `per_reset` multiplies the value by `0.0` (`.rdata`
+        // `0x10016738`), and the current value is what gets stored.  The walk
+        // starts at 0 for every table.
         let mut gated = |per: f64, scale: f64| {
+            let mut sampler = NormalSampler::default();
+            let mut accumulated = 0.0;
             (0..cols * rows)
                 .map(|_| {
-                    let mut value = 0.0;
                     if rng.uniform01() < per {
-                        value = rng.bipolar() * scale;
+                        accumulated += sampler.next(&mut rng) * scale;
                     }
                     if rng.uniform01() < options.per_reset {
-                        value = 0.0;
+                        accumulated = 0.0;
                     }
-                    value
+                    accumulated
                 })
                 .collect::<Vec<f64>>()
         };
@@ -414,10 +471,18 @@ impl GlitchTables {
 /// One destination pixel's sampled value: `(red, green, blue, alpha)`.
 type Rgba = [u8; 4];
 
-/// The pass `0x100048f0` walks and `0x10004f40` copies: every destination
-/// pixel inside `clip` is written from the source bitmap at the block's
-/// displacement, with the red and blue channels sampled `dcol` either side of
-/// the green sample (the three source pointers of the copy loop).
+/// The pass `0x100048f0` walks and `0x10004f40` copies.
+///
+/// The destination is written in *runs* — the part of one `size` block that
+/// falls inside the clip — and each run reads one contiguous span of the
+/// source plane: `0x10004f40` computes the run's start pointer, clamps that
+/// single pointer into `[begin, end - 4*length]` (`0x10004f76`-`0x10004f8a`)
+/// and then copies the run byte for byte, so a displaced run that would start
+/// outside the bitmap is pulled wholly inside it instead of clamping pixel by
+/// pixel.  Three runs are read per destination run: the centre one for green
+/// and alpha and the same span `dcol` either side for red and blue — the
+/// `± 4*channelOffset` pointers the copy loop builds around its centre
+/// pointer.
 fn apply_glitch(
     source: &[u8],
     source_bitmap: &LayerBitmap,
@@ -433,37 +498,49 @@ fn apply_glitch(
     let left = left.clamp(0, i64::from(dest_bitmap.width));
     let top = top.clamp(0, i64::from(dest_bitmap.height));
 
+    let source_width = i64::from(source_bitmap.width);
+    let source_pixels = source_width * i64::from(source_bitmap.height);
+    let size = i64::from(tables.size);
+
     for y in top..bottom {
         let line = tables.line[(y as u32).min(dest_bitmap.height.saturating_sub(1)) as usize];
-        for x in left..right {
+        let mut x = left;
+        while x < right {
+            let run_end = (((x / size) + 1) * size).min(right);
+            let length = run_end - x;
             let cell = tables.cell(x as u32, y as u32);
             let shift_x = ((line + tables.dx[cell]) * options.coef) as i64;
             let shift_y = (tables.dy[cell] * options.coef) as i64;
             let colour = (tables.colour[cell] * options.coef) as i64;
 
-            let sx = x + shift_x;
-            let sy = y + shift_y;
-            let green = sample(source, source_bitmap, sx, sy);
-            let red = sample(source, source_bitmap, sx + colour, sy);
-            let blue = sample(source, source_bitmap, sx - colour, sy);
+            // The run's start pixel, clamped the way the reference clamps the
+            // whole pointer: a run whose start falls outside the plane is
+            // pulled inside so the run still fits.
+            let run_start = |offset: i64| {
+                let start = (y + shift_y) * source_width + (x + shift_x + offset);
+                start.clamp(0, (source_pixels - length).max(0))
+            };
+            let centre = run_start(0);
+            let red = run_start(colour);
+            let blue = run_start(-colour);
 
-            let index = pixel_offset(x as u32, y as u32, dest_bitmap.width);
-            dest[index..index + 4].copy_from_slice(&[red[0], green[1], blue[2], green[3]]);
+            for step in 0..length {
+                let green = plane_pixel(source, centre + step);
+                let red = plane_pixel(source, red + step);
+                let blue = plane_pixel(source, blue + step);
+                let index = pixel_offset((x + step) as u32, y as u32, dest_bitmap.width);
+                dest[index..index + 4].copy_from_slice(&[red[0], green[1], blue[2], green[3]]);
+            }
+            x = run_end;
         }
     }
 }
 
-/// The edge-clamped sample the reference's pointer bounds checks
-/// (`0x10004f76`, `0x10004fd2`) amount to: a coordinate outside the source
-/// bitmap reads the nearest edge pixel.
-fn sample(source: &[u8], bitmap: &LayerBitmap, x: i64, y: i64) -> Rgba {
-    if bitmap.width == 0 || bitmap.height == 0 {
-        return [0, 0, 0, 0];
-    }
-    let x = x.clamp(0, i64::from(bitmap.width) - 1) as u32;
-    let y = y.clamp(0, i64::from(bitmap.height) - 1) as u32;
-    let index = pixel_offset(x, y, bitmap.width);
-    match source.get(index..index + 4) {
+/// The pixel at one linear plane index, the reference's
+/// `begin + 4 * index` pointer arithmetic over the tightly packed plane.
+fn plane_pixel(source: &[u8], index: i64) -> Rgba {
+    let start = index.max(0) as usize * 4;
+    match source.get(start..start + 4) {
         Some(pixel) => [pixel[0], pixel[1], pixel[2], pixel[3]],
         None => [0, 0, 0, 0],
     }
@@ -505,14 +582,17 @@ fn run_glitch(
 
 // ------------------------------------------------------------------ members
 
-/// `Layer.doGlitch(...)`:  the distorted pixels land on the layer the call
-/// went through.
+/// `Layer.doGlitch(sourceLayer, options)`: the distorted pixels land on the
+/// layer the call went through.
 ///
-/// The reference's invoker (`0x10002fb0`) requires an object argument before
-/// it runs, and its pass (`0x10004b00`) reads the options out of an object;
-/// the shape this port accepts covers both readings: an object argument that
-/// carries the layer member surface is the *source* layer, any other object
-/// is the option object. A call with neither distorts the layer in place.
+/// The reference's invoker (`0x10002fb0`) type-checks **two** object
+/// arguments — `tTJSVariant::Type()` must answer 1 for both
+/// (`0x10002ff7`/`0x10003020`) — and answers `TJS_E_BADPARAMCOUNT`
+/// (`0xfffffc15`, `0x100030ee`) otherwise; the first object is the layer the
+/// pass reads and the second the option object `0x10004b00` reads by name.
+/// Both are required here, and the layer the call went through is the
+/// destination, so `layer.doGlitch(other, %[...])` copies through the
+/// distortion and `layer.doGlitch(layer, %[...])` distorts in place.
 fn layer_do_glitch(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -521,16 +601,19 @@ fn layer_do_glitch(
     let Some(dest) = this_obj else {
         return Err(TjsError::bad_param_count());
     };
-    let (source, options) = split_layer_and_options(runtime, dest, &args);
-    let options = GlitchOptions::from_object(runtime, options);
-    run_glitch(runtime, source.unwrap_or(dest), dest, &options)?;
+    let source = object_argument(&args, 0).ok_or_else(TjsError::bad_param_count)?;
+    let options = object_argument(&args, 1).ok_or_else(TjsError::bad_param_count)?;
+    let options = GlitchOptions::from_object(runtime, Some(options));
+    run_glitch(runtime, source, dest, &options)?;
     Ok(Variant::Void)
 }
 
 /// `Layer.glitchCopy(sourceLayer, options)`: `0x100040e0`'s invoker rejects
 /// the call outright when the layer argument is not an object
 /// (`0xfffffc15` = `TJS_E_BADPARAMCOUNT`), so a missing or non-layer source
-/// is the same error here.
+/// is the same error here.  The option object stays optional — the pass reads
+/// every name it needs with a default (`0x10001ab0`), so a call with only the
+/// layer runs on those defaults.
 fn layer_glitch_copy(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -539,7 +622,7 @@ fn layer_glitch_copy(
     let Some(dest) = this_obj else {
         return Err(TjsError::bad_param_count());
     };
-    let Some(source) = args.first().and_then(Variant::object_handle) else {
+    let Some(source) = object_argument(&args, 0) else {
         return Err(TjsError::bad_param_count());
     };
     if !is_layer_like(runtime, source) {
@@ -550,23 +633,10 @@ fn layer_glitch_copy(
     Ok(Variant::Void)
 }
 
-/// Splits a member's arguments into an optional source layer and an optional
-/// option object, in the reference's order (layer first, options second).
-fn split_layer_and_options(
-    runtime: &Runtime<KrkrHost>,
-    dest: ObjectHandle,
-    args: &[Variant],
-) -> (Option<ObjectHandle>, Option<ObjectHandle>) {
-    let mut source = None;
-    let mut rest = args;
-    let candidate = args.first().and_then(Variant::object_handle);
-    if let Some(candidate) =
-        candidate.filter(|candidate| *candidate != dest && is_layer_like(runtime, *candidate))
-    {
-        source = Some(candidate);
-        rest = &args[1..];
-    }
-    (source, options_argument(runtime, rest))
+/// The object argument at `index`, the shape the reference's type check
+/// accepts (any object variant, `tTJSVariant::Type() == 1`).
+fn object_argument(args: &[Variant], index: usize) -> Option<ObjectHandle> {
+    args.get(index).and_then(Variant::object_handle)
 }
 
 /// The first object argument that is not a layer: the option object the pass
@@ -660,30 +730,18 @@ mod tests {
         ]
     }
 
-    /// The source encodes its own coordinates: red carries `x`, green carries
-    /// `y`, blue carries `(31 - x) * 8`, so a sampled pixel says which source
-    /// position each channel came from.
-    fn decoded(pixel: [u8; 4]) -> (i64, i64) {
-        (i64::from(pixel[0]), i64::from(pixel[1]))
-    }
-
     /// The source `x` the blue channel was sampled at, decoded from the
     /// `(31 - x) * 8` pattern.
     fn decoded_blue_x(pixel: [u8; 4]) -> i64 {
         31 - i64::from(pixel[2]) / 8
     }
 
-    /// The edge clamp the pass samples with (`0x10004f76`): a coordinate
-    /// outside the source bitmap reads the nearest edge pixel.
-    fn clamped(coordinate: i64, extent: u32) -> i64 {
-        coordinate.clamp(0, i64::from(extent) - 1)
-    }
-
-    /// A sampled coordinate is clamped, so a test recovers the displacement
-    /// from an interior pixel and then checks the whole row or block against
-    /// the clamped expectation.
-    fn clamp_matches(sampled_at: i64, coordinate: i64, offset: i64, extent: u32) -> bool {
-        sampled_at == clamped(coordinate + offset, extent)
+    /// The linear plane index a pixel was read from: the reference's pointer
+    /// arithmetic is linear over the plane (`begin + 4 * x + stride * y`), so
+    /// a run pulled inside the bitmap can cross from one row into the next and
+    /// only the linear index stays meaningful.
+    fn source_index(pixel: [u8; 4], width: u32) -> i64 {
+        i64::from(pixel[1]) * i64::from(width) + i64::from(pixel[0])
     }
 
     /// A compact summary for failure messages: full pixel dumps are unreadable
@@ -757,7 +815,7 @@ mod tests {
             probe.setImageSize(2, 2);
             probe.fillRect(0, 0, 2, 2, 0xff102030);
             probe.glitchCopy(probe, %[per_x: 0, per_y: 0, per_col: 0, noise: 0]);
-            probe.doGlitch(%[size: 2, per_x: 0, per_y: 0, per_col: 0, noise: 0]);
+            probe.doGlitch(probe, %[size: 2, per_x: 0, per_y: 0, per_col: 0, noise: 0]);
             return "" + (probe.doGlitch != void) + "/" + (probe.glitchCopy != void);
             "#,
         );
@@ -813,7 +871,7 @@ mod tests {
         let (bitmap, dest) = pixels(&mut engine, "dest");
         let (_, first) = pixels(&mut engine, "first");
         let (_, other) = pixels(&mut engine, "other");
-        let (_, source) = pixels(&mut engine, "source");
+        let (source_bitmap, source) = pixels(&mut engine, "source");
 
         assert_eq!(dest, first, "the same seed reproduces the same pass");
         assert_ne!(
@@ -829,41 +887,115 @@ mod tests {
             first_difference(&dest, &source, bitmap.width)
         );
 
-        // Every block shares one displacement, and it stays inside `sft_*`.
-        // An interior pixel recovers the displacement; the rest of the block
-        // then has to match its edge-clamped samples.
-        let mut block_offsets = Vec::new();
-        for block in 0..4u32 {
-            let probe_x = block * 8 + 4;
-            let probe_y = block * 8 + 4;
-            let (sx, sy) = decoded(pixel(&dest, bitmap.width, probe_x, probe_y));
-            let offset = (sx - i64::from(probe_x), sy - i64::from(probe_y));
-            assert!(
-                offset.0.abs() <= 8 && offset.1.abs() <= 4,
-                "offset {offset:?} escapes sft_x/sft_y"
-            );
-            for y in block * 8..block * 8 + 8 {
-                for x in block * 8..block * 8 + 8 {
-                    let (sx, sy) = decoded(pixel(&dest, bitmap.width, x, y));
-                    assert!(
-                        clamp_matches(sx, i64::from(x), offset.0, WIDTH)
-                            && clamp_matches(sy, i64::from(y), offset.1, HEIGHT),
-                        "({x}, {y}) in block {block} does not share the displacement {offset:?}"
+        // Every run reads one contiguous span of the source plane: the copy
+        // clamps the run's start pointer once (`0x10004f76`) and then walks it
+        // byte for byte, so consecutive destination pixels come from
+        // consecutive source pixels — a per-pixel clamp would repeat an edge
+        // pixel instead.  A block's run can cross a row, which is why the
+        // expectation is a linear plane index.
+        let mut run_starts = Vec::new();
+        for y in 0..HEIGHT {
+            for x0 in (0..WIDTH).step_by(8) {
+                let start = source_index(pixel(&dest, bitmap.width, x0, y), source_bitmap.width);
+                for step in 0..8 {
+                    let index = source_index(
+                        pixel(&dest, bitmap.width, x0 + step, y),
+                        source_bitmap.width,
+                    );
+                    assert_eq!(
+                        index,
+                        start + i64::from(step),
+                        "run ({x0}, {y}) is not contiguous at step {step}"
                     );
                 }
+                run_starts.push(start);
             }
-            block_offsets.push(offset);
         }
         assert!(
-            block_offsets
+            run_starts.iter().any(|start| *start != run_starts[0]),
+            "every run read the same span: {run_starts:?}"
+        );
+    }
+
+    /// The block tables are resetting random walks, not per-entry draws: the
+    /// accumulator at `0x1000225f` survives every entry (`0x100022c8`), a
+    /// reset zeroes it (`0x10002314`) and the current value is what gets
+    /// stored (`0x10002321`).  The row table has no such walk.
+    #[test]
+    fn block_tables_accumulate_a_walk_and_the_reset_rate_zeroes_it() {
+        use super::{GlitchOptions, GlitchTables};
+
+        let mut options = GlitchOptions::defaults();
+        options.seed = 2024;
+        options.size = 1;
+        options.sft_x = 8.0;
+        options.sft_y = 8.0;
+        options.sft_col = 8.0;
+        options.noise = 4.0;
+        options.per_x = 1.0;
+        options.per_y = 0.0;
+        options.per_col = 0.0;
+        options.per_reset = 0.0;
+        let tables = GlitchTables::build(&options, 32, 32);
+        assert!(
+            tables
+                .dx
                 .iter()
-                .any(|offset| *offset != block_offsets[0]),
-            "every block moved the same way: {block_offsets:?}"
+                .any(|value| value.abs() > 4.0 * options.sft_x),
+            "a 1024-entry walk should drift past four single steps: {:?}",
+            tables
+                .dx
+                .iter()
+                .fold(0.0f64, |max, value| max.max(value.abs()))
+        );
+        for (index, step) in tables
+            .dx
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .enumerate()
+        {
+            assert!(
+                step <= 6.0 * options.sft_x,
+                "step {index} of the walk is {step}, past six sigmas"
+            );
+        }
+        assert!(
+            tables.dy.iter().all(|value| *value == 0.0),
+            "a table whose rate is zero stays at zero"
+        );
+        assert!(
+            tables.colour.iter().all(|value| *value == 0.0),
+            "a table whose rate is zero stays at zero"
+        );
+
+        // `per_reset` 1.0 zeroes the accumulator on every entry.
+        options.per_reset = 1.0;
+        let reset = GlitchTables::build(&options, 32, 32);
+        assert!(
+            reset.dx.iter().all(|value| *value == 0.0),
+            "every entry resets, so the walk never leaves zero: {:?}",
+            reset
+                .dx
+                .iter()
+                .fold(0.0f64, |max, value| max.max(value.abs()))
+        );
+
+        // The row table is one normal draw per row, ungated (the block rates
+        // being zero leaves it as the only displacement).
+        options.per_x = 0.0;
+        options.per_reset = 0.0;
+        let rows = GlitchTables::build(&options, 32, 32);
+        assert!(rows.line.iter().any(|value| *value != 0.0), "rows jitter");
+        assert!(
+            rows.line
+                .iter()
+                .all(|value| value.abs() <= 6.0 * options.noise),
+            "a row draw stays inside six sigmas of `noise`"
         );
     }
 
     /// The row table has no probability gate: with the block rates at zero,
-    /// `noise` still shifts whole rows, each row by its own amount.
+    /// `noise` still shifts whole rows, each row by its own normal draw.
     #[test]
     fn row_noise_shifts_whole_rows() {
         let mut engine = engine();
@@ -876,36 +1008,51 @@ mod tests {
             "#,
         );
         let (bitmap, dest) = pixels(&mut engine, "dest");
-        let mut row_offsets = Vec::new();
-        for y in 0..32u32 {
-            let probe = WIDTH / 2;
-            let (sx, _) = decoded(pixel(&dest, bitmap.width, probe, y));
-            let offset = sx - i64::from(probe);
-            assert!(offset.abs() <= 4, "row {y} escapes the noise amplitude");
-            for x in 0..32u32 {
-                let (sx, sy) = decoded(pixel(&dest, bitmap.width, x, y));
-                assert!(
-                    clamp_matches(sx, i64::from(x), offset, WIDTH),
-                    "row {y} is not shifted as one: ({x}, {y}) samples {sx}, not {}",
-                    clamped(i64::from(x) + offset, WIDTH)
-                );
+        let (source_bitmap, _) = pixels(&mut engine, "source");
+        let width = i64::from(source_bitmap.width);
+        let last_run = width * i64::from(source_bitmap.height) - 8;
+
+        let mut row_shifts = Vec::new();
+        for y in 1..HEIGHT {
+            // The first run of the row recovers the row's own shift: no clamp
+            // can reach it for a normal draw of this scale.
+            let base = i64::from(y) * width;
+            let shift = source_index(pixel(&dest, bitmap.width, 0, y), source_bitmap.width) - base;
+            assert!(
+                shift.abs() <= 6 * 4,
+                "row {y} escaped six sigmas of `noise`: {shift}"
+            );
+            for x0 in (0..WIDTH).step_by(8) {
+                let start = source_index(pixel(&dest, bitmap.width, x0, y), source_bitmap.width);
+                let expected = (base + i64::from(x0) + shift).clamp(0, last_run);
                 assert_eq!(
-                    sy,
-                    i64::from(y),
-                    "green keeps its own source row at ({x}, {y})"
+                    start, expected,
+                    "row {y} run {x0} did not take the row's shift {shift}"
                 );
+                for step in 0..8 {
+                    let index = source_index(
+                        pixel(&dest, bitmap.width, x0 + step, y),
+                        source_bitmap.width,
+                    );
+                    assert_eq!(
+                        index,
+                        start + i64::from(step),
+                        "row {y} run {x0} is not contiguous at step {step}"
+                    );
+                }
             }
-            row_offsets.push(offset);
+            row_shifts.push(shift);
         }
         assert!(
-            row_offsets.iter().any(|offset| *offset != row_offsets[0]),
-            "no row moved: {row_offsets:?}"
+            row_shifts.iter().any(|shift| *shift != row_shifts[0]),
+            "no row moved: {row_shifts:?}"
         );
     }
 
-    /// `sft_col` splits the channels: red and blue sample either side of the
-    /// green sample (`0x10004f40`'s three source pointers), and green keeps
-    /// the geometric sample.
+    /// `sft_col` splits the channels: red and blue read runs `∓ colour` either
+    /// side of the green run (`0x10004f40`'s `± 4 * channelOffset` pointers),
+    /// the centre one keeps the geometric sample, each run is contiguous, and
+    /// the two outer runs are clamped into the plane on their own.
     #[test]
     fn colour_split_moves_red_against_blue() {
         let mut engine = engine();
@@ -913,49 +1060,94 @@ mod tests {
         run(
             &mut engine,
             r#"
-            dest.glitchCopy(source, %[size: 8, seed: 3, noise: 0, sft_x: 0, sft_y: 0,
-                sft_col: 6, per_x: 0, per_y: 0, per_col: 1.0, per_reset: 0]);
+            dest.glitchCopy(source, %[size: 4, seed: 3, noise: 0, sft_x: 0, sft_y: 0,
+                sft_col: 2, per_x: 0, per_y: 0, per_col: 1.0, per_reset: 0.5]);
             "#,
         );
         let (bitmap, dest) = pixels(&mut engine, "dest");
+        let (source_bitmap, _) = pixels(&mut engine, "source");
+        let width = i64::from(source_bitmap.width);
+        let total = width * i64::from(source_bitmap.height);
+        // The runs at the start of a row would have to clamp once the walk
+        // moves them left, so the assertions stay inside this window and check
+        // the walk stayed small enough for it.
+        let tested_runs = [8u32, 12, 16, 20];
+
         let mut split_seen = false;
-        // Interior pixels only: their samples cannot have been clamped.
-        for y in 0..32u32 {
-            for x in 8..24u32 {
-                let value = pixel(&dest, bitmap.width, x, y);
-                let red = i64::from(value[0]);
-                let green = i64::from(value[1]);
-                let blue = decoded_blue_x(value);
-                assert_eq!(green, i64::from(y), "green keeps the source row");
-                assert!(
-                    (red - blue).abs() <= 12,
-                    "the colour split escapes 2 * sft_col at ({x},{y}): R {red} vs B {blue}"
+        for y in 0..HEIGHT {
+            for x0 in tested_runs {
+                let x0 = i64::from(x0);
+                let value = pixel(&dest, bitmap.width, x0 as u32, y);
+                // Green and alpha come from the centre run, which no rate moves
+                // here, and the split has to straddle it symmetrically — the
+                // two together pin the centre to the block start.
+                assert_eq!(
+                    i64::from(value[1]),
+                    i64::from(y),
+                    "the centre run left the source row at run ({x0}, {y})"
                 );
                 assert_eq!(
-                    (red - blue) % 2,
-                    0,
-                    "red and blue must straddle the green sample symmetrically at ({x},{y}): R {red}, B {blue}"
+                    i64::from(value[3]),
+                    255,
+                    "alpha must come from the centre run at ({x0}, {y})"
                 );
-                if red != i64::from(x) || blue != i64::from(x) {
+
+                let red_offset = i64::from(value[0]) - x0;
+                let blue_offset = decoded_blue_x(value) - x0;
+                assert!(
+                    red_offset.abs() <= 8 && blue_offset.abs() <= 8,
+                    "the colour walk left the tested window at ({x0}, {y}): R {red_offset}, B {blue_offset}"
+                );
+                assert_eq!(
+                    red_offset, -blue_offset,
+                    "red and blue must straddle the centre sample at ({x0}, {y}): R {red_offset}, B {blue_offset}"
+                );
+                if red_offset != 0 {
                     split_seen = true;
+                }
+
+                // Both outer runs are contiguous reads of their own span, with
+                // the centre run between them.
+                for step in 0..4u32 {
+                    let step = i64::from(step);
+                    let pixel = pixel(&dest, bitmap.width, (x0 + step) as u32, y);
+                    assert_eq!(
+                        i64::from(pixel[0]),
+                        x0 + red_offset + step,
+                        "the red run is not contiguous at ({}, {y})",
+                        x0 + step
+                    );
+                    assert_eq!(
+                        decoded_blue_x(pixel),
+                        x0 + blue_offset + step,
+                        "the blue run is not contiguous at ({}, {y})",
+                        x0 + step
+                    );
+                    assert_eq!(
+                        i64::from(pixel[1]),
+                        i64::from(y),
+                        "the centre run left its row at ({}, {y})",
+                        x0 + step
+                    );
                 }
             }
         }
         assert!(split_seen, "no block took its colour displacement");
+        assert!(total > 0);
     }
 
-    /// `doGlitch` without a source layer distorts in place, and `glitchCopy`
-    /// without its layer argument is the reference's bad-argument-count
-    /// error (`0x100040e0` returns `0xfffffc15`).
+    /// `doGlitch` distorts the layer the call went through, requires both of
+    /// the reference's object arguments (`0x10002fb0`), and `glitchCopy`
+    /// without its layer argument is the same bad-argument-count error.
     #[test]
-    fn do_glitch_works_in_place_and_glitch_copy_rejects_a_missing_layer() {
+    fn do_glitch_works_in_place_and_both_members_reject_missing_arguments() {
         let mut engine = engine();
         run(&mut engine, SOURCE_LAYER);
         let (bitmap, before) = pixels(&mut engine, "source");
         run(
             &mut engine,
             r#"
-            source.doGlitch(%[size: 8, seed: 42, noise: 2, sft_x: 6, sft_y: 6,
+            source.doGlitch(source, %[size: 8, seed: 42, noise: 2, sft_x: 6, sft_y: 6,
                 sft_col: 0, per_x: 1.0, per_y: 1.0, per_col: 0, per_reset: 0]);
             "#,
         );
@@ -967,18 +1159,31 @@ mod tests {
             first_difference(&before, &after, bitmap.width)
         );
 
-        let message = run(
-            &mut engine,
-            r#"
-            var message = "";
-            try { dest.glitchCopy(); } catch (e) { message = e.message; }
-            return message;
-            "#,
-        );
-        assert_eq!(
-            message.to_tjs_string().expect("string"),
-            "Invalid argument count"
-        );
+        // `0x10002fb0` type-checks two object arguments; `0x100040e0` rejects
+        // a `glitchCopy` whose layer argument is missing or not an object.
+        for call in [
+            "dest.glitchCopy()",
+            "dest.glitchCopy(1)",
+            "source.doGlitch()",
+            "source.doGlitch(source)",
+            "source.doGlitch(1, %[size: 8])",
+        ] {
+            let message = run(
+                &mut engine,
+                &format!(
+                    r#"
+                    var message = "";
+                    try {{ {call}; }} catch (e) {{ message = e.message; }}
+                    return message;
+                    "#
+                ),
+            );
+            assert_eq!(
+                message.to_tjs_string().expect("string"),
+                "Invalid argument count",
+                "{call} must report the reference's TJS_E_BADPARAMCOUNT"
+            );
+        }
     }
 
     /// A layer whose image the script freed refuses the write with the
@@ -1025,7 +1230,7 @@ mod tests {
             freed.setImageSize(8, 8);
             freed.freeImage();
             var message = "";
-            try { freed.doGlitch(); } catch (e) { message = e.message; }
+            try { freed.doGlitch(source, %[size: 8]); } catch (e) { message = e.message; }
             return message;
             "#,
         );
