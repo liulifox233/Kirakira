@@ -19505,4 +19505,705 @@ mod tests {
         })
         .expect("engine")
     }
+
+    fn layer_rgba(engine: &KrkrEngine, layer_id: u64) -> Vec<u8> {
+        engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image")
+            .upload
+            .rgba
+            .to_vec()
+    }
+
+    /// `operateAffine`'s parameters are `src, sx, sy, sw, sh, affine, a, b, c,
+    /// d, tx, ty, mode, opa, type` with a trailing deprecated `hda`
+    /// (`LayerIntf.cpp:7490-7507`) and **no** clear argument; reading them one
+    /// slot late made an explicit mode throw (`opa` was consumed as the mode)
+    /// and let any non-zero `opa` clear the destination outside the quad.
+    #[test]
+    fn native_layer_operate_affine_takes_mode_and_opacity_from_slots_12_and_13() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                source.fillRect(0, 0, 4, 4, 0xffff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 4, 4, 0xff0000ff);
+                // The quad covers the top-left 2x2 only, so the rest of the
+                // destination shows whether the call cleared it.
+                dest.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omOpaque, 255, 0);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        let rgba = layer_rgba(&engine, layer_id);
+        let pixel = |x: usize, y: usize| &rgba[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+        assert_eq!(pixel(0, 0), [255, 0, 0, 255], "omOpaque blits the source");
+        assert_eq!(pixel(1, 1), [255, 0, 0, 255], "inside the quad");
+        assert_eq!(
+            pixel(3, 3),
+            [0, 0, 255, 255],
+            "outside the quad keeps the destination: opa is not a clear flag"
+        );
+    }
+
+    /// The opacity of `operateAffine` is `param[13]` and the stretch type
+    /// `param[14]` (`LayerIntf.cpp:7490-7496`).
+    #[test]
+    fn native_layer_operate_affine_reads_opacity_and_stretch_type_slots() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                source.fillRect(0, 0, 4, 4, 0xffff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 4, 4, 0xffffffff);
+                dest.operateAffine(source, 0, 0, 4, 4, false, 0, 0, 4, 0, 0, 4, omAlpha, 128, 0);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        let rgba = layer_rgba(&engine, layer_id);
+        // `bmAlpha` at opa 128 over opaque white: 0x00ff8080.
+        assert_eq!(&rgba[..4], [255, 128, 128, 0]);
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 1);
+                source.fillRect(0, 0, 1, 1, 0xffff0000);
+                source.fillRect(1, 0, 1, 1, 0xff0000ff);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 1);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 4, 1, 0xff00ff00);
+                // type = stLinear (2) in slot 14 interpolates; reading slot 15
+                // would fall back to nearest.
+                dest.operateAffine(source, 0, 0, 2, 1, false, 0, 0, 4, 0, 0, 1, omOpaque, 255, 2);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        let rgba = layer_rgba(&engine, layer_id);
+        assert_eq!(
+            &rgba[..4],
+            [255, 0, 0, 255],
+            "first column stays source red"
+        );
+        assert_eq!(
+            &rgba[12..16],
+            [0, 0, 255, 255],
+            "last column stays source blue"
+        );
+        let mixed = (1..3).any(|x| {
+            let p = &rgba[x * 4..x * 4 + 4];
+            p[0] > 0 && p[2] > 0
+        });
+        assert!(mixed, "stLinear blends the interior columns: {rgba:?}");
+    }
+
+    /// `bmCopyOnAddAlpha`/`bmAddAlpha`/`bmAddAlphaOnAddAlpha`
+    /// (`LayerBitmapIntf.cpp:1360-1415`): the `dfAddAlpha` family is
+    /// premultiplied, so the destination is scaled by `255 - src_alpha` and the
+    /// raw source is added instead of the straight-alpha lerp.
+    #[test]
+    fn native_layer_add_alpha_face_uses_the_premultiplied_blends() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                source.fillRect(0, 0, 4, 4, 0xffff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 4, 4, 0xffffffff);
+                // omAddAlpha on dfOpaque is bmAddAlpha: an opaque source
+                // replaces the destination outright.
+                dest.operateRect(0, 0, source, 0, 0, 4, 4, omAddAlpha, 255);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        assert_eq!(
+            &layer_rgba(&engine, layer_id)[..4],
+            [255, 0, 0, 255],
+            "TVPAdditiveAlphaBlend replaces an opaque destination"
+        );
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                source.fillRect(0, 0, 4, 4, 0xffff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 4, 4, 0xffffffff);
+                dest.operateRect(0, 0, source, 0, 0, 4, 4, omAddAlpha, 128);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        assert_eq!(
+            &layer_rgba(&engine, layer_id)[..4],
+            [254, 127, 127, 127],
+            "TVPAdditiveAlphaBlend_o scales both source and destination"
+        );
+
+        // A premultiplied destination: omAlpha is `bmAlphaOnAddAlpha`
+        // (TVPAlphaBlend_a/_ao), omAddAlpha is `bmAddAlphaOnAddAlpha`.
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                source.fillRect(0, 0, 4, 4, 0x80ff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.face = 4; // dfAddAlpha
+                dest.fillRect(0, 0, 4, 4, 0x80808080);
+                dest.operateRect(0, 0, source, 0, 0, 4, 4, omAlpha, 128);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        assert_eq!(
+            &layer_rgba(&engine, layer_id)[..4],
+            [158, 95, 95, 160],
+            "bmAlphaOnAddAlpha premultiplies the source"
+        );
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                source.fillRect(0, 0, 4, 4, 0x80ff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.face = 4; // dfAddAlpha
+                dest.fillRect(0, 0, 4, 4, 0x80808080);
+                dest.operateRect(0, 0, source, 0, 0, 4, 4, omAddAlpha, 255);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        assert_eq!(
+            &layer_rgba(&engine, layer_id)[..4],
+            [255, 63, 63, 192],
+            "bmAddAlphaOnAddAlpha adds the source into the scaled destination"
+        );
+    }
+
+    /// `bmAddAlphaOnAlpha` is the reference's "Not yet implemented" no-op
+    /// (`LayerBitmapIntf.cpp:1383-1386`): `omAddAlpha` onto a plain alpha face
+    /// changes nothing.
+    #[test]
+    fn native_layer_add_alpha_on_alpha_is_a_no_op() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                source.fillRect(0, 0, 4, 4, 0x80ff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.fillRect(0, 0, 4, 4, 0xff204080);
+                dest.operateRect(0, 0, source, 0, 0, 4, 4, omAddAlpha, 255);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        assert_eq!(&layer_rgba(&engine, layer_id)[..4], [32, 64, 128, 255]);
+    }
+
+    /// The `nsa` family (`add/sub/mul/dodge/darken/lighten/screen`) never
+    /// consults the source alpha (`DEFINE_BLEND_MIN_VARIATION`,
+    /// `blend_functor_c.h:30-33`): a half-transparent source still blends its
+    /// raw colour.
+    #[test]
+    fn native_layer_nsa_blends_ignore_the_source_alpha() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(4, 1);
+                source.fillRect(0, 0, 1, 1, 0x00abcdef);
+                source.fillRect(1, 0, 1, 1, 0x80ff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 1);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 4, 1, 0xff808080);
+                dest.operateRect(0, 0, source, 0, 0, 1, 1, omAdditive, 255);
+                dest.operateRect(1, 0, source, 1, 0, 1, 1, omScreen, 255);
+                dest.operateRect(2, 0, source, 1, 0, 1, 1, omMultiplicative, 255);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        let rgba = layer_rgba(&engine, layer_id);
+        assert_eq!(
+            &rgba[0..4],
+            [0xff, 0xff, 0xff, 0xff],
+            "raw add of a fully transparent colour still adds"
+        );
+        assert_eq!(
+            &rgba[4..8],
+            [255, 129, 129, 255],
+            "screen of the raw half-transparent colour"
+        );
+        assert_eq!(
+            &rgba[8..12],
+            [127, 0, 0, 0],
+            "multiplicative of the raw colour, alpha byte not blended"
+        );
+    }
+
+    /// `FillColorOnAddAlpha` (`LayerIntf.cpp:3948-3958`) uses
+    /// `TVPConstColorAlphaBlend_a` on a `dfAddAlpha` face and refuses a
+    /// negative opacity.
+    #[test]
+    fn native_layer_color_rect_on_add_alpha_face() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                dest.setImageSize(2, 1);
+                dest.face = 4; // dfAddAlpha
+                dest.fillRect(0, 0, 2, 1, 0xff804020);
+                dest.colorRect(0, 0, 1, 1, 0x00112233, 128);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        assert_eq!(&layer_rgba(&engine, layer_id)[..4], [88, 48, 23, 255]);
+
+        let error = engine
+            .execute_script("inline.tjs", "dest.colorRect(0, 0, 1, 1, 0x00112233, -1);")
+            .expect_err("negative opacity is refused on dfAddAlpha");
+        assert!(error.message.contains("Negative opacity"), "{error:?}");
+    }
+
+    /// `CopyRect`'s `dfProvince` branch (`LayerIntf.cpp:4179-4195`) copies the
+    /// source's province plane, and zero-fills the destination plane when the
+    /// source has none.
+    #[test]
+    fn native_layer_copy_rect_on_a_province_face() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(4, 1);
+                source.setProvincePixel(0, 0, 5);
+                source.setProvincePixel(1, 0, 6);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 1);
+                dest.face = 3; // dfProvince
+                dest.setProvincePixel(0, 0, 9);
+                dest.setProvincePixel(1, 0, 9);
+                dest.copyRect(0, 0, source, 0, 0, 4, 1);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "dest.getProvincePixel(0, 0)")
+                .expect("province pixel")
+                .to_integer()
+                .expect("integer"),
+            5
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "dest.getProvincePixel(1, 0)")
+                .expect("province pixel")
+                .to_integer()
+                .expect("integer"),
+            6
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "dest.getProvincePixel(2, 0)")
+                .expect("province pixel")
+                .to_integer()
+                .expect("integer"),
+            0
+        );
+
+        // A source without a province plane zero-fills the destination rect.
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.plain = new Layer();
+                plain.setImageSize(4, 1);
+                dest.setProvincePixel(0, 0, 9);
+                dest.setProvincePixel(1, 0, 9);
+                dest.copyRect(0, 0, plain, 0, 0, 4, 1);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "dest.getProvincePixel(0, 0) + ':' + dest.getProvincePixel(1, 0)"
+                )
+                .expect("province pixels")
+                .to_tjs_string()
+                .expect("string"),
+            "0:0"
+        );
+    }
+
+    /// Every other blit refuses a `dfProvince` face: `stretchCopy`,
+    /// `affineCopy`, `operateStretch`, `operateAffine` and `operateRect` reach
+    /// `GetBltMethodFromOperationModeAndDrawFace`, which has no province case
+    /// (`LayerIntf.cpp:4260-4262`, `:4303-4305`, `:4411-4415`, `:4447-4452`,
+    /// `:4370-4374`).
+    #[test]
+    fn native_layer_province_face_refuses_other_blits() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                global.dest = new Layer();
+                dest.setImageSize(2, 2);
+                dest.face = 3; // dfProvince
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "dest.stretchCopy(0, 0, 2, 2, source, 0, 0, 2, 2, 0);",
+            "dest.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateStretch(0, 0, 2, 2, source, 0, 0, 2, 2, omOpaque, 255);",
+            "dest.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omOpaque);",
+            "dest.operateRect(0, 0, source, 0, 0, 2, 2, omOpaque);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("province face has no blit method");
+            assert!(
+                error.message.contains("Not drawable face type"),
+                "{call}: {error:?}"
+            );
+        }
+        // `piledCopy` is not face-dispatched in the reference
+        // (`LayerIntf.cpp:4102-4142`), so it still composes.
+        engine
+            .execute_script(
+                "inline.tjs",
+                "dest.face = 3; dest.piledCopy(0, 0, source, 0, 0, 2, 2);",
+            )
+            .expect("piledCopy runs on a province face");
+    }
+
+    /// `clipLeft`/`clipTop`/`clipWidth`/`clipHeight` are live views of the
+    /// `ClipRect` (`LayerIntf.cpp:8927-9005`), which `SetClip` clamps to the
+    /// image (`:3718-3732`).
+    #[test]
+    fn native_layer_clip_properties_are_live_and_clamped() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(8, 8);
+                layer.setClip(2, 3, 4, 5);
+                "#,
+            )
+            .expect("script");
+        let read = |engine: &mut KrkrEngine, expression: &str| -> i64 {
+            engine
+                .execute_expression("inline.tjs", expression)
+                .expect("expression")
+                .to_integer()
+                .expect("integer")
+        };
+        assert_eq!(read(&mut engine, "layer.clipLeft"), 2);
+        assert_eq!(read(&mut engine, "layer.clipTop"), 3);
+        assert_eq!(read(&mut engine, "layer.clipWidth"), 4);
+        assert_eq!(read(&mut engine, "layer.clipHeight"), 5);
+
+        // The property is the same rectangle the fills are clipped to.
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                layer.clipWidth = 1;
+                layer.fillRect(0, 0, 8, 8, 0xff123456);
+                "#,
+            )
+            .expect("script");
+        let layer_id = read(&mut engine, "layer.__nativeLayerId") as u64;
+        let rgba = layer_rgba(&engine, layer_id);
+        let pixel = |x: usize, y: usize| &rgba[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
+        assert_eq!(pixel(2, 3), [18, 52, 86, 255], "inside the clip");
+        assert_eq!(
+            pixel(3, 3),
+            [255, 255, 255, 0],
+            "outside the clip keeps the holder"
+        );
+
+        // Clamping: negative origins, image bounds and the right >= left rule.
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                layer.setClip(-5, -5, 10, 10);
+                global.first = layer.clipLeft + "," + layer.clipTop + "," +
+                    layer.clipWidth + "," + layer.clipHeight;
+                layer.setClip(100, 0, 10, 10);
+                global.second = layer.clipLeft + "," + layer.clipWidth + "," + layer.clipHeight;
+                layer.setClip();
+                global.third = layer.clipLeft + "," + layer.clipWidth;
+                "#,
+            )
+            .expect("script");
+        let text = |engine: &mut KrkrEngine, expression: &str| -> String {
+            engine
+                .execute_expression("inline.tjs", expression)
+                .expect("expression")
+                .to_tjs_string()
+                .expect("string")
+        };
+        assert_eq!(text(&mut engine, "first"), "0,0,5,5");
+        assert_eq!(text(&mut engine, "second"), "100,0,8");
+        assert_eq!(text(&mut engine, "third"), "0,8", "setClip() resets");
+
+        // Without an image the rectangle cannot be set, but it stays readable.
+        let error = engine
+            .execute_script(
+                "inline.tjs",
+                "layer.freeImage(); layer.setClip(0, 0, 1, 1);",
+            )
+            .expect_err("no image");
+        assert!(
+            error.message.contains("Not drawable layer type"),
+            "{error:?}"
+        );
+        assert_eq!(read(&mut engine, "layer.clipLeft"), 0);
+        assert_eq!(read(&mut engine, "layer.clipWidth"), 0);
+    }
+
+    /// `SetMainPixel`/`SetMaskPixel` require a main image
+    /// (`LayerIntf.cpp:2594-2596`, `:2621`): a write after `freeImage` throws
+    /// instead of fabricating a bitmap.
+    #[test]
+    fn native_layer_pixel_setters_require_an_image() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(4, 4);
+                layer.freeImage();
+                global.hasImage = layer.hasImage;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "hasImage")
+                .expect("expression")
+                .to_integer()
+                .expect("integer"),
+            0
+        );
+        for call in [
+            "layer.setMainPixel(0, 0, 0xff0000);",
+            "layer.setMaskPixel(0, 0, 128);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("a freed bitmap cannot be written");
+            assert!(
+                error.message.contains("Not drawable layer type"),
+                "{call}: {error:?}"
+            );
+        }
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "layer.hasImage")
+                .expect("expression")
+                .to_integer()
+                .expect("integer"),
+            0
+        );
+    }
+
+    /// `SetType` (`LayerIntf.cpp:1446-1466`) allocates or frees the image with
+    /// the type, and `SetHasImage` refuses one on `ltBinder`/`ltEffect`/
+    /// `ltFilter` (`:2228-2235`).
+    #[test]
+    fn native_layer_type_change_allocates_and_frees_the_image() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(4, 4);
+                layer.type = 0; // ltBinder
+                global.binder = layer.hasImage;
+                layer.type = 2; // ltAlpha allocates again
+                global.alpha = layer.hasImage;
+                layer.type = 0;
+                "#,
+            )
+            .expect("script");
+        let read = |engine: &mut KrkrEngine, expression: &str| -> i64 {
+            engine
+                .execute_expression("inline.tjs", expression)
+                .expect("expression")
+                .to_integer()
+                .expect("integer")
+        };
+        assert_eq!(read(&mut engine, "binder"), 0);
+        assert_eq!(read(&mut engine, "alpha"), 1);
+        let error = engine
+            .execute_script("inline.tjs", "layer.hasImage = 1;")
+            .expect_err("ltBinder cannot have an image");
+        assert!(error.message.contains("cannot have image"), "{error:?}");
+    }
+
+    /// `InternalAffineBlt` throws `TVPOutOfRectangle` when the source
+    /// rectangle leaves the source bitmap (`LayerBitmapIntf.cpp:2704-2709`);
+    /// a stretch with a type at or above `stLinear` goes to the resampler and
+    /// only clips.
+    #[test]
+    fn native_layer_blits_validate_the_source_rectangle() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                global.dest = new Layer();
+                dest.setImageSize(2, 2);
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "dest.affineCopy(source, 1, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(source, 1, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omOpaque);",
+            "dest.stretchCopy(0, 0, 2, 2, source, 1, 1, 2, 2, 0);",
+            "dest.operateStretch(0, 0, 2, 2, source, 1, 1, 2, 2, omOpaque, 255, 0);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("source rectangle leaves the bitmap");
+            assert!(
+                error.message.contains("Out of rectangle"),
+                "{call}: {error:?}"
+            );
+        }
+        engine
+            .execute_script(
+                "inline.tjs",
+                "dest.stretchCopy(0, 0, 2, 2, source, 1, 1, 2, 2, 2);",
+            )
+            .expect("a resampled stretch clips instead of throwing");
+    }
+
+    /// A negative destination extent is the reference's mirrored blit: the
+    /// affine path receives a rectangle whose right/bottom edge precedes its
+    /// left/top one (`LayerBitmapIntf.cpp:1867-1875`).
+    #[test]
+    fn native_layer_negative_stretch_extents_mirror() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 1);
+                source.fillRect(0, 0, 1, 1, 0xffff0000);
+                source.fillRect(1, 0, 1, 1, 0xff0000ff);
+
+                global.dest = new Layer();
+                dest.setImageSize(2, 1);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 2, 1, 0xff00ff00);
+                dest.stretchCopy(2, 0, -2, 1, source, 0, 0, 2, 1, 0);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        let rgba = layer_rgba(&engine, layer_id);
+        assert_eq!(&rgba[0..4], [0, 0, 255, 255], "mirrored: blue first");
+        assert_eq!(&rgba[4..8], [255, 0, 0, 255], "mirrored: red last");
+     }
 }
