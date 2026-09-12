@@ -103,9 +103,9 @@ pub struct LayerBitmap {
     /// layer-local coordinates, already defaulted to the full image when unset
     /// (reference `ClipRect`, `LayerIntf.cpp:3709-3716`).
     pub clip: (i64, i64, i64, i64),
-    /// `layer_type` (`ltAlpha`=0, …), so a plugin can apply the same type
-    /// checks the reference's family does; `ltBinder` (0), `ltEffect` (6) and
-    /// `ltFilter` (7) never carry an image.
+    /// `layer_type` (`ltBinder`=0, `ltAlpha`=2, …), so a plugin can apply the
+    /// same type checks the reference's family does — the binder/effect/filter
+    /// types (0, 6, 7) never carry an image.
     pub layer_type: i32,
 }
 
@@ -264,6 +264,13 @@ pub fn layer_province_read<R>(
 /// plane the closure leaves all zero is deallocated — `FillRect`'s `dfProvince`
 /// branch does the same (`classes.rs` `fill_layer_province`), and an all-zero
 /// plane reads identically to no plane.
+///
+/// An object that is not a layer attached to a render node (a non-`Layer`
+/// object, or an already-invalidated layer) fails with
+/// [`LayerBitmapError::NotDrawable`] even when `allocate` is false: there is no
+/// plane to hand out and nowhere to commit one.  [`layer_province_read`] hands
+/// that object an empty view instead, and the native `setProvincePixel` is a
+/// silent no-op there.
 pub fn layer_province_write<R>(
     runtime: &mut Runtime<KrkrHost>,
     layer: ObjectHandle,

@@ -2030,7 +2030,7 @@ impl KrkrHost {
     /// surfaces, long-exposure accumulators, AVI bookkeeping) here instead of
     /// in a TJS member.  The slot is keyed by layer object *and* `TypeId`, so
     /// unrelated plugins never collide, and it is pruned by
-    /// [`KrkrHost::invalidate_native_object`] when the layer is destroyed.
+    /// `invalidate_native_object` when the layer is destroyed.
     ///
     /// The value is an `Arc`; plugin code takes it out before a pixel closure
     /// runs and keeps its own interior mutability (`Mutex`, atomics) inside,
