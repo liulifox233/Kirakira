@@ -12,7 +12,7 @@ use std::{
     thread,
 };
 
-use krkr_core::{DrawCommand, Point, Size};
+use krkr_core::{Color, DrawCommand, FrameOutput, Point, Size};
 use krkr_engine::{KagTaskState, KrkrEngine, KrkrHost, RuntimeSession, SystemPaths};
 use krkr_tjs2::runtime::{ObjectHandle, Runtime, Variant};
 
@@ -45,7 +45,12 @@ pub enum InteractiveCommand {
     },
     Resources,
     Help,
-    Shot(String),
+    Shot {
+        path: String,
+        /// Write the historical raw view (`draw_commands` only, flattened
+        /// onto black) instead of the composited frame with its transitions.
+        raw: bool,
+    },
     Expression(String),
     Members {
         expression: String,
@@ -238,10 +243,17 @@ pub fn parse_interactive_command(line: &str) -> Result<InteractiveCommand, Strin
             }
         }
         "shot" => {
-            if rest.is_empty() {
-                Err("usage: shot <path>".to_string())
+            let (raw, path) = match rest.strip_prefix("--raw") {
+                Some(tail) => (true, tail.trim_start()),
+                None => (false, rest),
+            };
+            if path.is_empty() {
+                Err("usage: shot [--raw] <path>".to_string())
             } else {
-                Ok(InteractiveCommand::Shot(rest.to_string()))
+                Ok(InteractiveCommand::Shot {
+                    path: path.to_string(),
+                    raw,
+                })
             }
         }
         "expr" => {
@@ -431,11 +443,52 @@ pub fn parse_interactive_until(rest: &str) -> Result<(InteractiveUntil, usize), 
     Ok((condition, max_frames))
 }
 
-/// Apply a command from the frame-loop control channel.  Returns `true` when
-/// the caller should terminate the probe.  Inspection commands are handled
-/// synchronously, while control commands only change the state consumed by
-/// the next frame boundary.
+/// Apply a command from a caller that records only the live draw list (the
+/// windowed `krkr-desktop --debug-console` shell).
+///
+/// The frame is reconstructed from the commands, so a running transition is
+/// not part of it: `draw` reports `transitions=0` and `shot` writes the
+/// historical view.  Frames without transitions are byte-identical between
+/// the two entries; a caller that has the `FrameOutput` (as `krkr-debug`
+/// does) uses [`apply_interactive_control_with_frame`] instead.
 #[allow(clippy::too_many_arguments)]
+pub fn apply_interactive_control(
+    command: InteractiveCommand,
+    paused: &mut bool,
+    budget: &mut Option<usize>,
+    until: &mut Option<InteractiveUntil>,
+    pending_clicks: &mut Vec<Point>,
+    pending_shots: &mut Vec<String>,
+    frame_index: usize,
+    runtime: &mut RuntimeSession,
+    textures: &mut TextureCache,
+    last_commands: Option<&[DrawCommand]>,
+    auto_click: &mut bool,
+    auto_point: &mut Option<Point>,
+) -> bool {
+    let frame = last_commands
+        .map(|commands| FrameOutput::new(Color::new(0.0, 0.0, 0.0, 0.0), commands.to_vec()));
+    let mut frame_shots = Vec::new();
+    let quit = apply_interactive_control_with_frame(
+        command,
+        paused,
+        budget,
+        until,
+        pending_clicks,
+        &mut frame_shots,
+        frame_index,
+        runtime,
+        textures,
+        frame.as_ref(),
+        auto_click,
+        auto_point,
+    );
+    // The commands-only caller has no frame to composite, so a queued shot
+    // keeps its path and is written by its own next-frame shot loop.
+    pending_shots.extend(frame_shots.into_iter().map(|(path, _raw)| path));
+    quit
+}
+
 /// Evaluates a console expression, turning "the VM is parked" into an explicit
 /// error.
 ///
@@ -518,17 +571,28 @@ pub fn member_lines(
     Ok(lines)
 }
 
-pub fn apply_interactive_control(
+/// Apply a command from the frame-loop control channel.  Returns `true` when
+/// the caller should terminate the probe.  Inspection commands are handled
+/// synchronously, while control commands only change the state consumed by
+/// the next frame boundary.
+///
+/// This is the frame-aware entry: `last_frame` is the complete
+/// `FrameOutput`, so `draw` reports the running transitions and `shot` writes
+/// their composite.  The windowed shell's `--debug-console` records only the
+/// live draw list and goes through [`apply_interactive_control`], which
+/// reconstructs a transition-free frame.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_interactive_control_with_frame(
     command: InteractiveCommand,
     paused: &mut bool,
     budget: &mut Option<usize>,
     until: &mut Option<InteractiveUntil>,
     pending_clicks: &mut Vec<Point>,
-    pending_shots: &mut Vec<String>,
+    pending_shots: &mut Vec<(String, bool)>,
     frame_index: usize,
     runtime: &mut RuntimeSession,
     textures: &mut TextureCache,
-    last_commands: Option<&[DrawCommand]>,
+    last_frame: Option<&FrameOutput>,
     auto_click: &mut bool,
     auto_point: &mut Option<Point>,
 ) -> bool {
@@ -616,8 +680,9 @@ pub fn apply_interactive_control(
             Err(error) => println!("interactive hit_error position={position:?}: {error}"),
         },
         InteractiveCommand::Draw => {
-            if let Some(commands) = last_commands {
-                dump_draw_commands(commands);
+            if let Some(frame) = last_frame {
+                dump_draw_commands(&frame.draw_commands);
+                dump_frame_transitions(frame);
             } else {
                 println!("interactive draw=(no rendered frame)");
             }
@@ -631,8 +696,9 @@ pub fn apply_interactive_control(
                 runtime.engine().tjs_runtime().is_suspended(),
             );
             dump_layers(runtime.engine(), Some("visible"));
-            if let Some(commands) = last_commands {
-                dump_draw_commands(commands);
+            if let Some(frame) = last_frame {
+                dump_draw_commands(&frame.draw_commands);
+                dump_frame_transitions(frame);
             } else {
                 println!("interactive draw=(no rendered frame)");
             }
@@ -676,7 +742,7 @@ pub fn apply_interactive_control(
             }
         }
         InteractiveCommand::Help => println!(
-            "interactive commands: advance [n], until <condition> [max], run, pause, click <x> <y>, state, layers [filter], layer <id>, hit <x> <y>, draw, probe, auto [on|off], autopoint <x> <y>|off, load <storage>, logs [-n tail] [needle]..., trace [list|add|rm|off|names] [pattern]..., resources, shot <path>, expr <tjs>, members [-a] [-f substr] <expr>, q"
+            "interactive commands: advance [n], until <condition> [max], run, pause, click <x> <y>, state, layers [filter], layer <id>, hit <x> <y>, draw, probe, auto [on|off], autopoint <x> <y>|off, load <storage>, logs [-n tail] [needle]..., trace [list|add|rm|off|names] [pattern]..., resources, shot [--raw] <path>, expr <tjs>, members [-a] [-f substr] <expr>, q"
         ),
         InteractiveCommand::Logs { needles, tail } => {
             let matches = runtime
@@ -699,11 +765,11 @@ pub fn apply_interactive_control(
                 println!("resource: {entry}");
             }
         }
-        InteractiveCommand::Shot(path) => {
-            if let Some(commands) = last_commands {
-                write_interactive_shot(&path, runtime.engine(), commands, textures);
+        InteractiveCommand::Shot { path, raw } => {
+            if let Some(frame) = last_frame {
+                write_interactive_shot(&path, runtime.engine(), frame, textures, raw);
             } else {
-                pending_shots.push(path);
+                pending_shots.push((path, raw));
                 println!("interactive=shot queued (advance once to render a frame)");
             }
         }
@@ -720,27 +786,25 @@ pub fn apply_interactive_control(
             expression,
             filter,
             all,
-        } => {
-            match evaluate_interactive_expression(runtime, &expression) {
-                Ok(value) => {
-                    match member_lines(
-                        runtime.engine_mut(),
-                        &value,
-                        &expression,
-                        filter.as_deref(),
-                        all,
-                    ) {
-                        Ok(lines) => {
-                            for line in lines {
-                                println!("{line}");
-                            }
+        } => match evaluate_interactive_expression(runtime, &expression) {
+            Ok(value) => {
+                match member_lines(
+                    runtime.engine_mut(),
+                    &value,
+                    &expression,
+                    filter.as_deref(),
+                    all,
+                ) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("{line}");
                         }
-                        Err(message) => println!("interactive members_error={message}"),
                     }
+                    Err(message) => println!("interactive members_error={message}"),
                 }
-                Err(error) => println!("interactive members_error={error}"),
             }
-        }
+            Err(error) => println!("interactive members_error={error}"),
+        },
         InteractiveCommand::Trace(command) => {
             apply_trace_command(runtime.engine_mut().tjs_runtime_mut(), command)
         }
@@ -752,14 +816,12 @@ pub fn apply_interactive_control(
     false
 }
 
-pub fn write_interactive_shot(
-    path: &str,
-    engine: &KrkrEngine,
-    commands: &[DrawCommand],
-    textures: &mut TextureCache,
-) {
-    // Live layer images take priority over cached uploads because a layer may
-    // be updated in place without emitting a new upload event.
+/// Copies the live layer images into the texture cache.
+///
+/// A layer image can be updated in place without a new upload event, which
+/// would leave the cached copy stale; the shot compositors therefore refresh
+/// from the layer tree first.
+pub fn refresh_live_layer_images(engine: &KrkrEngine, textures: &mut TextureCache) {
     for layer in engine.host().layer_tree().layers() {
         if let Some(image) = &layer.image {
             textures.insert(
@@ -772,17 +834,41 @@ pub fn write_interactive_shot(
             );
         }
     }
+}
+
+/// Writes one frame as a PNG.
+///
+/// The default view is the composited one: the live draw commands plus every
+/// running transition, the way the window presents the frame.  `raw` keeps
+/// the historical view (live `draw_commands` only), which is what the tool
+/// produced before transitions were composited; a frame without a transition
+/// is byte-identical in both views.
+pub fn write_interactive_shot(
+    path: &str,
+    engine: &KrkrEngine,
+    frame: &FrameOutput,
+    textures: &mut TextureCache,
+    raw: bool,
+) {
+    refresh_live_layer_images(engine, textures);
     let viewport = engine
         .content_viewport_size()
         .unwrap_or(Size::new(1280.0, 720.0));
-    let (width, height, rgba) = snapshot::composite_frame(
-        viewport.width.max(1.0) as u32,
-        viewport.height.max(1.0) as u32,
-        commands,
-        textures,
-    );
+    let width = viewport.width.max(1.0) as u32;
+    let height = viewport.height.max(1.0) as u32;
+    let (width, height, rgba) = if raw {
+        snapshot::composite_frame(width, height, &frame.draw_commands, textures)
+    } else {
+        snapshot::composite_frame_output(width, height, frame, textures)
+    };
     match snapshot::write_png(path, width, height, &rgba) {
-        Ok(()) => println!("interactive screenshot={path} frame_size={width}x{height}"),
+        Ok(()) if raw => {
+            println!("interactive screenshot={path} frame_size={width}x{height} raw=true")
+        }
+        Ok(()) => println!(
+            "interactive screenshot={path} frame_size={width}x{height} composited=true transitions={}",
+            frame.transitions.len()
+        ),
         Err(error) => println!("interactive screenshot_error={path}: {error}"),
     }
 }
@@ -1006,6 +1092,47 @@ pub fn dump_draw_commands(commands: &[DrawCommand]) {
             ),
         }
     }
+}
+
+/// Prints the transitions the composited view draws on top of the live
+/// commands: a `draw` taken mid-transition names the method, its progress and
+/// the three faces the kernel blends, so the command list and the composited
+/// `shot` can be read against each other.
+pub fn dump_frame_transitions(frame: &FrameOutput) {
+    println!(
+        "---interactive transitions={} live_commands={} composited_commands={}---",
+        frame.transitions.len(),
+        frame.draw_commands.len(),
+        composited_command_count(frame),
+    );
+    for (index, transition) in frame.transitions.iter().enumerate() {
+        println!(
+            "transition index={index} method={} progress={:.4} dest_rect={:?} old_commands={} under_commands={} source_commands={} rule_texture={:?} duration_millis={:.1}",
+            transition.method,
+            transition.progress,
+            transition.dest_rect,
+            transition.frozen_draw_commands.len(),
+            transition.under_draw_commands.len(),
+            transition.source_draw_commands.len(),
+            transition.rule_texture_id,
+            transition.params.duration_millis,
+        );
+    }
+}
+
+/// The draw commands the composited view rasterises for one frame: the live
+/// list plus every transition's three faces.
+pub fn composited_command_count(frame: &FrameOutput) -> usize {
+    frame.draw_commands.len()
+        + frame
+            .transitions
+            .iter()
+            .map(|transition| {
+                transition.frozen_draw_commands.len()
+                    + transition.under_draw_commands.len()
+                    + transition.source_draw_commands.len()
+            })
+            .sum::<usize>()
 }
 
 pub fn system_paths_for_project(root: &std::path::Path) -> SystemPaths {

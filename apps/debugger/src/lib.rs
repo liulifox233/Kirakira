@@ -7,3 +7,4 @@
 pub mod cli;
 pub mod console;
 pub mod snapshot;
+pub mod transition;
