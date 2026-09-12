@@ -407,6 +407,14 @@ pub const CATALOG: &[PluginEntry] = &[
         meta: crate::layer_ex_image::META,
     },
     PluginEntry {
+        name: "layerExLongExposure.dll",
+        aliases: &["LayerExLongExposure.dll"],
+        family: PluginFamily::Layer,
+        source: "(no public source; kirikiri2 trunk src/plugins/win32/layerExLongExposure)",
+        parquet: false,
+        meta: crate::layer_ex_long_exposure::META,
+    },
+    PluginEntry {
         name: "layerExMovie.dll",
         aliases: &["LayerExMovie.dll"],
         family: PluginFamily::Layer,
@@ -1024,6 +1032,7 @@ mod tests {
             "layerExAreaAverage.dll" => crate::layer_ex_area_average::META,
             "layerExBTOA.dll" => crate::layer_ex_btoa::META,
             "layerExImage.dll" => crate::layer_ex_image::META,
+            "layerExLongExposure.dll" => crate::layer_ex_long_exposure::META,
             "layerExMovie.dll" => crate::layer_ex_movie::META,
             "layerExRaster.dll" => crate::layer_ex_raster::META,
             "layerExSave.dll" => crate::layer_ex_save::META,
