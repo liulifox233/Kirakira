@@ -2430,7 +2430,11 @@ fn neutral_color_for_layer_type(layer_type: i64) -> i64 {
     }
 }
 
-fn not_drawable_layer_type() -> TjsError {
+/// `tTJSNI_BaseLayer`'s `TVPNotDrawableLayerType` text, shared by the native
+/// pixel accessors and the plugin-facing bitmap views
+/// (`plugin_api::layer`, Part B §B.3.1 of the design doc): a layer whose image
+/// was freed must not be resurrected by a write.
+pub(crate) fn not_drawable_layer_type() -> TjsError {
     TjsError::runtime("Not drawable layer type")
 }
 
@@ -3618,7 +3622,7 @@ fn this_layer_id(
     Ok((this, id))
 }
 
-fn this_render_layer_target(
+pub(crate) fn this_render_layer_target(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
 ) -> Result<(ObjectHandle, Option<LayerRenderTarget>)> {
@@ -3798,7 +3802,7 @@ fn kag_layer_target(
         .map(LayerRenderTarget::Kag)
 }
 
-fn render_layer_snapshot(
+pub(crate) fn render_layer_snapshot(
     runtime: &Runtime<KrkrHost>,
     target: &LayerRenderTarget,
 ) -> Option<LayerNode> {
@@ -3818,7 +3822,7 @@ fn registered_render_layer_target(
     runtime.host().layer_render_target(handle)
 }
 
-fn mutate_render_layer<R>(
+pub(crate) fn mutate_render_layer<R>(
     runtime: &mut Runtime<KrkrHost>,
     target: &LayerRenderTarget,
     mutate: impl FnOnce(&mut LayerNode) -> R,
@@ -5606,25 +5610,36 @@ fn layer_set_province_pixel(
         return Ok(Variant::Void);
     }
     mutate_render_layer(runtime, &target, |layer| {
-        if layer.province.is_none() {
-            let (width, height) = layer
-                .image
-                .as_ref()
-                .map(|image| (image.upload.width, image.upload.height))
-                .unwrap_or((layer.width.max(0.0) as u32, layer.height.max(0.0) as u32));
-            let (width, height) = (width.max(1), height.max(1));
-            layer.province = Some(ProvinceImage::new(
-                width,
-                height,
-                vec![0; (width as usize) * (height as usize)],
-            ));
-        }
+        ensure_layer_province_plane(layer);
         if let Some(province) = layer.province.as_mut() {
             province.set_pixel(x, y, (value & 0xff) as u8);
         }
     });
     mark_image_modified(runtime, this);
     Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseLayer::AllocateProvinceImage` (`LayerIntf.cpp:2647-2663`): the
+/// plane starts at the main image's size, or the layer Rect when the layer has
+/// no bitmap, and is at least one pixel wide/high.
+///
+/// Shared by `setProvincePixel`, `FillRect`'s `dfProvince` branch and the
+/// plugin-facing province view (`plugin_api::layer`), so all three allocate
+/// the same plane.
+pub(crate) fn allocate_layer_province_plane(layer: &LayerNode) -> ProvinceImage {
+    let (width, height) = layer
+        .image
+        .as_ref()
+        .map(|image| (image.upload.width, image.upload.height))
+        .unwrap_or((layer.width.max(0.0) as u32, layer.height.max(0.0) as u32));
+    let (width, height) = (width.max(1), height.max(1));
+    ProvinceImage::new(width, height, vec![0; (width as usize) * (height as usize)])
+}
+
+fn ensure_layer_province_plane(layer: &mut LayerNode) {
+    if layer.province.is_none() {
+        layer.province = Some(allocate_layer_province_plane(layer));
+    }
 }
 
 /// `tTJSNI_BaseLayer::IndependProvinceImage` (`LayerIntf.cpp:2425`): `copy`
@@ -5687,17 +5702,7 @@ fn fill_layer_province(
             if value == 0 {
                 return;
             }
-            let (plane_width, plane_height) = layer
-                .image
-                .as_ref()
-                .map(|image| (image.upload.width, image.upload.height))
-                .unwrap_or((layer.width.max(0.0) as u32, layer.height.max(0.0) as u32));
-            let (plane_width, plane_height) = (plane_width.max(1), plane_height.max(1));
-            layer.province = Some(ProvinceImage::new(
-                plane_width,
-                plane_height,
-                vec![0; (plane_width as usize) * (plane_height as usize)],
-            ));
+            ensure_layer_province_plane(layer);
         }
         let Some(province) = layer.province.as_mut() else {
             return;
@@ -7171,12 +7176,26 @@ fn layer_update(
     let this = this_obj
         .map(|this| runtime.bound_this(this).unwrap_or(this))
         .ok_or_else(|| TjsError::runtime("Layer.update requires this"))?;
-    // `tTJSNI_BaseLayer::UpdateByScript` (`LayerIntf.cpp:7638`) runs the
-    // layer's completion pass, which is what drives a `selfupdate` transition
-    // (`BeforeCompletion`, `LayerIntf.cpp:5056`).  The engine's pass is the
-    // frame itself, so the script-driven step is applied to the phase here.
-    // `UpdateTransDestinationOnSelfUpdate` (`:4828`) drives the *destination*
-    // when the source layer is the one being updated, so both ends are checked.
+    layer_update_by_script(runtime, this)?;
+    Ok(Variant::Void)
+}
+
+/// `tTJSNI_BaseLayer::UpdateByScript` (`LayerIntf.cpp:7638`), the body the
+/// `Layer.update` native and `plugin_api::layer::layer_update` share.
+///
+/// It runs the layer's completion pass, which is what drives a `selfupdate`
+/// transition (`BeforeCompletion`, `LayerIntf.cpp:5056`).  The engine's pass is
+/// the frame itself, so the script-driven step is applied to the phase here.
+/// `UpdateTransDestinationOnSelfUpdate` (`:4828`) drives the *destination*
+/// when the source layer is the one being updated, so both ends are checked.
+///
+/// The commit path of the plugin-facing bitmap views deliberately does *not*
+/// call this: the family contract is "mutate, then `Layer.update()`", and the
+/// plugin decides when the repaint is due.
+pub(crate) fn layer_update_by_script(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+) -> Result<()> {
     let mut destinations = Vec::new();
     if runtime.host().transition_self_update(this) {
         destinations.push(this);
@@ -7201,7 +7220,7 @@ fn layer_update(
     if !runtime.host_mut().request_layer_paint(this) {
         set_layer_property_storage(runtime, this, "callOnPaint", Variant::Integer(0));
     }
-    Ok(Variant::Void)
+    Ok(())
 }
 
 fn layer_focus(
@@ -9080,7 +9099,10 @@ fn remove_const_opacity(pixel: &mut [u8], level: i64) {
     pixel[3] = (((pixel[3] as i64) * strength) >> 8).clamp(0, 255) as u8;
 }
 
-fn mark_image_modified(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) {
+/// `ImageModified` for the layer's `imageModified` member.  Shared with the
+/// plugin-facing commit path (`plugin_api::layer`), which marks the layer the
+/// same way the native pixel setters do.
+pub(crate) fn mark_image_modified(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) {
     let layer = runtime.bound_this(layer).unwrap_or(layer);
     runtime.set_object_member(layer, "imageModified", Variant::Integer(1));
 }
