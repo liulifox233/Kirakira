@@ -36,9 +36,14 @@
 //!   and, like the reference, does not raise.
 //! - `save2` converts scalar elements to text instead of failing on a
 //!   non-String element (the reference's strict `GetString` throws).
-//! - `ssoHidden` has no effect: this engine's object model does not expose
-//!   per-member flags, and its built-in Array/Dictionary methods are filtered
-//!   by name. `ssoSort` is inherent (members are kept sorted), `ssoIndent` and
+//! - A dictionary member is never skipped by name: the reference filters by
+//!   the `TJS_HIDDENMEMBER` flag, and this object model's dictionary
+//!   instances carry only data, so `%[count => 1]` serializes its key. Array
+//!   instances, whose member map also holds the built-in Array methods, skip
+//!   those (`scripts_ex::is_hidden_member`).
+//! - `ssoHidden` therefore has no effect: only `__`-prefixed bookkeeping and
+//!   built-in method members are hidden here, and no object exposes flags.
+//!   `ssoSort` is inherent (members are kept sorted), `ssoIndent` and
 //!   `ssoConst` are honoured.
 //! - `Dictionary.toStructString`/`saveStruct2` stay on the class object, as
 //!   the reference's `TJS_STATICMEMBER` registration requires, so a dictionary
@@ -459,7 +464,8 @@ fn write_dictionary(
         .object_members(dictionary)
         .into_iter()
         .filter(|(key, _)| {
-            settings.options & SSO_HIDDEN != 0 || !crate::scripts_ex::is_hidden_member_name(key)
+            settings.options & SSO_HIDDEN != 0
+                || !crate::scripts_ex::is_hidden_member(runtime, dictionary, key)
         })
         .collect();
     if settings.constant_prefix() {
@@ -484,9 +490,13 @@ fn write_dictionary(
     Ok(())
 }
 
-/// `TJSRealToHexString` (`tjsVariant.cpp:259-306`): sign, `0x1.`, the full
-/// 52-bit significand as 13 uppercase hex digits, and a signed decimal
-/// exponent.
+/// `TJSRealToHexString` (`tjsVariant.cpp:259-306`), the same spelling the
+/// engine writes for its own real literals (`real_hex_literal`,
+/// `krkr-tjs2/src/runtime/builtins.rs:1341`): the special forms for
+/// NaN/infinities/zeros, otherwise the sign, `0x1.`, the 13 significand hex
+/// digits and `p` + the IEEE exponent as `%d` — no `+`, and a subnormal keeps
+/// its raw significand with exponent `-1023`, exactly as the reference prints
+/// it.
 fn real_hex_string(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -498,26 +508,18 @@ fn real_hex_string(value: f64) -> String {
             "+Infinity".to_string()
         };
     }
-    let bits = value.to_bits();
-    // The reference writes no sign for a positive value: `1.5` becomes
-    // `0x1.8000000000000p+0`, a negative value gets the `-`.
-    let sign = if bits >> 63 == 1 { "-" } else { "" };
-    let exponent_bits = ((bits >> 52) & 0x7ff) as i64;
-    let fraction = bits & 0x000F_FFFF_FFFF_FFFF;
-    if exponent_bits == 0 && fraction == 0 {
-        return if sign.is_empty() {
-            "0.0".to_string()
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_string()
         } else {
-            format!("{sign}0.0")
+            "+0.0".to_string()
         };
     }
-    if exponent_bits == 0 {
-        // Subnormal: normalise the significand so the leading 1 format holds.
-        let shift = fraction.leading_zeros() as i64 - 12;
-        let fraction = (fraction << (shift + 1)) & 0x000F_FFFF_FFFF_FFFF;
-        return format!("{sign}0x1.{fraction:013X}p{}", 1 - 1023 - shift);
-    }
-    format!("{sign}0x1.{fraction:013X}p{:+}", exponent_bits - 1023)
+    let bits = value.to_bits();
+    let prefix = if bits >> 63 == 1 { "-0x1." } else { "0x1." };
+    let exponent = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let fraction = bits & 0x000F_FFFF_FFFF_FFFF;
+    format!("{prefix}{fraction:013X}p{exponent}")
 }
 
 /// `TJSRealToString` (`tjsVariant.cpp:228-256`) is `%.15lg`; the comment after
@@ -663,6 +665,39 @@ mod tests {
         );
     }
 
+    /// Serializing must not drop a dictionary field whose name happens to look
+    /// like an Array/Dictionary method: the reference filters by the
+    /// `TJS_HIDDENMEMBER` flag, and a dictionary here has only data members.
+    #[test]
+    fn serializer_keeps_dictionary_keys_named_like_builtins() {
+        let root = test_root("savestruct-keys");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(SaveStructPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var data = %[count => 1, length => 2, save => 3];\n\
+                     (Dictionary.saveStruct2 incontextof data)(\"keys.ksd\");\n\
+                     return (Dictionary.toStructString incontextof data)();\n\
+                 })()",
+            )
+            .expect("serialize builtin-named keys");
+
+        assert_eq!(
+            value,
+            Variant::String(
+                "%[\"count\"=>int 1,\r\n\"length\"=>int 2,\r\n\"save\"=>int 3]".to_string()
+            )
+        );
+        let bytes = fs::read(root.join("keys.ksd")).expect("read the saved struct");
+        assert_eq!(
+            decode_utf16_text(&bytes),
+            value.to_tjs_string().expect("struct text")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn save_struct2_and_save2_round_trip_through_storage() {
         let root = test_root("savestruct-round-trip");
@@ -749,7 +784,35 @@ mod tests {
         assert_eq!(
             value,
             Variant::String(
-                "%[\"scale\"=>real 0x1.8000000000000p+0 /* 1.5 */]|[int 1,int 2]|1:1:1".to_string()
+                "%[\"scale\"=>real 0x1.8000000000000p0 /* 1.5 */]|[int 1,int 2]|1:1:1".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn real_specials_and_subnormals_follow_the_reference_spelling() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(SaveStructPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var text = Scripts.toStructString(%[zero => 0.0, negative => -1.5], 1);\n\
+                     var tiny = Scripts.toStructString(%[small => 5e-324], 1);\n\
+                     var negzero = Scripts.toStructString(%[minus => -0.0], 1);\n\
+                     return text + \"|\" + tiny + \"|\" + negzero;\n\
+                 })()",
+            )
+            .expect("real specials");
+
+        assert_eq!(
+            value,
+            Variant::String(
+                "%[\"negative\"=>real -0x1.8000000000000p0 /* -1.5 */,\n\
+                 \"zero\"=>real +0.0 /* +0.0 */]|\
+                 %[\"small\"=>real 0x1.0000000000001p-1023 /* 4.94065645841247e-324 */]|\
+                 %[\"minus\"=>real -0.0 /* -0.0 */]"
+                    .to_string()
             )
         );
     }

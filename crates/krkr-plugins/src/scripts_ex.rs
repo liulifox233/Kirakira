@@ -11,7 +11,12 @@
 //! Behaviour carried over from the reference:
 //!
 //! - `getObjectKeys`/`getObjectCount` skip hidden members and require an
-//!   argument (`TJS_E_BADPARAMCOUNT`).
+//!   argument (`TJS_E_BADPARAMCOUNT`). A Dictionary key is *never* skipped:
+//!   this object model's dictionary instances carry only data members, so the
+//!   reference's `TJS_HIDDENMEMBER` rule has nothing to hide there and a key
+//!   named `count`/`save`/… stays data. Array instances do carry the built-in
+//!   Array methods and properties as ordinary members, so those are the ones
+//!   skipped by name (see [`is_hidden_member`]).
 //! - `getObjectContext` answers the closure's `ObjThis` (null for a plain
 //!   object), `isNullContext` tests exactly that.
 //! - `equalStruct` compares arrays element-wise with an equal length, and
@@ -134,40 +139,62 @@ fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
 // ---------------------------------------------------------------------------
 // Shared helpers
 
-/// Members the reference's `TJS_IGNOREPROP` enumeration leaves out: the
-/// object's own bookkeeping (`__`-prefixed) and the built-in Array/Dictionary
-/// methods (including the ones `savestruct.dll` installs), which TJS registers
-/// as hidden. Shared with the `savestruct.dll` writer.
-pub(crate) fn is_hidden_member_name(key: &str) -> bool {
+/// Built-in Array methods and the `count`/`length` property members that an
+/// Array instance carries (its member map mirrors the elements plus these,
+/// `Object::sync_array_members`). The reference registers them with
+/// `TJS_HIDDENMEMBER`, so this is the one place enumeration has to skip them by
+/// name — and only for Array instances, where they cannot collide with data.
+pub(crate) const ARRAY_METHOD_NAMES: &[&str] = &[
+    "add",
+    "push",
+    "insert",
+    "erase",
+    "remove",
+    "pop",
+    "shift",
+    "unshift",
+    "clear",
+    "assign",
+    "assignStruct",
+    "load",
+    "save",
+    "saveStruct",
+    "loadStruct",
+    "split",
+    "join",
+    "sort",
+    "reverse",
+    "find",
+    "count",
+    "length",
+    "save2",
+    "saveStruct2",
+    "toStructString",
+];
+
+/// Whether the reference's `TJS_IGNOREPROP` enumeration would skip `key` on
+/// `object`. Shared with the `savestruct.dll` writer.
+///
+/// A Dictionary is deliberately *not* filtered: this object model builds
+/// dictionary instances with an empty member map (`native_dictionary`,
+/// `krkr-tjs2/src/runtime/builtins.rs:39-50`), so every key is data. The
+/// reference skips a dictionary member only when it carries the
+/// `TJS_HIDDENMEMBER` flag, which no dictionary key here does — filtering by
+/// name would silently drop real fields such as `%[count => 1]`, and it would
+/// disagree with `getObjectCount`, which counts them. Array instances and
+/// engine-owned native objects do carry built-in method members, and
+/// `__`-prefixed names are host bookkeeping in every case, so those are
+/// skipped by name.
+pub(crate) fn is_hidden_member(
+    runtime: &Runtime<KrkrHost>,
+    object: ObjectHandle,
+    key: &str,
+) -> bool {
+    if runtime.is_dictionary_instance(object) {
+        return false;
+    }
     key.starts_with("__")
-        || matches!(
-            key,
-            "clear"
-                | "assign"
-                | "assignStruct"
-                | "saveStruct"
-                | "loadStruct"
-                | "load"
-                | "save"
-                | "add"
-                | "push"
-                | "split"
-                | "insert"
-                | "erase"
-                | "remove"
-                | "pop"
-                | "shift"
-                | "unshift"
-                | "join"
-                | "sort"
-                | "reverse"
-                | "find"
-                | "count"
-                | "length"
-                | "save2"
-                | "saveStruct2"
-                | "toStructString"
-        )
+        || (runtime.array_elements(object).is_some() && ARRAY_METHOD_NAMES.contains(&key))
 }
 
 /// The object a value refers to, with the reference's conversion error when
@@ -188,7 +215,7 @@ fn visible_members(runtime: &Runtime<KrkrHost>, object: ObjectHandle) -> Vec<(St
     runtime
         .object_members(object)
         .into_iter()
-        .filter(|(key, _)| !is_hidden_member_name(key))
+        .filter(|(key, _)| !is_hidden_member(runtime, object, key))
         .collect()
 }
 
@@ -700,6 +727,40 @@ mod tests {
             .expect("object member helpers");
 
         assert_eq!(value, Variant::String("first,second:2:1:0:1".to_string()));
+    }
+
+    /// A Dictionary key is data, whatever it is called: the reference skips a
+    /// member by its `TJS_HIDDENMEMBER` flag, and this object model's
+    /// dictionary instances carry no built-in members at all, so filtering
+    /// names would drop real fields (and disagree with `getObjectCount`).
+    #[test]
+    fn dictionary_keys_named_like_builtins_are_kept() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(ScriptsExPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var data = %[count => 1, length => 2, save => 3];\n\
+                     var keys = Scripts.getObjectKeys(data);\n\
+                     keys.sort();\n\
+                     var copy = Scripts.clone(data);\n\
+                     Scripts.foreach(%[count => 9], function(key, value) {\n\
+                         global.__seenKey = key + \"=\" + value;\n\
+                     });\n\
+                     var arrayKeys = Scripts.getObjectKeys([\"a\", \"b\"]);\n\
+                     arrayKeys.sort();\n\
+                     return keys.join(\",\") + \":\" + Scripts.getObjectCount(data) + \":\" +\n\
+                         copy.count + \":\" + copy.length + \":\" + copy.save + \":\" +\n\
+                         global.__seenKey + \":\" + arrayKeys.join(\",\");\n\
+                 })()",
+            )
+            .expect("dictionary keys");
+
+        assert_eq!(
+            value,
+            Variant::String("count,length,save:3:1:2:3:count=9:0,1".to_string())
+        );
     }
 
     #[test]

@@ -239,13 +239,6 @@ fn cannot_open(name: &str) -> TjsError {
     TjsError::runtime(format!("cannot open : {name}"))
 }
 
-/// The reference's `Cannot get local name from %1` (`StorageIntf.cpp:581`),
-/// raised when a name exists but has no local file behind it (an archive
-/// member, for example).
-fn no_local_name(name: &str) -> TjsError {
-    TjsError::runtime(format!("Cannot get local name from {name}"))
-}
-
 /// The reference's directory-name check (`Main.cpp:452`).
 fn require_trailing_slash(name: &str) -> Result<()> {
     if name.ends_with('/') {
@@ -440,13 +433,9 @@ fn storages_get_time(
 ) -> Result<Variant> {
     let name = required_string(&args, 0, "Storages.getTime")?;
     let Some(metadata) = native_metadata(runtime, &name) else {
-        // The reference localizes the name first, so an archive member is a
-        // missing-local-name failure rather than a missing file (`Main.cpp:185-208`).
-        return Err(if storage_present(runtime, &name) {
-            no_local_name(&name)
-        } else {
-            cannot_open(&name)
-        });
+        // `_getTime` answers `cannot open : <raw argument>` for every name it
+        // cannot stat, archive members included (`Main.cpp:185-208`).
+        return Err(cannot_open(&name));
     };
     let Some(info) = new_dictionary(runtime) else {
         return Ok(Variant::Void);
@@ -1051,6 +1040,11 @@ fn temporary_files_entry_folder(
 /// (`Main.cpp:1044-1057`): the reference opens the file with
 /// `FILE_FLAG_DELETE_ON_CLOSE`, so the file disappears when the TJS object is
 /// invalidated; this module records the path and deletes it from `finalize`.
+///
+/// The engine calls `finalize` only for the VM's `invalidate` instruction
+/// (`krkr-tjs2/src/vm/dispatch.rs:2039-2090`), not from a garbage collector,
+/// so a holder a script simply drops the reference to keeps its files until
+/// the object is invalidated explicitly.
 fn claim_temporary_path(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1165,7 +1159,7 @@ mod tests {
         ] {
             assert_eq!(
                 engine
-                    .execute_expression("inline.tjs", &name)
+                    .execute_expression("inline.tjs", name)
                     .expect("attribute global"),
                 Variant::Integer(value),
                 "{name} has the wrong value"
@@ -1377,18 +1371,31 @@ mod tests {
                 "(function() {\n\
                      var first = Storages.getTemporaryName();\n\
                      var second = Storages.getTemporaryName();\n\
-                     return (first != second) + \":\" + (first.indexOf(\"krkr_\") != -1);\n\
+                     return first + \"|\" + second;\n\
                  })()",
             )
             .expect("temporary names");
 
-        assert_eq!(value, Variant::String("1:1".to_string()));
+        let Variant::String(names) = &value else {
+            panic!("unexpected value: {value:?}");
+        };
+        let (first, second) = names.split_once('|').expect("two names");
+        assert_ne!(first, second, "temporary names must differ");
+        assert!(first.contains("krkr_"), "unexpected name: {first}");
+        // `TVPGetTemporaryName` never touches the filesystem.
+        assert!(
+            !std::path::Path::new(first).exists(),
+            "getTemporaryName created {first}"
+        );
+        assert!(!std::path::Path::new(second).exists());
     }
 
     #[test]
-    fn temporary_files_class_claims_and_releases_a_file() {
+    fn temporary_files_claims_and_releases_files_and_folders() {
         let root = test_root("fstat-temporary");
         fs::write(root.join("probe.txt"), b"temp").expect("write probe");
+        fs::create_dir_all(root.join("folder")).expect("create folder");
+        fs::write(root.join("folder/inner.txt"), b"inner").expect("write inner");
 
         let mut engine = test_engine(&root);
         engine.register_plugin(FstatPlugin).expect("plugin");
@@ -1397,12 +1404,43 @@ mod tests {
                 "inline.tjs",
                 "(function() {\n\
                      var holder = new TemporaryFiles();\n\
-                     return holder.entry(\"probe.txt\") + \":\" + holder.entry(\"absent.txt\");\n\
+                     return holder.entry(\"probe.txt\") + \":\" + holder.entry(\"absent.txt\") + \":\" +\n\
+                         holder.entryFolder(\"folder/\") + \":\" + holder.entryFolder(\"probe.txt\");\n\
                  })()",
             )
-            .expect("claim a temporary file");
+            .expect("claim temporary paths");
 
-        assert_eq!(value, Variant::String("1:0".to_string()));
+        assert_eq!(value, Variant::String("1:0:1:0".to_string()));
+        // Claiming does not delete anything yet, and a holder the script drops
+        // without invalidating it leaves its files behind: this engine runs
+        // `finalize` for the `invalidate` instruction only, not from a GC.
+        assert!(root.join("probe.txt").exists());
+        assert!(root.join("folder").exists());
+
+        // `finalize` deletes what the holder claimed; a folder has to be
+        // emptied first, exactly as a platform delete-on-close would require.
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var holder = new TemporaryFiles();\n\
+                     var claimed = holder.entry(\"probe.txt\") + \":\" + holder.entryFolder(\"folder/\");\n\
+                     Storages.deleteFile(\"folder/inner.txt\");\n\
+                     holder.finalize();\n\
+                     return claimed;\n\
+                 })()",
+            )
+            .expect("finalize the holder");
+
+        assert_eq!(value, Variant::String("1:1".to_string()));
+        assert!(
+            !root.join("probe.txt").exists(),
+            "finalize must delete the claimed file"
+        );
+        assert!(
+            !root.join("folder").exists(),
+            "finalize must delete the claimed folder"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

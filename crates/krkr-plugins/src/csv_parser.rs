@@ -30,7 +30,11 @@
 //! honoured as the trunk's text-stream mode. Scalar constructor/method
 //! arguments are converted instead of throwing a variant-conversion error,
 //! which keeps `new CSVParser(void, 9)` working the way the shipped PackinOne
-//! build behaves.
+//! build behaves. One quoted-field edge case also differs: a run of four
+//! quotes (`""""`) yields one literal quote here, because the reference's
+//! scan-increment-in-condition quirk consumes the fourth quote as the pair's
+//! escape and yields two (`parse_csv_field` below handles `""` as the escape
+//! pair, which is what the shipped build does for the same input).
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
@@ -183,7 +187,8 @@ fn reset_csv_state(
     file: String,
 ) {
     runtime.set_object_member(this, "__csvText", Variant::String(text));
-    runtime.set_object_member(this, "__csvPos", Variant::Integer(0));
+    runtime.set_object_member(this, "__csvRecords", Variant::Void);
+    runtime.set_object_member(this, "__csvRecordIndex", Variant::Integer(0));
     runtime.set_object_member(this, "__csvLineNo", Variant::Integer(0));
     runtime.set_object_member(this, "__csvFile", Variant::String(file));
 }
@@ -236,12 +241,11 @@ fn csv_get_next_line(
     let Some(this) = csv_this(runtime, this_obj) else {
         return Ok(Variant::Void);
     };
-    let Some((fields, next_pos, line_no)) = csv_next_record(runtime, this) else {
+    let Some((fields, line_no)) = csv_next_record(runtime, this) else {
         // At EOF the reference closes the parser; the next call answers void
         // without touching the line number (`Main.cpp:417`).
         return Ok(Variant::Void);
     };
-    runtime.set_object_member(this, "__csvPos", Variant::Integer(next_pos as i64));
     runtime.set_object_member(this, "__csvLineNo", Variant::Integer(line_no));
     let fields = fields.into_iter().map(Variant::String).collect();
     Ok(Variant::Object(runtime.alloc_array_object(fields)))
@@ -353,8 +357,7 @@ fn csv_fire_do_line(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) -> Resu
     if !has_do_line {
         return Ok(Variant::Void);
     }
-    while let Some((fields, next_pos, line_no)) = csv_next_record(runtime, this) {
-        runtime.set_object_member(this, "__csvPos", Variant::Integer(next_pos as i64));
+    while let Some((fields, line_no)) = csv_next_record(runtime, this) {
         runtime.set_object_member(this, "__csvLineNo", Variant::Integer(line_no));
         let fields = fields.into_iter().map(Variant::String).collect();
         let fields = Variant::Object(runtime.alloc_array_object(fields));
@@ -363,26 +366,65 @@ fn csv_fire_do_line(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) -> Resu
     Ok(Variant::Void)
 }
 
-/// Parses the next record, returning its fields, the position after it and the
-/// advanced line number. `None` means end of text.
-fn csv_next_record(
-    runtime: &Runtime<KrkrHost>,
-    this: ObjectHandle,
-) -> Option<(Vec<String>, usize, i64)> {
+/// The parsed records, computed on first use and then kept on the instance.
+///
+/// The reference advances a position inside a buffer it holds, so a parse is
+/// one pass over the text. Holding the text in this object model means every
+/// read copies it, so the records are parsed once here and the per-record
+/// calls only advance `__csvRecordIndex`; a parser that reads a 10 000-row
+/// table no longer re-reads and re-scans the whole text 10 000 times.
+fn csv_records(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) -> Option<ObjectHandle> {
+    if let Variant::Object(records) = runtime.object_member(this, "__csvRecords") {
+        return Some(records);
+    }
     let text = match runtime.object_member(this, "__csvText") {
         Variant::String(text) => text,
         _ => return None,
     };
-    let position = csv_state_integer(runtime, this, "__csvPos").max(0) as usize;
     let chars: Vec<char> = text.chars().collect();
-    if position >= chars.len() {
-        return None;
-    }
     let separator = csv_separator(runtime, this);
     let newline = csv_newline(runtime, this);
-    let (fields, next_pos) = parse_csv_record(&chars, position, separator, &newline);
+    let mut position = 0;
+    let mut records = Vec::new();
+    while position < chars.len() {
+        let (fields, next) = parse_csv_record(&chars, position, separator, &newline);
+        if next <= position {
+            // A record always consumes at least one character; stop rather
+            // than loop forever if that ever stops holding.
+            break;
+        }
+        let fields = fields.into_iter().map(Variant::String).collect();
+        records.push(Variant::Object(runtime.alloc_array_object(fields)));
+        position = next;
+    }
+    let records = runtime.alloc_array_object(records);
+    runtime.set_object_member(this, "__csvRecords", Variant::Object(records));
+    Some(records)
+}
+
+/// The next record's fields and its advanced line number, or `None` at the end
+/// of the text.
+fn csv_next_record(
+    runtime: &mut Runtime<KrkrHost>,
+    this: ObjectHandle,
+) -> Option<(Vec<String>, i64)> {
+    let records = csv_records(runtime, this)?;
+    let index = csv_state_integer(runtime, this, "__csvRecordIndex").max(0) as usize;
+    let entry = runtime.array_elements(records)?.get(index)?.clone();
+    let fields = entry.object_handle().and_then(|handle| {
+        runtime.array_elements(handle).map(|fields| {
+            fields
+                .iter()
+                .map(|field| match field {
+                    Variant::String(text) => text.clone(),
+                    other => other.to_tjs_string().unwrap_or_default(),
+                })
+                .collect()
+        })
+    })?;
+    runtime.set_object_member(this, "__csvRecordIndex", Variant::Integer(index as i64 + 1));
     let line_no = csv_state_integer(runtime, this, "__csvLineNo") + 1;
-    Some((fields, next_pos, line_no))
+    Some((fields, line_no))
 }
 
 fn is_line_break(ch: char) -> bool {
@@ -579,6 +621,31 @@ mod tests {
             value,
             Variant::String("1/a,b;1/x\"y;2/line1|line2;".to_string())
         );
+    }
+
+    #[test]
+    fn records_are_parsed_once_and_quote_runs_keep_the_module_behaviour() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(CsvParserPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var parser = new CSVParser(null, #\",\");\n\
+                     parser.init(\"\\\"\\\"\\\"\\\"\\n\\\"x\\\"\");\n\
+                     var first = parser.getNextLine();\n\
+                     var second = parser.getNextLine();\n\
+                     return first[0].length + \":\" + second[0] + \":\" +\n\
+                         parser.__csvRecords.count;\n\
+                 })()",
+            )
+            .expect("quote runs");
+
+        // A run of four quotes yields one literal quote here (the reference's
+        // scan quirk yields two — documented divergence), and the whole text is
+        // parsed into `__csvRecords` once: reading records only advances
+        // `__csvRecordIndex`, so a per-record call no longer re-scans the text.
+        assert_eq!(value, Variant::String("1:x:2".to_string()));
     }
 
     #[test]
