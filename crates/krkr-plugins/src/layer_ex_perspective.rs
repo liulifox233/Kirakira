@@ -82,6 +82,16 @@
 //!   offsets of `span_image_filter` (`agg_span_image_filter.h:38-48`): sample at
 //!   the destination pixel centre (`x + 0.5`), then shift the *source* result by
 //!   `128` subpixel units (`agg_span_image_filter_rgba.h:451-452`).
+//! * The interpolator runs through `span_subdiv_adaptor`
+//!   (`agg_span_subdiv_adaptor.h:31-120`, the second type argument of the
+//!   reference's span filter, `Main.cpp:141-149`), which clamps every
+//!   interpolation block to `subdiv_size = 1 << 4` pixels and re-anchors — with
+//!   `span_interpolator_linear::resynchronize`
+//!   (`agg_span_interpolator_linear.h:76-85`) — the DDA to the *exact*
+//!   transformed coordinate of the block's end. This is what keeps the samples
+//!   on the projectivity for a quad whose top and bottom edges are not
+//!   horizontal: without it a destination run would be a single chord in source
+//!   space, which is exact only when the map along the row is linear (`w0 = 0`).
 //! * The 2×2 taps and their weights are `span_image_filter_rgba_2x2::generate`
 //!   (`agg_span_image_filter_rgba.h:432-521`): the left/top tap takes its weight
 //!   from `weight_array[256 + f]`, the right/bottom one from `weight_array[f]`
@@ -123,10 +133,22 @@
 //!   pixel (which is what a 2.4 `image_accessor_clone` source would do). The
 //!   2.3 header is not on this machine, so that reading is *inferred* from the
 //!   `back_color` argument the call site passes.
-//! * **Crash paths become errors.** A source that is not a layer, or either
-//!   layer without a main image, is a TJS error ("perspectiveCopy: src must be
-//!   Layer.", the engine's "Not drawable layer type"); the reference
-//!   dereferences the resulting null instance or buffer.
+//! * **Failure paths.** The reference has one crash and two TJS errors, and the
+//!   port answers the errors. A source that is not an *object* makes
+//!   `param[0]->AsObjectNoAddRef()` null and `getNative(NULL)` dereferences it
+//!   (`Main.cpp:91`, `layerExBase.cpp:104-118`); the port answers
+//!   "perspectiveCopy: src must be Layer.". A non-layer *object* fails
+//!   `NativeInstanceSupport` and the reference returns `TJS_E_NATIVECLASSCRASH`
+//!   (`:91`); through [`krkr_engine::plugin_api::layer`] the port's only failure
+//!   mode is `NotDrawable`, whose text is the one the reference throws in the
+//!   next case — so a non-layer object is reported as "Not drawable layer type"
+//!   rather than with that code. A layer without a main image throws the
+//!   reference's own "Not drawable layer type": `NI_LayerExBase::reset` reads
+//!   `Layer.imageWidth` (`layerExBase.cpp:78-85`) and `GetImageWidth` throws
+//!   `TVPNotDrawableLayerType` (`LayerIntf.cpp:2319-2323`). That read happens
+//!   *before* the `is_valid` gate (`Main.cpp:88-92` vs `:140`), so the port
+//!   reads both bitmaps before the gate too and a freed or image-less layer
+//!   raises even when the quad is rejected.
 //! * **`iround` of a non-finite value.** `int(v < 0 ? v - 0.5 : v + 0.5)` is
 //!   VCL's `cvttsd2si`, which yields `INT_MIN` for NaN and out-of-range values;
 //!   the port reproduces that (`layer_ex_raster.rs` documents the same quirk)
@@ -151,7 +173,8 @@
 use krkr_engine::{
     KrkrHost, KrkrPlugin,
     plugin_api::layer::{
-        LayerBitmapView, LayerBitmapViewMut, layer_bitmap_read_write, layer_update,
+        LayerBitmapView, LayerBitmapViewMut, layer_bitmap_read, layer_bitmap_read_write,
+        layer_update,
     },
 };
 use krkr_tjs2::{
@@ -245,12 +268,22 @@ fn layer_perspective_copy(
     // inverse map the sampler needs, destination quad → source rectangle. A
     // rejected quad leaves the all-zero matrix, which `is_valid` rejects.
     let transform = TransPerspective::quad_to_rect(&quad, left, top, right, bottom);
+
+    // `:86-92`: the reference resets the destination's and then the source's
+    // native instance *before* it builds the transform and tests it, and
+    // `NI_LayerExBase::reset` reads `Layer.imageWidth` first
+    // (`layerExBase.cpp:78-85`) — which throws "Not drawable layer type" when
+    // the layer has no main image (`LayerIntf.cpp:2319-2323`). So a layer whose
+    // image the script freed raises here even when the quad turns out to be
+    // rejected (`:140`), which is why the port reads both bitmaps before the
+    // gate rather than inside it. These reads commit nothing.
+    layer_bitmap_read(runtime, dest, |_| ())?;
+    layer_bitmap_read(runtime, src, |_| ())?;
+
     if transform.is_valid(AFFINE_EPSILON) {
         // `:110-166`: AGG reads and writes the two layers' whole images. The
         // views are the engine's scoped equivalents of
-        // `mainImageBufferForWrite` + `mainImageBufferPitch`
-        // (`layerExBase.cpp:79-85`), and a layer without an image fails here
-        // with "Not drawable layer type" where the reference would crash.
+        // `mainImageBufferForWrite` + `mainImageBufferPitch`.
         layer_bitmap_read_write(runtime, src, dest, |source, dest_view| {
             draw(source, dest_view, &quad, &transform);
         })?;
@@ -710,7 +743,8 @@ fn draw(
 
 /// One AGG span (`render_scanline_aa`, `agg_renderer_scanline.h:156-178`): the
 /// generator is asked for the run's colours, and each is blended with its own
-/// cover.
+/// cover. The colours come from [`SubdivAdaptor`], the port of
+/// `span_subdiv_adaptor` the reference wraps around its linear interpolator.
 #[allow(clippy::too_many_arguments)]
 fn draw_span(
     source: &LayerBitmapView<'_>,
@@ -722,28 +756,98 @@ fn draw_span(
     dest_pitch: usize,
 ) {
     let len = covers.len() as i32;
-    let x_start = f64::from(x) + 0.5;
-    let y_center = f64::from(y) + 0.5;
     // `span_image_filter::generate` begins at the span's first pixel *centre*
-    // and `len` pixels on (`x + len`, not `x + len + 0.5`) in the same row
-    // (`agg_span_image_filter.h:37-48`, `agg_span_interpolator_linear.h:63-79`).
-    let (tx, ty) = transform.transform(x_start, y_center);
-    let (tx_end, ty_end) = transform.transform(x_start + f64::from(len), y_center);
-    let mut line_x = Dda2LineInterpolator::new(iround(tx * 256.0), iround(tx_end * 256.0), len);
-    let mut line_y = Dda2LineInterpolator::new(iround(ty * 256.0), iround(ty_end * 256.0), len);
+    // and `len` pixels on in the same row (`agg_span_image_filter.h:38-48`);
+    // the adaptor's `begin` then splits that span into blocks of at most
+    // `subdiv_size` pixels (`agg_span_subdiv_adaptor.h:87-96`).
+    let mut adaptor = SubdivAdaptor::new(transform, f64::from(x) + 0.5, f64::from(y) + 0.5, len);
 
     for (offset, &cover) in covers.iter().enumerate() {
         // `span_image_filter_rgba_2x2::generate` subtracts the filter's 128
         // subpixel units before addressing the source (`:451-452`).
-        let x_hr = line_x.value().wrapping_sub(128);
-        let y_hr = line_y.value().wrapping_sub(128);
-        let color = sample_color(source, x_hr, y_hr);
+        let (x_sub, y_sub) = adaptor.coordinates();
+        let color = sample_color(source, x_sub.wrapping_sub(128), y_sub.wrapping_sub(128));
         let index = (y as usize) * dest_pitch + (x as usize + offset) * 4;
         if let Some(pixel) = dest.pixels.get_mut(index..index + 4) {
             blend_pre(pixel, color, cover);
         }
-        line_x.step();
-        line_y.step();
+        adaptor.step(transform);
+    }
+}
+
+/// `subdiv_shift`/`subdiv_size` of `span_subdiv_adaptor`
+/// (`agg_span_subdiv_adaptor.h:39-50`): the default construction the reference
+/// uses (`Main.cpp:142-144`, `subdiv_adaptor_type subdiv_adaptor(interpolator)`)
+/// clamps every interpolation block to 16 pixels.
+const SUBDIV_SHIFT: u32 = 4;
+const SUBDIV_SIZE: u32 = 1 << SUBDIV_SHIFT;
+
+/// `agg::span_subdiv_adaptor` (`agg_span_subdiv_adaptor.h:31-120`).
+///
+/// It is what keeps AGG's samples on the projectivity: the inner interpolator
+/// is only ever asked to span `subdiv_size` pixels, and at every block boundary
+/// (`:98-113`) it is re-anchored — `span_interpolator_linear::resynchronize`
+/// (`agg_span_interpolator_linear.h:76-85`) replaces the DDA with one running
+/// from the current value to the *exact* transformed coordinate of the block's
+/// end, `m_src_x / subpixel_scale + len`. Without this stage a destination run
+/// is one chord in source space, which is exact only when the mapping along the
+/// row is linear (`w0 = 0`); a quad whose top and bottom edges are not
+/// horizontal is off by whole source pixels mid-run.
+///
+/// The bookkeeping is AGG's, including its off-by-one: `begin` sets `m_pos = 1`
+/// for the first pixel, so the first block covers 15 pixels and is re-anchored
+/// with the value the DDA reached *after* those pixels.
+struct SubdivAdaptor {
+    line_x: Dda2LineInterpolator,
+    line_y: Dda2LineInterpolator,
+    pos: u32,
+    remaining: u32,
+    source_x: i32,
+    source_y: f64,
+}
+
+impl SubdivAdaptor {
+    fn new(transform: &TransPerspective, x: f64, y: f64, len: i32) -> Self {
+        let block = len.clamp(0, SUBDIV_SIZE as i32);
+        // `span_interpolator_linear::begin` transforms the block's start and
+        // `transform(x + len, y)` (`agg_span_interpolator_linear.h:54-73`).
+        let (tx, ty) = transform.transform(x, y);
+        let (tx_end, ty_end) = transform.transform(x + f64::from(block), y);
+        Self {
+            line_x: Dda2LineInterpolator::new(iround(tx * 256.0), iround(tx_end * 256.0), block),
+            line_y: Dda2LineInterpolator::new(iround(ty * 256.0), iround(ty_end * 256.0), block),
+            pos: 1,
+            remaining: len.max(0) as u32,
+            source_x: iround(x * 256.0) + 256,
+            source_y: y,
+        }
+    }
+
+    fn coordinates(&self) -> (i32, i32) {
+        (self.line_x.value(), self.line_y.value())
+    }
+
+    fn step(&mut self, transform: &TransPerspective) {
+        self.line_x.step();
+        self.line_y.step();
+        if self.pos >= SUBDIV_SIZE {
+            let block = self.remaining.min(SUBDIV_SIZE);
+            let (mut end_x, mut end_y) = (
+                f64::from(self.source_x) / 256.0 + f64::from(block),
+                self.source_y,
+            );
+            (end_x, end_y) = transform.transform(end_x, end_y);
+            self.line_x =
+                Dda2LineInterpolator::new(self.line_x.value(), iround(end_x * 256.0), block as i32);
+            self.line_y =
+                Dda2LineInterpolator::new(self.line_y.value(), iround(end_y * 256.0), block as i32);
+            self.pos = 0;
+        }
+        self.source_x = self.source_x.wrapping_add(256);
+        self.pos += 1;
+        // AGG's `--m_len` on an `unsigned` field wraps once the run is over;
+        // no caller reads it again, so the port saturates instead.
+        self.remaining = self.remaining.saturating_sub(1);
     }
 }
 
@@ -1262,16 +1366,89 @@ mod tests {
         assert_eq!(call_on_paint(&mut engine, "dest"), 1);
     }
 
+    /// A tilted card: the source's 64x8 rectangle maps onto the quad
+    /// `TL(0,0) TR(32,0) BR(32,4) BL(0,8)`, i.e. the projectivity
+    /// `(u, v) -> (u/(1 + u/64), v/(1 + u/64))` whose inverse is
+    /// `(u, v) = (X, Y)/(1 - X/64)`. The x mapping is *not* linear along a
+    /// destination row (the composed projectivity has `w0 != 0`), which is the
+    /// case `span_subdiv_adaptor` exists for.
+    ///
+    /// The source's left 32 columns are opaque black and its right 32 opaque
+    /// white, so a sample's colour says which side of `u = 32` it landed on
+    /// whatever the tap weights. Row 0's run is 32 pixels, i.e. two
+    /// interpolation blocks, and the adaptor's bookkeeping (its `m_pos = 1`
+    /// start makes the first block 15 pixels) anchors them at the exact
+    /// `u(0.5) = 0.504`, `u(16.5) = 22.232`, `u(32.5) = 66.032`,
+    /// `u(33.5) = 70.295` — in 1/256 units `iround` gives 129 -> 5691, then from
+    /// the value after 15 steps (5343) -> 16904, then 16181 -> 17996. The
+    /// integer DDA then samples `u` = 20.37, 23.20, 26.02, 28.84 at pixels
+    /// 15..18, and 34.49 at pixel 20: pixels 0..18 are black, pixel 19 mixes
+    /// columns 31/32, and pixels 20..31 are white.
+    ///
+    /// A single chord across the whole 32-pixel run — what this module did
+    /// before the adaptor was ported — samples `u` = 32.77, 34.83, 36.90 at
+    /// pixels 16..18, i.e. white. The assertions below are exactly the pixels
+    /// that subdivision changes.
+    #[test]
+    fn a_tilted_quad_subdivides_its_spans_like_the_reference() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "setup.tjs",
+            r#"
+            global.src = new Layer();
+            src.setImageSize(64, 8);
+            src.fillRect(0, 0, 32, 8, 0xff000000);
+            src.fillRect(32, 0, 32, 8, 0xffffffff);
+
+            global.dest = new Layer();
+            dest.setImageSize(32, 8);
+            dest.fillRect(0, 0, 32, 8, 0x00000000);
+            "#,
+        );
+
+        run(
+            &mut engine,
+            "tilt.tjs",
+            "dest.perspectiveCopy(src, 0, 0, 64, 8, 0, 0, 32, 0, 0, 8, 32, 4);",
+        );
+
+        // Rows 0..3 are fully inside the quad and share the same x mapping, so
+        // each carries the same block structure.
+        for y in 0..4 {
+            for x in 0..19 {
+                assert_eq!(pixel(&mut engine, "dest", x, y), 0x000000, "({x},{y})");
+                assert_eq!(mask(&mut engine, "dest", x, y), 0xff, "({x},{y}) alpha");
+            }
+            for x in 20..32 {
+                assert_eq!(pixel(&mut engine, "dest", x, y), 0xffffff, "({x},{y})");
+                assert_eq!(mask(&mut engine, "dest", x, y), 0xff, "({x},{y}) alpha");
+            }
+        }
+        // The slanted bottom edge leaves the lower rows' right side alone: at
+        // row 5 the quad ends at x = 24, so pixel 31 keeps the transparent fill
+        // while pixel 0 is still inside and still samples the black half.
+        assert_eq!(pixel(&mut engine, "dest", 31, 5), 0, "outside the quad");
+        assert_eq!(mask(&mut engine, "dest", 31, 5), 0, "outside the quad");
+        assert_eq!(
+            pixel(&mut engine, "dest", 0, 5),
+            0x000000,
+            "inside the quad"
+        );
+        assert_eq!(call_on_paint(&mut engine, "dest"), 1);
+    }
+
     /// A quad with no extent leaves AGG's matrix singular
     /// (`square_to_quad`'s affine branch gives `sx = sy = 0`), so `is_valid`
     /// refuses it and nothing is rasterised — but `redraw()` still runs
     /// (`Main.cpp:140, 168`). A zero-sized source *rectangle* is the same
-    /// singular rectangle in `quad_to_rect`; a source layer with no image at all
-    /// is the same call again (this engine refuses `setImageSize(0, 0)` with
-    /// "Cannot create empty layer image", so a layer without an image is the
-    /// zero-size source it can represent).
+    /// singular rectangle in `quad_to_rect`. A source without an image is not in
+    /// this group: the reference's `reset()` reads `Layer.imageWidth` before the
+    /// gate and throws "Not drawable layer type", so the port raises even with a
+    /// rejected quad (`new Layer()` carries a 32x32 holder, so the image-less
+    /// layer here is a freed one).
     #[test]
-    fn a_degenerate_quad_or_source_draws_nothing_but_repaints() {
+    fn a_degenerate_quad_or_source_rect_draws_nothing_but_repaints() {
         let mut engine = engine();
         run(&mut engine, "source.tjs", SOURCE_4X4);
         run(
@@ -1283,6 +1460,7 @@ mod tests {
             dest.fillRect(0, 0, 4, 4, 0xff204060);
 
             global.empty = new Layer();
+            empty.freeImage();
             "#,
         );
         let source_generation = generation(&mut engine, "src");
@@ -1304,27 +1482,29 @@ mod tests {
             "dest.perspectiveCopy(src, 0, 0, 0, 0, 0, 0, 4, 0, 0, 4, 4, 4);",
         );
         assert_eq!(pixel(&mut engine, "dest", 0, 0), 0x204060, "untouched");
-
-        // A source layer that never had an image, through the same call.
-        run(
-            &mut engine,
-            "degenerate.tjs",
-            "dest.perspectiveCopy(empty, 0, 0, 0, 0, 0, 0, 4, 0, 0, 4, 4, 4);",
-        );
-        assert_eq!(pixel(&mut engine, "dest", 0, 0), 0x204060, "untouched");
         assert_eq!(
             generation(&mut engine, "src"),
             source_generation,
             "the source keeps its image"
         );
+
+        // An image-less source raises before the validity gate, the way
+        // `reset()` does (`layerExBase.cpp:78-85`, `LayerIntf.cpp:2319-2323`).
+        let error = engine
+            .execute_script(
+                "degenerate.tjs",
+                "dest.perspectiveCopy(empty, 0, 0, 0, 0, 0, 0, 4, 0, 0, 4, 4, 4);",
+            )
+            .expect_err("an image-less source");
+        assert_eq!(error.message, "Not drawable layer type");
     }
 
-    /// The reference's failure paths are the engine's errors here: a source
-    /// that is not a layer (the reference dereferences a null instance) and a
-    /// layer whose image was freed (`mainImageBufferForWrite` answers void, and
-    /// the reference renders into a null buffer).
+    /// The reference's failure paths, mapped one by one (module doc, "Failure
+    /// paths"): a non-object source is the reference's one null dereference, a
+    /// freed or image-less layer is its `reset()`/`GetImageWidth` throw, and a
+    /// freed destination is the same throw from its own `reset`.
     #[test]
-    fn a_bad_source_is_an_error_not_a_crash() {
+    fn the_reference_failure_paths_are_errors_here() {
         let mut engine = engine();
         run(&mut engine, "source.tjs", SOURCE_4X4);
         run(&mut engine, "dest.tjs", DEST_4X4);
@@ -1334,7 +1514,7 @@ mod tests {
                 "bad.tjs",
                 "dest.perspectiveCopy(42, 0, 0, 4, 4, 0, 0, 4, 0, 0, 4, 4, 4);",
             )
-            .expect_err("a non-layer source");
+            .expect_err("a non-object source");
         assert_eq!(error.message, "perspectiveCopy: src must be Layer.");
 
         run(&mut engine, "free.tjs", "src.freeImage();");
@@ -1346,6 +1526,17 @@ mod tests {
             .expect_err("a freed source image");
         assert_eq!(error.message, "Not drawable layer type");
         assert_eq!(pixel(&mut engine, "dest", 0, 0), 0, "nothing was drawn");
+
+        // A freed destination is the reference's `dest->reset()` throw, and it
+        // happens even with a degenerate quad, before the `is_valid` gate.
+        run(&mut engine, "free.tjs", "dest.freeImage();");
+        let error = engine
+            .execute_script(
+                "bad.tjs",
+                "dest.perspectiveCopy(src, 0, 0, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2);",
+            )
+            .expect_err("a freed destination image, rejected quad");
+        assert_eq!(error.message, "Not drawable layer type");
     }
 
     /// This module registers one member *on top of* the engine's layer surface,
