@@ -7,7 +7,7 @@
 //! with a per-layer native instance to the global `Layer` class
 //! (`main.cpp:26-30`): `openMovie(filename, alpha)` copies the storage file to
 //! a temporary file and opens it through DirectShow
-//! (`layerExMovie.cpp:148-221`), then forces the video surface to 32bpp and
+//! (`layerExMovie.cpp:175-290`), then forces the video surface to 32bpp and
 //! pushes the movie size onto the layer's `imageWidth`/`imageHeight`/`type`
 //! (`:224-249`). `startMovie(loop)` runs the stream and fires
 //! `onStartMovie` (`:229-249`); frames are pulled from the engine's
@@ -20,40 +20,49 @@
 //!
 //! # Why this module is a [`PluginStatus::Shim`]
 //!
-//! Every link of the reference's chain between "script calls `openMovie`" and
-//! "pixels appear in the layer bitmap" is missing on this engine, and none of
-//! them can be faked from a plugin module:
+//! Exactly one link is missing, and it is the decoder: [`krkr_engine::plugin_api`]
+//! exposes `layer` and `storage` only, and `krkr-video`'s
+//! `VideoDecoderFactory`/`VideoSource`/`VideoPort`/`VideoFrame` are not
+//! re-exported by `krkr-engine` — this crate's production dependencies are
+//! `krkr-engine` and `krkr-tjs2` by policy — so a plugin can neither open a
+//! movie nor name a decoded frame. `KrkrHost::video_factory()` is public, but
+//! its argument and result types are unreachable from a plugin crate.
 //!
-//! * **No plugin-facing decoder.** [`krkr_engine::plugin_api`] exposes
-//!   `layer` and `storage` only. The engine's own decode path
-//!   (`native/video.rs` over `krkr-video`) is reached through the TJS
-//!   `VideoOverlay` object; `krkr-video`'s `VideoSource`/`VideoPort` are not
-//!   re-exported by `krkr-engine` and this crate's production dependencies
-//!   are `krkr-engine` and `krkr-tjs2` by policy, so a plugin cannot open a
-//!   movie even if it wanted to decode one frame at a time.
-//! * **No per-tick plugin hook.** [`krkr_engine::KrkrPlugin`] has
-//!   `name`/`register`/`unregister` only; the reference's whole movie pump is
-//!   `OnContinuousCallback` (`layerExMovie.cpp:350-421`), which has no Rust
-//!   counterpart. A plugin cannot even ask the engine to call it again.
-//! * **No script-thread event posting.** The scheduler's posting entry points
-//!   are `pub(crate)`, so `onUpdateMovie`/`onStartMovie`/`onStopMovie` could
-//!   not be delivered from a decoder thread either.
-//! * **No size to push.** The reference resizes the layer to the movie's
-//!   decoded size (`:243-249`); without decoding, the size is unknown, so not
-//!   even that observable side effect is honest to reproduce.
+//! The rest of the reference's chain is reachable *today*, which is why the
+//! follow-up engine mission is a `plugin_api::video` re-export and nothing
+//! else:
 //!
-//! What is left is the surface and its honest behaviour: the four members
-//! exist and behave exactly like the reference on a machine whose DirectShow
-//! open failed — `openMovie` checks the storage and returns, `startMovie`
-//! does nothing (`layerExMovie.cpp:231` guards on `pSample`), nothing plays,
-//! no event fires, `isPlayingMovie()` answers `false`. The difference is that
-//! the failure is *diagnosed*: `openMovie` logs which link is missing instead
-//! of leaving the script to wonder. A later engine mission that adds a
-//! `plugin_api::video` facility (open a storage movie, pull frames) plus a
-//! plugin tick or post hook would make the real port possible; the frame copy
-//! then follows `layerExMovie.cpp:355-390`, and the Kirikiroid2 port
+//! * **A per-frame hook exists.** `System.addContinuousHandler`
+//!   (`krkr-engine/src/native/system.rs`: registration and implementation;
+//!   invoked once per frame on the script thread from the engine update) is
+//!   the counterpart of the reference's `OnContinuousCallback`
+//!   (`layerExMovie.cpp:350-421`).
+//! * **A plugin can own that handler.** `Runtime::alloc_native_function` and
+//!   `Runtime::call_object_method` are public, so the handler can be a Rust
+//!   closure that pulls frames, writes them through `layer_bitmap_write` and
+//!   fires `onStartMovie`/`onUpdateMovie`/`onStopMovie` with the layer as
+//!   `this`.
+//! * **The size push** (`layerExMovie.cpp:243-249`) needs the decoded size;
+//!   `Layer.setImageSize` is script-reachable, so it follows the first
+//!   decoded frame.
+//!
+//! With a decoder, the frame copy follows `layerExMovie.cpp:355-390`
+//! (alpha = the right half's byte 0) and the Kirikiroid2 port
 //! (`Kirikiroid2/src/plugins/layerExMovie.cpp`) is the model for presenting
 //! through the engine's own video abstraction instead of DirectShow.
+//!
+//! Until that exists, the module is the surface and nothing more — which is
+//! exactly the reference's behaviour on a machine whose DirectShow open
+//! failed: `openMovie` checks the storage and returns, `startMovie` does
+//! nothing (`layerExMovie.cpp:296` guards on `pSample`), nothing plays, no
+//! event fires, `isPlayingMovie()` answers `false`, and the layer bitmap and
+//! its `imageWidth`/`imageHeight` stay untouched. The difference is that the
+//! failure is *diagnosed*: `openMovie` logs which link is missing instead of
+//! leaving the script to wonder.
+//!
+//! Reference line numbers refer to the krkrz checkout at
+//! `/Users/ruri/repo/krkrz` (`last_hodgepodge_repository`, Shift-JIS sources
+//! converted with `iconv -f CP932`), verified on 2026-09-12.
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
@@ -66,7 +75,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "Layer.openMovie/startMovie/stopMovie/isPlayingMovie (movie drawn into a layer image)",
-    notes: "Surface only, and honest about it: the engine has no plugin-facing video decoder, no per-tick plugin hook and no script-thread event posting, so the DirectShow-backed pump of layerExMovie.cpp:350-421 cannot be reproduced and no frame ever reaches the layer bitmap. openMovie validates the storage and logs the missing link (the reference logs and returns when its own open fails, layerExMovie.cpp:148-167); startMovie/stopMovie are silent no-ops like the reference's pSample==null paths; isPlayingMovie is false; the reference's imageWidth/imageHeight/type push (layerExMovie.cpp:243-249) is not reproduced because the movie size is unknowable without a decoder. A plugin_api::video facility plus a tick/post hook would enable the real port.",
+    notes: "Surface only, and honest about it: the only missing link is a plugin-facing decoder (plugin_api exposes layer/storage, and krkr-video's VideoDecoderFactory/VideoSource/VideoFrame are not re-exported, so a plugin cannot open a movie or name a frame), so no decoded frame can reach the layer bitmap. The pump itself is reachable today — System.addContinuousHandler runs on the script thread once per frame and Runtime::alloc_native_function/call_object_method are public — so the follow-up engine mission is a plugin_api::video re-export, nothing more. openMovie validates the storage and logs the missing link (the reference logs and returns when its own open fails, layerExMovie.cpp:141-167); startMovie/stopMovie are silent no-ops like the reference's pSample==null paths; isPlayingMovie is false; the reference's imageWidth/imageHeight/type push (layerExMovie.cpp:243-249) is not reproduced because the movie size is unknowable without a decoder.",
     install: |engine| engine.register_plugin(LayerExMoviePlugin),
 };
 
@@ -119,7 +128,7 @@ impl KrkrPlugin for LayerExMoviePlugin {
     }
 }
 
-/// `layerExMovie::openMovie` (`layerExMovie.cpp:143-252`), reduced to the
+/// `layerExMovie::openMovie` (`layerExMovie.cpp:127-292`), reduced to the
 /// storage check.
 ///
 /// The reference returns silently after logging `<filename>:ファイルが開けません`
@@ -138,8 +147,9 @@ fn layer_open_movie(
     if runtime.host().storage_exists(&filename) {
         runtime.host_mut().log(&format!(
             "WARN layerExMovie.dll: openMovie({filename:?}, alpha={alpha}) — this engine has no \
-             plugin-facing video decode facility and no per-tick plugin hook, so no decoder can \
-             feed the layer bitmap; playback stays unavailable (see src/layer_ex_movie.rs)"
+             plugin-facing video decode facility (plugin_api exposes layer/storage only and \
+             krkr-video's decoder types are not re-exported), so no decoded frame can feed the \
+             layer bitmap; playback stays unavailable (see src/layer_ex_movie.rs)"
         ));
     } else {
         runtime.host_mut().log(&format!(
@@ -151,7 +161,7 @@ fn layer_open_movie(
     Ok(Variant::Void)
 }
 
-/// `layerExMovie::startMovie` (`layerExMovie.cpp:226-249`).
+/// `layerExMovie::startMovie` (`layerExMovie.cpp:293-308`).
 ///
 /// The reference runs only when `pSample` exists (`:231`), marks the plug-in
 /// playing through the continuous-event hook (`start()`, `:274-280`) and fires
@@ -165,7 +175,7 @@ fn layer_start_movie(
     Ok(Variant::Void)
 }
 
-/// `layerExMovie::stopMovie` (`layerExMovie.cpp:254-267`).
+/// `layerExMovie::stopMovie` (`layerExMovie.cpp:313-324`).
 ///
 /// The reference removes the continuous-event hook and releases the media
 /// objects, then fires `onStopMovie` only when it was playing (`:258-265`).
@@ -178,7 +188,7 @@ fn layer_stop_movie(
     Ok(Variant::Void)
 }
 
-/// `layerExMovie::isPlayingMovie` (`layerExMovie.cpp:269-272`).
+/// `layerExMovie::isPlayingMovie` (`layerExMovie.cpp:326-330`).
 ///
 /// `playing` is set by `start()` (`:276`) and cleared by `stop()` (`:285`),
 /// both reachable only from a real open; without one it is `false`, which is
@@ -228,7 +238,7 @@ mod tests {
     }
 
     /// The four members plus the three script hooks the reference reads off
-    /// the layer object (`layerExMovie.cpp:56-60`) exist as callable members.
+    /// the layer object (`layerExMovie.cpp:55-60`) exist as callable members.
     #[test]
     fn the_layer_surface_is_registered() {
         let engine = engine();
@@ -274,7 +284,7 @@ mod tests {
     }
 
     /// A layer with the reference's three script hooks counted from TJS
-    /// (`layerExMovie.cpp:56-60`), plus a distinctive bitmap.
+    /// (`layerExMovie.cpp:55-60`), plus a distinctive bitmap.
     const HOOKED_LAYER: &str = r#"
         global.layer = new Layer();
         layer.setImageSize(3, 1);
@@ -294,7 +304,7 @@ mod tests {
     fn open_movie_never_plays_and_diagnoses_the_missing_link() {
         // No project storage at all: the file cannot be opened, the same
         // silent return the reference takes when its own open fails
-        // (`layerExMovie.cpp:148-153`), with the reason logged.
+        // (`layerExMovie.cpp:141-147`), with the reason logged.
         let mut engine = engine();
         engine
             .execute_script("inline.tjs", HOOKED_LAYER)

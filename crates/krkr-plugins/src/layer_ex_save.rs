@@ -17,7 +17,7 @@
 //! * **`Window` methods** (`Main.cpp:342-346`): `startSaveLayerImage`,
 //!   `cancelSaveLayerImage`, `stopSaveLayerImage`, with the
 //!   `onSaveLayerImageProgress`/`onSaveLayerImageDone` events
-//!   (`Main.cpp:143-321`).
+//!   (`Main.cpp:122-160`).
 //!
 //! # Byte order and channel mapping
 //!
@@ -36,39 +36,55 @@
 //! their result is order-independent. The PNG writer emits R, G, B, A
 //! (reference `writePixel` writes `p[2], p[1], p[0], p[3]`, `savepng.cpp:47-52`);
 //! the TLG5 writer feeds its channel composition B, G, R, A, the order the
-//! format defines (`savetlg5.cpp:96-121`).
+//! format defines (`savetlg5.cpp:99-121`).
 //!
 //! # Real vs mapped
 //!
-//! Real: all eight pixel helpers, the PNG writer (`savepng.cpp:158-255`
-//! structure and error strings), the TLG5 writer (`savetlg5.cpp:20-171`,
+//! Real: all eight pixel helpers, the PNG writer (`savepng.cpp:111-275`
+//! structure and error strings), the TLG5 writer (`savetlg5.cpp:16-171`,
 //! including the `TLG0.0` tag container) and the PNG octet form.
 //!
 //! Mapped, with the reason:
 //!
 //! * **PNG compression is this module's own deflate** (`deflate` below):
-//!   fixed-Huffman LZ77 for levels 1-9, stored blocks for level 0. The repo
+//!   fixed-Huffman LZ77 for levels 1-9, stored blocks for level 0, and zlib's
+//!   default level 6 for `Z_DEFAULT_COMPRESSION`/no `comp_lv` tag at all —
+//!   so the *effective* level selection matches the reference's. The repo
 //!   already depends on `flate2`, but this crate's production dependencies
 //!   are `krkr-engine` and `krkr-tjs2` only, so no zlib is linkable here.
-//!   The output is a normal zlib stream; `comp_lv` selects press/no-press
-//!   and match-search effort rather than reproducing zlib's algorithm, and
-//!   the reference's own readme already warns its PNG path is unfiltered and
-//!   compresses worse than libpng.
+//!   The output is a normal zlib stream; the levels vary the match-search
+//!   depth of this encoder rather than reproducing zlib's algorithm (no
+//!   dynamic Huffman, one block), an unprofitable compressed block falls back
+//!   to stored like zlib's own, and the reference's readme already warns its
+//!   PNG path is unfiltered and compresses worse than libpng.
 //! * **`Window.startSaveLayerImage` runs synchronously**: it encodes and
 //!   writes inside the call (the reference runs a worker thread and posts
-//!   `WM_APP` messages back). The engine has no public way for a plugin to
-//!   post an event to the script thread — the scheduler's posting entry
-//!   points are `pub(crate)` — so the file is saved and
-//!   `onSaveLayerImageProgress`/`onSaveLayerImageDone` fire inline, at the
-//!   same progress points the reference's compressor reports. Cancellation
-//!   still works the reference's way: a script that calls
+//!   `WM_APP` messages back). This is a simplification, not an engine limit:
+//!   a plugin can own a worker thread and still deliver events on the script
+//!   thread through `System.addContinuousHandler` (a per-frame callback, see
+//!   `krkr-engine/src/native/system.rs` and the invocation in
+//!   `engine.rs`) plus the public `Runtime::call_object_method`. The
+//!   synchronous form trades that thread and its handler bookkeeping for a
+//!   save that blocks the frame for its duration (measured at ~0.7 ms for a
+//!   stored 1920x1080 save and ~85 ms at the default level). Everything else
+//!   is the reference's: `onSaveLayerImageProgress`/
+//!   `onSaveLayerImageDone` fire at the same progress points the reference's
+//!   compressor reports (a repeated percentage is suppressed like
+//!   `SaveInfo::progress`, `Main.cpp:288-299`), a script that calls
 //!   `cancelSaveLayerImage` from inside a progress handler stops the encoder
-//!   before the file is written and the done event reports `canceled = 1`;
-//!   `stopSaveLayerImage` silences the events and skips the write.
+//!   before the file is written and the done event reports `canceled = 1`,
+//!   and `stopSaveLayerImage` silences the events and skips the write.
 //! * **The save-layer clone** the reference makes for the background thread
-//!   (`Main.cpp:229-260`) is a pixel snapshot here — the same stability
+//!   (`Main.cpp:228-260`) is a pixel snapshot here — the same stability
 //!   guarantee without a second `Layer` object; the events therefore carry
-//!   the caller's layer, not a clone.
+//!   the caller's layer, and a layer the clone machinery would have rejected
+//!   is reported with the writer's `<file>:invalid layer` instead of the
+//!   reference's `保存処理用レイヤの生成に失敗しました`/`…複製に失敗しました`
+//!   (`Main.cpp:233-252`).
+//!
+//! Reference line numbers refer to the krkrz checkout at
+//! `/Users/ruri/repo/krkrz` (`last_hodgepodge_repository`, Shift-JIS sources
+//! converted with `iconv -f CP932`), verified on 2026-09-12.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -94,7 +110,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "Layer.saveLayerImagePng/Tlg5/PngOctet and the crop/diff/ooze/blank helpers; Window.startSaveLayerImage",
-    notes: "A port of layerExSave (utils.cpp:94-512 pixel helpers, savepng.cpp PNG writer, savetlg5.cpp TLG5 writer with the TLG0.0 tags container, Main.cpp:342-346 Window API). PNG and TLG5 are real decodable files (round-tripped through the engine's own loaders in tests); the deflate behind PNG is this module's fixed-Huffman LZ77 because no zlib is linkable from this crate, and comp_lv selects press/no-press rather than zlib's levels. Window.startSaveLayerImage is synchronous (the engine offers plugins no script-thread event posting), fires the reference's progress/done events inline and keeps the cancel/stop semantics; the reference's background thread and its save-layer clone become a pixel snapshot and the caller's layer object.",
+    notes: "A port of layerExSave (utils.cpp:94-512 pixel helpers, savepng.cpp PNG writer, savetlg5.cpp TLG5 writer with the TLG0.0 tags container, Main.cpp:342-346 Window API). PNG and TLG5 are real decodable files (round-tripped through the engine's own loaders in tests); the deflate behind PNG is this module's fixed-Huffman LZ77 because no zlib is linkable from this crate — comp_lv keeps the reference's meaning (0 stores, -1 is zlib's default level 6, 1-9 press harder) while the algorithm differs, and an unprofitable compressed block falls back to stored like zlib. Window.startSaveLayerImage is synchronous (a simplification, not an engine limit: a worker thread could deliver events through System.addContinuousHandler), fires the reference's progress/done events inline with its percentage dedup and keeps the cancel/stop semantics; the reference's background thread and its save-layer clone become a pixel snapshot and the caller's layer object.",
     install: |engine| engine.register_plugin(LayerExSavePlugin),
 };
 
@@ -110,7 +126,7 @@ impl KrkrPlugin for LayerExSavePlugin {
             return Ok(());
         };
         // `NCB_ATTACH_FUNCTION(<name>, Layer, <fn>)` (`utils.cpp:120-512`,
-        // `savepng.cpp:244-274`, `savetlg5.cpp:264-275`), one class-level
+        // `savepng.cpp:244-275`, `savetlg5.cpp:264-277`), one class-level
         // function per member; the reference's own numparams checks become the
         // declared minimums.
         for (name, arg_count, function) in LAYER_FUNCTIONS {
@@ -304,10 +320,15 @@ fn rect_dictionary(runtime: &mut Runtime<KrkrHost>, x: i64, y: i64, w: i64, h: i
     Variant::Object(dictionary)
 }
 
-fn arg_integer(args: &[Variant], index: usize) -> i64 {
-    args.get(index)
-        .and_then(|value| value.to_integer().ok())
-        .unwrap_or(0)
+/// A positional `int` argument, converted the way ncbind's `int` parameter
+/// conversion does (`*param` -> `AsInteger()`): an absent argument is 0, a
+/// value the conversion refuses (an object, an octet) is its TJS error, not a
+/// silent 0.
+fn arg_integer(args: &[Variant], index: usize) -> Result<i64> {
+    match args.get(index) {
+        None => Ok(0),
+        Some(value) => value.to_integer(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,23 +553,37 @@ fn copy_blue_to_alpha(
 /// `isBlank` (`utils.cpp:436-477`): whether every pixel of the rectangle has
 /// a zero blue byte (engine byte 2 — the reference's `*buffer`, byte 0).
 ///
-/// The bounds check is the reference's own, including its `top < 0` typo
-/// where `height < 0` was intended (`:455-458`): a negative width or height
-/// passes the check and makes the loops empty, i.e. "blank".
+/// The bounds check is the reference's own (`utils.cpp:455-458`), including
+/// its `top < 0` typo where `height < 0` was intended: a negative *height*
+/// passes the check and scans nothing ("blank"), a negative *width*, `left`
+/// or `top` is the reference's `invalid layer range`.
+///
+/// The four parameters arrive as `tjs_int` in the reference
+/// (`tjs_int left = *param[0];`, `:441-444`), i.e. narrowed to 32 bits, and
+/// the sums are `int` arithmetic that the reference lets wrap. The port takes
+/// the same narrowing and wraps the same way, so a script value outside the
+/// 32-bit range behaves like the reference's and the additions can never
+/// panic in an overflow-checked profile.
 fn is_blank(
     pixels: &[u8],
     geometry: Geometry,
-    left: i64,
-    top: i64,
-    width: i64,
-    height: i64,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
 ) -> Result<bool> {
-    let (image_width, image_height) = (geometry.width as i64, geometry.height as i64);
-    if left < 0 || top < 0 || left + width > image_width || top + height > image_height {
+    let image_width = geometry.width.min(i32::MAX as usize) as i32;
+    let image_height = geometry.height.min(i32::MAX as usize) as i32;
+    if left < 0
+        || top < 0
+        || width < 0
+        || left.wrapping_add(width) > image_width
+        || top.wrapping_add(height) > image_height
+    {
         return Err(TjsError::runtime("invalid layer range"));
     }
-    for y in top..top + height {
-        for x in left..left + width {
+    for y in top..top.wrapping_add(height) {
+        for x in left..left.wrapping_add(width) {
             let offset = geometry.offset(x as usize, y as usize);
             if pixels[offset + 2] != 0 {
                 return Ok(false);
@@ -703,14 +738,14 @@ fn layer_ooze_color(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
-    let level = arg_integer(&args, 0);
+    let level = arg_integer(&args, 0)?;
     if level <= 0 {
         return Err(TjsError::runtime("Invalid level count."));
     }
     // `(unsigned char)` truncation, then the reference's `threshold < 1`
-    // clamp (`utils.cpp:311-317`); a byte cannot exceed 255.
-    let threshold = (arg_integer(&args, 1) as u8).max(1);
-    let fill_color = arg_integer(&args, 2);
+    // clamp (`utils.cpp:310-319`); a byte cannot exceed 255.
+    let threshold = (arg_integer(&args, 1)? as u8).max(1);
+    let fill_color = arg_integer(&args, 2)?;
     let fill = [
         ((fill_color >> 16) & 0xff) as u8,
         ((fill_color >> 8) & 0xff) as u8,
@@ -754,15 +789,14 @@ fn layer_is_blank(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
+    // `tjs_int left = *param[0];` (`utils.cpp:441-444`): the reference narrows
+    // each parameter to 32 bits before checking it.
+    let left = arg_integer(&args, 0)? as i32;
+    let top = arg_integer(&args, 1)? as i32;
+    let width = arg_integer(&args, 2)? as i32;
+    let height = arg_integer(&args, 3)? as i32;
     let blank = layer_bitmap_read(runtime, layer, |view| {
-        is_blank(
-            view.pixels,
-            Geometry::read(view),
-            arg_integer(&args, 0),
-            arg_integer(&args, 1),
-            arg_integer(&args, 2),
-            arg_integer(&args, 3),
-        )
+        is_blank(view.pixels, Geometry::read(view), left, top, width, height)
     })
     .map_err(|_| TjsError::runtime("src must be Layer."))??;
     Ok(Variant::Integer(i64::from(blank)))
@@ -775,8 +809,8 @@ fn layer_clear_alpha(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
-    let threshold = arg_integer(&args, 0);
-    let fill_color = arg_integer(&args, 1);
+    let threshold = arg_integer(&args, 0)?;
+    let fill_color = arg_integer(&args, 1)?;
     layer_bitmap_write(runtime, layer, |view| {
         let geometry = Geometry::write(view);
         clear_alpha(view.pixels, geometry, threshold, fill_color);
@@ -819,7 +853,7 @@ impl SavedPlane {
     }
 }
 
-/// The tag dictionary the PNG writer reads (`savepng.cpp:158-232`): the
+/// The tag dictionary the PNG writer reads (`savepng.cpp:111-169`): the
 /// `pHYs`/`oFFs`/`vpAg` chunk values plus the compression level.
 #[derive(Default)]
 struct PngTags {
@@ -831,7 +865,7 @@ struct PngTags {
 
 /// A dictionary member, through the normal dispatch path so a getter is
 /// honoured; `None` when the member does not exist (`ncbPropAccessor`'s
-/// `HasValue` false, `savepng.cpp:170-211`).
+/// `HasValue` false, `savepng.cpp:131-169`).
 fn dict_member(
     runtime: &mut Runtime<KrkrHost>,
     dictionary: ObjectHandle,
@@ -843,7 +877,7 @@ fn dict_member(
     runtime.resolve_object_member(dictionary, name).ok()
 }
 
-/// `ncbPropAccessor::getIntValue` (`savepng.cpp:174-205`): a missing member
+/// `ncbPropAccessor::getIntValue` (`savepng.cpp:131-169`): a missing member
 /// reads 0, so `reso_x`/`offs_y`/… each stand alone.
 fn dict_integer(runtime: &mut Runtime<KrkrHost>, dictionary: ObjectHandle, name: &str) -> i64 {
     dict_member(runtime, dictionary, name)
@@ -865,7 +899,7 @@ fn dict_unit(
     i64::from(value == one_value)
 }
 
-/// Reads the PNG tag dictionary (`savepng.cpp:158-232`): each chunk appears
+/// Reads the PNG tag dictionary (`savepng.cpp:111-169`): each chunk appears
 /// when either of its coordinates is present, and `comp_lv` defaults to
 /// zlib's `Z_DEFAULT_COMPRESSION` (`-1`).
 fn read_png_tags(runtime: &mut Runtime<KrkrHost>, dictionary: Option<ObjectHandle>) -> PngTags {
@@ -909,13 +943,17 @@ fn read_png_tags(runtime: &mut Runtime<KrkrHost>, dictionary: Option<ObjectHandl
     tags
 }
 
-/// The `tags` string of the TLG0.0 container (`savetlg5.cpp:206-247`):
-/// `EnumMembers` visited in order, each entry written as
+/// The `tags` string of the TLG0.0 container (`savetlg5.cpp:190-214`):
+/// every member visited, each entry written as
 /// `<name-length>:<name>=<value-length>:<value>,`.
 ///
-/// The reference's lengths are `GetNarrowStrLen()`; with a Rust string the
-/// UTF-8 byte length is the equivalent, and the members come out in the
-/// runtime's member order.
+/// Three divergences, all in an intentionally unverified corner of the
+/// reference (its own readme: "動作未確認"): the reference's lengths are
+/// `GetNarrowStrLen()` where this uses the UTF-8 byte length; the reference
+/// enumerates in TJS2's dictionary order where [`Runtime::object_members`]
+/// returns the engine's member order (alphabetical today); and a value whose
+/// string conversion fails (an octet) contributes an empty value where the
+/// reference's `ttstr` conversion has no exact Rust analogue.
 fn tlg_tags_string(runtime: &Runtime<KrkrHost>, dictionary: Option<ObjectHandle>) -> String {
     let Some(dictionary) = dictionary else {
         return String::new();
@@ -935,10 +973,10 @@ fn tlg_tags_string(runtime: &Runtime<KrkrHost>, dictionary: Option<ObjectHandle>
 }
 
 // ---------------------------------------------------------------------------
-// PNG writer (savepng.cpp:158-274)
+// PNG writer (savepng.cpp:111-275)
 // ---------------------------------------------------------------------------
 
-/// One PNG, as `CompressPNG::compress` builds it (`savepng.cpp:158-232`):
+/// One PNG, as `CompressPNG::compress` builds it (`savepng.cpp:111-169`):
 /// signature, `IHDR` with the fixed 8-bit RGBA type, the optional tag
 /// chunks, then a single unfiltered `IDAT` and `IEND`.
 fn encode_png(
@@ -949,7 +987,7 @@ fn encode_png(
     let mut out = Vec::new();
     out.extend_from_slice(b"\x89PNG\x0D\x0A\x1A\x0A");
 
-    // `compress_first` (`savepng.cpp:196-208`): `PNGTYPE_RGBA8888` packs bit
+    // `compress_first` (`savepng.cpp:119-130`): `PNGTYPE_RGBA8888` packs bit
     // depth 8, colour type 6, compression 0 and filter 0 into one DWORD, then
     // the interlace byte follows.
     let mut ihdr = Vec::with_capacity(13);
@@ -959,7 +997,7 @@ fn encode_png(
     ihdr.push(0);
     png_chunk(&mut out, b"IHDR", &ihdr);
 
-    // `compress_second` (`savepng.cpp:209-232`).
+    // `compress_second` (`savepng.cpp:131-169`).
     if let Some((x, y, unit)) = tags.reso {
         let mut payload = Vec::new();
         payload.extend_from_slice(&(x as u32).to_be_bytes());
@@ -982,7 +1020,7 @@ fn encode_png(
         png_chunk(&mut out, b"vpAg", &payload);
     }
 
-    // `compress_third` (`savepng.cpp:233-255`): one filter byte 0 per row,
+    // `compress_third` (`savepng.cpp:170-185`): one filter byte 0 per row,
     // then R, G, B, A per pixel.
     let mut raw = Vec::with_capacity(plane.height * (1 + plane.width * 4));
     for y in 0..plane.height {
@@ -1081,11 +1119,20 @@ enum Encoded {
     Canceled,
 }
 
+/// zlib's `Z_DEFAULT_COMPRESSION` (`savepng.cpp:19, 168`): the level the
+/// reference uses when the tags carry no `comp_lv`, which is zlib level 6.
+const DEFAULT_COMPRESSION: i64 = 6;
+
 /// zlib's `deflate()` at the level the reference asked for
-/// (`savepng.cpp:57-99`): level 0 is stored blocks, levels 1-9 are one
-/// fixed-Huffman block over a greedy LZ77 match search. Level -1 is zlib's
-/// `Z_DEFAULT_COMPRESSION`; anything outside -1..=9 is the reference's
-/// "deflate initialize" error.
+/// (`savepng.cpp:46-95`). Level -1 is zlib's `Z_DEFAULT_COMPRESSION` — the
+/// default when no `comp_lv` tag is given — and is mapped to
+/// [`DEFAULT_COMPRESSION`]; level 0 is stored blocks and 1-9 are one
+/// fixed-Huffman block over a greedy LZ77 match search whose depth scales
+/// with the level. Anything outside -1..=9 is the reference's
+/// "deflate initialize" error (`savepng.cpp:51-52`).
+///
+/// Like zlib, a compressed block that did not pay off is replaced by a stored
+/// one (zlib picks a stored block in the same situation).
 fn deflate(
     data: &[u8],
     level: i64,
@@ -1094,7 +1141,12 @@ fn deflate(
     if !(-1..=9).contains(&level) {
         return Err("deflate initialize".to_string());
     }
-    if level <= 0 {
+    let level = if level == -1 {
+        DEFAULT_COMPRESSION
+    } else {
+        level
+    };
+    if level == 0 {
         return Ok(deflate_stored(data, progress));
     }
     let depth = 4 + (level as usize) * 4;
@@ -1105,7 +1157,9 @@ fn deflate(
     let mut head = vec![u32::MAX; HASH_SIZE];
     let mut prev = vec![u32::MAX; data.len()];
     let mut index = 0usize;
-    let mut reported = 0usize;
+    // The reference reports progress in 4096-byte input steps, *before*
+    // consuming each step, and honours a cancel there (`savepng.cpp:62-74`).
+    let mut next_reported = 0usize;
     while index < data.len() {
         let (length, distance) = if index + MIN_MATCH <= data.len() {
             find_match(data, index, &head, &prev, depth)
@@ -1125,9 +1179,10 @@ fn deflate(
             insert_match(data, index, &mut head, &mut prev);
             index += 1;
         }
-        if index.saturating_sub(reported) >= 4096 {
-            reported = index;
-            let percent = (index * 100 / data.len().max(1)) as i32;
+        while index >= next_reported && next_reported < data.len() {
+            let consumed = (next_reported + 4096).min(data.len());
+            next_reported += 4096;
+            let percent = (consumed * 100 / data.len().max(1)) as i32;
             if progress(percent) {
                 return Ok(Encoded::Canceled);
             }
@@ -1135,13 +1190,26 @@ fn deflate(
     }
     let (code, bits) = fixed_code(256);
     writer.write_code(code, bits);
-    if progress(100) {
-        return Ok(Encoded::Canceled);
+    // The reference's *final* `doProgress(100)` (`savepng.cpp:86-87`) only
+    // runs when nothing canceled, and its result is ignored — the file is
+    // written even if the script cancels from that last event.
+    progress(100);
+    let encoded = writer.finish();
+    if encoded.len() > stored_length(data.len()) {
+        // zlib falls back to a stored block when Huffman coding made the data
+        // bigger; the reference inherits that through `deflate`.
+        return Ok(deflate_stored(data, progress));
     }
-    Ok(Encoded::Bytes(writer.finish()))
+    Ok(Encoded::Bytes(encoded))
 }
 
-/// zlib's level 0: uncompressed deflate blocks (`savepng.cpp:57-99` still goes
+/// The exact byte size [`deflate_stored`] produces for `length` bytes: 5 bytes
+/// of block header per 65535-byte block, at least one block.
+fn stored_length(length: usize) -> usize {
+    length + 5 * length.div_ceil(65535).max(1)
+}
+
+/// zlib's level 0: uncompressed deflate blocks (`savepng.cpp:46-95` still goes
 /// through `deflate` for them).
 fn deflate_stored(data: &[u8], progress: &mut dyn FnMut(i32) -> bool) -> Encoded {
     let mut writer = BitWriter::new();
@@ -1341,19 +1409,19 @@ impl BitWriter {
 }
 
 // ---------------------------------------------------------------------------
-// TLG5 writer (savetlg5.cpp:20-171)
+// TLG5 writer (savetlg5.cpp:16-171)
 // ---------------------------------------------------------------------------
 
 /// `BLOCK_HEIGHT` (`savetlg5.cpp:6`): four rows per block.
 const TLG_BLOCK_HEIGHT: usize = 4;
 
 /// The plane bytes each TLG5 channel carries, in the format's own order:
-/// channel 0 is B, 1 is G, 2 is R, 3 is A (`savetlg5.cpp:96-121`, and
+/// channel 0 is B, 1 is G, 2 is R, 3 is A (`savetlg5.cpp:99-121`, and
 /// `tlg5_compose_colors4` on the decoding side), while the engine plane is
 /// R, G, B, A.
 const TLG_CHANNEL_BYTE: [usize; 4] = [2, 1, 0, 3];
 
-/// `CompressTLG5::compress` (`savetlg5.cpp:174-262`): the raw stream, wrapped
+/// `CompressTLG5::compress` (`savetlg5.cpp:185-252`): the raw stream, wrapped
 /// in a `TLG0.0` container when the tags string is non-empty.
 fn compress_tlg5(plane: &SavedPlane, tags: &str, progress: &mut dyn FnMut(i32) -> bool) -> Encoded {
     if tags.is_empty() {
@@ -1373,7 +1441,7 @@ fn compress_tlg5(plane: &SavedPlane, tags: &str, progress: &mut dyn FnMut(i32) -
     Encoded::Bytes(out)
 }
 
-/// `CompressTLG5::main` (`savetlg5.cpp:20-171`): the `TLG5.0` header, the
+/// `CompressTLG5::main` (`savetlg5.cpp:16-171`): the `TLG5.0` header, the
 /// back-patched block-size table, then one 4-row block at a time — per
 /// channel the row/inter-pixel deltas, the B/G/R/A channel composition and
 /// either the LZSS payload or the raw bytes, whichever is smaller.
@@ -1390,7 +1458,7 @@ fn tlg5_stream(plane: &SavedPlane, progress: &mut dyn FnMut(i32) -> bool) -> Enc
     };
     let mut out = Vec::new();
     out.extend_from_slice(b"TLG5.0\x00raw\x1a");
-    out.push(4); // colors, always ARGB (`savetlg5.cpp:25-26`)
+    out.push(4); // colors, always ARGB (`savetlg5.cpp:20-29`)
     out.extend_from_slice(&(width as u32).to_le_bytes());
     out.extend_from_slice(&(height as u32).to_le_bytes());
     out.extend_from_slice(&(block_height as u32).to_le_bytes());
@@ -1405,8 +1473,8 @@ fn tlg5_stream(plane: &SavedPlane, progress: &mut dyn FnMut(i32) -> bool) -> Enc
         let rows = last_row - first_row;
         if progress((first_row * 100 / height.max(1)) as i32) {
             // The reference still reports its final step before returning the
-            // canceled flag (`savetlg5.cpp:160-168`); the PNG path does not
-            // (`savepng.cpp:94-99`).
+            // canceled flag (`savetlg5.cpp:171`); the PNG path does not
+            // (`savepng.cpp:86-95`).
             progress(100);
             return Encoded::Canceled;
         }
@@ -1422,7 +1490,7 @@ fn tlg5_stream(plane: &SavedPlane, progress: &mut dyn FnMut(i32) -> bool) -> Enc
         let mut count = 0usize;
         for y in first_row..last_row {
             // `prevcl` is reset per scan line; `upper` is the row above, or
-            // zero for the image's first row (`savetlg5.cpp:63-88`).
+            // zero for the image's first row (`savetlg5.cpp:69-98`).
             let mut previous_channel = [0i32; 4];
             let previous_offset = (y > 0).then(|| geometry.offset(0, y - 1));
             for x in 0..width {
@@ -1606,7 +1674,11 @@ impl SlideEncoder {
     /// The best candidate among the slots with the same two-byte prefix,
     /// longest match wins; `(0, 0)` when nothing reaches three bytes.
     fn find_match(&self, input: &[u8], index: usize) -> (usize, usize) {
-        let max_length = SLIDE_MAX_MATCH.min(input.len() - index);
+        // `curlen -= 1; lim = (SLIDE_M < curlen ? SLIDE_M : curlen) +
+        // place_org` (`slide.cpp:105-107`): the reference caps the comparison
+        // one byte short of the remaining input.
+        let curlen = input.len() - index - 1;
+        let max_length = SLIDE_MAX_MATCH.min(curlen);
         if max_length < 3 || index + 2 > input.len() {
             return (0, 0);
         }
@@ -1686,14 +1758,14 @@ impl SlideEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// The Layer save functions (savepng.cpp:244-274, savetlg5.cpp:264-275)
+// The Layer save functions (savepng.cpp:244-275, savetlg5.cpp:264-277)
 // ---------------------------------------------------------------------------
 
 fn snapshot_layer(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<SavedPlane> {
     layer_bitmap_read(runtime, layer, SavedPlane::snapshot).map_err(|_| invalid_layer_image())
 }
 
-/// `Layer.saveLayerImagePng(filename, tags=void)` (`savepng.cpp:244-255`).
+/// `Layer.saveLayerImagePng(filename, tags=void)` (`savepng.cpp:244-257`).
 fn layer_save_png(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1708,7 +1780,7 @@ fn layer_save_png(
     write_saved(runtime, &filename, encoded)
 }
 
-/// `Layer.saveLayerImagePngOctet(compression_level=1)` (`savepng.cpp:263-274`):
+/// `Layer.saveLayerImagePngOctet(compression_level=1)` (`savepng.cpp:263-275`):
 /// the same stream as an octet, and an empty string when the layer has no
 /// image (`encodeToOctet` clears the result first).
 fn layer_save_png_octet(
@@ -1717,9 +1789,12 @@ fn layer_save_png_octet(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
+    // `numparams >= 1 ? (int)param[0]->AsInteger() : 1` (`savepng.cpp:268`):
+    // an explicit argument converts (so `void` selects level 0), only an
+    // absent one is the default level 1.
     let level = match args.first() {
-        Some(Variant::Void) | None => 1,
-        Some(value) => value.to_integer().unwrap_or(0),
+        None => 1,
+        Some(value) => value.to_integer()?,
     };
     let Ok(plane) = snapshot_layer(runtime, layer) else {
         return Ok(Variant::String(String::new()));
@@ -1735,7 +1810,7 @@ fn layer_save_png_octet(
     })
 }
 
-/// `Layer.saveLayerImageTlg5(filename, tags=void)` (`savetlg5.cpp:264-275`).
+/// `Layer.saveLayerImageTlg5(filename, tags=void)` (`savetlg5.cpp:264-277`).
 fn layer_save_tlg5(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1777,12 +1852,12 @@ fn object_argument(args: &[Variant], index: usize) -> Option<ObjectHandle> {
 }
 
 // ---------------------------------------------------------------------------
-// Window.startSaveLayerImage (Main.cpp:143-346)
+// Window.startSaveLayerImage (Main.cpp:110-346)
 // ---------------------------------------------------------------------------
 
 /// One in-flight (here: in-call) save's shared flags. The reference's
 /// `SaveInfo` keeps `canceled` for the compressor and a `notify` pointer the
-/// `stop()` call clears (`Main.cpp:33-113`); this is both.
+/// `stop()` call clears (`Main.cpp:96-104`); this is both.
 #[derive(Default)]
 struct SaveJobState {
     /// `cancelSaveLayerImage`: stop at the next progress point, report done.
@@ -1793,17 +1868,20 @@ struct SaveJobState {
 
 thread_local! {
     /// Save jobs by window object, with the reference's handler numbering:
-    /// the lowest free slot, or the end of the list (`Main.cpp:211-221`).
+    /// the lowest free slot, or the end of the list (`Main.cpp:217-226`).
     static SAVE_JOBS: RefCell<BTreeMap<ObjectHandle, Vec<Option<Arc<SaveJobState>>>>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
-/// `WindowSaveImage::startSaveLayerImage` (`Main.cpp:204-266`).
+/// `WindowSaveImage::startSaveLayerImage` (`Main.cpp:216-261`).
 ///
 /// Synchronous: the reference clones the layer onto a worker thread and
-/// posts its events through the window message queue, which this engine
-/// gives plugins no way to do (see the module docs). The visible contract —
-/// handler numbering, the file, the two events, `cancel`/`stop` — is kept.
+/// posts its events through the window message queue. A worker thread is
+/// reachable (its events would go through `System.addContinuousHandler`),
+/// but this port encodes and writes inside the call instead; the visible
+/// contract — handler numbering, the file, the two events with the
+/// reference's percentage timing, `cancel`/`stop` — is kept (see the module
+/// docs).
 fn window_start_save(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1821,7 +1899,7 @@ fn window_start_save(
     let plane = snapshot_layer(runtime, layer)
         .map_err(|_| TjsError::runtime(format!("{filename}:invalid layer")))?;
 
-    // Format by extension (`Main.cpp:298-306`): `.png` exactly, everything
+    // Format by extension (`Main.cpp:310-317`): `.png` exactly, everything
     // else TLG5.
     let is_png = storage_extension(&filename) == ".png";
     let png_tags = if is_png {
@@ -1841,7 +1919,24 @@ fn window_start_save(
     let filename_value = Variant::String(filename.clone());
     let mut hook_error: Option<TjsError> = None;
     let encoded = {
+        // `SaveInfo::progress` (`Main.cpp:288-299`): a `stop()` cleared the
+        // notifier and posts nothing more; a repeated percentage is
+        // suppressed (`progressPercent` starts as a void variant, whose
+        // integer value is 0, so a first 0% step is suppressed too); and the
+        // return value is the cancel latch *as the call started*, because the
+        // reference posts the event and processes it later — a cancel raised
+        // inside a handler takes effect at the next progress step, not this
+        // one.
+        let mut reported_percent = 0i32;
         let mut progress = |percent: i32| -> bool {
+            let canceled = job.canceled.load(Ordering::Relaxed);
+            if job.stopped.load(Ordering::Relaxed) {
+                return true;
+            }
+            if percent == reported_percent {
+                return canceled;
+            }
+            reported_percent = percent;
             let args = vec![
                 Variant::Integer(handler),
                 Variant::Integer(i64::from(percent)),
@@ -1853,7 +1948,7 @@ fn window_start_save(
                 hook_error = Some(error);
                 return true;
             }
-            job.canceled.load(Ordering::Relaxed) || job.stopped.load(Ordering::Relaxed)
+            canceled
         };
         if is_png {
             encode_png(&plane, &png_tags, &mut progress).map_err(TjsError::runtime)
@@ -1864,10 +1959,15 @@ fn window_start_save(
 
     let canceled = job.canceled.load(Ordering::Relaxed);
     let stopped = job.stopped.load(Ordering::Relaxed);
+    // A cancel or stop raised by the *final* progress step does not reach the
+    // encoder (the reference ignores that call's result, `savepng.cpp:86-87`
+    // and `savetlg5.cpp:171`), so an `Encoded::Bytes` here is still written;
+    // `Encoded::Canceled` is a pre-final cancel, which the reference's
+    // compressor turns into a canceled `save()` that writes nothing
+    // (`compress.hpp:157-196`).
     let outcome = match encoded {
         Err(error) => Err(error),
         Ok(Encoded::Canceled) => Ok(()),
-        Ok(Encoded::Bytes(_)) if canceled || stopped => Ok(()),
         Ok(Encoded::Bytes(bytes)) => runtime
             .host_mut()
             .write_binary_storage(&filename, "w", &bytes)
@@ -1893,7 +1993,7 @@ fn window_start_save(
     Ok(Variant::Integer(handler))
 }
 
-/// `WindowSaveImage::cancelSaveLayerImage` (`Main.cpp:270-275`).
+/// `WindowSaveImage::cancelSaveLayerImage` (`Main.cpp:266-270`).
 fn window_cancel_save(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1902,14 +2002,14 @@ fn window_cancel_save(
     let window = this_obj
         .map(|window| runtime.bound_this(window).unwrap_or(window))
         .ok_or_else(|| TjsError::runtime("Window method requires this"))?;
-    let handler = arg_integer(&args, 0);
+    let handler = arg_integer(&args, 0)?;
     if let Some(job) = save_job(window, handler) {
         job.canceled.store(true, Ordering::Relaxed);
     }
     Ok(Variant::Void)
 }
 
-/// `WindowSaveImage::stopSaveLayerImage` (`Main.cpp:280-285`).
+/// `WindowSaveImage::stopSaveLayerImage` (`Main.cpp:275-280`).
 fn window_stop_save(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1918,15 +2018,18 @@ fn window_stop_save(
     let window = this_obj
         .map(|window| runtime.bound_this(window).unwrap_or(window))
         .ok_or_else(|| TjsError::runtime("Window method requires this"))?;
-    let handler = arg_integer(&args, 0);
+    let handler = arg_integer(&args, 0)?;
     if let Some(job) = save_job(window, handler) {
+        // `SaveInfo::stop()` (`Main.cpp:101-104`): cancel *and* clear the
+        // notifier, so the compressor stops and no event is posted again.
+        job.canceled.store(true, Ordering::Relaxed);
         job.stopped.store(true, Ordering::Relaxed);
         clear_save_job(window, handler);
     }
     Ok(Variant::Void)
 }
 
-/// `TVPExtractStorageExt` + `ToLowerCase` (`Main.cpp:301-303`): the
+/// `TVPExtractStorageExt` + `ToLowerCase` (`Main.cpp:310-311`): the
 /// extension of the file name part, after the last `/`, `\\` or `>`.
 fn storage_extension(name: &str) -> String {
     let start = name
@@ -1939,7 +2042,7 @@ fn storage_extension(name: &str) -> String {
     name[start + index..].to_ascii_lowercase()
 }
 
-/// The lowest free handler slot, or a new one (`Main.cpp:211-221`).
+/// The lowest free handler slot, or a new one (`Main.cpp:217-226`).
 fn register_save_job(window: ObjectHandle, state: Arc<SaveJobState>) -> i64 {
     SAVE_JOBS.with(|jobs| {
         let mut jobs = jobs.borrow_mut();
@@ -1979,7 +2082,7 @@ fn clear_save_job(window: ObjectHandle, handler: i64) {
 }
 
 /// Fires one of the window's `onSaveLayerImage*` events the way the
-/// reference's `FuncCall` does (`Main.cpp:60-76`): a member that is absent or
+/// reference's `FuncCall` does (`Main.cpp:67-77`): a member that is absent or
 /// not callable is ignored, an exception inside the handler propagates.
 fn fire_window_hook(
     runtime: &mut Runtime<KrkrHost>,
@@ -2088,7 +2191,7 @@ mod tests {
     }
 
     /// Every member of both reference surfaces exists
-    /// (`utils.cpp:120-512`, `savepng.cpp:244-274`, `savetlg5.cpp:264-275`,
+    /// (`utils.cpp:120-512`, `savepng.cpp:244-275`, `savetlg5.cpp:264-277`,
     /// `Main.cpp:342-346`).
     #[test]
     fn the_surface_is_registered() {
@@ -2119,8 +2222,8 @@ mod tests {
         }
     }
 
-    /// The reference's own `numparams` checks (`utils.cpp:196-202, 244-251,
-    /// 261-298, 443-446`, `savepng.cpp:236-238`, `savetlg5.cpp:257-259`).
+    /// The reference's own `numparams` checks (`utils.cpp:195, 247,
+    /// 306-309, 439`, `savepng.cpp:248`, `savetlg5.cpp:268`).
     #[test]
     fn argument_counts_are_the_reference_checks() {
         let mut engine = engine();
@@ -2145,7 +2248,7 @@ mod tests {
             );
         }
         // `copyBlueToAlpha` declares no minimum; a missing argument reaches
-        // its own check instead (`utils.cpp:394-400`).
+        // its own check instead (`utils.cpp:395-397`).
         let error = engine
             .execute_script("bad.tjs", "layer.copyBlueToAlpha();")
             .expect_err("missing src");
@@ -2281,7 +2384,7 @@ mod tests {
         );
 
         // The fill colours are `0xAARRGGBB` DWORD writes
-        // (`utils.cpp:270-272`, `:213-225`).
+        // (`utils.cpp:276-278`, `:213-225`).
         run(
             &mut engine,
             "fill.tjs",
@@ -2290,7 +2393,7 @@ mod tests {
         assert_eq!(pixel(&mut engine, "layer", 0, 0), 0x00ff00);
         assert_eq!(pixel(&mut engine, "layer", 2, 1), 0x0000ff);
 
-        // A size mismatch is the reference's error (`utils.cpp:216-217`).
+        // A size mismatch is the reference's error (`utils.cpp:208, 271`).
         run(
             &mut engine,
             "other.tjs",
@@ -2350,7 +2453,7 @@ mod tests {
         );
 
         // The reference re-clears every below-threshold pixel on each call
-        // (`utils.cpp:326-340`), so reaching the ends takes one call with
+        // (`utils.cpp:325-338`), so reaching the ends takes one call with
         // `level = 2`, not two calls.
         run(
             &mut engine,
@@ -2443,7 +2546,7 @@ mod tests {
     }
 
     /// `isBlank` (`utils.cpp:436-477`): the blue byte test and the
-    /// reference's own bounds check, typo included.
+    /// reference's own bounds check, typo and `tjs_int` narrowing included.
     #[test]
     fn is_blank_tests_the_blue_byte() {
         let mut red = engine();
@@ -2465,6 +2568,10 @@ mod tests {
                 .to_integer()
                 .expect("integer")
         };
+        let range_error = |engine: &mut KrkrEngine, call: &str| {
+            let error = engine.execute_script("bad.tjs", call).expect_err(call);
+            assert_eq!(error.message, "invalid layer range", "{call}");
+        };
         assert_eq!(
             blank(&mut engine, "layer.isBlank(0, 0, 1, 1)"),
             1,
@@ -2481,17 +2588,30 @@ mod tests {
             1,
             "the blue byte is the test"
         );
-        // A negative width passes the bounds check and scans nothing.
-        assert_eq!(blank(&mut engine, "layer.isBlank(1, 0, -1, 1)"), 1);
 
-        let error = engine
-            .execute_script("bad.tjs", "layer.isBlank(2, 0, 2, 1);")
-            .expect_err("past the edge");
-        assert_eq!(error.message, "invalid layer range");
-        let error = engine
-            .execute_script("bad.tjs", "layer.isBlank(-1, 0, 1, 1);")
-            .expect_err("negative origin");
-        assert_eq!(error.message, "invalid layer range");
+        // `width < 0` is rejected (`utils.cpp:456`), while a negative *height*
+        // passes the check — that is where the reference's duplicate
+        // `top < 0` stands in for `height < 0`.
+        range_error(&mut engine, "layer.isBlank(1, 0, -1, 1);");
+        assert_eq!(
+            blank(&mut engine, "layer.isBlank(0, 0, 1, -1)"),
+            1,
+            "negative height scans nothing"
+        );
+        range_error(&mut engine, "layer.isBlank(2, 0, 2, 1);");
+        range_error(&mut engine, "layer.isBlank(-1, 0, 1, 1);");
+        range_error(&mut engine, "layer.isBlank(0, -1, 1, 1);");
+
+        // The parameters narrow to `tjs_int` first (`utils.cpp:441-444`), so
+        // an out-of-range script value behaves exactly like the reference's
+        // and the sums cannot overflow: 2^63-1 truncates to -1, while i32::MAX
+        // plus a width wraps negative and scans nothing.
+        range_error(&mut engine, "layer.isBlank(9223372036854775807, 0, 1, 1);");
+        assert_eq!(
+            blank(&mut engine, "layer.isBlank(2147483647, 0, 1, 1)"),
+            1,
+            "the wrapped sum is not `> imageWidth`, so the loop is empty"
+        );
 
         // Only red, no blue: still "blank" — the reference tests byte 0 of a
         // B, G, R, A buffer, which is the blue channel.
@@ -2577,7 +2697,7 @@ mod tests {
         same
     }
 
-    /// The PNG writer (`savepng.cpp:158-255`): a real PNG that the engine's
+    /// The PNG writer (`savepng.cpp:111-275`): a real PNG that the engine's
     /// own loader decodes back to the same pixels.
     #[test]
     fn save_layer_image_png_round_trips_through_the_engine_loader() {
@@ -2604,7 +2724,7 @@ mod tests {
     }
 
     /// The tag dictionary becomes the `pHYs`/`oFFs`/`vpAg` chunks
-    /// (`savepng.cpp:209-232`).
+    /// (`savepng.cpp:131-169`).
     #[test]
     fn save_layer_image_png_writes_the_tag_chunks() {
         let mut engine = engine();
@@ -2632,22 +2752,40 @@ mod tests {
         assert!(bytes.windows(4).any(|window| window == b"vpAg"));
     }
 
-    /// `comp_lv` is honoured (`savepng.cpp:230-231`): 0 stores, 1-9
-    /// LZSS-press, and a level zlib would reject is the reference's
-    /// "deflate initialize" (`savepng.cpp:61-62`).
+    /// `comp_lv` is honoured (`savepng.cpp:168`): 0 stores, 1-9
+    /// LZSS-press, the default (no tag) compresses like zlib's level 6
+    /// (`savepng.cpp:19, 168`), and a level zlib would reject is the
+    /// reference's "deflate initialize" (`savepng.cpp:51-52`).
     #[test]
     fn save_layer_image_png_levels() {
         let mut engine = engine();
         run(&mut engine, "layer.tjs", PATTERN);
-        for level in [0, 1, 9] {
-            let name = format!("level{level}.png");
+        for (tag, name) in [
+            ("%[comp_lv: 0]", "level0.png"),
+            ("%[comp_lv: 1]", "level1.png"),
+            ("%[comp_lv: 9]", "level9.png"),
+            ("%[comp_lv: 6]", "level6.png"),
+            ("void", "default.png"),
+        ] {
             run(
                 &mut engine,
                 "save.tjs",
-                &format!("layer.saveLayerImagePng(\"{name}\", %[comp_lv: {level}]);"),
+                &format!("layer.saveLayerImagePng(\"{name}\", {tag});"),
             );
-            assert!(round_trips(&mut engine, &name), "level {level}");
+            assert!(round_trips(&mut engine, name), "{name}");
         }
+        // The default is `Z_DEFAULT_COMPRESSION`, i.e. level 6 — not the
+        // stored path level 0 takes.
+        assert_eq!(
+            saved(&engine, "default.png"),
+            saved(&engine, "level6.png"),
+            "no comp_lv means the default level"
+        );
+        assert_ne!(
+            saved(&engine, "default.png"),
+            saved(&engine, "level0.png"),
+            "and not the stored level"
+        );
         let error = engine
             .execute_script(
                 "bad.tjs",
@@ -2661,7 +2799,7 @@ mod tests {
         assert_eq!(error.message, "deflate initialize");
     }
 
-    /// `saveLayerImagePngOctet` (`savepng.cpp:263-274`): the same stream as
+    /// `saveLayerImagePngOctet` (`savepng.cpp:263-275`): the same stream as
     /// the file, and an empty string when the layer has no image.
     #[test]
     fn save_layer_image_png_octet_matches_the_file() {
@@ -2680,11 +2818,22 @@ mod tests {
             panic!("expected an octet, got {octet:?}");
         };
         assert_eq!(bytes, file, "the octet form is the file form");
-        // The default level is 1 (`savepng.cpp:269`).
+        // The default level is 1 (`savepng.cpp:268`).
         let default = engine
             .execute_expression("octet.tjs", "layer.saveLayerImagePngOctet()")
             .expect("octet");
         assert_eq!(default, Variant::Octet(file.clone()));
+        // An explicit `void` argument converts (`AsInteger(void) == 0`), so
+        // it selects the stored level rather than the default.
+        run(
+            &mut engine,
+            "save.tjs",
+            "layer.saveLayerImagePng(\"level0.png\", %[comp_lv: 0]);",
+        );
+        let void = engine
+            .execute_expression("octet.tjs", "layer.saveLayerImagePngOctet(void)")
+            .expect("octet");
+        assert_eq!(void, Variant::Octet(saved(&engine, "level0.png")));
 
         run(&mut engine, "free.tjs", "layer.freeImage();");
         let empty = engine
@@ -2693,11 +2842,11 @@ mod tests {
         assert_eq!(
             empty.to_tjs_string().expect("string"),
             "",
-            "no image: the reference clears the result (`savepng.cpp:297-299`)"
+            "no image: the reference clears the result (`savepng.cpp:221`)"
         );
     }
 
-    /// The TLG5 writer (`savetlg5.cpp:20-171`): a real TLG5 stream the
+    /// The TLG5 writer (`savetlg5.cpp:16-171`): a real TLG5 stream the
     /// engine's own decoder reads back.
     #[test]
     fn save_layer_image_tlg5_round_trips_through_the_engine_loader() {
@@ -2721,7 +2870,7 @@ mod tests {
     }
 
     /// A non-empty tag dictionary wraps the stream in the `TLG0.0` container
-    /// (`savetlg5.cpp:216-247`), which the engine's loader unwraps.
+    /// (`savetlg5.cpp:228-252`), which the engine's loader unwraps.
     #[test]
     fn save_layer_image_tlg5_wraps_the_tags_container() {
         let mut engine = engine();
@@ -2742,7 +2891,7 @@ mod tests {
                 as usize;
         assert_eq!(tags_offset + 8 + tags_length, bytes.len());
         // Members come out in the runtime's order (alphabetical), each as
-        // `<len>:<name>=<len>:<value>,` (`savetlg5.cpp:230-235`).
+        // `<len>:<name>=<len>:<value>,` (`savetlg5.cpp:214`).
         let tags = "7:comment=5:hello,1:n=1:3,";
         assert_eq!(tags_length, tags.len());
         assert!(
@@ -2752,6 +2901,76 @@ mod tests {
             "the tags string is written verbatim"
         );
         assert!(round_trips(&mut engine, "tagged.tlg5"));
+    }
+
+    /// A larger, noisy image: several TLG5 blocks, both channel paths (a
+    /// compressed one where the deltas repeat, raw ones where they do not),
+    /// a multi-row PNG and deflate matches over the whole scanline buffer.
+    /// The 4x3 tests above cover one block and a handful of bytes, so this is
+    /// the in-repo pin for the multi-block and raw-channel branches.
+    #[test]
+    fn a_larger_noisy_image_round_trips_and_uses_both_channel_paths() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "noisy.tjs",
+            r#"
+            global.layer = new Layer();
+            layer.setImageSize(24, 12);
+            var seed = 7;
+            for (var y = 0; y < 12; y++) {
+                for (var x = 0; x < 24; x++) {
+                    seed = (seed * 48271) % 2147483647;
+                    layer.fillRect(x, y, 1, 1, seed % 0x1000000);
+                    layer.setMaskPixel(x, y, ((x + y) % 2) * 255);
+                }
+            }
+            "#,
+        );
+        run(
+            &mut engine,
+            "save.tjs",
+            r#"
+            layer.saveLayerImageTlg5("noisy.tlg5");
+            layer.saveLayerImagePng("noisy.png");
+            "#,
+        );
+        assert!(round_trips(&mut engine, "noisy.tlg5"));
+        assert!(round_trips(&mut engine, "noisy.png"));
+
+        let bytes = saved(&engine, "noisy.tlg5");
+        assert_eq!(&bytes[..11], b"TLG5.0\x00raw\x1a");
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 12);
+        // Three 4-row blocks (`savetlg5.cpp:16-171`): the size table and the
+        // block walk below both have to agree with the file length.
+        let blocks = 3usize;
+        let mut offset = 24 + blocks * 4;
+        let mut table = 0u32;
+        let mut types = Vec::new();
+        for block in 0..blocks {
+            let size =
+                u32::from_le_bytes(bytes[24 + block * 4..28 + block * 4].try_into().unwrap());
+            table += size;
+            let end = offset + size as usize;
+            for _ in 0..4 {
+                let kind = bytes[offset];
+                let payload =
+                    u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+                types.push(kind);
+                offset += 5 + payload;
+            }
+            assert_eq!(offset, end, "block {block} size covers its four channels");
+        }
+        assert_eq!(offset, bytes.len(), "the table covers the whole file");
+        assert_eq!(table as usize, bytes.len() - 24 - blocks * 4);
+        assert!(
+            types.contains(&0x00),
+            "the repeating alpha deltas compress: {types:?}"
+        );
+        assert!(
+            types.contains(&0x01),
+            "the noisy colour deltas are stored raw: {types:?}"
+        );
     }
 
     /// The writers' error shapes (`compress.hpp:139-156`,
@@ -2780,7 +2999,7 @@ mod tests {
             assert_eq!(error.message, message, "{call}");
         }
         // An octet save with no image is not an error: the reference clears
-        // the result instead (`savepng.cpp:297-299`).
+        // the result instead (`savepng.cpp:221`).
         assert_eq!(
             engine
                 .execute_expression("bad.tjs", "layer.saveLayerImagePngOctet()")
@@ -2798,7 +3017,7 @@ mod tests {
         assert_eq!(error.message, "..\\outside.png:can't open");
     }
 
-    /// `Window.startSaveLayerImage` (`Main.cpp:204-266`): the handler, the
+    /// `Window.startSaveLayerImage` (`Main.cpp:216-261`): the handler, the
     /// file, and the two events with the reference's arguments. The save runs
     /// synchronously here (the module docs explain why), so the events are
     /// already in the script's log when the call returns.
@@ -2836,7 +3055,7 @@ mod tests {
         );
 
         // The next save takes the next slot, and a non-`.png` name selects
-        // TLG5 (`Main.cpp:298-306`).
+        // TLG5 (`Main.cpp:310-317`).
         let second = engine
             .execute_expression(
                 "save.tjs",
@@ -2852,17 +3071,23 @@ mod tests {
         assert_eq!(&saved(&engine, "second.tlg5")[..11], b"TLG5.0\x00raw\x1a");
         assert_eq!(
             events(&mut engine),
-            "progress:0:100:window.png|done:0:0:window.png|progress:0:0:second.tlg5|progress:0:100:second.tlg5|done:0:0:second.tlg5",
-            "the TLG5 path reports per block (`savetlg5.cpp:58-61`)"
+            "progress:0:100:window.png|done:0:0:window.png|progress:0:100:second.tlg5|done:0:0:second.tlg5",
+            "the TLG5 path reports per block (`savetlg5.cpp:61-65`); its first \
+             block is 0%, which `progressPercent` suppresses as a repeat of its \
+             initial 0 (`Main.cpp:291`)"
         );
     }
 
-    /// `cancelSaveLayerImage` from a progress handler stops the save before
-    /// the file is written and reports `canceled = 1`; `stopSaveLayerImage`
-    /// silences the events and the write (`Main.cpp:79-113, 268-285`).
+    /// `cancelSaveLayerImage`/`stopSaveLayerImage` (`Main.cpp:96-104,
+    /// 266-280`) with the reference's timing: `SaveInfo::progress` *posts*
+    /// the event, so a cancel raised inside a handler is seen by the next
+    /// progress step — an early cancel stops the encoder before the write,
+    /// a cancel raised by the only (final) step has already passed it, which
+    /// is the reference's own behaviour (`savepng.cpp:62-95`).
     #[test]
-    fn window_cancel_and_stop_stop_the_save() {
+    fn window_cancel_and_stop_follow_the_reference_timing() {
         let mut stopped_engine = engine();
+        let mut early = engine();
         let mut engine = engine();
         run(&mut engine, "layer.tjs", PATTERN);
         run(
@@ -2880,14 +3105,61 @@ mod tests {
             };
             "#,
         );
+        // A small image has one progress step (100%), so the cancel lands
+        // after the encoder's only step: the reference writes the file and
+        // reports `canceled = 1`.
         engine
             .execute_expression(
                 "save.tjs",
-                "window.startSaveLayerImage(layer, \"canceled.png\", void)",
+                "window.startSaveLayerImage(layer, \"canceled-late.png\", void)",
             )
             .expect("start");
-        assert!(!engine.host().storage_exists("canceled.png"));
+        assert!(engine.host().storage_exists("canceled-late.png"));
         assert_eq!(events(&mut engine), "progress:100|done:1");
+
+        // A 64x64 image spans several 4096-byte progress steps of the PNG
+        // path (`savepng.cpp:62-74`); cancelling at the first one stops the
+        // encoder at the second, before anything is written.
+        run(
+            &mut early,
+            "layer.tjs",
+            r#"
+            global.layer = new Layer();
+            layer.setImageSize(64, 64);
+            for (var y = 0; y < 64; y++) {
+                for (var x = 0; x < 64; x++) {
+                    layer.fillRect(x, y, 1, 1, 0xff000000 | (x * 4 + y * 64));
+                }
+            }
+            "#,
+        );
+        run(
+            &mut early,
+            "events.tjs",
+            r#"
+            global.events = [];
+            global.window = new Window();
+            window.onSaveLayerImageProgress = function(handler, percent, layer, filename) {
+                global.events.push("progress:" + percent);
+                window.cancelSaveLayerImage(handler);
+            };
+            window.onSaveLayerImageDone = function(handler, canceled, layer, filename) {
+                global.events.push("done:" + canceled);
+            };
+            "#,
+        );
+        early
+            .execute_expression(
+                "save.tjs",
+                "window.startSaveLayerImage(layer, \"canceled-early.png\", void)",
+            )
+            .expect("start");
+        assert!(!early.host().storage_exists("canceled-early.png"));
+        let log = events(&mut early);
+        assert!(
+            log.starts_with("progress:") && log.ends_with("|done:1"),
+            "an early cancel reports done(canceled = 1): {log}"
+        );
 
         let stopped = &mut stopped_engine;
         run(stopped, "layer.tjs", PATTERN);
@@ -2912,9 +3184,12 @@ mod tests {
                 "window.startSaveLayerImage(layer, \"stopped.png\", void)",
             )
             .expect("start");
-        assert!(!stopped.host().storage_exists("stopped.png"));
+        // `stop()` clears the notifier (`Main.cpp:101-104`): the file the
+        // encoder already finished is written, but nothing is posted again —
+        // no done event.
+        assert!(stopped.host().storage_exists("stopped.png"));
         assert_eq!(events(stopped), "progress:100", "no done event");
-        // Unknown handlers are ignored by both (`Main.cpp:270-285`).
+        // Unknown handlers are ignored by both (`Main.cpp:266-280`).
         run(
             stopped,
             "bad.tjs",
