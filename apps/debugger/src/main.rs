@@ -48,7 +48,11 @@
 //!   --pixels                print per-image pixel statistics while running
 //!   --layers                dump the layer tree at the end
 //!   --dump-global <name>    dump a global variable's members at the end
-//!   --dump-storage <name>   print a storage file's contents and exit
+//!   --dump-storage <name>   print a storage file's contents and exit; the
+//!                           bytes are written verbatim, so a redirect keeps
+//!                           every binary pack byte-exact
+//!   --dump-auto-paths       print the auto search paths the storage holds,
+//!                           in declaration order (last wins), after startup
 //!   --dump-layer-images <dir>
 //!                           write one PNG per layer image at the end
 //!   --logs                  dump host logs at the end
@@ -114,13 +118,7 @@
 
 use krkr_debug::{console::*, snapshot};
 
-use std::{
-    collections::VecDeque,
-    path::PathBuf,
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{collections::VecDeque, io::Write, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use krkr_assets::{NativeAssetStore, ProjectStorage};
 use krkr_audio::VirtualAudioSink;
@@ -128,11 +126,11 @@ use krkr_core::{
     AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, Point,
     PointerButton, Size,
 };
+use krkr_debug::snapshot::TextureCache;
 use krkr_engine::{
     EngineConfig, EngineInput, KagTaskState, KrkrEngine, KrkrHost, RuntimeSession, TransitionPolicy,
 };
 use krkr_tjs2::runtime::{ObjectHandle, Runtime, Variant};
-use krkr_debug::snapshot::TextureCache;
 
 use krkr_debug::cli::{BreakpointSpec, CliDebugger, parse_breakpoint_spec};
 
@@ -161,6 +159,7 @@ struct Config {
     layers: bool,
     dump_globals: Vec<String>,
     dump_storages: Vec<String>,
+    dump_auto_paths: bool,
     dump_layer_images: Option<String>,
     logs: bool,
     timed_transitions: bool,
@@ -268,6 +267,7 @@ fn parse_args() -> Config {
             "--dump-storage" => config
                 .dump_storages
                 .push(next_arg(&mut args, "--dump-storage")),
+            "--dump-auto-paths" => config.dump_auto_paths = true,
             "--dump-layer-images" => {
                 config.dump_layer_images = Some(next_arg(&mut args, "--dump-layer-images"));
             }
@@ -367,7 +367,10 @@ fn kag_awaits_click(engine: &KrkrEngine) -> bool {
     ) {
         return false;
     }
-    let Some(wait_until) = runtime.object_member(conductor, "waitUntil").object_handle() else {
+    let Some(wait_until) = runtime
+        .object_member(conductor, "waitUntil")
+        .object_handle()
+    else {
         return false;
     };
     runtime
@@ -460,6 +463,9 @@ fn main() {
         .expect("usage: krkr-debug <game_dir> [-b spec]... [options]");
 
     let storage = ProjectStorage::for_root(&root).expect("storage");
+    // The engine takes its own `Arc`; this handle stays with the debugger so
+    // diagnostics can read storage state the engine interface does not expose.
+    let storage_probe = storage.clone();
     let mut engine = KrkrEngine::new(EngineConfig {
         project_storage: Some(Arc::new(storage)),
         system_paths: system_paths_for_project(&root),
@@ -548,6 +554,14 @@ fn main() {
         println!("loaded scenario {scenario}");
     }
 
+    if config.dump_auto_paths {
+        let auto_paths = storage_probe.auto_paths();
+        println!("---auto-paths count={}---", auto_paths.len());
+        for path in &auto_paths {
+            println!("auto-path: {path}");
+        }
+    }
+
     for storage in &config.dump_storages {
         let bytes = runtime
             .engine()
@@ -555,7 +569,12 @@ fn main() {
             .read_binary_storage(storage)
             .expect("storage dump");
         println!("---storage {storage} bytes={}---", bytes.len());
-        print!("{}", String::from_utf8_lossy(&bytes));
+        // Write the bytes verbatim. `String::from_utf8_lossy` would corrupt
+        // every binary pack (a PBD, an XP3 segment, a `TJS/ns0` payload), so a
+        // redirected dump could no longer be compared or decoded byte-exactly.
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&bytes).expect("storage dump write");
+        stdout.flush().expect("storage dump flush");
     }
 
     if let Some(script) = &config.before_script {
@@ -1117,7 +1136,9 @@ fn queue_virtual_audio_completions(
 
 #[cfg(test)]
 mod tests {
-    use krkr_debug::console::{DEFAULT_LOG_TAIL, InteractiveCommand, TraceCommand, parse_interactive_command};
+    use krkr_debug::console::{
+        DEFAULT_LOG_TAIL, InteractiveCommand, TraceCommand, parse_interactive_command,
+    };
 
     #[test]
     fn interactive_control_commands_are_deterministic() {
