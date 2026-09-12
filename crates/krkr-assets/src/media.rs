@@ -47,134 +47,42 @@
 //!   fall back to the whole built-in resolver (filesystem layers, XP3, memory
 //!   overlay, catalogue, auto paths), which is that stack plus more.
 //!
-//! Two things a provider cannot rely on yet, so the engine-side follow-up
-//! knows what to add:
+//! The provider trait and the name helpers live in `krkr_core::media` — a
+//! plugin implements them against that path, through
+//! `krkr_engine::plugin_api` — and are re-exported here so this module keeps
+//! the parsing rules and the divergences they explain.
+//!
+//! What a provider can rely on from the engine:
 //!
 //! * A media that *wraps* the built-in stack — `lzfs` resolves the name it is
-//!   handed through the ordinary search path — has to call back into
-//!   `ProjectStorage`. It must not hold a strong `ProjectStorage` to do that:
-//!   the registry lives inside the storage, so that is a reference cycle. The
-//!   engine should give such a provider a weak handle, or resolve through a
-//!   callback, when it registers it.
+//!   handed through the ordinary search path — gets a weak handle to the
+//!   project storage in `StorageMediaProvider::attach_storage`, which the
+//!   engine fills in before the media is inserted. It is `Weak` because the
+//!   registry lives inside the storage, so a strong handle would be a
+//!   reference cycle.
+//!
+//! One thing a provider cannot rely on yet:
+//!
 //! * Media *auto paths* (`Storages.addAutoPath("psb://container.psb/")`) do not
 //!   reach a provider: the auto-path machinery folds `media://` into `media:/`
 //!   before the provider could see it. The reference discovers those entries by
 //!   listing each auto path instead (`TVPRebuildAutoPathTable`,
 //!   `StorageIntf.cpp:1035-1144`).
 
-use std::io::{self, Read, Seek, SeekFrom};
-
-use krkr_core::{ResourceData, ResourceStream};
-
-/// The media name the reference has already registered for the built-in
-/// filesystem resolver (`StorageIntf.cpp:200-205`).
-pub const FILE_MEDIA_NAME: &str = "file";
-
-/// Whether `name` can be registered as a media name. The reference recognizes
-/// a media name as the run of ASCII letters before `:`
-/// (`StorageIntf.cpp:299-318`), so anything else can never be addressed by a
-/// storage name.
-pub fn is_valid_media_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphabetic())
-}
-
-/// Splits `media://domain/path` into the media name and the name space the
-/// media owns (`domain/path`). Returns `None` for names that are not
-/// media-qualified, so an ordinary relative path always stays on the built-in
-/// resolver.
-///
-/// A bare `media://` is *not* a media name here: the reference rejects it as
-/// `TVPInvalidPathName` (`StorageIntf.cpp:341-343`), and inventing a new error
-/// for a name the pre-registry engine accepted as an ordinary path would be a
-/// regression.
-pub fn split_media_name(name: &str) -> Option<(&str, &str)> {
-    let (media_name, media_path) = name.split_once("://")?;
-    if !is_valid_media_name(media_name) || media_path.is_empty() {
-        return None;
-    }
-    Some((media_name, media_path))
-}
-
-/// A registered storage media, mirroring the operations the engine uses from
-/// `iTVPStorageMedia` (`StorageIntf.h:107-143`).
-///
-/// Implementations are shared between threads: the engine resolves storage
-/// from the script thread, from resource workers and from media threads, so
-/// `Send + Sync` is required and interior mutability must be the provider's
-/// own concern (the reference uses critical sections the same way).
-///
-/// `name` is always the media's own name space — everything after
-/// `media://`, with `\` already unified to `/`. A provider that mounts a
-/// container the way `psb`/`zip`/`var` do splits its container or domain at the
-/// first `/`; `lzfs`/`steam` treat the whole string as one path.
-pub trait StorageMediaProvider: Send + Sync {
-    /// The media name, e.g. `psb`, `lzfs`, `proxy`, `steam`
-    /// (`iTVPStorageMedia::GetName`, `StorageIntf.h:113`).
-    fn media_name(&self) -> &str;
-
-    /// `iTVPStorageMedia::CheckExistentStorage` (`StorageIntf.h:128`): whether
-    /// this media serves `name`. A `false` return is a *miss* — the resolver
-    /// then tries the built-in stack — so a provider must not report an error
-    /// this way.
-    fn exists(&self, name: &str) -> bool;
-
-    /// Opens `name` as a stream (`iTVPStorageMedia::Open`,
-    /// `StorageIntf.h:131`). The error is the media's own failure and is
-    /// surfaced verbatim, the way the reference propagates
-    /// `TVPThrowExceptionMessage` out of `Open` (for example
-    /// `cannot open steamfile:%1`, krkr2 `plugins/win32/steam/Storages.cpp:394`).
-    fn open(&self, name: &str) -> io::Result<Box<dyn ResourceStream>>;
-
-    /// Reads `name` whole. The default streams it through [`Self::open`] the
-    /// way `TVPCreateStream` plus a read-to-end does.
-    fn read(&self, name: &str) -> io::Result<ResourceData> {
-        let mut stream = self.open(name)?;
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes)?;
-        Ok(ResourceData::from_vec(bytes))
-    }
-
-    /// Length of `name` when the media can answer it cheaply. The default
-    /// opens the entry and seeks to its end.
-    fn byte_len(&self, name: &str) -> io::Result<Option<u64>> {
-        let mut stream = self.open(name)?;
-        let current = stream.stream_position().ok();
-        let len = stream.seek(SeekFrom::End(0)).ok();
-        if let Some(position) = current {
-            let _ = stream.seek(SeekFrom::Start(position));
-        }
-        Ok(len)
-    }
-
-    /// `iTVPStorageMedia::GetListAt` (`StorageIntf.h:136`), in the spelling
-    /// `Storages.dirlist`/`getDirList` promise: immediate children only, with a
-    /// trailing `/` on directories (`fstat/Main.cpp:469-472`,
-    /// `dirlist/Main.cpp:56-64`).
-    ///
-    /// `ErrorKind::NotFound` or `ErrorKind::Unsupported` mean "this media does
-    /// not serve a directory here" — the resolver then falls back to the
-    /// built-in stack, exactly like a failed existence probe. Any other error
-    /// is a provider failure and is surfaced.
-    fn list(&self, name: &str) -> io::Result<Vec<String>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "storage media `{}` does not list `{name}`",
-                self.media_name()
-            ),
-        ))
-    }
-}
+pub use krkr_core::media::{
+    FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name,
+};
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::io::{self, Read};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use krkr_core::StoragePort;
+    use krkr_core::{ResourceStream, StoragePort};
 
     use super::*;
     use crate::storage::ProjectStorage;
@@ -297,6 +205,77 @@ mod tests {
                 io::Error::new(io::ErrorKind::NotFound, format!("no cloud file `{name}`"))
             })?;
             Ok(Box::new(io::Cursor::new(bytes.clone())))
+        }
+    }
+
+    /// A media that owns writes into its scheme, the way `var`/`proxy` do. The
+    /// read-only behaviour (`minizip`'s) is the trait default and is covered by
+    /// the `FakeMedia` fixture, which does not override `write`.
+    struct WritableMedia {
+        files: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
+        writes: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl WritableMedia {
+        fn new() -> Self {
+            Self {
+                files: std::sync::Mutex::new(BTreeMap::new()),
+                writes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_file(self, path: &str, bytes: &[u8]) -> Self {
+            self.files
+                .lock()
+                .expect("write media lock")
+                .insert(path.to_string(), bytes.to_vec());
+            self
+        }
+
+        fn written(&self, path: &str) -> Option<Vec<u8>> {
+            self.files
+                .lock()
+                .expect("write media lock")
+                .get(path)
+                .cloned()
+        }
+
+        /// `(name space, mode)` of every write the engine dispatched here.
+        fn writes(&self) -> Vec<(String, String)> {
+            self.writes.lock().expect("write media lock").clone()
+        }
+    }
+
+    impl StorageMediaProvider for WritableMedia {
+        fn media_name(&self) -> &str {
+            "psb"
+        }
+
+        fn exists(&self, name: &str) -> bool {
+            self.files
+                .lock()
+                .expect("write media lock")
+                .contains_key(name)
+        }
+
+        fn open(&self, name: &str) -> io::Result<Box<dyn ResourceStream>> {
+            let files = self.files.lock().expect("write media lock");
+            let bytes = files.get(name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no entry `{name}`"))
+            })?;
+            Ok(Box::new(io::Cursor::new(bytes.clone())))
+        }
+
+        fn write(&self, name: &str, mode: &str, bytes: &[u8]) -> io::Result<()> {
+            self.files
+                .lock()
+                .expect("write media lock")
+                .insert(name.to_string(), bytes.to_vec());
+            self.writes
+                .lock()
+                .expect("write media lock")
+                .push((name.to_string(), mode.to_string()));
+            Ok(())
         }
     }
 
@@ -597,6 +576,144 @@ mod tests {
             .expect_err("the built-in filesystem media is taken");
         assert_eq!(reserved.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(storage.media_names(), vec!["psb".to_string()]);
+    }
+
+    #[test]
+    fn registering_the_same_provider_again_is_a_no_op() {
+        // The engine registers a boot plugin's media from
+        // `KrkrEngine::register_plugin` and again from the first
+        // `Plugins.link` (`krkr-engine/src/native/plugins.rs`), handing the same
+        // `Arc` both times. The second call is intentional and must not read as
+        // `TVPMediaNameHadAlreadyBeenRegistered` (`StorageIntf.cpp:224-236`).
+        let media: Arc<dyn StorageMediaProvider> =
+            Arc::new(FakeMedia::new("psb").with_file("container.psb/inner", b"PSB"));
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage
+            .register_media(Arc::clone(&media))
+            .expect("first registration");
+        storage
+            .register_media(Arc::clone(&media))
+            .expect("the same provider again");
+        assert_eq!(storage.media_names(), vec!["psb".to_string()]);
+        // A *different* provider under a name already taken still fails, and
+        // the no-op registration keeps the provider that was there.
+        let duplicate = storage
+            .register_media(Arc::new(
+                FakeMedia::new("psb").with_file("container.psb/inner", b"other"),
+            ))
+            .expect_err("another provider under a taken name");
+        assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            storage
+                .read_binary_vec("psb://container.psb/inner")
+                .expect("original media"),
+            b"PSB"
+        );
+    }
+
+    #[test]
+    fn the_concrete_storage_delegates_the_port_media_methods() {
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        let port: &dyn krkr_core::ProjectStoragePort = &storage;
+        let media: Arc<dyn StorageMediaProvider> =
+            Arc::new(FakeMedia::new("lzfs").with_file("./a.bin", b"lz4"));
+
+        port.register_storage_media(Arc::clone(&media))
+            .expect("port registration");
+        assert_eq!(port.storage_media_names(), vec!["lzfs".to_string()]);
+        assert!(port.storage_exists("lzfs://./a.bin"));
+        assert_eq!(
+            port.read_binary_storage("lzfs://./a.bin")
+                .expect("port read")
+                .as_bytes()
+                .expect("bytes")
+                .as_ref(),
+            b"lz4"
+        );
+        // The defaulted port method that a backend without a registry inherits
+        // is not what `ProjectStorage` answers with: unregistration reports
+        // whether a provider was there.
+        assert!(port.unregister_storage_media("LZFS"));
+        assert!(port.storage_media_names().is_empty());
+        assert!(!port.unregister_storage_media("lzfs"));
+    }
+
+    #[test]
+    fn a_media_receives_writes_into_its_scheme() {
+        let media = Arc::new(WritableMedia::new().with_file("container.psb/entry", b"old"));
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage
+            .register_media(Arc::clone(&media) as Arc<dyn StorageMediaProvider>)
+            .expect("register media");
+
+        storage
+            .write_binary_storage("psb://container.psb/entry", "", b"new")
+            .expect("media write");
+        assert_eq!(
+            media.writes(),
+            vec![("container.psb/entry".to_string(), String::new())]
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("psb://container.psb/entry")
+                .expect("media read"),
+            b"new"
+        );
+
+        // The media sees its own name space: the scheme is stripped, the media
+        // name lowercased and `\` unified before dispatch
+        // (`StorageIntf.cpp:271-277`, `:164-168`). The write-mode string is the
+        // engine's, handed through unchanged.
+        storage
+            .write_binary_storage("PSB://container.psb\\other", "o4", b"xy")
+            .expect("offset write");
+        assert_eq!(
+            media.written("container.psb/other").as_deref(),
+            Some(&b"xy"[..])
+        );
+        assert_eq!(media.writes().last().expect("last write").1, "o4");
+
+        // Writes bypass the existence search (`StorageIntf.cpp:1236-1244`), so
+        // a media is asked to create an entry that does not exist yet.
+        storage
+            .write_binary_storage("psb://container.psb/created", "", b"created")
+            .expect("creating write");
+        assert_eq!(
+            storage
+                .read_binary_vec("psb://container.psb/created")
+                .expect("read back"),
+            b"created"
+        );
+    }
+
+    #[test]
+    fn a_read_only_media_owns_writes_into_its_scheme() {
+        let storage = storage_with(FakeMedia::new("psb").with_file("container.psb/entry", b"PSB"));
+
+        // `FakeMedia` does not override `write`, so the trait's read-only
+        // default answers — minizip's behaviour (`storage.cpp:439-457`).
+        let error = storage
+            .write_binary_storage("psb://container.psb/entry", "", b"x")
+            .expect_err("read-only media");
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert_eq!(
+            storage
+                .read_binary_vec("psb://container.psb/entry")
+                .expect("media read"),
+            b"PSB"
+        );
+
+        // An unregistered scheme keeps the pre-registry write path, which for a
+        // storage without a filesystem root is the memory overlay.
+        storage
+            .write_binary_storage("zip://./data.bin", "", b"zip")
+            .expect("memory write");
+        assert_eq!(
+            storage
+                .read_binary_vec("zip://./data.bin")
+                .expect("memory read"),
+            b"zip"
+        );
     }
 
     #[test]

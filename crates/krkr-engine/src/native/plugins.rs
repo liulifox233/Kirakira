@@ -37,6 +37,12 @@ fn plugins_unlink(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = required_arg_string(&args, 0, "Plugins.unlink")?;
+    // The reference unregisters a plugin's media as its module goes away
+    // (`V2Unlink`, `varfile/Main.cpp:451-477`), so the plugin's `unregister`
+    // runs before its name leaves the registry.
+    if let Some(plugin) = runtime.host().plugin_to_unregister(&name) {
+        plugin.unregister(runtime)?;
+    }
     Ok(Variant::Integer(i64::from(
         runtime.host_mut().unlink_plugin(&name),
     )))

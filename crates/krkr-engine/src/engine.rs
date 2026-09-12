@@ -4787,9 +4787,12 @@ fn apply_laycount_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -4802,7 +4805,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{KrkrHost, KrkrPlugin};
+    use crate::{
+        KrkrHost, KrkrPlugin,
+        plugin_api::{ResourceStream, StorageMediaProvider, storage},
+    };
 
     #[test]
     fn engine_is_send() {
@@ -18913,6 +18919,193 @@ mod tests {
                 .linked_plugins()
                 .any(|name| name == "test-plugin")
         );
+    }
+
+    /// A media a test plugin registers: `mock://` over an in-memory file table
+    /// that can change while the engine runs, the way a `steam` cloud file or a
+    /// `proxy` mapping does.
+    struct MockMedia {
+        files: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl MockMedia {
+        fn new() -> Self {
+            Self {
+                files: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn publish(&self, path: &str, bytes: &[u8]) {
+            self.files
+                .lock()
+                .expect("mock media lock")
+                .insert(path.to_string(), bytes.to_vec());
+        }
+
+        fn file(&self, path: &str) -> Option<Vec<u8>> {
+            self.files
+                .lock()
+                .expect("mock media lock")
+                .get(path)
+                .cloned()
+        }
+    }
+
+    impl StorageMediaProvider for MockMedia {
+        fn media_name(&self) -> &str {
+            "mock"
+        }
+
+        fn exists(&self, name: &str) -> bool {
+            self.files
+                .lock()
+                .expect("mock media lock")
+                .contains_key(name)
+        }
+
+        fn open(&self, name: &str) -> io::Result<Box<dyn ResourceStream>> {
+            let files = self.files.lock().expect("mock media lock");
+            let bytes = files.get(name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no entry `{name}`"))
+            })?;
+            Ok(Box::new(io::Cursor::new(bytes.clone())))
+        }
+
+        fn write(&self, name: &str, _mode: &str, bytes: &[u8]) -> io::Result<()> {
+            self.publish(name, bytes);
+            Ok(())
+        }
+    }
+
+    /// A media-carrying plugin: `register` runs at boot and again when the
+    /// first `Plugins.link` installs the module, and both calls hand the
+    /// registry the same `Arc` (design A.3.2 of
+    /// `docs/plugins/plugin-facing-engine-facilities.md`).
+    struct MediaPlugin {
+        media: Arc<MockMedia>,
+        register_calls: Arc<AtomicU64>,
+        unregister_calls: Arc<AtomicU64>,
+    }
+
+    impl KrkrPlugin for MediaPlugin {
+        fn name(&self) -> &str {
+            "media-plugin"
+        }
+
+        fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+            self.register_calls.fetch_add(1, Ordering::Relaxed);
+            storage::register_storage_media(
+                runtime,
+                Arc::clone(&self.media) as Arc<dyn StorageMediaProvider>,
+            )
+        }
+
+        fn unregister(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+            self.unregister_calls.fetch_add(1, Ordering::Relaxed);
+            storage::unregister_storage_media(runtime, self.media.media_name());
+            Ok(())
+        }
+    }
+
+    fn media_read(engine: &KrkrEngine, name: &str) -> io::Result<Vec<u8>> {
+        let storage = engine
+            .tjs_runtime()
+            .host()
+            .project_storage()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let data = storage.read_binary_storage(name)?;
+        Ok(data.as_bytes()?.into_owned())
+    }
+
+    fn media_write(engine: &KrkrEngine, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let storage = engine
+            .tjs_runtime()
+            .host()
+            .project_storage()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        storage.write_binary_storage(name, "", bytes)
+    }
+
+    #[test]
+    fn plugin_media_registers_at_boot_again_on_link_and_leaves_on_unlink() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let media = Arc::new(MockMedia::new());
+        let register_calls = Arc::new(AtomicU64::new(0));
+        let unregister_calls = Arc::new(AtomicU64::new(0));
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        engine
+            .register_plugin(MediaPlugin {
+                media: Arc::clone(&media),
+                register_calls: Arc::clone(&register_calls),
+                unregister_calls: Arc::clone(&unregister_calls),
+            })
+            .expect("the plugin registers its media at boot");
+
+        assert_eq!(register_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.tjs_runtime().host().storage_media_names(),
+            vec!["mock".to_string()]
+        );
+        media.publish("./data.bin", b"mock bytes");
+        assert_eq!(
+            media_read(&engine, "mock://./data.bin").expect("media read"),
+            b"mock bytes"
+        );
+        media_write(&engine, "mock://./saved.bin", b"saved bytes").expect("media write");
+        assert_eq!(
+            media.file("./saved.bin").as_deref(),
+            Some(&b"saved bytes"[..])
+        );
+
+        // The first explicit link installs the module again with the same
+        // `Arc`; the registry dedupes it instead of failing the script with
+        // `TVPMediaNameHadAlreadyBeenRegistered`.
+        engine
+            .execute_script("link.tjs", r#"Plugins.link("media-plugin");"#)
+            .expect("linking again must not be a duplicate registration");
+        assert_eq!(register_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            engine.tjs_runtime().host().storage_media_names(),
+            vec!["mock".to_string()]
+        );
+        assert_eq!(
+            media_read(&engine, "mock://./data.bin").expect("media read after link"),
+            b"mock bytes"
+        );
+        // A second link is the reference's early return for an already-loaded
+        // module: nothing is installed a third time.
+        engine
+            .execute_script("link.tjs", r#"Plugins.link("media-plugin");"#)
+            .expect("second link");
+        assert_eq!(register_calls.load(Ordering::Relaxed), 2);
+
+        // `Plugins.unlink` runs the plugin's `unregister`, which drops the
+        // media; the scheme then keeps the pre-registry behaviour.
+        engine
+            .execute_script("unlink.tjs", r#"Plugins.unlink("media-plugin");"#)
+            .expect("unlink");
+        assert_eq!(unregister_calls.load(Ordering::Relaxed), 1);
+        assert!(engine.tjs_runtime().host().storage_media_names().is_empty());
+        assert!(media_read(&engine, "mock://./data.bin").is_err());
+
+        // Unlinking forgets the module, so a later link installs it again
+        // (Open question A.5.5: `script_linked_plugins` is cleared with it).
+        engine
+            .execute_script("relink.tjs", r#"Plugins.link("media-plugin");"#)
+            .expect("relink after unlink");
+        assert_eq!(register_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            engine.tjs_runtime().host().storage_media_names(),
+            vec!["mock".to_string()]
+        );
+        assert_eq!(
+            media_read(&engine, "mock://./data.bin").expect("media read after relink"),
+            b"mock bytes"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
