@@ -10,7 +10,7 @@ use super::blend;
 use krkr_core::{
     AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerId, LayerImage, LayerNode,
     ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
-    TransitionScrollStay,
+    TransitionScrollStay, UnknownTransitionName,
 };
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
@@ -4348,14 +4348,97 @@ fn object_optional_string(
     }
 }
 
+/// The shortest clock a reference transition provider runs on.
+///
+/// Every provider clamps its own `time` option before it constructs its
+/// handler -- `if(time < 2) time = 2; // too small time may cause problem` --
+/// in the three built-ins (`TransIntf.cpp:530`, `:768`, `:1044`) and in every
+/// extrans provider (`wave.cpp:336`, `mosaic.cpp:443`, `turn.cpp:561`,
+/// `rotatetrans.cpp:192/291/460`, `ripple.cpp:1591`).  A handler therefore
+/// never sees a duration below 2 ms, which is what keeps `HalfTime = time / 2`
+/// (`wave.cpp:55`) away from zero.  The engine clamps at the call site so the
+/// millisecond clock the kernels read (`TransitionParams::duration_millis`)
+/// carries the same floor.
+pub(crate) const TRANSITION_MIN_MILLIS: u64 = 2;
+
+/// Transition names a linked plugin shim would answer for, keyed by the plugin
+/// (`KrkrPlugin::name`, the name the host records) and the exact names its
+/// provider registers through `TVPAddTransHandlerProvider` (`TransIntf.h:112`).
+///
+/// The reference resolves a name only while some loaded plugin's provider
+/// answers to it (`TVPFindTransHandlerProvider`, `TransIntf.cpp:341-359`), so
+/// these names are not *unknown* while their plugin is linked.  This build's
+/// plugin host has no provider registry yet, so the closest projection is the
+/// plugin shim's own degrade -- `crossfade` -- which is what the shim modules
+/// record (`krkr-plugins/src/extnagano.rs`, `glitch_effect.rs`).  The table is
+/// the twelve extNagano providers (`docs/plugins/transitions.md` §3, the DLL's
+/// string table) and GlitchEffect's three re-derived names (§4.2).  KaichoTrans
+/// registers extra `beginTransition` methods too, but neither its source nor a
+/// binary on disk names them, so a kaicho-only name stays unknown -- which is
+/// what the reference does while no provider has registered it.
+const PLUGIN_TRANSITION_NAMES: &[(&str, &[&str])] = &[
+    (
+        "extNagano.dll",
+        &[
+            "3duniversal",
+            "blurfade",
+            "book",
+            "flutter",
+            "honeyturn",
+            "imagewipe",
+            "morphing",
+            "multiripple",
+            "rgbfade",
+            "scanline",
+            "spin",
+            "zoomfade",
+        ],
+    ),
+    ("GlitchEffect.dll", &["fadeglitch", "glitch", "loopglitch"]),
+];
+
+/// The reference's provider lookup for one script- or tag-supplied name.
+///
+/// `TVPFindTransHandlerProvider` (`TransIntf.cpp:341-359`) is an exact,
+/// case-sensitive find over the registered providers and throws
+/// `TVPCannotFindTransHander` (`:354`) on a miss, before any option is read
+/// (`LayerIntf.cpp:6206`).  `"Wave"` is therefore *not* `"wave"`, and an
+/// unknown name is a script error rather than a silent crossfade.  The miss is
+/// returned as `UnknownTransitionName` and the call sites report it as the
+/// message-only `eTJSError` the reference raises (no numeric code, no trace).
+pub(crate) fn resolve_transition_method(
+    runtime: &Runtime<KrkrHost>,
+    name: &str,
+) -> std::result::Result<TransitionMethod, UnknownTransitionName> {
+    let unknown = match TransitionMethod::try_from_name(name) {
+        Ok(method) => return Ok(method),
+        Err(unknown) => unknown,
+    };
+    // A linked plugin shim answers for its own names (`PLUGIN_TRANSITION_NAMES`);
+    // an unlinked one registered no provider, so its names stay unknown.
+    let answers_for_name = PLUGIN_TRANSITION_NAMES
+        .iter()
+        .any(|(plugin, names)| names.contains(&name) && plugin_is_linked(runtime, plugin));
+    if answers_for_name {
+        return Ok(TransitionMethod::Crossfade);
+    }
+    Err(unknown)
+}
+
+fn plugin_is_linked(runtime: &Runtime<KrkrHost>, plugin: &str) -> bool {
+    runtime
+        .host()
+        .linked_plugins()
+        .any(|linked| linked.eq_ignore_ascii_case(plugin))
+}
+
 fn transition_params_from_options(
     runtime: &mut Runtime<KrkrHost>,
-    method: &str,
+    method: TransitionMethod,
     options: Option<ObjectHandle>,
 ) -> Result<(TransitionParams, Option<ImageUpload>)> {
-    let method = method.to_ascii_lowercase();
     let mut params = TransitionParams {
-        method: TransitionMethod::from_name(&method),
+        method,
         ..TransitionParams::default()
     };
     match params.method {
@@ -4501,6 +4584,21 @@ fn object_optional_scroll_stay(
     }
 }
 
+/// One transition colour option (`bgcolor`, `bgcolor1`, `bgcolor2`): a
+/// `tjs_uint32` **ARGB** value, exactly the option the reference stores in its
+/// handler (`tTVPWaveTransHandlerProvider::StartTransition`: `bgcolor1` is read
+/// at `wave.cpp:345` and `bgcolor2` at `:348`, both as `(tjs_int)tmp`) and
+/// fills with (`TVPFillARGB`, `wave.cpp:219` and `:228`, after
+/// `CurBGColor = Blend(BGColor1, BGColor2, BlendRatio)` at `:159`).  The top
+/// byte is alpha, so the reference's `0` default is *transparent* black and a
+/// vacated region lets the scene beneath show through; games write `0xff000000`
+/// for opaque black.  The kernels take the four channels as floats
+/// (`krkr-render`'s `color_uniform`).
+///
+/// The option is read the way TJS converts it: `(tjs_int)` parses a numeric
+/// string (`TJSParseNumber`, `tjsLex.cpp:731-758`, so `"0xff0000"` is a number)
+/// and yields `0` for anything else -- a name like `"red"` or a `"#rrggbb"`
+/// spelling is not a number and becomes transparent black.
 fn object_optional_color(
     runtime: &Runtime<KrkrHost>,
     object: ObjectHandle,
@@ -4510,29 +4608,23 @@ fn object_optional_color(
     if matches!(value, Variant::Void) {
         return Ok(None);
     }
-    let color = match value {
-        Variant::String(text) => match text.as_str() {
-            "black" => 0x000000,
-            "white" => 0xffffff,
-            "red" => 0xff0000,
-            "green" => 0x00ff00,
-            "blue" => 0x0000ff,
-            _ => {
-                let text = text
-                    .strip_prefix("0x")
-                    .or_else(|| text.strip_prefix("0X"))
-                    .or_else(|| text.strip_prefix('#'))
-                    .unwrap_or(&text);
-                i64::from_str_radix(text, 16).unwrap_or(0)
-            }
-        },
-        value => value.to_integer()?,
-    };
-    Ok(Some(Color::rgb_u8(
-        ((color >> 16) & 0xff) as u8,
-        ((color >> 8) & 0xff) as u8,
-        (color & 0xff) as u8,
-    )))
+    Ok(Some(argb_color(value.to_integer()?)))
+}
+
+/// Decodes one `tjs_uint32` ARGB value into the render model's `Color`.
+///
+/// The reference keeps these values as `tjs_uint32` and every kernel reads the
+/// same channel layout (`r` in bits 16-23, `g` 8-15, `b` 0-7, `a` 24-31); a
+/// negative `i64` from TJS wraps into the same 32 bits a `tjs_uint32` cast
+/// keeps.
+pub(crate) fn argb_color(value: i64) -> Color {
+    let value = value as u32;
+    Color::new(
+        ((value >> 16) & 0xff) as f32 / 255.0,
+        ((value >> 8) & 0xff) as f32 / 255.0,
+        (value & 0xff) as f32 / 255.0,
+        ((value >> 24) & 0xff) as f32 / 255.0,
+    )
 }
 
 fn source_object(value: &Variant) -> Option<ObjectHandle> {
@@ -4880,17 +4972,24 @@ fn layer_begin_transition(
         .transpose()?
         .unwrap_or(1)
         != 0;
-    let method = args
+    let name = args
         .first()
         .filter(|value| !matches!(value, Variant::Void))
         .map(Variant::to_tjs_string)
         .transpose()?
-        .unwrap_or_else(|| "crossfade".to_string());
+        .unwrap_or_default();
+    // `TVPFindTransHandlerProvider` runs as soon as the two guards passed
+    // (`LayerIntf.cpp:6206`) -- before the option reads and before the family's
+    // size check, which lives inside `pro->StartTransition` (`:6241`).  The
+    // lookup is exact and case-sensitive, and a miss is a script error, so a
+    // `void` name is the empty name the reference cannot find too.
+    let method = resolve_transition_method(runtime, &name)
+        .map_err(|unknown| TjsError::runtime(unknown.message()))?;
     // The three providers the reference registers (`TVPRegisterDefaultTransHandlerProvider`,
     // `TransIntf.cpp:1196`) and the rules they impose on their options.
     let crossfade_family = matches!(
-        method.to_ascii_lowercase().as_str(),
-        "crossfade" | "universal" | "scroll"
+        method,
+        TransitionMethod::Crossfade | TransitionMethod::Universal | TransitionMethod::Scroll
     );
     // `tTVPCrossFadeTransHandlerProvider::StartTransition` (`TransIntf.cpp:508`,
     // inherited by `universal` and `scroll`): both faces must have the same
@@ -4910,19 +5009,26 @@ fn layer_begin_transition(
         Some(options) => object_optional_integer(runtime, options, "time").transpose()?,
         None => None,
     };
-    // `GetTransitionObject` (`TransIntf.cpp:528`): the family requires `time`
-    // and treats anything below 2 ms as 2 ("too small time may cause
-    // problem"), so it never runs an instantaneous exchange.
-    let duration = if crossfade_family {
-        let Some(time) = time else {
-            return Err(TjsError::runtime("Specify option time"));
-        };
-        time.max(2) as u64
-    } else {
-        time.unwrap_or(0).max(0) as u64
+    // Every provider clamps its own `time` option to the reference's 2 ms floor
+    // (`TRANSITION_MIN_MILLIS`), not only the crossfade family, so no handler
+    // ever runs on a shorter clock.
+    let duration = match (crossfade_family, time) {
+        // `GetTransitionObject` (`TransIntf.cpp:529` throws `TVPSpecifyOption`
+        // for the missing member; the clamp is the next line): the family
+        // requires `time`.
+        (true, None) => return Err(TjsError::runtime("Specify option time")),
+        (_, Some(time)) => time.max(TRANSITION_MIN_MILLIS as i64) as u64,
+        // An extrans method without `time` has no clock to run on.  Official
+        // fails the provider call there (`wave.cpp:332-333`); the engine's own
+        // projection keeps its immediate completion for that case.
+        (false, None) => 0,
     };
-    let (transition_params, rule_image_upload) =
-        transition_params_from_options(runtime, &method, options)?;
+    let (mut transition_params, rule_image_upload) =
+        transition_params_from_options(runtime, method, options)?;
+    // The clock the extrans kernels run on (`TransitionParams::duration_millis`):
+    // exactly the clamped `time` in whole milliseconds, `0` when the caller
+    // supplied none.
+    transition_params.duration_millis = duration as f32;
     // `options.selfupdate` / `options.callback` (`LayerIntf.cpp:6209-6234`).
     let (self_update, tick_callback) = transition_driver_options(runtime, options);
     // `StartTransition` (`LayerIntf.cpp:6271`): without children the handler
@@ -10725,3 +10831,44 @@ pub(crate) static BASIC_DRAW_DEVICE_CLASS: NativeClassSpec = NativeClassSpec {
     static_methods: &[],
     static_properties: &["dtNone", "dtDrawDib", "dtDBGDI", "dtDBDD", "dtDBD3D"],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(byte: u32) -> f32 {
+        byte as f32 / 255.0
+    }
+
+    #[test]
+    fn argb_color_decodes_the_reference_channel_layout() {
+        // `bgcolor`/`bgcolor1`/`bgcolor2` are `tjs_uint32` ARGB values
+        // (`wave.cpp:345`/`:348`, filled by `TVPFillARGB` at `:219`): the top
+        // byte is alpha, so the reference default `0` is see-through black.
+        assert_eq!(
+            argb_color(0x7fff8000),
+            Color::new(channel(0xff), channel(0x80), channel(0x00), channel(0x7f))
+        );
+        assert_eq!(argb_color(0), Color::new(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(argb_color(0xff000000), Color::new(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(argb_color(0xffffffff), Color::new(1.0, 1.0, 1.0, 1.0));
+        // A negative TJS integer wraps into the same 32 bits a `tjs_uint32`
+        // cast keeps.
+        assert_eq!(argb_color(-1), Color::new(1.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn plugin_transition_names_are_unknown_to_the_core_registry() {
+        // `resolve_transition_method` tries the core registry first, so a name
+        // listed in both tables would never reach its plugin branch.
+        for (plugin, names) in PLUGIN_TRANSITION_NAMES {
+            assert!(!names.is_empty(), "{plugin} lists no transition names");
+            for &name in names.iter() {
+                assert!(
+                    TransitionMethod::try_from_name(name).is_err(),
+                    "`{name}` is in the core registry and in {plugin}'s list too"
+                );
+            }
+        }
+    }
+}
