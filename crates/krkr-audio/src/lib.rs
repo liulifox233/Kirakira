@@ -49,6 +49,12 @@ const STATIC_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const STATIC_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const PRELOAD_MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Frames of silence a [`ChannelPcmDecoder`] emits while its producer stalls
+/// (end of stream or a waiting movie decoder), matching kira's own silence
+/// block size so the decode loop never spins on empty chunks.
+#[cfg(not(target_arch = "wasm32"))]
+const STALL_SILENCE_FRAMES: usize = 4096;
+
 pub struct AudioSystem {
     state: AudioState,
     control_tx: Option<mpsc::Sender<ControlMessage>>,
@@ -742,10 +748,14 @@ fn handle_prepared_audio(
 ///
 /// A static sound hands the tap the decoded buffer its [`StaticSoundData`] is
 /// already holding (shared, never copied), so the whole waveform stays readable
-/// at the playback cursor. kira decodes a streaming sound on its own thread
-/// into a private queue and offers no hook into it, so a streaming instance is
-/// registered without samples and reads as silence; feeding it needs
-/// `StreamingSoundData::from_decoder` with our own decoder.
+/// at the playback cursor. kira decodes a streaming sound on its own thread into
+/// a private queue and exposes neither the frames nor even its sample rate, so
+/// there is nothing this tap can serve: the function returns `None` for a
+/// streaming sound, **no tap instance is registered for its id**, and
+/// [`PcmTap::read`], [`PcmTap::state`] and [`PcmTap::cursor`] answer `None` for
+/// it — consumers must treat that as "no PCM available". Feeding streaming
+/// sounds needs `StreamingSoundData::from_decoder` with a decoder of our own
+/// that publishes the frames it decodes.
 fn register_sound_tap(
     pcm_tap: &PcmTap,
     id: AudioInstanceId,
@@ -1038,26 +1048,38 @@ fn load_streaming_sound(
 /// an external decoder (movie soundtracks decoded by krkr-video). The video
 /// container never enters the audio file loaders.
 ///
-/// Each chunk is also published to the instance's [`PcmTapFeed`], which is how
-/// the movie soundtrack reaches `getSample`/`fftgraph` style consumers; kira
-/// renders exactly the frames this decoder hands over, so pushed coordinates
-/// and the render clock stay aligned.
+/// Every chunk — and every silence block emitted while the producer stalls — is
+/// published to the instance's [`PcmTapFeed`] at the stream frame coordinate it
+/// will be rendered at, the same frame space as `SoundHandle::position()`.
+/// kira's decode queue runs up to 16 384 frames ahead of playback; tagging each
+/// published frame with its own coordinate is what keeps a tap read at the
+/// cursor aligned with what is audible.
 #[cfg(not(target_arch = "wasm32"))]
 struct ChannelPcmDecoder {
     spec: krkr_core::PcmAudioSpec,
     total_frames: usize,
     stream: Arc<Mutex<Box<dyn krkr_core::PcmStream>>>,
     tap: Option<PcmTapFeed>,
+    /// Frames handed to kira so far: the stream frame the next emitted frame
+    /// will be rendered at, and therefore the coordinate every published chunk
+    /// is tagged with.
+    emitted_frames: u64,
+    /// Silence published while the producer stalls, sized like one emitted
+    /// block, so published coordinates keep covering what kira renders.
+    silence: Vec<f32>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ChannelPcmDecoder {
     fn new(source: PcmStreamSource, tap: Option<PcmTapFeed>) -> Self {
+        let channels = source.spec.channels.max(1) as usize;
         Self {
             spec: source.spec,
             total_frames: source.total_frames as usize,
             stream: source.stream,
             tap,
+            emitted_frames: 0,
+            silence: vec![0.0; STALL_SILENCE_FRAMES * channels],
         }
     }
 }
@@ -1075,6 +1097,7 @@ impl kira::sound::streaming::Decoder for ChannelPcmDecoder {
     }
 
     fn decode(&mut self) -> Result<Vec<Frame>, FromFileError> {
+        let channels = self.spec.channels.max(1) as usize;
         let chunk = self
             .stream
             .lock()
@@ -1083,14 +1106,24 @@ impl kira::sound::streaming::Decoder for ChannelPcmDecoder {
         let Some(chunk) = chunk else {
             // Producer closed (end of stream) or stalled: emit silence so
             // kira's decode loop never spins on empty chunks. The transport
-            // still stops the sound once `num_frames` is reached. Nothing is
-            // pushed to the tap: silence is not decoded audio, and the tap
-            // reads for this range report "not available" instead.
-            return Ok(vec![Frame::ZERO; 4096]);
+            // still stops the sound once `num_frames` is reached. These are
+            // frames kira really renders, so they are published like any other
+            // chunk: a tap read over them must report silence, not audio that
+            // belongs to a different coordinate.
+            if let Some(tap) = &self.tap {
+                tap.push_at(self.emitted_frames, &self.silence);
+            }
+            self.emitted_frames = self
+                .emitted_frames
+                .saturating_add(STALL_SILENCE_FRAMES as u64);
+            return Ok(vec![Frame::ZERO; STALL_SILENCE_FRAMES]);
         };
         if let Some(tap) = &self.tap {
-            tap.push(&chunk.samples);
+            tap.push_at(self.emitted_frames, &chunk.samples);
         }
+        self.emitted_frames = self
+            .emitted_frames
+            .saturating_add((chunk.samples.len() / channels) as u64);
         Ok(match self.spec.channels {
             1 => chunk
                 .samples
@@ -1107,7 +1140,9 @@ impl kira::sound::streaming::Decoder for ChannelPcmDecoder {
 
     fn seek(&mut self, index: usize) -> Result<usize, FromFileError> {
         // Live streams cannot rewind; movie seeks re-feed the channel from
-        // the decoder side instead.
+        // the decoder side instead. Published coordinates assume the linear
+        // playback of the one stream this decoder was built for, so a real
+        // rewind would have to restart the decoder and the tap together.
         Ok(index)
     }
 }
@@ -1627,5 +1662,76 @@ mod tests {
         assert!(is_likely_voice_storage("voice/hero_001.ogg"));
         assert!(is_likely_voice_storage("sound\\VOICE_A.ogg"));
         assert!(!is_likely_voice_storage("sound/07.click.ogg"));
+    }
+
+    /// Pins the tap contract of both prepared kinds: a static sound hands over
+    /// its decoded buffer and is readable at the reported position, while a
+    /// streaming sound registers no instance at all, so readers see `None`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn only_static_sounds_register_a_tap() {
+        struct StubStreamingDecoder;
+
+        impl kira::sound::streaming::Decoder for StubStreamingDecoder {
+            type Error = FromFileError;
+
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+
+            fn num_frames(&self) -> usize {
+                0
+            }
+
+            fn decode(&mut self) -> Result<Vec<Frame>, FromFileError> {
+                Ok(Vec::new())
+            }
+
+            fn seek(&mut self, index: usize) -> Result<usize, FromFileError> {
+                Ok(index)
+            }
+        }
+
+        let tap = PcmTap::new(64);
+        let id = AudioInstanceId(77);
+
+        let streaming =
+            PreparedSound::Streaming(StreamingSoundData::from_decoder(StubStreamingDecoder));
+        assert!(register_sound_tap(&tap, id, &streaming, false, false).is_none());
+        assert!(!tap.contains(id));
+        assert!(tap.read(id, PcmTapWindow::ahead(8)).is_none());
+        assert!(tap.state(id).is_none());
+        assert!(tap.cursor(id).is_none());
+
+        let frames: Arc<[Frame]> = (0..16)
+            .map(|index| Frame::new(index as f32, -(index as f32)))
+            .collect::<Vec<_>>()
+            .into();
+        let static_sound = PreparedSound::Static(StaticSoundData {
+            sample_rate: 48_000,
+            frames,
+            settings: kira::sound::static_sound::StaticSoundSettings::default(),
+            slice: None,
+        });
+        let feed = register_sound_tap(&tap, id, &static_sound, false, false).expect("static tap");
+        assert_eq!(
+            tap.spec(id),
+            Some(PcmAudioSpec {
+                sample_rate: 48_000,
+                channels: 2
+            })
+        );
+        feed.set_source_position(8);
+        let snapshot = tap.read(id, PcmTapWindow::recent(4)).expect("snapshot");
+        assert_eq!(snapshot.first_frame, 4);
+        assert_eq!(snapshot.available_frames, 4);
+        assert_eq!(
+            snapshot.frames,
+            [4.0, -4.0, 5.0, -5.0, 6.0, -6.0, 7.0, -7.0]
+        );
+
+        // The slot is retired with the sound.
+        feed.stop();
+        assert_eq!(tap.state(id), Some(PcmTapState::Stopped));
     }
 }

@@ -34,7 +34,21 @@
 //! | pause | frozen; position updates only re-anchor the source |
 //! | stop | frozen at its last value; the readable window becomes silent |
 //!
-//! The source (stream) frame the cursor currently points at is reported as
+//! The coordinate space the cursor counts in is the feed's:
+//!
+//! * A feed that **publishes coordinates** ([`PcmTapFeed::push_at`], the live
+//!   PCM movie decoder) works in absolute stream frames: coordinate `c` is the
+//!   audio the sound renders at stream frame `c`. The tap sets the cursor from
+//!   the reported render position directly, so a window at the cursor addresses
+//!   exactly what is playing no matter how far the producer has decoded ahead of
+//!   playback — the producer, which knows the stream position of every chunk it
+//!   emits, is the only side that can keep that alignment.
+//! * A feed that **attaches a decoded buffer** ([`PcmTapFeed::attach_decoded`],
+//!   static sounds) works in unrolled buffer frames: the cursor keeps counting
+//!   across loop wraps and the decoded buffer is addressed through the reported
+//!   source position.
+//!
+//! The source (stream) frame the cursor points at is reported as
 //! [`PcmTapSnapshot::source_frame`]. Reads are relative to the cursor:
 //! [`PcmTapWindow::back_frames`] reaches into the recent past (what `fftgraph`
 //! visualises) and [`PcmTapWindow::ahead_frames`] looks ahead (the reference
@@ -44,38 +58,38 @@
 //!
 //! A tap instance keeps at most [`PcmTap::capacity_frames`] frames, i.e.
 //! [`DEFAULT_CAPACITY_FRAMES`] = 65_536 frames by default (about 1.4 s at
-//! 48 kHz; ~512 KiB of interleaved stereo `f32`). For a push-fed instance the
-//! readable window therefore reaches back `capacity_frames` frames from the
-//! feed's write head: a window around the cursor is readable as long as the
-//! cursor stays inside that range, and anything older has been overwritten and
-//! reads as silence.
+//! 48 kHz; ~512 KiB of interleaved stereo `f32`). A published coordinate stays
+//! readable until it is overwritten, i.e. while it is within `capacity_frames`
+//! of the feed's write head — which is what lets the frames a producer decodes
+//! ahead of playback (up to kira's 16 384-frame queue) stay readable as the
+//! cursor catches up.
 //!
 //! Nothing is allocated or copied until somebody reads: a push-fed instance
-//! allocates its ring on the first read and ignores pushes before that, so the
-//! tap can sit inside the audio path on every platform at no cost. (Coordinates
-//! start at the first push after that first read, so a consumer that wants a
-//! cursor's worth of history should arm the tap when playback starts.)
-//!
-//! Static sounds are served from the `Arc<[Frame]>` their `StaticSoundData`
-//! already holds (shared, never copied), so any window inside the decoded
-//! buffer is readable; live PCM streams are served from the bounded ring of the
-//! frames the decoder has pushed ahead of playback. A window that falls outside
-//! the available audio (not decoded yet, overwritten, before the stream start,
-//! past the end of a non-looping sound, or after [`PcmTapFeed::stop`]) reads as
-//! silence with [`PcmTapSnapshot::available_frames`] counting the frames that
-//! did carry data — mirroring `GetVisBuffer`'s "return how many samples were
-//! written, 0 when the sound is not playing"
+//! allocates its ring on the first read and ignores publishes before that, so
+//! the tap can sit inside the audio path on every platform at no cost. Audio the
+//! producer emitted before the tap was armed was never captured, and a read over
+//! those coordinates reports zero [`PcmTapSnapshot::available_frames`]: silence,
+//! never audio from somewhere else. The same holds for coordinates the producer
+//! never published (a gap left by a dropped publish or a stalled producer), for
+//! coordinates already overwritten, for a window before the stream start or past
+//! the end of a non-looping sound, and for every read after
+//! [`PcmTapFeed::stop`]. This mirrors `GetVisBuffer`'s "return how many samples
+//! were written, 0 when the sound is not playing"
 //! (`krkrz/src/core/sound/win32/WaveImpl.cpp:3274`).
 //!
 //! # Concurrency
 //!
-//! Readers take the instance's buffer lock and copy the window out. The write
-//! side only ever uses `try_lock`, so a read can never block a producer (a
-//! read might briefly wait for an in-flight push, never the other way around).
-//! A push that loses that race is dropped and its coordinate range is
-//! invalidated — stale samples are never served as if they were current — and
-//! the next successful push resumes at the correct coordinate. The position and
-//! state updates are plain atomics, so the control plane never blocks either.
+//! Readers take the instance's buffer lock and copy the window out. The
+//! per-frame write path ([`PcmTapFeed::push_at`]) only ever uses `try_lock`, so
+//! a read can never block a producer: a publish that loses that race is dropped
+//! (counted by [`PcmTapFeed::dropped_pushes`]), the coordinates it covered stay
+//! unpublished, and later publishes resume at their own coordinates — a read
+//! over the hole is silence rather than stale audio. The control-plane writers,
+//! [`PcmTapFeed::attach_decoded`] and [`PcmTapFeed::stop`], take the lock
+//! normally: they run on the audio control thread, never in the render callback,
+//! so the only reader that can delay them is one copying a window. Position and
+//! state updates are plain atomics, so nothing else in the control plane blocks
+//! either.
 
 use std::{
     collections::BTreeMap,
@@ -220,25 +234,51 @@ struct TapInstance {
     id: AudioInstanceId,
     spec: PcmAudioSpec,
     capacity_frames: u32,
+    /// Whether the cursor is the feed's own coordinate ([`TapMode::Ring`]) or an
+    /// unrolled buffer clock ([`TapMode::Decoded`]).
+    mode: AtomicU8,
     state: AtomicU8,
     cursor: AtomicU64,
     source_frame: AtomicU64,
     total_frames: AtomicU64,
     looping: AtomicBool,
-    drop_skip: AtomicU64,
     dropped_pushes: AtomicU64,
     buffers: Mutex<TapBuffers>,
 }
 
+/// How a feed's frames are addressed.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TapMode {
+    /// The feed publishes absolute coordinates ([`PcmTapFeed::push_at`]): the
+    /// cursor is the render position in that same space.
+    Ring = 0,
+    /// The feed attached a decoded buffer ([`PcmTapFeed::attach_decoded`]): the
+    /// cursor unrolls loops and the buffer is addressed through the source.
+    Decoded = 1,
+}
+
+impl TapMode {
+    fn from_u8(value: u8) -> Self {
+        if value == Self::Decoded as u8 {
+            Self::Decoded
+        } else {
+            Self::Ring
+        }
+    }
+}
+
 #[derive(Default)]
 struct TapBuffers {
-    /// Ring of decoded frames, addressed by rendered-frame coordinate:
+    /// Ring of published frames, addressed by the feed's coordinate:
     /// coordinate `c` lives at slot `c % capacity_frames`. `None` until the
     /// first read arms the tap.
     ring: Option<Vec<f32>>,
-    /// Decoded-frame coordinate the next push writes to.
+    /// Coordinate just past the last published frame.
     write_head: u64,
-    /// Lowest coordinate whose ring contents are still valid.
+    /// Lowest coordinate whose ring contents are still valid. A publish that
+    /// does not continue `write_head` leaves a hole: everything older is
+    /// dropped from the readable range so the hole can never be read as audio.
     valid_from: u64,
     /// Full decoded buffer of a static sound, shared with kira's sound data.
     decoded: Option<Arc<[Frame]>>,
@@ -275,12 +315,12 @@ impl PcmTap {
             id,
             spec,
             capacity_frames: self.inner.capacity_frames,
+            mode: AtomicU8::new(TapMode::Ring as u8),
             state: AtomicU8::new(STATE_PLAYING),
             cursor: AtomicU64::new(0),
             source_frame: AtomicU64::new(SOURCE_UNKNOWN),
             total_frames: AtomicU64::new(0),
             looping: AtomicBool::new(false),
-            drop_skip: AtomicU64::new(0),
             dropped_pushes: AtomicU64::new(0),
             buffers: Mutex::new(TapBuffers::default()),
         });
@@ -372,15 +412,25 @@ impl PcmTapFeed {
         self.instance.state()
     }
 
-    /// Appends decoded frames (interleaved, matching [`PcmTapFeed::spec`]) to
-    /// the ring, at the coordinate following the last pushed frame.
+    /// Publishes decoded frames (interleaved, matching [`PcmTapFeed::spec`]) at
+    /// the coordinate `first_frame`.
     ///
-    /// This is the decode side of a live stream: the producer runs ahead of
-    /// playback, so a pushed frame becomes readable when the cursor reaches its
-    /// coordinate. Until the first read arms the instance the push is inert
-    /// (no allocation, no copy).
-    pub fn push(&self, samples: &[f32]) {
-        self.instance.push(samples);
+    /// `first_frame` is the producer's own coordinate for the first frame of
+    /// `samples`: the stream frame the sound renders it at. Coordinate `c` then
+    /// holds the audio rendered at `c`, which is the same space
+    /// [`PcmTapFeed::set_source_position`] reports, so a read at the cursor
+    /// addresses exactly what is playing no matter how far the producer has
+    /// decoded ahead. A producer that also emits silence for a stalled source
+    /// must publish it (or skip its coordinates), otherwise the coordinates that
+    /// follow describe audio the sound never played.
+    ///
+    /// Coordinates from different publishes must be contiguous; a gap (a dropped
+    /// publish, a stalled producer that skipped coordinates) makes everything
+    /// older than the new range unreadable, so the hole can never be served as
+    /// audio. Until the first read arms the instance the publish is inert (no
+    /// allocation, no copy).
+    pub fn push_at(&self, first_frame: u64, samples: &[f32]) {
+        self.instance.publish_at(first_frame, samples);
     }
 
     /// Attaches the full decoded buffer of a static sound (shared with kira,
@@ -390,10 +440,15 @@ impl PcmTapFeed {
         self.instance.attach_decoded(frames, looping);
     }
 
-    /// Reports the playback position as a source (stream) frame, e.g. from
-    /// `SoundHandle::position()`. The cursor advances by the same amount, so a
-    /// forward seek moves it forward, a loop wrap keeps it counting, and a
-    /// backward seek moves it back.
+    /// Reports the render position, e.g. from `SoundHandle::position()`.
+    ///
+    /// For a feed that publishes coordinates ([`PcmTapFeed::push_at`]) this is
+    /// the stream frame being rendered, and the cursor becomes exactly that
+    /// frame: reads at the cursor address the audio playing right now. For a
+    /// feed with an attached decoded buffer ([`PcmTapFeed::attach_decoded`]) the
+    /// reported frame is the source position: a loop wrap keeps the cursor
+    /// counting, a forward seek moves it forward and a backward seek moves it
+    /// back. Paused or stopped instances do not move at all.
     pub fn set_source_position(&self, frame: u64) {
         self.instance.set_source_position(frame);
     }
@@ -444,6 +499,10 @@ impl TapInstance {
         self.spec.channels.max(1) as usize
     }
 
+    fn mode(&self) -> TapMode {
+        TapMode::from_u8(self.mode.load(Ordering::Relaxed))
+    }
+
     fn state(&self) -> PcmTapState {
         PcmTapState::from_u8(self.state.load(Ordering::Relaxed))
     }
@@ -463,32 +522,46 @@ impl TapInstance {
         if frames == 0 || self.state() != PcmTapState::Playing {
             return;
         }
-        self.cursor.fetch_add(frames, Ordering::Relaxed);
-        match (self.source_position(), self.loop_total()) {
-            (Some(source), Some(total)) => self
+        let previous = self.cursor.load(Ordering::Relaxed);
+        let cursor = previous.saturating_add(frames);
+        self.cursor.store(cursor, Ordering::Relaxed);
+        match (self.mode(), self.source_position(), self.loop_total()) {
+            // A published-coordinate feed shares the render space with the
+            // cursor, so the source follows it one to one.
+            (TapMode::Ring, Some(_), _) => self.source_frame.store(cursor, Ordering::Relaxed),
+            (TapMode::Decoded, Some(source), Some(total)) => self
                 .source_frame
                 .store(source.saturating_add(frames) % total, Ordering::Relaxed),
-            (Some(source), None) => self
+            (TapMode::Decoded, Some(source), None) => self
                 .source_frame
                 .store(source.saturating_add(frames), Ordering::Relaxed),
-            (None, _) => {}
+            (_, None, _) => {}
         }
     }
 
     fn set_source_position(&self, frame: u64) {
-        if self.state() == PcmTapState::Stopped {
+        match self.state() {
+            PcmTapState::Stopped => return,
+            PcmTapState::Paused => {
+                // Frozen cursor: keep the reported position fresh so resuming
+                // does not replay the frames rendered while paused.
+                self.source_frame.store(frame, Ordering::Relaxed);
+                return;
+            }
+            PcmTapState::Playing => {}
+        }
+        if self.mode() == TapMode::Ring {
+            // The feed publishes absolute stream coordinates, so the render
+            // position *is* the cursor: reads then address the audio being
+            // played no matter how far the producer is decoding ahead.
+            self.cursor.store(frame, Ordering::Relaxed);
+            self.source_frame.store(frame, Ordering::Relaxed);
             return;
         }
         let Some(previous) = self.source_position() else {
             self.source_frame.store(frame, Ordering::Relaxed);
             return;
         };
-        if self.state() == PcmTapState::Paused {
-            // Frozen cursor: keep the anchor fresh so resuming does not replay
-            // the frames that were rendered while paused.
-            self.source_frame.store(frame, Ordering::Relaxed);
-            return;
-        }
         if frame >= previous {
             self.advance_frames(frame - previous);
         } else if let Some(total) = self.loop_total() {
@@ -505,6 +578,12 @@ impl TapInstance {
 
     fn seek_to_source(&self, frame: u64) {
         if self.state() == PcmTapState::Stopped {
+            return;
+        }
+        if self.mode() == TapMode::Ring {
+            // The stream moved, so the cursor moves with it.
+            self.cursor.store(frame, Ordering::Relaxed);
+            self.source_frame.store(frame, Ordering::Relaxed);
             return;
         }
         if let Some(previous) = self.source_position() {
@@ -537,7 +616,7 @@ impl TapInstance {
         buffers.valid_from = 0;
     }
 
-    fn push(&self, samples: &[f32]) {
+    fn publish_at(&self, first_frame: u64, samples: &[f32]) {
         if samples.is_empty() || self.state() == PcmTapState::Stopped {
             return;
         }
@@ -547,11 +626,10 @@ impl TapInstance {
             return;
         }
         let Ok(mut buffers) = self.buffers.try_lock() else {
-            // A reader is copying a window. Never block the producer: skip this
-            // chunk, remember its length so the next push resumes at the right
-            // coordinate, and invalidate the window so the hole reads as
-            // silence instead of stale audio.
-            self.drop_skip.fetch_add(frames, Ordering::Relaxed);
+            // A reader is copying a window. Never block the producer: drop this
+            // chunk. Its coordinates stay unpublished, so reads over them are
+            // silence, and the next publish — which carries its own coordinate —
+            // closes the gap.
             self.dropped_pushes.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -560,15 +638,19 @@ impl TapInstance {
             return;
         }
         let capacity = self.capacity_frames as u64;
-        let skipped = self.drop_skip.swap(0, Ordering::Relaxed);
-        // A chunk larger than the ring keeps only its tail, but the dropped
-        // head must still move the coordinates forward.
+        // A chunk larger than the ring keeps only its tail, but its head still
+        // occupies coordinates and must not be served as if it were audio; the
+        // capacity bound below drops those coordinates, exactly like a wrapped
+        // ring.
         let chunk_skip = frames.saturating_sub(capacity);
-        let mut head = buffers
-            .write_head
-            .saturating_add(skipped)
-            .saturating_add(chunk_skip);
-        let written = frames - chunk_skip;
+        let end = first_frame.saturating_add(frames);
+        if first_frame != buffers.write_head {
+            // The publish does not continue the previous range: everything
+            // older belongs to a hole that must never read as audio. A
+            // contiguous publish must keep the older range readable.
+            buffers.valid_from = first_frame;
+        }
+        let mut head = first_frame.saturating_add(chunk_skip);
         {
             let ring = buffers.ring.as_mut().expect("ring is allocated");
             for frame in chunk_skip as usize..frames as usize {
@@ -578,13 +660,11 @@ impl TapInstance {
                 head = head.saturating_add(1);
             }
         }
-        buffers.write_head = head;
-        buffers.valid_from = if skipped > 0 {
-            // Everything older than this push belongs to a gap: never serve it.
-            head.saturating_sub(written)
-        } else {
-            buffers.valid_from.max(head.saturating_sub(capacity))
-        };
+        debug_assert_eq!(head, end);
+        buffers.write_head = buffers.write_head.max(end);
+        buffers.valid_from = buffers
+            .valid_from
+            .max(buffers.write_head.saturating_sub(capacity));
     }
 
     fn attach_decoded(&self, frames: Arc<[Frame]>, looping: bool) {
@@ -596,6 +676,7 @@ impl TapInstance {
             .store(frames.len() as u64, Ordering::Relaxed);
         self.looping.store(looping, Ordering::Relaxed);
         buffers.decoded = Some(frames);
+        self.mode.store(TapMode::Decoded as u8, Ordering::Relaxed);
         if self.source_position().is_none() {
             self.source_frame.store(0, Ordering::Relaxed);
         }
@@ -609,18 +690,11 @@ impl TapInstance {
             && self.state() != PcmTapState::Stopped
         {
             // The first read arms a push-fed instance: allocate the ring here,
-            // so that an unread tap stays allocation- and copy-free, and start
-            // its rendered-frame clock, because the ring's coordinates begin
-            // with the first frame pushed after arming. A tap armed in the
-            // middle of playback cannot recover the frames already rendered,
-            // which is why the clock starts at the arming point rather than at
-            // the stream start.
+            // so an unread tap stays allocation- and copy-free. Coordinates are
+            // the feed's own and survive arming, so the cursor is untouched:
+            // audio the producer emitted before this point was never captured
+            // and reads as silence.
             buffers.ring = Some(vec![0.0; self.capacity_frames as usize * channels]);
-            buffers.write_head = 0;
-            buffers.valid_from = 0;
-            self.drop_skip.store(0, Ordering::Relaxed);
-            self.cursor.store(0, Ordering::Relaxed);
-            self.source_frame.store(SOURCE_UNKNOWN, Ordering::Relaxed);
         }
 
         let state = self.state();

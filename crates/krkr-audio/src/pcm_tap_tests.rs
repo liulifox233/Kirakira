@@ -1,6 +1,6 @@
-//! Headless tests for the decoded-PCM tap. Everything here is driven by a
-//! synthetic sample source, so the cursor and ring semantics are verified
-//! without an audio device and without kira's render thread.
+//! Headless tests for the decoded-PCM tap. Everything here is driven by
+//! synthetic sources, so the timing model (cursor, coordinates, ring windows)
+//! is verified without an audio device and without kira's render thread.
 
 use super::*;
 
@@ -26,6 +26,7 @@ fn stereo(range: std::ops::Range<usize>) -> Vec<f32> {
         .collect()
 }
 
+/// Decoded buffer where frame `index` is `(index, -index)`.
 fn decoded(count: usize) -> Arc<[Frame]> {
     (0..count)
         .map(|index| Frame::new(index as f32, -(index as f32)))
@@ -43,7 +44,7 @@ fn instance_of(tap: &PcmTap) -> Arc<TapInstance> {
 #[test]
 fn ring_stays_inert_until_the_first_read_arms_it() {
     let (tap, feed) = registered(8);
-    feed.push(&stereo(0..4));
+    feed.push_at(0, &stereo(0..4));
     assert!(
         !instance_of(&tap).ring_allocated(),
         "an unread tap must not allocate its ring"
@@ -54,18 +55,25 @@ fn ring_stays_inert_until_the_first_read_arms_it() {
     assert!(snapshot.frames.iter().all(|sample| *sample == 0.0));
     assert!(instance_of(&tap).ring_allocated());
 
-    // Coordinates start at the first push after arming.
-    feed.push(&stereo(10..14));
-    let snapshot = tap.read(ID, PcmTapWindow::ahead(4)).expect("snapshot");
+    // Audio emitted before the arming read was never captured: only what the
+    // producer publishes afterwards is readable, at its own coordinate.
+    feed.push_at(10, &stereo(10..14));
+    let snapshot = tap.read(ID, PcmTapWindow::ahead(14)).expect("snapshot");
+    assert_eq!(snapshot.first_frame, 0);
     assert_eq!(snapshot.available_frames, 4);
-    assert_eq!(snapshot.frames, stereo(10..14));
+    assert!(
+        snapshot.frames[..10 * 2]
+            .iter()
+            .all(|sample| *sample == 0.0)
+    );
+    assert_eq!(snapshot.frames[10 * 2..], stereo(10..14));
 }
 
 #[test]
 fn window_contents_follow_the_rendered_cursor() {
     let (tap, feed) = registered(16);
     let _ = tap.read(ID, PcmTapWindow::ahead(0));
-    feed.push(&stereo(0..16));
+    feed.push_at(0, &stereo(0..16));
     feed.advance_rendered(6);
 
     let snapshot = tap
@@ -87,7 +95,7 @@ fn window_contents_follow_the_rendered_cursor() {
 fn ring_keeps_only_the_bounded_window() {
     let (tap, feed) = registered(4);
     let _ = tap.read(ID, PcmTapWindow::ahead(0));
-    feed.push(&stereo(0..10));
+    feed.push_at(0, &stereo(0..10));
     feed.advance_rendered(8);
 
     // Coordinates 6..8 are the oldest frames the 4-frame ring still holds;
@@ -105,6 +113,79 @@ fn ring_keeps_only_the_bounded_window() {
     assert_eq!(snapshot.available_frames, 2);
     assert!(snapshot.frames[..5 * 2].iter().all(|sample| *sample == 0.0));
     assert_eq!(snapshot.frames[5 * 2..], stereo(6..8));
+}
+
+#[test]
+fn ring_cursor_addresses_the_publishers_coordinates() {
+    let (tap, feed) = registered(64);
+    let _ = tap.read(ID, PcmTapWindow::ahead(0));
+
+    // kira is rendering stream frame 1000 while its decode queue is already
+    // 32 frames ahead, so the producer publishes coordinates from 1032 on.
+    feed.set_source_position(1_000);
+    assert_eq!(tap.cursor(ID), Some(1_000));
+    feed.push_at(1_032, &stereo(0..32));
+
+    // The frames being rendered were never published: the read must report
+    // silence rather than the audio that belongs to 32 frames in the future.
+    let snapshot = tap.read(ID, PcmTapWindow::ahead(4)).expect("snapshot");
+    assert_eq!(snapshot.cursor, 1_000);
+    assert_eq!(snapshot.available_frames, 0);
+    assert!(snapshot.frames.iter().all(|sample| *sample == 0.0));
+
+    // Once rendering catches up, the cursor addresses exactly those frames.
+    feed.set_source_position(1_032);
+    let snapshot = tap.read(ID, PcmTapWindow::ahead(4)).expect("snapshot");
+    assert_eq!(snapshot.cursor, 1_032);
+    assert_eq!(snapshot.first_frame, 1_032);
+    assert_eq!(snapshot.available_frames, 4);
+    assert_eq!(snapshot.frames, stereo(0..4));
+}
+
+#[test]
+fn contiguous_publishes_keep_the_whole_window_readable() {
+    let (tap, feed) = registered(64);
+    let _ = tap.read(ID, PcmTapWindow::ahead(0));
+    // A decoder publishes chunk by chunk: every earlier chunk must stay
+    // readable, not just the newest one.
+    feed.push_at(0, &stereo(0..16));
+    feed.push_at(16, &stereo(16..32));
+    feed.push_at(32, &stereo(32..48));
+    feed.advance_rendered(40);
+
+    let snapshot = tap.read(ID, PcmTapWindow::recent(40)).expect("snapshot");
+    assert_eq!(snapshot.first_frame, 0);
+    assert_eq!(snapshot.available_frames, 40);
+    assert_eq!(snapshot.frames, stereo(0..40));
+}
+
+#[test]
+fn a_gap_between_publishes_reads_as_silence() {
+    let (tap, feed) = registered(64);
+    let _ = tap.read(ID, PcmTapWindow::ahead(0));
+    feed.push_at(0, &stereo(0..16));
+    feed.advance_rendered(16);
+    assert_eq!(
+        tap.read_recent(ID, 4).expect("snapshot").available_frames,
+        4
+    );
+
+    // The producer stalls: nothing is published for 16..48 while the sound
+    // keeps rendering those coordinates.
+    feed.advance_rendered(32);
+    let snapshot = tap.read_recent(ID, 4).expect("snapshot");
+    assert_eq!(snapshot.cursor, 48);
+    assert_eq!(snapshot.available_frames, 0);
+
+    // It resumes at its own coordinate; the hole stays silent and the older
+    // published range is not served as if it covered the gap.
+    feed.push_at(48, &stereo(48..64));
+    feed.advance_rendered(16);
+    let snapshot = tap.read_recent(ID, 20).expect("snapshot");
+    assert_eq!(snapshot.first_frame, 44);
+    assert_eq!(snapshot.available_frames, 16);
+    assert!(snapshot.frames[..4 * 2].iter().all(|sample| *sample == 0.0));
+    assert_eq!(snapshot.frames[4 * 2..], stereo(48..64));
 }
 
 #[test]
@@ -171,10 +252,27 @@ fn cursor_freezes_while_paused() {
 }
 
 #[test]
+fn ring_cursor_freezes_while_paused() {
+    let (tap, feed) = registered(32);
+    let _ = tap.read(ID, PcmTapWindow::ahead(0));
+    feed.set_source_position(500);
+    assert_eq!(tap.cursor(ID), Some(500));
+
+    feed.set_paused(true);
+    feed.advance_rendered(5);
+    feed.set_source_position(600);
+    assert_eq!(tap.cursor(ID), Some(500), "a paused cursor must not move");
+
+    feed.set_paused(false);
+    feed.set_source_position(601);
+    assert_eq!(tap.cursor(ID), Some(601));
+}
+
+#[test]
 fn stop_zeroes_the_readable_window() {
     let (tap, feed) = registered(16);
     let _ = tap.read(ID, PcmTapWindow::ahead(0));
-    feed.push(&stereo(0..8));
+    feed.push_at(0, &stereo(0..8));
     feed.advance_rendered(4);
     assert_eq!(
         tap.read_recent(ID, 4).expect("snapshot").available_frames,
@@ -188,7 +286,7 @@ fn stop_zeroes_the_readable_window() {
     assert_eq!(snapshot.frames, vec![0.0; 8]);
 
     // Nothing after a stop reaches the tap again.
-    feed.push(&stereo(20..24));
+    feed.push_at(20, &stereo(20..24));
     feed.set_source_position(9);
     feed.advance_rendered(9);
     assert_eq!(tap.cursor(ID), Some(4));
@@ -237,19 +335,20 @@ fn backward_position_jumps_without_a_loop_are_seeks() {
 }
 
 #[test]
-fn a_contended_push_is_dropped_without_blocking() {
+fn a_contended_publish_is_dropped_without_blocking() {
     let (tap, feed) = registered(16);
     let _ = tap.read(ID, PcmTapWindow::ahead(0));
     let instance = instance_of(&tap);
 
     // A reader holding the buffer lock must never stall the producer.
     let held = instance.lock_buffers();
-    feed.push(&stereo(0..8));
+    feed.push_at(0, &stereo(0..8));
     assert_eq!(feed.dropped_pushes(), 1);
     drop(held);
 
-    // The next push resumes at the correct coordinate; the gap is silence.
-    feed.push(&stereo(8..16));
+    // The next publish carries its own coordinate, so the dropped range stays
+    // a hole that reads as silence.
+    feed.push_at(8, &stereo(8..16));
     feed.advance_rendered(16);
     let snapshot = tap.read_recent(ID, 16).expect("snapshot");
     assert_eq!(snapshot.first_frame, 0);
@@ -281,7 +380,7 @@ fn register_replaces_the_instance_and_remove_clears_it() {
     assert_eq!(second.id(), ID);
     assert_eq!(first.id(), ID);
     // The retired feed no longer reaches the registered instance.
-    first.push(&stereo(0..4));
+    first.push_at(0, &stereo(0..4));
     assert_eq!(
         tap.read(ID, PcmTapWindow::ahead(4))
             .expect("snapshot")
@@ -293,40 +392,6 @@ fn register_replaces_the_instance_and_remove_clears_it() {
     assert!(!tap.contains(ID));
     assert!(tap.read(ID, PcmTapWindow::ahead(4)).is_none());
     assert!(tap.cursor(ID).is_none());
-}
-
-#[test]
-fn arming_mid_playback_starts_the_clock_at_the_arming_point() {
-    let (tap, feed) = registered(16);
-    // Playback has been running: positions were reported and decoded frames
-    // were pushed before anybody read.
-    feed.set_source_position(4_000);
-    feed.set_source_position(4_800);
-    feed.push(&stereo(0..8));
-    assert!(!instance_of(&tap).ring_allocated());
-
-    let snapshot = tap.read(ID, PcmTapWindow::ahead(1)).expect("snapshot");
-    assert_eq!(
-        snapshot.cursor, 0,
-        "the clock starts where the tap was armed"
-    );
-    assert_eq!(snapshot.available_frames, 0);
-
-    // Frames decoded from here on are readable at the new origin.
-    feed.push(&stereo(8..16));
-    feed.advance_rendered(8);
-    let snapshot = tap.read_recent(ID, 8).expect("snapshot");
-    assert_eq!(snapshot.cursor, 8);
-    assert_eq!(snapshot.frames, stereo(8..16));
-
-    // The stream position stays absolute even though the clock restarted.
-    feed.set_source_position(4_900);
-    assert_eq!(
-        tap.read(ID, PcmTapWindow::ahead(1))
-            .expect("snapshot")
-            .source_frame,
-        Some(4_900)
-    );
 }
 
 #[test]
