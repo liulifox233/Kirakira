@@ -2423,16 +2423,26 @@ pub fn normalize_storage_separators(path: &str) -> String {
 /// normalization and KRKR's case-insensitive spelling. A trailing `/` is
 /// part of the name: the reference's compression loop only deletes a
 /// delimiter that is followed by another one (`StorageIntf.cpp:409-413`), so
-/// `"dir/"` normalizes to `"dir/"` and `"dir//"` to `"dir/"`.
+/// `"dir/"` normalizes to `"dir/"` and `"dir//"` to `"dir/"` — but a `/`
+/// immediately in front of `>` is a duplicated delimiter there and
+/// disappears (`"dir/>"` is `"dir>"`).
 pub fn normalize_storage_name(path: &str) -> Result<String> {
     let path = normalize_storage_separators(path);
     let (outer, inner) = path
         .split_once('>')
         .map_or((path.as_str(), None), |(outer, inner)| (outer, Some(inner)));
-    let outer = normalize_logical_path(outer, false)?;
+    let mut outer = normalize_logical_path(outer, false)?;
     let Some(inner) = inner else {
         return Ok(outer);
     };
+    // The reference appends `>` + the in-archive name and runs one compression
+    // loop over the combined string (`StorageIntf.cpp:392-398`), where `>` is
+    // a delimiter like `/` (`:405`). A trailing delimiter on the outer path is
+    // therefore deleted by the duplicated-delimiter rule (`:409-413`); it only
+    // survives when it ends the whole name.
+    if outer.ends_with('/') {
+        outer.pop();
+    }
     let inner = normalize_logical_path(inner, true)?;
     Ok(format!("{outer}>{inner}"))
 }
@@ -2700,6 +2710,16 @@ mod tests {
             normalize_storage_name("archive.xp3>").unwrap(),
             "archive.xp3>"
         );
+        // `>` is just another delimiter inside the reference's single
+        // compression pass over `path + ">" + in-archive name`
+        // (`StorageIntf.cpp:392-398`, `:405`), so an outer trailing `/` in
+        // front of it is a duplicated delimiter and disappears. Ground truth
+        // from the loop run verbatim: "dir/>"→"dir>", "a//>"→"a>",
+        // "a/>b/c/"→"a>b/c/", "/>x"→">x".
+        assert_eq!(normalize_storage_name("dir/>").unwrap(), "dir>");
+        assert_eq!(normalize_storage_name("a//>").unwrap(), "a>");
+        assert_eq!(normalize_storage_name("a/>b/c/").unwrap(), "a>b/c/");
+        assert_eq!(normalize_storage_name("/>x").unwrap(), ">x");
         // Media-qualified names keep their trailing delimiter too. The
         // `media://` spelling itself is folded to `media:/` by this
         // normalizer, a divergence `crates/krkr-assets/src/media.rs:66-70`

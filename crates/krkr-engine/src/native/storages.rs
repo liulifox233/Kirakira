@@ -294,6 +294,12 @@ mod tests {
             full_path(&mut engine, "archive.xp3>DIR/"),
             "archive.xp3>dir/"
         );
+        // The delimiter in front of `>` is a duplicated one for the reference
+        // and disappears (`StorageIntf.cpp:392-398`, `:405`, `:409-413`).
+        assert_eq!(
+            full_path(&mut engine, "archive.xp3/>DIR/"),
+            "archive.xp3>dir/"
+        );
         assert_eq!(full_path(&mut engine, "/"), "/");
         assert_eq!(full_path(&mut engine, ""), "");
     }
