@@ -19839,10 +19839,51 @@ mod tests {
             .expect("layer id") as u64;
         assert_eq!(&layer_rgba(&engine, layer_id)[..4], [88, 48, 23, 255]);
 
+        // `FillColorOnAddAlpha` runs `BlendColor`, whose `opa == 0` case is a
+        // no-op (`LayerBitmapIntf.cpp:408-420`): the pixel keeps its value.
+        engine
+            .execute_script("inline.tjs", "dest.colorRect(0, 0, 1, 1, 0x00112233, 0);")
+            .expect("zero opacity");
+        assert_eq!(&layer_rgba(&engine, layer_id)[..4], [88, 48, 23, 255]);
+
         let error = engine
             .execute_script("inline.tjs", "dest.colorRect(0, 0, 1, 1, 0x00112233, -1);")
             .expect_err("negative opacity is refused on dfAddAlpha");
         assert!(error.message.contains("Negative opacity"), "{error:?}");
+    }
+
+    /// The shipped x86 build installs the SSE2 `bmScreen` kernels
+    /// (`TVPGL_SSE2_Init`, `blend_function_sse2.cpp:1364`), whose `_o` body
+    /// carries the complement the pure-C fallback (`blend_functor_c.h:301`)
+    /// omits: a faded screen layer lightens toward white instead of collapsing
+    /// to near-black.
+    #[test]
+    fn native_layer_screen_with_opacity_uses_the_shipped_kernel() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(1, 1);
+                source.fillRect(0, 0, 1, 1, 0x80ff0000);
+
+                global.dest = new Layer();
+                dest.setImageSize(1, 1);
+                dest.face = 1; // dfOpaque
+                dest.fillRect(0, 0, 1, 1, 0xff808080);
+                dest.operateRect(0, 0, source, 0, 0, 1, 1, omScreen, 128);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        assert_eq!(
+            &layer_rgba(&engine, layer_id)[..4],
+            [0xc0, 0x81, 0x81, 0xff],
+            "sse2_screen_blend_o_functor at opa 128"
+        );
     }
 
     /// `CopyRect`'s `dfProvince` branch (`LayerIntf.cpp:4179-4195`) copies the
@@ -19963,6 +20004,54 @@ mod tests {
                 "dest.face = 3; dest.piledCopy(0, 0, source, 0, 0, 2, 2);",
             )
             .expect("piledCopy runs on a province face");
+        // The operate family has no face switch in the reference: it throws
+        // only when `GetBltMethodFromOperationModeAndDrawFace` has no method
+        // for the mode (`LayerIntf.cpp:4357-4393`), and the universal modes
+        // resolve on every face. `omAlpha` is face-dependent, so it throws.
+        let error = engine
+            .execute_script(
+                "inline.tjs",
+                "dest.face = 3; dest.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha, 255);",
+            )
+            .expect_err("dfProvince has no omAlpha method");
+        assert!(
+            error.message.contains("Not drawable face type"),
+            "{error:?}"
+        );
+    }
+
+    /// The operate family's universal modes blend into the main image on a
+    /// `dfProvince` face (`LayerIntf.cpp:4357-4393`: the method lookup is the
+    /// only face check those calls have).
+    #[test]
+    fn native_layer_operate_blends_into_a_province_layer_main_image() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                source.fillRect(0, 0, 2, 2, 0xff404040);
+
+                global.dest = new Layer();
+                dest.setImageSize(2, 2);
+                dest.fillRect(0, 0, 2, 2, 0xff808080);
+                dest.face = 3; // dfProvince
+                dest.operateRect(0, 0, source, 0, 0, 2, 2, omAdditive, 255);
+                "#,
+            )
+            .expect("omAdditive resolves on a province face");
+        let layer_id = engine
+            .execute_expression("inline.tjs", "dest.__nativeLayerId")
+            .expect("layer id")
+            .to_integer()
+            .expect("integer") as u64;
+        assert_eq!(
+            &layer_rgba(&engine, layer_id)[..4],
+            [0xc0, 0xc0, 0xc0, 0xff],
+            "the raw add lands in the layer's main image"
+        );
     }
 
     /// `clipLeft`/`clipTop`/`clipWidth`/`clipHeight` are live views of the
@@ -20039,7 +20128,10 @@ mod tests {
         assert_eq!(text(&mut engine, "second"), "100,0,8");
         assert_eq!(text(&mut engine, "third"), "0,8", "setClip() resets");
 
-        // Without an image the rectangle cannot be set, but it stays readable.
+        // Without an image the rectangle cannot be set, but it stays readable:
+        // `DeallocateImage` does not touch `ClipRect`
+        // (`LayerIntf.cpp:2079-2085`), so the layer keeps the `ResetClip`
+        // rectangle it had (the 8x8 image).
         let error = engine
             .execute_script(
                 "inline.tjs",
@@ -20051,7 +20143,44 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(read(&mut engine, "layer.clipLeft"), 0);
-        assert_eq!(read(&mut engine, "layer.clipWidth"), 0);
+        assert_eq!(read(&mut engine, "layer.clipWidth"), 8);
+    }
+
+    /// `setClip` takes no arguments (reset) or at least four; 1..3 is the
+    /// reference's `TJS_E_BADPARAMCOUNT` (`LayerIntf.cpp:6997-7021`).
+    #[test]
+    fn native_layer_set_clip_rejects_partial_arguments() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(4, 4);
+                layer.setClip(1, 1, 2, 2);
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "layer.setClip(1);",
+            "layer.setClip(1, 2);",
+            "layer.setClip(1, 2, 3);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("partial setClip arguments are refused");
+            assert!(
+                error.message.contains("Invalid argument count"),
+                "{call}: {error:?}"
+            );
+        }
+        // The rejected calls left the rectangle alone.
+        let width = engine
+            .execute_expression("inline.tjs", "layer.clipWidth")
+            .expect("clip width")
+            .to_integer()
+            .expect("integer");
+        assert_eq!(width, 2);
     }
 
     /// `SetMainPixel`/`SetMaskPixel` require a main image

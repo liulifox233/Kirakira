@@ -2557,6 +2557,10 @@ fn restore_default_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
         layer.image_left = 0.0;
         layer.image_top = 0.0;
         layer.set_image(image);
+        // `AllocateImage` ends with `ResetClip()` (`LayerIntf.cpp:2067`), so a
+        // rebuilt bitmap starts with the whole-image clip rather than the
+        // rectangle a previous image left behind.
+        layer.clip = None;
     });
 }
 
@@ -2566,8 +2570,21 @@ fn deallocate_layer_image(
     target: &LayerRenderTarget,
 ) {
     // `tTJSNI_BaseLayer::DeallocateImage` (`LayerIntf.cpp:2079`) frees the
-    // province plane together with the main image.
+    // province plane together with the main image. `ClipRect` survives it
+    // (`:2079-2085` only deletes the bitmaps), so a `ResetClip` state is
+    // materialized at the image size it had: the accessors keep reporting the
+    // last rectangle instead of falling back to the (now absent) image.
     mutate_render_layer(runtime, target, |layer| {
+        if layer.clip.is_none()
+            && let Some(image) = layer.image.as_ref()
+        {
+            layer.clip = Some(krkr_core::Rect::new(
+                0.0,
+                0.0,
+                image.upload.width as f32,
+                image.upload.height as f32,
+            ));
+        }
         layer.clear_image();
         layer.province = None;
     });
@@ -4510,6 +4527,17 @@ fn layer_free_image(
     if let Some(target) = runtime.host().layer_render_target(this) {
         deallocate_layer_image(runtime, this, &target);
     } else if let Some(layer) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
+        // `DeallocateImage` keeps `ClipRect` (`LayerIntf.cpp:2079-2085`).
+        if layer.clip.is_none()
+            && let Some(image) = layer.image.as_ref()
+        {
+            layer.clip = Some(krkr_core::Rect::new(
+                0.0,
+                0.0,
+                image.upload.width as f32,
+                image.upload.height as f32,
+            ));
+        }
         layer.clear_image();
         layer.province = None;
         runtime.host_mut().clear_layer_image_storage(layer_id);
@@ -6055,9 +6083,12 @@ fn stretch_copy_impl(
     operate: bool,
 ) -> Result<Variant> {
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
-    // `StretchCopy`/`OperateStretch` throw on any face without a stretch blit
-    // method (`LayerIntf.cpp:4260-4262`, `:4411-4415`).
-    if is_province_face(runtime, this) {
+    // `StretchCopy`'s `switch(DrawFace)` throws on every face it does not
+    // handle (`LayerIntf.cpp:4260-4262`). `OperateStretch` has no face switch:
+    // it throws only when `GetBltMethodFromOperationModeAndDrawFace` fails,
+    // which is what the blt resolution below reports (`:4411-4415`), so the
+    // universal `om*` modes still blend into the main image on `dfProvince`.
+    if is_province_face(runtime, this) && !operate {
         return Err(not_drawable_face_type());
     }
     let dx = optional_integer(&args, 0)?.unwrap_or(0);
@@ -6216,9 +6247,11 @@ fn affine_copy_impl(
         return Err(TjsError::runtime("Layer.affineCopy requires 12 arguments"));
     }
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
-    // `AffineCopy`/`OperateAffine` throw on any face without an affine blit
-    // method (`LayerIntf.cpp:4303-4305`, `:4447-4452`).
-    if is_province_face(runtime, this) {
+    // `AffineCopy`'s `switch(DrawFace)` throws on every face it does not handle
+    // (`LayerIntf.cpp:4303-4305`); `OperateAffine` has no face switch and
+    // throws only when the blt lookup fails (`:4447-4452`), so the universal
+    // `om*` modes still blend into the main image on `dfProvince`.
+    if is_province_face(runtime, this) && !operate {
         return Err(not_drawable_face_type());
     }
     let Some(source_object) = args.first().and_then(variant_object) else {
@@ -6395,19 +6428,23 @@ fn copy_province_rect(
     // rectangle to the destination's `ClipRect`, moving the destination point
     // with it (the right/bottom edges are computed from the *untrimmed*
     // origin, exactly as the reference does). A layer without a stored clip is
-    // the `ResetClip` state, whose rectangle is the whole image.
-    let clip = layer_clip_bounds(runtime, dest_target).or_else(|| {
-        render_layer_snapshot(runtime, dest_target).and_then(|layer| {
-            layer.image.map(|image| {
-                (
-                    0,
-                    0,
-                    image.upload.width as i64,
-                    image.upload.height as i64,
-                )
+    // the `ResetClip` state, whose rectangle is the whole image; a layer that
+    // never had an image keeps `ClipRect = (0,0,0,0)` (`LayerIntf.cpp:379-382`),
+    // which cancels the copy.
+    let clip = layer_clip_bounds(runtime, dest_target)
+        .or_else(|| {
+            render_layer_snapshot(runtime, dest_target).and_then(|layer| {
+                layer.image.map(|image| {
+                    (
+                        0,
+                        0,
+                        image.upload.width as i64,
+                        image.upload.height as i64,
+                    )
+                })
             })
         })
-    });
+        .or(Some((0, 0, 0, 0)));
     let (mut dx, mut dy) = (dx, dy);
     let (mut left, mut top) = (sx, sy);
     let (mut right, mut bottom) = (sx.saturating_add(width), sy.saturating_add(height));
@@ -6507,14 +6544,13 @@ fn copy_rect_impl(
 
     // `CopyRect`'s dfProvince branch copies the source's province plane (or
     // zero-fills the destination plane when the source has none,
-    // `LayerIntf.cpp:4179-4195`). Every other blit throws on that face:
-    // `stretchCopy` (`:4260`), `affineCopy` (`:4303`), `operateStretch`
-    // (`:4411`), `operateAffine` (`:4447`) and `operateRect` (`:4370`) reach
-    // `GetBltMethodFromOperationModeAndDrawFace`, which has no dfProvince case.
-    if is_province_face(runtime, this) {
-        if matches!(kind, LayerCopyKind::Operate) {
-            return Err(not_drawable_face_type());
-        }
+    // `LayerIntf.cpp:4179-4195`). The copy flavours differ on that face:
+    // `copyRect` uses it, while `stretchCopy` (`:4260`), `affineCopy`
+    // (`:4303`) and `piledCopy` (no face dispatch, `:4102-4142`) never reach
+    // it, and `operateRect` (`:4357-4393`) has no face switch at all — it
+    // throws only when `GetBltMethodFromOperationModeAndDrawFace` fails, so
+    // the universal `om*` modes blend into the main image.
+    if is_province_face(runtime, this) && matches!(kind, LayerCopyKind::Copy) {
         copy_province_rect(
             runtime,
             &dest_target,
