@@ -27,7 +27,7 @@
 //! commands are `ncbNativeClassMethod` instantiations). The 55 names, their
 //! order and their count are the dossier's.
 //!
-//! # Reference defaults
+//! # Reference defaults and the active style
 //!
 //! Every property starts at the value the DLL's constructor writes
 //! (`FUN_1000d5e0`, `.rdata` constants `0x1002c700`-`0x1002c728`): `face`
@@ -35,13 +35,32 @@
 //! pitch 0, ruby size 10, ruby offset -2, text color `0xffffffff`, shadow on
 //! with color `0xff000000` and diff 1, edge off with color `0xff0080ff`,
 //! align/valign -1, `timeScale`/`fontScale` 1.0. `setDefault` derives
-//! `bigfontsize` (2x), `smallfontsize` (0.5x), `rubysize` (/2.4) and `linesize`
-//! from `fontsize` when the caller leaves them out, exactly as `FUN_100022f0`
-//! does.
+//! `bigfontsize` (2x), `smallfontsize` (0.5x), `rubysize` (`/3.0`) and
+//! `linesize` from `fontsize` when the caller leaves them out, exactly as
+//! `FUN_100022f0` does.
+//!
+//! The DLL keeps a second, *active* copy of the style members that the layout
+//! and the character objects read, and the `set*`/`reset*` commands drive it:
+//!
+//! - `setFont(dict)` (`FUN_10002980`) reads the character attributes
+//!   `face bold fontsize rubysize rubyoffset color shadow shadowcolor
+//!   shadowdiff edge edgecolor` into the active members;
+//! - `setStyle(dict)` (`FUN_10002e30`) reads the layout keys `linespacing pitch
+//!   linesize align valign` into the active members;
+//! - `resetFont()` (`FUN_1000def0`) and `resetStyle()` (`FUN_1000dff0`) **copy
+//!   the stored defaults into the active members** — they are what a script
+//!   pairs with `defaultFace = …` (`system/LangRender.tjs`:
+//!   `defaultFace = kag.getLanguageFont(a5), resetFont()` and
+//!   `defaultLineSpacing = …, resetStyle()`), and they never clear the
+//!   `default*` properties.
+//!
+//! The module holds the active copy in a nested Dictionary under the state
+//! member's `active` key; a value the layout has no active override for falls
+//! back to the property's reference default.
 //!
 //! The same constructor also seeds the line-breaking character sets the
 //! `setOption` keys replace (`following` 68 characters, `leading` 19,
-//! `begin`/trailing 10 each) and `kinsoku_max` 1 with `word_break` on; those are
+//! `begin`/`end` 10 each) and `kinsoku_max` 1 with `word_break` on; those are
 //! stored when a script passes them but not applied yet — see below.
 //!
 //! # What the engine cannot do yet
@@ -52,22 +71,26 @@
 //!
 //! - vertical layout: `vertical` is stored and the scroll getters switch axis
 //!   like the DLL, but glyphs are still laid out horizontally because the text
-//!   drawing path performs no glyph rotation.
+//!   drawing path performs no glyph rotation. The game drives that rotation
+//!   through the Font (`onFontChange` sets `font.angle = 2700`).
 //! - the link model: `getLinkNames`/`getLinkRects`/`getLinkCharacters` return
 //!   empty arrays, `isLinkContains` false and `getLinkOfPosition` -1 because no
 //!   engine object tracks link spans or `linkName`s.
 //! - inline evaluation: `onEval(text)` returns its argument; the DLL evaluates
 //!   the expression through `TVPExecuteExpression`, which a plugin cannot reach
-//!   in this runtime.
-//! - `calcLineOffset`/`calcShowCount` follow their reference signatures; the
-//!   DLL's own definitions were not decompiled, so the values are the natural
-//!   ones over this module's line records (a line's origin; the characters in a
-//!   line range).
+//!   in this runtime. (The game's `TextRender.onEval` overrides it with
+//!   `Scripts.eval`.)
+//! - `calcLineOffset(line)` follows its reference signature; the DLL's own
+//!   definition was not decompiled, so the value is the natural one over this
+//!   module's line records (the line's origin).
 //! - line-breaking options: `vertical`, `width_time_scale` and the booleans are
 //!   stored and the layout acts on those it can (axis, per-glyph delay), but
-//!   `following`/`leading`/`begin`/`kinsoku_max`/`word_break` and the
-//!   `ignore_*` gates need the DLL's kazari line-breaking rules, which were not
-//!   decompiled — text is broken at the render box width only.
+//!   `following`/`leading`/`begin`/`end`/`kinsoku_max`/`word_break` and the
+//!   `ignore_*` gates need the DLL's kazari line-breaking rules — text is broken
+//!   at the render box width only, and nothing applies the auto-indent the game
+//!   passes as `render`'s argument 1 (`system/TextRender.tjs` calls
+//!   `TextRenderBase.render(a3, a4, a7, a8, 0)` with `a4` = 1 by default, and
+//!   `system/LangRender.tjs` passes `kag.autoIndent`).
 //! - `done()` returns 1 where the DLL returns void: this renderer finishes
 //!   synchronously, and the in-repo game conductors treat the truthy answer as
 //!   "the characters are materialized".
@@ -81,9 +104,16 @@
 //!   `onLabel` are not `TextRenderBase` members in the DLL (its character
 //!   objects carry them, and the object is built dynamically per character).
 //!   They stay here as void, script-assignable members because glyph
-//!   measurement goes through `onGetTextWidth` and game scripts assign them.
+//!   measurement goes through `onGetTextWidth` and game scripts assign them;
+//!   `onFontChange` is called with the active style dictionary when the active
+//!   attributes change, as the DLL's notification does.
 //! - `setRenderSize` also seeds the result properties with the box, so a script
 //!   that sizes a window before rendering sees the box rather than a stale 0.
+//! - `setFont` also accepts a non-Dictionary argument (a native `Font`) and
+//!   stores it as the instance's `font` member, which the layout measures
+//!   through when a game does not override `setFont` itself. The DLL's
+//!   measurement is delegated to the game's `onGetTextWidth`; this fallback
+//!   keeps the engine's own font path working for the in-repo games.
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
@@ -96,7 +126,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "TextRenderBase",
-    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 18 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and inline onEval evaluation still need engine work.",
+    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model, inline onEval evaluation and the auto-indent/kinsoku rules still need engine work.",
     install: |engine| engine.register_plugin(TextRenderPlugin),
 };
 
@@ -183,8 +213,8 @@ struct Member {
 /// registration function `FUN_10005a60` (each name is registered with the
 /// command object built immediately before it) and the command vftables.
 const SURFACE: &[Member] = &[
-    member("setOption", "void (const tTJSVariant &)", set_option, 1),
-    member("setDefault", "void (const tTJSVariant &)", set_default, 1),
+    member("setOption", "void (tTJSVariant)", set_option, 1),
+    member("setDefault", "void (tTJSVariant)", set_default, 1),
     member("setRenderSize", "void (float, float)", set_render_size, 1),
     prop("vertical", "bool", ValueKind::Bool, Default::Bool(false)),
     prop(
@@ -202,8 +232,8 @@ const SURFACE: &[Member] = &[
     member("clear", "void ()", clear, 0),
     member("resetFont", "void ()", reset_font, 0),
     member("resetStyle", "void ()", reset_style, 0),
-    member("setFont", "void (const tTJSVariant &)", set_font, 1),
-    member("setStyle", "void (const tTJSVariant &)", set_style, 1),
+    member("setFont", "void (tTJSVariant)", set_font, 1),
+    member("setStyle", "void (tTJSVariant)", set_style, 1),
     member(
         "render",
         "bool (const tjs_char *, int, int, int, bool)",
@@ -226,11 +256,12 @@ const SURFACE: &[Member] = &[
     ),
     prop_read_only("renderLines", "int", ValueKind::Int, Default::Int(0)),
     prop_read_only("renderCount", "int", ValueKind::Int, Default::Int(0)),
-    prop_read_only(
+    prop_computed(
         "renderDelay",
         "float",
         ValueKind::Real,
         Default::Real(0.0),
+        render_delay,
     ),
     prop_read_only(
         "renderLeft",
@@ -286,7 +317,7 @@ const SURFACE: &[Member] = &[
     ),
     member(
         "calcShowCount",
-        "tTJSVariant (int, int) const",
+        "int (int) const",
         calc_show_count,
         1,
     ),
@@ -298,7 +329,7 @@ const SURFACE: &[Member] = &[
     ),
     member(
         "getLinkNames",
-        "tTJSVariant () const",
+        "tTJSVariant ()",
         get_link_names,
         0,
     ),
@@ -750,6 +781,90 @@ fn surface_default(name: &str) -> Option<Default> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The active style
+//
+// The DLL keeps a second, active copy of the style members (`FUN_10002980`
+// writes it, `FUN_1000def0`/`FUN_1000dff0` refill it from the defaults) and the
+// layout reads that copy. This module stores it in a nested Dictionary under
+// the state member's `active` key; a property with no active override falls
+// back to its reference default, so a game that never calls the resets still
+// lays text out with the constructor defaults.
+
+const ACTIVE_STYLE: &str = "active";
+
+fn active_style_handle(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle) -> ObjectHandle {
+    if let Variant::Object(handle) = state_member(runtime, instance, ACTIVE_STYLE) {
+        return handle;
+    }
+    let handle = runtime.alloc_dictionary_object();
+    state_store(runtime, instance, ACTIVE_STYLE, Variant::Object(handle));
+    handle
+}
+
+fn active_store(
+    runtime: &mut Runtime<KrkrHost>,
+    instance: ObjectHandle,
+    property: &str,
+    value: Variant,
+) {
+    let active = active_style_handle(runtime, instance);
+    runtime.set_object_member(active, property, value);
+}
+
+fn active_value(runtime: &Runtime<KrkrHost>, instance: ObjectHandle, property: &str) -> Variant {
+    let Variant::Object(active) = state_member(runtime, instance, ACTIVE_STYLE) else {
+        return Variant::Void;
+    };
+    runtime.object_member(active, property)
+}
+
+/// Copy the stored default of `property` into the active style — the operation
+/// `resetFont`/`resetStyle` perform (`FUN_1000def0`/`FUN_1000dff0` copy the
+/// `default*` members into the active ones, so a `defaultFace = …` written just
+/// before the reset is what lands there).
+fn active_refresh(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle, property: &str) {
+    let value = match state_member(runtime, instance, property) {
+        Variant::Void => match surface_default(property) {
+            Some(default) => default_variant(default),
+            None => Variant::Void,
+        },
+        value => value,
+    };
+    active_store(runtime, instance, property, value);
+}
+
+/// The layout's view of a style attribute: the active copy when the game has
+/// pushed one (through `setFont`/`setStyle`/`resetFont`/`resetStyle`), else the
+/// property value, else the reference default.
+fn effective_real(runtime: &Runtime<KrkrHost>, instance: ObjectHandle, name: &str) -> f64 {
+    match active_value(runtime, instance, name) {
+        Variant::Void => value_real(runtime, instance, name),
+        value => value.to_real().unwrap_or(0.0),
+    }
+}
+
+fn effective_int(runtime: &Runtime<KrkrHost>, instance: ObjectHandle, name: &str) -> i64 {
+    match active_value(runtime, instance, name) {
+        Variant::Void => value_int(runtime, instance, name),
+        value => value.to_integer().unwrap_or(0),
+    }
+}
+
+fn effective_bool(runtime: &Runtime<KrkrHost>, instance: ObjectHandle, name: &str) -> bool {
+    match active_value(runtime, instance, name) {
+        Variant::Void => value_bool(runtime, instance, name),
+        value => value.to_integer().unwrap_or(0) != 0,
+    }
+}
+
+fn effective_text(runtime: &Runtime<KrkrHost>, instance: ObjectHandle, name: &str) -> String {
+    match active_value(runtime, instance, name) {
+        Variant::Void => value_text(runtime, instance, name),
+        value => value.to_tjs_string().unwrap_or_default(),
+    }
+}
+
 /// A property's own member name is also its state key, so `setDefault` writes
 /// the very values the `default*` properties read — exactly as the DLL's
 /// `FUN_100022f0` writes the members its property getters return.
@@ -760,13 +875,17 @@ fn property_state_key(name: &str) -> &str {
 // ---------------------------------------------------------------------------
 // setOption (FUN_10001a70) and setDefault (FUN_100022f0)
 
-/// The 18 `setOption` keys the DLL compares, in its own order. Unknown keys are
-/// never read: the DLL's accessor loop has no default branch, so an unknown key
-/// is silently ignored, and so is a known key of the wrong type.
+/// The 19 `setOption` keys the DLL compares, in its own order (`FUN_10001a70`
+/// reads `following leading begin end vertical kinsoku_max word_break` and the
+/// `ignore_*`/`width_time_scale` gates; `end` sits between `begin` and
+/// `vertical`, wide string 0x1002aae4). Unknown keys are never read: the DLL's
+/// accessor loop has no default branch, so an unknown key is silently ignored,
+/// and so is a known key of the wrong type.
 const OPTION_KEYS: &[&str] = &[
     "following",
     "leading",
     "begin",
+    "end",
     "vertical",
     "kinsoku_max",
     "word_break",
@@ -784,8 +903,8 @@ const OPTION_KEYS: &[&str] = &[
     "ignore_xr",
 ];
 
-/// The 18 style keys `setDefault`/`setStyle` read (`FUN_100022f0`), mapped onto
-/// the properties whose members they write.
+/// The 18 style keys `setDefault` reads (`FUN_100022f0`), mapped onto the
+/// properties whose members they write.
 const STYLE_KEYS: &[(&str, &str)] = &[
     ("face", "defaultFace"),
     ("bold", "defaultBold"),
@@ -807,12 +926,67 @@ const STYLE_KEYS: &[(&str, &str)] = &[
     ("valign", "defaultValign"),
 ];
 
+/// The character attributes `setFont` reads (`FUN_10002980`), in its order:
+/// face, bold, fontsize, rubysize, rubyoffset, color, shadow, shadowcolor,
+/// shadowdiff, edge, edgecolor. The DLL writes them into the *active* members.
+const FONT_KEYS: &[(&str, &str)] = &[
+    ("face", "defaultFace"),
+    ("bold", "defaultBold"),
+    ("fontsize", "defaultFontSize"),
+    ("rubysize", "defaultRubySize"),
+    ("rubyoffset", "defaultRubyOffset"),
+    ("color", "defaultChColor"),
+    ("shadow", "defaultShadow"),
+    ("shadowcolor", "defaultShadowColor"),
+    ("shadowdiff", "defaultShadowDiff"),
+    ("edge", "defaultEdge"),
+    ("edgecolor", "defaultEdgeColor"),
+];
+
+/// The layout keys `setStyle` reads (`FUN_10002e30`): linespacing, pitch, then
+/// the line size (which falls back to `fontsize`), align and valign.
+const LAYOUT_KEYS: &[(&str, &str)] = &[
+    ("linespacing", "defaultLineSpacing"),
+    ("pitch", "defaultPitch"),
+    ("linesize", "defaultLineSize"),
+    ("align", "defaultAlign"),
+    ("valign", "defaultValign"),
+];
+
+/// The active members `resetFont` copies the stored defaults into, per
+/// `FUN_1000def0`: bold, italic, size, ruby size, ruby offset, face, color,
+/// shadow, shadow diff, shadow color, edge color and edge.
+const RESET_FONT_PROPERTIES: &[&str] = &[
+    "defaultBold",
+    "defaultItalic",
+    "defaultFontSize",
+    "defaultRubySize",
+    "defaultRubyOffset",
+    "defaultFace",
+    "defaultChColor",
+    "defaultShadow",
+    "defaultShadowDiff",
+    "defaultShadowColor",
+    "defaultEdgeColor",
+    "defaultEdge",
+];
+
+/// The active layout values `resetStyle` recomputes (`FUN_1000dff0`):
+/// `lineSpacing`, `pitch`, `align`, `valign`, plus the line advance
+/// `fontScale * lineSize` that the DLL stores at member 0xc8.
+const RESET_STYLE_PROPERTIES: &[&str] = &[
+    "defaultLineSpacing",
+    "defaultPitch",
+    "defaultAlign",
+    "defaultValign",
+];
+
 /// Reference ratios the DLL derives when `fontsize` arrives without its
-/// dependent keys: the constructor's 24/48/12/24 defaults give big = 2x,
-/// small = 0.5x, line size = font size, and ruby size 10 for font size 24.
+/// dependent keys: big = 2x, small = 0.5x, line size = font size, and the ruby
+/// size divides by the double at `.rdata` 0x1002c720, which is 3.0.
 const BIG_FONT_RATIO: f64 = 2.0;
 const SMALL_FONT_RATIO: f64 = 0.5;
-const RUBY_FONT_DIVISOR: f64 = 2.4;
+const RUBY_FONT_DIVISOR: f64 = 3.0;
 
 fn set_option(
     runtime: &mut Runtime<KrkrHost>,
@@ -830,7 +1004,7 @@ fn set_option(
             continue;
         };
         let coerced = match *key {
-            "following" | "leading" | "begin" => Variant::String(value.to_tjs_string()?),
+            "following" | "leading" | "begin" | "end" => Variant::String(value.to_tjs_string()?),
             "kinsoku_max" => Variant::Integer(value.to_integer().unwrap_or(1)),
             "vertical" => {
                 let flag = Variant::Integer(i64::from(value.to_integer().unwrap_or(0) != 0));
@@ -861,12 +1035,42 @@ fn set_default(
     Ok(Variant::Void)
 }
 
+/// `setStyle(dict)` (`FUN_10002e30`) writes the layout subset into the active
+/// members; it is not a second `setDefault`. Its line-size step reads `linesize`
+/// and falls back to `fontsize` when only that one is present, the two-source
+/// block the DLL has there.
 fn set_style(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    set_default(runtime, this_obj, args)
+    let Some(this) = bound_this(runtime, this_obj) else {
+        return Ok(Variant::Void);
+    };
+    let Some(styles) = dictionary_argument(runtime, args.first()) else {
+        return Ok(Variant::Void);
+    };
+    for (key, property) in LAYOUT_KEYS {
+        if let Some(value) = read_property(runtime, styles, key) {
+            active_store(
+                runtime,
+                this,
+                property,
+                coerce_variant(value, style_value_kind(property)),
+            );
+        }
+    }
+    if read_property(runtime, styles, "linesize").is_none()
+        && let Some(value) = read_property(runtime, styles, "fontsize")
+    {
+        active_store(
+            runtime,
+            this,
+            "defaultLineSize",
+            coerce_variant(value, ValueKind::Real),
+        );
+    }
+    Ok(Variant::Void)
 }
 
 /// Read every known style key from `styles` and write it to the property the
@@ -995,8 +1199,10 @@ fn clear(
     Ok(Variant::Void)
 }
 
-/// `resetFont` (`FUN_1000def0`) drops the attributes a font selection
-/// invalidates: align, fontsize, linesize, linespacing, pitch and valign.
+/// `resetFont` (`FUN_1000def0`) copies the stored font/style defaults into the
+/// active members — the DLL's companion to `defaultFace = …, resetFont()`.
+/// bold, italic, size, ruby size, ruby offset, face, color, shadow, shadow
+/// diff, shadow color, edge color, edge.
 fn reset_font(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1005,23 +1211,18 @@ fn reset_font(
     let Some(this) = bound_this(runtime, this_obj) else {
         return Ok(Variant::Void);
     };
-    runtime.delete_object_member(this, "font");
-    for property in [
-        "defaultAlign",
-        "defaultFontSize",
-        "defaultLineSize",
-        "defaultLineSpacing",
-        "defaultPitch",
-        "defaultValign",
-    ] {
-        state_clear(runtime, this, property_state_key(property));
-        state_clear(runtime, this, property);
+    for property in RESET_FONT_PROPERTIES {
+        active_refresh(runtime, this, property);
     }
+    notify_font_change(runtime, this);
     Ok(Variant::Void)
 }
 
-/// `resetStyle` (`FUN_1000dff0`) clears bold, color, edge, edgecolor, face,
-/// fontsize, rubyoffset, rubysize, shadow, shadowcolor and shadowdiff.
+/// `resetStyle` (`FUN_1000dff0`) recomputes and applies the layout defaults:
+/// line spacing, pitch, align, valign and the line advance `fontScale *
+/// lineSize` (`FUN_1000dff0` stores that product at member 0xc8). The module's
+/// layout derives the line step from the line size and spacing on the fly, so
+/// the advance needs no separate member.
 fn reset_style(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1030,24 +1231,23 @@ fn reset_style(
     let Some(this) = bound_this(runtime, this_obj) else {
         return Ok(Variant::Void);
     };
-    for property in [
-        "defaultBold",
-        "defaultChColor",
-        "defaultEdge",
-        "defaultEdgeColor",
-        "defaultFace",
-        "defaultFontSize",
-        "defaultRubyOffset",
-        "defaultRubySize",
-        "defaultShadow",
-        "defaultShadowColor",
-        "defaultShadowDiff",
-    ] {
-        state_clear(runtime, this, property_state_key(property));
+    for property in RESET_STYLE_PROPERTIES {
+        active_refresh(runtime, this, property);
     }
     Ok(Variant::Void)
 }
 
+/// `setFont(dict)` (`FUN_10002980`) reads the character attributes into the
+/// active style and notifies `onFontChange`; the DLL calls that notification on
+/// its own virtual when face/bold/size change, and the game's handler pushes
+/// the values into its Font (`system/TextRender.tjs`:
+/// `font.bold = a0.bold; font.italic = a0.italic; font.face = …`).
+///
+/// A non-Dictionary argument — a native `Font` a game hands to the base
+/// `setFont` instead of overriding it — is stored as the instance's `font`
+/// member, which the layout measures through. `system/TextRender.tjs` overrides
+/// `setFont` for exactly that, so this keeps the engine font path working for
+/// games that extend it rather than replace it.
 fn set_font(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1056,22 +1256,70 @@ fn set_font(
     let Some(this) = bound_this(runtime, this_obj) else {
         return Ok(Variant::Void);
     };
-    if let Some(font) = args.first().and_then(Variant::object_handle) {
-        // `render` reads the instance's `font` member, which is also where a
-        // game script assigns the layer font directly.
-        runtime.set_object_member(this, "font", Variant::Object(font));
+    let Some(argument) = args.first().cloned() else {
+        return Ok(Variant::Void);
+    };
+    let Some(source) = dictionary_argument(runtime, Some(&argument)) else {
+        return Ok(Variant::Void);
+    };
+    if !runtime.is_dictionary_instance(source) {
+        runtime.set_object_member(this, "font", Variant::Object(source));
+        return Ok(Variant::Void);
     }
-    for property in [
-        "defaultAlign",
-        "defaultFontSize",
-        "defaultLineSize",
-        "defaultLineSpacing",
-        "defaultPitch",
-        "defaultValign",
-    ] {
-        state_clear(runtime, this, property_state_key(property));
+    for (key, property) in FONT_KEYS {
+        if let Some(value) = read_property(runtime, source, key) {
+            active_store(
+                runtime,
+                this,
+                property,
+                coerce_variant(value, style_value_kind(property)),
+            );
+        }
     }
+    notify_font_change(runtime, this);
     Ok(Variant::Void)
+}
+
+/// Call the instance's `onFontChange` with a dictionary of the active style,
+/// the shape the DLL's notification carries and the game's handler reads
+/// (`a0.face`, `a0.bold`, `a0.italic`). A game that does not define it keeps
+/// the module's void compat slot and nothing happens.
+fn notify_font_change(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle) {
+    let report = runtime.alloc_dictionary_object();
+    for (property, key) in [
+        ("defaultFace", "face"),
+        ("defaultBold", "bold"),
+        ("defaultItalic", "italic"),
+        ("defaultFontSize", "size"),
+        ("defaultRubySize", "rubysize"),
+        ("defaultRubyOffset", "rubyoffset"),
+        ("defaultChColor", "color"),
+        ("defaultShadow", "shadow"),
+        ("defaultShadowColor", "shadowColor"),
+        ("defaultShadowDiff", "shadowDiff"),
+        ("defaultEdge", "edge"),
+        ("defaultEdgeColor", "edgeColor"),
+    ] {
+        let value = match property {
+            "defaultFace" => Variant::String(effective_text(runtime, instance, property)),
+            "defaultBold" | "defaultItalic" | "defaultShadow" | "defaultEdge" => {
+                Variant::Integer(i64::from(effective_bool(runtime, instance, property)))
+            }
+            "defaultChColor" | "defaultShadowColor" | "defaultShadowDiff"
+            | "defaultEdgeColor" => Variant::Integer(effective_int(runtime, instance, property)),
+            _ => Variant::Real(effective_real(runtime, instance, property)),
+        };
+        runtime.set_object_member(report, key, value);
+    }
+    let Ok(handler) = runtime.resolve_object_member(instance, "onFontChange") else {
+        return;
+    };
+    let Some(handler) = handler.object_handle() else {
+        return;
+    };
+    if runtime.object_is_callable(handler) {
+        let _ = runtime.call_object_method(instance, "onFontChange", vec![Variant::Object(report)]);
+    }
 }
 
 /// The layout results, which are also the get-only result properties: a `render`
@@ -1205,8 +1453,13 @@ fn calc_line_offset(
     Ok(Variant::Real(offset))
 }
 
-/// `calcShowCount(from, to)` — how many characters sit on the lines in
-/// `[from, to)`.
+/// `calcShowCount(elapsed)` (`FUN_10011080`) — how many characters are visible
+/// after `elapsed` milliseconds: the DLL walks its records backwards and
+/// answers `index + 1` for the first record whose display time (`record time x
+/// timeScale`) has come, and 0 before the first character. The game drives its
+/// typewriter with this (`sysscn/rendermsgwin.tjs` `onUpdate`:
+/// `calcShowCount(System.getTickCount() - startTime)`, `calcShowCount(0)` at
+/// start).
 fn calc_show_count(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1215,27 +1468,30 @@ fn calc_show_count(
     let Some(this) = bound_this(runtime, this_obj) else {
         return Ok(Variant::Integer(0));
     };
-    let from = arguments(&args, 0).to_integer().unwrap_or(0).max(0);
-    let to = arguments(&args, 1)
-        .to_integer()
-        .unwrap_or(i64::MAX / 2)
-        .max(from);
-    let mut count = 0_i64;
+    let elapsed = arguments(&args, 0).to_real().unwrap_or(0.0);
+    let time_scale = value_real(runtime, this, "timeScale");
+    let mut shown = 0_i64;
     for record in character_records(runtime, this) {
         let Some(record) = record.object_handle() else {
             continue;
         };
-        let line = runtime.object_member(record, "line").to_integer().unwrap_or(0);
-        if line >= from && line < to {
-            count += 1;
+        let time = runtime.object_member(record, "time").to_real().unwrap_or(0.0);
+        if time * time_scale <= elapsed {
+            shown += 1;
+        } else {
+            break;
         }
     }
-    Ok(Variant::Integer(count))
+    Ok(Variant::Integer(shown))
 }
 
-/// `getCharacters(from?, to?)` — the character objects. The DLL's command takes
-/// two ints; with no arguments every character is returned, which is how the
-/// in-repo game scripts call it.
+/// `getCharacters(from, count)` (`FUN_10003d90`) — the character objects. The
+/// second argument is a **count**, and 0 means "everything from `from`":
+/// `if (arg2 == 0) arg2 = renderCount - arg1`. The game calls
+/// `getCharacters(0, 0)` in its message renderer and its redraw path, so
+/// treating the second argument as an end index would return nothing and draw
+/// no dialogue at all. One argument means "from here to the end"; no arguments
+/// returns every character.
 fn get_characters(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1250,15 +1506,16 @@ fn get_characters(
     }
     let from = usize::try_from(arguments(&args, 0).to_integer().unwrap_or(0).max(0))
         .unwrap_or(usize::MAX);
-    let to = match args.get(1) {
-        Some(value) => usize::try_from(value.to_integer().unwrap_or(0).max(0)).unwrap_or(usize::MAX),
-        None => records.len(),
+    let count = match args.get(1) {
+        Some(value) => value.to_integer().unwrap_or(0),
+        None => 0,
     };
-    let slice = records
-        .into_iter()
-        .skip(from)
-        .take(to.saturating_sub(from))
-        .collect();
+    let take = if count <= 0 {
+        records.len().saturating_sub(from)
+    } else {
+        usize::try_from(count).unwrap_or(usize::MAX)
+    };
+    let slice = records.into_iter().skip(from).take(take).collect();
     Ok(Variant::Object(runtime.alloc_array_object(slice)))
 }
 
@@ -1346,43 +1603,39 @@ fn render(
     // Font.getTextWidth). `font` belongs to the TextRender instance, not the
     // render arguments.
     let font = runtime.object_member(this, "font").object_handle();
-    // An explicit numeric size argument wins over the instance font and the
-    // `defaultFontSize` property.
-    let size_argument = args
-        .get(1)
-        .and_then(|value| match value {
-            Variant::Integer(value) => Some(*value),
-            Variant::Real(value) => Some(*value as i64),
-            _ => None,
-        })
-        .filter(|value| *value > 0);
-    let font_size = size_argument
-        .or_else(|| font.and_then(|font| resolve_font_int(runtime, font, &["height", "size"])))
-        .unwrap_or_else(|| value_real(runtime, this, "defaultFontSize") as i64)
+    // The remaining arguments stay unused: the DLL's own use of them was not
+    // recovered, and the games put different things in argument 1 — PARQUET
+    // passes the auto-indent the KAGEX layer supplies (1 by default,
+    // `system/TextRender.tjs` → `TextRenderBase.render(a3, a4, a7, a8, 0)`),
+    // so reading it as a font size would lay every glyph out one pixel wide.
+    // The size comes from the instance font, else the active/default font size.
+    let font_size = font
+        .and_then(|font| resolve_font_int(runtime, font, &["height", "size"]))
+        .unwrap_or_else(|| effective_real(runtime, this, "defaultFontSize") as i64)
         .max(1);
     let font_scale = value_real(runtime, this, "fontScale");
     let font_size = ((font_size as f64) * font_scale).round().max(1.0) as i64;
     let color = font
         .and_then(|font| resolve_font_int(runtime, font, &["color"]))
-        .unwrap_or_else(|| value_int(runtime, this, "defaultChColor"));
+        .unwrap_or_else(|| effective_int(runtime, this, "defaultChColor"));
     let width = state_int(runtime, this, RENDER_WIDTH).unwrap_or(0).max(0);
-    let line_size = value_real(runtime, this, "defaultLineSize").max(font_size as f64);
-    let line_spacing = value_real(runtime, this, "defaultLineSpacing").max(0.0);
-    let pitch = value_real(runtime, this, "defaultPitch");
+    let line_size = effective_real(runtime, this, "defaultLineSize").max(font_size as f64);
+    let line_spacing = effective_real(runtime, this, "defaultLineSpacing").max(0.0);
+    let pitch = effective_real(runtime, this, "defaultPitch");
     let line_height = (line_size + line_spacing).max(1.0);
-    let ruby_size = value_real(runtime, this, "defaultRubySize")
+    let ruby_size = effective_real(runtime, this, "defaultRubySize")
         .max(font_size as f64 / RUBY_FONT_DIVISOR)
         .max(1.0);
-    let time_scale = value_real(runtime, this, "timeScale");
+    let ruby_offset = effective_real(runtime, this, "defaultRubyOffset");
     let width_time_scale = state_bool(runtime, this, LAYOUT_WIDTH_TIME_SCALE);
-    let bold = value_bool(runtime, this, "defaultBold");
-    let italic = value_bool(runtime, this, "defaultItalic");
-    let shadow = value_bool(runtime, this, "defaultShadow");
-    let shadow_color = value_int(runtime, this, "defaultShadowColor");
-    let shadow_diff = value_int(runtime, this, "defaultShadowDiff");
-    let edge = value_bool(runtime, this, "defaultEdge");
-    let edge_color = value_int(runtime, this, "defaultEdgeColor");
-    let face = value_text(runtime, this, "defaultFace");
+    let bold = effective_bool(runtime, this, "defaultBold");
+    let italic = effective_bool(runtime, this, "defaultItalic");
+    let shadow = effective_bool(runtime, this, "defaultShadow");
+    let shadow_color = effective_int(runtime, this, "defaultShadowColor");
+    let shadow_diff = effective_int(runtime, this, "defaultShadowDiff");
+    let edge = effective_bool(runtime, this, "defaultEdge");
+    let edge_color = effective_int(runtime, this, "defaultEdgeColor");
+    let face = effective_text(runtime, this, "defaultFace");
     let vertical = value_bool(runtime, this, "vertical");
 
     let mut x = 0_i64;
@@ -1407,7 +1660,10 @@ fn render(
         let character = match token {
             RubyToken::Ruby { text: ruby, count } => {
                 pending_ruby = Some(ruby);
-                ruby_remaining = count + 1;
+                // A count read out of message text must not overflow the group
+                // counter; a group longer than the rest of the text just ends
+                // with the text.
+                ruby_remaining = count.saturating_add(1);
                 continue;
             }
             RubyToken::Char(character) => character,
@@ -1452,18 +1708,17 @@ fn render(
         runtime.set_object_member(record, "edge", Variant::Integer(i64::from(edge)));
         runtime.set_object_member(record, "edgeColor", Variant::Integer(edge_color));
         // Character timing: `delay` is this glyph's own wait and `time` the wait
-        // accumulated before it; `width_time_scale` charges the wait by advance
-        // width instead of one tick per glyph, and `renderDelay` reports the
-        // total times `timeScale`.
-        runtime.set_object_member(
-            record,
-            "delay",
-            Variant::Real(if width_time_scale {
-                char_width as f64
-            } else {
-                1.0
-            }),
-        );
+        // accumulated through it, so nothing is visible at elapsed 0 — the shape
+        // `calcShowCount` reads. `width_time_scale` charges the wait by advance
+        // width instead of one tick per glyph; `renderDelay` reports the total
+        // wait times `timeScale` (the DLL's `[+0x220] x timeScale`).
+        let char_delay = if width_time_scale {
+            char_width as f64
+        } else {
+            1.0
+        };
+        delay += char_delay;
+        runtime.set_object_member(record, "delay", Variant::Real(char_delay));
         runtime.set_object_member(record, "time", Variant::Real(delay));
         runtime.set_object_member(record, "link", Variant::Integer(0));
         runtime.set_object_member(record, "linkName", Variant::String(String::new()));
@@ -1477,11 +1732,6 @@ fn render(
         runtime.set_object_member(record, "line", Variant::Integer(line));
         runtime.set_object_member(record, "index", Variant::Integer(records.len() as i64));
         records.push(Variant::Object(record));
-        delay += if width_time_scale {
-            char_width as f64
-        } else {
-            1.0
-        };
         min_left = Some(min_left.map_or(x, |left| left.min(x)));
         max_right = max_right.max(x.saturating_add(char_width));
         max_bottom = max_bottom.max(y.saturating_add(line_height as i64));
@@ -1497,7 +1747,7 @@ fn render(
             if ruby_remaining == 0
                 && let (Some(first), Some(ruby)) = (group_first_record, pending_ruby.take())
             {
-                attach_ruby(runtime, first, &ruby, group_base_width, ruby_size);
+                attach_ruby(runtime, first, &ruby, group_base_width, ruby_size, ruby_offset);
             }
         }
     }
@@ -1506,7 +1756,7 @@ fn render(
     if let (Some(first), Some(ruby)) = (group_first_record, pending_ruby)
         && ruby_remaining > 0
     {
-        attach_ruby(runtime, first, &ruby, group_base_width, ruby_size);
+        attach_ruby(runtime, first, &ruby, group_base_width, ruby_size, ruby_offset);
     }
     let count = records.len() as i64;
     let characters = runtime.alloc_array_object(records);
@@ -1523,7 +1773,9 @@ fn render(
         Variant::String(text.clone()),
     );
     state_store(runtime, this, LAYOUT_COUNT, Variant::Integer(count));
-    state_store(runtime, this, LAYOUT_DELAY, Variant::Real(delay * time_scale));
+    // The accumulator is stored unscaled: `renderDelay` multiplies it by the
+    // current `timeScale` on every read, like the DLL's getter.
+    state_store(runtime, this, LAYOUT_DELAY, Variant::Real(delay));
     state_store(runtime, this, "renderCount", Variant::Integer(count));
     state_store(runtime, this, "renderLines", Variant::Integer(lines));
     let origins = line_origins
@@ -1549,7 +1801,6 @@ fn render(
     let height = state_int(runtime, this, RENDER_HEIGHT).unwrap_or(0).max(0);
     let over = (height > 0 && max_bottom > height) || (width > 0 && max_right > width);
     state_store(runtime, this, "renderOver", Variant::Integer(i64::from(over)));
-    state_store(runtime, this, "renderDelay", Variant::Real(delay * time_scale));
     state_store(runtime, this, "renderText", Variant::String(text));
     state_store(
         runtime,
@@ -1569,21 +1820,20 @@ fn attach_ruby(
     ruby: &str,
     group_base_width: i64,
     ruby_size: f64,
+    ruby_offset: f64,
 ) {
     let ruby_record = runtime.alloc_dictionary_object();
     let ruby_width = ruby.chars().count() as i64 * ruby_size as i64;
     let ruby_x = (group_base_width.max(ruby_width) - ruby_width) / 2;
     runtime.set_object_member(ruby_record, "text", Variant::String(ruby.to_string()));
     runtime.set_object_member(ruby_record, "x", Variant::Integer(ruby_x));
-    runtime.set_object_member(
-        ruby_record,
-        "left",
-        Variant::Integer(ruby_x),
-    );
+    runtime.set_object_member(ruby_record, "left", Variant::Integer(ruby_x));
+    // The ruby sits above the base glyph; `defaultRubyOffset` (reference -2)
+    // nudges it, as the DLL's ruby layout does.
     runtime.set_object_member(
         ruby_record,
         "y",
-        Variant::Integer(-(ruby_size as i64)),
+        Variant::Integer(-(ruby_size as i64) + ruby_offset as i64),
     );
     runtime.set_object_member(ruby_record, "size", Variant::Integer(ruby_size as i64));
     runtime.set_object_member(first, "ruby", Variant::Object(ruby_record));
@@ -1612,6 +1862,17 @@ fn line_origins(runtime: &Runtime<KrkrHost>, instance: ObjectHandle) -> Vec<f64>
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// `renderDelay` — the total wait the layout accumulated, times the *current*
+/// `timeScale`: the DLL's getter multiplies its accumulator by `[+0x54]` on
+/// every read (`FUN_10010e90`), so a `timeScale` write after the render still
+/// changes the answer. The game only tests it against 0, which is how it
+/// decides between drawing the text at once and running the reveal timer
+/// (`sysscn/rendermsgwin.tjs`).
+fn render_delay(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle) -> Result<Variant> {
+    let delay = state_real(runtime, instance, LAYOUT_DELAY).unwrap_or(0.0);
+    Ok(Variant::Real(delay * value_real(runtime, instance, "timeScale")))
 }
 
 /// `maxScrollOffset` — the DLL subtracts the render origin from the content
@@ -1799,65 +2060,67 @@ mod tests {
             .expect("string result")
     }
 
-    /// The checklist from the M27 dossier, independently typed: the 55 names in
-    /// the DLL's registration order with `true` for methods and `false` for
-    /// properties (the binary's command objects decide the kind).
-    const REFERENCE_SURFACE: &[(&str, bool)] = &[
-        ("setOption", true),
-        ("setDefault", true),
-        ("setRenderSize", true),
-        ("vertical", false),
-        ("timeScale", false),
-        ("fontScale", false),
-        ("clear", true),
-        ("resetFont", true),
-        ("resetStyle", true),
-        ("setFont", true),
-        ("setStyle", true),
-        ("render", true),
-        ("newline", true),
-        ("done", true),
-        ("onEval", true),
-        ("renderOver", false),
-        ("renderLines", false),
-        ("renderCount", false),
-        ("renderDelay", false),
-        ("renderLeft", false),
-        ("renderTop", false),
-        ("renderRight", false),
-        ("renderBottom", false),
-        ("contains", true),
-        ("renderText", false),
-        ("maxScrollOffset", false),
-        ("maxScrollLine", false),
-        ("getKeyWait", true),
-        ("calcLineOffset", true),
-        ("calcShowCount", true),
-        ("getCharacters", true),
-        ("getLinkNames", true),
-        ("getLinkRects", true),
-        ("getLinkCharacters", true),
-        ("isLinkContains", true),
-        ("getLinkOfPosition", true),
-        ("defaultFace", false),
-        ("defaultFontSize", false),
-        ("defaultBigFontSize", false),
-        ("defaultSmallFontSize", false),
-        ("defaultLineSize", false),
-        ("defaultLineSpacing", false),
-        ("defaultPitch", false),
-        ("defaultAlign", false),
-        ("defaultValign", false),
-        ("defaultRubySize", false),
-        ("defaultRubyOffset", false),
-        ("defaultChColor", false),
-        ("defaultShadow", false),
-        ("defaultShadowColor", false),
-        ("defaultShadowDiff", false),
-        ("defaultEdge", false),
-        ("defaultEdgeColor", false),
-        ("defaultBold", false),
-        ("defaultItalic", false),
+    /// The checklist from the M27 dossier and the DLL's command vftables,
+    /// independently typed: the 55 names in the DLL's registration order, with
+    /// `true` for methods and `false` for properties and the reference
+    /// signature each command object's mangled RTTI name carries.
+    #[rustfmt::skip]
+    const REFERENCE_SURFACE: &[(&str, bool, &str)] = &[
+        ("setOption", true, "void (tTJSVariant)"),
+        ("setDefault", true, "void (tTJSVariant)"),
+        ("setRenderSize", true, "void (float, float)"),
+        ("vertical", false, "bool"),
+        ("timeScale", false, "float"),
+        ("fontScale", false, "float"),
+        ("clear", true, "void ()"),
+        ("resetFont", true, "void ()"),
+        ("resetStyle", true, "void ()"),
+        ("setFont", true, "void (tTJSVariant)"),
+        ("setStyle", true, "void (tTJSVariant)"),
+        ("render", true, "bool (const tjs_char *, int, int, int, bool)"),
+        ("newline", true, "void ()"),
+        ("done", true, "void ()"),
+        ("onEval", true, "tTJSString (const tjs_char *)"),
+        ("renderOver", false, "bool"),
+        ("renderLines", false, "int"),
+        ("renderCount", false, "int"),
+        ("renderDelay", false, "float"),
+        ("renderLeft", false, "float"),
+        ("renderTop", false, "float"),
+        ("renderRight", false, "float"),
+        ("renderBottom", false, "float"),
+        ("contains", true, "bool (float, float) const"),
+        ("renderText", false, "const tjs_char *"),
+        ("maxScrollOffset", false, "float"),
+        ("maxScrollLine", false, "int"),
+        ("getKeyWait", true, "tTJSVariant () const"),
+        ("calcLineOffset", true, "float (int) const"),
+        ("calcShowCount", true, "int (int) const"),
+        ("getCharacters", true, "tTJSVariant (int, int) const"),
+        ("getLinkNames", true, "tTJSVariant ()"),
+        ("getLinkRects", true, "tTJSVariant (int) const"),
+        ("getLinkCharacters", true, "tTJSVariant (int) const"),
+        ("isLinkContains", true, "bool (int, float, float) const"),
+        ("getLinkOfPosition", true, "int (float, float)"),
+        ("defaultFace", false, "const tjs_char *"),
+        ("defaultFontSize", false, "float"),
+        ("defaultBigFontSize", false, "float"),
+        ("defaultSmallFontSize", false, "float"),
+        ("defaultLineSize", false, "float"),
+        ("defaultLineSpacing", false, "float"),
+        ("defaultPitch", false, "float"),
+        ("defaultAlign", false, "int"),
+        ("defaultValign", false, "int"),
+        ("defaultRubySize", false, "float"),
+        ("defaultRubyOffset", false, "float"),
+        ("defaultChColor", false, "unsigned int"),
+        ("defaultShadow", false, "bool"),
+        ("defaultShadowColor", false, "unsigned int"),
+        ("defaultShadowDiff", false, "int"),
+        ("defaultEdge", false, "bool"),
+        ("defaultEdgeColor", false, "unsigned int"),
+        ("defaultBold", false, "bool"),
+        ("defaultItalic", false, "bool"),
     ];
 
     /// The get-only properties: the DLL registers them with a null setter, so a
@@ -1884,7 +2147,7 @@ mod tests {
             SURFACE.len(),
             "the checklist covers every member"
         );
-        for (index, ((name, is_method), member)) in
+        for (index, ((name, is_method, signature), member)) in
             REFERENCE_SURFACE.iter().zip(SURFACE).enumerate()
         {
             assert_eq!(member.name, *name, "member {index} name");
@@ -1893,9 +2156,9 @@ mod tests {
                 method, *is_method,
                 "member {name}: kind differs from the DLL's command object"
             );
-            assert!(
-                !member.signature.is_empty(),
-                "member {name} carries its reference signature"
+            assert_eq!(
+                member.signature, *signature,
+                "member {name}: signature differs from the command's RTTI name"
             );
         }
     }
@@ -1915,7 +2178,7 @@ mod tests {
         names.sort();
         let mut expected = REFERENCE_SURFACE
             .iter()
-            .map(|(name, _)| (*name).to_string())
+            .map(|(name, _, _)| (*name).to_string())
             .collect::<Vec<_>>();
         // `finalize` comes from the DLL's class auto-registration, and the five
         // callback slots are this module's documented engine-compat members.
@@ -1927,7 +2190,7 @@ mod tests {
         );
         expected.sort();
         assert_eq!(names, expected);
-        for (name, is_method) in REFERENCE_SURFACE {
+        for (name, is_method, _) in REFERENCE_SURFACE {
             let member = runtime
                 .object_member(class, name)
                 .object_handle()
@@ -1994,25 +2257,29 @@ mod tests {
             r#"
             var render = new TextRenderBase();
             render.setOption(%[
-                "begin" => "b", "following" => "f", "leading" => "l",
+                "begin" => "b", "end" => "e", "following" => "f", "leading" => "l",
                 "vertical" => 1, "kinsoku_max" => 7, "word_break" => 0,
                 "ignore_color" => 1, "ignore_size" => 1, "ignore_delay" => 1,
                 "ignore_over" => 1, "ignore_overy" => 1, "ignore_overx" => 1,
                 "ignore_ruby" => 1, "ignore_type" => 1, "ignore_face" => 1,
                 "ignore_style" => 1, "ignore_xr" => 1, "width_time_scale" => 1,
-                "end" => 1, "bogus" => 1
+                "bogus" => 1
             ]);
             var state = render.__krkr_text_render;
-            return render.vertical + "/" + state.begin + "/" + state.following + "/" + state.leading + "/"
-                + state.kinsoku_max + "/" + state.word_break + "/" + state.ignore_color + "/"
-                + state.ignore_size + "/" + state.ignore_delay + "/" + state.ignore_over + "/"
-                + state.ignore_overy + "/" + state.ignore_overx + "/" + state.ignore_ruby + "/"
-                + state.ignore_type + "/" + state.ignore_face + "/" + state.ignore_style + "/"
-                + state.ignore_xr + "/" + state.width_time_scale + "/" + (state.end === void) + "/"
+            return render.vertical + "/" + state.begin + "/" + state.end + "/" + state.following + "/"
+                + state.leading + "/" + state.kinsoku_max + "/" + state.word_break + "/"
+                + state.ignore_color + "/" + state.ignore_size + "/" + state.ignore_delay + "/"
+                + state.ignore_over + "/" + state.ignore_overy + "/" + state.ignore_overx + "/"
+                + state.ignore_ruby + "/" + state.ignore_type + "/" + state.ignore_face + "/"
+                + state.ignore_style + "/" + state.ignore_xr + "/" + state.width_time_scale + "/"
                 + (state.bogus === void);
             "#,
         );
-        assert_eq!(value, "1/b/f/l/7/0/1/1/1/1/1/1/1/1/1/1/1/1/1/1");
+        // `end` sits between `begin` and `vertical` in the DLL's comparison order
+        // (`FUN_10001a70`) and is the second 10-character bracket set the game
+        // passes (`system/TextRender.tjs`: `t1["end"] = "」』）'"…"` for
+        // `autoIndentEndCharacters`).
+        assert_eq!(value, "1/b/e/f/l/7/0/1/1/1/1/1/1/1/1/1/1/1/1/1");
     }
 
     /// The style keys (`FUN_100022f0`) write the members the `default*`
@@ -2042,12 +2309,13 @@ mod tests {
         );
         assert_eq!(
             value,
-            "MS Gothic/1193046/0/16711935/4/1/65280/1/9/3/1/2/-3/24/30/60/15/30/12.5"
+            "MS Gothic/1193046/0/16711935/4/1/65280/1/9/3/1/2/-3/24/30/60/15/30/10"
         );
     }
 
     /// A `setDefault` without `linesize`/`linespacing` keeps the DLL's
-    /// constructor defaults for them; the derived ones follow `fontsize`.
+    /// constructor defaults for them; the derived ones follow `fontsize`, and
+    /// the ruby size divides by the `.rdata` double 3.0 at 0x1002c720.
     #[test]
     fn set_default_keeps_reference_defaults_for_unset_keys() {
         let value = run(
@@ -2059,7 +2327,7 @@ mod tests {
                 + render.defaultLineSpacing + "/" + Math.floor(render.defaultRubySize * 1000) / 1000;
             "#,
         );
-        assert_eq!(value, "20/50/5/20/6/8.333");
+        assert_eq!(value, "20/50/5/20/6/6.666");
     }
 
     /// The DLL's get-only properties reject a script write the way a null
@@ -2211,6 +2479,108 @@ mod tests {
         assert_eq!(value, "2/1/1");
     }
 
+    /// `getCharacters`' second argument is a count, 0 meaning "to the end"
+    /// (`FUN_10003d90`: `if (arg2 == 0) arg2 = renderCount - arg1`). PARQUET
+    /// asks for `getCharacters(0, 0)` in its message renderer and its redraw
+    /// path and draws every record it gets back, so an empty answer draws no
+    /// dialogue at all.
+    #[test]
+    fn get_characters_second_argument_is_a_count() {
+        let value = run(
+            r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("abcde");
+            var all = render.getCharacters(0, 0);
+            var tail = render.getCharacters(2, 0);
+            var slice = render.getCharacters(1, 2);
+            var none = render.getCharacters(4, 1);
+            var from_one = render.getCharacters(3);
+            var texts = "";
+            var i = 0;
+            while (i < slice.count) { texts += slice[i].text, i = i + 1; }
+            return all.count + "/" + all[4].text + "/" + tail.count + "/" + slice.count + "/"
+                + texts + "/" + none.count + "/" + from_one.count;
+            "#,
+        );
+        assert_eq!(value, "5/e/3/2/bc/1/2");
+    }
+
+    /// `calcShowCount(elapsed)` (`FUN_10011080`) is the typewriter clock: the
+    /// number of characters whose display time — the per-character wait times
+    /// `timeScale` — has come at `elapsed` milliseconds.
+    #[test]
+    fn calc_show_count_reveals_characters_over_elapsed_time() {
+        let value = run(
+            r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("abcd");
+            var start = render.calcShowCount(0);
+            var one = render.calcShowCount(1);
+            var two = render.calcShowCount(2);
+            var all = render.calcShowCount(100);
+            var waits = render.getCharacters()[1].time;
+            render.timeScale = 2;
+            var scaled = render.calcShowCount(2);
+            return start + "/" + one + "/" + two + "/" + all + "/" + waits + "/" + scaled + "/"
+                + render.renderDelay;
+            "#,
+        );
+        // Each glyph waits one unit, so at 2 the third is still pending; with
+        // `timeScale` 2 only one character has arrived at 2.
+        assert_eq!(value, "0/1/2/4/2/1/8");
+    }
+
+    /// `render`'s remaining arguments are not a font size: PARQUET passes the
+    /// auto-indent there (1 by default) and sets the size through the Font, so
+    /// reading argument 1 as a size laid every glyph out one pixel wide.
+    #[test]
+    fn render_arguments_beyond_the_text_do_not_resize_the_glyphs() {
+        let value = run(
+            r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("a", 1, 0);
+            var char = render.getCharacters(0, 0)[0];
+            return char.size + "/" + (char.width > 1);
+            "#,
+        );
+        assert_eq!(value, "20/1");
+    }
+
+    /// A ruby annotation count read out of message text is clamped instead of
+    /// overflowing the group counter.
+    #[test]
+    fn ruby_annotation_count_cannot_overflow() {
+        let value = run(
+            r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("[あ,18446744073709551615]ab");
+            var chars = render.getCharacters(0, 0);
+            var ruby = "";
+            if (chars[0].ruby !== void) {
+                ruby = chars[0].ruby.text;
+            }
+            return chars.count + "/" + chars[0].text + "/" + ruby;
+            "#,
+        );
+        assert_eq!(value, "2/a/あ");
+    }
+
     /// `clear` empties the character list, `newline` starts the next render on a
     /// fresh line and `resetStyle`/`resetFont` drop the style members the DLL's
     /// readers clear.
@@ -2236,29 +2606,48 @@ mod tests {
             // `newline` breaks the layout before the next text, so the second
             // render holds the one glyph that follows the break.
             var break_y = chars[0].y;
-            render.setDefault(%["fontsize" => 30, "face" => "X", "color" => 0x111111]);
-            render.resetStyle();
-            var style = render.defaultFontSize + "/" + render.defaultFace + "/" + render.defaultChColor;
-            render.setDefault(%["fontsize" => 30, "pitch" => 4]);
+            // `system/LangRender.tjs` writes a default and applies it with the
+            // matching reset: `defaultFace = kag.getLanguageFont(a5), resetFont()`
+            // and `defaultLineSpacing = …, resetStyle()`. The resets copy the
+            // stored defaults into the active style and never clear them.
+            render.setDefault(%["face" => "Lang", "fontsize" => 30, "linespacing" => 20]);
             render.resetFont();
-            var font_reset = render.defaultFontSize + "/" + (render.defaultPitch == 0);
+            render.resetStyle();
+            render.render("a\nb");
+            var styled = render.getCharacters();
+            var active = styled[0].face + "/" + styled[1].y;
+            var defaults = render.defaultFace + "/" + render.defaultFontSize + "/"
+                + render.defaultLineSpacing;
+            // `setFont(dict)` writes the active style, not the default — and it
+            // must not clobber the `font` member the game's own `onGetTextWidth`
+            // measures through (`system/LangRender.tjs` calls
+            // `TextRenderBase.setFont(%["face" => defaultFace])`).
+            render.setFont(%["face" => "Pressed"]);
+            render.render("c");
+            var pressed = render.getCharacters()[0].face + "/" + render.defaultFace + "/"
+                + (render.font !== void);
             var sliced = render.getCharacters(0, 1).count;
             return before + "/" + cleared + "/" + chars.count + "/" + after_break + "/"
-                + (break_y > 0) + "/" + style + "/" + font_reset + "/" + sliced + "/"
+                + (break_y > 0) + "/" + active + "/" + defaults + "/" + pressed + "/" + sliced + "/"
                 + render.getLinkNames().count + "/" + render.getLinkRects(0).count + "/"
                 + render.getLinkCharacters(0).count + "/" + render.isLinkContains(0, 1, 1) + "/"
                 + render.getLinkOfPosition(1, 1);
             "#,
         );
+        // The active face reaches the character records, the reset style's line
+        // spacing (20) steps the second line to 20 + the derived line size 30,
+        // the defaults the script wrote survive the resets, and the `font`
+        // member the game measures through is untouched by the dictionary call.
         assert_eq!(
             value,
-            "3/0/1/2/1/24/normal/4294967295/24/1/1/0/0/0/0/-1"
+            "3/0/1/2/1/Lang/50/Lang/30/20/Pressed/Lang/1/1/0/0/0/0/-1"
         );
     }
 
     /// The script-facing members a subclass relies on: `vertical` read through
     /// the property (the bytecode reads it as a bare symbol), `onEval` on a
-    /// subclass, and the character objects' callback slots.
+    /// subclass, the character objects' callback slots, and the `onFontChange`
+    /// notification the DLL fires when the active font attributes change.
     #[test]
     fn subclass_reads_vertical_and_keeps_its_own_callbacks() {
         let value = run(
@@ -2266,12 +2655,20 @@ mod tests {
             class ProbeRender extends TextRenderBase {
                 function ProbeRender() {
                     TextRenderBase.TextRenderBase();
+                    this.fontChanges = 0;
                 }
                 function readVertical() {
                     return vertical;
                 }
                 function onEval(text) {
                     return "eval:" + text;
+                }
+                // The DLL passes the active style; the game's own handler reads
+                // `a0.face` / `a0.bold` / `a0.italic` off it.
+                function onFontChange(style) {
+                    this.seenFace = style.face;
+                    this.seenBold = style.bold;
+                    this.fontChanges = fontChanges + 1;
                 }
             }
             var render = new ProbeRender();
@@ -2284,11 +2681,50 @@ mod tests {
             options.vertical = 2;
             render.setOption(options);
             var via_dictionary = render.readVertical();
+            render.setDefault(%["face" => "First"]);
+            render.resetFont();
+            render.setFont(%["face" => "Second", "bold" => 1]);
             return before + "/" + literal + "/" + via_dictionary + "/" + render.onEval("1+1") + "/"
-                + (render.onGetTextWidth === void);
+                + (render.onGetTextWidth === void) + "/" + render.fontChanges + "/"
+                + render.seenFace + "/" + render.seenBold;
             "#,
         );
-        assert_eq!(value, "0/1/1/eval:1+1/1");
+        assert_eq!(value, "0/1/1/eval:1+1/1/2/Second/1");
+    }
+
+    /// `setStyle` (`FUN_10002e30`) writes the *active* layout, so a later
+    /// `setDefault` with the same key does not disturb it until a `resetStyle`
+    /// copies the default in.
+    #[test]
+    fn set_style_writes_the_active_layout_not_the_defaults() {
+        let value = run(
+            r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.setStyle(%["pitch" => 5, "linespacing" => 12]);
+            render.render("ab");
+            var line = render.getCharacters(0, 0);
+            var pitch = line[1].left - line[0].left - line[0].width;
+            render.render("a\nb");
+            var styled = render.getCharacters(0, 0);
+            var line_step = styled[1].y;
+            render.setDefault(%["linespacing" => 40]);
+            render.render("a\nb");
+            var after_default = render.getCharacters(0, 0)[1].y;
+            render.resetStyle();
+            render.render("a\nb");
+            var after_reset = render.getCharacters(0, 0)[1].y;
+            return pitch + "/" + line_step + "/" + after_default + "/" + after_reset + "/"
+                + render.defaultLineSpacing;
+            "#,
+        );
+        // pitch 5 reaches the advance, the active line spacing 12 steps the
+        // second line to 24 + 12, the default 40 stays out of the layout until
+        // `resetStyle` applies it (24 + 40).
+        assert_eq!(value, "5/36/36/64/40");
     }
 
     /// Members outside the 55 the dossier inventoried: the three a previous
@@ -2324,4 +2760,5 @@ mod tests {
         // such member (M27 corrected the M24 census line).
         assert!(member("setRender").is_none());
     }
+
 }
