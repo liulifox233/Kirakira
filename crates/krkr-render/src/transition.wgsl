@@ -1,3 +1,35 @@
+// Transition kernels.
+//
+// Each function below is one transition method's per-pixel kernel.  The options
+// they read and the fidelity of each against the reference source are recorded
+// per variant on krkr-core's `TransitionMethod`; the verdicts are:
+//
+//   crossfade      faithful     `TVPConstAlphaBlend_SD` over the scene beneath
+//                               (the composite plan's own test proves it)
+//   wave           faithful     ported element by element from `extrans/wave.cpp`
+//                               in M36; the deviations it records are listed at
+//                               the kernel
+//   universal      approximate  the rule graphic is read as a scroll texture and
+//                               the phase advances with `progress` instead of the
+//                               reference's tick clock
+//   scroll         approximate  direction from the numeric `from` code only, band
+//                               widths linear in `progress`
+//   mosaic         approximate  sine block ramp against the reference's integer
+//                               triangle, grid anchored at the frame origin
+//                               instead of re-centred on the image
+//   turn           approximate  no fold table, no specular gloss, pseudo-random
+//                               tile order instead of the diagonal phase sweep
+//   rotatezoom     approximate  twist runs the other way, fixed pivot, in-quad
+//                               crossfade where the reference copies pixels
+//   rotatevanish   approximate  closest of the six; the same three deviations
+//   rotateswap     approximate  crossfade instead of region layering, no lateral
+//                               slide, no vertical squash, linear scale ramps
+//   ripple         approximate  travelling Gaussian band instead of the cached
+//                               standing wave; `rwidth`/`speed` reinterpreted
+//
+// No kernel degrades to another method: a name that resolves to a method always
+// runs that method's kernel.
+
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) tex_coord: vec2<f32>,
@@ -10,7 +42,7 @@ struct VertexOutput {
 };
 
 struct TransitionUniforms {
-    data: array<vec4<f32>, 8>,
+    data: array<vec4<f32>, 12>,
 };
 
 @group(0) @binding(0)
@@ -33,6 +65,12 @@ var rule_image: texture_2d<f32>;
 
 @group(0) @binding(6)
 var rule_sampler: sampler;
+
+@group(0) @binding(7)
+var under_image: texture_2d<f32>;
+
+@group(0) @binding(8)
+var under_sampler: sampler;
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
@@ -153,24 +191,142 @@ fn transition_scroll(uv: vec2<f32>) -> vec4<f32> {
     return transparent;
 }
 
+// Screen transitions run over the whole frame surface; these accessors expose
+// the extra state the extrans kernels need on top of `data[0..8]`.
+//
+//   data[8]  = the destination layer's rectangle in logical frame pixels
+//              (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6513-6540`); zero
+//              width/height means the destination has no measurable geometry.
+//   data[9]  = logical -> physical transform of the frame (scale, offset x,
+//              offset y) and whether the under pass (binding 7) was rendered.
+//   data[10] = the transition's duration in milliseconds (`Time`), 0 when the
+//              caller did not supply the clock.
+fn image_rect() -> vec4<f32> {
+    return uniforms.data[8];
+}
+
+fn transform_scale() -> f32 {
+    return max(uniforms.data[9].x, 1.0e-6);
+}
+
+fn transform_offset() -> vec2<f32> {
+    return uniforms.data[9].yz;
+}
+
+fn under_available() -> bool {
+    return uniforms.data[9].w >= 0.5;
+}
+
+fn duration_millis() -> f32 {
+    return max(uniforms.data[10].x, 0.0);
+}
+
+// `BlendRatio = CurTime * 255 / Time` (`extrans/wave.cpp:156`).  `Blend` scales
+// by 1/256 rather than 1/255 (`common.h:18-31`), so the blend factor is the
+// reference's integer ratio over 256.  Without the millisecond clock the phase
+// is the ratio itself.
+fn wave_blend_ratio(timed: bool, cur_time: f32, total: f32, p: f32) -> f32 {
+    if (!timed) {
+        return p;
+    }
+    return floor(cur_time * 255.0 / total) / 256.0;
+}
+
+// `wave` (`extrans/wave.cpp:16-265`): raster scroll.  Each destination row is
+// shifted by `d = (int)(sin(y*CurOmega + CurRadStart) * CurH)` samples, the
+// vacated strip on the row becomes the animated `bgcolor1 -> bgcolor2` colour,
+// and the covered span lerps `Src1` into `Src2` at `BlendRatio`
+// (`tTVPWaveTransHandler::Process`, `wave.cpp:173-261`).  Options: `maxh` (50),
+// `maxomega` (0.2), `bgcolor1`/`bgcolor2` (0), `wavetype` (0).
+//
+// Deviations the M36 port records rather than hides:
+//   * the reference runs on the integer millisecond clock (`CurTime =
+//     tick - StartTick`, `wave.cpp:129-133`); this kernel rebuilds it from
+//     `progress` and `data[10].x`, and only when the caller supplied no clock
+//     (`Time == 0`) does it use the normalized phase, which is the same curve
+//     minus the millisecond quantization;
+//   * the destination layer type (`ltAlpha`/`ltAddAlpha`, `wave.cpp:238-246`)
+//     has no channel in the transition model, so the plain
+//     `TVPConstAlphaBlend_SD` path runs;
+//   * the lerp is the float form of the reference's per-byte integer
+//     `a + ((b-a)*opa >> 8)` (`common.h:26`), so it can differ by 1/255;
+//   * the composite's `old`/`new` faces are whole scenes (the destination's
+//     bitmap composited over the scene beneath), so for covered pixels that
+//     scene is read at the *shifted* position where the reference composites
+//     the blended bitmap over the unshifted scene.  Both agree wherever the
+//     layer bitmaps are opaque; semi-transparent layers shift what shows
+//     through by `d`.
 fn transition_wave(uv: vec2<f32>) -> vec4<f32> {
     let p = progress();
-    let screen = viewport_size();
-    let pi = 3.14159265359;
-    var envelope = sin(p * pi);
-    let wave_type = uniforms.data[2].y;
-    if (wave_type >= 1.5) {
-        envelope = p;
-    } else if (wave_type >= 0.5) {
-        envelope = 1.0 - p;
+    let frame = viewport_size();
+    let image = image_rect();
+    let scale = transform_scale();
+    let origin = transform_offset();
+
+    // The reference's handlers work in the destination bitmap's own pixels
+    // (`tTVPDivisibleData::Left/Top/Width/Height`, `LayerIntf.cpp:6513-6540`);
+    // image pixels are the layer's logical pixels.
+    let local = (uv * frame - origin) / scale - image.xy;
+
+    // `StartProcess` (`wave.cpp:120-166`).
+    let time = duration_millis();
+    let timed = time > 0.0;
+    let total = select(1.0, time, timed);
+    let cur_time = select(p, p * total, timed);
+    // `HalfTime = Time / 2` is integer division (`wave.cpp:47`).
+    let half = select(0.5, floor(total * 0.5), timed);
+    var t = clamp(cur_time, 0.0, total);
+    if (t >= half) {
+        t = total - t;
     }
-    let max_h = uniforms.data[2].z;
+    let ramp = sin((3.14159265359 * 0.5) * t / half);
+    // `CurH = tt * MaxH` (`:145`), truncated to `tjs_int`.
+    let cur_h = trunc(ramp * uniforms.data[2].z);
+    // `CurOmega` per `wavetype` (`:147-158`); `wavetype` is read as `tjs_int`, so
+    // anything outside 0..2 follows the default branch (the reference's switch
+    // leaves `CurOmega` untouched there).
+    let wave_type = trunc(uniforms.data[2].y);
     let max_omega = uniforms.data[2].w;
-    let offset = sin(uv.y * screen.y * max_omega + p * pi * 4.0) * envelope * max_h / screen.x;
-    let bg = mix(uniforms.data[3], uniforms.data[4], p);
-    let old_color = sample_old(uv + vec2<f32>(offset * (1.0 - p), 0.0), bg);
-    let new_color = sample_new(uv - vec2<f32>(offset * p, 0.0), bg);
-    return mix(old_color, new_color, p);
+    var omega = max_omega * ramp;
+    if (wave_type == 1.0) {
+        omega = max_omega * (total - cur_time) / total;
+    }
+    if (wave_type == 2.0) {
+        omega = max_omega * cur_time / total;
+    }
+    // `rad = data->Top * CurOmega + CurRadStart` (`wave.cpp:175,183`): one phase
+    // per integer image row (`data->Top + n`), so the row index floors.
+    let rad = floor(local.y) * omega - omega * floor(image.w * 0.5);
+    // `d = (int)(sin(rad) * CurH)` (`:186`).
+    let d = trunc(sin(rad) * cur_h);
+    let ratio = wave_blend_ratio(timed, cur_time, total, p);
+
+    // `Clip(l, r, Left, Left + Width)` (`:227-236`): outside the covered span the
+    // destination bitmap's samples are replaced by `CurBGColor`.
+    let src_x = local.x - d;
+    if (src_x < 0.0 || src_x >= image.z) {
+        // `TVPFillARGB(dest, ..., CurBGColor)` (`:203-221`) writes the colour into
+        // the destination's own bitmap; the layer manager then composites that
+        // bitmap over the scene beneath, which is the `under` pass.
+        let bg = mix(uniforms.data[3], uniforms.data[4], ratio);
+        if (!under_available()) {
+            return bg;
+        }
+        let under = textureSample(under_image, under_sampler, uv);
+        return vec4<f32>(
+            bg.rgb * bg.a + under.rgb * (1.0 - bg.a),
+            bg.a + under.a * (1.0 - bg.a),
+        );
+    }
+
+    // `TVPConstAlphaBlend_SD(dest, src1, src2, len, BlendRatio)` (`:238-246`):
+    // both bitmaps are read at the shifted column and lerped sample by sample.
+    let shifted = uv - vec2<f32>(d * scale / frame.x, 0.0);
+    return mix(
+        textureSample(old_image, old_sampler, shifted),
+        textureSample(new_image, new_sampler, shifted),
+        ratio,
+    );
 }
 
 fn transition_mosaic(uv: vec2<f32>) -> vec4<f32> {

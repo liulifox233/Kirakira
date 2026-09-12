@@ -897,22 +897,184 @@ pub enum DrawCommand {
     Image(ImageCommand),
 }
 
+/// The transition providers this build has a kernel for, keyed by the exact
+/// name the reference registers (`TVPAddTransHandlerProvider`,
+/// `TransIntf.cpp:307-324`, which stores `iTVPTransHandlerProvider::GetName`).
+///
+/// `crossfade`, `universal` and `scroll` are the reference's built-ins
+/// (`TVPRegisterDefaultTransHandlerProvider`, `TransIntf.cpp:1196-1213`); the
+/// other seven come from `extrans.dll` (`extrans/Main.cpp:32-36` and each
+/// provider's `GetName`, e.g. `wave.cpp:297`, `mosaic.cpp:408`, `turn.cpp:526`,
+/// `rotatetrans.cpp:152/252/424`, `ripple.cpp:1549`).
+///
+/// Providers that a *loaded plugin* registers but this build has no kernel for
+/// -- extNagano's twelve names, GlitchEffect's three, the kaicho family -- are
+/// deliberately absent: official only resolves a name while some registered
+/// provider answers to it, so the engine's lookup has to consult the plugin
+/// host's provider registry for those and decide between registering a
+/// provider and reporting the name as unknown.  See `UnknownTransitionName`.
+pub const TRANSITION_PROVIDER_NAMES: &[(&str, TransitionMethod)] = &[
+    ("crossfade", TransitionMethod::Crossfade),
+    ("universal", TransitionMethod::Universal),
+    ("scroll", TransitionMethod::Scroll),
+    ("wave", TransitionMethod::Wave),
+    ("mosaic", TransitionMethod::Mosaic),
+    ("turn", TransitionMethod::Turn),
+    ("rotatezoom", TransitionMethod::RotateZoom),
+    ("rotatevanish", TransitionMethod::RotateVanish),
+    ("rotateswap", TransitionMethod::RotateSwap),
+    ("ripple", TransitionMethod::Ripple),
+];
+
+/// A transition provider name, and the kernel state of its implementation in
+/// this build.
+///
+/// Every name in `TRANSITION_PROVIDER_NAMES` has a kernel in
+/// `krkr-render/transition.wgsl`.  The fidelity of the ones that predate the
+/// M36 port is *approximate* and recorded per variant below, so no silent
+/// approximation survives in the code: `mosaic`, `turn`, the three rotate
+/// kernels and `ripple` reproduce the family of effect, not the reference's
+/// element-by-element result, and each variant documents what differs.  `wave`
+/// is the one ported against `extrans/wave.cpp` directly (M36).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum TransitionMethod {
+    /// `tTVPCrossFadeTransHandlerProvider` (`TransIntf.cpp:1196`).
+    ///
+    /// Faithful: the composite reproduces `TVPConstAlphaBlend_SD`
+    /// (`TransIntf.cpp:680`, per-channel lerp including alpha) over the scene
+    /// beneath the destination layer; the expansion and its test live in
+    /// `krkr-render` (`transition_composite_plan`, `composite_plan_reproduces_...`).
     Crossfade = 0,
+    /// `tTVPUniversalTransHandler` (`TransIntf.cpp:777`): 8-bit rule graphic,
+    /// `vague` (default 64) as the softness ramp.
+    ///
+    /// Approximate: the reference advances a `tjs_int` phase and blends through
+    /// the rule's threshold; the kernel walks `progress * (1 + vague)` and
+    /// reads the rule as a scroll-and-repeat texture instead of the reference's
+    /// `GetScanLine` sampling, and it samples the rule in frame space rather
+    /// than at the destination rectangle's image coordinates.
     Universal = 1,
+    /// `tTVPScrollTransHandler` (`TransIntf.cpp:925`): `from` picks the
+    /// direction, `stay` keeps one face in place.
+    ///
+    /// Approximate: same three-part composition (leaving face, entering face,
+    /// empty band), but the kernel resolves the direction from the numeric
+    /// `from` code only and the band widths follow `progress` linearly while
+    /// the reference computes its phase from the tick clock.
     Scroll = 2,
+    /// `wave` (`extrans/wave.cpp:16-265`): raster scroll, `maxh` (50),
+    /// `maxomega` (0.2), `bgcolor1`/`bgcolor2` (0), `wavetype` (0).
+    ///
+    /// Faithful: ported element by element in M36, with the deviations the port
+    /// could not remove recorded at the kernel (`krkr-render/transition.wgsl`,
+    /// `transition_wave`): the millisecond clock is reconstructed from
+    /// `progress` and `TransitionParams::duration_millis`, the destination
+    /// layer type has no channel in the model, the lerp is the float form of
+    /// the reference's per-byte integer blend, and a non-opaque destination
+    /// reads the scene beneath at the shifted position.
     Wave = 3,
+    /// `mosaic` (`extrans/mosaic.cpp:11`): `maxsize` (30), one averaged colour
+    /// per animated block.
+    ///
+    /// Approximate: the reference ramps the block size as the integer triangle
+    /// `(maxsize-2) * t/HalfTime + 2` and re-anchors the block grid to the image
+    /// centre every frame (`mosaic.cpp:123-143`), while the kernel uses a float
+    /// `1 + sin(pi*p) * maxsize` ramp with the grid anchored at the frame
+    /// origin; the reference samples the block's centre pixel exactly and
+    /// fills the block with `Blend`, the kernel samples through a bilinear
+    /// sampler.
     Mosaic = 4,
+    /// `turn` (`extrans/turn.cpp:15`): `bgcolor` (0), 64x64 tiles folded by a
+    /// generated per-phase line table plus a specular gloss.
+    ///
+    /// Approximate: the kernel has neither the fold table
+    /// (`turntrans_table.cpp`, 63 x 64 entries of 16.16 source scans) nor the
+    /// diagonal phase sweep (`phase = Phase - (x-y)*2`, `turn.cpp:141-144`)
+    /// nor the gloss; it squeezes each tile horizontally and reveals the tiles
+    /// in a pseudo-random order (`transition.wgsl`, `hash_tile`).
     Turn = 5,
+    /// `rotatezoom` (`extrans/rotatetrans.cpp:18-120`): `factor` (1),
+    /// `accel` (0), `twist` (2), `twistaccel` (-2), `centerx`/`centery`
+    /// (w/2, h/2), destination fixed and the source rotated/scaled to 1.
+    ///
+    /// Approximate: the scale and twist ramps match (`pow`/`1-(1-x)^-a`,
+    /// `rotatetrans.cpp:72-103`) but the kernel spins the source the opposite
+    /// way (`2*pi*twist*(1 - ramp)` against `2*pi*Twist*ramp`, `:105`), keeps a
+    /// fixed pivot where the reference drifts the centre toward the screen
+    /// centre (`:89-90`), rotates in aspect-normalized uv (a shear on
+    /// non-square frames) and cross-fades inside the quad where the reference
+    /// copies pixels (`:117`, `rotatebase.cpp` has no blending).
     RotateZoom = 6,
+    /// `rotatevanish` (`extrans/rotatetrans.cpp:222-316`): the same handler
+    /// with `factor` 1 -> 0 and the source not fixed; `accel` (2), `twist` (2),
+    /// `twistaccel` (2).
+    ///
+    /// Approximate, and the closest of the six: scale ramp `1 - pow(p, accel)`,
+    /// twist sign and ramp `2*pi*twist*pow(p, twistaccel)`, which face is the
+    /// background and what the pixels outside the quad show all match.  What
+    /// differs is the same as `RotateZoom` (in-quad crossfade, aspect shear,
+    /// fixed pivot, bilinear taps instead of integer copies).
     RotateVanish = 7,
+    /// `rotateswap` (`extrans/rotatetrans.cpp:318-475`): `bgcolor` (0),
+    /// `twist` (1); the two faces spin out and in, one on top of the other.
+    ///
+    /// Approximate: the twist angles match in sign and magnitude, but the
+    /// reference gives each face a lateral sine slide and a vertical squash
+    /// (`:352-387`), uses the `zm^2` / `1-(1-zm)^2` ramps, and composites the
+    /// two faces as hard-edged regions that switch order at half time, while
+    /// the kernel only cross-fades them.
     RotateSwap = 8,
+    /// `ripple` (`extrans/ripple.cpp:1519`): `centerx`/`centery`,
+    /// `rwidth` (128, 16/32/64/128), `roundness` (1.0), `speed` (6 rad/s),
+    /// `maxdrift` (24).
+    ///
+    /// Approximate: the reference evaluates a standing displacement wave from
+    /// cached `DisplaceMap`/`DriftMap` tables (`ripple.cpp:148-263`) whose
+    /// amplitude is `sin(pi*CurTime/Time)`, quantized to 8.8 fixed point and
+    /// mirror-wrapped at the borders, while the kernel draws a travelling
+    /// Gaussian band around a centre-out front, uses `rwidth` as a band width
+    /// instead of the wave's wavelength mask and `speed` as a spatial frequency
+    /// instead of a phase advance.
     Ripple = 9,
 }
 
 impl TransitionMethod {
+    /// The reference's provider lookup (`TVPFindTransHandlerProvider`,
+    /// `TransIntf.cpp:341-359`): a hash-table find on the name, so the match is
+    /// **exact and case-sensitive** -- `"Wave"` is not `"wave"`, and the
+    /// reference throws for it.
+    ///
+    /// `name` is the caller's own spelling; `UnknownTransitionName` carries it
+    /// back so the script sees the official text.
+    ///
+    /// The plugin-provided names (`extnagano`: `zoomfade`, `blurfade`,
+    /// `scanline`, `3duniversal`, `rgbfade`, `spin`, `flutter`, `imagewipe`,
+    /// `book`, `honeyturn`, `morphing`, `multiripple`; `GlitchEffect`:
+    /// `glitch`, `fadeglitch`, `loopglitch`) are not in the table: official
+    /// resolves them only while the plugin's provider is registered, and this
+    /// build's plugin host does not publish a provider registry yet.  A caller
+    /// that has one must check it *before* reporting the name as unknown.
+    pub fn try_from_name(name: &str) -> Result<Self, UnknownTransitionName> {
+        TRANSITION_PROVIDER_NAMES
+            .iter()
+            .find(|(provider, _)| *provider == name)
+            .map(|(_, method)| *method)
+            .ok_or_else(|| UnknownTransitionName::new(name))
+    }
+
+    /// The lenient name mapping the engine's transition call sites use.
+    ///
+    /// It lower-cases the name and maps everything it does not know to
+    /// `Crossfade`.  That is neither the reference's behaviour
+    /// (`try_from_name`: a provider lookup that throws
+    /// `TVPCannotFindTransHander`, `TransIntf.cpp:354`) nor Kirikiroid2's
+    /// (one warning box, then crossfade,
+    /// `Kirikiroid2/src/core/visual/TransIntf.cpp:365-372`); it is Kirakira's
+    /// own silent degradation and the reason the fidelity table above records
+    /// each kernel's state.  New call sites use `try_from_name` and report
+    /// `UnknownTransitionName::message()`; this stays for the paths that must
+    /// not abort a scenario until they are migrated.
     pub fn from_name(name: &str) -> Self {
         let name = name.to_ascii_lowercase();
         match name.as_str() {
@@ -949,6 +1111,59 @@ impl TransitionMethod {
         }
     }
 }
+
+/// The reference's `TVPCannotFindTransHander` (`TransIntf.cpp:354`): the name
+/// no registered provider answered to.
+///
+/// Script identity: `TVPFindTransHandlerProvider` reports it through
+/// `TVPThrowExceptionMessage` (`MsgIntf.cpp:123-140`), a message-only
+/// `eTJSError`.  At a script `try` boundary
+/// `TJS_CONVERT_TO_TJS_EXCEPTION_OBJECT` builds the caught object with
+/// `TJSGetExceptionObject(tjs, result, msg, NULL)`
+/// (`tjs2/tjsError.h:115-146`; the try opcode is `tjsInterCodeExec.cpp:1551-1586`),
+/// so the script sees:
+///
+/// * `e.message == message()` -- the exception text and nothing else,
+/// * no numeric `tjs_error` code: an `eTJSError` is not built from a `tjs_error`
+///   value, so the engine raises it as `TjsError::runtime(...)`
+///   (`TjsErrorKind::Runtime`, whose `tjs_error_code()` is `None`),
+/// * no `trace`: the reference passes `NULL` for the trace, so the exception is
+///   message-only where a caught `throw` carries a trace.
+///
+/// KAG3 does not catch it inside the tag: `MainWindow.tjs:5482-5487` calls
+/// `beginTransition` directly.  The Conductor's outer loop catches it, stops the
+/// scenario (`timer.enabled = false`, `onStop()`), reports `dm(msg)` and
+/// rethrows a `ConductorException` to the global exception handler (kirikiri2
+/// `kag3/template/system/Conductor.tjs:55-186`), so an unknown name kills the
+/// scenario instead of degrading it.  Kirikiroid2 is the outlier: one warning
+/// box, then the `crossfade` provider
+/// (`Kirikiroid2/src/core/visual/TransIntf.cpp:365-372`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnknownTransitionName {
+    /// The name exactly as the caller spelled it: `TVPFormatMessage` substitutes
+    /// it into the message verbatim, so `"Wave"` stays `"Wave"`.
+    pub name: String,
+}
+
+impl UnknownTransitionName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    /// The text the reference substitutes `%1` into
+    /// (`IDS_TVP_CANNOT_FIND_TRANS_HANDER`, `vc2012/string_table_en.rc:154`).
+    pub fn message(&self) -> String {
+        format!("Cannot find transition handler {}", self.name)
+    }
+}
+
+impl fmt::Display for UnknownTransitionName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for UnknownTransitionName {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -990,6 +1205,23 @@ pub struct TransitionParams {
     pub roundness: f32,
     pub speed: f32,
     pub max_drift: f32,
+    /// The transition's duration in milliseconds: exactly the `time` option the
+    /// reference constructs its handler with (`tTVPWaveTransHandler::Time`,
+    /// `wave.cpp:324-336`; the crossfade family clamps it to >= 2,
+    /// `TransIntf.cpp:528`).  Milliseconds, whole number, non-negative, no wrap
+    /// (the reference stores it in a `tjs_uint64`); `f32` holds every duration a
+    /// game can specify (`2^24` ms is over four and a half hours, and above that
+    /// only sub-millisecond precision is lost, which the reference's integer
+    /// clock never needs).
+    ///
+    /// The extrans kernels need it because their ramps run on the millisecond
+    /// clock (`CurTime = tick - StartTick`, `wave.cpp:130-160`;
+    /// `BlendRatio = CurTime * 255 / Time`, `:156`; `ripple.cpp:1258-1266`),
+    /// not on the normalized phase.  `0.0` means "the caller did not supply the
+    /// clock": the kernel then derives the clock from `FrameTransition::progress`
+    /// (`CurTime ~= progress * Time`), which is the same curve minus the
+    /// reference's integer-millisecond quantization.
+    pub duration_millis: f32,
 }
 
 impl Default for TransitionParams {
@@ -1002,10 +1234,15 @@ impl Default for TransitionParams {
             wave_type: 0.0,
             max_h: 50.0,
             max_omega: 0.2,
-            bg_color1: Color::new(0.0, 0.0, 0.0, 1.0),
-            bg_color2: Color::new(0.0, 0.0, 0.0, 1.0),
+            // The reference's own defaults are `bgcolor1 = 0` / `bgcolor2 = 0`
+            // (`wave.cpp:327-331`, `turn.cpp:555-564`, `rotatetrans.cpp:181-210`)
+            // and a `tjs_uint32` option value is ARGB, so `0` is transparent
+            // black and a kernel that fills a vacated region with it lets the
+            // scene beneath the layer show through (`wave.cpp:203-221`).
+            bg_color1: Color::new(0.0, 0.0, 0.0, 0.0),
+            bg_color2: Color::new(0.0, 0.0, 0.0, 0.0),
             max_size: 30.0,
-            bg_color: Color::new(0.0, 0.0, 0.0, 1.0),
+            bg_color: Color::new(0.0, 0.0, 0.0, 0.0),
             factor: 1.0,
             accel: 0.0,
             twist: 2.0,
@@ -1016,6 +1253,7 @@ impl Default for TransitionParams {
             roundness: 1.0,
             speed: 6.0,
             max_drift: 24.0,
+            duration_millis: 0.0,
         }
     }
 }
@@ -3656,6 +3894,69 @@ mod tests {
         assert!(
             matches!(store.poll().as_slice(), [SaveEvent::Loaded { id, data: None, .. }]
             if *id == missing_id)
+        );
+    }
+
+    /// The provider lookup is the reference's hash find (`TransIntf.cpp:341-359`):
+    /// every registered name resolves to its kernel, and the match is exact --
+    /// `"Wave"` is not the registered `"wave"` and is unknown to the reference.
+    #[test]
+    fn transition_name_lookup_is_the_reference_exact_match() {
+        for (name, method) in TRANSITION_PROVIDER_NAMES {
+            assert_eq!(TransitionMethod::try_from_name(name), Ok(*method));
+            assert_eq!(method.as_name(), *name);
+        }
+
+        assert_eq!(
+            TransitionMethod::try_from_name("Wave"),
+            Err(UnknownTransitionName::new("Wave"))
+        );
+        // Names only a loaded plugin registers stay unknown until the plugin
+        // host publishes its provider registry (see `TRANSITION_PROVIDER_NAMES`).
+        assert!(TransitionMethod::try_from_name("blurfade").is_err());
+        assert!(TransitionMethod::try_from_name("glitch").is_err());
+        // The lenient mapping the engine still uses keeps its old behaviour:
+        // case-folded, and anything unknown silently becomes a crossfade.
+        assert_eq!(TransitionMethod::from_name("Wave"), TransitionMethod::Wave);
+        assert_eq!(
+            TransitionMethod::from_name("blurfade"),
+            TransitionMethod::Crossfade
+        );
+        assert_eq!(
+            TransitionMethod::from_name(""),
+            TransitionMethod::Crossfade
+        );
+    }
+
+    /// The unknown-name path produces the reference's exact text: `%1` is the
+    /// caller's own spelling (`TVPFormatMessage`, `MsgIntf.cpp:115-121`), and the
+    /// exception is message-only -- `TVPCannotFindTransHander` carries no
+    /// `tjs_error` code and no trace (`TransIntf.cpp:354`, `tjsError.h:115-146`).
+    #[test]
+    fn unknown_transition_name_reports_the_official_message() {
+        let error = TransitionMethod::try_from_name("furu-furu").expect_err("unknown name");
+        assert_eq!(error.name, "furu-furu");
+        assert_eq!(error.message(), "Cannot find transition handler furu-furu");
+        assert_eq!(error.to_string(), "Cannot find transition handler furu-furu");
+
+        let spaced = TransitionMethod::try_from_name("wave ").expect_err("trailing space is a miss");
+        assert_eq!(spaced.message(), "Cannot find transition handler wave ");
+    }
+
+    /// The extrans kernels run on the millisecond clock the reference stores in
+    /// `Time`/`CurTime`; `0` is the documented "not supplied" value and nothing
+    /// else in the parameter set depends on the field.
+    #[test]
+    fn transition_duration_clock_defaults_to_not_supplied() {
+        let params = TransitionParams::default();
+        assert_eq!(params.duration_millis, 0.0);
+        assert_eq!(
+            TransitionParams {
+                duration_millis: 1000.0,
+                ..TransitionParams::default()
+            }
+            .duration_millis,
+            1000.0
         );
     }
 }
