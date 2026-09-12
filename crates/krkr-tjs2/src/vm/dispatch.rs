@@ -2698,7 +2698,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     }
 
     fn string_replace(&self, value: &str, pattern: &Variant, replacement: &str) -> Result<Variant> {
-        if let Variant::Object(handle) = pattern {
+        // A script's `RegExp` value is self-bound (`new`'s result, or a
+        // literal the compiler built), so read the object behind the binding
+        // (`AsObjectNoAddRef`) before looking for the pattern members.
+        if let Some(handle) = pattern.object_handle() {
             let object = &self.runtime.heap[handle.0];
             let pattern = object.get("pattern").to_tjs_string()?;
             let flags = object.get("flags").to_tjs_string()?;
@@ -4156,6 +4159,34 @@ mod tests {
         run_with(&mut runtime, "return target.children;").expect("getter still works");
     }
 
+    /// An install that preserves script properties stores each native property
+    /// as a self-bound value (`install_layer_native_properties` writes
+    /// `Closure{property, Some(object)}`), so the deny-list has to read the
+    /// property object behind that binding.
+    #[test]
+    fn deny_list_reads_a_self_bound_property_member() {
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        let property = runtime.register_object_native_property(
+            target,
+            "focused",
+            |_runtime, _this| Ok(Variant::Integer(1)),
+            |_runtime, _this, _value| Ok(()),
+        );
+        runtime.set_object_member(target, "focused", Variant::self_bound(property));
+
+        let unmatched = runtime.deny_native_property_writes(target, &["focused"]);
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        let error = run_with(&mut runtime, "target.focused = 1;").expect_err("denied write");
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied);
+        assert_eq!(error.tjs_error_code(), Some(-1007));
+        assert_eq!(
+            run_with(&mut runtime, "return target.focused;").expect("getter still works"),
+            Variant::Integer(1)
+        );
+    }
+
     #[test]
     fn declared_argument_counts_fail_with_bad_param_count() {
         let mut runtime = Runtime::new();
@@ -4330,6 +4361,22 @@ mod tests {
         assert_eq!(
             error.message,
             "Cannot convert the variable type ((object) to string)"
+        );
+    }
+
+    /// A script's `RegExp` value is self-bound (`new`'s result), so
+    /// `String.replace` has to read the object behind the binding before it
+    /// looks for the pattern members -- otherwise a bound pattern falls
+    /// through to the literal-string replacement.
+    #[test]
+    fn string_replace_reads_through_a_self_bound_regexp() {
+        assert_eq!(
+            run(r#"
+                var pattern = new RegExp("[^A-Za-z]", "g");
+                return "a1b2".replace(pattern, "+");
+                "#)
+            .expect("replace"),
+            Variant::String("a+b+".to_string())
         );
     }
 

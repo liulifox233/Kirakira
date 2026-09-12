@@ -1078,21 +1078,24 @@ fn macros_from_snapshot_object(
     parser: &KagParser,
     snapshot_object: ObjectHandle,
 ) -> Vec<(String, String)> {
-    match runtime.object_member(snapshot_object, "macros") {
-        Variant::Object(macros) => runtime
+    let macros = runtime.object_member(snapshot_object, "macros");
+    if let Some(macros) = macros.object_handle() {
+        return runtime
             .object_members(macros)
             .into_iter()
             .filter_map(|(name, value)| match value {
                 Variant::String(source) => Some((name, source)),
                 _ => None,
             })
-            .collect(),
-        Variant::Void => parser
+            .collect();
+    }
+    if matches!(macros, Variant::Void) {
+        return parser
             .macro_definitions()
             .map(|(name, source)| (name.to_string(), source.to_string()))
-            .collect(),
-        _ => Vec::new(),
+            .collect();
     }
+    Vec::new()
 }
 
 fn condition_state_from_object(
@@ -1173,22 +1176,21 @@ fn apply_snapshot_macros_from_object(
         return;
     }
 
-    match runtime.object_member(snapshot_object, "macros") {
-        Variant::Object(macros) => {
-            let definitions = runtime.object_members(macros).into_iter().filter_map(
-                |(name, value)| match value {
-                    Variant::String(source) => Some((name, source)),
-                    _ => None,
-                },
-            );
-            snapshot.set_macro_definitions(definitions);
-        }
-        Variant::Void => snapshot.set_macro_definitions(
+    let macros = runtime.object_member(snapshot_object, "macros");
+    if let Some(macros) = macros.object_handle() {
+        let definitions = runtime.object_members(macros).into_iter().filter_map(
+            |(name, value)| match value {
+                Variant::String(source) => Some((name, source)),
+                _ => None,
+            },
+        );
+        snapshot.set_macro_definitions(definitions);
+    } else if matches!(macros, Variant::Void) {
+        snapshot.set_macro_definitions(
             parser
                 .macro_definitions()
                 .map(|(name, source)| (name.to_string(), source.to_string())),
-        ),
-        _ => {}
+        );
     }
 }
 

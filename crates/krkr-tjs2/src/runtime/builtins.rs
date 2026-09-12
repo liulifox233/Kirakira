@@ -1155,38 +1155,41 @@ fn deep_clone_struct_value<H: TjsHost + 'static>(
     value: &Variant,
     stack: &mut BTreeSet<ObjectHandle>,
 ) -> Result<Variant> {
-    match value {
-        Variant::Object(handle) if runtime.heap[handle.0].array_elements().is_some() => {
-            if !stack.insert(*handle) {
-                return Ok(Variant::Null);
-            }
-            let elements = runtime.heap[handle.0]
-                .array_elements()
-                .map(Vec::from)
-                .unwrap_or_default();
-            let dest = runtime.alloc_array_object(Vec::new());
-            for element in elements {
-                let element = deep_clone_struct_value(runtime, &element, stack)?;
-                runtime.heap[dest.0].array_push(element);
-            }
-            stack.remove(handle);
-            Ok(Variant::Object(dest))
+    // A member stored from `this` or `new` carries its binding; the value to
+    // clone is the object behind it (`AsObjectNoAddRef`).
+    let Some(handle) = value.object_handle() else {
+        return Ok(value.clone());
+    };
+    if runtime.heap[handle.0].array_elements().is_some() {
+        if !stack.insert(handle) {
+            return Ok(Variant::Null);
         }
-        Variant::Object(handle) if is_dictionary_object(runtime, *handle) => {
-            if !stack.insert(*handle) {
-                return Ok(Variant::Null);
-            }
-            let entries = dictionary_struct_entries(runtime, *handle);
-            let dest = runtime.alloc_ordinary_object();
-            runtime.add_object_class_info(dest, "Dictionary");
-            for (key, value) in entries {
-                let value = deep_clone_struct_value(runtime, &value, stack)?;
-                runtime.heap[dest.0].set(key, value);
-            }
-            stack.remove(handle);
-            Ok(Variant::Object(dest))
+        let elements = runtime.heap[handle.0]
+            .array_elements()
+            .map(Vec::from)
+            .unwrap_or_default();
+        let dest = runtime.alloc_array_object(Vec::new());
+        for element in elements {
+            let element = deep_clone_struct_value(runtime, &element, stack)?;
+            runtime.heap[dest.0].array_push(element);
         }
-        _ => Ok(value.clone()),
+        stack.remove(&handle);
+        Ok(Variant::Object(dest))
+    } else if is_dictionary_object(runtime, handle) {
+        if !stack.insert(handle) {
+            return Ok(Variant::Null);
+        }
+        let entries = dictionary_struct_entries(runtime, handle);
+        let dest = runtime.alloc_ordinary_object();
+        runtime.add_object_class_info(dest, "Dictionary");
+        for (key, value) in entries {
+            let value = deep_clone_struct_value(runtime, &value, stack)?;
+            runtime.heap[dest.0].set(key, value);
+        }
+        stack.remove(&handle);
+        Ok(Variant::Object(dest))
+    } else {
+        Ok(value.clone())
     }
 }
 

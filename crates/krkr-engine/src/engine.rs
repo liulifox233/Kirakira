@@ -4836,6 +4836,50 @@ mod tests {
         );
     }
 
+    /// The transition-completed event hands the destination and the source out
+    /// as `tTJSVariant(TransDestObj, TransDestObj)` /
+    /// `(TransSrcObj, TransSrcObj)` (`LayerIntf.cpp:6411-6418`), so a handler's
+    /// `===` against the layers the script holds is true.
+    #[test]
+    fn transition_completed_hands_out_self_bound_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .host_mut()
+            .set_transition_policy(crate::TransitionPolicy::Immediate);
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.win = new Window();
+                global.source = new Layer(win);
+                global.dest = new Layer(win);
+                global.record = "";
+                dest.visible = true;
+                source.visible = true;
+                dest.onTransitionCompleted = function(destArg, srcArg) {
+                    global.record = "" + (destArg === global.dest) + ":" +
+                        (srcArg === global.source) + ":" + (destArg === srcArg);
+                };
+                dest.beginTransition("crossfade", true, source, %[time: 1000]);
+                "#,
+            )
+            .expect("begin transition");
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("finish immediate transition");
+
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "global.record")
+                .expect("record"),
+            Variant::String("1:1:0".to_string())
+        );
+    }
+
     #[test]
     fn scripts_eval_runs_in_engine() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -14923,6 +14967,57 @@ mod tests {
             .expect("script");
 
         assert_eq!(value, Variant::String("1:0:1:blur:focus".to_string()));
+    }
+
+    /// The focus events hand their layer arguments out as
+    /// `tTJSVariant(Owner, Owner)`: the candidate and the previously focused
+    /// layer for `onBeforeFocus` (`LayerIntf.cpp:3385-3401`), the newly focused
+    /// layer for `onBlur` (`:3353-3365`), the old one for `onFocus`
+    /// (`:3369-3381`).  The candidate a handler answers with is read back
+    /// through its binding, so an override that calls
+    /// `onSearchNextFocusable(layer)` (`SetFocusWork`, `LayerIntf.h:608-609`)
+    /// moves the focus.
+    #[test]
+    fn focus_events_hand_out_self_bound_layers() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var window = new Window();
+                var root = new Layer(window, null);
+                var first = new Layer(window, root);
+                var second = new Layer(window, root);
+                root.visible = true;
+                first.visible = true;
+                second.visible = true;
+                root.focusable = true;
+                first.focusable = true;
+                second.focusable = true;
+                global.record = "";
+                first.onBlur = function(focused) {
+                    global.record += "/blur:" + (focused === second) + ":" +
+                        (root.children.find(focused) != -1);
+                };
+                second.onFocus = function(prev, direction) {
+                    global.record += "/focus:" + (prev === first) + ":" + direction;
+                };
+                second.onBeforeFocus = function(layer, prev, direction) {
+                    global.record += "/before:" + (layer === second) + ":" +
+                        (prev === first) + ":" + direction;
+                    layer.onSearchNextFocusable(second);
+                };
+                first.focus();
+                second.focus();
+                return global.record + "/focused:" + second.focused;
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("/before:1:1:1/blur:1:1/focus:1:1/focused:1".to_string())
+        );
     }
 
     /// `NotifyPart` -> `RemoveTreeModalState` (`LayerManager.cpp:168`,

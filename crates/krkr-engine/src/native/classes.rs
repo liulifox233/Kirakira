@@ -3554,10 +3554,7 @@ fn ensure_native_layer_attached(runtime: &mut Runtime<KrkrHost>, handle: ObjectH
     if !had_id && window.is_none() && parent.is_none() {
         return;
     }
-    let children = match runtime.object_member(handle, "__nativeLayerProperty$children") {
-        Variant::Object(children) => Some(children),
-        _ => None,
-    };
+    let children = variant_object(&runtime.object_member(handle, "__nativeLayerProperty$children"));
     let is_primary = runtime
         .object_member(handle, "__nativeLayerProperty$isPrimary")
         .is_truthy();
@@ -6676,13 +6673,15 @@ fn layer_set_focus_to(
         return Ok(false);
     };
     let previous = focused_layer(runtime, window);
+    // `FireBeforeFocus` hands the candidate layer and the previously focused
+    // one out as `tTJSVariant(Owner, Owner)` (`LayerIntf.cpp:3385-3401`).
     let target = layer_focus_work(
         runtime,
         target,
         "onBeforeFocus",
         Some(target),
         vec![
-            previous.map(Variant::Object).unwrap_or(Variant::Null),
+            previous.map(Variant::self_bound).unwrap_or(Variant::Null),
             Variant::Integer(i64::from(direction)),
         ],
     )?;
@@ -6698,17 +6697,26 @@ fn layer_set_focus_to(
         // `Manager->GetFocusedLayer() == this` (`LayerIntf.cpp:3218`) from the
         // window's focused layer, which the write below moves.
         if !matches!(runtime.object_member(previous, "onBlur"), Variant::Void) {
-            runtime.call_object_method(previous, "onBlur", vec![Variant::Object(target)])?;
+            // `org->FireBlur(layer)`: the layer losing focus is told about the
+            // new one as `tTJSVariant(Owner, Owner)` (`:3353-3365`, fired from
+            // `tTVPLayerManager::SetFocusTo`, `LayerManager.cpp:786`).
+            runtime.call_object_method(
+                previous,
+                "onBlur",
+                vec![self_bound(Variant::Object(target))],
+            )?;
         }
     }
 
     set_window_property_storage(runtime, window, "focusedLayer", Variant::Object(target));
     if !matches!(runtime.object_member(target, "onFocus"), Variant::Void) {
+        // `FocusedLayer->FireFocus(org, direction)` hands the previously
+        // focused layer out the same way (`:3369-3381`).
         runtime.call_object_method(
             target,
             "onFocus",
             vec![
-                previous.map(Variant::Object).unwrap_or(Variant::Null),
+                previous.map(Variant::self_bound).unwrap_or(Variant::Null),
                 Variant::Integer(i64::from(direction)),
             ],
         )?;
@@ -6723,17 +6731,22 @@ fn layer_focus_work(
     candidate: Option<ObjectHandle>,
     mut extra_args: Vec<Variant>,
 ) -> Result<Option<ObjectHandle>> {
-    let candidate_value = candidate.map(Variant::Object).unwrap_or(Variant::Null);
+    // `FocusWork = this` (`LayerIntf.cpp:3387`): the stored value and the
+    // handler's first argument are the candidate as `tTJSVariant(dsp, dsp)`.
+    let candidate_value = candidate.map(Variant::self_bound).unwrap_or(Variant::Null);
     runtime.set_object_member(layer, "__nativeFocusWork", candidate_value.clone());
     let mut args = vec![candidate_value];
     args.append(&mut extra_args);
     if !matches!(runtime.object_member(layer, method), Variant::Void) {
         runtime.call_object_method(layer, method, args)?;
     }
-    Ok(match runtime.object_member(layer, "__nativeFocusWork") {
-        Variant::Object(handle) => Some(runtime.bound_this(handle).unwrap_or(handle)),
-        _ => None,
-    })
+    // A handler override stores its answer through `SetFocusWork`
+    // (`LayerIntf.h:608-609`), which a script calls with a layer value that is
+    // self-bound: read the object back out of the binding.
+    Ok(runtime
+        .object_member(layer, "__nativeFocusWork")
+        .object_handle()
+        .map(|handle| runtime.bound_this(handle).unwrap_or(handle)))
 }
 
 fn layer_set_focus_work(
@@ -8145,11 +8158,14 @@ fn notify_transition_completed(
     dest: ObjectHandle,
     source: Option<ObjectHandle>,
 ) -> Result<()> {
+    // The transition-completed event hands the destination and source layers
+    // out as `tTJSVariant(TransDestObj, TransDestObj)` /
+    // `(TransSrcObj, TransSrcObj)` (`LayerIntf.cpp:6411-6418`).
     let source = source
         .filter(|source| runtime.object_valid(*source))
-        .map(Variant::Object)
+        .map(Variant::self_bound)
         .unwrap_or_default();
-    let callback_args = vec![Variant::Object(dest), source];
+    let callback_args = vec![self_bound(Variant::Object(dest)), source];
     if !matches!(
         runtime.object_member(dest, "onTransitionCompleted"),
         Variant::Void

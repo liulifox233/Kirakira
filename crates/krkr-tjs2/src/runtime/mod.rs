@@ -751,8 +751,11 @@ impl<H: TjsHost + 'static> Runtime<H> {
     ) -> Vec<String> {
         let mut unmatched = Vec::new();
         for name in names {
+            // The member is the property object, which an install that
+            // preserves script properties stores as a self-bound value; read
+            // the object behind the binding.
             let member = self.heap[object.0].get_raw(name);
-            let Some(Variant::Object(handle)) = member else {
+            let Some(handle) = member.as_ref().and_then(Variant::object_handle) else {
                 unmatched.push((*name).to_string());
                 continue;
             };
