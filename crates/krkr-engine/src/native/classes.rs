@@ -5994,12 +5994,12 @@ fn layer_piled_copy(
     let sy = optional_integer(&args, 4)?.unwrap_or(0);
     let width = optional_integer(&args, 5)?.unwrap_or(0);
     let height = optional_integer(&args, 6)?.unwrap_or(0);
-    if width <= 0 || height <= 0 {
-        return Ok(Variant::Void);
-    }
     let Some(dest_target) = dest_target else {
         return Ok(Variant::Void);
     };
+    // `PiledCopy` checks both images before it touches the rectangles
+    // (`LayerIntf.cpp:4111-4112`), so an empty source rectangle still reports a
+    // missing bitmap.
     // `if(!MainImage) TVPThrowExceptionMessage(TVPNotDrawableLayerType);`
     // (`LayerIntf.cpp:4111`).
     require_drawable_layer_image(runtime, &dest_target)?;
@@ -6011,6 +6011,9 @@ fn layer_piled_copy(
     // (`LayerIntf.cpp:4112`).
     if !render_layer_snapshot(runtime, &source_target).is_some_and(|layer| layer.image.is_some()) {
         return Err(TjsError::runtime("Source layer has no image"));
+    }
+    if width <= 0 || height <= 0 {
+        return Ok(Variant::Void);
     }
     register_kag_layer_slots_from_tjs(runtime);
     let mut layers = Vec::new();
@@ -6169,6 +6172,31 @@ fn stretch_copy_impl(
     let sy = optional_integer(&args, 6)?.unwrap_or(0);
     let source_width = optional_integer(&args, 7)?.unwrap_or(0);
     let source_height = optional_integer(&args, 8)?.unwrap_or(0);
+    let Some(dest_target) = dest_target else {
+        return Ok(Variant::Void);
+    };
+    // Official TJS `operateStretch` (`LayerIntf.cpp:7315`): `omAuto` becomes the
+    // source layer's `GetOperationModeFromType()`; `stretchCopy` has no mode and
+    // always uses the destination face's copy method. The blt lookup and the
+    // `MainImage` check both run before `StretchBlt`'s extent checks
+    // (`:4245`/`:4417` precede `LayerBitmapIntf.cpp:1824`), so an empty stretch
+    // still reports a missing bitmap.
+    let blt = if operate {
+        let mut mode = optional_integer(&args, 9)?.unwrap_or(OM_AUTO);
+        if mode == OM_AUTO {
+            let source_type = layer_property_value(runtime, source_object, "type")
+                .to_integer()
+                .unwrap_or(2);
+            mode = operation_mode_from_layer_type(source_type);
+        }
+        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
+            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
+    } else {
+        copy_blt_for_layer(runtime, this)
+    };
+    // `StretchCopy`/`OperateStretch` require the destination bitmap
+    // (`LayerIntf.cpp:4245`/`:4417`).
+    require_drawable_layer_image(runtime, &dest_target)?;
     // `StretchBlt` only rejects *zero* extents (`LayerBitmapIntf.cpp:1824`); a
     // negative destination extent mirrors through the affine path below.
     if dest_width == 0 || dest_height == 0 || source_width <= 0 || source_height <= 0 {
@@ -6188,29 +6216,6 @@ fn stretch_copy_impl(
         // `TVPResampleImage`'s clipping yields a non-positive size and returns.
         return Ok(Variant::Void);
     }
-    let Some(dest_target) = dest_target else {
-        return Ok(Variant::Void);
-    };
-    // Official TJS `operateStretch` (`LayerIntf.cpp:7315`): `omAuto` becomes the
-    // source layer's `GetOperationModeFromType()`; `stretchCopy` has no mode and
-    // always uses the destination face's copy method. The blt lookup runs before
-    // the `MainImage` check (`:4410-4418`), so it comes first here too.
-    let blt = if operate {
-        let mut mode = optional_integer(&args, 9)?.unwrap_or(OM_AUTO);
-        if mode == OM_AUTO {
-            let source_type = layer_property_value(runtime, source_object, "type")
-                .to_integer()
-                .unwrap_or(2);
-            mode = operation_mode_from_layer_type(source_type);
-        }
-        blend::operation_mode_to_blt(mode, effective_draw_face(runtime, this))
-            .ok_or_else(|| TjsError::runtime("Not drawable face type"))?
-    } else {
-        copy_blt_for_layer(runtime, this)
-    };
-    // `StretchCopy`/`OperateStretch` require the destination bitmap
-    // (`LayerIntf.cpp:4245`/`:4417`).
-    require_drawable_layer_image(runtime, &dest_target)?;
     complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
         return Ok(Variant::Void);
@@ -6361,10 +6366,12 @@ fn affine_copy_impl(
     // as the images of the source rectangle's *corners* — `(-0.5,-0.5)`,
     // `(rp-0.5,-0.5)` and `(-0.5,bp-0.5)` in the source rectangle's own frame
     // (`LayerBitmapIntf.cpp:3494-3513`); `InternalAffineBlt` then reads the
-    // source rectangle as `refrect.*.65536 - 32768` (`:2711-2718`). The point
-    // form's callers already pass that convention (KAG's
-    // `AffineSourceBMPBase.drawAffine` subtracts 0.5 from every transformed
-    // corner), so the matrix form has to subtract it too.
+    // source rectangle as `refrect.*.65536 - 32768` (`:2711-2718`). The two
+    // forms take the same points, so the matrix form has to subtract the half
+    // pixel the point form's callers already do (a decompiled copy of KAG's
+    // `AffineSourceBMPBase.drawAffine` from a game's data subtracts 0.5 from
+    // each transformed corner, which is a data point for, not the source of,
+    // the convention).
     let points = if affine {
         let (a, b, c, d, tx, ty) = (
             values[0], values[1], values[2], values[3], values[4], values[5],
@@ -9371,9 +9378,8 @@ fn affine_copy_pixels(
             // *corners*: `InternalAffineBlt` shifts the rectangle to
             // `refrect.*.65536 - 32768` (`LayerBitmapIntf.cpp:2711-2718`) while
             // `AffineBlt`'s matrix entry point builds them from `(-0.5,-0.5)`,
-            // `(rp-0.5,-0.5)` and `(-0.5,bp-0.5)` (`:3494-3513`), and KAG's
-            // `AffineSourceBMPBase.drawAffine` passes its transformed corners
-            // minus 0.5. Solving `dest = p0 + u*(p1-p0) + v*(p2-p0)` therefore
+            // `(rp-0.5,-0.5)` and `(-0.5,bp-0.5)` (`:3494-3513`). Solving
+            // `dest = p0 + u*(p1-p0) + v*(p2-p0)` therefore
             // puts `u`/`v` in the rectangle's corner frame (`u = 0` is the
             // left edge), and the nearest sample for a destination pixel is
             // `src + floor(u * len)`: the reference reads
@@ -9598,7 +9604,12 @@ fn collect_piled_render_layers(
     let Some(layer) = render_layer_snapshot(runtime, &target) else {
         return;
     };
-    if !layer.renderable || !layer.visible || layer.opacity == 0 {
+    // A binder draws no bitmap of its own (`BltImage` returns for `ltBinder`,
+    // `LayerIntf.cpp:5185-5187`) and forwards its children's own
+    // `type`/`opacity` (`:5848-5854`), so its own `Opacity` and its lack of an
+    // image must not cut the subtree out of the pile.
+    let binder = i64::from(layer.layer_type) == LT_BINDER;
+    if !layer.renderable || !layer.visible || (layer.opacity == 0 && !binder) {
         return;
     }
 
@@ -9627,7 +9638,20 @@ fn collect_piled_render_layers(
         },
         None => layer_clip,
     };
-    let opacity = parent_opacity * layer.opacity as f32 / 255.0;
+    // `PiledCopy` copies the source layer's completed bitmap plane for plane
+    // (`LayerIntf.cpp:4120-4122`) and `tCompleteDrawable::DrawCompleted`
+    // (`:6119-6128`) ignores the `type`/`opacity` it is handed, so the *source*
+    // layer's own `Opacity` never reaches the pile. Each child is blitted with
+    // its own `Opacity` (child `DrawSelf` → parent `DrawCompleted` → `BltImage`,
+    // `:5385`, `:5920-5923`). A non-binder ancestor's opacity still multiplies
+    // in as this engine's one-step approximation of the reference's two-step
+    // composite (the ancestor's bitmap is blitted into its own parent with the
+    // ancestor's opacity).
+    let opacity = if root || binder {
+        parent_opacity
+    } else {
+        parent_opacity * layer.opacity as f32 / 255.0
+    };
     if opacity <= 0.0 {
         return;
     }
@@ -9643,7 +9667,7 @@ fn collect_piled_render_layers(
 
     // `GetTargetLayerType` (`LayerIntf.cpp:5834`): a child of an `ltBinder`
     // layer draws into the bitmap of the nearest non-binder ancestor.
-    let child_dest_type = if i64::from(layer.layer_type) == LT_BINDER {
+    let child_dest_type = if binder {
         dest_type
     } else {
         i64::from(layer.layer_type)

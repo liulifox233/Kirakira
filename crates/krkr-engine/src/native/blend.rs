@@ -859,7 +859,7 @@ pub(crate) fn const_alpha_fill_blend_a(d: u32, color: u32, opacity: u32) -> u32 
         )
 }
 
-/// `tTVPBBStretchType` (`LayerBitmapIntf.h:61`), collapsed to the kernels the
+/// `tTVPBBStretchType` (`LayerBitmapIntf.h:59-87`), collapsed to the kernels the
 /// resamplers implement.
 ///
 /// Every `stFast*` variant shares its precise counterpart's *weight* function —
@@ -870,9 +870,17 @@ pub(crate) fn const_alpha_fill_blend_a(d: u32, color: u32, opacity: u32) -> u32 
 /// `stLinear` to `TVPWeightResampleSSE2<BilinearWeightSSE>` and
 /// `stSemiFastLinear` to `TVPWeightResampleSSE2Fix<BilinearWeightSSE>`
 /// (`ResampleImageSSE2.cpp:1151-1158`), which differ only in the fixed-point
-/// weight arithmetic this engine does not model. `stNearest`/`stFastNearest`
-/// never reach the resampler at all — `StretchBlt` routes every type below
-/// `stLinear` to `AffineBlt` (`LayerBitmapIntf.cpp:1857-1875`).
+/// weight arithmetic this engine does not model.
+///
+/// `stNearest` (0) and `stFastLinear` (1) never reach the resampler at all:
+/// `StretchBlt` routes every type below `stLinear` (2) to `AffineBlt`
+/// (`LayerBitmapIntf.cpp:1857-1875`), where `InternalAffineBlt`'s
+/// `type >= stFastLinear` test (`:3227`, the `btFastLinear` block at `:2041`
+/// sits inside `#if 0`) picks the bilinear affine loop (`:2458`) and anything
+/// lower the nearest one. This engine maps `stFastLinear` to `Bilinear`; the
+/// nearest scan below is the `stNearest` path, while `stFastLinear` samples
+/// through the resampler's window rather than that affine loop — a known
+/// approximation in `stretch_copy_pixels`' filtered branch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StretchType {
     Nearest,
@@ -1064,8 +1072,8 @@ fn resample_axis_weights(
 
 /// `TVPResampleImage`'s sampler: the separable two-pass weight application of
 /// `tTVPSampler::samplingVertical` / `samplingHorizontal`
-/// (`visual/gl/ResampleImage.cpp:407-466`) with the fixed-point-free channel
-/// clamping of `:428-431`.
+/// (`visual/gl/ResampleImage.cpp:407-466`) with the 8-bit intermediate both
+/// passes quantize through (`:428-431`, `:459-462`).
 ///
 /// `source_rect` is the source rectangle in pixels, which is where the
 /// reference's kernel folds; the destination size decides whether the kernel is
@@ -1086,10 +1094,11 @@ pub(crate) fn sample_resample_rgba(
         return None;
     }
     if kind == StretchType::AreaAvg {
-        // `stAreaAvg` runs its own accumulator (`TVPCalculateAxisAreaAvg`,
-        // `visual/gl/ResampleImage.cpp:374-379` + `:468-506`); this engine keeps
-        // its box average over the sample cell as an approximation, so the
-        // weighted path below is not used for it.
+        // `stAreaAvg` runs its own accumulator instead: `TVPCalculateAxisAreaAvg`
+        // (`visual/gl/ResampleImageInternal.h:88`, called from
+        // `gl/ResampleImage.cpp:374-379`) through `TVPAreaAvgResample` (`:660`).
+        // This engine keeps its box average over the sample cell as an
+        // approximation, so the weighted path below is not used for it.
         let cx = (dest_offset.0 as f32 + 0.5) * (right - left) as f32 / dest_size.0 as f32
             + left as f32;
         let cy = (dest_offset.1 as f32 + 0.5) * (bottom - top) as f32 / dest_size.1 as f32
@@ -1108,25 +1117,45 @@ pub(crate) fn sample_resample_rgba(
     let (start_y, weights_y) =
         resample_axis_weights(top, bottom, bottom - top, dest_size.1, dest_offset.1, kind)?;
 
-    let mut sums = [0f64; 4];
-    for (index_y, weight_y) in weights_y.iter().enumerate() {
-        let source_y = start_y + index_y as i64;
-        if source_y < 0 || source_y >= i64::from(source_height) {
+    // The reference filters in two passes: `samplingVertical` resolves each
+    // source column of the tap window into an *8-bit* intermediate — the
+    // per-channel `float` sum is clamped and cast at `:428-431` — and
+    // `samplingHorizontal` then weights those already-quantized values and
+    // truncates again (`:439-466`, `:459-462`); `ResamplerFunc` drives the pair
+    // row by row (`:610-653`). Truncating the intermediate is part of the
+    // reference's pixel output (it can differ from a single f64 pass by 1 per
+    // channel), so the port quantizes the same way.
+    let mut intermediate = vec![0u8; weights_x.len() * 4];
+    for (index_x, _) in weights_x.iter().enumerate() {
+        let source_x = start_x + index_x as i64;
+        if source_x < 0 || source_x >= i64::from(source_width) {
             continue;
         }
-        for (index_x, weight_x) in weights_x.iter().enumerate() {
-            let source_x = start_x + index_x as i64;
-            if source_x < 0 || source_x >= i64::from(source_width) {
+        let mut sums = [0.0f32; 4];
+        for (index_y, weight_y) in weights_y.iter().enumerate() {
+            let source_y = start_y + index_y as i64;
+            if source_y < 0 || source_y >= i64::from(source_height) {
                 continue;
             }
-            let weight = weight_x * weight_y;
             let index = ((source_y as u32 * source_width + source_x as u32) * 4) as usize;
             if index + 4 > source.len() {
                 continue;
             }
+            let weight = *weight_y as f32;
             for (channel, sum) in sums.iter_mut().enumerate() {
-                *sum += f64::from(source[index + channel]) * weight;
+                *sum += f32::from(source[index + channel]) * weight;
             }
+        }
+        for (channel, value) in sums.iter().enumerate() {
+            intermediate[index_x * 4 + channel] = value.clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    let mut sums = [0.0f32; 4];
+    for (index_x, weight_x) in weights_x.iter().enumerate() {
+        let weight = *weight_x as f32;
+        for (channel, sum) in sums.iter_mut().enumerate() {
+            *sum += f32::from(intermediate[index_x * 4 + channel]) * weight;
         }
     }
     Some([

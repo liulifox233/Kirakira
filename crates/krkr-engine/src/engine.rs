@@ -14961,6 +14961,79 @@ mod tests {
         assert_eq!(value, "1122867:255:0:0".to_string());
     }
 
+    /// The source layer's own `Opacity` never reaches a `piledCopy` pile:
+    /// `PiledCopy` copies the completed bitmap raw (`LayerIntf.cpp:4120-4122`)
+    /// and `tCompleteDrawable::DrawCompleted` ignores the opacity it is handed
+    /// (`:6119-6128`). A binder's opacity is never applied either — a binder
+    /// draws no bitmap and forwards its children's own `type`/`opacity`
+    /// (`:5848-5854`).
+    #[test]
+    fn native_layer_piled_copy_ignores_source_and_binder_opacity() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var base = new Layer();
+                base.visible = true;
+                base.setSize(2, 1);
+                base.setImageSize(2, 1);
+                base.fillRect(0, 0, 2, 1, 0xff000000);
+                base.opacity = 128;                        // must not reach the child
+
+                var child = new Layer(null, base);
+                child.type = ltOpaque;
+                child.visible = true;
+                child.setPos(1, 0);
+                child.setSize(1, 1);
+                child.setImageSize(1, 1);
+                child.fillRect(0, 0, 1, 1, 0xffff0000);
+
+                var dest = new Layer();
+                dest.setImageSize(2, 1);
+                dest.piledCopy(0, 0, base, 0, 0, 2, 1);
+                var first = dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
+                    dest.getMainPixel(1, 0) + ":" + dest.getMaskPixel(1, 0);
+
+                // A binder with opacity 0 must not hide its children either: it
+                // draws no bitmap of its own and forwards theirs.
+                var root2 = new Layer();
+                root2.visible = true;
+                root2.setSize(2, 1);
+                root2.setImageSize(2, 1);
+                root2.fillRect(0, 0, 2, 1, 0xff000000);
+
+                var binder = new Layer(null, root2);
+                binder.visible = true;
+                binder.setPos(1, 0);
+                binder.setSize(1, 1);
+                binder.opacity = 0;
+                binder.type = ltBinder;
+
+                var sub = new Layer(null, binder);
+                sub.type = ltOpaque;
+                sub.visible = true;
+                sub.setSize(1, 1);
+                sub.setImageSize(1, 1);
+                sub.fillRect(0, 0, 1, 1, 0xff00ff00);
+
+                var second = new Layer();
+                second.setImageSize(2, 1);
+                second.piledCopy(0, 0, root2, 0, 0, 2, 1);
+                return first + "/" + second.getMainPixel(0, 0) + ":" +
+                    second.getMaskPixel(0, 0) + ":" + second.getMainPixel(1, 0) + ":" +
+                    second.getMaskPixel(1, 0);
+                "#,
+            )
+            .expect("script")
+            .to_tjs_string()
+            .expect("string");
+        // The base's own opaque black is copied raw and the `ltOpaque` child is
+        // copied verbatim on top (not faded to 128, which is what folding the
+        // source's opacity in would do); the binder's grandchild still lands.
+        assert_eq!(value, "0:255:16711680:255/0:255:65280:255".to_string());
+    }
+
     /// The filtered stretch path uses the reference resampler's kernel: the tap
     /// window is `left = floor(cx - range)` … `floor(cx + range) - 1`
     /// (`visual/gl/ResampleImage.cpp:301-317`), shrinking widens it by the
@@ -15034,6 +15107,51 @@ mod tests {
         // Destination pixel 0 is where the source rectangle's pixel 1 lands, so
         // it receives the blue pixel; pixel 1 stays outside the copied width.
         assert_eq!(value, "255:255:16777215:0".to_string());
+    }
+
+    /// The reference resampler filters in two passes and quantizes the vertical
+    /// one to 8 bits before the horizontal pass (`visual/gl/ResampleImage.cpp:
+    /// 407-436` `samplingVertical`, its cast at `:428-431`; `:439-466`
+    /// `samplingHorizontal`; the pair driven at `:610-653`), so a 2-D filtered
+    /// stretch differs from a single f64 pass by up to 1 per channel. This case
+    /// is built so the two disagree: a 2x2 source whose red values alternate
+    /// 0/2 stretched to 1x4 has its third destination row's vertical averages
+    /// at 1.5 and 0.5, which truncate to 1 and 0 (two-pass: 0.5 -> 0) instead
+    /// of adding up to 1.
+    #[test]
+    fn native_layer_stretch_copy_truncates_the_vertical_pass() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let layer_id = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 2);
+                source.fillRect(0, 0, 2, 2, 0xff000000);   // opaque black
+                source.setMainPixel(0, 0, 0x000000);       // RGB only, alpha kept
+                source.setMainPixel(0, 1, 0x020000);
+                source.setMainPixel(1, 0, 0x020000);
+                source.setMainPixel(1, 1, 0x000000);
+
+                global.dest = new Layer();
+                dest.setImageSize(1, 4);
+                dest.stretchCopy(0, 0, 1, 4, source, 0, 0, 2, 2, stLinear);
+                return dest.__nativeLayerId;
+                "#,
+            )
+            .expect("script")
+            .to_integer()
+            .expect("layer id") as u64;
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .expect("layer image");
+        let reds = (0..4)
+            .map(|row| image.upload.rgba[row * 4])
+            .collect::<Vec<_>>();
+        assert_eq!(reds, vec![1, 1, 0, 1]);
     }
 
     /// `affineCopy`'s matrix form builds its points from the source rectangle's
