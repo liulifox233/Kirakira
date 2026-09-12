@@ -582,7 +582,9 @@ mod tests {
     #[test]
     fn subclass_reads_vertical_set_through_set_option() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
-        engine.register_plugin(TextRenderPlugin).expect("register plugin");
+        engine
+            .register_plugin(TextRenderPlugin)
+            .expect("register plugin");
 
         let value = engine
             .execute_script(

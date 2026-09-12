@@ -1,18 +1,85 @@
+//! Native (Rust) replacements for the KRKR plugins games load with
+//! `Plugins.link`, plus the [`catalog`] of every plugin name the engine knows
+//! about.
+//!
+//! Registration goes through [`register_reference_plugins`] (installs every
+//! catalog entry) or [`register_profile_plugins`] with a [`GameProfile`] that
+//! selects a subset by any spelling of a plugin's name. Each plugin lives in
+//! its own module, and a plugin that has no implementation yet is a module
+//! that installs no TJS surface at all and reports itself through the engine
+//! log — an unimplemented plugin stays visible instead of silently absent.
+
+pub mod catalog;
+
 mod add_font;
 mod alpha_movie;
+mod csv_parser;
+mod dirlist;
+mod dmmcloud;
+mod draw_device_d3d;
+mod draw_device_d3dz;
+mod emoteplayer;
+mod expat;
+mod ext_kag_parser;
 mod extnagano;
 mod extrans;
+mod fft_graph;
+mod fstat;
+mod gamepad;
+mod get_about;
+mod get_lang_name;
 mod get_sample;
+mod gfx_effect;
+mod glitch_effect;
+mod http_request;
 mod json;
+mod k2compat;
 mod kag_parser_ex;
+mod kag_parser_exb;
+mod kagexopt;
+mod kaicho_trans;
+mod kirikiroid2;
+mod krkrsteam;
+mod krmovie;
+mod layer_ex_alpha;
+mod layer_ex_area_average;
+mod layer_ex_btoa;
 mod layer_ex_draw;
+mod layer_ex_image;
+mod layer_ex_movie;
+mod layer_ex_raster;
+mod layer_ex_save;
+mod layer_ex_shimmer;
 mod lzfs;
+mod menu;
+mod minizip;
 mod motion_player;
+mod multi_image;
 mod packinone;
+mod perspective;
+mod placeholder;
 mod psb_file;
+mod psd;
+mod save_struct;
+mod scripts_ex;
+mod shrink_copy;
+mod sqlite3;
+mod steam_draw_device;
 mod text_render;
+mod util_generic;
+mod util_graph;
+mod util_system;
+mod varfile;
+mod wf_basic_effect;
+mod wf_typical_dsp;
 mod win32_dialog;
+mod win32ole;
 mod window_ex;
+mod wuopus;
+mod wutcwf;
+mod wuvorbis;
+mod xp3_filter;
+mod yuzuex;
 
 use std::collections::BTreeSet;
 
@@ -20,21 +87,79 @@ use krkr_engine::KrkrEngine;
 
 pub use add_font::AddFontPlugin;
 pub use alpha_movie::AlphaMoviePlugin;
+pub use catalog::{
+    CATALOG, GIST_PLUGIN_NAMES, PARQUET_PLUGIN_FILES, PluginEntry, PluginFamily, PluginStatus,
+    canonical_name, install_plugin, is_same_plugin, missing_plugins, parquet_plugin_names,
+    plugin_mappings, resolve,
+};
+pub use csv_parser::CsvParserPlugin;
+pub use dirlist::DirlistPlugin;
+pub use dmmcloud::DmmCloudPlugin;
+pub use draw_device_d3d::DrawDeviceD3DPlugin;
+pub use draw_device_d3dz::DrawDeviceD3DZPlugin;
+pub use emoteplayer::EmotePlayerPlugin;
+pub use expat::ExpatPlugin;
+pub use ext_kag_parser::ExtKagParserPlugin;
 pub use extnagano::ExtNaganoPlugin;
 pub use extrans::ExtransPlugin;
+pub use fft_graph::FftGraphPlugin;
+pub use fstat::FstatPlugin;
+pub use gamepad::GamepadPlugin;
+pub use get_about::GetAboutPlugin;
+pub use get_lang_name::GetLangNamePlugin;
 pub use get_sample::GetSamplePlugin;
+pub use gfx_effect::GfxEffectPlugin;
+pub use glitch_effect::GlitchEffectPlugin;
+pub use http_request::HttpRequestPlugin;
 pub use json::JsonPlugin;
+pub use k2compat::K2CompatPlugin;
 pub use kag_parser_ex::KagParserExPlugin;
+pub use kag_parser_exb::KagParserExbPlugin;
+pub use kagexopt::KagexOptPlugin;
+pub use kaicho_trans::KaichoTransPlugin;
+pub use kirikiroid2::Kirikiroid2Plugin;
+pub use krkrsteam::KrkrSteamPlugin;
+pub use krmovie::KrmoviePlugin;
+pub use layer_ex_alpha::LayerExAlphaPlugin;
+pub use layer_ex_area_average::LayerExAreaAveragePlugin;
+pub use layer_ex_btoa::LayerExBtoaPlugin;
 pub use layer_ex_draw::LayerExDrawPlugin;
+pub use layer_ex_image::LayerExImagePlugin;
+pub use layer_ex_movie::LayerExMoviePlugin;
+pub use layer_ex_raster::LayerExRasterPlugin;
+pub use layer_ex_save::LayerExSavePlugin;
+pub use layer_ex_shimmer::LayerExShimmerPlugin;
 pub use lzfs::LzfsPlugin;
+pub use menu::MenuPlugin;
+pub use minizip::MinizipPlugin;
 pub use motion_player::MotionPlayerPlugin;
+pub use multi_image::MultiImagePlugin;
 pub use packinone::PackinOnePlugin;
+pub use perspective::PerspectivePlugin;
 pub use psb_file::PsbFilePlugin;
 #[doc(hidden)]
 pub use psb_file::{PsbValue, debug_parse_psb};
+pub use psd::PsdPlugin;
+pub use save_struct::SaveStructPlugin;
+pub use scripts_ex::ScriptsExPlugin;
+pub use shrink_copy::ShrinkCopyPlugin;
+pub use sqlite3::Sqlite3Plugin;
+pub use steam_draw_device::SteamDrawDevicePlugin;
 pub use text_render::TextRenderPlugin;
+pub use util_generic::UtilGenericPlugin;
+pub use util_graph::UtilGraphPlugin;
+pub use util_system::UtilSystemPlugin;
+pub use varfile::VarfilePlugin;
+pub use wf_basic_effect::WfBasicEffectPlugin;
+pub use wf_typical_dsp::WfTypicalDspPlugin;
 pub use win32_dialog::Win32DialogPlugin;
+pub use win32ole::Win32OlePlugin;
 pub use window_ex::WindowExPlugin;
+pub use wuopus::WuOpusPlugin;
+pub use wutcwf::WutcwfPlugin;
+pub use wuvorbis::WuVorbisPlugin;
+pub use xp3_filter::Xp3FilterPlugin;
+pub use yuzuex::YuzuExPlugin;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PluginOrigin {
@@ -50,104 +175,14 @@ pub struct PluginMapping {
     pub notes: &'static str,
 }
 
-pub const IMPLEMENTED_MAPPINGS: &[PluginMapping] = &[
-    PluginMapping {
-        feature: "System.addFont",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("addFont.dll"),
-        notes: "Registers fonts from game storage through the addFont compatibility plugin.",
-    },
-    PluginMapping {
-        feature: "Motion / Motion.Player / Motion.EmotePlayer",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("motionplayer.dll"),
-        notes: "Provides the current motionplayer compatibility shims that previously lived in krkr-engine.",
-    },
-    PluginMapping {
-        feature: "WIN32Dialog",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("win32dialog.dll"),
-        notes: "No-op Win32 dialog classes (WIN32Dialog plus Header/Items/Bitmap/SolidBrush/DrawItem/Notify/Blob subclasses) with the constant surface scripts reference.",
-    },
-    PluginMapping {
-        feature: "Window/MenuItem/Pad/Debug.console/System/Scripts extensions",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("windowEx.dll"),
-        notes: "No-op windowEx member surface attached to the existing engine classes.",
-    },
-    PluginMapping {
-        feature: "Scripts.evalJSON / evalJSONStorage / saveJSON / toJSONString",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("json.dll"),
-        notes: "Functional lenient JSON parser and serializer compatible with wtnbgo/json.",
-    },
-    PluginMapping {
-        feature: "CSVParser, Scripts.loadDataPack, Storages.saveOctet, System.getOSVersion, Layer effects",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("PackinOne.dll"),
-        notes: "Subset of the PackinOne bundle that games actually call; the rest is no-op surface.",
-    },
-    PluginMapping {
-        feature: "Layer drawing methods / GdiPlus namespace",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("layerExDraw.dll"),
-        notes: "No-op drawing surface; draw* methods return zeroed GdiPlus.RectF instances.",
-    },
-    PluginMapping {
-        feature: "TextRenderBase",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("textrender.dll"),
-        notes: "No-op text render surface; layout queries return conservative values.",
-    },
-    PluginMapping {
-        feature: "PSBFile / PSBValueClass",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("psbfile.dll"),
-        notes: "No-op PSB document surface; load validates storage readability only.",
-    },
-    PluginMapping {
-        feature: "AlphaMovie",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("AlphaMovie.dll"),
-        notes: "No-op alpha movie class; playback immediately reaches the finished state so polling wrappers terminate.",
-    },
-    PluginMapping {
-        feature: "WaveSoundBuffer.getSample / sampleValue / sampleCount / sampleAhead",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("getSample.dll"),
-        notes: "Silent-audio stub: sampleValue reads as 0.0 so lip-sync scripts stay idle.",
-    },
-    PluginMapping {
-        feature: "KAGParser tag dictionaries expose taglist",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("KAGParserEx.dll"),
-        notes: "The engine emits KAGParserEx-style taglist member lists unconditionally; the plugin itself is a marker.",
-    },
-    PluginMapping {
-        feature: "wave / mosaic / turn / rotatezoom / rotatevanish / rotateswap / ripple transitions",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("extrans.dll"),
-        notes: "Transition names currently degrade to crossfade in krkr-core; the plugin itself is a marker.",
-    },
-    PluginMapping {
-        feature: "zoomfade / blurfade / scanline / 3duniversal / rgbfade / spin / flutter / imagewipe / book / honeyturn / morphing / multiripple transitions",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("extNagano.dll"),
-        notes: "Transition names currently degrade to crossfade in krkr-core; the plugin itself is a marker.",
-    },
-    PluginMapping {
-        feature: "lzfs archive support",
-        provider: PluginOrigin::Plugin,
-        plugin_name: Some("lzfs.dll"),
-        notes: "No TJS surface; games without .lzfs archives need nothing. Marker only.",
-    },
-    PluginMapping {
-        feature: "System / Storages / Scripts / KAGParser / Layer / Window",
-        provider: PluginOrigin::Native,
-        plugin_name: None,
-        notes: "Core TVP/KRKR runtime objects stay in krkr-engine and are not modeled as external plugins.",
-    },
-];
+/// Engine-owned runtime objects that are not plugins: every game gets them
+/// from krkr-engine, so no `.dll` name selects them.
+pub const NATIVE_MAPPINGS: &[PluginMapping] = &[PluginMapping {
+    feature: "System / Storages / Scripts / KAGParser / Layer / Window",
+    provider: PluginOrigin::Native,
+    plugin_name: None,
+    notes: "Core TVP/KRKR runtime objects stay in krkr-engine and are not modeled as external plugins.",
+}];
 
 pub fn register_reference_plugins(engine: &mut KrkrEngine) -> krkr_tjs2::Result<()> {
     register_profile_plugins(engine, &GameProfile::all())
@@ -155,7 +190,7 @@ pub fn register_reference_plugins(engine: &mut KrkrEngine) -> krkr_tjs2::Result<
 
 /// Declares the compatibility capabilities a game actually needs. Hosts can
 /// construct this from a package manifest or a known title profile instead of
-/// linking/initialising every marker plugin on every platform.
+/// initialising every plugin on every platform.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GameProfile {
     plugins: BTreeSet<String>,
@@ -172,6 +207,7 @@ impl Default for GameProfile {
 }
 
 impl GameProfile {
+    /// Every catalog entry.
     pub fn all() -> Self {
         Self {
             plugins: default_plugin_names().map(str::to_string).collect(),
@@ -179,6 +215,14 @@ impl GameProfile {
         }
     }
 
+    /// The plugins PARQUET itself ships (see
+    /// [`catalog::PARQUET_PLUGIN_FILES`]).
+    pub fn parquet() -> Self {
+        Self::only(parquet_plugin_names())
+    }
+
+    /// Only the named plugins, in any spelling (see
+    /// [`catalog::resolve`]).
     pub fn only<I, S>(plugins: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -190,8 +234,15 @@ impl GameProfile {
         }
     }
 
+    /// True when `plugin_name` is enabled. Names resolve through the catalog,
+    /// so any spelling of a plugin — canonical name or alias, any case —
+    /// selects the same plugin.
     pub fn enables(&self, plugin_name: &str) -> bool {
-        self.allow_all || self.plugins.contains(plugin_name)
+        self.allow_all
+            || self
+                .plugins
+                .iter()
+                .any(|selected| is_same_plugin(selected, plugin_name))
     }
 
     pub fn plugins(&self) -> impl Iterator<Item = &str> {
@@ -199,49 +250,78 @@ impl GameProfile {
     }
 }
 
+/// Installs every catalog entry the profile enables, in catalog order.
 pub fn register_profile_plugins(
     engine: &mut KrkrEngine,
     profile: &GameProfile,
 ) -> krkr_tjs2::Result<()> {
-    macro_rules! register_if {
-        ($name:literal, $plugin:expr) => {
-            if profile.enables($name) {
-                engine.register_plugin($plugin)?;
-            }
-        };
+    for entry in CATALOG {
+        if profile.enables(entry.name) {
+            install_plugin(engine, entry)?;
+        }
     }
-    register_if!("addFont.dll", AddFontPlugin);
-    register_if!("motionplayer.dll", MotionPlayerPlugin);
-    register_if!("win32dialog.dll", Win32DialogPlugin);
-    register_if!("windowEx.dll", WindowExPlugin);
-    register_if!("json.dll", JsonPlugin);
-    register_if!("PackinOne.dll", PackinOnePlugin);
-    register_if!("layerExDraw.dll", LayerExDrawPlugin);
-    register_if!("textrender.dll", TextRenderPlugin);
-    register_if!("psbfile.dll", PsbFilePlugin);
-    register_if!("AlphaMovie.dll", AlphaMoviePlugin);
-    register_if!("getSample.dll", GetSamplePlugin);
-    register_if!("KAGParserEx.dll", KagParserExPlugin);
-    register_if!("extrans.dll", ExtransPlugin);
-    register_if!("extNagano.dll", ExtNaganoPlugin);
-    register_if!("lzfs.dll", LzfsPlugin);
     Ok(())
 }
 
 pub fn default_plugin_names() -> impl Iterator<Item = &'static str> {
-    IMPLEMENTED_MAPPINGS
-        .iter()
-        .filter_map(|mapping| mapping.plugin_name)
+    CATALOG.iter().map(|entry| entry.name)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::GameProfile;
+    use super::*;
 
     #[test]
     fn empty_profile_is_explicitly_empty_while_default_keeps_compatibility() {
         assert!(GameProfile::default().enables("json.dll"));
         assert!(!GameProfile::only(["addFont.dll"]).enables("json.dll"));
         assert!(!GameProfile::only(std::iter::empty::<&str>()).enables("json.dll"));
+    }
+
+    #[test]
+    fn a_profile_selects_a_plugin_by_any_of_its_names() {
+        for alias in [
+            "textrender.dll",
+            "textRender.dll",
+            "TextRender.dll",
+            "TEXTRENDER.DLL",
+        ] {
+            assert!(
+                GameProfile::only([alias]).enables("textrender.dll"),
+                "{alias} does not select the textrender entry"
+            );
+            assert!(
+                GameProfile::only(["textrender.dll"]).enables(alias),
+                "textrender.dll does not select {alias}"
+            );
+        }
+        assert!(GameProfile::only(["motionplayer_nod3d.dll"]).enables("motionplayer.dll"));
+        assert!(GameProfile::only(["saveStruct.dll"]).enables("savestruct.dll"));
+    }
+
+    #[test]
+    fn the_parquet_profile_covers_every_shipped_dll() {
+        let profile = GameProfile::parquet();
+        for name in PARQUET_PLUGIN_FILES {
+            let entry = resolve(name).expect("catalog entry");
+            assert!(
+                profile.enables(entry.name),
+                "{name} is shipped by PARQUET but not enabled by the parquet profile"
+            );
+        }
+        assert!(!profile.enables("sqlite3.dll"));
+        assert!(profile.enables("krmovie.dll"));
+    }
+
+    #[test]
+    fn the_full_profile_covers_the_whole_catalog() {
+        let profile = GameProfile::all();
+        for name in default_plugin_names() {
+            assert!(
+                profile.enables(name),
+                "{name} missing from the full profile"
+            );
+        }
+        assert_eq!(default_plugin_names().count(), CATALOG.len());
     }
 }
