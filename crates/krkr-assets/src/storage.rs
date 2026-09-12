@@ -2426,12 +2426,31 @@ pub fn normalize_storage_separators(path: &str) -> String {
 /// `"dir/"` normalizes to `"dir/"` and `"dir//"` to `"dir/"` — but a `/`
 /// immediately in front of `>` is a duplicated delimiter there and
 /// disappears (`"dir/>"` is `"dir>"`).
+///
+/// A media-qualified name keeps the `://` the reference treats as structure
+/// (`media://domain/path`, `StorageIntf.cpp:299-354`, reassembled at `:462`):
+/// `getFullPath("psb://container.psb/inner/")` stays `psb://container.psb/inner/`
+/// instead of folding to `psb:/container.psb/inner/`, so the result still
+/// reaches the provider through `split_media_name`.
 pub fn normalize_storage_name(path: &str) -> Result<String> {
     let path = normalize_storage_separators(path);
     let (outer, inner) = path
         .split_once('>')
         .map_or((path.as_str(), None), |(outer, inner)| (outer, Some(inner)));
-    let mut outer = normalize_logical_path(outer, false)?;
+    // The reference splits `media://domain/path` before it compacts anything
+    // (`StorageIntf.cpp:299-354`), lower-cases the media name (`:366-374`) and
+    // reassembles `media + "://" + domain + path` (`:462`), so the two slashes
+    // are structure rather than a path delimiter and never collapse. Only the
+    // path part is compacted; the domain is re-emitted as written, the way the
+    // reference leaves it to the media's own `NormalizeDomainName` (this
+    // engine does not case-fold outer names either).
+    let mut outer = match split_media_prefix(outer) {
+        Some((media, domain, path)) => {
+            let path = normalize_logical_path(path, false)?;
+            format!("{}://{domain}{path}", media.to_ascii_lowercase())
+        }
+        None => normalize_logical_path(outer, false)?,
+    };
     let Some(inner) = inner else {
         return Ok(outer);
     };
@@ -2439,12 +2458,38 @@ pub fn normalize_storage_name(path: &str) -> Result<String> {
     // loop over the combined string (`StorageIntf.cpp:392-398`), where `>` is
     // a delimiter like `/` (`:405`). A trailing delimiter on the outer path is
     // therefore deleted by the duplicated-delimiter rule (`:409-413`); it only
-    // survives when it ends the whole name.
-    if outer.ends_with('/') {
+    // survives when it ends the whole name. The two slashes of a media prefix
+    // are structure rather than path delimiters, so an empty name space keeps
+    // them (`"psb://>"`).
+    if outer.ends_with('/') && !outer.ends_with("://") {
         outer.pop();
     }
     let inner = normalize_logical_path(inner, true)?;
     Ok(format!("{outer}>{inner}"))
+}
+
+/// Splits the reference's `media://domain/path` form (`StorageIntf.cpp:299-354`)
+/// into the media name, the domain and the path (which keeps its leading `/`).
+///
+/// Only the explicit `://` spelling counts: it is the one
+/// [`split_media_name`] accepts, and the reference's `media:/path` and
+/// `media:path` spellings have never reached a provider in this engine. The
+/// reference fills an omitted domain from the media's current domain (`"."`)
+/// and prepends its current path to a relative one; this engine has no
+/// current media/domain/path state and re-emits what the name carries. A
+/// `media://domain` name with no path is `TVPInvalidPathName` there
+/// (`:341-343`); this engine hands such a name to the registered media, which
+/// owns its own namespace validation (`crate::media`), so the spelling is kept
+/// instead of rejected.
+fn split_media_prefix(name: &str) -> Option<(&str, &str, &str)> {
+    let (media, name_space) = name.split_once("://")?;
+    if !is_valid_media_name(media) {
+        return None;
+    }
+    // The domain runs to the next `/`; a name with no further delimiter names
+    // the media itself, which keeps the whole `name_space` as its domain.
+    let domain_len = name_space.find('/').unwrap_or(name_space.len());
+    Some((media, &name_space[..domain_len], &name_space[domain_len..]))
 }
 
 fn normalize_logical_path(path: &str, lower_case: bool) -> Result<String> {
@@ -2720,14 +2765,94 @@ mod tests {
         assert_eq!(normalize_storage_name("a//>").unwrap(), "a>");
         assert_eq!(normalize_storage_name("a/>b/c/").unwrap(), "a>b/c/");
         assert_eq!(normalize_storage_name("/>x").unwrap(), ">x");
-        // Media-qualified names keep their trailing delimiter too. The
-        // `media://` spelling itself is folded to `media:/` by this
-        // normalizer, a divergence `crates/krkr-assets/src/media.rs:66-70`
-        // already records for the auto-path machinery; the trailing
-        // delimiter is this normalization's contract.
+        // Media-qualified names keep their trailing delimiter too; the media
+        // prefix itself is `normalization_keeps_the_media_prefix`'s subject.
         assert_eq!(
             normalize_storage_name("psb://container.psb/inner/").unwrap(),
-            "psb:/container.psb/inner/"
+            "psb://container.psb/inner/"
+        );
+    }
+
+    /// Ground truth: the media/domain split of `NormalizeStorageName`
+    /// (`StorageIntf.cpp:299-354`) and its `media + "://" + domain + path`
+    /// reassembly (`:462`). The two slashes are structure, not a path
+    /// delimiter, so a media-qualified name keeps them and the normalized
+    /// result still dispatches through [`split_media_name`].
+    #[test]
+    fn normalization_keeps_the_media_prefix() {
+        assert_eq!(
+            normalize_storage_name("psb://container.psb/inner/").unwrap(),
+            "psb://container.psb/inner/"
+        );
+        assert_eq!(
+            normalize_storage_name("psb://container.psb/inner").unwrap(),
+            "psb://container.psb/inner"
+        );
+        // A media-root name: the domain is everything up to the next `/`.
+        assert_eq!(
+            normalize_storage_name("psb://container.psb/").unwrap(),
+            "psb://container.psb/"
+        );
+        // The reference lower-cases the media name (`:366-374`) and leaves the
+        // domain alone; only the path is compacted.
+        assert_eq!(
+            normalize_storage_name("PSB://container.psb//inner/").unwrap(),
+            "psb://container.psb/inner/"
+        );
+        assert_eq!(
+            normalize_storage_name("psb://container.psb/./inner/../").unwrap(),
+            "psb://container.psb/"
+        );
+        // Separators are unified before the media split (`:271-277`).
+        assert_eq!(
+            normalize_storage_name(r"psb:\\container.psb\inner").unwrap(),
+            "psb://container.psb/inner"
+        );
+        // An explicit `.` domain survives, the way the finding's reference
+        // sample `TVPNormalizeStorageName("file://./x")` keeps it.
+        assert_eq!(normalize_storage_name("file://./x").unwrap(), "file://./x");
+        // `media://name` (a domain with no path) is `TVPInvalidPathName` in the
+        // reference (`:341-343`); this engine hands such a name to the
+        // registered media, which owns its namespace validation
+        // (`crate::media`), so the spelling survives for that hand-off.
+        assert_eq!(
+            normalize_storage_name("psb://container.psb").unwrap(),
+            "psb://container.psb"
+        );
+        // A media path may not escape its namespace, exactly like a plain one.
+        assert!(normalize_storage_name("psb://container.psb/../x").is_err());
+        // The archive delimiter is split off first, so the media prefix sits
+        // on the outer half and the in-archive half keeps its own rules.
+        assert_eq!(
+            normalize_storage_name("psb://container.psb/arc.xp3>INNER/").unwrap(),
+            "psb://container.psb/arc.xp3>inner/"
+        );
+        // The `/` in front of `>` is a duplicated delimiter (`:392-398`,
+        // `:409-413`) — but the media prefix's `//` is not a path delimiter at
+        // all, so an empty name space keeps it.
+        assert_eq!(
+            normalize_storage_name("psb://container.psb/>inner").unwrap(),
+            "psb://container.psb>inner"
+        );
+        assert_eq!(
+            normalize_storage_name("psb://>inner").unwrap(),
+            "psb://>inner"
+        );
+        // Only the explicit `://` spelling is a media name here: it is the one
+        // `split_media_name` accepts, so the reference's `media:/path` and
+        // `media:path` spellings keep the plain-path compaction.
+        assert_eq!(
+            normalize_storage_name("psb:/container.psb").unwrap(),
+            "psb:/container.psb"
+        );
+        assert_eq!(normalize_storage_name("psb2://c/x").unwrap(), "psb2:/c/x");
+        assert_eq!(normalize_storage_name("://c/x").unwrap(), ":/c/x");
+        // The provider dispatch the round trip needs: `getFullPath` output fed
+        // back into a `Storages` call still splits into media and namespace.
+        let full_path = normalize_storage_name("psb://container.psb/inner/").unwrap();
+        assert_eq!(
+            split_media_name(&full_path),
+            Some(("psb", "container.psb/inner/"))
         );
     }
 
@@ -2762,6 +2887,31 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate == "bgimage/白.jpg")
+        );
+    }
+
+    /// The media auto-path divergence `crate::media`'s module doc records: the
+    /// stored auto path keeps its `media://` spelling, but joining a candidate
+    /// re-parses the path through `Path`, which collapses the structural `//`
+    /// before the name is ever handed to `split_media_name`. Pinned so neither
+    /// half of the statement drifts unnoticed.
+    #[test]
+    fn media_auto_path_candidates_still_fold_the_media_prefix() {
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage.add_auto_path("psb://container.psb/");
+
+        let candidates = storage.storage_candidates("inner").expect("candidates");
+
+        assert!(candidates.iter().any(|candidate| candidate == "inner"));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "psb:/container.psb/inner")
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.starts_with("psb://"))
         );
     }
 

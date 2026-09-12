@@ -259,9 +259,54 @@ fn chop_storage_ext(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use krkr_assets::{ProjectStorage, StorageMediaProvider};
+    use krkr_core::{ProjectStoragePort, ResourceStream};
     use krkr_tjs2::runtime::Variant;
 
     use crate::engine::{EngineConfig, KrkrEngine};
+
+    /// A media that records the name space of every probe, so a test can see
+    /// that a normalized name actually reached the provider.
+    struct ProbeMedia {
+        entry: &'static str,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl ProbeMedia {
+        fn new(entry: &'static str) -> Self {
+            Self {
+                entry,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("media lock").clone()
+        }
+    }
+
+    impl StorageMediaProvider for ProbeMedia {
+        fn media_name(&self) -> &str {
+            "psb"
+        }
+
+        fn exists(&self, name: &str) -> bool {
+            self.asked
+                .lock()
+                .expect("media lock")
+                .push(name.to_string());
+            name == self.entry
+        }
+
+        fn open(&self, name: &str) -> std::io::Result<Box<dyn ResourceStream>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no entry `{name}`"),
+            ))
+        }
+    }
 
     /// Evaluates `Storages.getFullPath(<name>)` the way a script reaches it.
     fn full_path(engine: &mut KrkrEngine, name: &str) -> String {
@@ -302,5 +347,109 @@ mod tests {
         );
         assert_eq!(full_path(&mut engine, "/"), "/");
         assert_eq!(full_path(&mut engine, ""), "");
+    }
+
+    #[test]
+    fn get_full_path_keeps_the_media_prefix() {
+        // `TVPNormalizeStorageName` splits `media://domain/path`, lower-cases
+        // the media name and re-emits `media + "://" + domain + path`
+        // (`StorageIntf.cpp:299-354`, `:366-374`, `:462`), so the two slashes
+        // are structure and survive; folding them to `psb:/container.psb/...`
+        // would leave a name no registered media can dispatch, because
+        // `split_media_name` requires the literal `://`.
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        assert_eq!(
+            full_path(&mut engine, "psb://container.psb/inner/"),
+            "psb://container.psb/inner/"
+        );
+        assert_eq!(
+            full_path(&mut engine, "psb://container.psb/inner"),
+            "psb://container.psb/inner"
+        );
+        // A media-root name, and the media name lower-cased the way the
+        // reference does (`StorageIntf.cpp:366-374`).
+        assert_eq!(
+            full_path(&mut engine, "psb://container.psb/"),
+            "psb://container.psb/"
+        );
+        assert_eq!(
+            full_path(&mut engine, "PSB://container.psb"),
+            "psb://container.psb"
+        );
+        // The archive delimiter splits first, so the media prefix sits on the
+        // outer half only.
+        assert_eq!(
+            full_path(&mut engine, "psb://container.psb/arc.xp3>DIR/"),
+            "psb://container.psb/arc.xp3>dir/"
+        );
+    }
+
+    /// The round trip the finding lost: the string `Storages.getFullPath`
+    /// returns has to reach the registered provider when a script feeds it
+    /// back into a `Storages` call.
+    #[test]
+    fn get_full_path_media_names_stay_dispatchable() {
+        let media = Arc::new(ProbeMedia::new("container.psb/inner"));
+        let storage = Arc::new(ProjectStorage::new(None, Vec::new(), None, Vec::new()));
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(Arc::clone(&storage) as Arc<dyn ProjectStoragePort>),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine
+            .tjs_runtime_mut()
+            .host_mut()
+            .register_storage_media(Arc::clone(&media) as Arc<dyn StorageMediaProvider>)
+            .expect("register media");
+
+        let result = engine
+            .execute_script(
+                "getFullPath-round-trip.tjs",
+                r#"
+                var full = Storages.getFullPath("psb://container.psb/inner");
+                return full + "|" + Storages.isExistentStorage(full);
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            result,
+            Variant::String("psb://container.psb/inner|1".to_string())
+        );
+        assert_eq!(media.asked(), vec!["container.psb/inner".to_string()]);
+    }
+
+    /// The other consumer of the same normalization: `addAutoPath` stores the
+    /// media spelling, and `removeAutoPath` has to match it after its own
+    /// normalization pass.
+    #[test]
+    fn media_auto_paths_keep_their_prefix_through_add_and_remove() {
+        let storage = Arc::new(ProjectStorage::new(None, Vec::new(), None, Vec::new()));
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(Arc::clone(&storage) as Arc<dyn ProjectStoragePort>),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+
+        engine
+            .execute_script(
+                "auto-path-media.tjs",
+                r#"Storages.addAutoPath("psb://container.psb/");"#,
+            )
+            .expect("script");
+
+        // `addAutoPath` trims the required trailing delimiter, keeping the
+        // `://` the media registry dispatches on.
+        assert_eq!(
+            storage.auto_paths(),
+            vec!["psb://container.psb".to_string()]
+        );
+        assert!(
+            engine
+                .tjs_runtime_mut()
+                .host_mut()
+                .remove_auto_path("psb://container.psb")
+        );
+        assert!(storage.auto_paths().is_empty());
     }
 }
