@@ -924,9 +924,7 @@ fn install_menu_item_index_property(
         move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
             menu_item_index(runtime, this_obj)
         },
-        move |runtime: &mut Runtime<KrkrHost>,
-              this_obj: Option<ObjectHandle>,
-              value: Variant| {
+        move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, value: Variant| {
             let index = value.to_integer().unwrap_or(0);
             set_menu_item_index(runtime, this_obj, index)
         },
@@ -1408,36 +1406,11 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "setImagePos", layer_set_image_pos);
     register_native_method_preserving_script(runtime, handle, "setImageSize", layer_set_image_size);
     register_native_method_preserving_script(runtime, handle, "setClip", layer_set_clip);
-    register_native_method_preserving_script(
-        runtime,
-        handle,
-        "getMainPixel",
-        layer_get_main_pixel,
-    );
-    register_native_method_preserving_script(
-        runtime,
-        handle,
-        "setMainPixel",
-        layer_set_main_pixel,
-    );
-    register_native_method_preserving_script(
-        runtime,
-        handle,
-        "getMaskPixel",
-        layer_get_mask_pixel,
-    );
-    register_native_method_preserving_script(
-        runtime,
-        handle,
-        "setMaskPixel",
-        layer_set_mask_pixel,
-    );
-    register_native_method_preserving_script(
-        runtime,
-        handle,
-        "setCursorPos",
-        layer_set_cursor_pos,
-    );
+    register_native_method_preserving_script(runtime, handle, "getMainPixel", layer_get_main_pixel);
+    register_native_method_preserving_script(runtime, handle, "setMainPixel", layer_set_main_pixel);
+    register_native_method_preserving_script(runtime, handle, "getMaskPixel", layer_get_mask_pixel);
+    register_native_method_preserving_script(runtime, handle, "setMaskPixel", layer_set_mask_pixel);
+    register_native_method_preserving_script(runtime, handle, "setCursorPos", layer_set_cursor_pos);
     register_native_method_preserving_script(
         runtime,
         handle,
@@ -3793,18 +3766,6 @@ fn insert_kag_layer_slot(
     slots.insert(handle, KagLayerSlot::new(page, &layer));
 }
 
-fn kag_layer_target(
-    runtime: &Runtime<KrkrHost>,
-    handle: ObjectHandle,
-) -> Option<LayerRenderTarget> {
-    let handle = runtime.bound_this(handle).unwrap_or(handle);
-    runtime
-        .host()
-        .kag_layer_slot(handle)
-        .cloned()
-        .map(LayerRenderTarget::Kag)
-}
-
 pub(crate) fn render_layer_snapshot(
     runtime: &Runtime<KrkrHost>,
     target: &LayerRenderTarget,
@@ -5102,28 +5063,16 @@ fn layer_begin_transition(
     // its own image, rect and pixels, and only the stop's `Exchange`/`Swap`
     // moves content between the two objects
     // (`tTJSNI_BaseLayer::InternalStopTransition`, `:6364`).
-    let mut source_page_layers = sync_kag_source_page(runtime, source)?;
-    // Staged layers the source's own subtree already covers must not become
-    // extra roots: the face draws its roots in order, so a layer reachable from
-    // the source would be drawn twice (doubling every semi-transparent pixel).
-    if let Some(source_layer_id) = source_layer_id {
-        source_page_layers.retain(|layer_id| {
-            *layer_id != source_layer_id
-                && !runtime
-                    .host()
-                    .layer_tree()
-                    .is_ancestor_or_self(source_layer_id, *layer_id)
-        });
-    }
-    // The face itself is rebuilt from the render tree on every pass -- official
-    // re-renders the source's own cache each completion
-    // (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`) -- and the staged
-    // page model was just folded into those nodes.
+    //
+    // The face is the source's own subtree: a script layer's bitmap is its own
+    // node, so the source page needs no extra roots -- KAGEX keeps the incoming
+    // page in the source object's own layers and hands that subtree to this
+    // transition (`MainWindow.tjs` `beginTransition`).
     let faces = match source_layer_id {
         Some(source) => TransitionFaces::Layers {
             dest: dest_layer_id.unwrap_or(source),
             source,
-            extra_roots: source_page_layers,
+            extra_roots: Vec::new(),
             with_children,
         },
         None => TransitionFaces::Frozen(TransitionFaceLists::default()),
@@ -5315,15 +5264,6 @@ fn begin_provider_transition(
     Ok(())
 }
 
-fn layer_member_i64(
-    runtime: &Runtime<KrkrHost>,
-    handle: ObjectHandle,
-    name: &str,
-    fallback: i64,
-) -> Result<i64> {
-    layer_property_i64(runtime, handle, name, fallback)
-}
-
 fn copy_render_state(dest: &mut LayerNode, source: &LayerNode) {
     dest.copy_render_state_from(source);
     dest.renderable = source.renderable;
@@ -5356,87 +5296,12 @@ fn apply_layer_node_state_to_script(
     }
 }
 
-/// Brings the source page's render nodes in line with the KAG page model.
-///
-/// `kag.back.*` is a staging page: `loadImages`, `setSizeToImageSize`,
-/// `left`/`top`/`visible` on those layer objects update the page model
-/// (`pending_kag_layers`), which only reaches the render tree through
-/// `apply_pending_kag_layers`.  The transition's incoming face is the source's
-/// own content (`TransSrc->Complete(destrect)`, `LayerIntf.cpp:6604`), so what
-/// the script wrote to the staging page has to be visible to the draw model
-/// first.  Only the source page is synced -- `tTransDrawable::DrawCompleted`
-/// writes neither layer (`:6567-6681`), so the destination is never touched.
-fn sync_kag_source_page(
-    runtime: &mut Runtime<KrkrHost>,
-    source: ObjectHandle,
-) -> Result<Vec<LayerId>> {
-    let Some(LayerRenderTarget::Kag(slot)) = kag_layer_target(runtime, source) else {
-        return Ok(Vec::new());
-    };
-    if slot.page != "back" {
-        return Ok(Vec::new());
-    }
-
-    // Only a whole-page transition draws the staged page.  `[backlay]` with no
-    // `layer=` stages every page layer for the `[trans]` on the page base
-    // (`MainWindow.tjs:3166-3183`), while a single-layer `[trans layer=N]`
-    // stages -- and draws -- that one layer.  The staging buffer is only
-    // consumed by the engine's own page swap and is never cleared on the script
-    // path, so a stale full staging must not leak into a later layer
-    // transition: it would paint the old page's opaque background over the
-    // incoming sprite inside the destination rectangle.
-    let mut names = vec![slot.layer.clone()];
-    if is_kag_page_base(&slot.layer) {
-        for name in runtime.host().pending_kag_layer_names() {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    let mut layer_ids = Vec::new();
-    for name in names {
-        let Some(snapshot) = kag_layer_object_snapshot(runtime, &slot.page, &name)? else {
-            continue;
-        };
-        let Some(handle) = kag_page_layer_handle(runtime, &slot.page, &name) else {
-            continue;
-        };
-        let Some(layer_id) = native_layer_id(runtime, handle)? else {
-            continue;
-        };
-        if let Some(node) = runtime.host_mut().layer_tree_mut().layer_mut(layer_id) {
-            let renderable = node.renderable;
-            node.copy_render_state_from(&snapshot);
-            node.renderable = renderable;
-        }
-        layer_ids.push(layer_id);
-    }
-    Ok(layer_ids)
-}
-
 /// Whether a KAG layer name is the page base (`[backlay]` stages the whole page
 /// for it, `MainWindow.tjs:346-355`).
 fn is_kag_page_base(name: &str) -> bool {
     name == "base" || name == "background"
 }
 
-fn kag_layer_object_snapshot(
-    runtime: &Runtime<KrkrHost>,
-    page: &str,
-    layer: &str,
-) -> Result<Option<LayerNode>> {
-    let Some(mut snapshot) = runtime.host().kag_layer(page, layer).cloned() else {
-        return Ok(None);
-    };
-    if is_kag_page_base(layer) {
-        return Ok(Some(snapshot));
-    }
-    let Some(handle) = kag_page_layer_handle(runtime, page, layer) else {
-        return Ok(Some(snapshot));
-    };
-    apply_script_layer_members(runtime, handle, &mut snapshot)?;
-    Ok(Some(snapshot))
-}
 /// The TJS layer object for a KAG page layer (`kag.<page>.<name>`), when the
 /// script has one.
 ///
@@ -5469,57 +5334,12 @@ fn kag_page_layer_handle(
     } else {
         ("layers", layer)
     };
-    let array = runtime.object_member(page_object, array_name).object_handle()?;
+    let array = runtime
+        .object_member(page_object, array_name)
+        .object_handle()?;
     variant_object(&runtime.object_member(array, index))
         .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
 }
-fn apply_script_layer_members(
-    runtime: &Runtime<KrkrHost>,
-    handle: ObjectHandle,
-    layer: &mut LayerNode,
-) -> Result<()> {
-    layer.left = layer_member_i64(runtime, handle, "left", layer.left as i64)? as f32;
-    layer.top = layer_member_i64(runtime, handle, "top", layer.top as i64)? as f32;
-    layer.width =
-        layer_member_i64(runtime, handle, "width", layer.width.max(0.0) as i64)?.max(0) as f32;
-    layer.height =
-        layer_member_i64(runtime, handle, "height", layer.height.max(0.0) as i64)?.max(0) as f32;
-    layer.image_left =
-        layer_member_i64(runtime, handle, "imageLeft", layer.image_left as i64)? as f32;
-    layer.image_top = layer_member_i64(runtime, handle, "imageTop", layer.image_top as i64)? as f32;
-    if let Some(image) = &layer.image {
-        let size = image.size();
-        layer.image_width = size.width;
-        layer.image_height = size.height;
-    } else {
-        layer.image_width = 0.0;
-        layer.image_height = 0.0;
-    }
-    layer.visible = layer_member_i64(runtime, handle, "visible", i64::from(layer.visible))? != 0;
-    layer.opacity =
-        layer_member_i64(runtime, handle, "opacity", i64::from(layer.opacity))?.clamp(0, 255) as u8;
-    layer.enabled = layer_member_i64(runtime, handle, "enabled", i64::from(layer.enabled))? != 0;
-    layer.node_enabled = layer_member_i64(
-        runtime,
-        handle,
-        "nodeEnabled",
-        i64::from(layer.node_enabled),
-    )? != 0;
-    layer.layer_type =
-        layer_member_i64(runtime, handle, "type", i64::from(layer.layer_type))? as i32;
-    layer.face = layer_member_i64(runtime, handle, "face", i64::from(layer.face))? as i32;
-    layer.hit_type =
-        layer_member_i64(runtime, handle, "hitType", i64::from(layer.hit_type))? as i32;
-    layer.hit_threshold = layer_member_i64(
-        runtime,
-        handle,
-        "hitThreshold",
-        i64::from(layer.hit_threshold),
-    )?
-    .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    Ok(())
-}
-
 fn layer_stop_transition(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -5561,10 +5381,12 @@ fn layer_set_cursor_pos(
         .native_layer(this)
         .and_then(|layer_id| runtime.host().layer_tree().absolute_position(layer_id))
         .unwrap_or(krkr_core::Point::new(0.0, 0.0));
-    runtime.host_mut().set_cursor_position(krkr_core::Point::new(
-        origin.x + x as f32,
-        origin.y + y as f32,
-    ));
+    runtime
+        .host_mut()
+        .set_cursor_position(krkr_core::Point::new(
+            origin.x + x as f32,
+            origin.y + y as f32,
+        ));
     Ok(Variant::Void)
 }
 
@@ -5873,7 +5695,9 @@ fn fill_layer_province(
         };
         let x0 = x.max(clip_x);
         let y0 = y.max(clip_y);
-        let x1 = x.saturating_add(width).min(clip_x.saturating_add(clip_width));
+        let x1 = x
+            .saturating_add(width)
+            .min(clip_x.saturating_add(clip_width));
         let y1 = y
             .saturating_add(height)
             .min(clip_y.saturating_add(clip_height));
@@ -6362,7 +6186,16 @@ fn layer_piled_copy(
     // of leaving it be.
     let mut pile = vec![0u8; width as usize * height as usize * 4];
     for layer in &layers {
-        composite_piled_layer(&mut pile, width as u32, height as u32, layer, sx, sy, width, height);
+        composite_piled_layer(
+            &mut pile,
+            width as u32,
+            height as u32,
+            layer,
+            sx,
+            sy,
+            width,
+            height,
+        );
     }
     mutate_layer_pixels_min(
         runtime,
@@ -6865,14 +6698,9 @@ fn copy_province_rect(
     let clip = layer_clip_bounds(runtime, dest_target)
         .or_else(|| {
             render_layer_snapshot(runtime, dest_target).and_then(|layer| {
-                layer.image.map(|image| {
-                    (
-                        0,
-                        0,
-                        image.upload.width as i64,
-                        image.upload.height as i64,
-                    )
-                })
+                layer
+                    .image
+                    .map(|image| (0, 0, image.upload.width as i64, image.upload.height as i64))
             })
         })
         .or(Some((0, 0, 0, 0)));
@@ -8741,12 +8569,7 @@ fn leave_mouse_from_tree(runtime: &mut Runtime<KrkrHost>, root: LayerId) -> Resu
 /// that parts with its layer must not keep delivering moves to it.
 fn release_capture_from_tree(runtime: &mut Runtime<KrkrHost>, root: LayerId) {
     let captured = runtime.host().captured_layer();
-    if captured.is_some_and(|layer| {
-        runtime
-            .host()
-            .layer_tree()
-            .is_ancestor_or_self(root, layer)
-    }) {
+    if captured.is_some_and(|layer| runtime.host().layer_tree().is_ancestor_or_self(root, layer)) {
         runtime.host_mut().set_captured_layer(None);
     }
 }
@@ -8975,8 +8798,9 @@ pub(crate) fn finish_native_transition(
     }
     finish_kag_window_transition_if_pending(runtime, completion.dest)?;
 
-    let owned = window
-        .is_some_and(|window| script_owns_transition_completion(runtime, window, trans_count_before));
+    let owned = window.is_some_and(|window| {
+        script_owns_transition_completion(runtime, window, trans_count_before)
+    });
     if deliver_event && !owned {
         runtime.set_object_member(completion.dest, "inTransition", Variant::Integer(0));
         if let Some(window) = window
@@ -9676,12 +9500,7 @@ fn affine_copy_pixels(
         max_x.max(0) as u32,
         max_y.max(0) as u32,
     );
-    let (min_x, min_y, max_x, max_y) = (
-        min_x as i64,
-        min_y as i64,
-        max_x as i64,
-        max_y as i64,
-    );
+    let (min_x, min_y, max_x, max_y) = (min_x as i64, min_y as i64, max_x as i64, max_y as i64);
     for dy in min_y..max_y {
         for dx in min_x..max_x {
             // The affine points are the images of the source rectangle's

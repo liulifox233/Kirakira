@@ -251,7 +251,6 @@ pub(crate) struct LayerInstance {
     /// `LayerIntf.cpp:630`): the TJS array is reused and its contents are
     /// rebuilt from this list the next time the property is read.
     pub children_dirty: bool,
-    pub render_target: LayerRenderTarget,
     /// Set once the layer is `Part()`ed out of the layer tree
     /// (`LayerIntf.cpp:589`).  Draw and hit test only walk from each manager's
     /// primary layer (`tTVPLayerManager::RecreateOverallOrderIndex`,
@@ -276,7 +275,6 @@ impl LayerInstance {
             children: Vec::new(),
             children_array,
             children_dirty: true,
-            render_target: LayerRenderTarget::Native(layer_id),
             detached: false,
             properties: BTreeMap::new(),
         }
@@ -1849,10 +1847,9 @@ impl KrkrHost {
     /// every layer outside its ancestry (`IsDisabledByMode`).
     pub(crate) fn set_modal_layer(&mut self, handle: ObjectHandle, layer: LayerId) {
         let window = self.native_layer_window(handle);
-        self.modal_layers
-            .retain(|(entry_window, entry_layer)| {
-                !(*entry_window == window && *entry_layer == layer)
-            });
+        self.modal_layers.retain(|(entry_window, entry_layer)| {
+            !(*entry_window == window && *entry_layer == layer)
+        });
         self.modal_layers.push((window, layer));
         self.sync_modal_layer();
     }
@@ -2140,14 +2137,13 @@ impl KrkrHost {
         false
     }
 
-    pub(crate) fn kag_layer_slot(&self, handle: ObjectHandle) -> Option<&KagLayerSlot> {
-        self.kag_layer_slots.get(&handle)
-    }
-
+    /// Every script layer draws into its own node; the KAG page a layer object
+    /// belongs to never redirects its pixels (see
+    /// [`Self::replace_kag_layer_slots`]).
     pub(crate) fn layer_render_target(&self, handle: ObjectHandle) -> Option<LayerRenderTarget> {
         self.native_layers
             .get(&handle)
-            .map(|instance| instance.render_target.clone())
+            .map(|instance| LayerRenderTarget::Native(instance.layer_id))
     }
 
     /// The per-layer plugin state attached to `layer` under type `T`, if any.
@@ -2209,23 +2205,27 @@ impl KrkrHost {
         value.downcast::<T>().ok()
     }
 
+    /// Records which `kag.<page>.<name>` slot each script layer object holds.
+    ///
+    /// The map is page bookkeeping only: every script layer draws into its own
+    /// bitmap (`tTJSNI_BaseLayer::MainImage`), exactly as the reference does --
+    /// there is no engine-side page buffer.  KAG's pages are object graphs the
+    /// game builds and exchanges itself (`MainWindow.tjs` swaps `fore`/`back`
+    /// and copies between the two objects with `assignImages`), so routing a
+    /// script object's pixels anywhere but its own node would drop everything
+    /// the script painted the moment a page swap changed its role.  The engine's
+    /// own KAG page layers (the `[bg]`/`[image] page=back` targets) keep the
+    /// staging model in [`Self::mutate_kag_layer`].
     pub(crate) fn replace_kag_layer_slots(&mut self, slots: BTreeMap<ObjectHandle, KagLayerSlot>) {
         if self.kag_layer_slots == slots {
             return;
         }
         self.kag_layer_slots = slots;
+        // A page exchange changes which object is the displayed page, and the
+        // fore base's parent projection follows the map, so every instance
+        // re-projects its own node.
         let handles = self.native_layers.keys().copied().collect::<Vec<_>>();
         for handle in handles {
-            let Some(layer_id) = self.native_layer(handle) else {
-                continue;
-            };
-            let target = match self.kag_layer_slots.get(&handle).cloned() {
-                Some(slot) if slot.page == "back" => LayerRenderTarget::Kag(slot),
-                _ => LayerRenderTarget::Native(layer_id),
-            };
-            if let Some(instance) = self.native_layers.get_mut(&handle) {
-                instance.render_target = target;
-            }
             self.apply_layer_instance_to_render(handle);
         }
     }
@@ -2241,9 +2241,7 @@ impl KrkrHost {
         let Some(instance) = self.native_layers.get(&handle).cloned() else {
             return false;
         };
-        let LayerRenderTarget::Native(layer_id) = instance.render_target else {
-            return false;
-        };
+        let layer_id = instance.layer_id;
         if self.layer_tree.layer(layer_id).is_some() {
             return false;
         }
@@ -2255,7 +2253,8 @@ impl KrkrHost {
         let window_closed = instance
             .window
             .is_some_and(|window| self.native_window_closed(window));
-        let renderable = instance.renderable_in_tree(render_parent, self.parent_resolves(&instance));
+        let renderable =
+            instance.renderable_in_tree(render_parent, self.parent_resolves(&instance));
         if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
             apply_layer_properties_to_node(layer, &instance.properties, window_closed);
             layer.renderable = renderable;
@@ -2264,6 +2263,11 @@ impl KrkrHost {
         true
     }
 
+    /// Projects an instance's stored state onto its own render node.
+    ///
+    /// A script layer always draws into its own bitmap: `tTJSNI_BaseLayer` owns
+    /// its `MainImage` and KAG's pages are the objects the game builds and
+    /// exchanges (`MainWindow.tjs`), so no page role redirects the pixels here.
     pub(crate) fn apply_layer_instance_to_render(&mut self, handle: ObjectHandle) {
         self.ensure_native_layer_node(handle);
         let Some(instance) = self.native_layers.get(&handle).cloned() else {
@@ -2276,29 +2280,17 @@ impl KrkrHost {
             .window
             .map(|window| self.window_frame_offset(window))
             .unwrap_or(Point::new(0.0, 0.0));
-        match instance.render_target.clone() {
-            LayerRenderTarget::Native(layer_id) => {
-                let render_parent = self
-                    .native_layer_render_parent(handle, instance.parent)
-                    .filter(|parent_id| *parent_id != layer_id);
-                self.layer_tree.set_parent(layer_id, render_parent);
-                let renderable =
-                    instance.renderable_in_tree(render_parent, self.parent_resolves(&instance));
-                if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
-                    apply_layer_properties_to_node(layer, &instance.properties, window_closed);
-                    layer.renderable = renderable;
-                    apply_window_offset_to_node(layer, window_offset);
-                }
-            }
-            LayerRenderTarget::Kag(slot) => {
-                if let Some(layer) = self.layer_tree.layer_mut(instance.layer_id) {
-                    layer.renderable = false;
-                }
-                self.mutate_kag_layer(&slot.page, &slot.layer, |layer| {
-                    apply_layer_properties_to_node(layer, &instance.properties, window_closed);
-                    apply_window_offset_to_node(layer, window_offset);
-                });
-            }
+        let layer_id = instance.layer_id;
+        let render_parent = self
+            .native_layer_render_parent(handle, instance.parent)
+            .filter(|parent_id| *parent_id != layer_id);
+        self.layer_tree.set_parent(layer_id, render_parent);
+        let renderable =
+            instance.renderable_in_tree(render_parent, self.parent_resolves(&instance));
+        if let Some(layer) = self.layer_tree.layer_mut(layer_id) {
+            apply_layer_properties_to_node(layer, &instance.properties, window_closed);
+            layer.renderable = renderable;
+            apply_window_offset_to_node(layer, window_offset);
         }
     }
 
@@ -2441,12 +2433,8 @@ impl KrkrHost {
             instance.set_property("parent", Variant::Void);
             detached = instance.detached;
         }
-        if let LayerRenderTarget::Native(layer_id) = instance.render_target {
-            self.layer_tree.set_parent(layer_id, None);
-        }
-        if detached
-            && let Some(layer) = self.layer_tree.layer_mut(instance.layer_id)
-        {
+        self.layer_tree.set_parent(instance.layer_id, None);
+        if detached && let Some(layer) = self.layer_tree.layer_mut(instance.layer_id) {
             layer.renderable = false;
         }
     }
@@ -2660,9 +2648,7 @@ impl KrkrHost {
             // fast decode so small graphics keep that schedule; otherwise
             // TJS/KAG resumes this native call after the completion lands.
             #[cfg(not(target_arch = "wasm32"))]
-            if wait_for_decode
-                && let Some(result) = self.wait_for_script_image(name)
-            {
+            if wait_for_decode && let Some(result) = self.wait_for_script_image(name) {
                 return result;
             }
             Err(TjsError::resource_pending(name.to_string()))
@@ -3391,6 +3377,21 @@ impl KrkrHost {
         &mut self.font_system
     }
 
+    /// Applies a mutation to a KAG page layer.
+    ///
+    /// `page="back"` is the engine's own incoming page for the games that drive
+    /// KAG through the built-in tags: the write is staged and published by the
+    /// `[trans]` projection (`apply_pending_kag_layers`).  Script layer objects
+    /// never come through here for their own pixels -- they own their bitmap,
+    /// see [`Self::replace_kag_layer_slots`].
+    ///
+    /// The two worlds are deliberately separate and do not see each other's
+    /// content: a script layer object cannot read what `[backlay]` /
+    /// `[image page=back]` staged here, and nothing staged here reaches a
+    /// script object's node.  Games that drive their own pages (KAGEX, and this
+    /// title's `MainWindow.tjs`) exchange pixels between their own layer
+    /// objects; only a game that mixes tag-driven pages with script page
+    /// objects would need the two brought back together.
     pub(crate) fn mutate_kag_layer<R>(
         &mut self,
         page: &str,
@@ -3458,10 +3459,9 @@ impl KrkrHost {
         // destination's own subtree, so the crossfade fades the outgoing page
         // out toward what is behind it (`const_alpha_blend_functor`,
         // `blend_functor_c.h:584-594`).
-        let (under_draw_commands, under_image_uploads) =
-            self.layer_tree.draw_model_filtered(|node| {
-                !self.layer_tree.is_ancestor_or_self(dest_layer, node.id)
-            });
+        let (under_draw_commands, under_image_uploads) = self
+            .layer_tree
+            .draw_model_filtered(|node| !self.layer_tree.is_ancestor_or_self(dest_layer, node.id));
         let dest_rect = self.transition_destination_rect(dest_layer, true);
         self.apply_pending_kag_layers();
         // The tag has no separate source layer: `backlay` staged the incoming
@@ -3550,9 +3550,8 @@ impl KrkrHost {
     ) -> Option<Rect> {
         let bounds = |node: &LayerNode| {
             let origin = self.layer_tree.absolute_position(node.id)?;
-            (node.width > 0.0 && node.height > 0.0).then(|| {
-                Rect::new(origin.x, origin.y, node.width, node.height)
-            })
+            (node.width > 0.0 && node.height > 0.0)
+                .then(|| Rect::new(origin.x, origin.y, node.width, node.height))
         };
         let own = self.layer_tree.layer(layer_id).and_then(bounds);
         if !with_children {
@@ -3592,8 +3591,7 @@ impl KrkrHost {
         let event_disabled = self.scheduler.event_disabled();
         let mut index = 0;
         while index < self.active_transitions.len() {
-            let dest_visible = self
-                .active_transitions[index]
+            let dest_visible = self.active_transitions[index]
                 .dest_layer
                 .is_none_or(|layer_id| self.layer_tree.node_visible(layer_id));
             if self.active_transitions[index].completion_event_prevented {
@@ -3703,10 +3701,7 @@ impl KrkrHost {
             .iter()
             .filter(|transition| !transition.self_update && !transition.completion_event_prevented)
             .filter_map(|transition| {
-                Some((
-                    transition.dest_handle()?,
-                    transition.tick_callback.clone()?,
-                ))
+                Some((transition.dest_handle()?, transition.tick_callback.clone()?))
             })
             .collect()
     }
@@ -3778,7 +3773,10 @@ impl KrkrHost {
 
     /// `tTJSNI_BaseLayer::TransDest` (`LayerIntf.cpp:6290`): the destination of
     /// the transition this layer is the source of.
-    pub(crate) fn layer_transition_destination(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+    pub(crate) fn layer_transition_destination(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<ObjectHandle> {
         self.active_transitions
             .iter()
             .find(|transition| transition.source_handle() == Some(handle))
@@ -3932,9 +3930,8 @@ impl KrkrHost {
                 // runs before the layer manager composites the result, so the
                 // incoming face is drawn over the scene *without* the
                 // destination's subtree.
-                let (under_draw_commands, under_image_uploads) = self
-                    .layer_tree
-                    .draw_model_filtered_suppressing_images(
+                let (under_draw_commands, under_image_uploads) =
+                    self.layer_tree.draw_model_filtered_suppressing_images(
                         |node| !self.layer_tree.is_ancestor_or_self(*dest, node.id),
                         suppressed,
                     );
@@ -3948,9 +3945,9 @@ impl KrkrHost {
                     ),
                     _ => Point::new(0.0, 0.0),
                 };
-                let (source_draw_commands, source_image_uploads) = self
-                    .layer_tree
-                    .source_face(*source, extra_roots, offset, *with_children);
+                let (source_draw_commands, source_image_uploads) =
+                    self.layer_tree
+                        .source_face(*source, extra_roots, offset, *with_children);
                 TransitionFaceLists {
                     old_draw_commands,
                     old_image_uploads,
@@ -4000,10 +3997,6 @@ impl KrkrHost {
                 }
             }
         }
-    }
-
-    pub(crate) fn pending_kag_layer_names(&self) -> Vec<String> {
-        self.pending_kag_layers.keys().cloned().collect()
     }
 
     fn pending_kag_layer_mut(&mut self, layer: &str) -> &mut LayerNode {
@@ -4773,9 +4766,10 @@ mod tests {
             .insert(id, ("button.png".to_string(), revision));
 
         // A zero budget never waits, so the load stays asynchronous.
-        assert!(host
-            .wait_for_script_image_within("button.png", Duration::ZERO)
-            .is_none());
+        assert!(
+            host.wait_for_script_image_within("button.png", Duration::ZERO)
+                .is_none()
+        );
 
         // A real budget applies the worker completion inside the same call,
         // matching official synchronous `TVPLoadGraphic` loads.
@@ -4787,9 +4781,10 @@ mod tests {
         assert!(host.pending_script_image_loads.is_empty());
 
         // The production budget path resolves from the cache without waiting.
-        assert!(host
-            .wait_for_script_image("button.png")
-            .is_some_and(|result| result.is_ok()));
+        assert!(
+            host.wait_for_script_image("button.png")
+                .is_some_and(|result| result.is_ok())
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

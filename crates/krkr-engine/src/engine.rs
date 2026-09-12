@@ -433,7 +433,11 @@ impl KrkrEngine {
     }
 
     fn sync_kag_bgm_system_state(&mut self, window: ObjectHandle, scflags: ObjectHandle) {
-        let Some(bgm) = self.tjs_runtime.object_member(window, "bgm").object_handle() else {
+        let Some(bgm) = self
+            .tjs_runtime
+            .object_member(window, "bgm")
+            .object_handle()
+        else {
             return;
         };
         let Some(buffer) = self
@@ -1364,9 +1368,7 @@ impl KrkrEngine {
                 .tjs_runtime
                 .call_function(callback, Vec::new())?
                 .to_integer()?;
-            self.tjs_runtime
-                .host_mut()
-                .set_transition_tick(dest, tick);
+            self.tjs_runtime.host_mut().set_transition_tick(dest, tick);
         }
         Ok(())
     }
@@ -1960,11 +1962,7 @@ impl KrkrEngine {
                         "input primary release pressed={:?} captured={:?} release={:?} handled_by_script={handled_by_script}",
                         self.pressed_layer, captured, release_hit
                     ));
-                    self.dispatch_layer_pointer_event(
-                        "onMouseUp",
-                        0,
-                        captured.or(release_hit),
-                    )?;
+                    self.dispatch_layer_pointer_event("onMouseUp", 0, captured.or(release_hit))?;
                     let click_target = self.pressed_layer.filter(|pressed| {
                         release_hit == Some(*pressed) || self.layer_contains_cursor(*pressed)
                     });
@@ -3806,11 +3804,13 @@ impl KagSession {
                 // KAG's own `[trans]` is `kag.fore.base.beginTransition`
                 // (`KAGLayer.tjs`), so the projection owns that layer object
                 // when the script has one.
-                let page_base =
-                    crate::native::classes::kag_layer_object(runtime, "fore", "base");
-                runtime
-                    .host_mut()
-                    .begin_kag_transition(duration, params, rule_image_upload, page_base);
+                let page_base = crate::native::classes::kag_layer_object(runtime, "fore", "base");
+                runtime.host_mut().begin_kag_transition(
+                    duration,
+                    params,
+                    rule_image_upload,
+                    page_base,
+                );
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::Wt => {
@@ -10083,12 +10083,10 @@ mod tests {
         // (`AllocateDefaultImage`, `LayerIntf.cpp:404`), so the visible
         // `rootProbe` contributes an image command. The 1×1 child under the
         // hidden parent must not.
-        assert!(
-            !frame.output.draw_commands.iter().any(|command| matches!(
-                command,
-                krkr_core::DrawCommand::Image(image) if image.texture_size.width == 1.0
-            ))
-        );
+        assert!(!frame.output.draw_commands.iter().any(|command| matches!(
+            command,
+            krkr_core::DrawCommand::Image(image) if image.texture_size.width == 1.0
+        )));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -10615,8 +10613,80 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// KAG's pages are object graphs the game exchanges itself: KAGEX paints
+    /// the page it is on, then `onTransitionEnd` copies the other page onto the
+    /// displayed one and swaps `fore`/`back` (`MainWindow.tjs`).  A script
+    /// layer's bitmap belongs to its object (`tTJSNI_BaseLayer::MainImage`), so
+    /// the copy has to see what the script painted, whichever page role the
+    /// object currently holds.
     #[test]
-    fn native_kag_back_message_draw_text_is_staged_until_transition() {
+    fn kag_back_page_script_layer_keeps_its_bitmap_across_the_page_exchange() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), messages: []];
+                kag.back = %[base: new Layer(), messages: []];
+                kag.fore.messages[0] = new Layer();
+                kag.back.messages[0] = new Layer();
+                kag.fore.messages[0].visible = true;
+                kag.back.messages[0].visible = true;
+                kag.fore.messages[0].setSize(160, 48);
+                kag.fore.messages[0].font.height = -24;
+                kag.fore.messages[0].drawText(4, 4, "PAGE", 0xffffff, 255);
+                var displayed = kag.fore;
+                kag.fore = kag.back;
+                kag.back = displayed;
+                kag.fore.messages[0].setSize(160, 48);
+                kag.fore.messages[0].assignImages(kag.back.messages[0]);
+                "#,
+            )
+            .expect("script");
+
+        let kag = object_handle(&engine, "kag");
+        let fore = member_object(&engine, kag, "fore");
+        let messages = member_object(&engine, fore, "messages");
+        let displayed = member_object(&engine, messages, "0");
+        let layer_id = engine
+            .host()
+            .native_layer(displayed)
+            .expect("displayed page layer");
+        let image = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.clone())
+            .expect("the exchanged page carries the painted bitmap");
+        assert!(
+            image.upload.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            "the page exchange must not leave an empty holder on the displayed page"
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        let texture = image.upload.texture_id;
+        assert!(frame.output.draw_commands.iter().any(|command| matches!(
+            command,
+            krkr_core::DrawCommand::Image(image) if image.texture_id == texture
+        )));
+    }
+
+    /// The engine's own page slots and the game's script layer objects are
+    /// separate worlds, and this test pins the seam: a `[backlay]`/`[image
+    /// page=back]` write goes into the engine's staged page (published by the
+    /// `[trans]` projection), while a script layer writes its own node and
+    /// never reads the staging back.  Games that drive their own pages (KAGEX
+    /// and this title's `MainWindow.tjs`) therefore exchange pixels through
+    /// their layer objects; a game whose script page object is expected to pick
+    /// up tag-staged content would need the two brought back together.
+    #[test]
+    fn kag_engine_page_staging_and_script_layer_objects_stay_separate() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -10624,32 +10694,52 @@ mod tests {
                 r#"
                 global.kag = new Dictionary();
                 kag.fore = %[base: new Layer(), layers: [], messages: []];
-                kag.back = %[base: new Layer(), layers: [], messages: []];
-                kag.back.messages[0] = new Layer();
-                kag.back.messages[0].visible = true;
-                kag.back.messages[0].setSize(160, 48);
-                kag.back.messages[0].font.height = -24;
-                kag.back.messages[0].drawText(4, 4, "BACK", 0xffffff, 255);
+                kag.back = %[base: new Layer(null, kag.fore.base), layers: [], messages: []];
+                kag.fore.base.visible = true;
+                kag.fore.base.setSize(64, 64);
+                kag.back.base.visible = true;
+                kag.back.base.setSize(64, 64);
                 "#,
             )
-            .expect("script");
+            .expect("setup");
 
-        let frame = engine
-            .update(
-                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::ZERO,
-            )
-            .expect("pre-transition update");
-        assert_eq!(image_command_count(&frame), 0);
+        // The engine's own page write stages into `pending_kag_layers`.
+        engine.host_mut().mutate_kag_layer("back", "base", |layer| {
+            layer.visible = true;
+            layer.width = 64.0;
+            layer.height = 64.0;
+        });
+        let staged = engine
+            .host()
+            .kag_layer("back", "base")
+            .expect("staged page");
+        assert_eq!((staged.left, staged.width), (0.0, 64.0));
 
-        engine.host_mut().apply_immediate_transition();
-        let frame = engine
-            .update(
-                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                Duration::ZERO,
-            )
-            .expect("post-transition update");
-        assert_eq!(image_command_count(&frame), 1);
+        // A script layer object holds its own bitmap: its write lands on its own
+        // node and leaves the engine's staged page exactly as it was.
+        engine
+            .execute_script("inline.tjs", "kag.back.base.left = 7;")
+            .expect("script write");
+        let kag = object_handle(&engine, "kag");
+        let back = member_object(&engine, kag, "back");
+        let back_base = member_object(&engine, back, "base");
+        let back_node = engine
+            .host()
+            .native_layer(back_base)
+            .expect("back base node");
+        assert_eq!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(back_node)
+                .map(|layer| layer.left),
+            Some(7.0)
+        );
+        let staged = engine
+            .host()
+            .kag_layer("back", "base")
+            .expect("staged page");
+        assert_eq!(staged.left, 0.0);
     }
 
     #[test]
@@ -10681,7 +10771,7 @@ mod tests {
     }
 
     #[test]
-    fn native_kag_slot_mapping_tracks_fore_back_base_layers_and_messages() {
+    fn native_kag_slot_map_labels_pages_without_redirecting_script_layers() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -10709,41 +10799,55 @@ mod tests {
         let back_messages = member_object(&engine, back, "messages");
         let back_message0 = member_object(&engine, back_messages, "0");
 
-        let fore_base_slot = engine.host().kag_layer_slot(fore_base).expect("fore slot");
-        assert_eq!(fore_base_slot.page, "fore");
-        assert_eq!(fore_base_slot.layer, "base");
-        let back_layer_slot = engine
-            .host()
-            .kag_layer_slot(back_layer0)
-            .expect("back layer slot");
-        assert_eq!(back_layer_slot.page, "back");
-        assert_eq!(back_layer_slot.layer, "0");
-        let back_message_slot = engine
-            .host()
-            .kag_layer_slot(back_message0)
-            .expect("back message slot");
-        assert_eq!(back_message_slot.page, "back");
-        assert_eq!(back_message_slot.layer, "message0");
-        assert_eq!(
-            engine.host().kag_layer("back", "0").map(|layer| layer.left),
-            Some(42.0)
-        );
-        let native_back_layer = engine
+        let back_layer_node = engine
             .host()
             .native_layer(back_layer0)
             .expect("native layer");
-        assert!(
-            !engine
+        // The slot map still reports which page a layer object belongs to (the
+        // debugger labels and the fore-base parent projection read it), but it
+        // never redirects a layer's pixels: the script's write went to the
+        // object's own node, and the engine's page slot stayed untouched.
+        assert_eq!(
+            engine
+                .host()
+                .kag_layer_slot_for_render_layer(back_layer_node),
+            Some(("back".to_string(), "0".to_string()))
+        );
+        assert_eq!(
+            engine
                 .host()
                 .layer_tree()
-                .layer(native_back_layer)
-                .expect("native layer node")
+                .layer(back_layer_node)
+                .map(|layer| layer.left),
+            Some(42.0)
+        );
+        assert!(engine.host().kag_layer("back", "0").is_none());
+        let fore_base_slot = engine.host().kag_layer_slot_for_render_layer(
+            engine
+                .host()
+                .native_layer(fore_base)
+                .expect("fore base native layer"),
+        );
+        assert_eq!(
+            fore_base_slot,
+            Some(("fore".to_string(), "base".to_string()))
+        );
+        let back_message_node = engine
+            .host()
+            .native_layer(back_message0)
+            .expect("native message layer");
+        assert!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(back_message_node)
+                .expect("native message node")
                 .renderable
         );
     }
 
     #[test]
-    fn native_kag_backlay_stages_back_state_without_polluting_fore_object_properties() {
+    fn native_kag_pages_keep_their_own_state_across_a_backlay() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -10771,6 +10875,10 @@ mod tests {
             )
             .expect("stage back");
 
+        // Each page object keeps its own bitmap state: `[backlay]` is a copy the
+        // KAG script performs between the objects (`MainWindow.tjs`
+        // `backupLayer`), and the engine's page slots serve its own tag-driven
+        // content only.
         assert_eq!(
             engine
                 .execute_expression(
@@ -10780,9 +10888,23 @@ mod tests {
                 .expect("fore props"),
             Variant::String("5:7".to_string())
         );
-        let back = engine.host().kag_layer("back", "0").expect("back layer");
-        assert_eq!(back.left, 40.0);
-        assert_eq!(back.top, 50.0);
+        let back = object_handle(&engine, "kag");
+        let back = member_object(&engine, back, "back");
+        let back_layers = member_object(&engine, back, "layers");
+        let back_layer = member_object(&engine, back_layers, "0");
+        let back_node = engine.host().native_layer(back_layer).expect("back layer");
+        assert_eq!(
+            engine
+                .host()
+                .layer_tree()
+                .layer(back_node)
+                .map(|layer| (layer.left, layer.top)),
+            Some((40.0, 50.0))
+        );
+        // The engine's staging page for the same slot is untouched by the
+        // script's write.
+        let staged = engine.host().kag_layer("back", "0").expect("staged page");
+        assert_eq!((staged.left, staged.top), (0.0, 0.0));
     }
 
     #[test]
@@ -12405,8 +12527,7 @@ mod tests {
             rgba,
             vec![
                 // Outside the clip: the ctor holder's transparent white.
-                255, 255, 255, 0,
-                255, 0, 0, 255, // inside the clip
+                255, 255, 255, 0, 255, 0, 0, 255, // inside the clip
                 255, 0, 0, 255, // inside the clip
                 0, 255, 0, 255, // drawn after ResetClip
             ]
@@ -12537,10 +12658,7 @@ mod tests {
         }));
         assert_eq!(
             engine
-                .execute_expression(
-                    "inline.tjs",
-                    "dest.imageWidth + ':' + source.imageWidth"
-                )
+                .execute_expression("inline.tjs", "dest.imageWidth + ':' + source.imageWidth")
                 .expect("images"),
             Variant::String("32:1".to_string())
         );
@@ -12860,9 +12978,7 @@ mod tests {
             .expect("update");
         assert_eq!(frame.output.transitions.len(), 1);
 
-        let dest_layer = engine
-            .host_mut()
-            .ensure_kag_layer("fore", "base");
+        let dest_layer = engine.host_mut().ensure_kag_layer("fore", "base");
         engine
             .host_mut()
             .layer_tree_mut()
@@ -13080,12 +13196,7 @@ mod tests {
                 Duration::ZERO,
             )
             .expect("update");
-        let progress = frame
-            .output
-            .transitions
-            .first()
-            .expect("running")
-            .progress;
+        let progress = frame.output.transitions.first().expect("running").progress;
         assert!((progress - 0.6).abs() < 0.001, "progress was {progress}");
 
         // The destination's own update pass finishes it.
@@ -13564,12 +13675,7 @@ mod tests {
                 Duration::from_millis(200),
             )
             .expect("update");
-        let progress = frame
-            .output
-            .transitions
-            .first()
-            .expect("running")
-            .progress;
+        let progress = frame.output.transitions.first().expect("running").progress;
         assert!((progress - 0.8).abs() < 0.001, "progress was {progress}");
         assert!(
             engine
@@ -13600,7 +13706,6 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup");
     }
-
 
     /// KAG sizes `fore.base` to the screen (`MainWindow.tjs`,
     /// `setImageSize(scWidth, scHeight); setSizeToImageSize();`), so a page
@@ -13774,11 +13879,16 @@ mod tests {
                 kag.fore.base.setSize(200, 200);
                 kag.back.base.visible = true;
                 kag.back.base.setSize(200, 200);
-                kag.back.base.loadImages("face.png");
-                kag.back.base.setSizeToImageSize();
                 "#,
             )
             .expect("setup");
+        // The engine's own `[trans]` projection needs a staged page; a script
+        // layer object carries its own bitmap and needs no staging.
+        engine.host_mut().mutate_kag_layer("back", "base", |layer| {
+            layer.visible = true;
+            layer.width = 200.0;
+            layer.height = 200.0;
+        });
         engine
             .update(
                 EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
@@ -13808,7 +13918,12 @@ mod tests {
         // The projection takes the page base *object*'s own rectangle, which is
         // the layer KAG sized, rather than the engine's bare page slot.
         assert_eq!(
-            frame.output.transitions.first().expect("transition").dest_rect,
+            frame
+                .output
+                .transitions
+                .first()
+                .expect("transition")
+                .dest_rect,
             Some(krkr_core::Rect::new(0.0, 0.0, 200.0, 200.0))
         );
 
@@ -13936,9 +14051,7 @@ mod tests {
             root.join("sprite.png"),
             2,
             2,
-            &[
-                0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
+            &[0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0],
         );
 
         let mut engine = KrkrEngine::for_project(&root).expect("engine");
@@ -20911,7 +21024,9 @@ mod tests {
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
         encoder.set_color(png::ColorType::Indexed);
         encoder.set_depth(png::BitDepth::Eight);
-        let palette: Vec<u8> = (0..=255u8).flat_map(|value| [value, value, value]).collect();
+        let palette: Vec<u8> = (0..=255u8)
+            .flat_map(|value| [value, value, value])
+            .collect();
         encoder.set_palette(palette);
         let mut writer = encoder.write_header().expect("png header");
         writer.write_image_data(indices).expect("png indices");
@@ -20929,11 +21044,7 @@ mod tests {
     }
 
     /// The object a member holds, for the tests' own readers.
-    fn member_object(
-        engine: &KrkrEngine,
-        object: ObjectHandle,
-        name: &str,
-    ) -> ObjectHandle {
+    fn member_object(engine: &KrkrEngine, object: ObjectHandle, name: &str) -> ObjectHandle {
         engine
             .tjs_runtime()
             .object_member(object, name)
@@ -21820,5 +21931,5 @@ mod tests {
         let rgba = layer_rgba(&engine, layer_id);
         assert_eq!(&rgba[0..4], [0, 0, 255, 255], "mirrored: blue first");
         assert_eq!(&rgba[4..8], [255, 0, 0, 255], "mirrored: red last");
-     }
+    }
 }
