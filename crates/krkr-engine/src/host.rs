@@ -13,8 +13,8 @@ use krkr_assets::storage::normalize_storage_name;
 use krkr_core::{
     AssetKind, AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef,
     DrawCommand, FrameTransition, ImageUpload, LayerId, LayerImage, LayerNode, LayerTree,
-    LifecycleState, Point, ProjectStoragePort, Rect, ResourceData, StoragePort, TextInputEvent,
-    TextureId, TransitionParams,
+    LifecycleState, Point, ProjectStoragePort, Rect, ResourceData, StorageMediaProvider,
+    StoragePort, TextInputEvent, TextureId, TransitionParams,
 };
 use krkr_font::FontSystem;
 use krkr_kag::KagParser;
@@ -690,6 +690,51 @@ impl KrkrHost {
             .ok_or_else(|| TjsError::runtime("project storage is not configured"))
     }
 
+    /// Registers a plugin-owned storage media (`TVPRegisterStorageMedia`,
+    /// `krkrz/src/core/base/StorageIntf.cpp:530-538`), the hook
+    /// `crates/krkr-plugins`' media-carrying plugins call from
+    /// [`crate::KrkrPlugin::register`].
+    ///
+    /// Before the media is inserted it receives a weak handle to the project
+    /// storage ([`StorageMediaProvider::attach_storage`]), which is how a
+    /// wrapping media (`lzfs`, `proxy`) resolves inner names through the
+    /// engine's built-in stack. The handle is weak because the registry lives
+    /// inside the storage, so a strong handle would be a reference cycle.
+    ///
+    /// A storage that is not configured (a script-only host) or a backend
+    /// without a media registry (browser hosts) fails instead of panicking.
+    pub fn register_storage_media(&mut self, media: Arc<dyn StorageMediaProvider>) -> Result<()> {
+        let storage = self.project_storage.clone().ok_or_else(|| {
+            TjsError::runtime("cannot register a storage media: project storage is not configured")
+        })?;
+        let media_name = media.media_name().to_string();
+        media.attach_storage(Arc::downgrade(&storage));
+        storage.register_storage_media(media).map_err(|error| {
+            TjsError::runtime(format!(
+                "cannot register storage media `{media_name}`: {error}"
+            ))
+        })
+    }
+
+    /// Unregisters a plugin-owned storage media (`TVPUnregisterStorageMedia`,
+    /// `StorageIntf.cpp:535-538`). Returns whether a media was registered under
+    /// `media_name`.
+    pub fn unregister_storage_media(&mut self, media_name: &str) -> bool {
+        self.project_storage
+            .as_ref()
+            .map(|storage| storage.unregister_storage_media(media_name))
+            .unwrap_or(false)
+    }
+
+    /// Names of the registered storage media, sorted. The built-in `file` media
+    /// is implicit and never listed.
+    pub fn storage_media_names(&self) -> Vec<String> {
+        self.project_storage
+            .as_ref()
+            .map(|storage| storage.storage_media_names())
+            .unwrap_or_default()
+    }
+
     /// Returns browser-memory storage writes accumulated by the engine. Native
     /// filesystem projects return an empty journal; Web hosts can persist the
     /// returned entries without coupling the engine to a browser database.
@@ -1179,7 +1224,21 @@ impl KrkrHost {
             .push(format!("plugin `{name}` linked through Rust registry"));
     }
 
+    /// The host-registered plugin `Plugins.unlink` has to call
+    /// [`KrkrPlugin::unregister`] on, or `None` when no plugin under this name
+    /// was registered by the host.
+    pub(crate) fn plugin_to_unregister(&self, name: &str) -> Option<Arc<dyn KrkrPlugin>> {
+        self.plugin_registry
+            .iter()
+            .find(|plugin| plugin.name().eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
     pub(crate) fn unlink_plugin(&mut self, name: &str) -> bool {
+        // Unlinking forgets the module completely, the way `TVPUnloadPlugin`
+        // does, so a later `Plugins.link` installs it again: the script-linked
+        // marker has to go with the plugin name.
+        self.script_linked_plugins.remove(name);
         self.linked_plugins.remove(name)
     }
 
@@ -4199,7 +4258,9 @@ impl krkr_core::Clock for KrkrHost {
 mod tests {
     use super::*;
     use krkr_assets::ProjectStorage;
+    use krkr_core::ResourceStream;
     use std::fs;
+    use std::sync::{Mutex, Weak};
 
     #[test]
     fn advance_clock_offsets_timer_time_without_sleeping() {
@@ -4428,5 +4489,220 @@ mod tests {
             "Kirakira-engine-host-{prefix}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    /// A storage backend with a media registry of its own, so the engine's
+    /// registration path (`attach_storage` plus the port call) can be exercised
+    /// without `krkr-assets`.
+    #[derive(Default)]
+    struct FakePort {
+        files: Mutex<BTreeMap<String, Vec<u8>>>,
+        media: Mutex<Option<Arc<dyn StorageMediaProvider>>>,
+    }
+
+    impl FakePort {
+        fn publish(&self, path: &str, bytes: &[u8]) {
+            self.files
+                .lock()
+                .expect("fake port lock")
+                .insert(path.to_string(), bytes.to_vec());
+        }
+    }
+
+    impl StoragePort for FakePort {
+        fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>> {
+            let files = self.files.lock().expect("fake port lock");
+            let bytes = files.get(path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no file `{path}`"))
+            })?;
+            Ok(Box::new(io::Cursor::new(bytes.clone())))
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.files
+                .lock()
+                .expect("fake port lock")
+                .contains_key(path)
+        }
+    }
+
+    impl ProjectStoragePort for FakePort {
+        fn is_directory(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn list_directory(&self, name: &str) -> io::Result<Vec<String>> {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no directory `{name}`"),
+            ))
+        }
+
+        fn placed_path(&self, _name: &str) -> Option<String> {
+            None
+        }
+
+        fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData> {
+            self.data(name)
+        }
+
+        fn read_text_storage(&self, name: &str, _configured_encoding: &str) -> io::Result<String> {
+            let data = self.data(name)?;
+            Ok(String::from_utf8_lossy(&data.as_bytes()?).into_owned())
+        }
+
+        fn write_text_storage(&self, name: &str, _mode: &str, text: &str) -> io::Result<()> {
+            self.write_binary_storage(name, "", text.as_bytes())
+        }
+
+        fn write_binary_storage(&self, name: &str, _mode: &str, bytes: &[u8]) -> io::Result<()> {
+            self.publish(name, bytes);
+            Ok(())
+        }
+
+        fn add_auto_path(&self, _path: &str) {}
+
+        fn remove_auto_path(&self, _path: &str) -> bool {
+            false
+        }
+
+        fn clear_archive_cache(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn catalog_contains(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn catalog_contains_for_load(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn set_catalog_paths(&self, _paths: &[String]) {}
+
+        fn insert_memory(&self, path: &str, bytes: Vec<u8>) {
+            self.publish(path, &bytes);
+        }
+
+        fn insert_external_memory(&self, path: &str, bytes: Vec<u8>) {
+            self.publish(path, &bytes);
+        }
+
+        fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)> {
+            Vec::new()
+        }
+
+        fn register_storage_media(&self, media: Arc<dyn StorageMediaProvider>) -> io::Result<()> {
+            *self.media.lock().expect("fake port lock") = Some(media);
+            Ok(())
+        }
+
+        fn unregister_storage_media(&self, _media_name: &str) -> bool {
+            self.media.lock().expect("fake port lock").take().is_some()
+        }
+
+        fn storage_media_names(&self) -> Vec<String> {
+            self.media
+                .lock()
+                .expect("fake port lock")
+                .as_ref()
+                .map(|media| vec![media.media_name().to_string()])
+                .unwrap_or_default()
+        }
+    }
+
+    /// A media that resolves every name through the built-in stack, the way
+    /// `lzfs` and `proxy` do. It keeps only the weak handle the engine attached
+    /// (`StorageMediaProvider::attach_storage`) — a strong one would be a
+    /// reference cycle, because the registry lives inside the storage.
+    #[derive(Default)]
+    struct WrappingMedia {
+        storage: Mutex<Option<Weak<dyn ProjectStoragePort>>>,
+    }
+
+    impl WrappingMedia {
+        fn storage(&self) -> Option<Arc<dyn ProjectStoragePort>> {
+            self.storage
+                .lock()
+                .expect("wrapping media lock")
+                .as_ref()
+                .and_then(Weak::upgrade)
+        }
+
+        fn storage_attached(&self) -> bool {
+            self.storage().is_some()
+        }
+    }
+
+    impl StorageMediaProvider for WrappingMedia {
+        fn media_name(&self) -> &str {
+            "wrap"
+        }
+
+        fn exists(&self, name: &str) -> bool {
+            // A lost storage is a miss, never a panic.
+            self.storage()
+                .is_some_and(|storage| storage.exists(&format!("./inner/{name}")))
+        }
+
+        fn open(&self, name: &str) -> io::Result<Box<dyn ResourceStream>> {
+            let storage = self
+                .storage()
+                .ok_or_else(|| io::Error::other("the wrapping media lost its storage"))?;
+            storage.open(&format!("./inner/{name}"))
+        }
+
+        fn attach_storage(&self, storage: Weak<dyn ProjectStoragePort>) {
+            *self.storage.lock().expect("wrapping media lock") = Some(storage);
+        }
+    }
+
+    #[test]
+    fn host_attaches_the_storage_before_a_media_is_registered() {
+        let port = Arc::new(FakePort::default());
+        port.publish("./inner/entry.bin", b"inner bytes");
+        let mut host = KrkrHost::from_storage_port(
+            Arc::clone(&port) as Arc<dyn ProjectStoragePort>,
+            SystemPaths::default(),
+            Arc::new(UnavailableVideoFactory),
+        )
+        .expect("host");
+
+        let media = Arc::new(WrappingMedia::default());
+        host.register_storage_media(Arc::clone(&media) as Arc<dyn StorageMediaProvider>)
+            .expect("register the wrapping media");
+        assert_eq!(host.storage_media_names(), vec!["wrap".to_string()]);
+
+        // The media resolves the name it is handed through the engine's own
+        // stack, with nothing but the weak handle the host attached.
+        assert!(media.storage_attached());
+        assert!(media.exists("entry.bin"));
+        assert!(!media.exists("missing.bin"));
+        let data = media.read("entry.bin").expect("inner read");
+        assert_eq!(data.as_bytes().expect("bytes").as_ref(), b"inner bytes");
+
+        assert!(host.unregister_storage_media("wrap"));
+        assert!(host.storage_media_names().is_empty());
+        assert!(!host.unregister_storage_media("wrap"));
+    }
+
+    #[test]
+    fn media_registration_needs_a_project_storage() {
+        // A host that only runs scripts (the browser default) must fail
+        // cleanly instead of panicking (design A.5.6).
+        let mut host = KrkrHost::default();
+        let media = Arc::new(WrappingMedia::default());
+        let error = host
+            .register_storage_media(Arc::clone(&media) as Arc<dyn StorageMediaProvider>)
+            .expect_err("no project storage");
+        assert!(
+            error
+                .to_string()
+                .contains("project storage is not configured"),
+            "{error}"
+        );
+        assert!(!media.storage_attached());
+        assert!(host.storage_media_names().is_empty());
+        assert!(!host.unregister_storage_media("wrap"));
     }
 }

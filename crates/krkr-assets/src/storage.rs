@@ -610,7 +610,18 @@ impl ProjectStorage {
         let Ok(mut providers) = self.inner.media_providers.write() else {
             return Err(io::Error::other("storage media registry is poisoned"));
         };
-        if providers.contains_key(&name) {
+        if let Some(existing) = providers.get(&name) {
+            // The engine registers a boot plugin's media once from
+            // `KrkrEngine::register_plugin` and again when the first
+            // `Plugins.link` installs it (`native/plugins.rs`), and the second
+            // call is intentional. A plugin that keeps its media in a
+            // `OnceLock` hands back the same `Arc`, which is a no-op rather
+            // than `TVPMediaNameHadAlreadyBeenRegistered`
+            // (`StorageIntf.cpp:224-236`); a *different* provider under a name
+            // already taken still fails.
+            if Arc::ptr_eq(existing, &provider) {
+                return Ok(());
+            }
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("storage media `{name}` is already registered"),
@@ -693,6 +704,27 @@ impl ProjectStorage {
             // stack applies (`lzfs://./data/x.tjs` decodes like `data/x.tjs`).
             encoding_hint: infer_encoding_from_path(Path::new(media_path)),
         })
+    }
+
+    /// The registered media a *write* to `name` belongs to, with the name space
+    /// the media owns.
+    ///
+    /// Writes bypass the existence search: the reference hands the normalized
+    /// name straight to the media's `Open(name, TJS_BS_WRITE…)`
+    /// (`_TVPCreateStream`, `StorageIntf.cpp:1236-1244`, `:1279-1289`), so a
+    /// provider that cannot update in place is still asked to and owns the
+    /// error. `None` keeps the write on the built-in filesystem/memory path,
+    /// which is the pre-registry behaviour for an unregistered scheme.
+    fn media_write_target(&self, name: &str) -> Option<(Arc<dyn StorageMediaProvider>, String)> {
+        // Like the read path, an in-archive name is split at `>` before any
+        // media dispatch (`StorageIntf.cpp:804-827`).
+        if name.contains('>') {
+            return None;
+        }
+        let normalized = normalize_storage_separators(name);
+        let (media_name, media_path) = split_media_name(&normalized)?;
+        let provider = self.media_provider(media_name)?;
+        Some((provider, media_path.to_string()))
     }
 
     pub fn storage_exists(&self, name: &str) -> bool {
@@ -1121,6 +1153,18 @@ impl ProjectStorage {
     }
 
     pub fn write_binary_storage(&self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
+        // A registered media owns writes into its scheme, exactly as the
+        // reference dispatches through `_TVPCreateStream`'s write branch
+        // (`StorageIntf.cpp:1236-1244`): the provider is asked before the
+        // memory overlay and the filesystem, with no existence probe. Any
+        // successful write invalidates the write-side caches the way the
+        // built-in path does, mirroring the reference's cache clear after a
+        // write (`:1282-1289`).
+        if let Some((provider, media_path)) = self.media_write_target(name) {
+            provider.write(&media_path, mode, bytes).map_err(io_error)?;
+            self.invalidate_write_caches();
+            return Ok(());
+        }
         let Some(root) = self.inner.root.as_ref() else {
             let key = memory_write_key(name)?;
             let mut output = bytes.to_vec();
@@ -1823,6 +1867,18 @@ impl krkr_core::ProjectStoragePort for ProjectStorage {
 
     fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)> {
         ProjectStorage::drain_memory_writes(self)
+    }
+
+    fn register_storage_media(&self, media: Arc<dyn StorageMediaProvider>) -> io::Result<()> {
+        ProjectStorage::register_media(self, media)
+    }
+
+    fn unregister_storage_media(&self, media_name: &str) -> bool {
+        ProjectStorage::unregister_media(self, media_name)
+    }
+
+    fn storage_media_names(&self) -> Vec<String> {
+        ProjectStorage::media_names(self)
     }
 }
 

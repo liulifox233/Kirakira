@@ -6,6 +6,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod media;
+
+pub use media::{FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name};
+
 pub trait ResourceStream: Read + Seek + Send {}
 
 impl<T> ResourceStream for T where T: Read + Seek + Send {}
@@ -266,6 +270,35 @@ pub trait ProjectStoragePort: StoragePort {
     fn insert_external_memory(&self, path: &str, bytes: Vec<u8>);
 
     fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)>;
+
+    /// Registers a storage media (`TVPRegisterStorageMedia`,
+    /// `StorageIntf.cpp:530-538`), the plugin-facing way to add a URI scheme:
+    /// `psb://`, `lzfs://`, `proxy://`, `steam://`, `var://`, `zip://`.
+    ///
+    /// The default refuses the registration, which is what a backend without a
+    /// media registry (a browser host, a test double) must do: media
+    /// registration fails cleanly there instead of panicking.
+    fn register_storage_media(&self, media: Arc<dyn StorageMediaProvider>) -> io::Result<()> {
+        let _ = media;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this storage backend does not support media registration",
+        ))
+    }
+
+    /// Unregisters a storage media (`TVPUnregisterStorageMedia`,
+    /// `StorageIntf.cpp:535-538`). Returns whether a media was registered under
+    /// `media_name`; the built-in `file` media can never be removed.
+    fn unregister_storage_media(&self, media_name: &str) -> bool {
+        let _ = media_name;
+        false
+    }
+
+    /// Names of the registered media, sorted. Diagnostics and tests only; the
+    /// built-in `file` media is implicit and never listed.
+    fn storage_media_names(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Opaque identifier for a resource request that may complete after a frame.

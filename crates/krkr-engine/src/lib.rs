@@ -4,6 +4,7 @@ pub mod host;
 mod kag;
 mod native;
 pub mod plugin;
+pub mod plugin_api;
 pub mod resource_manager;
 mod scheduler;
 mod script;
