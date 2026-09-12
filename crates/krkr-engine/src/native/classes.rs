@@ -26,7 +26,8 @@ use crate::host::{
     TraceCategory, TransitionFaceLists, TransitionFaces,
 };
 use crate::plugin_api::transition::{
-    TransitionHandlerProvider, TransitionOptions, TransitionRequest,
+    TransitionContext, TransitionHandlerProvider, TransitionOptions, TransitionRequest,
+    TransitionScriptCallQueue,
 };
 use crate::resource_manager::decode_province_image;
 use crate::scheduler::AsyncTriggerMode;
@@ -5142,6 +5143,13 @@ fn layer_begin_transition(
 /// this channel needs the two images whatever `withchildren` says, because it
 /// does not walk child draws the way `tTransDrawable::DrawCompleted` does
 /// (`plugin_api::transition`, "What this channel does not model").
+///
+/// The factory runs through
+/// [`TransitionHandlerProvider::start_transition_with`] with a
+/// [`TransitionContext`] over this host, so a provider that needs a rule image
+/// (`iTVPSimpleImageProvider::LoadImage`) or a script closure can copy both out
+/// of the call; the drains after the factory and after the first pass deliver
+/// whatever either queued (`TransitionScriptCallback`), on this script thread.
 fn begin_provider_transition(
     runtime: &mut Runtime<KrkrHost>,
     provider: Arc<dyn TransitionHandlerProvider>,
@@ -5184,7 +5192,17 @@ fn begin_provider_transition(
         dest_size: (dest_snapshot.upload.width, dest_snapshot.upload.height),
         source_size: Some(source_size),
     };
-    let handler = provider.start_transition(&request).map_err(|error| {
+    // The script-closure channel of `plugin_api::transition`: one queue per
+    // destination layer, kept in the layer's extension slot so the per-tick
+    // drain finds it from the running transition's destination alone.
+    let scripts = runtime
+        .host_mut()
+        .layer_extension_or_insert_with(dest, TransitionScriptCallQueue::default);
+    let started = {
+        let mut context = TransitionContext::new(runtime.host_mut(), Arc::clone(&scripts));
+        provider.start_transition_with(&request, &mut context)
+    };
+    let handler = started.map_err(|error| {
         // `TVPTransHandlerError` + the detail text `LayerIntf.cpp:6246` passes
         // (`IDS_TVP_TRANS_HANDLER_ERROR`): the script sees the official
         // message, the provider's own reason goes to the host log the way the
@@ -5197,6 +5215,10 @@ fn begin_provider_transition(
             "Transition handler error iTVPTransHandlerProvider::StartTransition failed",
         )
     })?;
+    // A closure the reference's factory would have called synchronously (it
+    // has the script dispatch) runs here, on the script thread, before the
+    // first pass.
+    drain_transition_script_calls_for(runtime, dest)?;
     let (self_update, tick_callback) = transition_driver_options(runtime, options);
     // Every provider clamps its own `time` option to the reference's 2 ms floor
     // (`TRANSITION_MIN_MILLIS`); an absent `time` leaves no clock to run the
@@ -5259,8 +5281,10 @@ fn begin_provider_transition(
             )),
         });
     // `StartTransition` ends with `Update(true)` (`LayerIntf.cpp:6344`): the
-    // first pass composes the frame at tick zero.
+    // first pass composes the frame at tick zero, and a callback that pass
+    // queued runs right after it.
     runtime.host_mut().process_provider_transition(dest);
+    drain_transition_script_calls_for(runtime, dest)?;
     Ok(())
 }
 
@@ -7202,6 +7226,10 @@ fn layer_update(
 /// The commit path of the plugin-facing bitmap views deliberately does *not*
 /// call this: the family contract is "mutate, then `Layer.update()`", and the
 /// plugin decides when the repaint is due.
+///
+/// A self-updated provider pass runs here rather than from the host clock, so
+/// the script calls it queued (`plugin_api::transition`'s
+/// `TransitionScriptCallback`) are delivered right after the pass.
 pub(crate) fn layer_update_by_script(
     runtime: &mut Runtime<KrkrHost>,
     this: ObjectHandle,
@@ -7225,6 +7253,7 @@ pub(crate) fn layer_update_by_script(
         } else {
             runtime.host_mut().advance_self_updated_transition(dest);
         }
+        drain_transition_script_calls_for(runtime, dest)?;
     }
     set_layer_property_storage(runtime, this, "callOnPaint", Variant::Integer(1));
     if !runtime.host_mut().request_layer_paint(this) {
@@ -8753,11 +8782,69 @@ fn script_owns_transition_completion(
     })
 }
 
+/// Runs the script calls provider handlers queued during this tick's passes —
+/// [`TransitionScriptCallback`](crate::plugin_api::transition::TransitionScriptCallback)
+/// (`plugin_api::transition`).
+///
+/// A handler's pass runs from the host clock, where the TJS runtime is not in
+/// scope, so the call is queued and delivered here — on the script thread, in
+/// the same tick the pass ran (`engine.rs` calls this right after
+/// `advance_transition`; `Layer.update()` drains its own destination
+/// directly).  A callback that throws stops the drain and is reported like any
+/// other transition callback error.
+pub(crate) fn drain_transition_script_calls(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+    let destinations = runtime.host().transition_destinations();
+    let mut first_error = None;
+    for dest in destinations {
+        if let Err(error) = drain_transition_script_calls_for(runtime, dest)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// [`drain_transition_script_calls`] for one destination layer, whatever
+/// transitions are active elsewhere.  The queue lives in the layer's extension
+/// slot (`TransitionScriptCallQueue`); a destination without one has nothing
+/// queued.
+fn drain_transition_script_calls_for(
+    runtime: &mut Runtime<KrkrHost>,
+    dest: ObjectHandle,
+) -> Result<()> {
+    let Some(queue) = runtime
+        .host()
+        .layer_extension::<TransitionScriptCallQueue>(dest)
+    else {
+        return Ok(());
+    };
+    let mut first_error = None;
+    for call in queue.take() {
+        if let Err(error) = runtime.call_function(call.callee, call.args)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn finish_completed_native_transitions(runtime: &mut Runtime<KrkrHost>) -> Result<()> {
     let completions = runtime.host_mut().take_completed_native_transitions();
     for completion in completions {
         finish_native_transition(runtime, completion)?;
     }
+    // Provider passes ran on the host clock before this call (`engine.rs`
+    // advances the transitions first), so the script calls they queued are
+    // delivered here, with the runtime in hand.
+    drain_transition_script_calls(runtime)?;
     Ok(())
 }
 
