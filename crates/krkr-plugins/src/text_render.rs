@@ -2016,6 +2016,12 @@ fn measure_character_width(
 
 /// Read an integer font attribute through the TJS dispatch path (running any
 /// property getter), trying each name in order.
+///
+/// A member the font object does not have reads back as `Void`, and
+/// `Variant::to_integer` maps `Void` to 0 — so a missing `color` would paint
+/// every glyph black instead of falling back to `defaultChColor`, and a missing
+/// `height` would size the glyphs at 0. Skip absent values the way the engine's
+/// `resolve_font_member` does before converting.
 fn resolve_font_int(
     runtime: &mut Runtime<KrkrHost>,
     font: ObjectHandle,
@@ -2023,6 +2029,7 @@ fn resolve_font_int(
 ) -> Option<i64> {
     for name in names {
         if let Ok(value) = runtime.resolve_object_member(font, name)
+            && !matches!(value, Variant::Void | Variant::Null)
             && let Ok(value) = value.to_integer()
         {
             return Some(value);
@@ -2556,6 +2563,37 @@ mod tests {
             "#,
         );
         assert_eq!(value, "20/1");
+    }
+
+    /// A font object that lacks a member must fall back, not read 0: a missing
+    /// `color` used to paint every glyph black (the game hands `layer.font`, a
+    /// self-bound native Font with no `color`) because `Void.to_integer()` is 0,
+    /// and a missing `height`/`size` would size the glyphs at 0.
+    #[test]
+    fn missing_font_members_fall_back_instead_of_reading_zero() {
+        let value = run(
+            r#"
+            class SizedFont {
+                function SizedFont() { this.height = 20; }
+            }
+            class BareFont {
+            }
+            var render = new TextRenderBase();
+            render.setFont(new SizedFont());
+            render.setRenderSize(400, 0);
+            render.render("a");
+            var sized = render.getCharacters(0, 0)[0];
+            render.setFont(new BareFont());
+            render.render("b");
+            var bare = render.getCharacters(0, 0)[0];
+            return sized.size + "/" + sized.color + "/" + bare.size + "/" + bare.color + "/"
+                + render.defaultChColor;
+            "#,
+        );
+        // The colour falls back to `defaultChColor` (0xffffffff) instead of 0,
+        // and the size to `defaultFontSize` (24) when only one of the two font
+        // objects carries one.
+        assert_eq!(value, "20/4294967295/24/4294967295/4294967295");
     }
 
     /// A ruby annotation count read out of message text is clamped instead of
