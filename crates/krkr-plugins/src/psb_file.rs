@@ -21,12 +21,29 @@
 //! honest: if its v3 checksum still holds and its body is not marked encrypted
 //! (bit 0x0002) it is corrupt, and says so instead of blaming a missing key;
 //! only what the structure cannot defend and the flags still explain with a
-//! cipher reports as key-required — the one error a Phase-2 key store
-//! ([`PsbKeyStore`]) would convert into a real decode, covering both a
-//! ciphered checksum word (header bit) and a ciphered payload (body bit).  See
-//! the M45 survey (`.tower/comms/inbox/20260912-psb-decrypt-study-*`) for the
-//! evidence, and `vendor/eluna/crates/eluna/src/psb/mod.rs:139-161, 676-720`
-//! for the flag semantics this classification mirrors.
+//! cipher reports as key-required, covering both a ciphered checksum word
+//! (header bit) and a ciphered payload (body bit).
+//!
+//! Key-required is no longer a dead end: [`load_psb_document`]
+//! hands that error to the cipher layer ([`psb_cipher`]), which repairs a
+//! private copy of the document with every key the configuration supplies —
+//! the `KRKR_PSB_KEYS` environment variable today, an engine profile field
+//! when one exists — and puts each repair back through *this same admission*.
+//! The first repair that decodes is the document; when none does, the
+//! key-required diagnosis stands, so an unkeyed title sees exactly the Phase-1
+//! behaviour.  A document that loads as plaintext never reaches a cipher, and
+//! an unflagged document never reports key-required, so neither can be
+//! ciphered here.  See the M45 survey
+//! (`.tower/comms/inbox/20260912-psb-decrypt-study-*`) for the evidence,
+//! `vendor/eluna/crates/eluna/src/psb/mod.rs:139-161, 676-720` for the flag
+//! semantics this classification mirrors, and [`psb_cipher`] for the scheme's
+//! own references.
+
+/// Declared here rather than in `lib.rs`: the mission that added the cipher
+/// owns these two files, and this module is where the key-required seam feeds
+/// it.  Hoist the declaration the next time `lib.rs` is touched.
+#[path = "psb_cipher.rs"]
+mod psb_cipher;
 
 use std::{collections::BTreeMap, str};
 
@@ -38,6 +55,8 @@ use krkr_tjs2::{
 
 use crate::catalog::{PluginMeta, PluginStatus};
 
+use self::psb_cipher::{PSB_FLAG_BODY_ENCRYPTED, PSB_FLAG_ENCRYPTION_HINT, PsbConfig, PsbKeyStore};
+
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "PSBFile / PSBValueClass",
@@ -45,17 +64,6 @@ pub(crate) const META: PluginMeta = PluginMeta {
     install: |engine| engine.register_plugin(PsbFilePlugin),
 };
 
-/// Header-encryption bit.  The cipher starts at byte 0x08, so the checksum word
-/// at 0x28 is ciphertext too while this bit is genuinely in effect; M2 sets it
-/// on plaintext documents as well, which is why it is treated as a hint.
-const PSB_FLAG_HEADER_ENCRYPTED: u16 = 0x0001;
-/// Body-encryption bit.  Only the payload is ciphered — the header, its
-/// offsets and its checksum stay plaintext (`eluna/…/psb/mod.rs:40-41,
-/// 716-720`), so this bit also marks the one case where a *verifying* checksum
-/// and an undecodable body are both expected.
-const PSB_FLAG_BODY_ENCRYPTED: u16 = 0x0002;
-/// Either bit means a key may be required to decode the document.
-const PSB_FLAG_ENCRYPTION_HINT: u16 = PSB_FLAG_HEADER_ENCRYPTED | PSB_FLAG_BODY_ENCRYPTED;
 /// The v3 header protects bytes 0x08..0x28 with an Adler-32 stored at 0x28.
 const PSB_V3_CHECKSUM_START: usize = 0x08;
 const PSB_V3_CHECKSUM_END: usize = 0x28;
@@ -157,7 +165,8 @@ fn psb_file_load(
 fn load_psb_storage(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle, storage: &str) -> bool {
     match runtime.host().read_binary_storage(storage) {
         Ok(data) => {
-            let root = match PsbDocument::load(&data) {
+            let store = configured_key_store(runtime);
+            let root = match load_psb_document(&data, &store) {
                 Ok(root) => root,
                 Err(error) => {
                     runtime
@@ -172,6 +181,26 @@ fn load_psb_storage(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle, storage
             true
         }
         Err(_) => false,
+    }
+}
+
+/// The key store a load consults.
+///
+/// Keys come from configuration, and the only configuration surface this
+/// module has until the engine profile carries one is the `KRKR_PSB_KEYS`
+/// environment variable.  A malformed value is a configuration mistake, not a
+/// document failure: it is logged and ignored, leaving the plaintext path
+/// (and the honest key-required diagnosis) intact.
+fn configured_key_store(runtime: &mut Runtime<KrkrHost>) -> PsbKeyStore {
+    match PsbConfig::from_environment() {
+        Ok(config) => PsbKeyStore::from_config(&config),
+        Err(error) => {
+            runtime.host_mut().log(&format!(
+                "psbfile: ignoring {}: {error}",
+                self::psb_cipher::PSB_KEYS_ENV_VAR
+            ));
+            PsbKeyStore::new()
+        }
     }
 }
 
@@ -206,7 +235,7 @@ pub fn debug_parse_psb(bytes: &[u8]) -> std::result::Result<PsbValue, String> {
 }
 
 /// Why a PSB document did not load.  The distinction is deliberate: a
-/// key-required document is one a Phase-2 key store can still decode, while a
+/// key-required document is one a configured key could still decode, while a
 /// malformed document cannot be recovered by any key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
@@ -217,8 +246,9 @@ pub enum PsbError {
     Malformed(String),
     /// The document does not decode as plaintext while its header claims a
     /// cipher: either the header (and with it the checksum word) is ciphered,
-    /// or the payload is.  The game's key would settle it, which this crate
-    /// does not have yet (Phase 2).
+    /// or the payload is.  The key store's candidates were tried
+    /// ([`load_psb_document`]) and none of them decoded the
+    /// document, so the game's key is still missing.
     KeyRequired {
         /// The header's encryption field: `0x0001` header-encrypted,
         /// `0x0002` body-encrypted.
@@ -232,32 +262,10 @@ impl std::fmt::Display for PsbError {
             Self::Malformed(reason) => write!(formatter, "{reason}"),
             Self::KeyRequired { flags } => write!(
                 formatter,
-                "encrypted PSB (flags {flags:#06x}) needs the game's key, which is not available; \
-                 no cipher is registered yet (Phase 2)"
+                "encrypted PSB (flags {flags:#06x}) needs the game's key, which is not available"
             ),
         }
     }
-}
-
-/// Where Phase 2's cipher registry slots in.
-///
-/// The mission that implements key-based PSB decryption adds a concrete store
-/// (keys read from `GameProfile`/config) and wires it into
-/// [`PsbDocument::load`]: run the plaintext path first, then, on
-/// [`PsbError::KeyRequired`], look up `flags` here and feed the decrypted bytes
-/// back through the plaintext path.  Nothing registers one today, so the
-/// plaintext path is the whole pipeline.  Two residuals stay ambiguous without
-/// a key and are therefore classified as key-required: a header-encrypted
-/// document (bit 0x0001), whose checksum word is ciphertext while that bit is
-/// genuinely in effect — its structure never decodes, which is exactly what the
-/// reader sees — and a body-only encrypted document (bit 0x0002), whose
-/// plaintext header does verify but whose payload cannot be decoded.
-#[allow(dead_code, reason = "Phase-2 seam: no key store exists yet")]
-#[doc(hidden)]
-pub trait PsbKeyStore {
-    /// Decrypts a document the header says is encrypted, returning its
-    /// plaintext PSB bytes.
-    fn decrypt(&self, flags: u16, bytes: &[u8]) -> std::result::Result<Vec<u8>, String>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -330,9 +338,10 @@ impl<'a> PsbDocument<'a> {
     /// * it will not decode while the v3 checksum holds and the body is not
     ///   marked encrypted ⇒ malformed — proven-plaintext damage no key can
     ///   repair;
-    /// * it will not decode and a cipher is claimed ⇒ key-required, since the
+    /// * it will not decode and a cipher is claimed ⇒ key-required: the
     ///   checksum word may itself be ciphertext (header bit) or the payload may
-    ///   be (body bit), and only a Phase-2 key store could tell;
+    ///   be (body bit), and only a key can tell — [`load_psb_document`]
+    ///   runs this same function over each configured key's repair;
     /// * every other failure keeps its specific malformed reason.
     fn load(bytes: &'a [u8]) -> std::result::Result<PsbValue, PsbError> {
         let header = match Self::parse_header(bytes) {
@@ -696,6 +705,32 @@ impl<'a> PsbDocument<'a> {
     }
 }
 
+/// The pipeline entry: plaintext first, then the configured key store.
+///
+/// [`PsbDocument::load`] is the whole pipeline for a document that decodes —
+/// flag or no flag — and the store is consulted only for
+/// [`PsbError::KeyRequired`]: a document the structure cannot defend and the
+/// flags still explain with a cipher.  Each configured key then repairs a
+/// private copy ([`PsbKeyStore::decrypt_candidates`]) which is put through the
+/// *same* admission as a plaintext document (checksum, offsets, structure);
+/// the first repair that decodes is the document, and when none does the
+/// original key-required diagnosis (and its `flags`) stands.  A document that
+/// loads as plaintext never reaches a cipher, so the store has no say in what
+/// a plain — or merely flag-claiming — document decodes to.
+fn load_psb_document(bytes: &[u8], store: &PsbKeyStore) -> std::result::Result<PsbValue, PsbError> {
+    match PsbDocument::load(bytes) {
+        Err(PsbError::KeyRequired { flags }) => {
+            for plain in store.decrypt_candidates(flags, bytes) {
+                if let Ok(root) = PsbDocument::load(&plain) {
+                    return Ok(root);
+                }
+            }
+            Err(PsbError::KeyRequired { flags })
+        }
+        result => result,
+    }
+}
+
 impl PsbArray {
     fn get(self, bytes: &[u8], index: usize) -> std::result::Result<u64, String> {
         if index >= self.count {
@@ -809,59 +844,70 @@ fn native_void(
 
 #[cfg(test)]
 mod tests {
+    use super::psb_cipher::{PsbCipher, PsbKey};
     use super::*;
 
     /// Byte offsets inside [`minimal_document`]; the builder asserts every one
     /// of them, so a layout tweak cannot silently invalidate the constants.
     const NAMES_OFFSET: usize = 0x2c;
     const NAMES_NODES_OFFSET: usize = 0x30;
-    const NAME_INDEXES_OFFSET: usize = 0x75;
-    const STRINGS_OFFSET: usize = 0x79;
-    const STRINGS_DATA_OFFSET: usize = 0x7c;
-    const CHUNK_OFFSETS_OFFSET: usize = 0x7c;
-    const CHUNK_LENGTHS_OFFSET: usize = 0x7f;
-    const CHUNK_DATA_OFFSET: usize = 0x82;
-    const ROOT_OFFSET: usize = 0x82;
-    const ROOT_LENGTH: usize = 11;
+    const NAME_INDEXES_OFFSET: usize = 0x77;
+    const ROOT_OFFSET: usize = 0x7c;
+    const STRINGS_OFFSET: usize = 0x8b;
+    const STRINGS_DATA_OFFSET: usize = 0x8f;
+    const CHUNK_OFFSETS_OFFSET: usize = 0x92;
+    const CHUNK_LENGTHS_OFFSET: usize = 0x95;
+    const CHUNK_DATA_OFFSET: usize = 0x98;
+    const ROOT_LENGTH: usize = 15;
 
-    /// A complete PSB v3 the reader accepts, built the way the format's own
-    /// toolchain lays a document out: the name trie is three packed arrays
-    /// (charset, nameNodes, nameIndexes), then the string table, the resource
-    /// tables, and the root object.
+    /// A complete PSB v3 the reader accepts, laid out the way the reference
+    /// writer lays a document out (`emote-psb` `src/psb/write.rs:100-119`): the
+    /// name trie is three packed arrays (charset, nameNodes, nameIndexes), then
+    /// the root object, then the string table and its data, then the resource
+    /// tables with their data last.  The root sits between the names and the
+    /// strings because that is what the cipher's body range
+    /// (`names_offset..chunk_offsets_offset`) has to cover: a fixture that put
+    /// the root behind the resource tables would hide decryption bugs.
     ///
-    /// The root is `{ "A" -> 42 }`, so the fixture pins the whole decode path —
-    /// the name chain, object keys/values and value decoding — not just the
-    /// admission gate.  The trie encodes the name the narrow way: the charset's
-    /// single entry is the base code point 0, so a node's index doubles as its
-    /// character code, and the chain is `nameIndexes[0] = 64` → node 65 → node
-    /// 0, yielding `65 - 0 == 0x41 == 'A'`.
+    /// The root is `{ "A" -> 42, "B" -> "hi" }`, so the fixture pins the whole
+    /// decode path — the name chain, object keys/values, integer and string
+    /// decoding — not just the admission gate.  The trie encodes names the
+    /// narrow way: the charset's single entry is the base code point 0, so a
+    /// chain node's index doubles as its character code.  Key 0's entry
+    /// (`nameIndexes[0] = 64`) holds node 65, whose parent is node 0, yielding
+    /// `65 - 0 == 0x41 == 'A'`; key 1's entry (`nameIndexes[1] = 67`) holds
+    /// node 66, again ending at node 0 (`0x42 == 'B'`).
     fn minimal_document(flags: u16) -> Vec<u8> {
         // charset: one base code point (0).
         let charset = [0x0d_u8, 0x01, 0x0d, 0x00];
-        // namesData: node 64 is the key's entry node; node 65 is the one
-        // character node, whose parent is node 0 — the index the reader treats
-        // as the end of the chain (and whose entry it never reads).
-        let mut nodes = [0x00_u8; 66];
+        // namesData: node 64 is key 0's one-entry chain (character node 65),
+        // node 67 is key 1's (character node 66); node 0 — whose own entry the
+        // reader never reads — ends both.
+        let mut nodes = [0x00_u8; 68];
         nodes[64] = 65;
+        nodes[67] = 66;
         let mut names_data = vec![0x0d, nodes.len() as u8, 0x0d];
         names_data.extend_from_slice(&nodes);
-        // nameIndexes: key 0's name begins at node 64.
-        let name_indexes = [0x0d_u8, 0x01, 0x0d, 64];
-        // No string values and no binary resources, so those three tables are
-        // all empty; chunkData is the empty range after them.
-        let strings = [0x0d_u8, 0x00, 0x0c];
+        // nameIndexes: key 0's and key 1's chains start at nodes 64 and 67.
+        let name_indexes = [0x0d_u8, 0x02, 0x0d, 64, 67];
+        // Root object: key ids 0 and 1 mapped to the integer 42 and the string
+        // index 0.  The value array stores offsets relative to the byte after
+        // its header, so the two value markers sit directly behind the value
+        // table.
+        let root = [
+            0x21, 0x0d, 0x02, 0x0d, 0x00, 0x01, // keys: key ids 0 and 1
+            0x0d, 0x02, 0x0d, 0x00, 0x02, // values: offsets 0 and 2
+            0x05, 0x2a, // integer 42 (kind 0x05 = one-byte signed)
+            0x15, 0x00, // string table entry 0
+        ];
+        // One string value and no binary resources; chunkData is the empty
+        // range at the document's end.
+        let strings = [0x0d_u8, 0x01, 0x0d, 0x00];
+        let strings_data = b"hi\0";
         let chunk_offsets = [0x0d_u8, 0x00, 0x0c];
         let chunk_lengths = [0x0d_u8, 0x00, 0x0c];
-        // Root object: key id 0 (the name above) mapped to the integer 42.  The
-        // value array stores offsets relative to the byte after its header, so
-        // the integer marker sits directly behind the value table.
-        let root = [
-            0x21, 0x0d, 0x01, 0x0d, 0x00, // keys: one entry, key id 0
-            0x0d, 0x01, 0x0d, 0x00, // values: one entry, offset 0
-            0x05, 0x2a, // integer 42 (kind 0x05 = one-byte signed)
-        ];
 
-        // Assemble the payload, recording where each table begins, so the
+        // Assemble the payload, recording where each section begins, so the
         // constants the tests use are checked against what actually lands in
         // the file.
         let mut payload = Vec::new();
@@ -870,31 +916,33 @@ mod tests {
         payload.extend_from_slice(&names_data);
         let name_indexes_offset = NAMES_OFFSET + payload.len();
         payload.extend_from_slice(&name_indexes);
+        let root_offset = NAMES_OFFSET + payload.len();
+        payload.extend_from_slice(&root);
         let strings_offset = NAMES_OFFSET + payload.len();
         payload.extend_from_slice(&strings);
         let strings_data_offset = NAMES_OFFSET + payload.len();
-        let chunk_offsets_offset = strings_data_offset;
+        payload.extend_from_slice(strings_data);
+        let chunk_offsets_offset = NAMES_OFFSET + payload.len();
         payload.extend_from_slice(&chunk_offsets);
         let chunk_lengths_offset = NAMES_OFFSET + payload.len();
         payload.extend_from_slice(&chunk_lengths);
         let chunk_data_offset = NAMES_OFFSET + payload.len();
-        let root_offset = chunk_data_offset;
-        payload.extend_from_slice(&root);
         for (actual, expected) in [
             (names_nodes_offset, NAMES_NODES_OFFSET),
             (name_indexes_offset, NAME_INDEXES_OFFSET),
+            (root_offset, ROOT_OFFSET),
             (strings_offset, STRINGS_OFFSET),
             (strings_data_offset, STRINGS_DATA_OFFSET),
             (chunk_offsets_offset, CHUNK_OFFSETS_OFFSET),
             (chunk_lengths_offset, CHUNK_LENGTHS_OFFSET),
             (chunk_data_offset, CHUNK_DATA_OFFSET),
-            (root_offset, ROOT_OFFSET),
         ] {
             assert_eq!(actual, expected, "fixture offset");
         }
+        assert_eq!(root.len(), ROOT_LENGTH, "fixture root length");
         assert_eq!(
             payload.len() + NAMES_OFFSET,
-            ROOT_OFFSET + ROOT_LENGTH,
+            CHUNK_DATA_OFFSET,
             "document length"
         );
 
@@ -930,7 +978,10 @@ mod tests {
     }
 
     fn minimal_root() -> PsbValue {
-        PsbValue::Object(BTreeMap::from([("A".to_string(), PsbValue::Integer(42))]))
+        PsbValue::Object(BTreeMap::from([
+            ("A".to_string(), PsbValue::Integer(42)),
+            ("B".to_string(), PsbValue::String("hi".to_string())),
+        ]))
     }
 
     #[test]
@@ -966,8 +1017,9 @@ mod tests {
         let PsbValue::Object(root) = PsbDocument::load(&bytes).expect("plaintext v3 loads") else {
             panic!("a PSB root must be an object");
         };
-        assert_eq!(root.len(), 1);
+        assert_eq!(root.len(), 2);
         assert_eq!(root.get("A"), Some(&PsbValue::Integer(42)));
+        assert_eq!(root.get("B"), Some(&PsbValue::String("hi".to_string())));
     }
 
     #[test]
@@ -987,12 +1039,12 @@ mod tests {
     fn checksum_mismatch_with_a_parseable_structure_is_malformed() {
         for flags in [0x0000, 0x0001] {
             let mut bytes = minimal_document(flags);
-            // Damage the (unused) chunkData offset's low byte without resealing
-            // the checksum: the offsets and the root still decode, which proves
-            // the header was never ciphered — so the mismatched checksum word
-            // is damage, and calling for a key would be wrong.  The document is
-            // still refused; a tampered header must not load.
-            bytes[0x20] ^= 0x01;
+            // Damage the (unused) chunkLengths offset's low byte without
+            // resealing the checksum: the offsets and the root still decode,
+            // which proves the header was never ciphered — so the mismatched
+            // checksum word is damage, and calling for a key would be wrong.
+            // The document is still refused; a tampered header must not load.
+            bytes[0x1c] ^= 0x01;
             assert!(matches!(
                 PsbDocument::load(&bytes),
                 Err(PsbError::Malformed(reason)) if reason.contains("checksum")
@@ -1205,5 +1257,109 @@ mod tests {
             runtime.object_member(nested, "answer"),
             Variant::Integer(42)
         );
+    }
+
+    /// Encrypts a fixture the way the reference encoder does, using the same
+    /// scheme implementation the plugin decrypts with ([`PsbCipher`]'s
+    /// inverse; `xp3-brute` `src/encoder/psb.rs:989-1021`).
+    fn ciphered_document(flags: u16, key: PsbKey, plain: &[u8]) -> Vec<u8> {
+        PsbCipher::new(key)
+            .encrypt_document(flags, plain)
+            .expect("fixture document encrypts")
+    }
+
+    #[test]
+    fn synthetic_ciphered_documents_round_trip_through_the_key_store() {
+        // No real keyed sample exists in this tree (M45: PARQUET's documents
+        // are plaintext), so these fixtures are synthetic: encrypted with the
+        // scheme's own inverse over the ranges the reference decoder uses,
+        // then decoded through the plugin's document path and compared with
+        // the plaintext document's structure.
+        let key = PsbKey::emote(0x39d4_4b15);
+        let store = PsbKeyStore::from_config(&PsbConfig::new().with_key(key));
+        let plaintext_root = PsbDocument::load(&minimal_document(0x0000)).expect("plaintext loads");
+        for flags in [0x0001_u16, 0x0002, 0x0003] {
+            let plain = minimal_document(flags);
+            let ciphered = ciphered_document(flags, key, &plain);
+            assert_ne!(
+                ciphered, plain,
+                "the fixture is ciphered (flags {flags:#06x})"
+            );
+            // Without a key the Phase-1 diagnosis stands unchanged.
+            assert_eq!(
+                PsbDocument::load(&ciphered),
+                Err(PsbError::KeyRequired { flags })
+            );
+            // With the key the document decodes to the plaintext structure.
+            assert_eq!(
+                load_psb_document(&ciphered, &store),
+                Ok(plaintext_root.clone()),
+                "flags {flags:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_or_absent_keys_keep_the_honest_diagnosis() {
+        let right = PsbKey::emote(0x39d4_4b15);
+        let wrong = PsbKey::emote(0x0102_0304);
+        for flags in [0x0001_u16, 0x0002, 0x0003] {
+            let ciphered = ciphered_document(flags, right, &minimal_document(flags));
+
+            // Absent key: an empty store is the unkeyed pipeline.
+            assert_eq!(
+                load_psb_document(&ciphered, &PsbKeyStore::new()),
+                Err(PsbError::KeyRequired { flags })
+            );
+            // Wrong key: one failed repair must not change the verdict.
+            let wrong_store = PsbKeyStore::from_config(&PsbConfig::new().with_key(wrong));
+            let error = load_psb_document(&ciphered, &wrong_store).unwrap_err();
+            assert_eq!(error, PsbError::KeyRequired { flags });
+            // The text still names the flags and says the game's key is what
+            // is missing (the Phase-1 error semantics, minus the stale
+            // "no cipher is registered yet").
+            let message = error.to_string();
+            assert!(message.contains(&format!("{flags:#06x}")), "{message}");
+            assert!(message.contains("needs the game's key"), "{message}");
+
+            // A store holding the right key after a wrong one selects it.
+            let ordered =
+                PsbKeyStore::from_config(&PsbConfig::new().with_key(wrong).with_key(right));
+            assert_eq!(
+                load_psb_document(&ciphered, &ordered),
+                Ok(minimal_root()),
+                "flags {flags:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_documents_never_enter_the_cipher() {
+        let key = PsbKey::emote(0xdead_beef);
+        let store = PsbKeyStore::from_config(&PsbConfig::new().with_key(key));
+
+        // A plaintext document decodes the same with any number of keys
+        // configured: the cipher has no say over a document that loads.
+        let plain = minimal_document(0x0001);
+        assert_eq!(load_psb_document(&plain, &store), Ok(minimal_root()));
+
+        // An *unflagged* damaged document stays malformed — it must not be
+        // blamed on a missing key just because a key is configured.
+        let mut damaged = minimal_document(0x0000);
+        damaged[0x24..0x28].copy_from_slice(&0_u32.to_le_bytes());
+        reseal_checksum(&mut damaged);
+        assert!(matches!(
+            load_psb_document(&damaged, &store),
+            Err(PsbError::Malformed(reason)) if reason.contains("root")
+        ));
+
+        // Even a genuinely ciphered body that flags nothing stays unread: the
+        // flags are the contract, not an invitation to guess.
+        let mut unflagged = ciphered_document(0x0002, key, &minimal_document(0x0002));
+        unflagged[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(matches!(
+            load_psb_document(&unflagged, &store),
+            Err(PsbError::Malformed(_))
+        ));
     }
 }
