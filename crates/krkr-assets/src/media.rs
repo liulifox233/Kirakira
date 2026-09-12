@@ -64,10 +64,12 @@
 //! One thing a provider cannot rely on yet:
 //!
 //! * Media *auto paths* (`Storages.addAutoPath("psb://container.psb/")`) do not
-//!   reach a provider: the auto-path machinery folds `media://` into `media:/`
-//!   before the provider could see it. The reference discovers those entries by
-//!   listing each auto path instead (`TVPRebuildAutoPathTable`,
-//!   `StorageIntf.cpp:1035-1144`).
+//!   reach a provider: the stored auto path keeps its `media://` spelling, but
+//!   the candidate join re-parses it through `Path`
+//!   (`crate::storage::auto_path_candidates`), which collapses the structural
+//!   `//` like any other separator run, so the candidate never reaches
+//!   `split_media_name`. The reference discovers those entries by listing each
+//!   auto path instead (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1035-1144`).
 
 pub use krkr_core::media::{
     FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name,
@@ -85,7 +87,7 @@ mod tests {
     use krkr_core::{ResourceStream, StoragePort};
 
     use super::*;
-    use crate::storage::ProjectStorage;
+    use crate::storage::{ProjectStorage, normalize_storage_name};
 
     struct FakeMedia {
         name: &'static str,
@@ -347,6 +349,42 @@ mod tests {
         // `GetLocallyAccessibleName` is `""` for every media the dossiers
         // cover; a media name therefore has no OS path.
         assert_eq!(storage.placed_path("psb://container.psb/inner"), None);
+    }
+
+    /// `Storages.getFullPath` runs the name through
+    /// [`normalize_storage_name`](crate::storage::normalize_storage_name), and
+    /// a script may feed that result straight back into `Storages.*`. The
+    /// round trip only works while the normalization keeps the `://` that
+    /// `split_media_name` dispatches on.
+    #[test]
+    fn get_full_path_media_names_round_trip_to_the_provider() {
+        let storage = storage_with(
+            FakeMedia::new("psb")
+                .with_file("container.psb/inner", b"PSB")
+                .with_dir("container.psb/inner/", &["leaf.bin"]),
+        );
+
+        // The finding's probe: a media directory through `getFullPath` and
+        // back into a `Storages` call reaches the provider.
+        let directory = normalize_storage_name("psb://container.psb/inner/").expect("normalize");
+        assert_eq!(directory, "psb://container.psb/inner/");
+        assert_eq!(
+            split_media_name(&directory),
+            Some(("psb", "container.psb/inner/"))
+        );
+        assert!(storage.storage_exists_exact(&directory));
+
+        // The file spelling dispatches with the name space the provider has.
+        let file = normalize_storage_name("psb://container.psb/inner").expect("normalize");
+        assert_eq!(file, "psb://container.psb/inner");
+        assert_eq!(storage.read_binary_vec(&file).expect("media bytes"), b"PSB");
+
+        // A name whose media name was upper-case reaches the provider too:
+        // the normalization lower-cases it (`StorageIntf.cpp:366-374`) and the
+        // registry is keyed lower-case.
+        let upper = normalize_storage_name("PSB://container.psb/inner").expect("normalize");
+        assert_eq!(upper, "psb://container.psb/inner");
+        assert!(storage.storage_exists_exact(&upper));
     }
 
     #[test]
