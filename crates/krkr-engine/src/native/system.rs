@@ -185,15 +185,15 @@ fn system_touch_images(
 }
 
 fn touch_image_storages(runtime: &Runtime<KrkrHost>, source: &Variant) -> Result<Vec<String>> {
-    if let Variant::Object(array) = source {
+    if let Some(array) = source.object_handle() {
         let count = runtime
-            .object_member(*array, "count")
+            .object_member(array, "count")
             .to_integer()
             .unwrap_or(0)
             .max(0);
         let mut storages = Vec::with_capacity(count as usize);
         for index in 0..count {
-            let value = runtime.object_member(*array, &index.to_string());
+            let value = runtime.object_member(array, &index.to_string());
             if matches!(value, Variant::Void) {
                 break;
             }

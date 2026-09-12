@@ -344,7 +344,7 @@ fn kag_restore(
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let Some(Variant::Object(snapshot_object)) = args.first().cloned() else {
+    let Some(snapshot_object) = args.first().and_then(Variant::object_handle) else {
         return Err(TjsError::runtime(
             "KAGParser.restore requires a snapshot object",
         ));
@@ -662,7 +662,7 @@ fn sync_parser_from_members(
         &runtime.object_member(handle, "debugLevel"),
     )?);
 
-    if let Variant::Object(macros) = runtime.object_member(handle, "macros") {
+    if let Some(macros) = runtime.object_member(handle, "macros").object_handle() {
         let definitions = runtime
             .object_members(macros)
             .into_iter()
@@ -1152,17 +1152,14 @@ fn object_array_objects(
     object: ObjectHandle,
     name: &str,
 ) -> Vec<ObjectHandle> {
-    let Variant::Object(array) = runtime.object_member(object, name) else {
+    let Some(array) = runtime.object_member(object, name).object_handle() else {
         return Vec::new();
     };
     runtime
         .array_elements(array)
         .unwrap_or_default()
         .iter()
-        .filter_map(|value| match value {
-            Variant::Object(object) => Some(*object),
-            _ => None,
-        })
+        .filter_map(Variant::object_handle)
         .collect()
 }
 

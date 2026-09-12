@@ -738,26 +738,12 @@ impl<H: TjsHost + 'static> Runtime<H> {
     /// Returns the names that were not a native property of `object`, so the
     /// caller can assert its deny-list still matches the class.
     ///
-    /// Callers must know about one modelling gap before denying a property
-    /// that scripts also store through: `prop_set_handle` invokes a native
-    /// property's setter even for a store that carries `TJS_IGNOREPROP` (a
-    /// regmember-style `&obj.prop = v` or VM member store), so such a store
-    /// fails with -1007 on a denied property, where the reference's
-    /// `TJSDefaultPropSet` (`tjsObject.cpp:1435-1466`) skips the property
-    /// entirely and overwrites the member.  A caller with an ignore-prop
-    /// store path onto a denied name has to either implement that skip or
-    /// confirm no script reaches it (real games normally write such
-    /// properties through their setters); everything else about the denial is
-    /// the official behaviour.
-    ///
-    /// Deferred to the self-bound value model mission the tower is planning:
-    /// the skip is correct on its own (it is what makes `&obj.prop = v` replace
-    /// the member, e.g. KAGEX's `&layer.font = hook`), but it cannot land
-    /// before `this` and `new` results carry their binding
-    /// (`tTJSVariant(objthis, objthis)`, `tjsInterCodeExec.cpp:839`).  Without
-    /// that, the hook value loses its `ObjThis`, the injected `face` setter
-    /// runs against the writer instead of the hook, and the GINKA boot aborts
-    /// with `Member "fontSetter" does not exist` (round-2 review of 842cc15).
+    /// The denial applies to the two store shapes as the reference has them:
+    /// a plain `obj.prop = v` meets the denied setter and fails with -1007,
+    /// while a store carrying `TJS_IGNOREPROP` (`&obj.prop = v`,
+    /// regmember-style) skips the property object entirely and overwrites the
+    /// member (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1519-1541`), which
+    /// is how KAGEX replaces `Layer.font` with its font hook.
     pub fn deny_native_property_writes(
         &mut self,
         object: ObjectHandle,

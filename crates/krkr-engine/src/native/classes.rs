@@ -958,9 +958,9 @@ fn menu_item_children(
 ) -> Result<ObjectHandle> {
     let this =
         this_obj.ok_or_else(|| krkr_tjs2::TjsError::runtime(format!("{method} requires this")))?;
-    match runtime.object_member(this, "children") {
-        Variant::Object(children) => Ok(children),
-        _ => {
+    match runtime.object_member(this, "children").object_handle() {
+        Some(children) => Ok(children),
+        None => {
             let children = runtime.alloc_array_object(Vec::new());
             runtime.set_object_member(this, "children", Variant::Object(children));
             Ok(children)
@@ -1006,8 +1006,8 @@ fn menu_item_remove(
     let item = args.into_iter().next().unwrap_or_default();
     let children = menu_item_children(runtime, this_obj, "MenuItem.remove")?;
     runtime.array_remove_value(children, &item);
-    if let Variant::Object(child) = &item {
-        runtime.set_object_member(*child, "parent", Variant::Void);
+    if let Some(child) = item.object_handle() {
+        runtime.set_object_member(child, "parent", Variant::Void);
     }
     Ok(Variant::Void)
 }
@@ -1023,7 +1023,7 @@ fn menu_item_clear(
         .map(<[Variant]>::to_vec)
         .unwrap_or_default();
     for item in items {
-        if let Variant::Object(child) = item {
+        if let Some(child) = item.object_handle() {
             runtime.set_object_member(child, "parent", Variant::Void);
         }
     }
@@ -1036,10 +1036,10 @@ fn menu_item_set_parent(
     this_obj: Option<ObjectHandle>,
     item: &Variant,
 ) {
-    let (Some(this), Variant::Object(child)) = (this_obj, item) else {
+    let (Some(this), Some(child)) = (this_obj, item.object_handle()) else {
         return;
     };
-    runtime.set_object_member(*child, "parent", Variant::Object(this));
+    runtime.set_object_member(child, "parent", Variant::Object(this));
 }
 
 fn variant_object_handle(value: &Variant) -> Option<ObjectHandle> {
@@ -1053,13 +1053,8 @@ fn variant_object_handle(value: &Variant) -> Option<ObjectHandle> {
 /// The array a menu item lives in, or `None` when it has no parent
 /// (`MenuItem.parent` is void for a root item).
 fn menu_item_siblings(runtime: &Runtime<KrkrHost>, this: ObjectHandle) -> Option<ObjectHandle> {
-    let Variant::Object(parent) = runtime.object_member(this, "parent") else {
-        return None;
-    };
-    match runtime.object_member(parent, "children") {
-        Variant::Object(children) => Some(children),
-        _ => None,
-    }
+    let parent = runtime.object_member(this, "parent").object_handle()?;
+    runtime.object_member(parent, "children").object_handle()
 }
 
 /// `MenuItem.index` (`plugins/win32/menu/manual.tjs:134`): the item's position
@@ -1680,21 +1675,15 @@ const LAYER_NATIVE_PROPERTIES: &[&str] = &[
 /// the engine's own writes go through the host storage and the backing keys,
 /// which the access policy does not consult.
 ///
-/// `font` (`:9449`) is *not* denied here, and that is a deliberate, measured
-/// exception. The reference makes the two store shapes behave differently:
-/// `layer.font = x` meets the denied setter, while the `TJS_IGNOREPROP` store
+/// `font` (`:9449`) is denied as well. The two store shapes behave
+/// differently, exactly as the reference has them: `layer.font = x` meets the
+/// denied setter and fails with -1007, while the `TJS_IGNOREPROP` store
 /// `&layer.font = x` skips the property object entirely and overwrites the
-/// member (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1519-1552`). The VM
-/// cannot express that difference yet: `prop_set_handle` calls a native
-/// property's setter even for an ignore-prop store (see
-/// `Runtime::deny_native_property_writes`), so denying `font` refuses both
-/// shapes. KAGEX replaces a layer's font with a `FontHook` exactly through the
-/// second shape -- `sysscn/prerenderfontex.tjs`, `&a2.font = this` compiled to
-/// `spds` at bytecode 58 -- so a denied `font` aborts layer construction while
-/// the game boots (verified headless against GINKA). The engine's own font
-/// resolution already expects that replacement: it reads the font through TJS
+/// member (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1519-1552`). KAGEX
+/// replaces a layer's font with a `FontHook` through that second shape
+/// (`sysscn/prerenderfontex.tjs`, `&a2.font = this` compiled to `spds`), and
+/// the engine's own font resolution follows it: it reads the font through TJS
 /// dispatch because a game may wrap it in a hook (`resolve_font_member`).
-/// Denying `font` needs the ignore-prop skip in the VM first.
 const LAYER_READ_ONLY_PROPERTIES: &[&str] = &[
     "children",
     "nodeVisible",
@@ -1711,6 +1700,7 @@ const LAYER_READ_ONLY_PROPERTIES: &[&str] = &[
     "provinceImageBuffer",
     "provinceImageBufferForWrite",
     "provinceImageBufferPitch",
+    "font",
 ];
 
 /// `WindowIntf.cpp:1813 mainWindow`, `:1872 primaryLayer`,
@@ -1968,6 +1958,12 @@ fn layer_native_property_get(
 /// (`:665`), `window` (`:8683`), `prevFocusable` (`:9219`), `nextFocusable`
 /// (`:9242`) and `font` (`:9444`); `Window`'s `mainWindow` (`:1803`),
 /// `focusedLayer` (`:1824`) and `primaryLayer` (`:1865`) use the same form.
+/// The same shape comes back from the layer methods that hand out a layer --
+/// `getLayerAt` (`:6909`), `focusPrev`/`focusNext` (`:7729`, `:7747`) -- and
+/// from the event objects the action dispatcher builds: the target is
+/// `tTJSVariant(targthis, targ)` (`EventIntf.cpp:889`) and the event itself is
+/// handed to the handler as `tTJSVariant(evobj, evobj)`
+/// (`EventIntf.h:201`).
 ///
 /// The value carries its own object as ObjThis, which this engine models as a
 /// bound closure over the same object: TJS2 picks a call's or a write's
@@ -2212,12 +2208,18 @@ fn set_layer_absolute_order_mode(
 
 fn layer_property_value(runtime: &Runtime<KrkrHost>, handle: ObjectHandle, name: &str) -> Variant {
     let handle = runtime.bound_this(handle).unwrap_or(handle);
-    if let Some(value) = runtime.host().native_layer_property(handle, name) {
-        return value;
-    }
     let direct = runtime.object_member(handle, name);
+    // A plain member is the live value.  The reference keeps a property's
+    // state in the accessor's native instance and skips the accessor for a
+    // store that carries `TJS_IGNOREPROP` (`tTJSCustomObject::PropSet`,
+    // `tjsObject.cpp:1519-1541`), replacing the member -- KAGEX's
+    // `&layer.font = hook`.  The engine's host storage still holds whatever
+    // the property setter wrote last, so the member has to win here.
     if !runtime.variant_is_property(&direct) && !matches!(direct, Variant::Void) {
         return direct;
+    }
+    if let Some(value) = runtime.host().native_layer_property(handle, name) {
+        return value;
     }
     let stored = runtime.object_member(handle, &layer_property_backing_key(name));
     if !matches!(stored, Variant::Void) {
@@ -3624,16 +3626,16 @@ fn render_layer_target(
 
 pub(crate) fn register_kag_layer_slots_from_tjs(runtime: &mut Runtime<KrkrHost>) {
     let mut slots = BTreeMap::new();
-    let Variant::Object(kag) = runtime.global_member("kag") else {
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
         runtime.host_mut().replace_kag_layer_slots(slots);
         return;
     };
 
     for page in ["fore", "back"] {
-        let Variant::Object(page_object) = runtime.object_member(kag, page) else {
+        let Some(page_object) = runtime.object_member(kag, page).object_handle() else {
             continue;
         };
-        if let Variant::Object(base) = runtime.object_member(page_object, "base") {
+        if let Some(base) = runtime.object_member(page_object, "base").object_handle() {
             slots.insert(
                 runtime.bound_this(base).unwrap_or(base),
                 KagLayerSlot::new(page, "base"),
@@ -3654,7 +3656,7 @@ fn collect_kag_layer_array_slots(
     member: &str,
     message_layers: bool,
 ) {
-    let Variant::Object(array) = runtime.object_member(page_object, member) else {
+    let Some(array) = runtime.object_member(page_object, member).object_handle() else {
         return;
     };
     if let Some(elements) = runtime.array_elements(array) {
@@ -3680,10 +3682,10 @@ fn insert_kag_layer_slot(
     message_layer: bool,
     value: &Variant,
 ) {
-    let Variant::Object(candidate) = value else {
+    let Some(candidate) = value.object_handle() else {
         return;
     };
-    let handle = runtime.bound_this(*candidate).unwrap_or(*candidate);
+    let handle = runtime.bound_this(candidate).unwrap_or(candidate);
     let layer = if message_layer {
         format!("message{index}")
     } else {
@@ -4442,10 +4444,7 @@ fn object_optional_color(
 }
 
 fn source_object(value: &Variant) -> Option<ObjectHandle> {
-    match value {
-        Variant::Object(handle) => Some(*handle),
-        _ => None,
-    }
+    value.object_handle()
 }
 
 fn layer_free_image(
@@ -5063,12 +5062,8 @@ fn kag_page_layer_handle(
     page: &str,
     layer: &str,
 ) -> Option<ObjectHandle> {
-    let Variant::Object(kag) = runtime.global_member("kag") else {
-        return None;
-    };
-    let Variant::Object(page_object) = runtime.object_member(kag, page) else {
-        return None;
-    };
+    let kag = runtime.global_member("kag").object_handle()?;
+    let page_object = runtime.object_member(kag, page).object_handle()?;
     if is_kag_page_base(layer) {
         return variant_object(&runtime.object_member(page_object, "base"))
             .map(|handle| runtime.bound_this(handle).unwrap_or(handle));
@@ -5079,9 +5074,7 @@ fn kag_page_layer_handle(
     } else {
         ("layers", layer)
     };
-    let Variant::Object(array) = runtime.object_member(page_object, array_name) else {
-        return None;
-    };
+    let array = runtime.object_member(page_object, array_name).object_handle()?;
     variant_object(&runtime.object_member(array, index))
         .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
 }
@@ -6662,7 +6655,10 @@ fn focus_first_layer(
     forward: bool,
 ) -> Result<Variant> {
     if layer_set_focus_to(runtime, target, forward)? {
-        Ok(Variant::Object(target))
+        // `*result = tTJSVariant(lay->GetOwnerNoAddRef(),
+        // lay->GetOwnerNoAddRef())` (`LayerIntf.cpp:7729` for `focusPrev`,
+        // `:7747` for `focusNext`).
+        Ok(self_bound(Variant::Object(target)))
     } else {
         Ok(Variant::Null)
     }
@@ -6924,7 +6920,7 @@ fn layer_children(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Vec<Objec
     if runtime.host().native_layer(layer).is_some() {
         return children;
     }
-    let Variant::Object(children) = layer_property_value(runtime, layer, "children") else {
+    let Some(children) = layer_property_value(runtime, layer, "children").object_handle() else {
         return Vec::new();
     };
     let count = runtime
@@ -7133,9 +7129,13 @@ fn layer_on_click(
 
     let event = runtime.alloc_ordinary_object();
     runtime.add_object_class_info(event, "Dictionary");
-    runtime.set_object_member(event, "target", Variant::Object(this));
+    // `TVPCreateEventObject` stores the target as `tTJSVariant(targthis, targ)`
+    // (`EventIntf.cpp:889`) and `TVP_ACTION_INVOKE_BEGIN` hands the event
+    // itself as `tTJSVariant(evobj, evobj)` (`EventIntf.h:201`), so a handler
+    // receives both self-bound.
+    runtime.set_object_member(event, "target", self_bound(Variant::Object(this)));
     runtime.set_object_member(event, "type", Variant::String("onClick".to_string()));
-    runtime.call_object_method(window, "action", vec![Variant::Object(event)])
+    runtime.call_object_method(window, "action", vec![self_bound(Variant::Object(event))])
 }
 
 fn layer_on_hit_test(
@@ -7281,7 +7281,9 @@ fn layer_get_layer_at(
             // Disabled front layer blocks events to everything below it.
             return Ok(Variant::Null);
         }
-        return Ok(Variant::Object(object));
+        // `*result = tTJSVariant(lay->GetOwnerNoAddRef(),
+        // lay->GetOwnerNoAddRef())` (`LayerIntf.cpp:6909`).
+        return Ok(self_bound(Variant::Object(object)));
     }
     Ok(Variant::Null)
 }
@@ -8254,9 +8256,11 @@ fn this_font_spec(
 }
 
 fn layer_font_spec(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<FontSpec> {
-    match layer_property_value(runtime, layer, "font") {
-        Variant::Object(font) => font_spec_from_object(runtime, font),
-        _ => Ok(FontSpec::default()),
+    // KAGEX replaces the layer font with a script `FontHook` through the
+    // `TJS_IGNOREPROP` store, so the value here is a self-bound object.
+    match layer_property_value(runtime, layer, "font").object_handle() {
+        Some(font) => font_spec_from_object(runtime, font),
+        None => Ok(FontSpec::default()),
     }
 }
 

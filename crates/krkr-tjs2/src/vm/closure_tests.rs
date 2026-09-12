@@ -728,10 +728,13 @@ mod official {
         let file = official_handler_fixture("Array");
         let mut runtime = Runtime::new();
         let result = runtime.execute_file(&file).expect("execute fixture");
-        let Variant::Object(kag) = runtime.global_member("kag") else {
+        // A `new` result is `tTJSVariant(dsp, dsp)` (`tjsInterCodeExec.cpp:2384`),
+        // i.e. self-bound, so the stored global and the value the handler read
+        // back through it are the same bound closure.
+        let Some(kag) = runtime.global_member("kag").object_handle() else {
             panic!("global kag was not created");
         };
-        assert_eq!(result, Variant::Object(kag));
+        assert_eq!(result, Variant::self_bound(kag));
     }
 
     /// The same fixture with a Dictionary as the bound `this`. A Dictionary

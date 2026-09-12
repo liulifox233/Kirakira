@@ -102,7 +102,14 @@ impl Frame {
                 .ok_or_else(|| TjsError::runtime(format!("register {reg} does not exist")));
         }
         match reg {
-            -1 => Ok(self.this_obj.map(Variant::Object).unwrap_or(Variant::Null)),
+            // `ra[-1].SetObject(objthis, objthis)` (`tjsInterCodeExec.cpp:839`):
+            // `this` is the reference's `tTJSVariant(dsp, dsp)`, so a value
+            // derived from it (stored into a member or a local, passed on)
+            // remembers the object it came from.
+            -1 => Ok(self
+                .this_obj
+                .map(Variant::self_bound)
+                .unwrap_or(Variant::Null)),
             -2 => Ok(Variant::Object(self.this_proxy)),
             value => {
                 let index = usize::try_from((-3 - value) as i32).expect("nonnegative");
@@ -141,7 +148,9 @@ impl Frame {
         let mut registers = Vec::with_capacity(self.negative.len() + self.regs.len() + 2);
         registers.push((
             -1,
-            self.this_obj.map(Variant::Object).unwrap_or(Variant::Null),
+            self.this_obj
+                .map(Variant::self_bound)
+                .unwrap_or(Variant::Null),
         ));
         registers.push((-2, Variant::Object(self.this_proxy)));
         for (index, value) in self.negative.iter().enumerate() {
