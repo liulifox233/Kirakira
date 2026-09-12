@@ -46,13 +46,23 @@ fn native_array<H: TjsHost + 'static>(
 /// いません" (`docs/tjs2/j/contents/dictionary.html`).  Instance-style
 /// `dict.assign(src)` is an error there, and `dict.clear` reads as void, which
 /// is what the KAGEX attribute chains depend on.
+///
+/// `new Dictionary(count)` sizes the member table up front
+/// (`tjsDictionary.cpp:244-257`): an Integer count of 8 or more picks the
+/// bucket count from [`symbol_table::hash_bits_for_count`], anything else
+/// leaves the default 8 buckets.  The size is observable -- the same keys
+/// enumerate in a different order from a table that started wider.
 fn native_dictionary<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
+    args: Vec<Variant>,
 ) -> Result<Variant> {
-    let handle = runtime.alloc_object(Object::default());
-    runtime.add_object_class_info(handle, "Dictionary");
+    let handle = match args.first() {
+        Some(Variant::Integer(count)) if *count >= 8 => {
+            runtime.alloc_dictionary_object_sized(*count)
+        }
+        _ => runtime.alloc_dictionary_object(),
+    };
     Ok(Variant::Object(handle))
 }
 
@@ -545,7 +555,7 @@ fn array_assign<H: TjsHost + 'static>(
         // `TJS_HIDDENMEMBER` (`tDictionaryEnumCallback`, `:1088-1112`).  A
         // source key that happens to be named like a builtin (`clear`,
         // `count`, ...) is ordinary data and is copied.
-        for (key, value) in runtime.heap[src.0].members.clone() {
+        for (key, value) in runtime.heap[src.0].member_entries() {
             runtime.heap[dest.0].array_push(Variant::String(key));
             runtime.heap[dest.0].array_push(value);
         }
@@ -656,7 +666,10 @@ fn array_load_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    if let Some(value) = load_binary_struct(runtime, &path, &mode)? {
+    // An Array keeps its items in index order, so a decoded temporary already
+    // holds the file's order (`assign_array_struct` below copies it verbatim);
+    // only a dictionary root needs restoring in place.
+    if let Some(value) = load_binary_struct(runtime, &path, &mode, None)? {
         if let Variant::Object(src) = value
             && runtime.heap[handle.0].array_elements().is_some()
         {
@@ -920,7 +933,10 @@ fn dictionary_assign<H: TjsHost + 'static>(
     if let Some(elements) = runtime.heap[src.0].array_elements().map(Vec::from) {
         // An Array source is a flat name/value stream (`:329-346`): the loop
         // reads a name, stringifies it, then consumes the next element as the
-        // value, so a trailing unpaired element is dropped.
+        // value, so a trailing unpaired element is dropped.  The table is
+        // resized for the incoming items before the copy (`:332-334`).
+        let reqcount = runtime.heap[dest.0].members.len() as i64 + elements.len() as i64;
+        runtime.heap[dest.0].members.rebuild(reqcount);
         for pair in elements.chunks_exact(2) {
             let name = pair[0].to_tjs_string()?;
             let value = pair[1].clone();
@@ -930,7 +946,12 @@ fn dictionary_assign<H: TjsHost + 'static>(
     }
     // Snapshot after the clear, not before: `d.assign(d, 1)` assigns from the
     // already-emptied destination in the reference too.
-    let members = runtime.heap[src.0].members.clone();
+    let members = runtime.heap[src.0].member_entries();
+    // `reserve area`: the enumeration to count the source runs first, then
+    // `Owner->RebuildHash(reqcount)` sizes the table, then the copy runs
+    // (`:348-359`).
+    let reqcount = runtime.heap[dest.0].members.len() as i64 + members.len() as i64;
+    runtime.heap[dest.0].members.rebuild(reqcount);
     for (key, value) in members {
         runtime.heap[dest.0].set(key, value);
     }
@@ -1059,15 +1080,18 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    if let Some(value) = load_binary_struct(runtime, &path, &mode)? {
-        // A static `Dictionary.loadStruct(...)` call arrives with the class
-        // object as `this`; KRKR deserializes into a throw-away dictionary in
-        // that case, so never write the pack's members onto the class itself.
-        if let Variant::Object(src) = value
-            && !runtime.object_is_callable(handle)
-        {
-            assign_dictionary_struct(runtime, handle, src)?;
-        }
+    // A static `Dictionary.loadStruct(...)` call arrives with the class object
+    // as `this`; KRKR deserializes into a throw-away dictionary in that case
+    // (`if(!dic) dic = TJSCreateDictionaryObject();`, `tjsDictionary.cpp:42-58`),
+    // so the class object is never written.  A real instance *is* the
+    // serializer's `RootDictionary` and is restored in place, in file order --
+    // after `ni->Clear()`, which the reference runs before it even opens the
+    // stream (`:49-52`).
+    let root = (!runtime.object_is_callable(handle)).then_some(handle);
+    if let Some(root) = root {
+        runtime.heap[root.0].members.clear();
+    }
+    if let Some(value) = load_binary_struct(runtime, &path, &mode, root)? {
         return Ok(value);
     }
     let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
@@ -1101,6 +1125,7 @@ fn load_binary_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     path: &str,
     mode: &str,
+    root: Option<ObjectHandle>,
 ) -> Result<Option<Variant>> {
     let Ok(bytes) = runtime.host_mut().read_binary(path, mode) else {
         return Ok(None);
@@ -1108,7 +1133,7 @@ fn load_binary_struct<H: TjsHost + 'static>(
     if !bytes.starts_with(BINARY_STRUCT_HEADER) {
         return Ok(None);
     }
-    decode_binary_struct(runtime, &bytes)
+    decode_binary_struct_with_root(runtime, &bytes, root)
 }
 
 fn assign_array_struct<H: TjsHost + 'static>(
@@ -1141,6 +1166,11 @@ fn assign_dictionary_struct<H: TjsHost + 'static>(
 ) -> Result<()> {
     runtime.heap[dest.0].members.clear();
     let entries = dictionary_struct_entries(runtime, src);
+    // `AssignStructure` reserves the destination for the incoming members
+    // before the copy: count, `Owner->RebuildHash(reqcount)`, then copy
+    // (`tjsDictionary.cpp:540-556`).
+    let reqcount = runtime.heap[dest.0].members.len() as i64 + entries.len() as i64;
+    runtime.heap[dest.0].members.rebuild(reqcount);
     let mut stack = BTreeSet::new();
     stack.insert(src);
     for (key, value) in entries {
@@ -1298,7 +1328,8 @@ fn is_dictionary_object<H: TjsHost>(runtime: &Runtime<H>, handle: ObjectHandle) 
 }
 
 /// The destination-side view of a Dictionary's members: every entry, in the
-/// member map's order.  The reference's `SaveStructuredData` and
+/// member table's order (the reference's bucket walk, `EnumMembers`).
+/// The reference's `SaveStructuredData` and
 /// `AssignStructure` run `EnumMembers` over the object's own symbols and skip
 /// only `TJS_HIDDENMEMBER` (`tjsDictionary.cpp:410-420`, `:452-470`), so a key
 /// named `clear` or `count` is ordinary data -- which is why nothing here may
@@ -1308,11 +1339,7 @@ fn dictionary_struct_entries<H: TjsHost>(
     runtime: &Runtime<H>,
     handle: ObjectHandle,
 ) -> Vec<(String, Variant)> {
-    runtime.heap[handle.0]
-        .members
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+    runtime.heap[handle.0].member_entries()
 }
 
 fn tjs_quote(value: &str) -> String {
@@ -1567,6 +1594,26 @@ pub(crate) fn decode_binary_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     bytes: &[u8],
 ) -> Result<Option<Variant>> {
+    decode_binary_struct_with_root(runtime, bytes, None)
+}
+
+/// Restores a struct pack, optionally *into* `root`.
+///
+/// The reference's serializer takes the destination dictionary as its
+/// `RootDictionary` (`tTJSBinarySerializer(dic)`, `tjsDictionary.cpp:58-71`):
+/// `CreateDictionary` sizes that dictionary's own table with
+/// `RootDictionary->RebuildHash(count)` (`tjsBinarySerializer.cpp:80-88`) and
+/// `ReadDictionary` then adds every member in the order the file holds them
+/// (`:282-330` via `AddDictionary`'s `PropSetByVS`).  Handing `root` here
+/// reproduces that: the receiver is cleared, rebuilt at the count the stream
+/// announces, and filled in file order -- one traversal, not a decode followed
+/// by a copy in the decoded temporary's `EnumMembers` order.  A nested
+/// dictionary is still created fresh with `new Dictionary(count)`'s sizing.
+pub(crate) fn decode_binary_struct_with_root<H: TjsHost + 'static>(
+    runtime: &mut Runtime<H>,
+    bytes: &[u8],
+    root: Option<ObjectHandle>,
+) -> Result<Option<Variant>> {
     let payload = if bytes.starts_with(BINARY_STRUCT_HEADER) {
         &bytes[BINARY_STRUCT_HEADER.len()..]
     } else {
@@ -1579,6 +1626,7 @@ pub(crate) fn decode_binary_struct<H: TjsHost + 'static>(
         runtime,
         bytes: payload,
         index: 0,
+        root_dictionary: root,
     };
     decoder.value().map(Some)
 }
@@ -1587,10 +1635,20 @@ struct BinaryStructDecoder<'a, H: TjsHost> {
     runtime: &'a mut Runtime<H>,
     bytes: &'a [u8],
     index: usize,
+    /// The receiver a root dictionary is restored into; taken by the outermost
+    /// [`BinaryStructDecoder::value`] so only a top-level dictionary can claim
+    /// it, exactly like the reference's `RootDictionary` being cleared right
+    /// after `CreateDictionary` consumes it.
+    root_dictionary: Option<ObjectHandle>,
 }
 
 impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
     fn value(&mut self) -> Result<Variant> {
+        let root = self.root_dictionary.take();
+        self.value_into(root)
+    }
+
+    fn value_into(&mut self, root: Option<ObjectHandle>) -> Result<Variant> {
         let ty = self.read_u8()?;
         match ty {
             0x00..=0x7f => Ok(Variant::Integer(ty as i64)),
@@ -1640,15 +1698,15 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
             }
             0xde => {
                 let len = self.read_u16()? as usize;
-                self.dictionary(len)
+                self.dictionary(len, root)
             }
             0xdf => {
                 let len = self.read_u32()? as usize;
-                self.dictionary(len)
+                self.dictionary(len, root)
             }
             0xa0..=0xbf => self.string((ty - 0xa0) as usize),
             0x90..=0x9f => self.array((ty - 0x90) as usize),
-            0x80..=0x8f => self.dictionary((ty - 0x80) as usize),
+            0x80..=0x8f => self.dictionary((ty - 0x80) as usize, root),
             _ => Err(TjsError::runtime("invalid binary struct tag")),
         }
     }
@@ -1678,9 +1736,20 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
         Ok(Variant::Object(handle))
     }
 
-    fn dictionary(&mut self, len: usize) -> Result<Variant> {
-        let handle = self.runtime.alloc_ordinary_object();
-        self.runtime.add_object_class_info(handle, "Dictionary");
+    fn dictionary(&mut self, len: usize, root: Option<ObjectHandle>) -> Result<Variant> {
+        // The root of a pack is restored *into the receiver* in file order:
+        // `RootDictionary->RebuildHash(count)` sizes the receiver's table
+        // (`tjsBinarySerializer.cpp:80-88`) and the entries are added in the
+        // order the file holds them (`ReadDictionary`/`AddDictionary`,
+        // `:282-330`).  A nested dictionary is created with its member count
+        // (`CreateDictionary`'s `CreateNew(count)` path, `:90-98`).
+        let handle = match root {
+            Some(handle) => {
+                self.runtime.heap[handle.0].members.rebuild(len as i64);
+                handle
+            }
+            None => self.runtime.alloc_dictionary_object_sized(len as i64),
+        };
         for _ in 0..len {
             let Variant::String(key) = self.value()? else {
                 return Err(TjsError::runtime("binary dictionary key is not a string"));

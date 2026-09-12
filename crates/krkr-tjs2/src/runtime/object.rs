@@ -1,13 +1,15 @@
-use std::collections::BTreeMap;
-
 use crate::bytecode::BytecodeContextType;
 use crate::error::Result;
+use crate::runtime::symbol_table::SymbolTable;
 use crate::runtime::value::{ObjectHandle, Variant};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Object {
     pub kind: ObjectKind,
-    pub members: BTreeMap<String, Variant>,
+    /// The member table: the reference's open-chain hash store, so enumeration
+    /// is the reference's bucket walk rather than a key or insertion order.
+    /// See [`SymbolTable`].
+    pub members: SymbolTable,
     pub class_infos: Vec<String>,
     pub super_class: Option<ObjectHandle>,
     pub call_missing: bool,
@@ -21,7 +23,7 @@ impl Default for Object {
     fn default() -> Self {
         Self {
             kind: ObjectKind::Ordinary,
-            members: BTreeMap::new(),
+            members: SymbolTable::default(),
             class_infos: Vec::new(),
             super_class: None,
             call_missing: false,
@@ -65,11 +67,26 @@ impl Object {
                             .unwrap_or_default(),
                     )
                 } else {
-                    self.members.get(name).cloned()
+                    self.members.get(name)
                 }
             }
-            _ => self.members.get(name).cloned(),
+            _ => self.members.get(name),
         }
+    }
+
+    /// Every member in enumeration order, with an Array's elements answered
+    /// from its item list the way the reference's `EnumMembers` answers from
+    /// the native instance's items rather than from the symbol table.
+    pub fn member_entries(&self) -> Vec<(String, Variant)> {
+        if let ObjectKind::Array { elements } = &self.kind {
+            let mut entries = Vec::with_capacity(elements.len() + self.members.len());
+            for (index, value) in elements.iter().enumerate() {
+                entries.push((index.to_string(), value.clone()));
+            }
+            entries.extend(self.members.entries());
+            return entries;
+        }
+        self.members.entries()
     }
 
     /// True when `name` addresses an element this Array has no value for.
@@ -108,35 +125,27 @@ impl Object {
             let old_len = elements.len();
             if index >= old_len {
                 elements.resize(index + 1, Variant::Void);
-                for (offset, item) in elements[old_len..].iter().enumerate() {
-                    self.members
-                        .insert((old_len + offset).to_string(), item.clone());
-                }
             }
-            elements[index] = value.clone();
-            let canonical_name = index.to_string();
-            if name != canonical_name {
-                // Full array synchronization canonicalizes numeric member
-                // names, so do not leave aliases such as `01` behind.
-                self.members.remove(&name);
-            }
-            self.members.insert(canonical_name, value);
+            elements[index] = value;
+            // An index is not a symbol-table member: the reference stores an
+            // Array's items in the native instance (`tTJSArrayNI::Items`) and
+            // answers `PropGetByNum` from them, never through `Symbols`.
             self.sync_array_length_members();
             return;
         }
-        if let ObjectKind::Array { elements } = &mut self.kind {
-            if name == "count" || name == "length" {
-                let len = value.to_integer().unwrap_or(0).max(0) as usize;
-                elements.resize(len, Variant::Void);
-                self.sync_array_members();
-                return;
-            }
+        if let ObjectKind::Array { elements } = &mut self.kind
+            && (name == "count" || name == "length")
+        {
+            let len = value.to_integer().unwrap_or(0).max(0) as usize;
+            elements.resize(len, Variant::Void);
+            self.sync_array_members();
+            return;
         }
         self.members.insert(name, value);
     }
 
     pub fn delete(&mut self, name: &str) -> bool {
-        let removed = self.members.remove(name).is_some();
+        let removed = self.members.remove(name);
         if let ObjectKind::Array { elements } = &mut self.kind
             && let Some(index) = array_index(name, elements.len())
             && index < elements.len()
@@ -162,10 +171,10 @@ impl Object {
         self.array_extend(std::iter::once(value))
     }
 
-    /// Appends a batch of values without rebuilding every existing numeric
-    /// member for each element.  Array construction and binary-struct decode
-    /// commonly append thousands of values in a tight loop; doing a full
-    /// `sync_array_members` per value made those paths quadratic.
+    /// Appends a batch of values.  The mirror of numeric indices this engine
+    /// used to keep in the member table is gone: indices are answered from
+    /// `elements` (`Object::get_raw`), the way the reference answers them from
+    /// `tTJSArrayNI::Items` and never from `Symbols`.
     pub fn array_extend<I>(&mut self, values: I) -> bool
     where
         I: IntoIterator<Item = Variant>,
@@ -173,12 +182,7 @@ impl Object {
         let ObjectKind::Array { elements } = &mut self.kind else {
             return false;
         };
-        let start = elements.len();
         elements.extend(values);
-        for (index, value) in elements[start..].iter().enumerate() {
-            self.members
-                .insert((start + index).to_string(), value.clone());
-        }
         self.sync_array_length_members();
         true
     }
@@ -282,11 +286,9 @@ impl Object {
         let ObjectKind::Array { elements } = &mut self.kind else {
             return None;
         };
-        let Some(index) = elements.len().checked_sub(1) else {
+        let Some(value) = elements.pop() else {
             return Some(Variant::Void);
         };
-        let value = elements.pop().expect("array length checked above");
-        self.members.remove(&index.to_string());
         self.sync_array_length_members();
         Some(value)
     }
@@ -296,19 +298,16 @@ impl Object {
             return false;
         };
         elements.clear();
-        self.members.retain(|key, _| key.parse::<usize>().is_err());
         self.sync_array_length_members();
         true
     }
 
+    /// Keeps an Array's item list and its member table in step.  Only the
+    /// `count`/`length` properties live in the table: the items themselves are
+    /// indices, which `Object::get_raw` answers from `elements` and
+    /// `Object::member_entries` synthesizes for enumeration.
     fn sync_array_members(&mut self) {
-        if let ObjectKind::Array { elements } = &self.kind {
-            self.members.retain(|key, _| key.parse::<usize>().is_err());
-            for (index, value) in elements.iter().enumerate() {
-                self.members.insert(index.to_string(), value.clone());
-            }
-            self.sync_array_length_members();
-        }
+        self.sync_array_length_members();
     }
 
     fn sync_array_length_members(&mut self) {
@@ -369,7 +368,10 @@ mod tests {
 
         array.set("01", Variant::Integer(1));
         assert_eq!(array.get("1"), Variant::Integer(1));
-        assert!(!array.members.contains_key("01"));
+        // An index is never a symbol-table entry: the numeric name canonicalizes
+        // to an item, and the member table holds no `01` (or `1`) key at all.
+        assert!(!array.members.contains("01"));
+        assert!(!array.members.contains("1"));
     }
 
     #[test]

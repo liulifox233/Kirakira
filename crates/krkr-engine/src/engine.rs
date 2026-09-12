@@ -1283,6 +1283,15 @@ impl KrkrEngine {
         // earlier turn is visible to storage resolution from here on, on the
         // script thread and on resource workers alike.
         refresh_storage_tables(&mut self.tjs_runtime);
+        // `tTVPSystemControl::Event`'s rehash tick (`SystemControl.cpp:176-180`,
+        // krkr2 trunk runs it from `MainFormUnit.cpp:713-719`): every 1500 ms
+        // of the process clock `TJSDoRehash()` marks every object's member
+        // table stale, and each object rebuilds it at its member count on the
+        // next member read.  The reference skips the tick while
+        // `ContinuousEventCalling` is set (`:70-90`) -- a state this engine
+        // does not model, so the rule runs unconditionally here.
+        let now = self.tjs_runtime.host().tick_count_millis();
+        self.tjs_runtime.tjs_rehash_tick(now);
         if let Err(error) = apply_completed_resource_loads(&mut self.tjs_runtime) {
             if is_resource_pending_error(&error) {
                 self.kag_session.state = KagTaskState::WaitingResource;
