@@ -11333,6 +11333,99 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// A page's staged content *is* its base's own subtree: KAGEX builds every
+    /// env layer under `foreBase`/`backBase` (`KAGEnvironment.createLayer`), so
+    /// a plain layer hung on `kag.back.base` is the incoming screen and belongs
+    /// to the transition's source face only.  Drawing it in the live frame made
+    /// every `[begintrans]` crossfade run from the *new* content toward the
+    /// empty staging page, so the frame faded to the clear colour and the
+    /// content popped back when the page exchange swapped it in -- GINKA's
+    /// title entry.
+    #[test]
+    fn native_kag_base_transition_keeps_a_staged_plain_layer_on_the_staging_page() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("old.png"), 4, 4, &[255; 64]);
+        write_png(root.join("new.png"), 4, 4, &[0, 255, 0, 255].repeat(16));
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.kag = new Dictionary();
+                kag.fore = %[base: new Layer(), layers: [], messages: []];
+                kag.back = %[base: new Layer(), layers: [], messages: []];
+                kag.fore.base.loadImages(%[storage: "old.png", visible: true]);
+                kag.fore.base.setSizeToImageSize();
+                kag.fore.base.setSize(200, 200);
+                kag.back.base.visible = false;
+                kag.back.base.setSize(200, 200);
+                // The staging page's content is a plain layer under its base,
+                // not a KAG page slot (the env-layer shape).
+                kag.staged = new Layer(null, kag.back.base);
+                kag.staged.loadImages(%[
+                    storage: "new.png",
+                    visible: true,
+                    left: 40,
+                    top: 50
+                ]);
+                "#,
+            )
+            .expect("setup");
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("sync");
+
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                kag.fore.base.beginTransition(
+                    "crossfade",
+                    true,
+                    kag.back.base,
+                    %[time: 1000]
+                );
+                "#,
+            )
+            .expect("begin transition");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("transition frame");
+
+        // The live frame still shows the outgoing page alone.
+        assert_eq!(image_command_count(&frame), 1);
+        assert_eq!(content_image_command_count(&engine, &frame), 1);
+
+        let staged = |commands: &[krkr_core::DrawCommand]| {
+            commands.iter().any(|command| {
+                matches!(
+                    command,
+                    krkr_core::DrawCommand::Image(image)
+                        if image.rect.x == 40.0 && image.rect.y == 50.0
+                )
+            })
+        };
+        let transition = frame.output.transitions.first().expect("transition");
+        assert!(
+            staged(&transition.source_draw_commands),
+            "the staged layer is the transition's incoming face"
+        );
+        assert!(
+            !staged(&transition.frozen_draw_commands),
+            "the staged layer must not draw in the frame the transition fades away from"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn native_kag_base_transition_exchanges_back_children_into_fore() {
         let root = temp_root();

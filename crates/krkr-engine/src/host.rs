@@ -2290,27 +2290,14 @@ impl KrkrHost {
         });
         if is_fore_base && parent_is_back_page {
             None
-        } else if let Some(parent) = parent
-            && self
-                .kag_layer_slots
-                .get(&parent)
-                .is_some_and(|slot| slot.page == "back" && slot.layer == "base")
-            && self
-                .native_layer(handle)
-                .and_then(|layer_id| self.layer_tree.layer(layer_id))
-                .is_some_and(|layer| layer.renderable)
-        {
-            // `syspage ... page=back` builds UI below the staging base.  On
-            // exchange, KAG projects that live UI subtree into fore while the
-            // back base itself stays non-renderable.  Keep the script parent
-            // untouched, but attach its render root to the corresponding
-            // fore base so draw and hit-test traversal agree.
-            self.kag_layer_slots.iter().find_map(|(handle, slot)| {
-                (slot.page == "fore" && slot.layer == "base")
-                    .then(|| self.native_layer(*handle))
-                    .flatten()
-            })
         } else {
+            // A page's staged content *is* the page base's own subtree: KAGEX
+            // builds every env layer under `foreBase`/`backBase`
+            // (`KAGEnvironment.createLayer`), so a child of the staging base
+            // has to stay inside it -- the reference hides the whole page
+            // (`back.base.visible = false`, `exchangeForeBack`) and hands that
+            // subtree to the transition as its source face
+            // (`native_kag_base_transition_keeps_a_staged_plain_layer_on_the_staging_page`).
             parent.and_then(|parent| self.native_layer(parent))
         }
     }
