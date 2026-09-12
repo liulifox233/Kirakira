@@ -30,9 +30,9 @@
 //! | `drawCurve` `drawCurve2` `drawCurve3` | 2/3/5 | `:1366-1410` | real (cardinal spline) |
 //! | `drawEllipse` | 5 | `:1439-1445` | real |
 //! | `drawLine` `drawLines` `drawPolygon` `drawRectangle` `drawRectangles` | 5/2/2/5/2 | `:1456-1529` | real |
-//! | `drawPathString` `drawString` | 5 | `:1540-1636` | **warned stub** (no text backend) |
+//! | `drawString` `drawPathString` | 5 | `:1540-1636` | **warned stub** (no text backend) |
 //! | `measureString` `measureStringInternal` | 2 | `:1644-1681` | **warned stub** (empty RectF) |
-//! | `drawImage` `drawImageRect` `drawImageStretch` `drawImageAffine` | 3/7/9/12 | `:1690-1800` | **warned stub** (no image decode) |
+//! | `drawImage` `drawImageRect` `drawImageStretch` `drawImageAffine` | 3/7/9/12 | `:1690-1800` | real for a `Layer` source (bilinear samples); a data-less `GdiPlus.Image` warns |
 //! | `getRecordImage` `redrawRecord` `saveRecord` `loadRecord` | 0/0/1/1 | `:1884-1983` | **warned stub** (no metafile format) |
 //! | `saveImage` | ≥1 | `:2280-2319` | **warned stub** (no encoder; returns false) |
 //! | `getColorRegionRects` | 1 | `:2328-2373` | real row runs, doc'd divergence on merging |
@@ -81,9 +81,30 @@
 //! `LineCapFlat`, so butt caps), with a miter join at interior vertices
 //! (`LineJoinMiter`, miter limit 10 — `Pen`'s defaults) that falls back to a
 //! bevel past the limit. `Appearance.addPen`'s option dictionary may set
-//! `width`, `lineJoin` and the `startCap`/`endCap`/`dashCap` caps; dashes
-//! (`dashStyle`/`dashOffset`/`dashPattern`) and `compoundArray` are warned
-//! no-ops because the port does not dash a path.
+//! `width`, `lineJoin` and the `startCap`/`endCap` caps; dashes
+//! (`dashStyle`/`dashOffset`/`dashPattern`), `dashCap`, `compoundArray` and
+//! `PenAlignmentInset` are warned no-ops — dashes are not implemented in this
+//! port, so the pen draws one solid stroke.
+//!
+//! Brushes. Only `BrushTypeSolidColor` is implemented. The hatch, texture,
+//! path-gradient and linear-gradient types are recognised — and a type
+//! outside 0..=4 throws `invalid brush type` exactly where `createBrush`
+//! does (`:785-787`) — but their draw entries are skipped with a one-time
+//! warning rather than painted with a wrong colour.
+//!
+//! Images. `drawImage*` map the source `(sleft, stop, swidth, sheight)`
+//! rectangle onto a destination parallelogram through `calcTransform`
+//! exactly as the reference's four members funnel into `drawImageAffine`
+//! (`:1690-1800`), and the returned rect is the transformed corners' box. The
+//! `src` argument is the reference's `Image*`, which its converter also
+//! answers for a **`Layer`** (`main.cpp:424-445`); a layer's pixels are
+//! reachable here, so those calls are real: every destination pixel whose
+//! centre lies inside the quad takes a bilinear sample of the source (GDI+'s
+//! default interpolation mode; taps outside the image clamp to its edge),
+//! blended SourceOver. Destination edges are hard — GDI+ does not antialias a
+//! `DrawImage` parallelogram either. A `GdiPlus.Image` carries no pixels
+//! (the engine's decoder is not reachable from plugin code) and takes the
+//! reference's null-image no-op with a warning (`:1694`).
 //!
 //! Colours. The reference's pixels are B, G, R, A in memory (`0xAARRGGBB`
 //! DWORDs, dossier §1); the engine's plane is R, G, B, A (`plugin_api::layer`),
@@ -93,7 +114,9 @@
 //! `CompositingModeSourceOver` (`:993`) and the layer is `PixelFormat32bppARGB`
 //! — computed in `f64` and rounded half-up, where GDI+ blends in premultiplied
 //! integer space; a covered pixel's colour is exact, and a partially covered
-//! pixel can differ by one unit of alpha or colour from GDI+'s rounding.
+//! pixel can differ by one unit of alpha or colour from GDI+'s rounding. The
+//! image sampler interpolates the straight channels, where GDI+ interpolates
+//! premultiplied ones; the two agree wherever the alpha is uniform.
 //!
 //! The clip box (`bitmap.clip`) is applied per pixel, as the reference's
 //! `Region(Rect(clipLeft, clipTop, clipWidth, clipHeight))` (`:1006-1007`)
@@ -128,16 +151,34 @@
 //!   their intervals on every sub-row, so overlapping pieces count once, the
 //!   way GDI+ draws one continuous stroke outline. Only the sub-row
 //!   quantisation above remains.
-//! * **Text, images, metafiles, encoders.** Registered with the reference's
-//!   member count, a one-time warning and a failure result: no text backend
-//!   (`drawString`/`measureString`), no image decoder (`GdiPlus.Image`,
-//!   `drawImage*` — `drawImage` of a null `Image` is the reference's own
-//!   no-op, `:1694`), no metafile format (`record` setter warns,
-//!   `getRecordImage` answers void, `redrawRecord`/`saveRecord` answer false —
-//!   `saveRecord`'s false is the reference's result without a metafile,
-//!   `:1937-1964`; `loadRecord` answers false exactly as the reference always
-//!   does, `:1972-1983`) and no image encoder (`saveImage` answers false
-//!   instead of GDI+'s status).
+//! * **Text, metafiles, encoders, `GdiPlus.Image`.** Registered with the
+//!   reference's member count, a one-time warning and a failure result: no
+//!   text backend is reachable from plugin code (`drawString`/
+//!   `drawPathString`/`measureString*` draw nothing and measure empty), no
+//!   metafile format exists (`record` setter warns, `getRecordImage` answers
+//!   void, `redrawRecord`/`saveRecord` answer false — `saveRecord`'s false is
+//!   the reference's result without a metafile, `:1937-1964`; `loadRecord`
+//!   answers false exactly as the reference always does, `:1972-1983`), no
+//!   encoder is reachable (`saveImage` answers false instead of GDI+'s
+//!   status), and the engine's image decoder is not reachable either, so a
+//!   `GdiPlus.Image` has no pixels and `drawImage*` of one is the reference's
+//!   null-image no-op (`:1694`). A **`Layer`** source *is* sampled (see
+//!   Images above).
+//! * **State carriers.** The reference holds `Path` figures and `Appearance`
+//!   draw lists in ncbind native instances; this port stores each object's
+//!   data in a `__figures`/`__drawInfos` member of the object itself (a flat
+//!   array), so the state dies with the object and nothing else owns it. The
+//!   members are script-visible, which no reference script reads or writes.
+//! * **Read-only properties.** `RectF.left/top/right/bottom/location/bounds`
+//!   and the `Font` metrics deny a script write with `TJS_E_ACCESSDENYED`,
+//!   like the reference's `TJS_DENY_NATIVE_PROP_SETTER` properties, and the
+//!   `Matrix` `*Order` arguments are required, as ncbind's declared-parameter
+//!   count makes them.
+//! * **Brushes and dashes.** Only solid brushes and solid strokes are
+//!   rasterised; the other brush types, pen dashes and `compoundArray` are
+//!   recognised, warned about once and skipped. This is scope, not a missing
+//!   engine facility — gradients, hatch patterns and dashes are arithmetic
+//!   over this rasteriser.
 //! * **`getColorRegionRects`** returns the reference's scanline runs merged
 //!   vertically where they are identical; GDI+ unions the runs into a `Region`
 //!   first, whose scan conversion can merge differently. The covered area is
@@ -158,12 +199,15 @@ use std::sync::Mutex;
 use krkr_engine::{
     KrkrHost, KrkrPlugin,
     plugin_api::layer::{
-        LayerBitmap, LayerBitmapViewMut, layer_bitmap_read, layer_bitmap_write, layer_update,
+        LayerBitmap, LayerBitmapView, LayerBitmapViewMut, layer_bitmap_read,
+        layer_bitmap_read_write, layer_bitmap_write, layer_update,
     },
 };
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{NativeArgCount, NativeFunction, ObjectHandle, Runtime, Variant},
+    runtime::{
+        NativeArgCount, NativeFunction, NativePropertyAccess, ObjectHandle, Runtime, Variant,
+    },
 };
 
 use crate::catalog::{PluginMeta, PluginStatus};
@@ -171,7 +215,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "Layer.draw* vector drawing / GdiPlus namespace",
-    notes: "The path/line/curve/rectangle/ellipse surface, the Appearance pen+brush state, the per-layer transform stack, clear and the clip box are real: geometry is built as polylines, rasterised by this module's own area-coverage rasteriser (8 sub-rows per pixel row, even-odd fills, butt/miter strokes, SourceOver in straight alpha) and committed through plugin_api::layer. drawString/drawPathString/measureString*, drawImage*, the metafile record API, saveImage and GdiPlus.Image's decoder are registered with the reference's argument counts and a one-time warning (no text backend, image decoder, metafile format or encoder in the engine); getColorRegionRects is real row runs.",
+    notes: "The path/line/curve/rectangle/ellipse surface, the Appearance pen+brush state, the per-layer transform stack, clear, the clip box and the four drawImage* members are real: geometry is built as polylines, rasterised by this module's own area-coverage rasteriser (8 sub-rows per pixel row, even-odd fills, butt/miter strokes, SourceOver in straight alpha) and committed through plugin_api::layer; drawImage* accept a Layer source — which the reference's converter also answers — and sample it bilinearly. drawString/drawPathString/measureString*, the metafile record API, saveImage and GdiPlus.Image's decoder are registered with the reference's argument counts and a one-time warning (no text backend or encoder reachable from plugin code, no metafile format, and the decoder is not reachable so a GdiPlus.Image takes the reference's null-image path). Hatch/texture/gradient brushes, dashes and PenAlignmentInset are recognised and skipped with a one-time warning rather than painted wrongly. getColorRegionRects is real row runs.",
     install: |engine| engine.register_plugin(LayerExDrawPlugin),
 };
 
@@ -524,6 +568,14 @@ fn install_gdi_plus(runtime: &mut Runtime<KrkrHost>) {
         NativeArgCount::AtLeast(1),
         get_font_list,
     );
+    // ncbind puts a `finalize` on every class it registers (its instance
+    // adaptor's destructor); the geometry classes below carry one too.
+    runtime.register_object_native_with_arg_count(
+        gdi_plus,
+        "finalize",
+        NativeArgCount::AtLeast(0),
+        native_void,
+    );
 
     let point_f = point_f_constructor(runtime);
     let rect_f = rect_f_constructor(runtime);
@@ -673,23 +725,24 @@ fn install_rect_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
             runtime.set_object_member(handle, name, Variant::Real(0.0));
         }
     }
-    runtime.register_object_native_property(
+    register_readonly_property(
+        runtime,
         handle,
         "left",
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
             Ok(Variant::Real(this_real(runtime, this_obj, "x")))
         },
-        keep_setter,
     );
-    runtime.register_object_native_property(
+    register_readonly_property(
+        runtime,
         handle,
         "top",
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
             Ok(Variant::Real(this_real(runtime, this_obj, "y")))
         },
-        keep_setter,
     );
-    runtime.register_object_native_property(
+    register_readonly_property(
+        runtime,
         handle,
         "right",
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
@@ -697,9 +750,9 @@ fn install_rect_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
                 this_real(runtime, this_obj, "x") + this_real(runtime, this_obj, "width"),
             ))
         },
-        keep_setter,
     );
-    runtime.register_object_native_property(
+    register_readonly_property(
+        runtime,
         handle,
         "bottom",
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
@@ -707,9 +760,9 @@ fn install_rect_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
                 this_real(runtime, this_obj, "y") + this_real(runtime, this_obj, "height"),
             ))
         },
-        keep_setter,
     );
-    runtime.register_object_native_property(
+    register_readonly_property(
+        runtime,
         handle,
         "location",
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
@@ -717,9 +770,9 @@ fn install_rect_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
             let y = this_real(runtime, this_obj, "y");
             Ok(Variant::Object(new_point_f(runtime, x, y)))
         },
-        keep_setter,
     );
-    runtime.register_object_native_property(
+    register_readonly_property(
+        runtime,
         handle,
         "bounds",
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
@@ -728,7 +781,6 @@ fn install_rect_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
                 runtime, rect[0], rect[1], rect[2], rect[3],
             )))
         },
-        keep_setter,
     );
     runtime.register_object_native_with_arg_count(
         handle,
@@ -775,7 +827,7 @@ fn install_rect_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     runtime.register_object_native_with_arg_count(
         handle,
         "Union",
-        NativeArgCount::AtLeast(2),
+        NativeArgCount::AtLeast(3),
         rect_union,
     );
 }
@@ -918,24 +970,29 @@ fn rect_offset(
     Ok(Variant::Void)
 }
 
-/// GDI+'s `RectF::Union(rect1, rect2)` quirk: it computes the union of the two
-/// arguments and stores it in `this`, returning whether the result is
-/// non-empty (`gdiplustypes.h`; bound at `main.cpp:198`). Called as
-/// `rect.Union(a, b)`.
+/// GDI+'s `RectF` exposes `Union` as the static
+/// `BOOL Union(RectF& c, const RectF& a, const RectF& b)` — the single
+/// `Union` overload of `gdiplustypes.h`, which the reference's plain
+/// `NCB_METHOD(Union)` binds (`main.cpp:198`). A TJS call therefore spells
+/// out all three rectangles: `GdiPlus.RectF.Union(dst, a, b)` stores the
+/// union of `a` and `b` in the *first* argument and answers whether the
+/// result is non-empty. (The previous stub's 3-argument form had the same
+/// shape; this diff's 2-argument instance form did not exist in the
+/// reference.)
 fn rect_union(
     runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
+    _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let a = variant_rect(runtime, args.first());
-    let b = variant_rect(runtime, args.get(1));
+    let a = variant_rect(runtime, args.get(1));
+    let b = variant_rect(runtime, args.get(2));
     let left = a[0].min(b[0]);
     let top = a[1].min(b[1]);
     let right = (a[0] + a[2]).max(b[0] + b[2]);
     let bottom = (a[1] + a[3]).max(b[1] + b[3]);
     let (width, height) = (right - left, bottom - top);
-    if let Some(this) = this_obj {
-        store_rect(runtime, this, [left, top, width, height]);
+    if let Some(destination) = args.first().and_then(Variant::object_handle) {
+        store_rect(runtime, destination, [left, top, width, height]);
     }
     Ok(Variant::Integer(i64::from(width > 0.0 && height > 0.0)))
 }
@@ -1032,7 +1089,7 @@ fn install_matrix_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     runtime.register_object_native_with_arg_count(
         handle,
         "Multiply",
-        NativeArgCount::AtLeast(1),
+        NativeArgCount::AtLeast(2),
         matrix_multiply,
     );
     runtime.register_object_native_with_arg_count(
@@ -1041,34 +1098,38 @@ fn install_matrix_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
         NativeArgCount::AtLeast(0),
         matrix_reset,
     );
+    // GDI+'s `MatrixOrder` is a declared parameter of every one of these
+    // (`Status Rotate(REAL, MatrixOrder = ...)`, mingw-w64/ReactOS
+    // `gdiplustypes.h`), and ncbind counts declared parameters, defaults
+    // included (`ncbind.hpp:1186`), so the reference requires them too.
     runtime.register_object_native_with_arg_count(
         handle,
         "Rotate",
-        NativeArgCount::AtLeast(1),
+        NativeArgCount::AtLeast(2),
         matrix_rotate,
     );
     runtime.register_object_native_with_arg_count(
         handle,
         "RotateAt",
-        NativeArgCount::AtLeast(2),
+        NativeArgCount::AtLeast(3),
         matrix_rotate_at,
     );
     runtime.register_object_native_with_arg_count(
         handle,
         "Scale",
-        NativeArgCount::AtLeast(2),
+        NativeArgCount::AtLeast(3),
         matrix_scale,
     );
     runtime.register_object_native_with_arg_count(
         handle,
         "Shear",
-        NativeArgCount::AtLeast(2),
+        NativeArgCount::AtLeast(3),
         matrix_shear,
     );
     runtime.register_object_native_with_arg_count(
         handle,
         "Translate",
-        NativeArgCount::AtLeast(2),
+        NativeArgCount::AtLeast(3),
         matrix_translate,
     );
 }
@@ -1534,7 +1595,7 @@ fn install_font_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
         "descentLeading",
         "lineSpacing",
     ] {
-        runtime.register_object_native_property(handle, name, font_metric_getter, keep_setter);
+        register_readonly_property(runtime, handle, name, font_metric_getter);
     }
 }
 
@@ -1734,8 +1795,8 @@ fn appearance_add_pen(
             warn_once(
                 runtime,
                 "pen-dash",
-                "pen dashes (dashStyle/dashOffset/dashPattern) are not implemented: the \
-                 path is drawn solid",
+                "pen dashes are not implemented in this port: dashStyle/dashOffset/\
+                 dashPattern are ignored and the path is drawn solid",
             );
         }
         if object_has_member(runtime, handle, "dashPattern")
@@ -1744,8 +1805,20 @@ fn appearance_add_pen(
             warn_once(
                 runtime,
                 "pen-dash",
-                "pen dashes (dashStyle/dashOffset/dashPattern) are not implemented: the \
-                 path is drawn solid",
+                "pen dashes are not implemented in this port: dashStyle/dashOffset/\
+                 dashPattern are ignored and the path is drawn solid",
+            );
+        }
+        // `dashCap` only shapes dash ends; with dashes unimplemented it has
+        // nothing to affect, so say so instead of dropping it silently.
+        if let Some(cap) = object_real(runtime, handle, "dashCap")
+            && cap != 0.0
+        {
+            warn_once(
+                runtime,
+                "pen-dash-cap",
+                "pen dashCap is ignored: dashes are not implemented in this port, and with a \
+                 solid pen GDI+ has no dash ends for it to shape either",
             );
         }
         if object_has_member(runtime, handle, "compoundArray") {
@@ -1834,10 +1907,12 @@ fn line_cap(runtime: &mut Runtime<KrkrHost>, options: ObjectHandle, name: &str) 
 /// (default `BrushTypeSolidColor`), and an out-of-range type throws
 /// `invalid brush type` exactly where the reference does (`:786`).
 ///
-/// The four non-solid brush types are built by GDI+ from images, hatch
-/// patterns and gradient paths; this port has none of those, so it logs a
-/// one-time warning and answers `None` (the draw entry is skipped rather than
-/// painted with a wrong colour).
+/// The four non-solid types (hatch, texture, path gradient, linear gradient)
+/// are **not implemented in this port**, which carries the solid-colour
+/// rasteriser only; the entry is skipped with a one-time warning rather than
+/// painted with a wrong colour. (Their GDI+ construction needs hatch patterns
+/// and gradient-path sampling, not an engine facility, so this is scope
+/// rather than a missing capability.)
 fn resolve_brush(runtime: &mut Runtime<KrkrHost>, value: Option<&Variant>) -> Result<Option<u32>> {
     let Some(value) = value else {
         return Ok(None);
@@ -1854,8 +1929,8 @@ fn resolve_brush(runtime: &mut Runtime<KrkrHost>, value: Option<&Variant>) -> Re
                 warn_once(
                     runtime,
                     "brush-type",
-                    "hatch/texture/path-gradient/linear-gradient brushes are not \
-                     implemented; their draw entries are skipped",
+                    "hatch/texture/path-gradient/linear-gradient brushes are not implemented in \
+                     this port (solid colours only); their draw entries are skipped",
                 );
                 Ok(None)
             }
@@ -2712,7 +2787,16 @@ fn add_span(cover: &mut [f64], x0: i64, start: f64, end: f64, aa: bool) {
 
 /// Sorts and coalesces the slices of one sub-row, so overlapping stroke
 /// pieces count once.
+///
+/// The sort is the point: `stroke_pieces` emits its pieces in path order
+/// (all segment rectangles, then all join wedges and caps), so a later piece
+/// can lie to the *left* of an earlier one at a sampled row. The coalesce
+/// walks the intervals by ascending start; without the sort a disjoint
+/// left-hand interval whose start falls before the running end would be
+/// dropped instead of unioned, which loses whole stroke pieces (a stroked
+/// rectangle lost its left edge on the interior rows).
 fn merge_spans(spans: &mut [(f64, f64)], merged: &mut Vec<(f64, f64)>) {
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     merged.clear();
     for &(start, end) in spans.iter() {
         if end <= start {
@@ -2844,12 +2928,21 @@ fn clip_box(bitmap: LayerBitmap) -> (i64, i64, i64, i64) {
 /// the source alpha (`GdipGraphicsClear`/`FillPath` blend the antialiased
 /// coverage into the colour).
 fn blend_pixel(pixel: &mut [u8], colour: u32, coverage: f64) {
-    let src = [
-        f64::from((colour >> 16) & 0xff),
-        f64::from((colour >> 8) & 0xff),
-        f64::from(colour & 0xff),
-        f64::from((colour >> 24) & 0xff),
-    ];
+    blend_rgba(
+        pixel,
+        [
+            f64::from((colour >> 16) & 0xff),
+            f64::from((colour >> 8) & 0xff),
+            f64::from(colour & 0xff),
+            f64::from((colour >> 24) & 0xff),
+        ],
+        coverage,
+    );
+}
+
+/// The same SourceOver blend for a source colour already in `[R, G, B, A]`
+/// reals (`drawImage*`'s sampled pixels, whose alpha is part of the sample).
+fn blend_rgba(pixel: &mut [u8], src: [f64; 4], coverage: f64) {
     let source_alpha = src[3] / 255.0 * coverage;
     let dest_alpha = f64::from(pixel[3]) / 255.0;
     let out_alpha = source_alpha + dest_alpha * (1.0 - source_alpha);
@@ -3876,63 +3969,345 @@ fn layer_measure_string_internal(
 
 // ---------------------------------------------------------------- images
 
-/// `Layer.drawImage(x, y, src)` (`LayerExDraw.cpp:1690-1701`): the reference
-/// asks the image for its bounds and copies it; with a null image it returns
-/// a zero rect and draws nothing (`:1694`). `GdiPlus.Image` carries no pixels
-/// here, so this is the reference's null-image path plus a warning — a `Layer`
-/// passed as the image (which the reference's converter accepts,
-/// `main.cpp:432-437`) is not sampled either.
+/// `Layer.drawImage(x, y, src)` (`LayerExDraw.cpp:1690-1701`): the image's
+/// bounds position the copy, which is `drawImageRect(x + bounds.X, y +
+/// bounds.Y, src, 0, 0, bounds.Width, bounds.Height)`. The reference's
+/// converter accepts a **`Layer`** as the image as well as a GDI+ `Image`
+/// (`main.cpp:424-445`, the `LayerExDraw` fallback), and a layer's pixels are
+/// reachable here, so a layer source is sampled for real; a `GdiPlus.Image`
+/// carries no pixels in this engine (the decoder is not reachable from plugin
+/// code) and takes the reference's null-image path (`:1694`) with a warning.
 fn layer_draw_image(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
 ) -> Result<Variant> {
-    warn_image_stub(runtime);
-    Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)))
+    let layer = this_layer(this_obj)?;
+    let Some(source) = args.get(2).and_then(Variant::object_handle) else {
+        warn_image_stub(runtime);
+        return Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)));
+    };
+    let Some((width, height)) = layer_image_size(runtime, source) else {
+        warn_image_stub(runtime);
+        return Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)));
+    };
+    // `getBounds` of a bitmap is `(0, 0, width, height)`.
+    draw_image_affine(
+        runtime,
+        layer,
+        Some(source),
+        0.0,
+        0.0,
+        f64::from(width),
+        f64::from(height),
+        true,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        arg_real(&args, 0),
+        arg_real(&args, 1),
+    )
 }
 
 /// `Layer.drawImageRect` (`LayerExDraw.cpp:1714-1718`): forwards to
 /// `drawImageAffine` with the identity transform.
 fn layer_draw_image_rect(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
 ) -> Result<Variant> {
-    warn_image_stub(runtime);
-    Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)))
+    let layer = this_layer(this_obj)?;
+    draw_image_affine(
+        runtime,
+        layer,
+        args.get(2).and_then(Variant::object_handle),
+        arg_real(&args, 3),
+        arg_real(&args, 4),
+        arg_real(&args, 5),
+        arg_real(&args, 6),
+        true,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        arg_real(&args, 0),
+        arg_real(&args, 1),
+    )
 }
 
 /// `Layer.drawImageStretch` (`LayerExDraw.cpp:1733-1737`): an affine copy with
 /// `dwidth/swidth`, `dheight/sheight` scaling.
 fn layer_draw_image_stretch(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
 ) -> Result<Variant> {
-    warn_image_stub(runtime);
-    Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)))
+    let layer = this_layer(this_obj)?;
+    let swidth = arg_real(&args, 7);
+    let sheight = arg_real(&args, 8);
+    draw_image_affine(
+        runtime,
+        layer,
+        args.get(4).and_then(Variant::object_handle),
+        arg_real(&args, 5),
+        arg_real(&args, 6),
+        swidth,
+        sheight,
+        true,
+        arg_real(&args, 2) / swidth,
+        0.0,
+        0.0,
+        arg_real(&args, 3) / sheight,
+        arg_real(&args, 0),
+        arg_real(&args, 1),
+    )
 }
 
 /// `Layer.drawImageAffine` (`LayerExDraw.cpp:1748-1800`): the parallelogram
 /// `(A,B) (C,D) (E,F) (C-A+E, D-B+F)` of the source rect, or the affine form
-/// `A·x + C·y + E / B·x + D·y + F`.
+/// `A·x + C·y + E / B·x + D·y + F`. The `src` argument is the reference's
+/// `Image*`, which its converter also answers for a `Layer`
+/// (`main.cpp:424-445`); only a layer has pixels here.
 fn layer_draw_image_affine(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
 ) -> Result<Variant> {
-    warn_image_stub(runtime);
-    Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)))
+    let layer = this_layer(this_obj)?;
+    draw_image_affine(
+        runtime,
+        layer,
+        args.first().and_then(Variant::object_handle),
+        arg_real(&args, 1),
+        arg_real(&args, 2),
+        arg_real(&args, 3),
+        arg_real(&args, 4),
+        arg_int(&args, 5) != 0,
+        arg_real(&args, 6),
+        arg_real(&args, 7),
+        arg_real(&args, 8),
+        arg_real(&args, 9),
+        arg_real(&args, 10),
+        arg_real(&args, 11),
+    )
+}
+
+/// The shared body of the four `drawImage*` members: the source
+/// `(sleft, stop, swidth, sheight)` rectangle is mapped onto the destination
+/// parallelogram through `calcTransform`, sampled bilinearly and blended
+/// SourceOver, and the returned rect is the transformed corners' bounding box
+/// (`LayerExDraw.cpp:1748-1800`).
+#[allow(clippy::too_many_arguments)]
+fn draw_image_affine(
+    runtime: &mut Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    source: Option<ObjectHandle>,
+    sleft: f64,
+    stop: f64,
+    swidth: f64,
+    sheight: f64,
+    affine: bool,
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+) -> Result<Variant> {
+    let Some(source) = source else {
+        warn_image_stub(runtime);
+        return Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)));
+    };
+    if layer_image_size(runtime, source).is_none() {
+        // The reference's converter answers a null `Image*` for anything that
+        // is neither a GDI+ `Image` nor a layer, and `drawImageAffine` then
+        // keeps the zero rect (`:1752`).
+        warn_image_stub(runtime);
+        return Ok(Variant::Object(new_rect_f(runtime, 0.0, 0.0, 0.0, 0.0)));
+    }
+
+    // Destination corners in world space (`:1753-1774`): the affine form maps
+    // the source rect's own corners, the coordinate form takes three points
+    // and derives the fourth as `p1 + p2 - p0`.
+    let corners = if affine {
+        [
+            [e, f],
+            [a * swidth + e, b * swidth + f],
+            [c * sheight + e, d * sheight + f],
+            [a * swidth + c * sheight + e, b * swidth + d * sheight + f],
+        ]
+    } else {
+        [[a, b], [c, d], [e, f], [c - a + e, d - b + f]]
+    };
+
+    let (transform, view_transform, update_when_draw) = with_layer_state(runtime, layer, |state| {
+        (
+            state.transform,
+            state.view_transform,
+            state.update_when_draw,
+        )
+    });
+    let calc = matrix_mul(transform, view_transform);
+    let device: Vec<Point> = corners
+        .iter()
+        .map(|corner| Point::new(corner[0], corner[1]).transform(calc))
+        .collect();
+    // `calcTransform.TransformPoints(points, 4)` then the min/max box
+    // (`:1781-1795`).
+    let mut min_x = device[0].x;
+    let mut max_x = device[0].x;
+    let mut min_y = device[0].y;
+    let mut max_y = device[0].y;
+    for point in &device[1..] {
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
+
+    layer_bitmap_read_write(runtime, source, layer, |source_view, dest_view| {
+        rasterize_image(
+            source_view,
+            dest_view,
+            &device,
+            (sleft, stop, swidth, sheight),
+        );
+    })?;
+    if update_when_draw {
+        layer_update(runtime, layer)?;
+    }
+    Ok(Variant::Object(new_rect_f(
+        runtime,
+        min_x,
+        min_y,
+        max_x - min_x,
+        max_y - min_y,
+    )))
 }
 
 fn warn_image_stub(runtime: &mut Runtime<KrkrHost>) {
     warn_once(
         runtime,
         "draw-image",
-        "drawImage* are not implemented: this engine's image decoder is not reachable from \
-         plugin code, so GdiPlus.Image carries no pixels (the call behaves like the \
-         reference's null image: nothing is drawn)",
+        "drawImage*: the source has no pixels. Pass a Layer as `src` (the reference's \
+         converter accepts one and layer pixels are sampled); a GdiPlus.Image is not decoded \
+         because this engine's decoder is not reachable from plugin code",
     );
+}
+
+/// The main image's size of a layer-shaped source, `None` when the object is
+/// not a drawable layer (a `GdiPlus.Image` included).
+fn layer_image_size(runtime: &mut Runtime<KrkrHost>, source: ObjectHandle) -> Option<(u32, u32)> {
+    layer_bitmap_read(runtime, source, |view| {
+        (view.bitmap.width, view.bitmap.height)
+    })
+    .ok()
+}
+
+/// Draws the source rect onto the destination parallelogram: for every
+/// destination pixel whose centre falls inside the quad, the inverse of the
+/// parallelogram map gives the source point, which is sampled bilinearly
+/// (GDI+'s default interpolation; edge taps clamp) and blended SourceOver.
+/// Destination coverage is the centre test — GDI+ does not antialias the
+/// edges of a `DrawImage` parallelogram.
+fn rasterize_image(
+    source: &LayerBitmapView<'_>,
+    dest: &mut LayerBitmapViewMut<'_>,
+    corners: &[Point],
+    rect: (f64, f64, f64, f64),
+) {
+    let (sleft, stop, swidth, sheight) = rect;
+    if swidth <= 0.0 || sheight <= 0.0 {
+        return;
+    }
+    let origin = corners[0];
+    let u_axis = (corners[1].x - origin.x, corners[1].y - origin.y);
+    let v_axis = (corners[2].x - origin.x, corners[2].y - origin.y);
+    let det = u_axis.0 * v_axis.1 - u_axis.1 * v_axis.0;
+    if det.abs() <= f64::EPSILON {
+        return;
+    }
+
+    let bitmap = dest.bitmap;
+    let pitch = bitmap.pitch as usize;
+    let (clip_left, clip_top, clip_width, clip_height) = clip_box(bitmap);
+    let xs = corners.iter().map(|point| point.x);
+    let ys = corners.iter().map(|point| point.y);
+    let (min_x, max_x) = xs.fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), x| {
+        (min.min(x), max.max(x))
+    });
+    let (min_y, max_y) = ys.fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), y| {
+        (min.min(y), max.max(y))
+    });
+    let x0 = (min_x.floor() as i64).max(clip_left).max(0);
+    let y0 = (min_y.floor() as i64).max(clip_top).max(0);
+    let x1 = (max_x.ceil() as i64)
+        .min(clip_left + clip_width)
+        .min(i64::from(bitmap.width));
+    let y1 = (max_y.ceil() as i64)
+        .min(clip_top + clip_height)
+        .min(i64::from(bitmap.height));
+
+    for row in y0..y1 {
+        for column in x0..x1 {
+            let dx = column as f64 + 0.5 - origin.x;
+            let dy = row as f64 + 0.5 - origin.y;
+            let u = (dx * v_axis.1 - dy * v_axis.0) / det;
+            let v = (u_axis.0 * dy - u_axis.1 * dx) / det;
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let colour = sample_bilinear(source, sleft + u * swidth, stop + v * sheight);
+            let offset = row as usize * pitch + column as usize * 4;
+            if let Some(pixel) = dest.pixels.get_mut(offset..offset + 4) {
+                blend_rgba(pixel, colour, 1.0);
+            }
+        }
+    }
+}
+
+/// Bilinear taps at the source point `(x, y)`, in the layer's pixel frame
+/// (pixel `(i, j)` covers `[i, i+1) x [j, j+1)`); taps outside the image
+/// clamp to its edge, and a sample exactly on a pixel centre returns that
+/// pixel unchanged.
+fn sample_bilinear(source: &LayerBitmapView<'_>, x: f64, y: f64) -> [f64; 4] {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let left = fx.floor();
+    let top = fy.floor();
+    let tx = fx - left;
+    let ty = fy - top;
+    let (left, top) = (left as i64, top as i64);
+    let p00 = source_pixel(source, left, top);
+    let p10 = source_pixel(source, left + 1, top);
+    let p01 = source_pixel(source, left, top + 1);
+    let p11 = source_pixel(source, left + 1, top + 1);
+    let mut colour = [0.0; 4];
+    for channel in 0..4 {
+        let top_mix = p00[channel] + (p10[channel] - p00[channel]) * tx;
+        let bottom_mix = p01[channel] + (p11[channel] - p01[channel]) * tx;
+        colour[channel] = top_mix + (bottom_mix - top_mix) * ty;
+    }
+    colour
+}
+
+/// One source pixel as `[R, G, B, A]` reals, clamped to the image.
+fn source_pixel(source: &LayerBitmapView<'_>, x: i64, y: i64) -> [f64; 4] {
+    let width = i64::from(source.bitmap.width);
+    let height = i64::from(source.bitmap.height);
+    let x = x.clamp(0, (width - 1).max(0));
+    let y = y.clamp(0, (height - 1).max(0));
+    let offset = y as usize * source.bitmap.pitch as usize + x as usize * 4;
+    match source.pixels.get(offset..offset + 4) {
+        Some(pixel) => [
+            pixel[0].into(),
+            pixel[1].into(),
+            pixel[2].into(),
+            pixel[3].into(),
+        ],
+        None => [0.0; 4],
+    }
 }
 
 // ---------------------------------------------------------------- metafile
@@ -4177,6 +4552,27 @@ fn resolved_this(
     handle: Option<ObjectHandle>,
 ) -> Option<ObjectHandle> {
     handle.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
+}
+
+/// A read-only native property: the reference declares these with
+/// `NCB_PROPERTY_RO`, whose setter is `TJS_DENY_NATIVE_PROP_SETTER`, and a
+/// script write answers `TJS_E_ACCESSDENYED` — the engine's
+/// [`NativePropertyAccess::ReadOnly`].
+fn register_readonly_property<G>(
+    runtime: &mut Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: impl Into<String>,
+    getter: G,
+) where
+    G: Fn(&mut Runtime<KrkrHost>, Option<ObjectHandle>) -> Result<Variant> + Send + Sync + 'static,
+{
+    runtime.register_object_native_property_with_access(
+        object,
+        name,
+        NativePropertyAccess::ReadOnly,
+        getter,
+        keep_setter,
+    );
 }
 
 fn this_real(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, name: &str) -> f64 {
@@ -4932,19 +5328,95 @@ mod tests {
              layer.drawRectangle(app, 0, 0, 4, 4);",
         );
         // The brush fills the 4x4 rectangle, then the white pen strokes its
-        // outline: the outline is centred on the rectangle's edge, so the
-        // boundary pixels are half covered (`(128, 255, 128)` over the green
-        // interior), while the interior stays the fill's colour. The pen
+        // outline: the outline is centred on the rectangle's edge, so a
+        // single-edge pixel is half covered (`(128, 255, 128)` over the green
+        // interior), while the interior stays the fill's colour. The corner
+        // pixel (0,0) is covered by both the top and the left edge, so its
+        // stroke coverage is the *union* of the two half-covered bands,
+        // `1 - 0.5*0.5 = 0.75` -> `0.75*255 + 0.25*0 = 191 = 0xBF`. The pen
         // offset by (0, 4) draws the outline again one pixel lower, where its
-        // half-covered edge on row 4 is the same white.
+        // half-covered edge on row 4 meets the rectangle's own bottom edge.
         assert_eq!(pixel(&mut engine, "layer", 2, 2), 0x00_ff00, "the fill");
-        assert_eq!(pixel(&mut engine, "layer", 0, 0), 0x80_ff80, "the pen");
+        assert_eq!(
+            pixel(&mut engine, "layer", 0, 0),
+            0xBF_FFBF,
+            "the corner union"
+        );
+        // Interior rows carry the left and right edges; the left edge used to
+        // be dropped by the span merge (see `merge_spans`).
+        assert_eq!(
+            pixel(&mut engine, "layer", 0, 2),
+            0x80_FF80,
+            "the left edge"
+        );
+        assert_eq!(
+            pixel(&mut engine, "layer", 3, 2),
+            0x80_FF80,
+            "the right edge"
+        );
         // Row 4 carries the rectangle's own bottom edge and the offset pen's
         // top edge: two half-covered white strokes composite to alpha
         // `0.5 + 0.502 * 0.5 = 0.75` (192), the reference drawing each
         // appearance entry in turn (`LayerExDraw.cpp:1204-1261`).
         assert_eq!(alpha(&mut engine, "layer", 2, 4), 192, "the offset pen");
         assert_eq!(alpha(&mut engine, "layer", 5, 0), 0);
+    }
+
+    /// The P1 regression: a stroked multi-piece path is the union of its
+    /// pieces, so a piece lying to the *left* of an earlier one at a sampled
+    /// row must survive. A 1-pixel pen strokes the rectangle's edges centred
+    /// on them: at an interior row `y` the left edge covers `x in [0, 0.5]`
+    /// of pixel 0 and the right edge `x in [3.5, 4]` of pixel 3, plus
+    /// `[4, 4.5]` of pixel 4 (outside the fill, so it lands on transparency);
+    /// the corner pixel (0,0) is the union of the two half-covered bands,
+    /// `0.75 -> 0xBF` white over the green fill.
+    #[test]
+    fn a_stroked_rectangle_keeps_every_edge() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "edges.tjs",
+            "var app = new GdiPlus.Appearance();\n\
+             app.addBrush(0xff00ff00, 0, 0);\n\
+             app.addPen(0xffffffff, 1, 0, 0);\n\
+             layer.drawRectangle(app, 0, 0, 4, 4);",
+        );
+        for row in 1..=2 {
+            assert_eq!(
+                pixel(&mut engine, "layer", 0, row),
+                0x80_FF80,
+                "left edge at row {row} (the dropped piece)"
+            );
+            assert_eq!(
+                pixel(&mut engine, "layer", 3, row),
+                0x80_FF80,
+                "right edge at row {row}"
+            );
+            assert_eq!(alpha(&mut engine, "layer", 0, row), 255);
+        }
+        for column in 1..=2 {
+            assert_eq!(
+                pixel(&mut engine, "layer", column, 0),
+                0x80_FF80,
+                "top edge at column {column}"
+            );
+            assert_eq!(
+                pixel(&mut engine, "layer", column, 3),
+                0x80_FF80,
+                "bottom edge at column {column}"
+            );
+        }
+        assert_eq!(pixel(&mut engine, "layer", 0, 0), 0xBF_FFBF, "corner union");
+        assert_eq!(pixel(&mut engine, "layer", 3, 0), 0xBF_FFBF, "corner union");
+        assert_eq!(pixel(&mut engine, "layer", 2, 2), 0x00_FF00, "the fill");
+        // The right edge's outer half lands on transparency, half covered.
+        assert_eq!(alpha(&mut engine, "layer", 4, 2), 128);
+        assert_eq!(pixel(&mut engine, "layer", 4, 2), 0xFF_FFFF);
+        // The 90-degree miter join at (4,4) fills the outer square
+        // [4, 4.5] x [4, 4.5] -- a quarter of pixel (4,4), white on
+        // transparency.
+        assert_eq!(alpha(&mut engine, "layer", 4, 4), 64, "the miter corner");
+        assert_eq!(alpha(&mut engine, "layer", 5, 4), 0, "outside the stroke");
     }
 
     /// `getColorRegionRects` answers the colour's row runs merged vertically:
@@ -4967,6 +5439,88 @@ mod tests {
             integer(&mut engine, "layer.getColorRegionRects(0xff00ff00).length"),
             0
         );
+    }
+
+    /// The reference's image converter answers `Image*` for a **`Layer`** as
+    /// well as a GDI+ `Image` (`main.cpp:424-445`), so `drawImage*` samples a
+    /// layer's pixels: a 1:1 copy at an integer offset is exact (bilinear
+    /// taps land on pixel centres), a source sub-rect copies exactly, and a
+    /// 2x stretch pins the quad's corners to the clamped source corners.
+    #[test]
+    fn draw_image_samples_a_layer_source() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "source.tjs",
+            "global.src = new Layer();\n\
+             src.setImageSize(2, 2);\n\
+             src.fillRect(0, 0, 1, 1, 0xffff0000);\n\
+             src.fillRect(1, 0, 1, 1, 0xff00ff00);\n\
+             src.fillRect(0, 1, 1, 1, 0xff0000ff);\n\
+             src.fillRect(1, 1, 1, 1, 0xffffffff);",
+        );
+
+        run(
+            &mut engine,
+            "copy.tjs",
+            "global.rect = layer.drawImage(1, 1, src);",
+        );
+        assert_eq!(pixel(&mut engine, "layer", 1, 1), 0xff_0000);
+        assert_eq!(pixel(&mut engine, "layer", 2, 1), 0x00_ff00);
+        assert_eq!(pixel(&mut engine, "layer", 1, 2), 0x00_00ff);
+        assert_eq!(pixel(&mut engine, "layer", 2, 2), 0xff_ffff);
+        assert_eq!(alpha(&mut engine, "layer", 2, 2), 255);
+        assert_eq!(alpha(&mut engine, "layer", 3, 3), 0, "the copy's extent");
+        assert_eq!(integer(&mut engine, "rect.width"), 2);
+        assert_eq!(integer(&mut engine, "rect.height"), 2);
+
+        // `drawImageRect`: the source's right column, one pixel wide.
+        run(
+            &mut engine,
+            "rect.tjs",
+            "layer.clear(0x00000000);\n\
+             global.sub = layer.drawImageRect(0, 0, src, 1, 0, 1, 2);",
+        );
+        assert_eq!(pixel(&mut engine, "layer", 0, 0), 0x00_ff00);
+        assert_eq!(pixel(&mut engine, "layer", 0, 1), 0xff_ffff);
+        assert_eq!(alpha(&mut engine, "layer", 1, 0), 0);
+        assert_eq!(integer(&mut engine, "sub.width"), 1);
+        assert_eq!(integer(&mut engine, "sub.height"), 2);
+
+        // `drawImageStretch`: 2x2 -> 4x4. The corner pixels clamp their taps
+        // to the source corner (`(0.5, 0.5)` maps to source `(0.25, 0.25)`,
+        // whose taps are all pixel (0,0); `(3.5, 3.5)` maps to `(1.75, 1.75)`,
+        // taps 1 and 2 clamped to 1), so the corners are the source corners.
+        run(
+            &mut engine,
+            "stretch.tjs",
+            "layer.clear(0x00000000);\n\
+             global.stretched = layer.drawImageStretch(0, 0, 4, 4, src, 0, 0, 2, 2);",
+        );
+        assert_eq!(pixel(&mut engine, "layer", 0, 0), 0xff_0000);
+        assert_eq!(pixel(&mut engine, "layer", 3, 3), 0xff_ffff);
+        assert_eq!(alpha(&mut engine, "layer", 4, 0), 0, "the quad's extent");
+        assert_eq!(alpha(&mut engine, "layer", 0, 4), 0);
+        assert_eq!(integer(&mut engine, "stretched.width"), 4);
+        assert_eq!(integer(&mut engine, "stretched.height"), 4);
+
+        // The destination's clip box still bounds the copy: the source is
+        // 2x2, so a clip covering only (1,1) keeps that one pixel (the source
+        // corner (1,1)) and drops the rest of the copy.
+        run(
+            &mut engine,
+            "clip.tjs",
+            "layer.clear(0x00000000);\n\
+             layer.setClip(1, 1, 1, 1);\n\
+             layer.drawImage(0, 0, src);\n\
+             layer.setClip(0, 0, 6, 6);",
+        );
+        assert_eq!(
+            pixel(&mut engine, "layer", 1, 1),
+            0xff_ffff,
+            "inside the clip"
+        );
+        assert_eq!(alpha(&mut engine, "layer", 0, 0), 0, "outside the clip");
     }
 
     /// The stub members answer the reference's failure results and warn: text
@@ -5092,23 +5646,34 @@ mod tests {
         );
     }
 
-    /// `RectF.Union(a, b)` is GDI+'s two-argument form: it stores the union in
-    /// `this` (the reference's `NCB_METHOD(Union)`, `main.cpp:198`).
+    /// `GdiPlus.RectF.Union(dst, a, b)` is GDI+'s static three-argument form
+    /// (`BOOL Union(RectF& c, const RectF& a, const RectF& b)`, bound at
+    /// `main.cpp:198`): it stores the union of `a` and `b` in the *first*
+    /// argument and answers whether the result is non-empty. The two-argument
+    /// instance form the previous diff used does not exist in the reference.
     #[test]
-    fn rect_union_writes_into_this() {
+    fn rect_union_writes_into_its_first_argument() {
         let mut engine = engine();
         run(
             &mut engine,
             "union.tjs",
-            "global.r = new GdiPlus.RectF(0, 0, 0, 0);\n\
+            "global.r = new GdiPlus.RectF(9, 9, 1, 1);\n\
              var a = new GdiPlus.RectF(0, 0, 2, 2);\n\
              var b = new GdiPlus.RectF(1, 1, 2, 2);\n\
-             r.Union(a, b);",
+             global.ok = GdiPlus.RectF.Union(r, a, b);\n\
+             global.short = void;",
         );
         assert_eq!(integer(&mut engine, "r.x"), 0);
         assert_eq!(integer(&mut engine, "r.y"), 0);
         assert_eq!(integer(&mut engine, "r.width"), 3);
         assert_eq!(integer(&mut engine, "r.height"), 3);
+        assert_eq!(integer(&mut engine, "ok"), 1);
+        // The declared arity is the reference's three parameters, so the old
+        // two-argument call is short.
+        let error = engine
+            .execute_script("short.tjs", "GdiPlus.RectF.Union(r, a);")
+            .expect_err("two arguments");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
         run(
             &mut engine,
             "empty.tjs",
@@ -5118,8 +5683,11 @@ mod tests {
         assert_eq!(integer(&mut engine, "empty"), 1);
     }
 
-    /// `Matrix`'s optional `MatrixOrder`: the default prepends, `Append`
-    /// multiplies the other way around (`main.cpp:407-415`).
+    /// `Matrix`'s `MatrixOrder` argument (`main.cpp:407-415`): the reference
+    /// declares it on every `Multiply/Rotate/RotateAt/Scale/Shear/Translate`
+    /// (GDI+ defaults are invisible to ncbind, `ncbind.hpp:1186`), so the
+    /// argument is required; the default prepends, `Append` multiplies the
+    /// other way around.
     #[test]
     fn matrix_order_selects_the_multiplication_side() {
         let mut engine = engine();
@@ -5127,7 +5695,7 @@ mod tests {
             &mut engine,
             "matrix.tjs",
             "global.prepend = new GdiPlus.Matrix(2, 0, 0, 2, 0, 0);\n\
-             prepend.Multiply(new GdiPlus.Matrix(1, 0, 0, 1, 1, 1));\n\
+             prepend.Multiply(new GdiPlus.Matrix(1, 0, 0, 1, 1, 1), 0);\n\
              global.append = new GdiPlus.Matrix(2, 0, 0, 2, 0, 0);\n\
              append.Multiply(new GdiPlus.Matrix(1, 0, 0, 1, 1, 1), 1);",
         );
@@ -5135,6 +5703,58 @@ mod tests {
         assert_eq!(integer(&mut engine, "prepend.OffsetY()"), 2);
         assert_eq!(integer(&mut engine, "append.OffsetX()"), 1);
         assert_eq!(integer(&mut engine, "append.OffsetY()"), 1);
+
+        // The declared arity is the reference's two parameters.
+        let error = engine
+            .execute_script(
+                "short.tjs",
+                "var m = new GdiPlus.Matrix(1, 0, 0, 1, 0, 0);\n\
+                 m.Multiply(new GdiPlus.Matrix(1, 0, 0, 1, 1, 1));",
+            )
+            .expect_err("one argument");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+        let error = engine
+            .execute_script(
+                "short.tjs",
+                "var m = new GdiPlus.Matrix(1, 0, 0, 1, 0, 0);\n\
+                 m.Scale(2, 2);",
+            )
+            .expect_err("two arguments to Scale");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+    }
+
+    /// The reference's read-only properties (`NCB_PROPERTY_RO`) deny a script
+    /// write with `TJS_E_ACCESSDENYED`; they still read.
+    #[test]
+    fn read_only_geometry_properties_deny_writes() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "readonly.tjs",
+            "global.r = new GdiPlus.RectF(1, 2, 3, 4);\n\
+             global.left = r.left;\n\
+             global.font = new GdiPlus.Font(\"sans\", 12, 0);",
+        );
+        assert_eq!(integer(&mut engine, "left"), 1);
+        for script in [
+            "r.left = 9;",
+            "r.right = 9;",
+            "r.bounds = r;",
+            "font.ascent = 9;",
+        ] {
+            let error = engine
+                .execute_script("denied.tjs", script)
+                .expect_err(script);
+            assert_eq!(
+                error.kind,
+                krkr_tjs2::TjsErrorKind::AccessDenied,
+                "{script}: {}",
+                error.message
+            );
+        }
+        // The engine's own writes bypass the policy, which is what the
+        // constructors and `store_rect` rely on.
+        assert_eq!(integer(&mut engine, "r.width"), 3);
     }
 
     /// The rasteriser's coverage model, exercised directly: a half-covered
