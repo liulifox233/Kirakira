@@ -3642,8 +3642,23 @@ impl KagSession {
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::Trans => {
-                let duration = tag_millis(tag, "time").unwrap_or(Duration::ZERO);
-                let (params, rule_image_upload) = kag_transition_spec(runtime, tag)?;
+                // The `time` attribute is the handler's own clock and every
+                // provider clamps it to the reference's 2 ms floor
+                // (`TRANSITION_MIN_MILLIS`).  KAG's layer maps a specified `0`
+                // to `1` first (`KAGLayer.tjs:198-201`) and the provider then
+                // raises it to 2, so an explicit zero is a 2 ms transition and
+                // not an exchange.
+                let duration = tag_millis(tag, "time")
+                    .map(|duration| {
+                        duration.max(Duration::from_millis(
+                            crate::native::classes::TRANSITION_MIN_MILLIS,
+                        ))
+                    })
+                    .unwrap_or(Duration::ZERO);
+                let (mut params, rule_image_upload) = kag_transition_spec(runtime, tag)?;
+                // The clock the extrans kernels run on; `0` is "not supplied",
+                // which the kernels read as the progress-derived fallback.
+                params.duration_millis = duration.as_millis() as f32;
                 // KAG's own `[trans]` is `kag.fore.base.beginTransition`
                 // (`KAGLayer.tjs`), so the projection owns that layer object
                 // when the script has one.
@@ -4082,13 +4097,18 @@ fn kag_transition_spec(
     runtime: &mut Runtime<KrkrHost>,
     tag: &Tag,
 ) -> Result<(TransitionParams, Option<ImageUpload>)> {
-    let method = tag
+    let name = tag
         .literal_attr("method")
         .or_else(|| tag.literal_attr("rule").map(|_| "universal"))
-        .unwrap_or("crossfade")
-        .to_ascii_lowercase();
+        .unwrap_or("crossfade");
+    // `Layer.beginTransition` resolves the provider name before it reads any
+    // option (`LayerIntf.cpp:6206`) and the lookup is exact: a tag whose method
+    // is not registered stops the scenario with the official message instead
+    // of degrading to a crossfade.
+    let method = crate::native::classes::resolve_transition_method(runtime, name)
+        .map_err(|unknown| TjsError::runtime(unknown.message()))?;
     let mut params = TransitionParams {
-        method: TransitionMethod::from_name(&method),
+        method,
         ..TransitionParams::default()
     };
     match params.method {
@@ -4200,11 +4220,22 @@ fn parse_kag_number(value: &str) -> std::result::Result<f64, String> {
     trimmed.parse::<f64>().map_err(|error| error.to_string())
 }
 
+/// `bgcolor`, `bgcolor1` and `bgcolor2` of a `[trans]` tag: a `tjs_uint32`
+/// **ARGB** value, the same option the script path reads
+/// (`native::classes::object_optional_color`).
+///
+/// A KAG tag attribute reaches the provider as a string and official converts
+/// it with `(tjs_int)`, i.e. a TJS numeric parse (`TJSParseNumber`,
+/// `tjsLex.cpp:731-758`, so `0xff000000` is a number) that yields `0` for
+/// anything else -- a colour name like `red` is not a number and becomes
+/// transparent black.  The top byte is alpha, so `0xff000000` is the spelling
+/// for opaque black (`wave.cpp:345`/`:348`, `TVPFillARGB` at `:219`).
 fn kag_transition_color_attr(tag: &Tag, name: &str) -> Result<Option<Color>> {
-    let Some([r, g, b, _]) = parse_color_attr(tag, name)? else {
+    let Some(value) = tag.literal_attr(name) else {
         return Ok(None);
     };
-    Ok(Some(Color::rgb_u8(r, g, b)))
+    let color = parse_kag_number(value).unwrap_or(0.0) as i64;
+    Ok(Some(crate::native::classes::argb_color(color)))
 }
 
 fn kag_scroll_from_attr(tag: &Tag, name: &str) -> Result<Option<TransitionScrollFrom>> {
@@ -9297,7 +9328,7 @@ mod tests {
             concat!(
                 "[image storage=fore.png layer=base page=fore]",
                 "[image storage=back.png layer=base page=back]",
-                "[trans method=wave wavetype=2 maxh=20 maxomega=0.1 bgcolor1=0xff0000 bgcolor2=0x0000ff time=1000][wt][s]"
+                "[trans method=wave wavetype=2 maxh=20 maxomega=0.1 bgcolor1=0x80ff0000 bgcolor2=0x000000ff time=1000][wt][s]"
             ),
         )
         .expect("write scenario");
@@ -9317,8 +9348,115 @@ mod tests {
         assert_eq!(transition.params.wave_type, 2.0);
         assert_eq!(transition.params.max_h, 20.0);
         assert!((transition.params.max_omega - 0.1).abs() < 0.001);
-        assert_eq!(transition.params.bg_color1, Color::rgb_u8(255, 0, 0));
-        assert_eq!(transition.params.bg_color2, Color::rgb_u8(0, 0, 255));
+        // `bgcolor*` are `tjs_uint32` ARGB values (`wave.cpp:345`/`:348`): the
+        // top byte is alpha, so `0x000000ff` is a *transparent* blue.
+        assert_eq!(
+            transition.params.bg_color1,
+            Color::new(1.0, 0.0, 0.0, 0x80 as f32 / 255.0)
+        );
+        assert_eq!(transition.params.bg_color2, Color::new(0.0, 0.0, 1.0, 0.0));
+        // The tag's `time` is the handler's own millisecond clock.
+        assert_eq!(transition.params.duration_millis, 1000.0);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The `[trans]` tag's `time` reaches the kernels as the handler clock
+    /// (`TransitionParams::duration_millis`) and every provider clamps it to the
+    /// reference's 2 ms floor, so `time=1` runs a 2 ms transition and the
+    /// kernels can never see a clock their ramps divide by zero.
+    #[test]
+    fn kag_transition_time_is_clamped_to_the_reference_floor() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("fore.png"), 1, 1, &[255, 255, 255, 255]);
+        write_png(root.join("back.png"), 1, 1, &[0, 0, 0, 255]);
+        fs::write(
+            root.join("first.ks"),
+            concat!(
+                "[image storage=fore.png layer=base page=fore]",
+                "[image storage=back.png layer=base page=back]",
+                "[trans method=wave time=1][wt][s]"
+            ),
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("start transition");
+        let transition = frame.output.transitions.first().expect("transition");
+        assert_eq!(transition.params.duration_millis, 2.0);
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 1.0), Vec::new()),
+                Duration::from_millis(1),
+            )
+            .expect("mid transition");
+        assert_eq!(
+            frame
+                .output
+                .transitions
+                .first()
+                .map(|transition| transition.progress),
+            Some(0.5)
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 2.0), Vec::new()),
+                Duration::from_millis(1),
+            )
+            .expect("finish transition");
+        assert!(frame.output.transitions.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// An unknown `method` stops the scenario with the reference's message:
+    /// KAG3 calls `beginTransition` directly from the tag
+    /// (`MainWindow.tjs:5482-5487`), so the exception the provider lookup
+    /// throws (`TransIntf.cpp:354`) reaches the Conductor instead of degrading
+    /// the transition to a crossfade.
+    #[test]
+    fn kag_transition_unknown_method_reports_the_official_error() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        write_png(root.join("fore.png"), 1, 1, &[255, 255, 255, 255]);
+        write_png(root.join("back.png"), 1, 1, &[0, 0, 0, 255]);
+        fs::write(
+            root.join("first.ks"),
+            concat!(
+                "[image storage=fore.png layer=base page=fore]",
+                "[image storage=back.png layer=base page=back]",
+                "[trans method=nope time=100][wt][s]"
+            ),
+        )
+        .expect("write scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let error = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect_err("unknown transition method");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot find transition handler nope"),
+            "unexpected error: {error}"
+        );
+        // The tag never started a transition; the error is what stops the
+        // scenario (`process_native_fallback_tag` -> `advance`), the engine's
+        // projection of the Conductor's catch (`Conductor.tjs:55-186`).
+        assert!(engine.host().active_transition_count() == 0);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -12074,8 +12212,26 @@ mod tests {
                 var noRule = "";
                 try { pair.beginTransition("universal", true, other, %[time: 10]); }
                 catch (e) { noRule = e.message; }
+                // The provider lookup is exact and case-sensitive
+                // (`TransIntf.cpp:341-359`): a name no provider registered is
+                // the official message, and `Wave` is not `wave`.
+                var unknownName = "";
+                try { pair.beginTransition("nope", true, other, %[time: 10]); }
+                catch (e) { unknownName = e.message; }
+                var wrongCase = "";
+                try { pair.beginTransition("Wave", true, other, %[time: 10]); }
+                catch (e) { wrongCase = e.message; }
+                // A plugin-provided name has no provider while its plugin is
+                // not linked, which is the reference's miss as well.
+                var unlinkedPlugin = "";
+                try { pair.beginTransition("blurfade", true, other, %[time: 10]); }
+                catch (e) { unlinkedPlugin = e.message; }
+                var resolved = 0;
+                try { pair.beginTransition("wave", true, other, %[time: 10]); }
+                catch (e) { resolved = 1; }
                 return missing + "|" + notALayer + "|" + mismatch + "|" + imageless +
-                    "|" + noTime + "|" + noRule;
+                    "|" + noTime + "|" + noRule + "|" + unknownName + "|" + wrongCase +
+                    "|" + unlinkedPlugin + "|" + resolved;
                 "#,
             )
             .expect("script");
@@ -12085,10 +12241,161 @@ mod tests {
             Variant::String(
                 "Specify Layer class object|Specify Layer class object|Transition layer size mismatch 2x1 and 32x32|\
                  Transition source and destination must have image|Specify option time|\
-                 Specify option rule"
+                 Specify option rule|Cannot find transition handler nope|\
+                 Cannot find transition handler Wave|Cannot find transition handler blurfade|0"
                     .to_string()
             )
         );
+    }
+
+    /// The provider lookup of `Layer.beginTransition` consults the plugin host
+    /// (mission M54): a name a *linked* plugin shim would provide is not unknown
+    /// -- the shim has no kernel, so it degrades to `crossfade`
+    /// (`PLUGIN_TRANSITION_NAMES`) -- and an unlinked plugin leaves the name
+    /// unknown exactly as the reference does.
+    #[test]
+    fn native_layer_begin_transition_consults_linked_plugin_providers() {
+        struct ExtNaganoShim;
+
+        impl KrkrPlugin for ExtNaganoShim {
+            fn name(&self) -> &str {
+                "extNagano.dll"
+            }
+
+            fn register(&self, _runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let unlinked = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var dest = new Layer();
+                var source = new Layer();
+                var message = "";
+                try { dest.beginTransition("blurfade", true, source, %[time: 10]); }
+                catch (e) { message = e.message; }
+                return message;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            unlinked,
+            Variant::String("Cannot find transition handler blurfade".to_string())
+        );
+
+        engine
+            .register_plugin(ExtNaganoShim)
+            .expect("register plugin");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                global.source = new Layer();
+                dest.visible = true;
+                dest.beginTransition("blurfade", true, source, %[time: 10]);
+                "#,
+            )
+            .expect("script");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert_eq!(
+            frame.output.transitions.first().expect("transition").method,
+            "crossfade"
+        );
+    }
+
+    /// Mission M54: the script `time` option is the handler's own millisecond
+    /// clock (`TransitionParams::duration_millis`) and **every** provider clamps
+    /// it to the reference's 2 ms floor (`TRANSITION_MIN_MILLIS`), so the
+    /// kernels never receive a duration that makes their ramps divide by a zero
+    /// clock.  `bgcolor*` decode as `tjs_uint32` ARGB (top byte = alpha).
+    #[test]
+    fn native_layer_begin_transition_clamps_the_clock_and_decodes_argb_colors() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest = new Layer();
+                global.source = new Layer();
+                dest.visible = true;
+                dest.beginTransition("wave", true, source,
+                    %[time: 1, bgcolor1: 0x7f00ff00, bgcolor2: 0xff000000]);
+                "#,
+            )
+            .expect("script");
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        let transition = frame.output.transitions.first().expect("transition");
+        assert_eq!(transition.method, "wave");
+        // The requested 1 ms is raised to the reference's 2 ms clock, and that
+        // is the value the kernels read instead of the untimed fallback.
+        assert_eq!(transition.params.duration_millis, 2.0);
+        assert_eq!(
+            transition.params.bg_color1,
+            Color::new(0.0, 1.0, 0.0, 0x7f as f32 / 255.0)
+        );
+        assert_eq!(transition.params.bg_color2, Color::new(0.0, 0.0, 0.0, 1.0));
+        assert!(transition.progress.is_finite());
+
+        // The clamp is the clock the transition runs on: one millisecond in,
+        // half of the 2 ms clock has elapsed.
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 1.0), Vec::new()),
+                Duration::from_millis(1),
+            )
+            .expect("update");
+        let transition = frame.output.transitions.first().expect("transition");
+        assert_eq!(transition.progress, 0.5);
+        assert!(transition.progress.is_finite());
+        assert!(transition.params.duration_millis.is_finite());
+
+        // The second millisecond ends it; a 1 ms request never ran a 1 ms
+        // clock that could feed the kernels a zero-time ramp.
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 2.0), Vec::new()),
+                Duration::from_millis(1),
+            )
+            .expect("update");
+        assert!(frame.output.transitions.is_empty());
+
+        // An explicit `0` sits on the same floor: it is a 2 ms transition and
+        // no longer an instantaneous exchange (KAG's own layer maps a specified
+        // `0` to `1` before the provider raises it to 2, `KAGLayer.tjs:198-201`).
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.dest2 = new Layer();
+                global.source2 = new Layer();
+                dest2.visible = true;
+                dest2.beginTransition("wave", true, source2, %[time: 0]);
+                "#,
+            )
+            .expect("script");
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 3.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        let transition = frame.output.transitions.first().expect("transition");
+        assert_eq!(transition.params.duration_millis, 2.0);
     }
 
     #[test]
