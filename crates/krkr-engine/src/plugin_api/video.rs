@@ -14,7 +14,7 @@
 //! bytes are read through the project storage (XP3 members included) and
 //! handed over as [`VideoSource::Bytes`], the same flow `VideoOverlay` uses
 //! and the counterpart of the reference plugin copying the storage stream
-//! through `TVPCreateIStream` (`layerExMovie.cpp:152-190`).
+//! through `TVPCreateIStream` (`layerExMovie.cpp:142-167`).
 //!
 //! ```ignore
 //! use krkr_engine::plugin_api::video;
@@ -43,8 +43,8 @@
 //! **Errors.** [`VideoOpenError`] keeps the two failures apart — a movie the
 //! storage could not hand out ([`VideoOpenError::Storage`]) and a backend
 //! that refused the bytes it was given ([`VideoOpenError::Backend`]) — which
-//! is how `layerExMovie::openMovie` reports them (`:141-153` logs its own read
-//! failure and returns, `:191-235` returns when the filter graph fails), and
+//! is how `layerExMovie::openMovie` reports them (`:142-147` logs its own read
+//! failure and returns, `:180-184` returns when its stream fails to open), and
 //! it converts to [`TjsError`] for a plugin that throws instead of logging. No
 //! capability check stands in the way: a host whose backend cannot decode
 //! in-memory bytes reports [`VideoError::Unsupported`] from the factory
@@ -52,7 +52,8 @@
 //!
 //! Reference line numbers refer to the krkrz checkout at
 //! `/Users/ruri/repo/krkrz` (`last_hodgepodge_repository`, Shift-JIS sources
-//! converted with `iconv -f CP932`), verified on 2026-09-12.
+//! converted with `iconv -f CP932`), re-read one by one on 2026-09-12:
+//! `layerExMovie.cpp` is 421 lines, `main.cpp` 61.
 
 use std::{error::Error, fmt};
 
@@ -69,7 +70,7 @@ pub use krkr_video::{
 #[derive(Debug)]
 pub enum VideoOpenError {
     /// The project storage has no readable movie under this name — the
-    /// reference's `TVPCreateIStream` failure (`layerExMovie.cpp:148-153`).
+    /// reference's `TVPCreateIStream` failure (`layerExMovie.cpp:142-147`).
     Storage {
         /// The name the plugin asked for, as the script spelled it.
         name: String,
@@ -226,7 +227,7 @@ mod tests {
     }
 
     /// A name the storage cannot resolve is the reference's read failure
-    /// (`layerExMovie.cpp:148-153`), not a backend refusal.
+    /// (`layerExMovie.cpp:142-147`), not a backend refusal.
     #[test]
     fn a_missing_storage_reports_the_name_it_could_not_read() {
         let recorder = Arc::new(RecordingFactory::default());

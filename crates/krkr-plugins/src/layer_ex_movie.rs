@@ -6,29 +6,30 @@
 //! (`docs/plugins/layer-ex-family.md` §2.7). The reference attaches a class
 //! with a per-layer native instance to the global `Layer` class
 //! (`main.cpp:26-30`): `openMovie(filename, alpha)` copies the storage file to
-//! a temporary file and opens it through DirectShow
-//! (`layerExMovie.cpp:175-290`), then forces the video surface to 32bpp and
-//! pushes the movie size onto the layer's `imageWidth`/`imageHeight`/`type`
-//! (`:224-249`). `startMovie(loop)` runs the stream and fires
-//! `onStartMovie` (`:229-249`); frames are pulled from the engine's
+//! a temporary file (`:148-167`) and opens it through DirectShow
+//! (`:175-287`), then forces the video surface to 32bpp and pushes the movie
+//! size onto the layer's `imageWidth`/`imageHeight`/`type` (`:224-249`).
+//! `startMovie(loop)` runs the stream and fires `onStartMovie` (`:293-308`,
+//! the call at `:301-303`); frames are pulled from the engine's
 //! continuous-event callback (`:350-421`) and copied straight into the
 //! layer's bitmap (with `alpha=true` the movie is double-width: RGB in the
 //! left half, alpha in the right half's byte 0), then `onUpdateMovie` fires —
 //! deliberately without `redraw()`, the script calls `Layer.update()` itself
 //! (`:390`). `stopMovie()` stops the stream and fires `onStopMovie` when it
-//! was playing (`:256-267`); `isPlayingMovie()` reports the latch (`:269-272`).
+//! was playing (`:313-324`, the call at `:319-323`); `isPlayingMovie()`
+//! reports the latch (`:326-330`).
 //!
 //! # What replaces DirectShow
 //!
 //! [`krkr_engine::plugin_api::video`] replaces the DirectShow graph: the
 //! storage is read by `open_movie`, which hands the host's decoder factory the
 //! bytes as `VideoSource::Bytes` — the same flow `VideoOverlay` uses, and the
-//! counterpart of the reference's `TVPCreateIStream` copy (`:152-190`). The
+//! counterpart of the reference's `TVPCreateIStream` copy (`:142-167`). The
 //! per-frame callback becomes a `System.addContinuousHandler` handler this
 //! module allocates with `Runtime::alloc_native_function`: one handler per
 //! playing movie, the reference's one hook per instance
-//! (`TVPAddContinuousEventHook(this)`, `:274-288`). Decoder, latch and the
-//! pending frame live in a per-layer slot on the host
+//! (`TVPAddContinuousEventHook(this)`, `:332-338`, the call at `:336`).
+//! Decoder, latch and the pending frame live in a per-layer slot on the host
 //! (`KrkrHost::layer_extension*`), so invalidating the layer drops the movie
 //! with it — and the pump retires its own handler when it finds no session.
 //!
@@ -36,9 +37,10 @@
 //! the pump here paces against the tick the callback is handed: a frame is
 //! copied when its `pts_ms` has passed the timeline `startMovie` anchored, so
 //! playback follows the movie's own timeline rather than the engine's frame
-//! rate. The end of a stream either rewinds (the loop's `Seek(0)`, `:406-413`)
-//! or stops the movie and fires `onStopMovie` (`:415-416`), and a decode
-//! failure stops it the way the reference's error path does (`:419-421`).
+//! rate. The end of a stream either rewinds (the loop's `Seek(0)`, `:402`,
+//! branch `:400-409`) or stops the movie and fires `onStopMovie` (`:411`), and
+//! a decode failure stops it the way the reference's error path does
+//! (`:415-417`).
 //!
 //! # Mapped, with the reason
 //!
@@ -51,9 +53,10 @@
 //!   frames carry their alpha, which the copy keeps.
 //! * **The frame copy is clamped to both bitmaps.** The reference reads
 //!   `_width` pixels per row from a surface that is only `movieWidth` wide
-//!   (`:364-377`) and can therefore run past its own surface once the script
-//!   has enlarged the layer; here the copy stops at the smaller of the layer's
-//!   bitmap and the decoded frame.
+//!   (`:370` sets `w = movieWidth * 4`, the x loop at `:375` runs to `_width`)
+//!   and can therefore run past its own surface once the script has enlarged
+//!   the layer; here the copy stops at the smaller of the layer's bitmap and
+//!   the decoded frame.
 //! * **The layer is repainted after each frame** (`layer_update`), where the
 //!   reference leaves `redraw()` commented out (`:390`) and expects the script
 //!   to call `update()` from `onUpdateMovie` (`manual.tjs` §注意点). That is
@@ -73,7 +76,8 @@
 //!
 //! Reference line numbers refer to the krkrz checkout at
 //! `/Users/ruri/repo/krkrz` (`last_hodgepodge_repository`, Shift-JIS sources
-//! converted with `iconv -f CP932`), verified on 2026-09-12.
+//! converted with `iconv -f CP932`), re-read one by one on 2026-09-12:
+//! `layerExMovie.cpp` is 421 lines, `main.cpp` 61.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -94,7 +98,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "Layer.openMovie/startMovie/stopMovie/isPlayingMovie (movie drawn into a layer image)",
-    notes: "A port of layerExMovie (layerExMovie.cpp:127-421, main.cpp:26-30) over plugin_api::video and the engine's own per-frame callback: openMovie reads the storage through the host's decoder factory (VideoSource::Bytes, what VideoOverlay does) and pushes the decoded size through Layer.setImageSize; startMovie registers a System.addContinuousHandler pump and fires onStartMovie; each tick copies the next due frame into the layer bitmap (alpha movies: RGB from the left half, alpha from the right half's byte 0, :364-377) and fires onUpdateMovie; stopMovie removes the pump, drops the decoder and fires onStopMovie only when it was playing — a real latch, so a second stop is a no-op and a stopped movie needs a new openMovie. The end of a stream rewinds a looping movie (Seek(0), :406-413) and stops a non-looping one (:415-416); a decode failure stops it too. Per-layer sessions live in a KrkrHost layer extension, so invalidating the layer drops its decoder. Not reproduced: the ltOpaque/ltAlpha push (:249), because a plugin cannot write a layer's native type property; and the frame copy is clamped to both bitmaps where the reference's alpha branch reads past its own surface once the layer was resized. The layer is repainted after each frame (layer_update) where the reference leaves redraw() commented out.",
+    notes: "A port of layerExMovie (layerExMovie.cpp openMovie :127-288, startMovie :293-308, stopMovie :313-324, isPlayingMovie :326-330, start/stop :332-348, OnContinuousCallback :350-421; main.cpp:26-30) over plugin_api::video and the engine's own per-frame callback: openMovie reads the storage through the host's decoder factory (VideoSource::Bytes, what VideoOverlay does) and pushes the decoded size through Layer.setImageSize (:247-248); startMovie registers a System.addContinuousHandler pump and fires onStartMovie (:301-303); each tick copies the next due frame into the layer bitmap (alpha movies: RGB from the left half, alpha from the right half's byte 0, :369-381, the copy at :376-379) and fires onUpdateMovie (:391-393); stopMovie removes the pump, drops the decoder and fires onStopMovie only when it was playing (:319-323) — a real latch, so a second stop is a no-op and a stopped movie needs a new openMovie. The end of a stream rewinds a looping movie (Seek(0), :402) and stops a non-looping one (:411); a decode failure stops it too (:416). Per-layer sessions live in a KrkrHost layer extension, so invalidating the layer drops its decoder. Not reproduced: the ltOpaque/ltAlpha push (:249), because a plugin cannot write a layer's native type property; and the frame copy is clamped to both bitmaps where the reference's alpha branch reads past its own surface once the layer was resized. The layer is repainted after each frame (layer_update) where the reference leaves redraw() commented out (:390).",
     install: |engine| engine.register_plugin(LayerExMoviePlugin),
 };
 
@@ -153,11 +157,11 @@ impl KrkrPlugin for LayerExMoviePlugin {
 struct MovieSession {
     decoder: Box<dyn VideoPort>,
     /// `openMovie`'s second argument: the frame is double-width and carries
-    /// its alpha in the right half (`:364-377`).
+    /// its alpha in the right half (`:369-381`).
     alpha: bool,
-    /// `startMovie`'s argument: rewind at the end of the stream (`:406-413`).
+    /// `startMovie`'s argument: rewind at the end of the stream (`:400-409`).
     looping: bool,
-    /// The latch `isPlayingMovie` reports (`:269-272`).
+    /// The latch `isPlayingMovie` reports (`:326-330`).
     playing: bool,
     /// The tick the current timeline started at — the first pump tick after
     /// `startMovie`, or the tick a loop rewound on. Anchoring on a pump tick
@@ -171,7 +175,8 @@ struct MovieSession {
     /// advances no time instead of rewinding the timeline.
     last_tick: i64,
     /// The handler `startMovie` registered, so `stopMovie` can remove it
-    /// (`TVPAddContinuousEventHook`/`TVPRemoveContinuousEventHook`, `:274-288`).
+    /// (`TVPAddContinuousEventHook`/`TVPRemoveContinuousEventHook`, `:336` and
+    /// `:346`).
     handler: Option<Variant>,
 }
 
@@ -194,7 +199,8 @@ enum TickAction {
     /// Copy this frame into the layer and fire `onUpdateMovie`.
     Frame(VideoFrame),
     /// End of stream (`None`) or a decode failure (`Some`, the reason): stop
-    /// the movie the way the reference's callback does (`:408-421`).
+    /// the movie the way the reference's callback does (`:411` for the end of
+    /// a non-looping stream, `:416` for the error path).
     Stop(Option<String>),
 }
 
@@ -230,8 +236,9 @@ impl MovieSession {
                     Ok(Some(frame)) => self.pending = Some(frame),
                     Ok(None) if self.looping && !rewound => {
                         // `MS_S_ENDOFSTREAM` with `loop`: `pAMStream->Seek(0)`
-                        // (`:406-413`). A backend that cannot rewind ends the
-                        // movie the way a decode failure does.
+                        // (`:402`, in the loop branch `:400-409`). A backend
+                        // that cannot rewind ends the movie the way a decode
+                        // failure does.
                         rewound = true;
                         if let Err(error) = self.decoder.seek_ms(0) {
                             return TickAction::Stop(Some(format!(
@@ -260,13 +267,13 @@ impl MovieSession {
     }
 }
 
-/// `layerExMovie::openMovie` (`layerExMovie.cpp:127-292`).
+/// `layerExMovie::openMovie` (`layerExMovie.cpp:127-288`).
 ///
 /// The reference's temporary-file copy and DirectShow open become
 /// [`open_movie`]; what it does to the layer is the same: on a failure it logs
 /// `<filename>:ファイルが開けません` and returns with the layer untouched
-/// (`:148-153`), on success it sizes the layer's image to the movie
-/// (`:243-247`) and leaves playback to `startMovie`.
+/// (`:142-147`, the log at `:145`), on success it sizes the layer's image to
+/// the movie (`:247-248`) and leaves playback to `startMovie`.
 fn layer_open_movie(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -275,7 +282,7 @@ fn layer_open_movie(
     let layer = this_layer(this_obj)?;
     let filename = args.first().cloned().unwrap_or_default().to_tjs_string()?;
     let alpha = args.get(1).is_some_and(Variant::is_truthy);
-    // `clearMovie()` runs first (`:127`): an open replaces whatever was open,
+    // `clearMovie()` runs first (`:129`): an open replaces whatever was open,
     // and a playing movie stops here — the reference's `clearMovie` fires no
     // event, only `stopMovie` does.
     stop_session(runtime, layer)?;
@@ -289,8 +296,8 @@ fn layer_open_movie(
         }
     };
     let metadata = decoder.metadata().clone();
-    // `_pWidth`/`_pHeight` (`:243-247`): the layer's image takes the movie's
-    // size, half the frame's width in the double-width alpha form (`:245-246`).
+    // `_pWidth`/`_pHeight` (`:247-248`): the layer's image takes the movie's
+    // size, half the frame's width in the double-width alpha form (`:243-245`).
     let width = i64::from(if alpha {
         metadata.width / 2
     } else {
@@ -313,7 +320,7 @@ fn layer_open_movie(
 
 /// `layerExMovie::startMovie` (`layerExMovie.cpp:293-308`).
 ///
-/// `if (pSample)` (`:231`): with no movie open there is nothing to start, and
+/// `if (pSample)` (`:296`): with no movie open there is nothing to start, and
 /// the reference says nothing — the path a failed `openMovie` or a
 /// `stopMovie` that released the stream leaves behind.
 fn layer_start_movie(
@@ -326,10 +333,11 @@ fn layer_start_movie(
     let Some(slot) = runtime.host().layer_extension::<MovieSlot>(layer) else {
         return Ok(Variant::Void);
     };
-    // `start()` (`:274-280`) is `stop()` then `TVPAddContinuousEventHook(this)`;
-    // the hook object is the same either way, so a movie that is already
-    // playing only re-arms its flags — and fires `onStartMovie` again, as the
-    // reference's unconditional call at `:235` does.
+    // `start()` (`:332-338`) is `stop()` then
+    // `TVPAddContinuousEventHook(this)` (`:336`); the hook object is the same
+    // either way, so a movie that is already playing only re-arms its flags —
+    // and fires `onStartMovie` again, as the reference's unconditional call at
+    // `:301-303` does.
     let pumping = lock(&slot).handler.is_some();
     let handler = if pumping {
         None
@@ -355,8 +363,8 @@ fn layer_stop_movie(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
-    // `bool p = playing; stop(); clearMovie();` (`:256-259`): the hook and the
-    // stream go either way, the event only when it was playing.
+    // `bool p = playing; stop(); clearMovie();` (`:316-318`): the hook and the
+    // stream go either way, the event only when it was playing (`:319-323`).
     if stop_session(runtime, layer)? {
         fire_hook(runtime, layer, "onStopMovie", Vec::new())?;
     }
@@ -404,8 +412,8 @@ fn pump_movie(
     match action {
         TickAction::Idle => {}
         TickAction::Frame(frame) => {
-            // `if (_buffer != NULL)` (`:355-390`): a layer without a bitmap
-            // gets neither the copy nor the event.
+            // `if (_buffer != NULL)` (`:365`, the guarded block `:365-394`): a
+            // layer without a bitmap gets neither the copy nor the event.
             if copy_frame_into_layer(runtime, layer, &frame, alpha)? {
                 fire_hook(runtime, layer, "onUpdateMovie", Vec::new())?;
             }
@@ -416,7 +424,8 @@ fn pump_movie(
                     .host_mut()
                     .log(&format!("layerExMovie.dll: {reason}"));
             }
-            // The reference's own `stopMovie()` from the callback (`:415-421`),
+            // The reference's own `stopMovie()` from the callback (`:411` for
+            // the end of a non-looping stream, `:416` for the error path),
             // which is where a finished or broken stream fires its event.
             if stop_session(runtime, layer)? {
                 fire_hook(runtime, layer, "onStopMovie", Vec::new())?;
@@ -427,8 +436,9 @@ fn pump_movie(
 }
 
 /// Registers the per-frame pump — `start()`'s `TVPAddContinuousEventHook(this)`
-/// (`:274-280`). The handler is the object `System.removeContinuousHandler`
-/// later has to match by identity, so the pump keeps a handle on itself.
+/// (`:332-338`, the call at `:336`). The handler is the object
+/// `System.removeContinuousHandler` later has to match by identity, so the pump
+/// keeps a handle on itself.
 fn start_pump(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<Variant> {
     let self_cell: HandlerCell = Arc::new(Mutex::new(None));
     let cell = Arc::clone(&self_cell);
@@ -449,11 +459,11 @@ fn start_pump(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<Va
     Ok(handler)
 }
 
-/// `stop()` + `clearMovie()` (`:283-292`): remove the continuous handler, drop
-/// the decoder, forget the session.
+/// `stop()` + `clearMovie()` (`:343-348` and `:74-119`): remove the continuous
+/// handler, drop the decoder, forget the session.
 ///
 /// Returns the `playing` latch, which is what decides whether `onStopMovie`
-/// fires (`bool p = playing;`, `:256`) — and `false` when no movie was open,
+/// fires (`bool p = playing;`, `:316`) — and `false` when no movie was open,
 /// where the reference's `stop()`/`clearMovie()` are no-ops too.
 fn stop_session(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<bool> {
     let Some(slot) = runtime
@@ -472,7 +482,7 @@ fn stop_session(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<
     Ok(playing)
 }
 
-/// `TVPAddContinuousEventHook(this)` (`:277`): the plugin registers the same
+/// `TVPAddContinuousEventHook(this)` (`:336`): the plugin registers the same
 /// per-frame callback a script gets from `System.addContinuousHandler`.
 fn add_continuous_handler(runtime: &mut Runtime<KrkrHost>, handler: &Variant) -> Result<()> {
     let Variant::Object(system) = runtime.global_member("System") else {
@@ -484,7 +494,7 @@ fn add_continuous_handler(runtime: &mut Runtime<KrkrHost>, handler: &Variant) ->
     Ok(())
 }
 
-/// `TVPRemoveContinuousEventHook(this)` (`:285`): the scheduler matches the
+/// `TVPRemoveContinuousEventHook(this)` (`:346`): the scheduler matches the
 /// handler by identity, and removing one that is no longer registered is the
 /// no-op the reference's removal is.
 fn remove_continuous_handler(runtime: &mut Runtime<KrkrHost>, handler: &Variant) -> Result<()> {
@@ -499,7 +509,7 @@ fn remove_continuous_handler(runtime: &mut Runtime<KrkrHost>, handler: &Variant)
 /// whether a frame landed.
 ///
 /// A layer whose image the script freed is the reference's `_buffer == NULL`
-/// (`:356`): the frame is skipped, and no event fires.
+/// (`:365`): the frame is skipped, and no event fires.
 fn copy_frame_into_layer(
     runtime: &mut Runtime<KrkrHost>,
     layer: ObjectHandle,
@@ -517,10 +527,11 @@ fn copy_frame_into_layer(
 ///
 /// The alpha form takes RGB from the left half and the alpha from the right
 /// half's byte 0 — the reference's three `*dst++ = *src1++` followed by
-/// `*dst++ = *src2` (`:369-372`), read against the frame this engine decodes,
-/// whose byte order is R, G, B, A. Both forms stop at the smaller of the two
-/// bitmaps, where the reference's alpha branch would read past its own surface
-/// (`:370`, note `w = movieWidth * 4` but the loop bounded by `_width`).
+/// `*dst++ = *src2` (`:376-379`, in the alpha branch `:369-381`), read against
+/// the frame this engine decodes, whose byte order is R, G, B, A. Both forms
+/// stop at the smaller of the two bitmaps, where the reference's alpha branch
+/// would read past its own surface (`:370` sets `w = movieWidth * 4`, the x
+/// loop at `:375` runs to `_width`).
 fn copy_frame(view: &mut LayerBitmapViewMut<'_>, frame: &VideoFrame, alpha: bool) {
     let pitch = view.bitmap.pitch as usize;
     let stride = frame.stride as usize;
@@ -560,9 +571,10 @@ fn copy_frame(view: &mut LayerBitmapViewMut<'_>, frame: &VideoFrame, alpha: bool
 }
 
 /// Fires one of the layer's three movie events the way the reference's
-/// `FuncCall(0, NULL, NULL, NULL, 0, NULL, _obj)` does (`:235`, `:392`,
-/// `:263`): the layer is `this`, a member that is absent or not callable is
-/// ignored, and an exception inside the handler propagates.
+/// `FuncCall(0, NULL, NULL, NULL, 0, NULL, _obj)` does (`:301-303` for
+/// `onStartMovie`, `:391-393` for `onUpdateMovie`, `:319-323` for
+/// `onStopMovie`): the layer is `this`, a member that is absent or not callable
+/// is ignored, and an exception inside the handler propagates.
 fn fire_hook(
     runtime: &mut Runtime<KrkrHost>,
     layer: ObjectHandle,
@@ -650,7 +662,7 @@ mod tests {
         }
 
         fn seek_ms(&mut self, ms: i64) -> std::result::Result<(), VideoError> {
-            assert_eq!(ms, 0, "a loop rewinds to the start (`:408`)");
+            assert_eq!(ms, 0, "a loop rewinds to the start (`:402`)");
             self.next = 0;
             Ok(())
         }
@@ -833,7 +845,7 @@ mod tests {
         run(&mut engine, HOOKED_LAYER);
         run(&mut engine, r#"hooked.openMovie("movie.mp4", false);"#);
 
-        // `openMovie` pushes the decoded size (`:243-247`) and reads the
+        // `openMovie` pushes the decoded size (`:247-248`) and reads the
         // storage through the host's factory; nothing plays yet.
         assert_eq!(integer(&mut engine, "hooked.imageWidth"), 2);
         assert_eq!(integer(&mut engine, "hooked.imageHeight"), 1);
@@ -907,7 +919,7 @@ mod tests {
         );
     }
 
-    /// `alpha=true` is the double-width form (`:364-377`): RGB from the left
+    /// `alpha=true` is the double-width form (`:369-381`): RGB from the left
     /// half, the alpha from the right half's byte 0.
     #[test]
     fn an_alpha_movie_takes_its_alpha_from_the_right_halfs_byte_zero() {
@@ -924,7 +936,7 @@ mod tests {
         assert_eq!(
             integer(&mut engine, "hooked.imageWidth"),
             2,
-            "the layer is the drawn half of a double-width frame (`:245-246`)"
+            "the layer is the drawn half of a double-width frame (`:243-245`)"
         );
         assert_eq!(integer(&mut engine, "hooked.imageHeight"), 1);
 
@@ -936,7 +948,7 @@ mod tests {
     }
 
     /// The end of a non-looping stream stops the movie and fires
-    /// `onStopMovie` (`:415-416`).
+    /// `onStopMovie` (`:411`).
     #[test]
     fn the_end_of_a_non_looping_stream_stops_the_movie() {
         let factory = Arc::new(FakeVideoFactory::new(vec![frame(1, 1, 0, &[1, 2, 3, 255])]));
@@ -959,7 +971,7 @@ mod tests {
         assert_eq!(integer(&mut engine, "global.stopped"), 1, "only once");
     }
 
-    /// A looping movie rewinds at the end of the stream (`Seek(0)`, `:408`)
+    /// A looping movie rewinds at the end of the stream (`Seek(0)`, `:402`)
     /// and keeps playing.
     #[test]
     fn a_looping_movie_rewinds_at_the_end_of_the_stream() {
@@ -1039,7 +1051,7 @@ mod tests {
     }
 
     /// A movie that cannot open reports and leaves the layer alone: the
-    /// storage's own failure (`:148-153`) and the backend's (`:191-235`).
+    /// storage's own failure (`:142-147`) and the backend's (`:180-184`).
     #[test]
     fn a_movie_that_cannot_open_reports_and_leaves_the_layer_alone() {
         // The storage has no such file.
@@ -1062,7 +1074,7 @@ mod tests {
                 integer(&mut missing, "hooked.imageHeight"),
             ),
             size,
-            "the size push (`:243-247`) only happens for a movie that opened"
+            "the size push (`:247-248`) only happens for a movie that opened"
         );
         run(&mut missing, "hooked.startMovie(true);");
         assert_eq!(integer(&mut missing, "global.started"), 0);
@@ -1090,7 +1102,7 @@ mod tests {
         assert_eq!(handlers(&refused), 0);
     }
 
-    /// Opening another movie replaces the playing one (`clearMovie()`, `:127`)
+    /// Opening another movie replaces the playing one (`clearMovie()`, `:129`)
     /// without an event, and playback needs a new `startMovie`.
     #[test]
     fn opening_another_movie_replaces_the_playing_one() {
@@ -1162,7 +1174,7 @@ mod tests {
                 pixel(&mut engine, "hooked", 3, 1)
             ),
             outside,
-            "the copy stops at the decoded frame (`:359-390` clamps it here)"
+            "the copy stops at the decoded frame (`:383` clamps it here)"
         );
     }
 
