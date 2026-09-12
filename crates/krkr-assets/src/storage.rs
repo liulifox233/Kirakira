@@ -18,6 +18,8 @@ use krkr_tjs2::{Result, TjsError};
 use krkr_xp3::Xp3ResourceProvider;
 use memmap2::{Mmap, MmapOptions};
 
+use crate::media::{FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name};
+
 const RAW_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const RAW_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 const EXTERNAL_MEMORY_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
@@ -56,6 +58,11 @@ struct ProjectStorageInner {
     /// native filesystem-backed views never use it.
     memory_writes: Mutex<BTreeMap<String, Arc<[u8]>>>,
     auto_paths: RwLock<Vec<String>>,
+    /// Registered storage media (`TVPRegisterStorageMedia`), keyed by the
+    /// lowercased media name so `psb://` and `PSB://` reach the same provider.
+    /// A `RwLock` because plugins register while the engine serves reads from
+    /// several threads.
+    media_providers: RwLock<BTreeMap<String, Arc<dyn StorageMediaProvider>>>,
     revision: AtomicU64,
     /// Bumped only by changes to the name-to-file layout (search path,
     /// archive set, catalogue). Plain storage writes move `revision` so the
@@ -77,7 +84,7 @@ pub struct StorageData {
     pub encoding_hint: Option<&'static Encoding>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum LocatedResource {
     Fs {
         storage_name: String,
@@ -92,6 +99,16 @@ enum LocatedResource {
         archive: Option<String>,
         entry_name: String,
         byte_len: u64,
+    },
+    /// A name served by a registered storage media provider. The bytes are
+    /// never cached by this resolver: a media may be live (Steam cloud, a
+    /// script-owned dictionary) and owns its own caching, the way `psb`'s
+    /// document cache does.
+    Media {
+        storage_name: String,
+        provider: Arc<dyn StorageMediaProvider>,
+        media_path: String,
+        encoding_hint: Option<&'static Encoding>,
     },
     Memory {
         storage_name: String,
@@ -295,6 +312,7 @@ impl ProjectStorage {
                 catalog_paths: RwLock::new(catalog_paths),
                 memory_writes: Mutex::new(BTreeMap::new()),
                 auto_paths: RwLock::new(auto_paths),
+                media_providers: RwLock::new(BTreeMap::new()),
                 revision: AtomicU64::new(1),
                 graphic_revision: AtomicU64::new(1),
             }),
@@ -559,6 +577,124 @@ impl ProjectStorage {
         Ok(())
     }
 
+    /// Registers a storage media provider — the engine-side equivalent of
+    /// `TVPRegisterStorageMedia` (`krkrz/src/core/base/StorageIntf.cpp:530`).
+    ///
+    /// The media name must be ASCII letters, because that is the only media
+    /// spelling the reference can parse out of a storage name
+    /// (`StorageIntf.cpp:299-318`), and `file` is reserved for the built-in
+    /// filesystem resolver the reference always has registered
+    /// (`StorageIntf.cpp:200-205`). Both cases fail the way a second
+    /// registration of the same media does in the reference
+    /// (`TVPMediaNameHadAlreadyBeenRegistered`, `StorageIntf.cpp:224-236`).
+    ///
+    /// Registration never rewrites names: a scheme that is not registered keeps
+    /// resolving through the built-in stack exactly as it did before any media
+    /// existed. Once registered, the provider is consulted *before* the
+    /// filesystem layers, XP3, the memory overlay and the catalogue — the
+    /// order `TVPGetPlacedPath` uses (`StorageIntf.cpp:1153-1197`).
+    pub fn register_media(&self, provider: Arc<dyn StorageMediaProvider>) -> io::Result<()> {
+        let name = provider.media_name().to_ascii_lowercase();
+        if !is_valid_media_name(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid storage media name `{}`", provider.media_name()),
+            ));
+        }
+        if name == FILE_MEDIA_NAME {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("storage media `{name}` is already registered"),
+            ));
+        }
+        let Ok(mut providers) = self.inner.media_providers.write() else {
+            return Err(io::Error::other("storage media registry is poisoned"));
+        };
+        if providers.contains_key(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("storage media `{name}` is already registered"),
+            ));
+        }
+        providers.insert(name, provider);
+        drop(providers);
+        // A newly registered media can satisfy names that previously missed,
+        // so the negative lookup entries have to go.
+        self.invalidate_caches();
+        Ok(())
+    }
+
+    /// Unregisters a storage media provider
+    /// (`TVPUnregisterStorageMedia`, `StorageIntf.cpp:535`). Returns whether a
+    /// provider was registered under `media_name`.
+    pub fn unregister_media(&self, media_name: &str) -> bool {
+        let name = media_name.to_ascii_lowercase();
+        let removed = self
+            .inner
+            .media_providers
+            .write()
+            .map(|mut providers| providers.remove(&name).is_some())
+            .unwrap_or(false);
+        if removed {
+            self.invalidate_caches();
+        }
+        removed
+    }
+
+    /// Names of the registered media, sorted. The built-in filesystem resolver
+    /// is the implicit `file` media and is not listed.
+    pub fn media_names(&self) -> Vec<String> {
+        self.inner
+            .media_providers
+            .read()
+            .map(|providers| providers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn media_provider(&self, media_name: &str) -> Option<Arc<dyn StorageMediaProvider>> {
+        let name = media_name.to_ascii_lowercase();
+        self.inner
+            .media_providers
+            .read()
+            .ok()?
+            .get(&name)
+            .map(Arc::clone)
+    }
+
+    /// Resolves a media-qualified name against the registered providers.
+    ///
+    /// `None` means "no media serves this name" — either the scheme is not
+    /// registered, the provider's existence probe said no, or the name belongs
+    /// to the in-archive branch. The caller then falls back to the built-in
+    /// stack, which is the reference's auto-path step plus our filesystem,
+    /// XP3, memory and catalogue layers.
+    fn media_location(&self, name: &str) -> Option<LocatedResource> {
+        // `TVPIsExistentStorageNoSearchNoNormalize` splits an in-archive name
+        // at `>` before any media dispatch (`StorageIntf.cpp:804-827`), so the
+        // media never sees an archive member. Our in-archive branch resolves
+        // through the mounted XP3 providers; a media-hosted archive container
+        // needs the archive-opener hook the follow-up work adds.
+        if name.contains('>') {
+            return None;
+        }
+        // The reference unifies path delimiters before it splits the media off
+        // (`StorageIntf.cpp:271-277`).
+        let normalized = normalize_storage_separators(name);
+        let (media_name, media_path) = split_media_name(&normalized)?;
+        let provider = self.media_provider(media_name)?;
+        if !provider.exists(media_path) {
+            return None;
+        }
+        Some(LocatedResource::Media {
+            storage_name: format!("{}://{media_path}", media_name.to_ascii_lowercase()),
+            provider,
+            media_path: media_path.to_string(),
+            // Text decoding uses the same layer-name heuristic the built-in
+            // stack applies (`lzfs://./data/x.tjs` decodes like `data/x.tjs`).
+            encoding_hint: infer_encoding_from_path(Path::new(media_path)),
+        })
+    }
+
     pub fn storage_exists(&self, name: &str) -> bool {
         self.resolve_storage(name).is_ok()
     }
@@ -568,6 +704,12 @@ impl ProjectStorage {
     /// name (plus configured auto paths); probing `title.ks` for `title`
     /// would make UILoader mistake a scenario for its companion `title.ini`.
     pub fn storage_exists_exact(&self, name: &str) -> bool {
+        // The media probe happens on the name as given, before the auto-path
+        // candidates, exactly like `TVPGetPlacedPath` checks existence first
+        // (`StorageIntf.cpp:1169-1177`).
+        if self.media_location(name).is_some() {
+            return true;
+        }
         // KRKR scripts commonly construct an archive path from
         // `System.arcPath` before adding it as an auto path.  Preserve that
         // absolute-file probe instead of rejecting it while building logical
@@ -670,9 +812,8 @@ impl ProjectStorage {
         let Ok(catalog) = self.inner.catalog_paths.read() else {
             return None;
         };
-        let lookup = |candidate: &str| {
-            catalog_path(candidate).and_then(|key| catalog.get(&key).cloned())
-        };
+        let lookup =
+            |candidate: &str| catalog_path(candidate).and_then(|key| catalog.get(&key).cloned());
         if let Ok(candidates) = self.storage_candidates(&normalized) {
             for candidate in &candidates {
                 if split_archive_candidate(candidate).is_some() {
@@ -700,15 +841,54 @@ impl ProjectStorage {
     }
 
     /// Returns whether a logical directory exists in the filesystem, XP3
-    /// provider, or deferred publication catalogue.
+    /// provider, registered storage media, or deferred publication catalogue.
     pub fn is_directory(&self, name: &str) -> bool {
         self.list_directory(name).is_ok()
+    }
+
+    /// Lists a media-owned directory through its provider.
+    ///
+    /// `None` means the name is not media-qualified, no media is registered for
+    /// its scheme, or the provider reports that it does not serve a directory
+    /// here (`NotFound`/`Unsupported`) — the caller then keeps resolving
+    /// through the built-in stack. Any other provider error is returned as-is:
+    /// `GetListAt` sits behind the same call as `Open` in the reference, so a
+    /// broken media must not look like a missing directory.
+    ///
+    /// The provider's own order is preserved; it owns its namespace, the way
+    /// `steam`'s listing is a `std::set` and `psb`'s follows the document.
+    fn media_listing(&self, name: &str) -> io::Result<Option<Vec<String>>> {
+        if name.contains('>') {
+            return Ok(None);
+        }
+        let normalized = normalize_storage_separators(name);
+        let Some((media_name, media_path)) = split_media_name(&normalized) else {
+            return Ok(None);
+        };
+        let Some(provider) = self.media_provider(media_name) else {
+            return Ok(None);
+        };
+        match provider.list(media_path) {
+            Ok(children) => Ok(Some(children)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Lists immediate children using KRKR/fstat semantics: directory names
     /// have a trailing `/`, files do not. The result is sorted and de-duped
     /// case-insensitively across filesystem, XP3 and manifest layers.
     pub fn list_directory(&self, name: &str) -> io::Result<Vec<String>> {
+        if let Some(children) = self.media_listing(name)? {
+            return Ok(children);
+        }
         let (relative, absolute) = self.directory_paths(name)?;
         let prefix = if relative.is_empty() {
             String::new()
@@ -876,14 +1056,20 @@ impl ProjectStorage {
     pub fn placed_path(&self, name: &str) -> Option<PathBuf> {
         match self.resolve_storage(name).ok()? {
             LocatedResource::Fs { path, .. } => Some(path),
-            LocatedResource::Xp3 { .. } | LocatedResource::Memory { .. } => None,
+            // Media providers report no locally accessible name in the
+            // reference either (`GetLocallyAccessibleName` is `""` for
+            // psb/lzfs/proxy/steam/zip/var).
+            LocatedResource::Xp3 { .. }
+            | LocatedResource::Media { .. }
+            | LocatedResource::Memory { .. } => None,
         }
     }
 
     /// Returns the normalized logical storage name selected by the resolver.
-    /// Unlike [`Self::placed_path`], this also works for XP3 and memory-backed
-    /// resources, matching KRKR's `TVPGetPlacedPath` contract (which returns a
-    /// logical `archive.xp3>entry` name rather than an OS path for archives).
+    /// Unlike [`Self::placed_path`], this also works for XP3, media and
+    /// memory-backed resources, matching KRKR's `TVPGetPlacedPath` contract
+    /// (which returns a logical `archive.xp3>entry` name rather than an OS path
+    /// for archives, and the `media://domain/path` spelling for a media).
     pub fn resolved_storage_name(&self, name: &str) -> Option<String> {
         Some(self.resolve_storage(name).ok()?.storage_name().to_string())
     }
@@ -1006,6 +1192,11 @@ impl ProjectStorage {
                     None => provider.open(&entry_name),
                 }
             }
+            LocatedResource::Media {
+                provider,
+                media_path,
+                ..
+            } => provider.open(&media_path),
             LocatedResource::Memory {
                 source_path, data, ..
             } => {
@@ -1017,8 +1208,19 @@ impl ProjectStorage {
     }
 
     pub fn storage_byte_len(&self, name: &str) -> io::Result<Option<u64>> {
-        self.resolve_storage_io(name)
-            .map(|located| Some(located.byte_len()))
+        match self.resolve_storage_io(name)? {
+            LocatedResource::Fs { byte_len, .. } | LocatedResource::Xp3 { byte_len, .. } => {
+                Ok(Some(byte_len))
+            }
+            LocatedResource::Memory { data, .. } => Ok(Some(data.len() as u64)),
+            // A media decides its own length and may not know it without
+            // opening the entry.
+            LocatedResource::Media {
+                provider,
+                media_path,
+                ..
+            } => provider.byte_len(&media_path),
+        }
     }
 
     pub(crate) fn storage_candidates(&self, name: &str) -> Result<Vec<String>> {
@@ -1030,6 +1232,21 @@ impl ProjectStorage {
     }
 
     fn resolve_storage_io(&self, name: &str) -> io::Result<LocatedResource> {
+        // A media is live storage, so a miss must not be remembered the way a
+        // filesystem miss is: a Steam cloud file can appear, and a script
+        // re-probing `steam://` has to see it.
+        let media_qualified = media_qualified_name(name);
+
+        // A registered storage media is consulted before everything else, the
+        // way `TVPIsExistentStorageNoSearchNoNormalize` dispatches on the media
+        // name before the file media ever sees it (`StorageIntf.cpp:799-830`).
+        // An unregistered scheme simply falls through to the built-in stack,
+        // which is what names like `psb://` did before media registration
+        // existed.
+        if let Some(storage) = self.media_location(name) {
+            return Ok(storage);
+        }
+
         if let Some(storage) = self.find_absolute_storage(name)? {
             return Ok(storage);
         }
@@ -1190,7 +1407,9 @@ impl ProjectStorage {
             }
         }
 
-        self.cache_lookup(name, None);
+        if !media_qualified {
+            self.cache_lookup(name, None);
+        }
         Err(storage_not_found(name))
     }
 
@@ -1368,12 +1587,17 @@ impl ProjectStorage {
     }
 
     fn load_located_data(&self, located: &LocatedResource) -> io::Result<ResourceData> {
-        let key = RawCacheKey {
+        // A media is live storage (Steam cloud, a container mounted by a
+        // plugin, a value the script owns) and caches on its own terms — the
+        // `psb` document cache is the reference example. `cache_source` answers
+        // `None` for one, so this resolver never remembers its bytes.
+        let key = located.cache_source().map(|source| RawCacheKey {
             revision: self.revision(),
-            source: located.cache_source(),
-        };
-        if let Ok(mut cache) = self.inner.raw_cache.lock()
-            && let Some(data) = cache.get(&key)
+            source,
+        });
+        if let Some(key) = &key
+            && let Ok(mut cache) = self.inner.raw_cache.lock()
+            && let Some(data) = cache.get(key)
         {
             return Ok(data);
         }
@@ -1396,10 +1620,17 @@ impl ProjectStorage {
                 stream.read_to_end(&mut bytes)?;
                 ResourceData::from_vec(bytes)
             }
+            LocatedResource::Media {
+                provider,
+                media_path,
+                ..
+            } => provider.read(media_path)?,
             LocatedResource::Memory { data, .. } => ResourceData::from_vec(data.to_vec()),
         };
 
-        if let Ok(mut cache) = self.inner.raw_cache.lock() {
+        if let Some(key) = key
+            && let Ok(mut cache) = self.inner.raw_cache.lock()
+        {
             cache.insert(key, data.clone());
         }
         Ok(data)
@@ -1600,6 +1831,7 @@ impl LocatedResource {
         match self {
             Self::Fs { storage_name, .. }
             | Self::Xp3 { storage_name, .. }
+            | Self::Media { storage_name, .. }
             | Self::Memory { storage_name, .. } => storage_name,
         }
     }
@@ -1608,19 +1840,13 @@ impl LocatedResource {
         match self {
             Self::Fs { encoding_hint, .. } => *encoding_hint,
             Self::Xp3 { .. } => None,
+            Self::Media { encoding_hint, .. } => *encoding_hint,
             Self::Memory { encoding_hint, .. } => *encoding_hint,
         }
     }
 
-    fn byte_len(&self) -> u64 {
-        match self {
-            Self::Fs { byte_len, .. } | Self::Xp3 { byte_len, .. } => *byte_len,
-            Self::Memory { data, .. } => data.len() as u64,
-        }
-    }
-
-    fn cache_source(&self) -> RawCacheSource {
-        match self {
+    fn cache_source(&self) -> Option<RawCacheSource> {
+        Some(match self {
             Self::Fs { path, .. } => RawCacheSource::Fs(path.clone()),
             Self::Xp3 {
                 archive,
@@ -1631,13 +1857,15 @@ impl LocatedResource {
                 None => entry_name.clone(),
             }),
             Self::Memory { storage_name, .. } => RawCacheSource::Memory(storage_name.clone()),
-        }
+            // Media bytes are live and never cached here.
+            Self::Media { .. } => return None,
+        })
     }
 
     fn memory_source_path(&self) -> Option<&str> {
         match self {
             Self::Memory { source_path, .. } => Some(source_path),
-            Self::Fs { .. } | Self::Xp3 { .. } => None,
+            Self::Fs { .. } | Self::Xp3 { .. } | Self::Media { .. } => None,
         }
     }
 }
@@ -1872,6 +2100,12 @@ fn auto_path_archive(auto_path: &str) -> Option<String> {
 /// Splits a candidate produced from an archive-scoped auto path.
 fn split_archive_candidate(candidate: &str) -> Option<(&str, &str)> {
     candidate.split_once('>')
+}
+
+/// Whether `name` is media-qualified (`media://…`). The in-archive branch owns
+/// names with `>` (`StorageIntf.cpp:804-827`), so they are not media names.
+fn media_qualified_name(name: &str) -> bool {
+    !name.contains('>') && split_media_name(&normalize_storage_separators(name)).is_some()
 }
 
 fn push_unique_storage_candidate(candidates: &mut Vec<String>, path: &Path) {

@@ -19,7 +19,9 @@ use std::{
 use krkr_core::{AssetEvent, AssetKind, AssetRequestId, AssetScheduler};
 use serde::{Deserialize, Serialize};
 
+pub mod media;
 pub mod storage;
+pub use media::StorageMediaProvider;
 pub use storage::{PackageMount, ProjectStorage};
 
 /// Version of the semantic-path Web manifest. This deliberately remains v1;
