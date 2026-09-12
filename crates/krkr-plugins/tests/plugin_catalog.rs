@@ -106,17 +106,38 @@ fn a_profile_built_from_aliases_installs_the_canonical_plugins() {
 
 #[test]
 fn a_case_variant_link_reaches_the_registered_plugin() {
+    // `Plugins.link` resolves its argument through the registered catalog
+    // names, so a case-variant spelling still reaches the module — and,
+    // exactly as at boot, the first explicit link reinstalls it, which is what
+    // lets a `patch.tjs` that shadowed a class be cured.
+    //
+    // The observable proof is therefore the module's own surface: k2compat's
+    // `Window.TouchMouse` is clobbered first, and only a link that reached the
+    // registered plugin puts it back.
     let mut engine = test_engine();
     register_profile_plugins(&mut engine, &GameProfile::only(["k2compat.dll"])).expect("register");
-    let before = placeholder_reports(&engine, "k2compat.dll");
+    engine
+        .execute_expression("clobber.tjs", "Window.TouchMouse = void")
+        .expect("clobber the touch mouse surface");
+    let clobbered = engine
+        .execute_expression("clobber.tjs", "typeof Window.TouchMouse")
+        .expect("probe the clobbered surface");
+    assert_ne!(
+        clobbered.to_tjs_string().expect("string"),
+        "Object",
+        "the surface was not clobbered, so the link check below proves nothing"
+    );
 
     engine
         .execute_expression("link.tjs", r#"Plugins.link("K2COMPAT.DLL")"#)
         .expect("link");
 
+    let restored = engine
+        .execute_expression("link.tjs", "typeof Window.TouchMouse")
+        .expect("probe the touch mouse surface");
     assert_eq!(
-        placeholder_reports(&engine, "k2compat.dll"),
-        before + 1,
+        restored.to_tjs_string().expect("string"),
+        "Object",
         "Plugins.link did not reach the registered plugin"
     );
 }
