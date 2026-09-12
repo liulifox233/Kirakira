@@ -1223,7 +1223,14 @@ impl<'a, H: TjsHost + 'static> StructTextSerializer<'a, H> {
             // A member stored from `this` or `new` carries its binding; the
             // serialized value is the object itself (`tTJSDictionary::
             // SaveStruct` walks the member variants and writes the object).
-            Variant::Closure(closure) => self.object(closure.object, depth),
+            // A member stored from `this` or `new` carries its binding; the
+            // serialized value is what `tTJSVariantClosure::SelectObjectNoAddRef`
+            // selects -- ObjThis when there is one (`tjsVariant.h:194`), which
+            // for a self-bound value is the object itself
+            // (`tjsDictionary.cpp:457`).
+            Variant::Closure(closure) => {
+                self.object(closure.this_obj.unwrap_or(closure.object), depth)
+            }
             Variant::CodeObject(_) => "null".to_string(),
         }
     }
@@ -1417,7 +1424,9 @@ impl<'a, H: TjsHost + 'static> BinaryStructSerializer<'a, H> {
             Variant::String(value) => put_binary_string(out, value)?,
             Variant::Octet(value) => put_binary_octet(out, value)?,
             Variant::Object(handle) => self.object(*handle, out)?,
-            Variant::Closure(closure) => self.object(closure.object, out)?,
+            Variant::Closure(closure) => {
+                self.object(closure.this_obj.unwrap_or(closure.object), out)?
+            }
             Variant::CodeObject(_) => out.push(0xc0),
         }
         Ok(())

@@ -5088,6 +5088,35 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// `SaveStruct` serializes what `tTJSVariantClosure::SelectObjectNoAddRef`
+    /// selects -- ObjThis when there is one (`tjsVariant.h:194`,
+    /// `tjsDictionary.cpp:457`) -- so a bound array method serializes the array
+    /// behind it rather than the function object.
+    #[test]
+    fn save_struct_serializes_the_object_behind_a_bound_method() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create project root");
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        let result = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var list = [1, 2, 3];
+                var holder = %[];
+                holder.entry = list.push;
+                var path = System.dataPath + "bound.ksd";
+                (Dictionary.saveStruct incontextof holder)(path, "c");
+                var loaded = Scripts.evalStorage(path, "c");
+                return loaded.entry.count + ":" + loaded.entry[2];
+                "#,
+            )
+            .expect("save and load");
+
+        assert_eq!(result, Variant::String("3:3".to_string()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn structured_persistence_supports_krkr_modes_and_binary_format() {
         let root = temp_root();
