@@ -13,6 +13,23 @@ use crate::runtime::{
 use super::opcode::{OpcodeForm, binary_family, execute_binary_value, opcode_form};
 use super::{CallOutcome, Continuation, DispatchFlags, Frame, Vm};
 
+/// Labels `error` with the member access or call that was in flight, unless
+/// the error already describes a failure of its own.
+///
+/// A dispatch step that fails builds a fresh error; an error that escaped a
+/// callee's *body* comes back carrying that body's stack frames (and the call
+/// sites inside it).  Labeling such an error with the access that merely
+/// enclosed it blames a call that did not fail -- the shape that had the
+/// `Scripts.newMenuStorage` alias blamed for the `new` inside the script it
+/// had just loaded.
+fn label_in_flight_call(error: TjsError, access: TjsMemberAccess) -> TjsError {
+    if error.contexts.is_empty() {
+        error.with_member_access(access)
+    } else {
+        error
+    }
+}
+
 impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// Host-side member read that mirrors the C++ side of KRKR: a missing
     /// member is `void`, never the script-facing `Member "%1" does not exist`
@@ -73,22 +90,28 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
 
         let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
-            error.with_member_access(TjsMemberAccess {
-                operation: TjsMemberOperation::Getting,
-                receiver_type: receiver_type.clone(),
-                member_name: name.to_string(),
-                callee_type: None,
-            })
+            label_in_flight_call(
+                error,
+                TjsMemberAccess {
+                    operation: TjsMemberOperation::Getting,
+                    receiver_type: receiver_type.clone(),
+                    member_name: Some(name.to_string()),
+                    callee_type: None,
+                },
+            )
         })?;
         let effective_this = self.effective_member_this(closure_this, caller_this)?;
         self.prop_get_handle(handle, name, flags, effective_this)
             .map_err(|error| {
-                error.with_member_access(TjsMemberAccess {
-                    operation: TjsMemberOperation::Getting,
-                    receiver_type,
-                    member_name: name.to_string(),
-                    callee_type: None,
-                })
+                label_in_flight_call(
+                    error,
+                    TjsMemberAccess {
+                        operation: TjsMemberOperation::Getting,
+                        receiver_type,
+                        member_name: Some(name.to_string()),
+                        callee_type: None,
+                    },
+                )
             })
     }
 
@@ -308,31 +331,40 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         };
         if let Some(result) = string_set {
             return result.map_err(|error| {
-                error.with_member_access(TjsMemberAccess {
-                    operation: TjsMemberOperation::Setting,
-                    receiver_type,
-                    member_name: name.to_string(),
-                    callee_type: None,
-                })
+                label_in_flight_call(
+                    error,
+                    TjsMemberAccess {
+                        operation: TjsMemberOperation::Setting,
+                        receiver_type,
+                        member_name: Some(name.to_string()),
+                        callee_type: None,
+                    },
+                )
             });
         }
         let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
-            error.with_member_access(TjsMemberAccess {
-                operation: TjsMemberOperation::Setting,
-                receiver_type: receiver_type.clone(),
-                member_name: name.to_string(),
-                callee_type: None,
-            })
+            label_in_flight_call(
+                error,
+                TjsMemberAccess {
+                    operation: TjsMemberOperation::Setting,
+                    receiver_type: receiver_type.clone(),
+                    member_name: Some(name.to_string()),
+                    callee_type: None,
+                },
+            )
         })?;
         let effective_this = self.effective_member_this(closure_this, caller_this)?;
         self.prop_set_handle(handle, name, value, flags, effective_this)
             .map_err(|error| {
-                error.with_member_access(TjsMemberAccess {
-                    operation: TjsMemberOperation::Setting,
-                    receiver_type,
-                    member_name: name.to_string(),
-                    callee_type: None,
-                })
+                label_in_flight_call(
+                    error,
+                    TjsMemberAccess {
+                        operation: TjsMemberOperation::Setting,
+                        receiver_type,
+                        member_name: Some(name.to_string()),
+                        callee_type: None,
+                    },
+                )
             })
     }
 
@@ -359,12 +391,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if let Some(result) = member_set {
             let receiver_type = self.value_debug_type(&target);
             return result.map_err(|error| {
-                error.with_member_access(TjsMemberAccess {
-                    operation: TjsMemberOperation::Setting,
-                    receiver_type,
-                    member_name: self.member_diagnostic_name(member),
-                    callee_type: None,
-                })
+                label_in_flight_call(
+                    error,
+                    TjsMemberAccess {
+                        operation: TjsMemberOperation::Setting,
+                        receiver_type,
+                        member_name: Some(self.member_diagnostic_name(member)),
+                        callee_type: None,
+                    },
+                )
             });
         }
         let name = self.indirect_member_name(member)?;
@@ -890,12 +925,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     pub(super) fn delete_member(&mut self, target: Variant, name: &str) -> Result<bool> {
         let receiver_type = self.value_debug_type(&target);
         let handle = self.resolve_object(target).map_err(|error| {
-            error.with_member_access(TjsMemberAccess {
-                operation: TjsMemberOperation::Deleting,
-                receiver_type,
-                member_name: name.to_string(),
-                callee_type: None,
-            })
+            label_in_flight_call(
+                error,
+                TjsMemberAccess {
+                    operation: TjsMemberOperation::Deleting,
+                    receiver_type,
+                    member_name: Some(name.to_string()),
+                    callee_type: None,
+                },
+            )
         })?;
         Ok(self.runtime.heap[handle.0].delete(name))
     }
@@ -918,12 +956,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     ) -> Result<bool> {
         let receiver_type = self.value_debug_type(&target);
         let handle = self.resolve_object(target).map_err(|error| {
-            error.with_member_access(TjsMemberAccess {
-                operation: TjsMemberOperation::Deleting,
-                receiver_type,
-                member_name: self.member_diagnostic_name(member),
-                callee_type: None,
-            })
+            label_in_flight_call(
+                error,
+                TjsMemberAccess {
+                    operation: TjsMemberOperation::Deleting,
+                    receiver_type,
+                    member_name: Some(self.member_diagnostic_name(member)),
+                    callee_type: None,
+                },
+            )
         })?;
         let name = match member {
             Variant::Void => return Ok(false),
@@ -1394,12 +1435,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 let value = self
                     .run_call_stack(vec![*frame], base_depth)
                     .map_err(|error| {
-                        error.with_member_access(TjsMemberAccess {
-                            operation: TjsMemberOperation::Calling,
-                            receiver_type: receiver_type.clone(),
-                            member_name: name.to_string(),
-                            callee_type: None,
-                        })
+                        label_in_flight_call(
+                            error,
+                            TjsMemberAccess {
+                                operation: TjsMemberOperation::Calling,
+                                receiver_type: receiver_type.clone(),
+                                member_name: Some(name.to_string()),
+                                callee_type: None,
+                            },
+                        )
                     })?;
                 Ok(if dest_reg == 0 { Variant::Void } else { value })
             }
@@ -1429,12 +1473,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
 
         let (handle, closure_this) = self.closure_parts(object_value.clone()).map_err(|error| {
-            error.with_member_access(TjsMemberAccess {
-                operation: TjsMemberOperation::Calling,
-                receiver_type: receiver_type.clone(),
-                member_name: name.to_string(),
-                callee_type: None,
-            })
+            label_in_flight_call(
+                error,
+                TjsMemberAccess {
+                    operation: TjsMemberOperation::Calling,
+                    receiver_type: receiver_type.clone(),
+                    member_name: Some(name.to_string()),
+                    callee_type: None,
+                },
+            )
         })?;
         let mut member = if let Some(this_obj) = self.bound_super_this(handle, caller_this)?
             && self.handle_class_name_matches(handle, name)
@@ -1490,12 +1537,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             // `tjsInterCodeExec.cpp:307-330`).
             self.prop_get_handle(handle, name, DispatchFlags::call(), lookup_this)
                 .map_err(|error| {
-                    error.with_member_access(TjsMemberAccess {
-                        operation: TjsMemberOperation::Calling,
-                        receiver_type: receiver_type.clone(),
-                        member_name: name.to_string(),
-                        callee_type: None,
-                    })
+                    label_in_flight_call(
+                        error,
+                        TjsMemberAccess {
+                            operation: TjsMemberOperation::Calling,
+                            receiver_type: receiver_type.clone(),
+                            member_name: Some(name.to_string()),
+                            callee_type: None,
+                        },
+                    )
                 })?
         };
         // TJS2 emits one entry point per class extender in the superclass
@@ -1523,7 +1573,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 TjsError::invalid_type().with_member_access(TjsMemberAccess {
                     operation: TjsMemberOperation::Calling,
                     receiver_type,
-                    member_name: name.to_string(),
+                    member_name: Some(name.to_string()),
                     callee_type: Some(callee_type),
                 }),
             );
@@ -1550,14 +1600,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .or_else(|| self.receiver_supplies_call_this(handle, name).then_some(handle))
             .or(caller_this);
         self.call_value(member, call_this, args, false, continuation)
-        .map_err(|error| {
-            error.with_member_access(TjsMemberAccess {
-                operation: TjsMemberOperation::Calling,
-                receiver_type,
-                member_name: name.to_string(),
-                callee_type: Some(callee_type),
+            .map_err(|error| {
+                label_in_flight_call(
+                    error,
+                    TjsMemberAccess {
+                        operation: TjsMemberOperation::Calling,
+                        receiver_type,
+                        member_name: Some(name.to_string()),
+                        callee_type: Some(callee_type),
+                    },
+                )
             })
-        })
     }
 
     /// Whether a member call on this receiver supplies the callee's `this`
@@ -2061,12 +2114,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         Continuation::Root,
                     )
                     .map_err(|error| {
-                        error.with_member_access(TjsMemberAccess {
-                            operation: TjsMemberOperation::Calling,
-                            receiver_type: receiver_type.clone(),
-                            member_name: "finalize".to_string(),
-                            callee_type: None,
-                        })
+                        label_in_flight_call(
+                            error,
+                            TjsMemberAccess {
+                                operation: TjsMemberOperation::Calling,
+                                receiver_type: receiver_type.clone(),
+                                member_name: Some("finalize".to_string()),
+                                callee_type: None,
+                            },
+                        )
                     })?;
                 match outcome {
                     CallOutcome::Immediate(_, Continuation::Root) => {}
@@ -2078,12 +2134,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     CallOutcome::Frame(frame) => {
                         self.run_call_stack(vec![*frame], base_depth)
                             .map_err(|error| {
-                                error.with_member_access(TjsMemberAccess {
-                                    operation: TjsMemberOperation::Calling,
-                                    receiver_type: receiver_type.clone(),
-                                    member_name: "finalize".to_string(),
-                                    callee_type: None,
-                                })
+                                label_in_flight_call(
+                                    error,
+                                    TjsMemberAccess {
+                                        operation: TjsMemberOperation::Calling,
+                                        receiver_type: receiver_type.clone(),
+                                        member_name: Some("finalize".to_string()),
+                                        callee_type: None,
+                                    },
+                                )
                             })?;
                     }
                 }
@@ -2287,10 +2346,33 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
             ObjectKind::Ordinary | ObjectKind::Array { .. } | ObjectKind::NativeProperty { .. } => {
                 // A data object is not callable; the reference reports
-                // `TJS_E_INVALIDTYPE` (-1005) for the attempt.
-                Err(TjsError::invalid_type())
+                // `TJS_E_INVALIDTYPE` (-1005) for the attempt
+                // (`tjsObject.cpp:1800-1804`).
+                Err(self.call_target_error(handle, is_new))
             }
         }
+    }
+
+    /// The failure of a call through a *value* that is not callable.
+    ///
+    /// `VM_CALL` and `VM_NEW` take their callee from a register and carry no
+    /// member name (the reference compiles `new a.b()` as a property read
+    /// followed by `VM_NEW`, `tjsInterCodeGen.cpp:1819`), so the context names
+    /// the value being called -- reported by kind -- the way the named call
+    /// sites name their callee.  `VM_NEW` runs `CreateNew`, whose nameless
+    /// `TJS_E_INVALIDTYPE` is the same code `CallFunction` reports for
+    /// `VM_CALL` (`tjsObject.cpp:1800-1804`, `tjsInterCodeExec.cpp:2400`).
+    fn call_target_error(&self, handle: ObjectHandle, is_new: bool) -> TjsError {
+        TjsError::invalid_type().with_member_access(TjsMemberAccess {
+            operation: if is_new {
+                TjsMemberOperation::Constructing
+            } else {
+                TjsMemberOperation::Calling
+            },
+            receiver_type: self.object_debug_type(handle, "object"),
+            member_name: None,
+            callee_type: None,
+        })
     }
 
     fn create_new_inter_code(
@@ -3606,10 +3688,124 @@ mod tests {
         run(source).expect_err("script should fail")
     }
 
+    /// The rendered trace with allocation-order object ids and bytecode
+    /// offsets folded to `N`, so the attribution can be pinned without
+    /// depending on heap order or compiler layout.
+    fn folded_trace(error: &TjsError) -> String {
+        let mut folded = String::new();
+        let mut digits = false;
+        for ch in error.to_string().chars() {
+            if ch.is_ascii_digit() {
+                if !digits {
+                    folded.push('N');
+                    digits = true;
+                }
+            } else {
+                digits = false;
+                folded.push(ch);
+            }
+        }
+        folded
+    }
+
     fn vm_with(runtime: &mut Runtime<NoHost>) -> Vm<'_, '_, NoHost> {
         let file = compile_source_to_bytecode("dispatch-test.tjs", "return 0;").expect("compile");
         let file_id = runtime.install_script_file(Arc::new(file));
         Vm::new(file_id, runtime).expect("vm")
+    }
+
+    /// `Scripts.execStorage` runs the named script inside the native call and
+    /// hands its failure back while the member call is still in flight.  GINKA
+    /// reaches the failure traced below exactly this way: its `patch.tjs`
+    /// aliases `Scripts.execStorage` as `newMenuStorage`, and loading
+    /// `AfterInit.tjs` through that alias runs a `new` on a value the
+    /// k2compat shim published as a plain object.
+    fn nested_script_loader(
+        child: &'static str,
+    ) -> impl Fn(&mut Runtime<NoHost>, Option<ObjectHandle>, Vec<Variant>) -> Result<Variant>
+    + Send
+    + Sync
+    + 'static {
+        move |runtime, _this_obj, _args| {
+            let file = compile_source_to_bytecode("child.tjs", child).expect("compile child");
+            runtime.execute_file(&file)
+        }
+    }
+
+    #[test]
+    fn a_new_on_a_non_callable_value_names_the_constructing_call_site() {
+        let mut runtime = Runtime::new();
+        let target = runtime.alloc_ordinary_object();
+        runtime.set_global_member("target", Variant::Object(target));
+        let plain = runtime.alloc_ordinary_object();
+        runtime.set_global_member("plain", Variant::Object(plain));
+        runtime.register_object_native(
+            target,
+            "loadStorage",
+            nested_script_loader(
+                "target.keep = function() { return 1; };\n\
+                 target.keep();\n\
+                 return new plain();",
+            ),
+        );
+
+        let error = run_with(&mut runtime, "return target.loadStorage();").expect_err("fails");
+
+        // The official identity of the failure: `VM_NEW` on a value whose
+        // `CreateNew` is the default one answers `TJS_E_INVALIDTYPE`
+        // (`tjsObject.cpp:1794-1800`).
+        assert_eq!(error.kind, TjsErrorKind::InvalidType);
+        assert_eq!(error.tjs_error_code(), Some(-1005));
+        assert_eq!(
+            error.message,
+            "Not a function or invalid method/property type"
+        );
+
+        // Before the fix this trace named `loadStorage` -- the member call
+        // that had just loaded the child script -- and never the value the
+        // failing `new` actually tried to construct.
+        assert_eq!(
+            folded_trace(&error),
+            "InvalidType error: Not a function or invalid method/property type\n\
+             \x20 while constructing object#N\n\
+             \x20 at child.tjs:global [TopLevel] bytecode N (child.tjs:N:N)\n\
+             \x20 at child.tjs:global [TopLevel] bytecode N (child.tjs:N:N)\n\
+             \x20 at dispatch-test.tjs:global [TopLevel] bytecode N (dispatch-test.tjs:N:N)\n\
+             \x20 at dispatch-test.tjs:global [TopLevel] bytecode N (dispatch-test.tjs:N:N)"
+        );
+        let trace = error.to_string();
+        assert!(!trace.contains("loadStorage"), "{trace}");
+        assert!(!trace.contains("keep"), "{trace}");
+    }
+
+    #[test]
+    fn a_successful_member_call_is_not_blamed_for_a_later_new_failure() {
+        // The minimal shape from the finding: a member call that succeeds,
+        // followed by `new` on a non-callable value.  Nothing records an
+        // "earlier member call", so the trace names the failing call site and
+        // no member at all.
+        let mut runtime = Runtime::new();
+        let holder = runtime.alloc_ordinary_object();
+        runtime.set_global_member("holder", Variant::Object(holder));
+        let plain = runtime.alloc_ordinary_object();
+        runtime.set_global_member("plain", Variant::Object(plain));
+
+        let error = run_with(
+            &mut runtime,
+            "holder.keep = function() { return 1; };\n\
+             holder.keep();\n\
+             return new plain();",
+        )
+        .expect_err("fails");
+
+        assert_eq!(error.kind, TjsErrorKind::InvalidType);
+        assert_eq!(
+            error.message,
+            "Not a function or invalid method/property type"
+        );
+        let trace = error.to_string();
+        assert!(trace.contains("while constructing object"), "{trace}");
+        assert!(!trace.contains("keep"), "{trace}");
     }
 
     /// A VM-native handler needs a named function: a closure is not generic

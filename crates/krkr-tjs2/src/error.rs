@@ -469,18 +469,31 @@ impl fmt::Display for TjsSourceLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TjsMemberAccess {
     pub operation: TjsMemberOperation,
+    /// The object the access ran on. A call through a *value* rather than a
+    /// named member has no receiver to name -- the call opcodes take their
+    /// callee from a register -- so this field holds the value being called
+    /// there (see [`TjsMemberAccess::member_name`]).
     pub receiver_type: String,
-    pub member_name: String,
+    /// The member name, or `None` for a call through a value: `VM_CALL` and
+    /// `VM_NEW` carry no member name (the reference compiles `new a.b()` as a
+    /// property read followed by `VM_NEW`, `tjsInterCodeGen.cpp:1819`), so the
+    /// call site is identified by the callee's kind instead.
+    pub member_name: Option<String>,
+    /// Kind of the value a member read resolved to (`object<Scripts>#133`,
+    /// `NativeFunction#134`, ...), for the call sites that reached one.
     pub callee_type: Option<String>,
 }
 
 impl fmt::Display for TjsMemberAccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} member `{}` on {}",
-            self.operation, self.member_name, self.receiver_type
-        )?;
+        match &self.member_name {
+            Some(member_name) => write!(
+                f,
+                "{} member `{}` on {}",
+                self.operation, member_name, self.receiver_type
+            )?,
+            None => write!(f, "{} {}", self.operation, self.receiver_type)?,
+        }
         if let Some(callee_type) = &self.callee_type {
             write!(f, " with callee {callee_type}")?;
         }
@@ -494,6 +507,11 @@ pub enum TjsMemberOperation {
     Setting,
     Calling,
     Deleting,
+    /// The `new` opcode's call: `VM_NEW` runs `CreateNew` rather than
+    /// `FuncCall` (`tjsInterCodeExec.cpp:2357-2400`), and a value whose
+    /// default `CreateNew` cannot construct reports the same
+    /// `TJS_E_INVALIDTYPE` as the `FuncCall` miss (`tjsObject.cpp:1800-1804`).
+    Constructing,
 }
 
 impl fmt::Display for TjsMemberOperation {
@@ -503,6 +521,7 @@ impl fmt::Display for TjsMemberOperation {
             Self::Setting => write!(f, "setting"),
             Self::Calling => write!(f, "calling"),
             Self::Deleting => write!(f, "deleting"),
+            Self::Constructing => write!(f, "constructing"),
         }
     }
 }
@@ -752,5 +771,49 @@ mod tests {
             TjsError::variant_convert_to_object(&value).message,
             expected
         );
+    }
+
+    #[test]
+    fn member_access_context_renders_named_and_valueless_accesses() {
+        fn access(
+            operation: TjsMemberOperation,
+            member_name: Option<&str>,
+            callee_type: Option<&str>,
+        ) -> TjsMemberAccess {
+            TjsMemberAccess {
+                operation,
+                receiver_type: "object<Scripts>#133".to_string(),
+                member_name: member_name.map(str::to_string),
+                callee_type: callee_type.map(str::to_string),
+            }
+        }
+
+        // A named member access keeps its original sentence, both on its own
+        // and through the context wrapper.
+        let named = access(
+            TjsMemberOperation::Calling,
+            Some("newMenuStorage"),
+            Some("NativeFunction#134"),
+        );
+        assert_eq!(
+            named.to_string(),
+            "calling member `newMenuStorage` on object<Scripts>#133 with callee NativeFunction#134"
+        );
+        assert_eq!(
+            TjsError::runtime("").with_member_access(named).contexts[0].to_string(),
+            "while calling member `newMenuStorage` on object<Scripts>#133 with callee NativeFunction#134"
+        );
+        // A call through a value has no member name to show: `VM_CALL` and
+        // `VM_NEW` carry none, so the callee's kind identifies the call site
+        // instead.
+        assert_eq!(
+            access(TjsMemberOperation::Constructing, None, None).to_string(),
+            "constructing object<Scripts>#133"
+        );
+        assert_eq!(
+            access(TjsMemberOperation::Calling, None, None).to_string(),
+            "calling object<Scripts>#133"
+        );
+        assert_eq!(TjsMemberOperation::Constructing.to_string(), "constructing");
     }
 }
