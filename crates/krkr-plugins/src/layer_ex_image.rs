@@ -133,11 +133,6 @@ fn clip_box(bitmap: krkr_engine::plugin_api::layer::LayerBitmap) -> ClipBox {
 }
 
 impl ClipBox {
-    /// Byte offset of the clip's pixel `(x, y)`.
-    fn offset(&self, x: usize, y: usize) -> usize {
-        (self.top + y) * self.pitch + (self.left + x) * 4
-    }
-
     /// Applies `f` to every pixel's four bytes in the clip box.
     fn for_each_pixel(&self, pixels: &mut [u8], mut f: impl FnMut(&mut [u8; 4])) {
         let stride = self.pitch;
@@ -507,7 +502,19 @@ fn gen_convolve_matrix(radius: f32) -> Vec<f32> {
     let radius = (0.5 * radius).abs() + 0.25;
     let std_dev = radius;
     let radius = std_dev * 2.0;
-    let mut matrix_length = (2.0 * (radius - 0.5).ceil() + 1.0) as i32;
+    // `int32_t(2 * ceil(radius-0.5) + 1)` with an `if (matrix_length <= 0)
+    // matrix_length = 1;` clamp (`:417-418`). The reference's cast is VCL's
+    // `cvttsd2si`, which yields INT_MIN for a value outside `int32` (and for
+    // NaN/±inf), so an absurd radius degrades to the one-tap identity there; a
+    // saturating Rust `as` would instead ask for an 8.6 GB kernel at
+    // `gaussianBlur(1e30)`.
+    let scaled = f64::from(2.0 * (radius - 0.5).ceil() + 1.0);
+    let mut matrix_length =
+        if scaled.is_finite() && scaled >= f64::from(i32::MIN) && scaled <= f64::from(i32::MAX) {
+            scaled as i32
+        } else {
+            i32::MIN
+        };
     if matrix_length <= 0 {
         matrix_length = 1;
     }
@@ -656,6 +663,10 @@ fn get_col(source: &[u8], column: usize, pitch: usize, height: usize, dest: &mut
 }
 
 /// `setCol` (`LayerExImage.cpp:621-632`): the tight column back into the plane.
+///
+/// `dest` is the clip box's origin — the reference passes `_buffer + x*4`
+/// (`:663`), whose `_buffer` already carries `clipTop * _pitch + clipLeft * 4`
+/// — so `column` is clip-relative and row 0 is the clip box's first row.
 fn set_col(dest: &mut [u8], column: usize, pitch: usize, height: usize, source: &[u8]) {
     for y in 0..height {
         let offset = y * pitch + column * 4;
@@ -683,6 +694,13 @@ fn layer_gaussian_blur(
         if clip.width == 0 || clip.height == 0 {
             return;
         }
+        // `reset()` moves the reference's `_buffer` to
+        // `clipTop * _pitch + clipLeft * 4` (`LayerExImage.cpp:21-22`), so both
+        // passes below work from that origin: `_buffer + _pitch*y` for the rows
+        // (`:652`) and `setCol(_buffer + x*4, ...)` for the columns (`:663`).
+        let Some(plane) = view.pixels.get_mut(clip.top * clip.pitch + clip.left * 4..) else {
+            return;
+        };
         let cmatrix = gen_convolve_matrix(radius);
         let ctable = gen_lookup_table(&cmatrix);
         let tmp_pitch = clip.width * 4;
@@ -691,8 +709,8 @@ fn layer_gaussian_blur(
         let mut tmp = vec![0u8; tmp_pitch * clip.height];
         let mut line = vec![0u8; tmp_pitch];
         for y in 0..clip.height {
-            let row = clip.offset(0, y);
-            if let Some(source) = view.pixels.get(row..row + tmp_pitch) {
+            let row = y * clip.pitch;
+            if let Some(source) = plane.get(row..row + tmp_pitch) {
                 line.copy_from_slice(source);
             }
             blur_line(
@@ -718,13 +736,7 @@ fn layer_gaussian_blur(
                 &mut dest_col,
                 4,
             );
-            set_col(
-                view.pixels,
-                clip.left + x,
-                clip.pitch,
-                clip.height,
-                &dest_col,
-            );
+            set_col(plane, x, clip.pitch, clip.height, &dest_col);
         }
     })?;
     layer_update(runtime, layer)?;
@@ -1054,6 +1066,110 @@ mod tests {
         assert_eq!(main(&mut engine, 0, 0), 0x000000, "outside the clip box");
         assert_eq!(main(&mut engine, 3, 0), 0x000000, "outside the clip box");
         assert_eq!(mask(&mut engine, 1, 0), 0x80, "alpha is untouched");
+    }
+
+    /// The blur's column pass writes at the clip box's origin, not the image's
+    /// (`LayerExImage.cpp:21-22, :663`): with a radius of 0 the kernel is the
+    /// one-tap identity, so a clipped blur has to leave every byte — including
+    /// the rows above the clip box — exactly as it found them.
+    #[test]
+    fn gaussian_blur_off_zero_top_leaves_the_rows_above_the_clip_box_alone() {
+        let mut engine = engine();
+        engine
+            .execute_script(
+                "cliptop.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(4, 4);
+                for (var y = 0; y < 4; y++) {
+                    for (var x = 0; x < 4; x++) {
+                        layer.fillRect(x, y, 1, 1, 0xff000000 | (0x0f * (y * 4 + x + 1) << 16));
+                    }
+                }
+                layer.setClip(0, 1, 4, 2);
+                layer.gaussianBlur(0);
+                "#,
+            )
+            .expect("blur in a clip box");
+
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(
+                    main(&mut engine, x, y),
+                    (0x0f * (y * 4 + x + 1)) << 16,
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// The same with both offsets non-zero and a kernel that actually spreads:
+    /// the frame around the clip box keeps its bytes, the box itself changes.
+    #[test]
+    fn gaussian_blur_keeps_the_frame_around_an_offset_clip_box() {
+        let mut engine = engine();
+        engine
+            .execute_script(
+                "clipoffset.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(6, 5);
+                for (var y = 0; y < 5; y++) {
+                    for (var x = 0; x < 6; x++) {
+                        layer.fillRect(x, y, 1, 1, 0xff000000 | (0x08 * (y * 6 + x + 1) << 16));
+                    }
+                }
+                layer.setClip(1, 1, 4, 3);
+                layer.gaussianBlur(2);
+                "#,
+            )
+            .expect("blur in an offset clip box");
+
+        let mut inside_changed = false;
+        for y in 0..5usize {
+            for x in 0..6usize {
+                let pattern: i64 = ((0x08 * (y * 6 + x + 1)) as i64) << 16;
+                let value = main(&mut engine, x as i64, y as i64);
+                let inside = (1..5).contains(&x) && (1..4).contains(&y);
+                if inside {
+                    inside_changed |= value != pattern;
+                } else {
+                    assert_eq!(value, pattern, "({x}, {y}) is outside the clip box");
+                }
+            }
+        }
+        assert!(inside_changed, "the clip box itself was filtered");
+    }
+
+    /// `gaussianBlur(1e30)` is the reference's `INT_MIN` cast path
+    /// (`LayerExImage.cpp:417-418`): a one-tap identity, not an 8.6 GB kernel.
+    #[test]
+    fn an_absurd_blur_radius_degrades_to_the_identity_tap() {
+        assert_eq!(super::gen_convolve_matrix(1e30), vec![1.0]);
+        assert_eq!(super::gen_convolve_matrix(f32::INFINITY), vec![1.0]);
+        // NaN takes the same length path; its tap stays NaN because the
+        // reference's `exp(-x²/2σ²)` is NaN for a NaN σ, so only the length is
+        // asserted.
+        let nan_kernel = super::gen_convolve_matrix(f32::NAN);
+        assert_eq!(nan_kernel.len(), 1);
+        assert!(nan_kernel[0].is_nan());
+
+        let mut engine = engine();
+        engine
+            .execute_script(
+                "absurd.tjs",
+                r#"
+                global.layer = new Layer();
+                layer.setImageSize(3, 1);
+                layer.fillRect(0, 0, 3, 1, 0xff000000);
+                layer.setMainPixel(1, 0, 0xffffff);
+                layer.gaussianBlur(1e30);
+                "#,
+            )
+            .expect("absurd gaussianBlur");
+        assert_eq!(main(&mut engine, 0, 0), 0x000000);
+        assert_eq!(main(&mut engine, 1, 0), 0xffffff);
+        assert_eq!(main(&mut engine, 2, 0), 0x000000);
     }
 
     /// Every member needs a layer with an image; a freed one reports the
