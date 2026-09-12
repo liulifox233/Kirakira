@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 krkr-engine.workspace = true
 krkr-tjs2.workspace = true
+# The `lzfs` media decodes LZ4 frames with `lz4_flex`'s frame API (the same
+# crate `krkr-emote` already pulls into the workspace).
+lz4_flex = "0.11"
 
 [dev-dependencies]
 krkr-assets.workspace = true
