@@ -9,6 +9,7 @@ members = [
     "crates/krkr-audio",
     "crates/krkr-assets",
     "crates/krkr-core",
+    "crates/krkr-emote",
     "crates/krkr-plugins",
     "crates/krkr-font",
     "crates/krkr-kag",
@@ -18,6 +19,9 @@ members = [
     "crates/krkr-video",
     "crates/krkr-xp3",
 ]
+# The vendored eluna fork keeps its own workspace (see vendor/eluna/UPSTREAM.md);
+# `krkr-emote` consumes `vendor/eluna/crates/eluna` as a path dependency.
+exclude = ["vendor/eluna"]
 resolver = "3"
 
 [workspace.package]
@@ -75,6 +79,7 @@ web-sys = { version = "0.3.81", features = ["Window", "Document", "Element", "Ht
 krkr-audio = { path = "crates/krkr-audio" }
 krkr-assets = { path = "crates/krkr-assets" }
 krkr-core = { path = "crates/krkr-core" }
+krkr-emote = { path = "crates/krkr-emote" }
 krkr-plugins = { path = "crates/krkr-plugins" }
 krkr-font = { path = "crates/krkr-font" }
 krkr-kag = { path = "crates/krkr-kag" }
@@ -83,3 +88,6 @@ krkr-engine = { path = "crates/krkr-engine" }
 krkr-tjs2 = { path = "crates/krkr-tjs2" }
 krkr-video = { path = "crates/krkr-video" }
 krkr-xp3 = { path = "crates/krkr-xp3" }
+
+# Vendored eluna fork; version and patches are tracked in vendor/eluna/UPSTREAM.md.
+eluna = { path = "vendor/eluna/crates/eluna" }
