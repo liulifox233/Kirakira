@@ -351,7 +351,14 @@ impl Table {
     }
 
     /// `RebuildHash(requestcount)` (`tjsObject.cpp:743-848`).
+    ///
+    /// `RebuildHashMagic = TJSGlobalRebuildHashMagic;` is the reference's
+    /// *first* statement (`:751`), before the size formula and before the
+    /// same-size early return (`:764`): a rebuild that changes nothing still
+    /// marks the table current, which is what stops `PropGet` from rebuilding
+    /// again on every later read.
     fn rebuild(table: &mut Table, requestcount: i64) {
+        table.rebuild_magic = rebuild_hash_magic();
         let hashbits = hash_bits_for_count(requestcount).min(HASH_BITS_ALLOCATION_CAP);
         let new_size = 1usize << hashbits;
         if new_size == table.buckets.len() {
@@ -682,6 +689,35 @@ mod tests {
         assert_eq!(table.hash_size(), 32, "9 members rebuild to 32 buckets");
     }
 
+    /// `RebuildHash` writes `RebuildHashMagic = TJSGlobalRebuildHashMagic` as
+    /// its first statement (`tjsObject.cpp:751`), before the size formula and
+    /// before the same-size early return (`:764`).  Without that write the
+    /// table stays stale forever after the first rehash and rebuilds again the
+    /// moment the member count leaves the current size band -- a sequence
+    /// difference for the same insertion history, which is what this test
+    /// discriminates (the extra rebuild would reach 64 slots and the order
+    /// below would come out as the oracle's
+    /// `[e2,a,g3,e3,e,w2,d3,c,b3,b,c3,a3,f3,l2,h3,y2]`).
+    #[test]
+    fn a_finished_rebuild_marks_the_table_current() {
+        let table = table_with(&["e", "a", "c", "b", "e2", "l2", "w2", "y2"]);
+        tjs_do_rehash();
+        assert!(table.get("e").is_some(), "the read rebuilds at 8 members");
+        assert_eq!(table.hash_size(), 32);
+        for name in ["a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3"] {
+            table.insert(name.to_string(), Variant::Integer(1));
+        }
+        assert!(table.get("e").is_some());
+        assert_eq!(table.hash_size(), 32, "no rebuild without a new magic");
+        assert_eq!(
+            order(&table),
+            [
+                "c3", "e2", "a", "g3", "a3", "f3", "e3", "e", "w2", "d3", "c", "b3", "l2", "b",
+                "h3", "y2"
+            ]
+        );
+    }
+
     /// The engine's tick is the reference's `if(tick > LastRehashedTick + 1500)
     /// { LastRehashedTick = tick; TJSDoRehash(); }` (`SystemControl.cpp:176-180`)
     /// with `LastRehashedTick` starting at 0 (`:51`), and its effect on the
@@ -735,6 +771,46 @@ mod tests {
         runtime.tjs_rehash_tick(3_002);
         assert!(runtime.heap[handle.0].members.get("e").is_some());
         assert_eq!(runtime.heap[handle.0].members.hash_size(), 64);
+    }
+
+    /// The same rule through the `Runtime` API, which is where the reviewer's
+    /// reproduction ran: after a rehash has been applied by a read, growing the
+    /// member count must *not* trigger another rebuild, because the completed
+    /// rebuild marked the table current (`tjsObject.cpp:751`).
+    #[test]
+    fn growth_after_a_rehashed_table_stays_unrebuilt() {
+        use crate::runtime::Runtime;
+
+        let mut runtime = Runtime::new();
+        let handle = runtime.alloc_dictionary_object();
+        for name in ["e", "a", "c", "b", "e2", "l2", "w2", "y2"] {
+            runtime.set_object_member(handle, name, Variant::Integer(1));
+        }
+        runtime.tjs_do_rehash();
+        assert!(runtime.heap[handle.0].members.get("e").is_some());
+        assert_eq!(runtime.heap[handle.0].members.hash_size(), 32);
+        for name in ["a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3"] {
+            runtime.set_object_member(handle, name, Variant::Integer(1));
+        }
+        assert!(runtime.heap[handle.0].members.get("e").is_some());
+        assert_eq!(
+            runtime.heap[handle.0].members.hash_size(),
+            32,
+            "the rehash is not stale again just because the object grew"
+        );
+        let names = runtime.heap[handle.0]
+            .members
+            .entries()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "c3", "e2", "a", "g3", "a3", "f3", "e3", "e", "w2", "d3", "c", "b3", "l2", "b",
+                "h3", "y2"
+            ]
+        );
     }
 
     /// Values round-trip through insert/get/remove, and a re-insert replaces

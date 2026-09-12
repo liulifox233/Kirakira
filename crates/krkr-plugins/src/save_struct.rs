@@ -744,6 +744,41 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// A binary `loadStruct` restores the receiver **in place, in file order**
+    /// (`tTJSBinarySerializer`'s `RootDictionary`: `RootDictionary->RebuildHash(count)`,
+    /// `tjsBinarySerializer.cpp:80-88`, then `AddDictionary`'s `PropSetByVS` per
+    /// entry in the order the file holds them, `:282-330`).  Decoding into a
+    /// temporary and copying the temporary's `EnumMembers` order would walk the
+    /// buckets a second time and reverse the members of a colliding slot.
+    ///
+    /// The five keys below all hash into one bucket, so the file holds them as
+    /// the saving dictionary enumerated them (`ab,y,w,l,e`) and the reference
+    /// root -- `RebuildHash(5)`, sixteen slots -- enumerates
+    /// `e,w,l,y,ab`.
+    #[test]
+    fn binary_load_struct_restores_the_receiver_in_file_order() {
+        let root = test_root("savestruct-file-order");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(SaveStructPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var saved = %[];\n\
+                     saved.e = 1; saved.l = 2; saved.w = 3; saved.y = 4; saved.ab = 5;\n\
+                     (Dictionary.saveStruct incontextof saved)(\"order.ksd\", \"b\");\n\
+                     var loaded = %[];\n\
+                     (Dictionary.loadStruct incontextof loaded)(\"order.ksd\", \"b\");\n\
+                     return Scripts.getObjectKeys(loaded).join(\",\") + \":\" +\n\
+                         loaded.e + loaded.w + loaded.ab;\n\
+                 })()",
+            )
+            .expect("binary struct round trip");
+
+        assert_eq!(value, Variant::String("e,w,l,y,ab:135".to_string()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn newlines_and_escapes_follow_the_reference() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
