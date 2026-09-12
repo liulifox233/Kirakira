@@ -1,6 +1,7 @@
 /target/
 *.log
 .DS_Store
+/in[0-9]*
 .cargo
 node_modules/
 dist/
