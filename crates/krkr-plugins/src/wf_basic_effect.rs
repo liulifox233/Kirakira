@@ -387,10 +387,13 @@ impl GraphicEqualizer {
 // StkFreeVerb
 // ---------------------------------------------------------------------------
 
-/// The comb tunings of the DLL's FreeVerb (`.data` `0x1003426c`, in table
-/// order), scaled by `sample_rate / 44100` at construction (`0x1000b892`).
+/// The comb tunings of the DLL's FreeVerb (`.data` `0x1003426c`, listed there
+/// descending as `1617…1116`), scaled by `sample_rate / 44100` at construction
+/// (`0x1000b892`).
 const FREEVERB_COMB_TUNINGS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
-/// The allpass tunings (`.data` `0x1003428c`).
+/// The allpass tunings (`.data` `0x1003428c`, listed there as
+/// `225, 556, 441, 341`; the bank is parallel, so the order carries no
+/// behaviour).
 const FREEVERB_ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
 /// The classic stereo spread added to every right-channel delay.
 const FREEVERB_STEREO_SPREAD: usize = 23;
@@ -644,15 +647,17 @@ impl FreeVerb {
     /// right. Channels past the second are passed through untouched (the
     /// recovered adapter only ever asks for one or two channels, and the
     /// DLL rejects a source wider than four with `HiRes format not supported.`).
+    /// A buffer whose length is not a multiple of `channels` is tolerated like
+    /// the sibling processors: the trailing partial frame is processed with
+    /// its missing channels read as the first, so the reverb never indexes
+    /// past the chunk it was handed.
     pub fn process(&mut self, frames: &mut [f32], channels: usize) {
         if channels == 0 {
             return;
         }
         for frame in frames.chunks_mut(channels) {
-            let (input_left, input_right) = match channels {
-                1 => (frame[0], frame[0]),
-                _ => (frame[0], frame[1]),
-            };
+            let input_left = frame[0];
+            let input_right = frame.get(1).copied().unwrap_or(input_left);
             let scaled_left = input_left * FREEVERB_FIXED_GAIN;
             let scaled_right = input_right * FREEVERB_FIXED_GAIN;
 
@@ -678,8 +683,8 @@ impl FreeVerb {
             let dry = 1.0 - self.effect_mix;
 
             frame[0] = dry * input_left + self.effect_mix * mixed_left;
-            if channels > 1 {
-                frame[1] = dry * input_right + self.effect_mix * mixed_right;
+            if let Some(right) = frame.get_mut(1) {
+                *right = dry * input_right + self.effect_mix * mixed_right;
             }
         }
     }
@@ -776,13 +781,11 @@ impl DelayEffect {
     }
 
     /// `OnePole::setPole` semantics (`0x10010933`): `|pole| >= 1` is refused
-    /// with the recovered warning; the pole is used as this stage's `a1`.
+    /// with the recovered warning and **without touching the live
+    /// coefficients** — STK's setter returns before storing, so the previous
+    /// pole keeps filtering and [`DelayEffect::damping`] keeps reporting it.
     pub fn set_damping(&mut self, pole: f32) -> Option<&'static str> {
         if !pole.is_finite() || pole.abs() >= 1.0 {
-            for damper in &mut self.dampers {
-                damper.a1 = 0.0;
-                damper.b0 = 1.0;
-            }
             return Some(DELAY_POLE_WARNING);
         }
         self.damping = pole;
@@ -1694,6 +1697,36 @@ mod tests {
         assert_eq!(frames, input);
     }
 
+    /// A buffer whose length is not a multiple of the channel count is
+    /// tolerated instead of panicking: the trailing partial frame is processed
+    /// like the sibling processors do, and nothing indexes past the buffer.
+    #[test]
+    fn a_partial_trailing_frame_does_not_panic() {
+        // Five samples at two channels: two whole frames plus one odd sample.
+        // The wet path is silent for the first 1115 samples, so every output
+        // sample is exactly the dry half — including the odd one, which pins
+        // that the odd sample really is processed (as a mono frame) rather
+        // than skipped or over-read.
+        let mut reverb = FreeVerb::new(44100.0);
+        reverb.set_effect_mix(0.5);
+        let mut frames = [0.25_f32; 5];
+        reverb.process(&mut frames, 2);
+        for value in frames {
+            assert!(
+                (value - 0.125).abs() < 1e-6,
+                "every sample is the dry half, got {value}"
+            );
+        }
+
+        // The sibling processors tolerate the same short tail.
+        let mut equalizer = GraphicEqualizer::new(44100.0);
+        let mut delay = DelayEffect::new(44100.0);
+        let mut tail = [0.75_f32, 0.5];
+        equalizer.process(&mut tail, 3);
+        delay.process(&mut tail, 3);
+        assert!(tail.iter().all(|value| value.is_finite()));
+    }
+
     /// The FreeVerb impulse response with the wet path only: silence until the
     /// shortest comb delay (the recovered tuning 1116 samples at 44.1 kHz
     /// scaled by `sampleRate / 44100`), then a live tail.
@@ -1865,6 +1898,34 @@ mod tests {
         assert!(
             (response[echo_samples] - 0.5).abs() < 1e-6,
             "a 0.5 pole scales the echo by b0 = 0.5, got {}",
+            response[echo_samples]
+        );
+    }
+
+    /// A refused damping pole is inert, as STK's `OnePole::setPole` is: the
+    /// warning is reported but neither the live coefficients nor the value the
+    /// getter answers change.
+    #[test]
+    fn a_refused_damping_pole_leaves_the_state_alone() {
+        let mut delay = DelayEffect::new(44100.0);
+        assert_eq!(delay.set_damping(0.5), None);
+        let warning = delay.set_damping(2.0);
+        assert!(warning.is_some_and(|text| text.contains("OnePole::setPole")));
+        assert_eq!(
+            delay.damping(),
+            0.5,
+            "the refusal keeps the previous pole, not the refused one"
+        );
+
+        // The audio still carries the 0.5 pole's shaping: b0 = 0.5 scales the
+        // echo by half.
+        delay.set_feedback(0.5);
+        assert_eq!(delay.set_delay_millis(100.0), None);
+        let echo_samples = 4410;
+        let response = impulse_response(echo_samples * 2, 1, |frames| delay.process(frames, 1));
+        assert!(
+            (response[echo_samples] - 0.5).abs() < 1e-6,
+            "the refused call must not change the running filter, got {}",
             response[echo_samples]
         );
     }

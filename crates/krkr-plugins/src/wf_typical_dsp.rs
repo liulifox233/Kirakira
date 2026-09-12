@@ -15,17 +15,25 @@
 //!   (`TVPCannotConnectMultipleWaveSoundBufferAtOnce`).
 //! * Members referenced by the registration: `name`, `label`, `getParamInfo`,
 //!   `setParams`, `currentValue`, `defaultValue`, `interface`, `finalize`.
-//! * The parameter vocabulary in the string table: the design names
-//!   `Bessel`, `Butterworth`, `Chebyshev I`, `Chebyshev II`, `Elliptic`,
-//!   `Legendre`, `RBJ`; the response names `Low Pass`, `High Pass`,
-//!   `Band Pass`, `Band Stop`, `Low Shelf`, `High Shelf`, `Band Shelf`; and
-//!   the parameter labels `Custom One-Pole`, `Custom Two-Pole`,
-//!   `Center Frequency`, `Cutoff Frequency`, `Bandwidth (Hz)`,
-//!   `Bandwidth (Octaves)`, `Order`, `Pole Angle`, `Pole Distance`,
-//!   `Pole Real`. The DLL's template instances (`Dsp::FilterDesign<Dsp::LowPass
-//!   … Design::{Bessel,Butterworth,ChebyshevI,ChebyshevII,Elliptic,Legendre,
-//!   RBJ}, DirectFormI/II, TransposedDirectFormI/II>`) are Vinnie Falco's
-//!   DSPFilters library, which is what the response/design matrix above is.
+//! * The DLL's own parameter vocabulary. Its identifier strings are the
+//!   **space-less** UTF-16 names (`strings -el`): the responses `LowPass`,
+//!   `HighPass`, `BandPass`, `BandStop`, `LowShelf`, `HighShelf`, `BandShelf`
+//!   (plus `AllPass`, `BandPass1`, `BandPass2`, which this port recognises but
+//!   does not model) and the designs `Bessel`, `Butterworth`, `ChebyshevI`,
+//!   `ChebyshevII`, `Chebyshev1`, `Chebyshev2`, `Elliptic`, `Legendre`, `RBJ`,
+//!   `Custom`, `OnePole`, `TwoPole`. The *spaced* spellings
+//!   (`Low Pass`, `Chebyshev I`, …) occur in the binary in neither encoding —
+//!   they are this port's readable canonical values (the dossier's
+//!   transcription), and the space-less identifiers are accepted as aliases of
+//!   them. The only spaced strings in the image are the parameter **labels**
+//!   (`Custom One-Pole`, `Custom Two-Pole`, `Center Frequency`,
+//!   `Cutoff Frequency`, `Bandwidth (Hz)`, `Bandwidth (Octaves)`, `Order`,
+//!   `Pole Angle`, `Pole Distance`, `Pole Real`), which this port reproduces
+//!   in its parameter table. The DLL's template instances
+//!   (`Dsp::FilterDesign<Dsp::LowPass … Design::{Bessel,Butterworth,
+//!   ChebyshevI,ChebyshevII,Elliptic,Legendre,RBJ}, DirectFormI/II,
+//!   TransposedDirectFormI/II>`) are Vinnie Falco's DSPFilters library, which
+//!   is what the response/design matrix above is.
 //! * Error strings: `invalid usage of ParamInfo`, `attempt to process/reset
 //!   empty ChannelState`, `ClassID mismatched:`.
 //! * Processing is float PCM (`TVPConvertPCMToFloat`), i.e. the same
@@ -52,7 +60,9 @@
 //! defaults, and a real IIR designer/processor behind them — a biquad chain
 //! built from the selected design and response:
 //!
-//! * `RBJ` — the cookbook coefficients, all seven responses.
+//! * `RBJ` — the cookbook coefficients for every response the class names;
+//!   `Band Shelf` maps to the cookbook's **peaking** section (RBJ has no
+//!   band-shelf formula), which the arm comment in `rbj_sections` records.
 //! * `Butterworth`, `Chebyshev I`, `Chebyshev II`, `Bessel`, `Legendre` —
 //!   an analog prototype (computed here: closed forms for Butterworth and the
 //!   two Chebyshev families, the roots of the reverse Bessel polynomial and of
@@ -65,9 +75,13 @@
 //! **Not implemented** (documented, not silently substituted): the
 //! `Elliptic` design and the shelf responses for the non-RBJ designs need the
 //! elliptic function machinery / polynomial shelf algebra of the reference
-//! matrix; both answer a clear error instead of a wrong filter. The DLL's own
-//! Bessel/Legendre pole tables were not extracted (that is a second RE pass on
-//! the 1.1 MB image), so those two prototypes are computed numerically here.
+//! matrix; the DLL's `AllPass`, `BandPass1` and `BandPass2` response
+//! identifiers are recognised but unmodelled (this port names them in its
+//! refusal instead of treating them as typos); and the RBJ `Band Shelf` is the
+//! peaking approximation above. All of them answer a clear error rather than a
+//! wrong filter. The DLL's own Bessel/Legendre pole tables were not extracted
+//! (that is a second RE pass on the 1.1 MB image), so those two prototypes are
+//! computed numerically here.
 //!
 //! **Not reachable from the audio path yet**: like `wfBasicEffect`, nothing in
 //! the engine consumes `WaveSoundBuffer.filters` or carries a filter chain
@@ -97,13 +111,14 @@ pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "WaveDSPFilter (tTJSNC_WaveDSPFilter / tTJSNI_WaveDSPFilter) on WaveSoundBuffer",
     notes: "Real IIR designer and processor behind the recovered member surface: RBJ cookbook \
-            (all seven responses), Butterworth / Chebyshev I / Chebyshev II / Bessel / Legendre \
-            analog prototypes through the bilinear transform, and custom pole placement; the \
-            parameter table carries the recovered labels and design/response names. The Elliptic \
-            design and the non-RBJ shelf responses answer a clear error instead of a wrong \
-            filter (see the module docs). The engine has no per-buffer filter chain yet, so the \
-            filter runs through its Rust `process` entry point only and `interface` answers a \
-            sentinel integer.",
+            (with Band Shelf mapped to the peaking section), Butterworth / Chebyshev I / \
+            Chebyshev II / Bessel / Legendre analog prototypes through the bilinear transform, \
+            and custom pole placement; the parameter table carries the recovered labels and both \
+            the DLL's own identifiers and the readable spellings for design/response values. The \
+            Elliptic design, the DLL's AllPass/BandPass1/BandPass2 identifiers and the non-RBJ \
+            shelf responses answer a clear error instead of a wrong filter (see the module docs). \
+            The engine has no per-buffer filter chain yet, so the filter runs through its Rust \
+            `process` entry point only and `interface` answers a sentinel integer.",
     install: |engine| engine.register_plugin(WfTypicalDspPlugin),
 };
 
@@ -134,7 +149,8 @@ const INTERFACE_SENTINEL: i64 = 0x5746_0101;
 // The recovered vocabularies
 // ---------------------------------------------------------------------------
 
-/// The response names from the DLL's string table.
+/// This port's canonical response values (the dossier's spaced spellings; the
+/// DLL itself only has the space-less identifiers below).
 pub const RESPONSE_NAMES: [&str; 7] = [
     "Low Pass",
     "High Pass",
@@ -145,7 +161,7 @@ pub const RESPONSE_NAMES: [&str; 7] = [
     "Band Shelf",
 ];
 
-/// The design names from the DLL's string table.
+/// This port's canonical design values.
 pub const DESIGN_NAMES: [&str; 7] = [
     "Bessel",
     "Butterworth",
@@ -156,9 +172,66 @@ pub const DESIGN_NAMES: [&str; 7] = [
     "RBJ",
 ];
 
-/// The two pole-placement designs (the DLL's `Custom One-Pole` /
-/// `Custom Two-Pole` strings).
+/// The two pole-placement designs (the DLL's `Custom` + `OnePole`/`TwoPole`
+/// identifiers, labelled `Custom One-Pole` / `Custom Two-Pole`).
 pub const CUSTOM_DESIGN_NAMES: [&str; 2] = ["Custom One-Pole", "Custom Two-Pole"];
+
+/// The DLL's own space-less response identifiers (`strings -el`), each mapped
+/// to the canonical value it aliases.
+pub const RESPONSE_IDENTIFIERS: [(&str, &str); 7] = [
+    ("LowPass", "Low Pass"),
+    ("HighPass", "High Pass"),
+    ("BandPass", "Band Pass"),
+    ("BandStop", "Band Stop"),
+    ("LowShelf", "Low Shelf"),
+    ("HighShelf", "High Shelf"),
+    ("BandShelf", "Band Shelf"),
+];
+
+/// The DLL's design identifiers, including its `Chebyshev1`/`Chebyshev2`
+/// short forms and the `OnePole`/`TwoPole` halves of the custom designs,
+/// each mapped to the canonical value it aliases.
+pub const DESIGN_IDENTIFIERS: [(&str, &str); 13] = [
+    ("Bessel", "Bessel"),
+    ("Butterworth", "Butterworth"),
+    ("ChebyshevI", "Chebyshev I"),
+    ("Chebyshev1", "Chebyshev I"),
+    ("ChebyshevII", "Chebyshev II"),
+    ("Chebyshev2", "Chebyshev II"),
+    ("Elliptic", "Elliptic"),
+    ("Legendre", "Legendre"),
+    ("RBJ", "RBJ"),
+    ("CustomOnePole", "Custom One-Pole"),
+    ("OnePole", "Custom One-Pole"),
+    ("CustomTwoPole", "Custom Two-Pole"),
+    ("TwoPole", "Custom Two-Pole"),
+];
+
+/// The DLL's identifiers this port recognises but does not model: they get a
+/// named refusal rather than the generic unknown-value message.
+pub const UNMODELLED_RESPONSE_IDENTIFIERS: [&str; 3] = ["AllPass", "BandPass1", "BandPass2"];
+
+/// Resolves a response name or identifier to the canonical value.
+pub fn canonical_response(name: &str) -> Option<&'static str> {
+    if let Some(canonical) = RESPONSE_NAMES.iter().find(|candidate| **candidate == name) {
+        return Some(canonical);
+    }
+    RESPONSE_IDENTIFIERS
+        .iter()
+        .find(|(identifier, _)| *identifier == name)
+        .map(|(_, canonical)| *canonical)
+}
+
+/// Resolves a design name or identifier to the canonical value.
+pub fn canonical_design(name: &str) -> Option<&'static str> {
+    if let Some(canonical) = design_names().find(|candidate| *candidate == name) {
+        return Some(canonical);
+    }
+    DESIGN_IDENTIFIERS
+        .iter()
+        .find(|(identifier, _)| *identifier == name)
+        .map(|(_, canonical)| *canonical)
+}
 
 /// Every design name `setParams` accepts.
 pub fn design_names() -> impl Iterator<Item = &'static str> {
@@ -241,7 +314,7 @@ pub enum ResponseType {
 
 impl ResponseType {
     pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
+        Some(match canonical_response(name)? {
             "Low Pass" => Self::LowPass,
             "High Pass" => Self::HighPass,
             "Band Pass" => Self::BandPass,
@@ -289,7 +362,7 @@ pub enum DesignKind {
 
 impl DesignKind {
     pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
+        Some(match canonical_design(name)? {
             "Bessel" => Self::Bessel,
             "Butterworth" => Self::Butterworth,
             "Chebyshev I" => Self::ChebyshevI,
@@ -1658,19 +1731,23 @@ fn filter_set_params(
 fn param_value_from_variant(value: &Variant) -> Result<ParamValue> {
     match value {
         Variant::String(text) => {
-            // Both text parameters draw from recovered vocabularies; any other
-            // string is the recovered ParamInfo error.
-            let known = RESPONSE_NAMES
-                .iter()
-                .chain(DESIGN_NAMES.iter())
-                .chain(CUSTOM_DESIGN_NAMES.iter())
-                .find(|name| **name == text.as_str());
-            match known {
-                Some(name) => Ok(ParamValue::Text(name)),
-                None => Err(TjsError::runtime(format!(
-                    "invalid usage of ParamInfo: unknown value `{text}`"
-                ))),
+            // Both text parameters accept the canonical spellings and the
+            // DLL's own space-less identifiers; anything else is the recovered
+            // ParamInfo error (with the DLL's unmodelled identifiers named).
+            if let Some(canonical) = canonical_response(text).or_else(|| canonical_design(text)) {
+                return Ok(ParamValue::Text(canonical));
             }
+            if UNMODELLED_RESPONSE_IDENTIFIERS
+                .iter()
+                .any(|identifier| identifier == text)
+            {
+                return Err(TjsError::runtime(format!(
+                    "invalid usage of ParamInfo: `{text}` is a WaveDSPFilter identifier this port does not model"
+                )));
+            }
+            Err(TjsError::runtime(format!(
+                "invalid usage of ParamInfo: unknown value `{text}`"
+            )))
         }
         Variant::Void | Variant::Null => Err(TjsError::runtime(
             "invalid usage of ParamInfo: a parameter value is required".to_string(),
@@ -1894,6 +1971,88 @@ mod tests {
             "(function() { var f = new WaveDSPFilter(); try { f.setParams(\"design\", \"Elliptic\"); } catch (e) {} return f.label; })()",
         );
         assert_eq!(value, "Butterworth");
+    }
+
+    /// The DLL's own space-less identifiers are accepted alongside the
+    /// readable spellings, and the stored value is the canonical one. The
+    /// identifiers were read from the shipped image (`strings -el`):
+    /// `LowPass`, `HighPass`, `BandPass`, `BandStop`, `LowShelf`, `HighShelf`,
+    /// `BandShelf`, `Bessel`, `Butterworth`, `ChebyshevI`, `ChebyshevII`,
+    /// `Chebyshev1`, `Chebyshev2`, `Elliptic`, `Legendre`, `RBJ`, `Custom`,
+    /// `OnePole`, `TwoPole` (+ the unmodelled `AllPass`, `BandPass1`,
+    /// `BandPass2`).
+    #[test]
+    fn the_dll_identifier_spellings_are_accepted() {
+        let mut engine = engine();
+        let value = string(
+            &mut engine,
+            "(function() {\n\
+                 var f = new WaveDSPFilter();\n\
+                 f.setParams(\"type\", \"LowPass\", \"design\", \"ChebyshevI\");\n\
+                 var first = f.currentValue(\"type\") + \"/\" + f.currentValue(\"design\");\n\
+                 f.setParams(%[type: \"HighPass\", design: \"Chebyshev1\"]);\n\
+                 var second = f.currentValue(\"type\") + \"/\" + f.currentValue(\"design\");\n\
+                 f.setParams(\"design\", \"OnePole\", \"poleDistance\", 0.5);\n\
+                 var third = f.currentValue(\"design\");\n\
+                 f.setParams(\"design\", \"RBJ\", \"type\", \"HighShelf\");\n\
+                 var fourth = f.currentValue(\"type\") + \"/\" + f.currentValue(\"design\");\n\
+                 return first + \"|\" + second + \"|\" + third + \"|\" + fourth;\n\
+             })()",
+        );
+        assert_eq!(
+            value,
+            "Low Pass/Chebyshev I|High Pass/Chebyshev I|Custom One-Pole|High Shelf/RBJ"
+        );
+
+        // A recognised-but-unmodelled identifier is named, not treated as a
+        // typo.
+        let error = try_run(
+            &mut engine,
+            "(function() { var f = new WaveDSPFilter(); f.setParams(\"type\", \"AllPass\"); return 0; })()",
+        )
+        .expect_err("AllPass is not modelled");
+        assert!(
+            error.message.contains("AllPass") && error.message.contains("does not model"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    /// Every identifier the module claims to accept really resolves, and every
+    /// alias maps onto a canonical name the enum understands.
+    #[test]
+    fn every_identifier_alias_resolves_to_a_known_value() {
+        for (identifier, canonical) in RESPONSE_IDENTIFIERS {
+            assert_eq!(
+                canonical_response(identifier),
+                Some(canonical),
+                "{identifier} must resolve to {canonical}"
+            );
+            assert!(
+                ResponseType::from_name(identifier).is_some(),
+                "{identifier} must build a response"
+            );
+        }
+        for (identifier, canonical) in DESIGN_IDENTIFIERS {
+            assert_eq!(
+                canonical_design(identifier),
+                Some(canonical),
+                "{identifier} must resolve to {canonical}"
+            );
+            assert!(
+                DesignKind::from_name(identifier).is_some(),
+                "{identifier} must build a design"
+            );
+        }
+        for canonical in RESPONSE_NAMES {
+            assert_eq!(canonical_response(canonical), Some(canonical));
+        }
+        for canonical in design_names() {
+            assert_eq!(canonical_design(canonical), Some(canonical));
+        }
+        for identifier in UNMODELLED_RESPONSE_IDENTIFIERS {
+            assert_eq!(canonical_response(identifier), None);
+        }
     }
 
     #[test]
