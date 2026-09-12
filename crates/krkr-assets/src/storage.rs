@@ -2187,6 +2187,25 @@ fn path_to_storage_name(path: &Path) -> String {
     normalize_storage_separators(&path.to_string_lossy())
 }
 
+/// The engine's extension completion for a name that carries no known
+/// extension. The reference has no completion at this layer:
+/// `TVPGetPlacedPath` (`krkrz/base/StorageIntf.cpp:1153-1197`) probes the name
+/// as given and then the auto-path table, and the completion a game relies on
+/// is the game's own -- KAGEX appends the extension itself and probes the
+/// exact name (`system/Utils.tjs:373 getExistFileNameAutoExtFill`, fed by
+/// `_imageFileExtList`, `system/KAGEnvironment.tjs:60300`, and
+/// `Layer.SupportedExtensions`, `system/Utils.tjs:2409`), while a graphic load
+/// suggests the registered handler's extensions (`TVPInternalLoadGraphic`,
+/// `krkrz/visual/GraphicsLoaderIntf.cpp:1480-1503`). This list is the
+/// engine-side equivalent for the load path, so it stays explicit and
+/// ordered: the order decides what a bare stem resolves to.
+///
+/// KAGEX image-source extensions (`stand`, `sinfo`, `event`, `stage`, `emf`)
+/// are deliberately absent. The game spells those names out before probing
+/// (`Storages.isExistentStorage(name + extension)`), so `foo` resolving to
+/// `foo.stand` here would answer a call the reference answers with `""` and
+/// flip the branch (`Storages.getPlacedPath(stem)` then
+/// `getPlacedPath(stem + ".stand")`) the framework probes with.
 fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
     let name = normalize_storage_separators(name);
     clean_relative_path(&name)?;
@@ -2213,7 +2232,8 @@ fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
 fn is_known_storage_extension(extension: &str) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "png"
+        "tlg"
+            | "png"
             | "jpg"
             | "jpeg"
             | "bmp"
@@ -3387,6 +3407,208 @@ mod tests {
         );
         assert!(fs_storage.read_binary_vec("sky").is_ok());
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The completion rule every load path (`Storages.open`, `read_data`) and
+    /// `Storages.getPlacedPath` applies when the name carries no known
+    /// extension. KRKR's own `TVPGetPlacedPath` does not complete names at all
+    /// (`krkrz/base/StorageIntf.cpp:1153-1197` probes the name as given and
+    /// then the auto-path table), so this list is the engine-side equivalent
+    /// of the graphic loader's extension suggestion
+    /// (`TVPInternalLoadGraphic`, `krkrz/visual/GraphicsLoaderIntf.cpp:1480-1503`,
+    /// which walks the registered graphic handlers). The order decides what a
+    /// bare stem resolves to, so the list is pinned here as a fixture instead
+    /// of drifting with the next format that gets added.
+    #[test]
+    fn completion_offers_the_known_extensions_in_order() {
+        let storage = ProjectStorage::from_memory(std::iter::empty::<(&str, Vec<u8>)>());
+        // The layer directories are auto paths of their own, so the raw
+        // candidate list interleaves them; the completion rule itself is the
+        // sequence of directory-free spellings.
+        let stems: Vec<String> = storage
+            .storage_candidates("hero")
+            .expect("candidates")
+            .into_iter()
+            .filter(|candidate| !candidate.contains('/'))
+            .collect();
+        assert_eq!(
+            stems,
+            [
+                "hero",
+                "hero.tlg",
+                "hero.png",
+                "hero.jpg",
+                "hero.jpeg",
+                "hero.bmp",
+                "hero.webp",
+                "hero.ks",
+                "hero.tjs",
+                "hero.asd",
+                "hero.ogg",
+                "hero.wav",
+                "hero.tcw",
+                "hero.mpg",
+                "hero.mpeg",
+            ]
+            .map(str::to_string)
+        );
+
+        // With an auto path, each spelling is followed by its auto-path
+        // candidate: the reference resolves one name against every declared
+        // path before trying the next name. Auto paths are searched in
+        // reverse declaration order, so the freshly added one comes first.
+        storage.add_auto_path("fgimage/");
+        let candidates = storage.storage_candidates("hero").expect("candidates");
+        assert_eq!(
+            candidates.into_iter().take(2).collect::<Vec<_>>(),
+            ["hero", "fgimage/hero"].map(str::to_string)
+        );
+    }
+
+    /// Two candidates on disk: the first extension in the list wins, and a
+    /// name that already carries a known extension is never re-extended.
+    #[test]
+    fn completion_picks_the_first_file_and_leaves_extended_names_alone() {
+        let storage = ProjectStorage::from_memory([
+            ("hero.png", b"png".to_vec()),
+            ("hero.tlg", b"tlg".to_vec()),
+        ]);
+        assert_eq!(
+            storage.resolved_storage_name("hero").as_deref(),
+            Some("hero.tlg")
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("hero")
+                .expect("first candidate wins"),
+            b"tlg"
+        );
+
+        // `hero.png` names one file: the known extension stops completion, so
+        // the `.tlg` sibling is not offered even though it exists.
+        let candidates = storage.storage_candidates("hero.png").expect("candidates");
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.ends_with(".tlg")),
+            "{candidates:?}"
+        );
+        assert_eq!(
+            candidates
+                .into_iter()
+                .filter(|candidate| !candidate.contains('/'))
+                .collect::<Vec<_>>(),
+            ["hero.png".to_string()]
+        );
+        assert_eq!(
+            storage.resolved_storage_name("hero.png").as_deref(),
+            Some("hero.png")
+        );
+        assert!(storage.read_binary_vec("hero.png").is_ok());
+    }
+
+    /// The pathological spellings a script can pass. They must stay
+    /// deterministic: an empty or dot-terminated name is probed as-is first
+    /// and only then extended, an unknown extension is treated like no
+    /// extension at all, and case is honoured by the case-insensitive layer
+    /// lookup without changing the returned spelling.
+    #[test]
+    fn completion_handles_pathological_names() {
+        let storage = ProjectStorage::from_memory([("hero.tlg", b"tlg".to_vec())]);
+
+        // Empty name: the reference returns "" early (`StorageIntf.cpp:262`
+        // for normalization) and `TVPGetPlacedPath` reports nothing.
+        assert!(storage.resolved_storage_name("").is_none());
+        let empty: Vec<String> = storage
+            .storage_candidates("")
+            .expect("candidates")
+            .into_iter()
+            .filter(|candidate| !candidate.contains('/'))
+            .collect();
+        assert_eq!(empty[..2], ["", ".tlg"].map(str::to_string));
+
+        // A trailing dot is not a known extension, so the stem is used
+        // verbatim (`hero.`) and completion appends to the whole name.
+        let dotted: Vec<String> = storage
+            .storage_candidates("hero.")
+            .expect("candidates")
+            .into_iter()
+            .filter(|candidate| !candidate.contains('/'))
+            .collect();
+        assert_eq!(dotted[..2], ["hero.", "hero..tlg"].map(str::to_string));
+        assert!(storage.resolved_storage_name("hero.").is_none());
+
+        // An unknown extension completes like a bare stem: `hero.xyz` first,
+        // then `hero.xyz.tlg`, so a script's made-up suffix can still reach a
+        // real file only when that exact name exists.
+        let unknown: Vec<String> = storage
+            .storage_candidates("hero.xyz")
+            .expect("candidates")
+            .into_iter()
+            .filter(|candidate| !candidate.contains('/'))
+            .collect();
+        assert_eq!(
+            unknown[..2],
+            ["hero.xyz", "hero.xyz.tlg"].map(str::to_string)
+        );
+        assert!(storage.resolved_storage_name("hero.xyz").is_none());
+
+        // Case: completion is suffix-based, and the lookup below it is
+        // case-insensitive, so an upper-case spelling resolves and reports
+        // the spelling the script asked for (the reference's placed path is
+        // likewise the normalized request, not the on-disk case).
+        assert_eq!(
+            storage.resolved_storage_name("HERO.TLG").as_deref(),
+            Some("HERO.TLG")
+        );
+        assert_eq!(
+            storage.resolved_storage_name("HERO").as_deref(),
+            Some("HERO.tlg")
+        );
+        assert_eq!(storage.read_binary_vec("HERO.TLG").expect("case"), b"tlg");
+    }
+
+    /// KAGEX resolves stand definitions itself: `system/Utils.tjs:373`
+    /// `getExistFileNameAutoExtFill` appends the caller's extension list and
+    /// probes `Storages.isExistentStorage`, and `system/AffineSource.tjs:667`
+    /// `findAffineSource` then classifies the source by the extension it sees
+    /// (`.stand`/`.sinfo`/`.event` -> `AffineSourceStand`,
+    /// `system/AffineSourceStand.tjs:1554-1556`). The engine therefore has to
+    /// resolve the exact `foo.stand` name through the auto path, and must not
+    /// answer a bare stem with its `.stand` sibling: the game's own probe
+    /// order (`getPlacedPath(stem)` then `getPlacedPath(stem + ".stand")`)
+    /// and `findAffineSource`'s fallback depend on the miss, and the
+    /// reference's `TVPGetPlacedPath` reports nothing for the stem either.
+    #[test]
+    fn kagex_stand_and_sinfo_names_resolve_exactly_and_a_bare_stem_stays_missing() {
+        let storage = ProjectStorage::from_memory([
+            ("fgimage/アカリ.stand", b"stand definition".to_vec()),
+            ("fgimage/info/アカリＡ.sinfo", b"#face info".to_vec()),
+        ]);
+        storage.add_auto_path("fgimage/");
+        storage.add_auto_path("fgimage/info/");
+
+        assert_eq!(
+            storage.resolved_storage_name("アカリ.stand").as_deref(),
+            Some("fgimage/アカリ.stand")
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("アカリ.stand")
+                .expect("the stand definition loads"),
+            b"stand definition"
+        );
+        assert!(storage.storage_exists_exact("アカリＡ.sinfo"));
+        assert_eq!(
+            storage
+                .read_binary_vec("アカリＡ.sinfo")
+                .expect("the face info loads"),
+            b"#face info"
+        );
+
+        assert!(storage.resolved_storage_name("アカリ").is_none());
+        assert!(!storage.storage_exists_exact("アカリ"));
+        assert!(storage.read_binary_vec("アカリ").is_err());
     }
 
     #[test]
