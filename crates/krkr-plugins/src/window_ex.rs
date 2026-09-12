@@ -13,8 +13,10 @@
 //!   `WM_QUERYOPEN` event and switches `_loadExternalIcon` to
 //!   `TVPGetLocallyAccessibleName` (`main.cpp:100-111`).
 //!
-//! This port follows the krkr2 copy; every citation below is a line of that
-//! file. All sources are Shift-JIS.
+//! This port follows the krkr2 copy; a citation without a tree prefix is a
+//! line of that `main.cpp`, while engine-internal files are cited from the
+//! krkrz tree (`krkrz/src/core/…`) that this engine's own comments use. All
+//! sources are Shift-JIS.
 //!
 //! # What the reference is
 //!
@@ -24,7 +26,7 @@
 //! (attach-function). `WindowEx` also installs a native message receiver
 //! (`main.cpp:617-630`) so that the Win32 message procedure's non-client
 //! events reach TJS as `onMinimize`…`onWindowsMessageHook`
-//! (`main.cpp:6-29`).
+//! (`main.cpp:8-32`).
 //!
 //! # What this port covers
 //!
@@ -50,10 +52,15 @@
 //!   `X/YVIRTUALSCREEN`, `CX/CYVIRTUALSCREEN`) come from the engine, the rest
 //!   answer 0 while the host has no metrics source (`main.cpp:1919-1974`);
 //! * `Window.getWindowRect` / `getClientRect` / `getNormalRect` from the
-//!   engine's window model, which stores the same quantities
-//!   (`WindowIntf.cpp:1317-1590`, `TVPWindow.cpp:625-761`);
-//! * `Window.ncHitTest`'s argument count check and its client-area answer —
-//!   the engine's window has no non-client area to hit-test
+//!   engine's window model, which stores the same quantities (krkrz
+//!   `src/core/visual/WindowIntf.cpp` `:1317` width, `:1437` left, `:1457`
+//!   top, `:1559` innerWidth; the values come from
+//!   `src/core/environ/win32/TVPWindow.cpp:636-761`. krkr2 trunk keeps this
+//!   geometry in `Win32/WindowImpl.cpp` instead, which is why the two trees'
+//!   line numbers differ);
+//! * `Window.ncHitTest`'s argument count check and the reference's own
+//!   null-handle answer: nothing in this engine writes `Window.HWND`, so
+//!   `SendMessage` reaches no window and answers 0, never an `HT*` code
 //!   (`main.cpp:332-339`);
 //! * `MenuItem.rightJustify` / `bmpItem` / `bmpChecked` / `bmpUnchecked`
 //!   including the `no layer object.` error for a non-`Layer` value
@@ -96,7 +103,10 @@
 //!
 //! Nothing here is invented: a member the engine cannot back either keeps the
 //! reference's value for a window-less object or is absent with the
-//! capability named in [`META`].
+//! capability named in [`META`]. The few places where this port answers a
+//! *value* the reference would not produce for such an object — the rect
+//! getters, the engine's published screen metrics, `getAboutString` and
+//! `getDoubleClickTime` — are listed under "Deliberate deviations" below.
 //!
 //! # Deliberate deviations
 //!
@@ -110,8 +120,9 @@
 //!   here because no engine-side object has a parent `HMENU`.
 //! * `getWindowRect` / `getClientRect` / `getNormalRect` read the engine's
 //!   window model (`Window.left/top/width/height`, `innerWidth`/`innerHeight`)
-//!   — the same quantities the official getters read (`TVPWindow.cpp:636-761`)
-//!   — instead of calling `GetWindowRect` on a handle.
+//!   — the same quantities the official getters read (krkrz
+//!   `src/core/environ/win32/TVPWindow.cpp:636-761`) — instead of calling
+//!   `GetWindowRect` on a handle.
 //! * `getSystemMetrics` answers the geometry the engine publishes on `System`
 //!   (`screenWidth`, `screenHeight`, `desktopLeft/Top/Width/Height`) for the
 //!   six metrics that name it, and 0 for the rest.
@@ -149,10 +160,13 @@ pub(crate) const META: PluginMeta = PluginMeta {
             maximizeBox/minimizeBox/disableMove/resetExSystemMenu). Real: ncht* and bi* constants, \
             Window._Notifications + getNotificationNum/getNotificationName, registerExEvent's \
             event caches, disableResize/disableMove/enableNCMouseEvent/exSystemMenu state, \
-            setMessageHook's 0..0x3FF check and bit bookkeeping, ncHitTest's count check, \
+            setMessageHook's 0..0x3FF check and bit bookkeeping, ncHitTest's count check and the \
+            reference's null-handle answer (0: nothing in this engine writes Window.HWND), \
             readEnvValue/expandEnvString, Scripts.setEvalErrorLog, getSystemMetrics' metric table, \
             the window-rect getters from the engine's window model, MenuItem icon properties with \
-            the reference's no-layer-object error. Members that still need engine support \
+            the reference's no-layer-object error, and the icon members' storage lookup \
+            (file not found. / cannot get in archive icon. for a name without a locally \
+            accessible form). Members that still need engine support \
             (desktop window ops incl. maximize/minimize/restore, z-order, icons and the overlay \
             bitmap, host monitor/cursor/metrics sources, a window message channel for the on* \
             events, Win32 menu backing for popupEx and the MenuItem menu-bar update, a Pad class, \
@@ -328,7 +342,7 @@ const SYSTEM_METRICS: &[(&str, i64)] = &[
     ("TABLETPC", 86), ("XVIRTUALSCREEN", 76), ("YVIRTUALSCREEN", 77),
 ];
 
-/// One extended event of `main.cpp:6-29`, with the number of arguments the
+/// One extended event of `main.cpp:8-32`, with the number of arguments the
 /// reference's message receiver passes when it calls the script member.
 ///
 /// `deferred` marks the four names `checkExEvents` (`main.cpp:662-667`) caches
@@ -398,6 +412,15 @@ fn tjs_fail() -> TjsError {
 /// truncates it, and an object raises the conversion error.
 fn as_integer_flag(value: &Variant) -> Result<bool> {
     Ok(value.to_integer()? != 0)
+}
+
+/// `(tjs_int)value.AsInteger()` — TJS's value→number conversion, which for
+/// strings is hex- and prefix-aware (`"0x10"` is 16, `"5abc"` is 5;
+/// `runtime/value.rs` `string_to_integer`). Rust's `str::parse` is a different
+/// conversion and must not stand in for it. A value that cannot convert at all
+/// reads as 0.
+fn as_integer_value(value: &Variant) -> i64 {
+    value.to_integer().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -988,9 +1011,10 @@ fn notification_number(runtime: &mut Runtime<KrkrHost>, name: &str) -> Result<i6
     match runtime.resolve_object_member(table, name) {
         Ok(Variant::Void) | Err(_) => Ok(-1),
         Ok(Variant::Integer(value)) => Ok(value),
-        Ok(Variant::Real(value)) => Ok(value as i64),
-        Ok(Variant::String(value)) => Ok(value.parse().unwrap_or(0)),
-        Ok(_) => Ok(0),
+        // `ncbPropAccessor::getIntValue` converts through `(tjs_int)`, i.e.
+        // TJS's own string→number conversion — `"0x10"` is 16 and `"5abc"` is 5
+        // (`runtime/value.rs` `string_to_integer`), never Rust's `str::parse`.
+        Ok(value) => Ok(as_integer_value(&value)),
     }
 }
 
@@ -1152,14 +1176,19 @@ fn window_set_window_icon(
     Ok(Variant::Void)
 }
 
-/// `_loadExternalIcon` (`main.cpp:100-111`): a name that does not resolve is
-/// `file not found.`, and a name inside an archive cannot yield an icon
-/// (`cannot get in archive icon.`). Extracting an `HICON` from a local file is
-/// the platform part this engine has no loader for.
+/// `_loadExternalIcon` (`main.cpp:100-111`, the krkr2 line): a name that does
+/// not resolve at all is `file not found.`, and a name that resolves but has no
+/// *locally accessible* form is `cannot get in archive icon.` — the icon is
+/// extracted from a file on disk, so an XP3 member or a `media://` or
+/// memory-backed resource cannot yield one. `KrkrHost::placed_path`
+/// (`host.rs:1009-1015`) is exactly that test: it answers `None` for everything
+/// that is not a local file.
 fn resolve_icon_storage(runtime: &mut Runtime<KrkrHost>, file: &str) -> Result<()> {
     match runtime.host().placed_storage_name(file) {
         None => Err(TjsError::runtime(FILE_NOT_FOUND)),
-        Some(placed) if placed.contains('>') => Err(TjsError::runtime(CANNOT_GET_IN_ARCHIVE_ICON)),
+        Some(_) if runtime.host().placed_path(file).is_none() => {
+            Err(TjsError::runtime(CANNOT_GET_IN_ARCHIVE_ICON))
+        }
         Some(_) => Ok(()),
     }
 }
@@ -1174,7 +1203,8 @@ fn window_get_window_rect(
     };
     // `GetWindowRect` (`main.cpp:138-147`). `Window.left/top/width/height` are
     // the same outer rectangle: the official getters read `GetWindowRect`
-    // (`TVPWindow.cpp:636-725`), and this engine's window model stores them.
+    // (krkrz `src/core/environ/win32/TVPWindow.cpp:636-725`), and this engine's
+    // window model stores them.
     let x = window_number(runtime, this, "left");
     let y = window_number(runtime, this, "top");
     let w = window_number(runtime, this, "width");
@@ -1192,9 +1222,9 @@ fn window_get_client_rect(
     };
     // `GetClientRect` + `ClientToScreen` (`main.cpp:150-163`).
     // `Window.innerWidth/innerHeight` is the client size in the official
-    // interface (`WindowIntf.cpp:1559` reads `GetInnerWidth`, which is
-    // `GetClientRect().width`); the engine's window has no non-client border,
-    // so the client origin is the window origin.
+    // interface (krkrz `src/core/visual/WindowIntf.cpp:1559` reads
+    // `GetInnerWidth`, which is `GetClientRect().width`); the engine's window
+    // has no non-client border, so the client origin is the window origin.
     let x = window_number(runtime, this, "left");
     let y = window_number(runtime, this, "top");
     let w = window_number(runtime, this, "innerWidth");
@@ -1223,7 +1253,7 @@ fn window_get_normal_rect(
 }
 
 fn window_nc_hit_test(
-    runtime: &mut Runtime<KrkrHost>,
+    _runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
@@ -1234,11 +1264,13 @@ fn window_nc_hit_test(
     }
     let _x = args[0].to_integer()? & 0xFFFF;
     let _y = args[1].to_integer()? & 0xFFFF;
-    // The engine's window has no non-client area of its own, so every point
-    // in it is client area — the answer `WM_NCHITTEST` gives for a window
-    // whose frame the host draws separately.
-    log_gap_once(runtime, "Window.ncHitTest", CAP_WINDOW_OPS);
-    Ok(Variant::Integer(1))
+    // `*r = (tjs_int)::SendMessage(GetHWND(obj), WM_NCHITTEST, 0, …)`
+    // (`main.cpp:337`) reads the handle off the object's `HWND` property
+    // (`:47-51`). Nothing in this engine ever writes `Window.HWND`, so the
+    // reference's own null-handle path is the one that applies: the message
+    // goes nowhere and `SendMessage` answers 0 — never an `HT*` code, which a
+    // window-less object cannot produce.
+    Ok(Variant::Integer(0))
 }
 
 fn window_set_message_hook(
@@ -1439,13 +1471,14 @@ fn menu_item_property_set(
             set_state_flag(runtime, this_obj, name, as_integer_flag(&value)?);
         }
         _ => {
-            let stored = match value {
+            let stored = match &value {
                 // `setBmpSelect` (`main.cpp:1143-1165`) stores
                 // `(HBITMAP)v.AsInteger()` for void, integer and string
-                // arguments…
+                // arguments — TJS's conversion, so the string `"0x10"` stores
+                // 16…
                 Variant::Void => Variant::Integer(0),
-                Variant::Integer(number) => Variant::Integer(number),
-                Variant::String(text) => Variant::Integer(text.parse().unwrap_or(0)),
+                Variant::Integer(number) => Variant::Integer(*number),
+                Variant::String(_) => Variant::Integer(as_integer_value(&value)),
                 Variant::Object(_) | Variant::Closure(_) => {
                     let Some(layer) = value.object_handle() else {
                         return Ok(());
@@ -2266,10 +2299,14 @@ mod tests {
     #[test]
     fn a_script_owned_notification_table_is_used_as_is() {
         let mut engine = engine();
-        let source = "Window._Notifications = %[\"SIZE\" => 42]; \
+        // The `"0x10"` entry pins the conversion: `ncbPropAccessor::getIntValue`
+        // goes through TJS's `(tjs_int)`, so a hex string is 16 and not Rust's
+        // `str::parse` result of 0.
+        let source = "Window._Notifications = %[\"SIZE\" => 42, \"MOVE\" => \"0x10\"]; \
                       return \"\" + Window.getNotificationNum(\"SIZE\") + \"/\" \
-                          + Window.getNotificationNum(\"MOVE\");";
-        assert_eq!(script_text(&mut engine, source), "42/-1");
+                          + Window.getNotificationNum(\"MOVE\") + \"/\" \
+                          + Window.getNotificationNum(\"NOPE\");";
+        assert_eq!(script_text(&mut engine, source), "42/16/-1");
     }
 
     #[test]
@@ -2365,9 +2402,12 @@ mod tests {
             eval_error(&mut engine, "(new Window()).ncHitTest(1)").kind,
             TjsErrorKind::BadParamCount
         );
+        // Nothing in this engine writes `Window.HWND`, so the reference's
+        // `SendMessage` reaches no window: the answer is 0, never an `HT*` code
+        // (`main.cpp:337`).
         assert_eq!(
             text(&mut engine, "(new Window()).ncHitTest(10, 20)"),
-            "1"
+            "0"
         );
     }
 
@@ -2416,6 +2456,68 @@ mod tests {
         assert_eq!(eval(&mut engine, "System.setApplicationIcon()"), Variant::Void);
     }
 
+    /// `_loadExternalIcon` (`main.cpp:100-111`, the krkr2 line) resolves the
+    /// name with `TVPGetPlacedPath` and then asks for a *locally accessible*
+    /// one: an XP3 member or a memory-backed resource resolves but cannot be
+    /// opened as a file, which is the reference's `cannot get in archive icon.`
+    /// A local file passes the lookup and only the missing platform icon loader
+    /// stops it (which the handler reports as a gap, not an error).
+    #[test]
+    fn icon_storage_rule_asks_for_a_locally_accessible_name() {
+        use krkr_assets::ProjectStorage;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kirakira-windowex-icons-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create project root");
+        std::fs::write(root.join("icon.ico"), b"not an icon").expect("write icon");
+
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(std::sync::Arc::new(storage)),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine
+            .register_plugin(WindowExPlugin)
+            .expect("windowEx plugin");
+        // A mounted resource resolves by name but has no local path, exactly
+        // like an XP3 member: `KrkrHost::placed_path` is `None` for both
+        // (`krkr-assets/src/storage.rs:876-881`).
+        engine
+            .host_mut()
+            .mount_virtual_resource("mounted.icon", b"icon".to_vec())
+            .expect("mount");
+
+        assert!(
+            eval_error(&mut engine, "Window.setWindowIcon(\"mounted.icon\")")
+                .message
+                .contains("cannot get in archive icon.")
+        );
+        assert!(
+            eval_error(&mut engine, "System.setApplicationIcon(\"mounted.icon\")")
+                .message
+                .contains("cannot get in archive icon.")
+        );
+        // The file exists on disk, so the lookup succeeds.
+        assert_eq!(
+            eval(&mut engine, "Window.setWindowIcon(\"icon.ico\")"),
+            Variant::Void
+        );
+        assert!(
+            eval_error(&mut engine, "Window.setWindowIcon(\"absent.ico\")")
+                .message
+                .contains("file not found.")
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn menu_item_properties_follow_the_reference() {
         let mut engine = engine();
@@ -2431,8 +2533,16 @@ mod tests {
             var layer = item.bmpItem; \
             item.bmpUnchecked = \"0\"; \
             var stringy = item.bmpUnchecked; \
-            return \"\" + before + after + unset + set + layer + stringy;";
-        assert_eq!(script_text(&mut engine, source), "0103-10");
+            item.bmpUnchecked = \"0x10\"; \
+            var hex = item.bmpUnchecked; \
+            item.bmpChecked = \"5abc\"; \
+            var prefixed = item.bmpChecked; \
+            return \"\" + before + after + unset + set + layer + stringy \
+                + \"/\" + hex + \"/\" + prefixed;";
+        // `setBmpSelect` stores `(HBITMAP)v.AsInteger()` (`main.cpp:1150`), so a
+        // hex string is 16 and a trailing-garbage string is 5 — TJS's
+        // conversion, not Rust's `str::parse`.
+        assert_eq!(script_text(&mut engine, source), "0103-10/16/5");
 
         assert!(
             eval_error(&mut engine, "(new MenuItem(new Window(), \"p\")).bmpItem = %[]")
