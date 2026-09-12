@@ -129,7 +129,12 @@ impl Renderer {
         let physical_size = window.inner_size();
         let scale_factor = window.scale_factor();
 
-        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        // The instance carries the window's display handle: the GL backend
+        // needs it to present on Wayland, and without it a session whose
+        // Vulkan driver never loads has no backend able to create the surface
+        // at all (the failure then reports an empty per-backend error map).
+        let mut instance_descriptor =
+            wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()));
         instance_descriptor.backends = preferred_backends();
         let instance = wgpu::Instance::new(instance_descriptor);
         let surface = instance
@@ -1152,7 +1157,12 @@ fn preferred_backends() -> wgpu::Backends {
 
 #[cfg(all(feature = "winit-surface", not(target_os = "macos")))]
 fn preferred_backends() -> wgpu::Backends {
-    wgpu::Backends::PRIMARY
+    // `Backends::PRIMARY` has no GL.  A Linux session whose Vulkan driver is
+    // not loadable (a bare nix shell, a machine without the loader path) would
+    // otherwise have no backend able to create the window surface; the GL
+    // backend covers it, and the display handle above gives it the Wayland
+    // connection it needs.
+    wgpu::Backends::PRIMARY | wgpu::Backends::GL
 }
 
 fn collect_image_texture_ids(commands: &[DrawCommand], texture_ids: &mut BTreeSet<TextureId>) {
@@ -1506,10 +1516,7 @@ enum TransitionFace {
 }
 
 /// The draw list behind one face.
-fn transition_face_commands(
-    transition: &FrameTransition,
-    face: TransitionFace,
-) -> &[DrawCommand] {
+fn transition_face_commands(transition: &FrameTransition, face: TransitionFace) -> &[DrawCommand] {
     match face {
         TransitionFace::Old => &transition.frozen_draw_commands,
         TransitionFace::Under => &transition.under_draw_commands,
@@ -1612,7 +1619,12 @@ fn transition_uniforms(
         .dest_rect
         .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
         .map(|rect| [rect.x, rect.y, rect.width, rect.height])
-        .unwrap_or([0.0, 0.0, content_size.width.max(1.0), content_size.height.max(1.0)]);
+        .unwrap_or([
+            0.0,
+            0.0,
+            content_size.width.max(1.0),
+            content_size.height.max(1.0),
+        ]);
     TransitionUniforms {
         data: [
             [
@@ -1908,12 +1920,7 @@ mod tests {
                 duration_millis: 1000.0,
                 ..TransitionParams::default()
             },
-            dest_rect: Some(Rect::new(
-                0.0,
-                0.0,
-                WAVE_WIDTH as f32,
-                WAVE_HEIGHT as f32,
-            )),
+            dest_rect: Some(Rect::new(0.0, 0.0, WAVE_WIDTH as f32, WAVE_HEIGHT as f32)),
             rule_texture_id: None,
             rule_image_upload: None,
             frozen_draw_commands: Vec::new(),
@@ -2153,12 +2160,11 @@ mod tests {
                     TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint, 0.0),
                     TexturedVertex::new([-1.0, -1.0], [0.0, 1.0], tint, 0.0),
                 ];
-                let vertex_buffer =
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Kirakira test wave vertices"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
+                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Kirakira test wave vertices"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Kirakira test wave pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2422,8 +2428,7 @@ mod tests {
         for channel in 0..3 {
             official[channel] = destination_alpha * destination[channel] * (1.0 - progress)
                 + source_alpha * source[channel] * progress
-                + ((1.0 - destination_alpha) * (1.0 - progress)
-                    + (1.0 - source_alpha) * progress)
+                + ((1.0 - destination_alpha) * (1.0 - progress) + (1.0 - source_alpha) * progress)
                     * under[channel];
         }
         official[3] = 1.0;
