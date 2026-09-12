@@ -39,6 +39,7 @@ use crate::{
         video_overlay_frame_quads,
     },
     plugin::KrkrPlugin,
+    plugin_api::storage::refresh_storage_tables,
     scheduler::{
         ASYNC_TRIGGER_EVENT_NAME, AUDIO_FADE_COMPLETED_EVENT_NAME, IdleEvent, ScriptEvent,
         ScriptEventKind, ScriptEventSelection, TIMER_EVENT_NAME,
@@ -1276,6 +1277,12 @@ impl KrkrEngine {
     }
 
     fn advance(&mut self, delta: Duration) -> Result<EngineTickResult> {
+        // Watched script dictionaries are mirrored once per frame/turn
+        // boundary (`plugin_api::storage::refresh_storage_tables`), before any
+        // script event of this turn runs: a mapping a script wrote on an
+        // earlier turn is visible to storage resolution from here on, on the
+        // script thread and on resource workers alike.
+        refresh_storage_tables(&mut self.tjs_runtime);
         if let Err(error) = apply_completed_resource_loads(&mut self.tjs_runtime) {
             if is_resource_pending_error(&error) {
                 self.kag_session.state = KagTaskState::WaitingResource;

@@ -28,9 +28,12 @@ use krkr_video::{UnavailableVideoFactory, VideoDecoderFactory};
 use crate::{
     KrkrPlugin,
     native::video::VideoOverlayState,
-    plugin_api::transition::{
-        TransitionFace, TransitionFrame, TransitionHandler, TransitionHandlerProvider,
-        TransitionOptions,
+    plugin_api::{
+        storage::StorageScriptTable,
+        transition::{
+            TransitionFace, TransitionFrame, TransitionHandler, TransitionHandlerProvider,
+            TransitionOptions,
+        },
     },
     resource_manager::{
         DecodedImageData, ResourceCompletion, ResourceManager, ResourceTaskId, decode_image_bytes,
@@ -419,6 +422,14 @@ pub struct KrkrHost {
     /// the plugin's `unregister` removes them (`V2Unlink`), and a running
     /// transition keeps the handler it started even then.
     transition_providers: BTreeMap<String, Arc<dyn TransitionHandlerProvider>>,
+    /// Script globals a plugin asked the engine to mirror for its storage
+    /// media (`plugin_api::storage::watch_storage_dictionary`), keyed by the
+    /// global's name.  The tables themselves are `Send + Sync` and belong to
+    /// the plugins (a media holds its table directly); this map is the
+    /// engine's list of what `refresh_storage_tables` has to re-read on the
+    /// script thread.  Design Part A.3.5 of
+    /// `docs/plugins/plugin-facing-engine-facilities.md`.
+    storage_script_tables: BTreeMap<String, Arc<StorageScriptTable>>,
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
     kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
     layer_tree: LayerTree,
@@ -529,6 +540,7 @@ impl Default for KrkrHost {
             plugin_registry: Vec::new(),
             script_linked_plugins: BTreeSet::new(),
             transition_providers: BTreeMap::new(),
+            storage_script_tables: BTreeMap::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
             layer_tree: LayerTree::new(),
@@ -759,6 +771,35 @@ impl KrkrHost {
             .as_ref()
             .map(|storage| storage.storage_media_names())
             .unwrap_or_default()
+    }
+
+    /// Records a storage media's script-table watch
+    /// (`plugin_api::storage::watch_storage_dictionary`) and returns the table
+    /// the engine will keep refreshing under `global_name`.
+    ///
+    /// Idempotent by name: the first table wins, so a plugin whose `register`
+    /// runs at boot and again on the first `Plugins.link` keeps the table its
+    /// media was built around.
+    pub fn watch_storage_table(
+        &mut self,
+        global_name: &str,
+        table: Arc<StorageScriptTable>,
+    ) -> Arc<StorageScriptTable> {
+        self.storage_script_tables
+            .entry(global_name.to_string())
+            .or_insert(table)
+            .clone()
+    }
+
+    /// The table watched under `global_name`, when a plugin watches it.
+    pub fn storage_script_table(&self, global_name: &str) -> Option<Arc<StorageScriptTable>> {
+        self.storage_script_tables.get(global_name).cloned()
+    }
+
+    /// Every watched global's name, in name order — what
+    /// `plugin_api::storage::refresh_storage_tables` re-reads.
+    pub fn storage_script_table_names(&self) -> Vec<String> {
+        self.storage_script_tables.keys().cloned().collect()
     }
 
     /// Registers a plugin-owned transition handler provider
