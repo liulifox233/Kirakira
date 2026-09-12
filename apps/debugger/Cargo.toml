@@ -6,7 +6,10 @@ license.workspace = true
 
 [dependencies]
 krkr-assets.workspace = true
-krkr-audio.workspace = true
+# PARQUET and many KRKR titles ship Ogg Opus BGM/voice.  Keep Opus optional for
+# wasm/headless consumers, but build the harness with the native decoder too, so
+# a standalone `krkr-debug` carries the same codec support as `krkr-desktop`.
+krkr-audio = { workspace = true, features = ["opus"] }
 krkr-core.workspace = true
 krkr-engine.workspace = true
 krkr-plugins.workspace = true
