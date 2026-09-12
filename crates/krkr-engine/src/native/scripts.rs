@@ -438,13 +438,15 @@ fn scripts_get_object_keys(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = required_arg_object(&args, 0, "Scripts.getObjectKeys")?;
-    let mut keys = runtime
+    // `ScriptsAdd::getKeys` appends every non-hidden member in `EnumMembers`
+    // order (`scriptsEx/Main.cpp:252-272` with `DictMemberGetCaller`), which is
+    // the object's bucket walk -- not a sorted list.
+    let keys = runtime
         .object_members(handle)
         .into_iter()
         .map(|(key, _)| key)
         .filter(|key| !is_hidden_member_name(key))
         .collect::<Vec<_>>();
-    keys.sort();
     let values = keys.into_iter().map(Variant::String).collect();
     Ok(Variant::Object(runtime.alloc_array_object(values)))
 }
@@ -526,6 +528,8 @@ fn preview_source(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::retry_interpolated_single_quote_source;
+    use crate::{EngineConfig, KrkrEngine};
+    use krkr_tjs2::runtime::Variant;
 
     #[test]
     fn retries_only_standalone_single_quoted_interpolated_source() {
@@ -534,5 +538,27 @@ mod tests {
             Some("@\"\\\"Let's go\\\"\"".to_string())
         );
         assert_eq!(retry_interpolated_single_quote_source("value + 1"), None);
+    }
+
+    /// `Scripts.getObjectKeys` answers in `EnumMembers` order -- the member
+    /// table's bucket walk (`tTJSCustomObject::InternalEnumMembers`,
+    /// `tjsObject.cpp:1207-1240`), *not* a sorted key list.  `e`, `c`, `a` and
+    /// `b` sit in slots 0, 1, 2 and 3 of the default eight-slot table, so the
+    /// sorted list `a, b, c, e` and the insertion order `e, a, c, b` are both
+    /// wrong.
+    #[test]
+    fn get_object_keys_walks_the_member_table_in_reference_order() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_expression(
+                "order.tjs",
+                "(function() {\n\
+                     var data = %[];\n\
+                     data.e = 1; data.a = 1; data.c = 1; data.b = 1;\n\
+                     return Scripts.getObjectKeys(data).join(\",\");\n\
+                 })()",
+            )
+            .expect("object keys");
+        assert_eq!(value, Variant::String("e,c,a,b".to_string()));
     }
 }

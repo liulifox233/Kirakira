@@ -947,13 +947,13 @@ fn read_png_tags(runtime: &mut Runtime<KrkrHost>, dictionary: Option<ObjectHandl
 /// every member visited, each entry written as
 /// `<name-length>:<name>=<value-length>:<value>,`.
 ///
-/// Three divergences, all in an intentionally unverified corner of the
+/// Two divergences, both in an intentionally unverified corner of the
 /// reference (its own readme: "動作未確認"): the reference's lengths are
-/// `GetNarrowStrLen()` where this uses the UTF-8 byte length; the reference
-/// enumerates in TJS2's dictionary order where [`Runtime::object_members`]
-/// returns the engine's member order (alphabetical today); and a value whose
-/// string conversion fails (an octet) contributes an empty value where the
-/// reference's `ttstr` conversion has no exact Rust analogue.
+/// `GetNarrowStrLen()` where this uses the UTF-8 byte length, and a value
+/// whose string conversion fails (an octet) contributes an empty value where
+/// the reference's `ttstr` conversion has no exact Rust analogue.  The member
+/// order is not a divergence: [`Runtime::object_members`] answers in
+/// `EnumMembers` order, the member table's bucket walk.
 fn tlg_tags_string(runtime: &Runtime<KrkrHost>, dictionary: Option<ObjectHandle>) -> String {
     let Some(dictionary) = dictionary else {
         return String::new();
@@ -2890,9 +2890,11 @@ mod tests {
             u32::from_le_bytes(bytes[tags_offset + 4..tags_offset + 8].try_into().unwrap())
                 as usize;
         assert_eq!(tags_offset + 8 + tags_length, bytes.len());
-        // Members come out in the runtime's order (alphabetical), each as
-        // `<len>:<name>=<len>:<value>,` (`savetlg5.cpp:214`).
-        let tags = "7:comment=5:hello,1:n=1:3,";
+        // Members come out in `EnumMembers` order -- the member table's bucket
+        // walk -- each as `<len>:<name>=<len>:<value>,` (`savetlg5.cpp:214`):
+        // `n` hashes into slot 1 and `comment` into slot 2 of the default
+        // eight-slot table, so `n` comes first.
+        let tags = "1:n=1:3,7:comment=5:hello,";
         assert_eq!(tags_length, tags.len());
         assert!(
             bytes

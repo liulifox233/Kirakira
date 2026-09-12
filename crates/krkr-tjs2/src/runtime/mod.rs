@@ -10,6 +10,7 @@ use crate::vm::{SuspendedCallStack, Vm};
 
 pub(crate) mod builtins;
 pub mod object;
+pub(crate) mod symbol_table;
 pub(crate) mod tjs_ns0;
 pub mod value;
 
@@ -247,6 +248,11 @@ pub struct Runtime<H: TjsHost = NoHost> {
     pub(crate) suspended_call: Option<SuspendedCallStack>,
     pub(crate) debugger: Option<Debugger>,
     pub(crate) debug_ui: Option<Box<dyn DebugUi<H>>>,
+    /// `LastRehashedTick` of the engine's event loop
+    /// (`SystemControl.cpp:176-180`): the wall-clock tick of the last
+    /// `TJSDoRehash`, so [`Runtime::tjs_rehash_tick`] can reproduce the
+    /// reference's 1500 ms cadence.
+    pub(crate) last_rehash_tick: i64,
     host: H,
 }
 
@@ -292,10 +298,32 @@ impl<H: TjsHost + 'static> Runtime<H> {
             suspended_call: None,
             debugger: None,
             debug_ui: None,
+            last_rehash_tick: 0,
             host,
         };
         builtins::install(&mut runtime);
         runtime
+    }
+
+    /// `TJSDoRehash()` (`tjsObject.cpp:362`): mark every object's member table
+    /// stale.  Each object rebuilds lazily on its next member read
+    /// (`:1396-1398`).  This is what `Scripts.rehash` calls, and what the
+    /// reference's 1500 ms event-loop tick calls.
+    pub fn tjs_do_rehash(&mut self) {
+        symbol_table::tjs_do_rehash();
+    }
+
+    /// The engine's rehash tick: `if(!ContinuousEventCalling && tick >
+    /// LastRehashedTick + 1500) { LastRehashedTick = tick; TJSDoRehash(); }`
+    /// (`SystemControl.cpp:176-180`; krkr2 trunk runs the same rule from its
+    /// window message loop, `MainFormUnit.cpp:713-719`).
+    ///
+    /// The reference measures `tick` in milliseconds since startup.
+    pub fn tjs_rehash_tick(&mut self, now_millis: i64) {
+        if now_millis > self.last_rehash_tick + symbol_table::REHASH_TICK_INTERVAL_MILLIS {
+            self.last_rehash_tick = now_millis;
+            self.tjs_do_rehash();
+        }
     }
 
     pub fn global_handle(&self) -> ObjectHandle {
@@ -329,6 +357,21 @@ impl<H: TjsHost + 'static> Runtime<H> {
     pub fn alloc_dictionary_object(&mut self) -> ObjectHandle {
         let handle = self.alloc_ordinary_object();
         self.add_object_class_info(handle, "Dictionary");
+        handle
+    }
+
+    /// A Dictionary whose member table is sized for `count` members, the way
+    /// `tTJSDictionaryClass::CreateNew` builds one
+    /// (`tjsDictionary.cpp:244-257`): an integer count of 8 or more picks the
+    /// bucket count from the size formula, anything else leaves the default
+    /// 8 buckets.  This is how `tTJSBinarySerializer::CreateDictionary` builds
+    /// every dictionary of a deserialized struct except the root
+    /// (`tjsBinarySerializer.cpp:90-98`).
+    pub fn alloc_dictionary_object_sized(&mut self, count: i64) -> ObjectHandle {
+        let handle = self.alloc_dictionary_object();
+        if count >= 8 {
+            self.heap[handle.0].members.rebuild(count);
+        }
         handle
     }
 
@@ -798,7 +841,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
     }
 
     pub fn object_members(&self, object: ObjectHandle) -> Vec<(String, Variant)> {
-        self.heap[object.0].members.clone().into_iter().collect()
+        self.heap[object.0].member_entries()
     }
 
     pub fn has_object_member(&self, object: ObjectHandle, name: &str) -> bool {

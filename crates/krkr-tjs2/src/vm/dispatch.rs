@@ -3156,7 +3156,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         source: ObjectHandle,
         dest: ObjectHandle,
     ) -> Result<()> {
-        let members = self.runtime.heap[source.0].members.clone();
+        let members = self.runtime.heap[source.0].member_entries();
         for (name, value) in members {
             let mut value = self.materialize_code_object(value);
             match &mut value {

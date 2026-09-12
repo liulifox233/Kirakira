@@ -272,7 +272,9 @@ fn assign_copies_keys_that_are_named_like_builtin_members() {
         ),
         Variant::String("String:T".into())
     );
-    // The same rule applies when an Array copies a Dictionary: pairs only.
+    // The same rule applies when an Array copies a Dictionary: pairs only,
+    // and in the source's *enumeration* order -- the reference's bucket walk,
+    // where `page` (hash slot 2) comes before `clear` (slot 4).
     assert_eq!(
         run(
             "dictionary.tjs",
@@ -283,7 +285,7 @@ fn assign_copies_keys_that_are_named_like_builtin_members() {
             return list.count + ":" + list[0] + "=" + list[1] + ":" + list[2] + "=" + list[3];
             "#,
         ),
-        Variant::String("4:clear=true:page=back".into())
+        Variant::String("4:page=back:clear=true".into())
     );
 }
 
@@ -565,5 +567,163 @@ fn kagex_attribute_chain_reaches_the_free_arm() {
             "#,
         ),
         Variant::String("clear".into())
+    );
+}
+
+/// The member order a `Dictionary` (or any ordinary object) enumerates in is
+/// the reference's bucket walk, not a key order and not an insertion order.
+///
+/// `tTJSCustomObject::InternalEnumMembers` (`tjsObject.cpp:1207-1240`) walks
+/// `Symbols` bucket by bucket, and within a bucket the slot's chain before the
+/// slot itself.  These four keys land in slots 0, 1, 2 and 3 of the default
+/// eight-slot table (`hash_name`), so the enumerated order is
+/// `e, c, a, b`: sorted would be `a, b, c, e` and insertion `e, a, c, b`.
+/// `Array.assign` copies a dictionary as name/value pairs in that order
+/// (`tTJSArrayNI::Assign`, `tjsArray.cpp:1060-1085`), so the pairs are the
+/// observable.
+#[test]
+fn members_enumerate_in_the_reference_bucket_order() {
+    assert_eq!(
+        run(
+            "order.tjs",
+            r#"
+            var data = %[];
+            data.e = 1; data.a = 1; data.c = 1; data.b = 1;
+            var list = [];
+            list.assign(data);
+            return list.join(",");
+            "#,
+        ),
+        Variant::String("e,1,c,1,a,1,b,1".into())
+    );
+}
+
+/// Two keys in one slot: the first takes the slot, the later one hangs off its
+/// chain, and the chain is emitted newest-first with the slot last
+/// (`InternalEnumMembers`, `tjsObject.cpp:1219-1240`).
+#[test]
+fn colliding_keys_chain_newest_first_under_their_slot() {
+    assert_eq!(
+        run(
+            "order.tjs",
+            r#"
+            var data = %[];
+            data.e = 1; data.l = 1; data.w = 1; data.y = 1;
+            var list = [];
+            list.assign(data);
+            return list.join(",");
+            "#,
+        ),
+        Variant::String("y,1,w,1,l,1,e,1".into())
+    );
+}
+
+/// A member found at chain position 3 or later moves to the front of its chain
+/// on the read (`Find`'s `if(cnt>2)`, `tjsObject.cpp:1110-1118`), so reading a
+/// deep member changes the order the object enumerates in.
+#[test]
+fn reading_a_deep_chain_member_moves_it_to_the_front() {
+    let probe = |read: &str| {
+        run(
+            "order.tjs",
+            &format!(
+                r#"
+            var data = %[];
+            data.e = 1; data.l = 1; data.w = 1; data.y = 1; data.ab = 1;
+            {read}
+            var list = [];
+            list.assign(data);
+            return list.join(",");
+            "#
+            ),
+        )
+    };
+    // All five keys share one slot: `e` took the slot and `l`, `w`, `y`, `ab`
+    // chained in front of it newest-first, so the chain runs ab, y, w, l.
+    // `w` sits at index 2: no move.
+    assert_eq!(
+        probe("var value = data.w;"),
+        Variant::String("ab,1,y,1,w,1,l,1,e,1".into())
+    );
+    // `l` sits at index 3: the read moves it to the front.
+    assert_eq!(
+        probe("var value = data.l;"),
+        Variant::String("l,1,ab,1,y,1,w,1,e,1".into())
+    );
+}
+
+/// Deleting the slot head frees the slot for the next insert into that bucket,
+/// and the surviving chain stays behind it (`DeleteByName` + `PostClear`,
+/// `tjsObject.cpp:862-866`, `tjsObject.h:451-458`).
+#[test]
+fn deleting_a_slot_head_frees_it_for_the_next_insert() {
+    let build = |extra: &str| {
+        run(
+            "order.tjs",
+            &format!(
+                r#"
+            var data = %[];
+            data.e = 1; data.l = 1; data.w = 1; data.y = 1;
+            {extra}
+            var list = [];
+            list.assign(data);
+            return list.join(",");
+            "#
+            ),
+        )
+    };
+    assert_eq!(
+        build("data.ab = 1;"),
+        Variant::String("ab,1,y,1,w,1,l,1,e,1".into()),
+        "without the delete the new key chains in front of the slot"
+    );
+    assert_eq!(
+        build("delete data.e; data.ab = 1;"),
+        Variant::String("y,1,w,1,l,1,ab,1".into()),
+        "after deleting the head the new key takes the freed slot"
+    );
+}
+
+/// `new Dictionary(count)` (`tjsDictionaryClass::CreateNew`,
+/// `tjsDictionary.cpp:244-257`) sizes the table from the count the way
+/// `RebuildHash` does, and the size is observable: the same eight keys
+/// enumerate in a different order from a table that started wider.
+#[test]
+fn dictionary_creation_size_changes_the_order() {
+    let build = |constructor: &str| {
+        run(
+            "order.tjs",
+            &format!(
+                r#"
+            var data = {constructor};
+            data.e = 1; data.a = 1; data.c = 1; data.b = 1;
+            data.e2 = 1; data.l2 = 1; data.w2 = 1; data.y2 = 1;
+            var list = [];
+            list.assign(data);
+            return list.join(",");
+            "#
+            ),
+        )
+    };
+    // Eight slots, as an inline `%[...]` and `new Dictionary()` both start.
+    assert_eq!(
+        build("new Dictionary()"),
+        Variant::String("e2,1,e,1,c,1,l2,1,a,1,b,1,w2,1,y2,1".into())
+    );
+    // `new Dictionary(16)` starts at 64 slots (`hash_bits_for_count(16)` = 6).
+    assert_eq!(
+        build("new Dictionary(16)"),
+        Variant::String("e2,1,a,1,e,1,w2,1,c,1,b,1,l2,1,y2,1".into())
+    );
+    assert_eq!(
+        build("%[]"),
+        Variant::String("e2,1,e,1,c,1,l2,1,a,1,b,1,w2,1,y2,1".into()),
+        "an inline dictionary literal is `new Dictionary()` with no arguments"
+    );
+    // The literal's own entries are inserted at construction, so `%[e2 => 1]`
+    // puts `e2` into the slot before the scripted `data.e = 1` runs.
+    assert_eq!(
+        build("%[e2 => 1]"),
+        Variant::String("e,1,e2,1,c,1,l2,1,a,1,b,1,w2,1,y2,1".into())
     );
 }

@@ -17,6 +17,9 @@
 //!   named `count`/`save`/… stays data. Array instances do carry the built-in
 //!   Array methods and properties as ordinary members, so those are the ones
 //!   skipped by name (see [`is_hidden_member`]).
+//! - `getObjectKeys`/`foreach` walk members in `EnumMembers` order: the
+//!   member table is the reference's hash store, so a key list comes out in
+//!   the reference's bucket order (`krkr-tjs2`'s `runtime::symbol_table`).
 //! - `getObjectContext` answers the closure's `ObjThis` (null for a plain
 //!   object), `isNullContext` tests exactly that.
 //! - `equalStruct` compares arrays element-wise with an equal length, and
@@ -31,13 +34,17 @@
 //! - `getMD5HashString` answers the 32 lowercase hex digits of an octet's
 //!   MD5 digest.
 //! - `clone` deep-copies arrays and dictionaries.
+//! - `rehash` bumps the global rebuild magic (`TJSDoRehash`); every object
+//!   then rebuilds its member table at its member count on the next member
+//!   read, exactly as `PropGet` does in the reference.  The engine shell also
+//!   runs the reference's 1500 ms event-loop tick
+//!   (`SystemControl.cpp:176-180`) from `Engine::advance`.
 //!
 //! Deliberate divergences:
 //!
-//! - Member enumeration follows this engine's object model, which keeps
-//!   members in sorted order; the reference enumerates them in hash order.
-//! - `rehash` is a no-op: the engine's object model has no hash table to
-//!   rebuild, and the reference's only observable effect is that rebuild.
+//! - The reference's rehash tick skips while `ContinuousEventCalling` is set
+//!   (`SystemControl.cpp:70-90`, `:169-180`); this engine has no
+//!   continuous-event mode, so its tick runs unconditionally.
 //! - `clone` delegates to an object's own `clone` member when it has one
 //!   (the reference's `FuncCall(...) == TJS_S_TRUE` test can never be true, a
 //!   dead branch in the original; delegating is what the sibling `PackinOne`
@@ -62,8 +69,8 @@ pub(crate) const META: PluginMeta = PluginMeta {
     feature: "Scripts.getObjectKeys/getObjectCount/getObjectContext/isNullContext/equalStruct/\
               equalStructNumericLoose/foreach/getMD5HashString/clone/rehash",
     notes: "All ten reference members are functional, including MD5 over octets and the \
-            right-side-skipping equalStruct rule; rehash is a no-op because the engine's object \
-            model has no hash table, and enumeration order is the engine's sorted member order.",
+            right-side-skipping equalStruct rule; rehash marks every member table stale, and \
+            enumeration follows the reference's hash-bucket order.",
     install: |engine| engine.register_plugin(ScriptsExPlugin),
 };
 
@@ -672,14 +679,17 @@ fn new_dictionary(runtime: &mut Runtime<KrkrHost>) -> Option<ObjectHandle> {
         .object_handle()
 }
 
-/// `TJSDoRehash` only bumps the engine's global "rebuild hash magic"
-/// (`tjsObject.cpp:362`); this object model keeps members in a B-tree with no
-/// hash table to rebuild, so the member exists and does nothing observable.
+/// `TJSDoRehash` (`tjsObject.cpp:362`): bump the global "rebuild hash magic"
+/// and mark every object's member table stale.  An object rebuilds its table
+/// at its member count on its next member read (`tjsObject.cpp:1396-1398`),
+/// which is observable: the same members enumerate in a different order
+/// afterwards, and a table that grew is no longer the 8-bucket default.
 fn scripts_rehash(
-    _runtime: &mut Runtime<KrkrHost>,
+    runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
+    runtime.tjs_do_rehash();
     Ok(Variant::Void)
 }
 
@@ -727,6 +737,70 @@ mod tests {
             .expect("object member helpers");
 
         assert_eq!(value, Variant::String("first,second:2:1:0:1".to_string()));
+    }
+
+    /// `Scripts.getObjectKeys` and `Scripts.foreach` both walk members through
+    /// `EnumMembers`, i.e. the member table's bucket order
+    /// (`tTJSCustomObject::InternalEnumMembers`, `tjsObject.cpp:1207-1240`;
+    /// `ScriptsAdd::getKeys`/`foreach`, `scriptsEx/Main.cpp:252-272`,
+    /// `:440-470`).  `e`, `c`, `a` and `b` sit in slots 0, 1, 2 and 3 of the
+    /// default eight-slot table, so neither the sorted list `a, b, c, e` nor
+    /// the insertion order `e, a, c, b` is what a script sees.
+    #[test]
+    fn object_keys_and_foreach_follow_the_member_table_order() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(ScriptsExPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var data = %[];\n\
+                     data.e = 1; data.a = 1; data.c = 1; data.b = 1;\n\
+                     global.__seen = \"\";\n\
+                     Scripts.foreach(data, function(key, value) {\n\
+                         global.__seen += key + value;\n\
+                     });\n\
+                     return Scripts.getObjectKeys(data).join(\",\") + \":\" + global.__seen;\n\
+                 })()",
+            )
+            .expect("object member order");
+
+        assert_eq!(value, Variant::String("e,c,a,b:e1c1a1b1".to_string()));
+    }
+
+    /// `Scripts.rehash` is `TJSDoRehash` (`tjsObject.cpp:362`): it bumps the
+    /// global rebuild magic, and each object rebuilds its table at its member
+    /// count on the *next member read* (`PropGet`, `:1396-1398`) -- not when it
+    /// is merely enumerated (`EnumMembers` has no such check).  Eight members
+    /// rebuild the default 8-slot table to 32 slots, which is visible in the
+    /// enumeration order.
+    #[test]
+    fn rehash_defers_its_rebuild_to_the_next_member_read() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(ScriptsExPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var data = %[];\n\
+                     data.e = 1; data.a = 1; data.c = 1; data.b = 1;\n\
+                     data.e2 = 1; data.l2 = 1; data.w2 = 1; data.y2 = 1;\n\
+                     var before = Scripts.getObjectKeys(data).join(\",\");\n\
+                     Scripts.rehash();\n\
+                     var afterEnum = Scripts.getObjectKeys(data).join(\",\");\n\
+                     var probe = data.e;\n\
+                     var afterRead = Scripts.getObjectKeys(data).join(\",\");\n\
+                     return before + \":\" + afterEnum + \":\" + afterRead;\n\
+                 })()",
+            )
+            .expect("rehash order");
+
+        assert_eq!(
+            value,
+            Variant::String(
+                "e2,e,c,l2,a,b,w2,y2:e2,e,c,l2,a,b,w2,y2:e2,a,e,w2,c,l2,b,y2".to_string()
+            )
+        );
     }
 
     /// A Dictionary key is data, whatever it is called: the reference skips a
@@ -853,7 +927,9 @@ mod tests {
             )
             .expect("foreach");
 
-        assert_eq!(value, Variant::String("0=a;1=b;:x:stopped".to_string()));
+        // `x` (slot 5) comes after `y` (slot 0) in the member table, so the
+        // walk reaches `x` second and stops there.
+        assert_eq!(value, Variant::String("0=a;1=b;:yx:stopped".to_string()));
     }
 
     #[test]

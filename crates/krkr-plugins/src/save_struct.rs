@@ -687,7 +687,11 @@ mod tests {
         assert_eq!(
             value,
             Variant::String(
-                "%[\"count\"=>int 1,\r\n\"length\"=>int 2,\r\n\"save\"=>int 3]".to_string()
+                // `EnumMembers` order, i.e. the member table's bucket walk:
+                // `save` hashes into slot 0 of the default eight-slot table,
+                // `length` and `count` share slot 1 with `length` chained in
+                // front of the slot-holding `count`.
+                "%[\"save\"=>int 3,\r\n\"length\"=>int 2,\r\n\"count\"=>int 1]".to_string()
             )
         );
         let bytes = fs::read(root.join("keys.ksd")).expect("read the saved struct");
