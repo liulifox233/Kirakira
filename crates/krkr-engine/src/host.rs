@@ -2398,7 +2398,11 @@ impl KrkrHost {
             let Some(manager) = self.resource_manager.as_ref() else {
                 return self.load_image_storage(name);
             };
-            let id = manager.request_image_decode(name.to_string(), revision);
+            let Some(id) = manager.request_image_decode(name.to_string(), revision) else {
+                // The decode worker stopped; decoding here cannot strand the
+                // VM on a completion that will never arrive.
+                return self.load_image_storage(name);
+            };
             self.pending_script_image_loads
                 .insert(id, (name.to_string(), revision));
             self.logs.push(format!(
@@ -2516,12 +2520,20 @@ impl KrkrHost {
             };
             let revision = self.storage_revision();
             let generation = self.next_resource_generation;
+            let Some(id) = manager.request_image_decode(request.storage.clone(), revision) else {
+                // The decode worker stopped; a pending target that can never
+                // complete would wait forever, so decode synchronously.
+                let image = self.load_image_storage(&request.storage)?;
+                return Ok(ImageLoadState::Ready(Box::new(CompletedImageLoad {
+                    request,
+                    image,
+                })));
+            };
             self.next_resource_generation = self.next_resource_generation.saturating_add(1);
             self.pending_image_loads
                 .retain(|_, load| load.request.target != request.target);
             self.image_target_generations
                 .insert(request.target.clone(), generation);
-            let id = manager.request_image_decode(request.storage.clone(), revision);
             self.pending_image_loads.insert(
                 id,
                 PendingImageLoad {
@@ -4312,7 +4324,8 @@ mod tests {
             .resource_manager
             .as_ref()
             .expect("resource manager")
-            .request_image_decode("button.png".to_string(), revision);
+            .request_image_decode("button.png".to_string(), revision)
+            .expect("worker accepts the decode");
         host.pending_script_image_loads
             .insert(id, ("button.png".to_string(), revision));
 
@@ -4337,6 +4350,64 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup");
     }
+
+    /// A decode that outlives the synchronous budget must still resolve the
+    /// suspended native call. The frame-start drain is the only wakeup, so a
+    /// query that never reports its completion would leave
+    /// `has_pending_resource_loads` set forever and freeze the scenario.
+    #[test]
+    fn queued_script_image_decode_always_reports_its_completion() {
+        let root = temp_root("script-image-async");
+        fs::create_dir_all(&root).expect("create root");
+        write_test_png(&root.join("button.png"), 2, 3);
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        let mut host = KrkrHost::from_storage(storage, SystemPaths::default()).expect("host");
+
+        let revision = host.storage_revision();
+        let id = host
+            .resource_manager
+            .as_ref()
+            .expect("resource manager")
+            .request_image_decode("button.png".to_string(), revision)
+            .expect("worker accepts the decode");
+        host.pending_script_image_loads
+            .insert(id, ("button.png".to_string(), revision));
+        assert!(host.has_pending_resource_loads());
+
+        // A zero budget keeps the asynchronous path: the request stays
+        // pending for the frame-start drain, exactly like a decode slower
+        // than `SCRIPT_IMAGE_SYNC_BUDGET`.
+        assert!(
+            host.wait_for_script_image_within("button.png", Duration::ZERO)
+                .is_none()
+        );
+
+        let mut wakeups = 0;
+        for _ in 0..10_000 {
+            let (_, script_image_completions) = host.take_completed_image_loads();
+            wakeups += script_image_completions;
+            if !host.has_pending_resource_loads() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(
+            wakeups, 1,
+            "the parked script image call must be woken once"
+        );
+        assert!(!host.has_pending_resource_loads());
+        assert!(host.script_image_errors.is_empty());
+        assert_eq!(
+            host.image_cache
+                .get("button.png")
+                .map(|image| (image.upload.width, image.upload.height)),
+            Some((2, 3))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     fn write_test_png(path: &std::path::Path, width: u32, height: u32) {
         let file = fs::File::create(path).expect("create png");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);

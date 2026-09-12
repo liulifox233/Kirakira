@@ -762,6 +762,19 @@ impl KrkrEngine {
         self.tjs_runtime.is_suspended()
     }
 
+    /// True while the TJS VM is parked on a resource request that has not
+    /// landed yet.
+    ///
+    /// This is the wait a frame boundary has to respect even when the engine's
+    /// own KAG session never started one: a game that drives KAG from its own
+    /// TJS conductor keeps the session `Finished` while a `Layer.loadImages`
+    /// call inside a logo/opening callback is blocked on the decode worker.
+    fn parked_on_pending_resource(&self) -> bool {
+        self.tjs_runtime.is_suspended()
+            && (self.tjs_runtime.host().has_pending_resource_loads()
+                || self.tjs_runtime.host().has_pending_external_resources())
+    }
+
     /// Returns scheduler queues useful to platform diagnostics: continuous
     /// handlers, queued script events, and idle async triggers.
     pub fn scheduler_diagnostics(&self) -> (usize, usize, usize, usize, usize) {
@@ -1010,6 +1023,18 @@ impl KrkrEngine {
         // retry the same nested KAG jump and recreate the pending error before
         // the platform session has had a chance to start the fetch. Input is
         // retained in the scheduler and delivered after the resource arrives.
+        //
+        // The suspended VM is the wait: games that drive KAG from their own
+        // TJS conductor (`parser.getNextTag()` in script) never move the
+        // engine session out of `Finished`, so a callback parked on a script
+        // image decode (`Layer.loadImages`) would otherwise keep the engine
+        // looking runnable — callbacks would be dispatched into the parked VM
+        // and the parked call would only resume on the frame that happened to
+        // poll the decode completion. Marking the session here keeps the
+        // pending load visible to every frame boundary until it lands.
+        if self.parked_on_pending_resource() {
+            self.kag_session.state = KagTaskState::WaitingResource;
+        }
         let waiting_for_resource = self.kag_session.state == KagTaskState::WaitingResource
             && (self.tjs_runtime.host().has_pending_external_resources()
                 || self.tjs_runtime.host().has_pending_resource_loads());
@@ -1184,7 +1209,11 @@ impl KrkrEngine {
             self.handle_callback_error("transition completion callback", error)?;
         }
         let transition_active = self.tjs_runtime.host().has_active_transition();
-        let resource_pending = self.tjs_runtime.host().has_pending_resource_loads();
+        // A parked VM keeps the resource wait alive even for requests the
+        // session's own load bookkeeping does not track (an external resource
+        // supplied by the host asset scheduler).
+        let resource_pending = self.tjs_runtime.host().has_pending_resource_loads()
+            || self.parked_on_pending_resource();
         self.kag_session
             .update_wait(delta, transition_active, resource_pending);
         match self
@@ -6397,6 +6426,52 @@ mod tests {
             .expect("resume resource");
         assert!(!engine.is_script_suspended());
         assert!(engine.take_external_resource_requests().is_empty());
+    }
+
+    /// A callback parked on a pending resource load must surface as a KAG wait
+    /// at the frame boundary. Games that drive KAG from their own TJS
+    /// conductor (`parser.getNextTag()` in script, e.g. GINKA's logo
+    /// sequence) never move the engine session out of `Finished`, so the
+    /// session state alone cannot tell a host that the runtime is stuck
+    /// waiting for a decode.
+    #[test]
+    fn script_parked_on_a_resource_reports_a_kag_resource_wait() {
+        let storage = ProjectStorage::from_memory(Vec::<(String, Vec<u8>)>::new());
+        let mut engine = KrkrEngine::new(EngineConfig {
+            project_storage: Some(Arc::new(storage)),
+            ..EngineConfig::default()
+        })
+        .expect("engine");
+        engine.set_external_resource_catalog(["lazy.ks"]);
+        engine
+            .execute_script(
+                "lazy-loader.tjs",
+                "var lines = new Array();\nlines.load(\"lazy.ks\");",
+            )
+            .expect("resource suspension is not a script error");
+        assert!(engine.is_script_suspended());
+        assert_eq!(*engine.kag_state(), KagTaskState::Finished);
+
+        let input = || {
+            EngineInput::new(
+                FrameInput::new(Size::new(320.0, 240.0), 1.0 / 60.0),
+                Vec::new(),
+            )
+        };
+        let frame = engine
+            .update(input(), Duration::from_millis(16))
+            .expect("frame while parked");
+        assert_eq!(frame.tick.state, KagTaskState::WaitingResource);
+        assert_eq!(*engine.kag_state(), KagTaskState::WaitingResource);
+
+        engine
+            .provide_external_resource("lazy.ks", b"first\nsecond\n".to_vec())
+            .expect("resume resource");
+        assert!(!engine.is_script_suspended());
+        engine
+            .update(input(), Duration::from_millis(16))
+            .expect("frame after resume");
+        assert_ne!(*engine.kag_state(), KagTaskState::WaitingResource);
     }
 
     #[test]

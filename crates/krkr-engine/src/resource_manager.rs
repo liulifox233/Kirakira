@@ -101,19 +101,27 @@ impl ResourceManager {
         })
     }
 
+    /// Queues an image decode on the resource worker.
+    ///
+    /// `None` means the worker is gone (it panicked, or the process is
+    /// shutting down). Callers must then decode on their own thread: parking a
+    /// script call on a completion that can never arrive leaves
+    /// `has_pending_resource_loads` set forever.
     pub fn request_image_decode(
         &self,
         storage: impl Into<String>,
         revision: u64,
-    ) -> ResourceTaskId {
+    ) -> Option<ResourceTaskId> {
         let storage = storage.into();
         let id = self.next_id();
-        let _ = self.task_tx.send(ResourceTask::DecodeImage {
-            id,
-            revision,
-            storage,
-        });
-        id
+        self.task_tx
+            .send(ResourceTask::DecodeImage {
+                id,
+                revision,
+                storage,
+            })
+            .ok()
+            .map(|()| id)
     }
 
     pub fn load_bytes_blocking(
