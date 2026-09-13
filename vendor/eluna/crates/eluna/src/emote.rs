@@ -2924,14 +2924,12 @@ fn prepare_child_inherit_source(
 fn frame_content_colors(content: &PsbValue) -> [u32; 4] {
     // Masked frames read only the keys their bitfield carries; the white
     // fallback is the native `mask & 0x20600` block (see
-    // `merge_frame_content`).
+    // `native_white_color_fallback`).
     let blend_mode = masked_field(content, 0x20000, "bm", &[])
         .and_then(PsbValue::as_u32)
         .unwrap_or(0x10);
     let Some(color) = masked_field(content, 0x200, "color", &[]) else {
-        let white_fallback = (blend_mode & 0xF0) == 0
-            && frame_key_mask(content).map_or(true, |mask| mask & 0x20600 != 0);
-        return if white_fallback {
+        return if native_white_color_fallback(content, blend_mode) {
             [0xFFFF_FFFF; 4]
         } else {
             [0x8080_80FF; 4]
@@ -3744,10 +3742,11 @@ fn evaluate_frame_list(
 
     let mut elapsed = (time_ticks - current_time).max(0.0);
     // frameInfo+8 (`ti`) is an integer time-quantization interval, read from
-    // the content's mask bit 0x4000000. The native `FUN_10024fd0` loads the
-    // integration with `fistpll` under RC=11, so it truncates elapsed/ti
-    // toward zero and multiplies back before deriving t; `fildl` at
-    // 100250a5 forces the truncating control word, it does not round.
+    // the content's mask bit 0x4000000. The native `FUN_10024fd0` truncates
+    // elapsed/ti toward zero and multiplies back before deriving t: it loads
+    // `fnstcw`/`or $0xc00` (RC=11) at 1002509e..100250ad and stores with
+    // `fistpll` at 100250b0, with the `fildl` at 1002508f loading the
+    // interval itself. Truncation, not rounding.
     let ti = masked_field(current_content, 0x4000000, "ti", &[])
         .or_else(|| {
             // The frame-level spelling is an extension for mask-less flavors
@@ -4182,6 +4181,8 @@ fn interpolate_frame_content(
     // sub_10355BF0 direction mode 3 samples the exact same authored
     // coordinate path twice at t and t+0.0001. Near the end it shifts the
     // pair back to [1-0.0001, 1] instead of sampling beyond the keyframe.
+    // Both samples go through the same gated `ccc`/`cp` values the coordinate
+    // interpolation above used, or p0/p1 would read two different paths.
     if state.motion_direction_type == 3 {
         let mut tangent_t0 = t;
         let mut tangent_t1 = t + 0.0001;
@@ -4189,24 +4190,11 @@ fn interpolate_frame_content(
             tangent_t1 = 1.0;
             tangent_t0 = 1.0 - 0.0001;
         }
-        let tangent_coord_t0 =
-            frame_easing(tangent_t0, current_content.field("ccc"), easing_table);
-        let tangent_coord_t1 =
-            frame_easing(tangent_t1, current_content.field("ccc"), easing_table);
-        let p0 = interpolate_native_coordinate(
-            a,
-            b,
-            tangent_coord_t0,
-            coordinate_plane,
-            current_content.field("cp"),
-        );
-        let p1 = interpolate_native_coordinate(
-            a,
-            b,
-            tangent_coord_t1,
-            coordinate_plane,
-            masked_field(current_content, 0x10000, "cp", &[]),
-        );
+        let cp = masked_field(current_content, 0x10000, "cp", &[]);
+        let tangent_coord_t0 = frame_easing(tangent_t0, coord_curve, easing_table);
+        let tangent_coord_t1 = frame_easing(tangent_t1, coord_curve, easing_table);
+        let p0 = interpolate_native_coordinate(a, b, tangent_coord_t0, coordinate_plane, cp);
+        let p1 = interpolate_native_coordinate(a, b, tangent_coord_t1, coordinate_plane, cp);
         let tangent = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
         state.motion_path_tangent_vector = Some(tangent);
         state.motion_path_tangent_degrees = match coordinate_plane {
@@ -4275,6 +4263,11 @@ fn interpolate_frame_content(
         state.feedback_timespan = Some(lerp(a, b, t));
     }
     // Type-12 uses WCC for wrt/wsf and recomputes the native scale/bias.
+    // `wcc` rides the fork's own stencil-wipe key family (stc/wrv/wrt/wsf);
+    // `motionplayer_nod3d.dll`'s FUN_1001d000 bit table defines no bit for
+    // that family and PARQUET authors none of those keys, so it stays a
+    // presence read — the mask gate covers the vocabulary the reference's
+    // applier defines.
     if let (Some(a), Some(b)) = (state.stencil_wipe, next_state.stencil_wipe) {
         if a.enabled {
             let wipe_t = frame_easing(t, current_content.field("wcc"), easing_table);
@@ -4379,10 +4372,7 @@ fn content_coord(content: &PsbValue) -> Option<[f32; 3]> {
 }
 
 fn content_bool_like(content: &PsbValue, name: &str) -> Option<bool> {
-    match content.field(name)? {
-        PsbValue::Bool(value) => Some(*value),
-        value => value.as_i64().map(|value| value != 0),
-    }
+    psb_value_bool(content.field(name)?)
 }
 
 /// Frame key-presence bitfield (`content.mask`, the native `FUN_1001cdc0`
@@ -4393,7 +4383,21 @@ fn frame_key_mask(content: &PsbValue) -> Option<i64> {
 }
 
 fn frame_has_key(content: &PsbValue, bit: i64) -> bool {
-    frame_key_mask(content).map_or(true, |mask| mask & bit != 0)
+    frame_key_mask(content).is_none_or(|mask| mask & bit != 0)
+}
+
+/// The native white-corner fallback (`FUN_1001d000`'s `mask & 0x20600`
+/// block): a frame whose color bit is clear and whose `bm` high nibble is 0
+/// paints white instead of the neutral gray, and a frame whose mask carries
+/// neither the color bit nor the `bm` bit keeps the gray.
+///
+/// Mask-less content keeps the legacy presence rule: reaching this fallback
+/// at all means the frame has no `color` key to read.
+fn native_white_color_fallback(content: &PsbValue, blend_mode: u32) -> bool {
+    if (blend_mode & 0xF0) != 0 {
+        return false;
+    }
+    frame_key_mask(content).is_none_or(|mask| mask & 0x200 == 0 && mask & 0x20600 != 0)
 }
 
 /// `content.<name>` only when the frame's mask says the key is present.
@@ -4505,14 +4509,12 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
             state.single_color = true;
             state.colors = [value as u32; 4];
         }
-    } else if content.field("color").is_none()
-        && frame_key_mask(content).map_or(true, |mask| mask & 0x20600 != 0)
-        && (state.blend_mode & 0xF0) == 0
-    {
+    } else if native_white_color_fallback(content, state.blend_mode) {
         // sub_1033D0E0: legacy non-MODULATE2X frames without an explicit
         // color use white instead of the normal neutral gray. The native
         // fallback lives inside its `mask & 0x20600` block, so a frame whose
-        // mask carries neither the color bit nor the bm bit keeps the gray.
+        // mask carries neither the color bit nor the bm bit keeps the gray,
+        // and a masked frame's stray `color` key is ignored entirely.
         state.colors = [0xFFFF_FFFF; 4];
     }
     if let Some(motion) = masked_field(content, 0x80000, "motion", &[]) {
@@ -8315,6 +8317,112 @@ mod tests {
         let angle = state.motion_path_tangent_degrees.unwrap();
         let expected = 1.5f32.atan2(1.0).to_degrees();
         assert!((angle - expected).abs() < 0.05, "{angle} vs {expected}");
+    }
+
+    /// The direction-mode-3 tangent block samples the same gated `ccc`/`cp`
+    /// values the coordinate interpolation uses: a type-3 frame whose mask
+    /// omits those bits must not read a stray curve or path (M137 review
+    /// finding 1), or p0/p1 would come from two different paths.
+    #[test]
+    fn native_tangent_samples_respect_the_frame_mask() {
+        let motion = || {
+            PsbValue::Object(vec![
+                ("dt".to_owned(), PsbValue::Int(3)),
+                ("dofst".to_owned(), PsbValue::Float(0.0)),
+            ])
+        };
+        // A strongly ease-out coordinate curve: `frame_easing(0.25)` is ~0.68,
+        // not 0.25, so reading it by mistake moves the coord by ~4.
+        let stray_ccc = || {
+            PsbValue::Object(vec![
+                (
+                    "c".to_owned(),
+                    PsbValue::List(vec![PsbValue::Int(1), PsbValue::Int(1)]),
+                ),
+                (
+                    "x".to_owned(),
+                    PsbValue::List(
+                        [0.0f32, 0.1, 0.5, 1.0]
+                            .into_iter()
+                            .map(PsbValue::Float)
+                            .collect(),
+                    ),
+                ),
+                (
+                    "y".to_owned(),
+                    PsbValue::List(
+                        [0.0f32, 0.8, 0.95, 1.0]
+                            .into_iter()
+                            .map(PsbValue::Float)
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+        let masked = vec![
+            test_frame(
+                0.0,
+                3,
+                test_content(vec![
+                    // coord + motion only: the stray ccc/cp are not frame keys.
+                    ("mask", PsbValue::Int(0x2 | 0x80000)),
+                    ("coord", test_coord(0.0, 0.0, 0.0)),
+                    ("ccc", stray_ccc()),
+                    ("cp", test_inline_cp_path()),
+                    ("motion", motion()),
+                ]),
+            ),
+            test_frame(
+                10.0,
+                1,
+                test_content(vec![
+                    ("mask", PsbValue::Int(0x2)),
+                    ("coord", test_coord(10.0, 0.0, 0.0)),
+                ]),
+            ),
+        ];
+        let state = evaluate_frame_list(&masked, 2.5, None, 0, None);
+        assert_eq!(
+            state.coord,
+            Some([2.5, 0.0, 0.0]),
+            "the stray ccc must not ease the coordinate"
+        );
+        let angle = state.motion_path_tangent_degrees.unwrap();
+        assert!(
+            angle.abs() < 1.0e-4,
+            "the stray cp must not bend the tangent, got {angle}"
+        );
+
+        // Control: with the bits set the same payload eases and bends.
+        let gated = vec![
+            test_frame(
+                0.0,
+                3,
+                test_content(vec![
+                    ("mask", PsbValue::Int(0x2 | 0x800 | 0x10000 | 0x80000)),
+                    ("coord", test_coord(0.0, 0.0, 0.0)),
+                    ("ccc", stray_ccc()),
+                    ("cp", test_inline_cp_path()),
+                    ("motion", motion()),
+                ]),
+            ),
+            test_frame(
+                10.0,
+                1,
+                test_content(vec![("coord", test_coord(10.0, 0.0, 0.0))]),
+            ),
+        ];
+        let state = evaluate_frame_list(&gated, 2.5, None, 0, None);
+        let coord = state.coord.unwrap()[0];
+        assert!(
+            (coord - 2.5).abs() > 0.5,
+            "the gated ccc eases the coordinate, got {coord}"
+        );
+        let angle = state.motion_path_tangent_degrees.unwrap();
+        assert!(
+            angle.abs() > 5.0,
+            "the gated cp bends the tangent, got {angle}"
+        );
     }
 
     #[test]
