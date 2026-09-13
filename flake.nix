@@ -30,6 +30,38 @@
           libxkbcommon
           vulkan-loader
         ];
+
+        # Wine is deliberately not part of the default shell: its closure is
+        # large (see scripts/wine/run.sh) and only the missions that run
+        # reference Windows binaries — verifying a written save against the
+        # real engine, double-checking plugin behaviour — need it.  `nix
+        # develop .#wine` gets that separate shell; scripts/wine/run.sh drives
+        # everything in it from a plain non-shell session.
+        #
+        # wineWow64Packages (not wine64) is required: the official krkrz
+        # Windows releases are 32-bit, and only the wow64 build runs them.
+        # The X11 entries are there so the engine can run on a virtual display
+        # (Xvfb) with no physical screen: xdotool drives it, ImageMagick takes
+        # the screenshots, xdpyinfo/xwininfo are what one inspects the display
+        # with when a window misbehaves, mesa-demos is the glxinfo the GL path
+        # gets diagnosed with, and p7zip unpacks the engine release.
+        #
+        # noto-fonts-cjk-sans is what makes the games' Chinese/Japanese text
+        # legible: Wine starts from a Latin-only font set, so every CJK glyph
+        # otherwise renders as a box.  scripts/wine/run.sh copies the font
+        # into the prefix and points Wine's font substitutions at it.
+        wineTools = with pkgs; [
+          wineWow64Packages.stable
+          xvfb
+          xdotool
+          xwininfo
+          xdpyinfo
+          mesa-demos
+          imagemagick
+          p7zip
+          curl
+          noto-fonts-cjk-sans
+        ];
       in {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
@@ -73,6 +105,21 @@
               exit 1
             fi
             echo "wasm target: $kirakira_wasm_target_libdir"
+          '';
+        };
+
+        devShells.wine = pkgs.mkShell {
+          packages = wineTools;
+
+          # scripts/wine/run.sh copies these fonts into the prefix's
+          # drive_c/windows/Fonts; Wine itself starts with a Latin-only set.
+          KIRA_WINE_FONT_DIR = "${pkgs.noto-fonts-cjk-sans}/share/fonts";
+
+          shellHook = ''
+            echo "Kirakira wine shell: $(wine --version)"
+            echo "  WINEARCH is not set here; scripts/wine/run.sh keeps the"
+            echo "  prefix (and the game scratch tree) under a scratch root so"
+            echo "  nothing in the checkout is written."
           '';
         };
       });

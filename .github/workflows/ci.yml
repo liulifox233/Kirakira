@@ -1,0 +1,52 @@
+# Minimal CI skeleton for Kirakira.
+#
+# Scope (deliberately small for now): the `test` job is the first step that
+# matters — a Nix-provided toolchain plus `cargo test` on the workspace, which
+# is exactly what a contributor runs locally (`nix develop --command cargo
+# test`).  Formatting/linting gates are intentionally not wired up here.
+#
+# The `wine-smoke` job is the M142 wine base behind a manual flag: it
+# provisions the pinned Wine and the official krkrz build through
+# scripts/wine/run.sh, runs a real 32-bit Windows binary and boots the engine
+# with a scratch startup.tjs.  It needs no game assets, so it is cheap enough
+# to run on a GitHub runner; it is dispatch-only because nothing else depends
+# on it yet.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: cargo test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: cargo test
+        run: nix develop --command cargo test --workspace
+
+  wine-smoke:
+    name: wine smoke (engine + trivial PE)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: install nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: provision wine environment and smoke-test it
+        # Downloads the pinned krkrz release (sha-256 checked by the script),
+        # initialises the wine prefix under KIRA_WINE_ROOT, runs a mingw
+        # hello.exe and boots the engine on a virtual display.
+        run: |
+          scripts/wine/run.sh setup
+          scripts/wine/run.sh smoke

@@ -1,0 +1,87 @@
+// Bookmark-container harness for scripts/wine/run.sh save-harness.
+//
+// This runs under the *real* krkrz engine (tvpwin32.exe 1.4.0.8, the official
+// 2017-12-25 release) with the game's own PackinOne.dll, in a bare engine
+// directory (no game tree, no KAG).  It reproduces what KAGEX's
+// BookMarkIO_DataPack.save() does, which is the whole point: the container
+// bytes below are written and read back by the reference implementation, not
+// by our reimplementation.
+//
+// KAGEX contract, read off GINKA/少女世界's system/MainWindow.tjs bytecode
+// (objects 473-476):
+//   digest.cryptmode = (saveDataMode != "")     -> 1, 少女世界 Config.tjs: saveDataMode = "z"
+//   digest.compress  = (saveDataMode == "z")    -> 1
+//   digest.iv        = System.title
+//     the plugin writes ivlen = 2*(chars+1) — UTF-16LE bytes including the
+//     string's NUL terminator (container offset 0x0e; 42 for the 20-char title)
+//   digest.seed      = Scripts.makeDataPackDigest(data, tick & 0xffffffff, saveDataID)
+//   thumb            = Scripts.makeDataPackThumb(layer, digest.ext, digest.quality, digest.component)
+//   Scripts.saveDataPack(name, data, digest, thumb)
+//   data             = %[ id = saveDataID, core = <kag state>, user = <user flags>, history = ... ]
+//
+// The harness fixes the seed so the output container is reproducible, and
+// keeps the KAGEX data shape (id/core/user) with one value of every ns0 type
+// so a reader has to walk strings, int64, double, arrays and dictionaries.
+//
+// Limitation: makeDataPackThumb answers "makeDataPackThumb: no image data"
+// for every layer shape a bare engine can build (fresh layer, image-sized
+// layer with a drawn face, layer loaded from a PNG, the window itself), with
+// both PackinOne builds.  The file this harness writes therefore has the
+// data_anchor.ksd shape: [16-byte header][iv][4s0 body + check], no leading
+// thumbnail.  A real save's layout is [JPEG][same pack]; prepending a JPEG
+// with ImageMagick was tried and the reference reader refused it
+// ("datapack not found"), so the thumbnail-prefixed layout is *not* verified
+// by this harness — see the M142 report.
+Plugins.link("PackinOne.dll");
+
+System.title = "【拯救失足少女汉化组】少女世界的生存之道";
+
+var saveDataID = "00000000-0000-0000-0000-000000000000";
+
+var pcflags = %[];
+pcflags.storeTime = 1757760000000;      // int64
+pcflags.playTime = 12345;
+pcflags.scenario = "scenario/main/scene01.ks";
+pcflags.line = 42;
+pcflags.flags = %[];
+pcflags.flags.cg_01 = 1;
+pcflags.void1 = void;
+
+var data = %[];
+data.id = saveDataID;
+data.core = pcflags;
+data.user = %[];
+data.user.note = "M142 wine harness";
+data.user.count = 4294967295;
+data.user.ratio = 1.5;
+data.user.list = [ "a", "b", 3 ];
+data.user.nested = %[];
+data.user.nested.deep = "值";
+
+var digest = %[];
+digest.cryptmode = 1;
+digest.compress = 1;
+digest.iv = System.title;
+digest.ext = "jpg";
+digest.seed = Scripts.makeDataPackDigest(data, 305419896, saveDataID); // fixed seed: reproducible
+// The plugin writes ivlen = 2*(chars+1): the UTF-16LE bytes *including* the
+// string's NUL terminator (verified against the container header, offset 0x0e).
+Debug.message("M142 digest.seed=" + digest.seed + " ivbytes=" + ((System.title.length + 1) * 2));
+
+Scripts.saveDataPack("savedata_cn/data0.jpg", data, digest, void);
+Debug.message("M142 saved savedata_cn/data0.jpg");
+
+// Read it straight back through the reference reader: this is the proof that
+// the container the writer just produced is one the reference accepts.
+var back = Scripts.loadDataPack("savedata_cn/data0.jpg");
+Debug.message("M142 RB id=" + back.id);
+Debug.message("M142 RB storeTime=" + back.core.storeTime);
+Debug.message("M142 RB scenario=" + back.core.scenario);
+Debug.message("M142 RB line=" + back.core.line);
+Debug.message("M142 RB cg=" + back.core.flags.cg_01);
+Debug.message("M142 RB note=" + back.user.note);
+Debug.message("M142 RB count=" + back.user.count);
+Debug.message("M142 RB ratio=" + back.user.ratio);
+Debug.message("M142 RB list=" + back.user.list[0] + "," + back.user.list[2]);
+Debug.message("M142: done");
+System.exit();
