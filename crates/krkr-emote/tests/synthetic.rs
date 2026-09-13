@@ -527,8 +527,8 @@ fn fade_root(source: Value) -> Value {
 }
 
 /// A present-but-null `parameterize` still freezes the layer at local time 0
-/// in the vendored tree (`emote.rs:4468-4474` with `resolve_parameterize`
-/// returning `None` for `Null` at `:4549-4557`), so dropping the field is what
+/// in the vendored tree (`emote.rs:4625-4631` with `resolve_parameterize`
+/// returning `None` for `Null` at `:4707-4714`), so dropping the field is what
 /// lets the later keyframe activate. The same bytes are sampled raw and
 /// through the adapter, and the file's `opa` byte reaches eluna's `/255`
 /// reading untouched (raw 128 → 128/255).
@@ -578,4 +578,258 @@ fn parameterize_null_freezes_without_the_strip() {
         1.0,
         "the tick-0 frame is fully opaque"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Frame key masks, item types and draw order (M137)
+// ---------------------------------------------------------------------------
+
+/// A one-animation, two-layer motion whose layers hold one type-2 frame with
+/// the same authored keys. `masked` carries `content.mask = 0x1` (only the
+/// ox/oy bit), `plain` carries no mask at all.
+fn mask_root(source: Value) -> Value {
+    let frame = |mask: Option<i64>| {
+        let mut fields = vec![
+            ("src", text("hero")),
+            ("icon", text("face")),
+            ("coord", list(vec![int(0), int(0), int(0)])),
+            ("ox", int(0)),
+            ("oy", int(0)),
+            ("zx", int(5)),
+            ("zy", int(5)),
+            ("opa", int(10)),
+        ];
+        if let Some(mask) = mask {
+            fields.push(("mask", int(mask)));
+        }
+        fields.push(("act", text("stray")));
+        object(vec![
+            ("content", Value::Object(fields)),
+            ("time", int(0)),
+            ("type", int(2)),
+        ])
+    };
+    let layer = |label: &'static str, mask: Option<i64>| {
+        object(vec![
+            ("label", text(label)),
+            ("coordinate", int(0)),
+            ("children", list(vec![])),
+            ("frameList", list(vec![frame(mask)])),
+        ])
+    };
+    object(vec![
+        ("id", text("motion")),
+        ("label", text("Synthetic")),
+        ("source", object(vec![("hero", source)])),
+        (
+            "object",
+            object(vec![(
+                "hero",
+                object(vec![(
+                    "motion",
+                    object(vec![(
+                        "mask_keys",
+                        object(vec![
+                            ("lastTime", int(30)),
+                            (
+                                "layer",
+                                list(vec![layer("masked", Some(0x1)), layer("plain", None)]),
+                            ),
+                        ]),
+                    )]),
+                )]),
+            )]),
+        ),
+    ])
+}
+
+/// `content.mask` decides which keys a frame carries: a key that is present
+/// in the object but outside the bitfield is not read (the native frame
+/// applier gates every read on it), while mask-less content stays permissive
+/// for the FreeMote flavor.
+#[test]
+fn frame_mask_gates_which_keys_a_frame_carries() {
+    let mut writer = PsbWriter::default();
+    let pixels = writer.add_resource(vec![1u8; 16 * 16 * 4]);
+    let bytes = writer.finish(4, &mask_root(freemote_source(&pixels)));
+    let motion = Motion::from_bytes(&bytes).expect("masked motion loads");
+
+    let masked = &motion.animations()[0].layers[0].frames[0];
+    assert_eq!(masked.mask, Some(0x1), "the bitfield is kept verbatim");
+    assert!(masked.has_key(0x1), "the ox/oy bit is set");
+    assert!(!masked.has_key(0x20), "the zx bit is absent");
+    assert_eq!(masked.coord, None, "coord needs bit 0x2");
+    assert_eq!(masked.opacity, None, "opa needs bit 0x400");
+    assert_eq!(masked.act, None, "act needs bit 0x40000");
+    assert!(!masked.is_empty(), "type 2 is a keyframe");
+    assert!(!masked.interpolates(), "type 2 does not tween");
+
+    let plain = &motion.animations()[0].layers[1].frames[0];
+    assert_eq!(plain.mask, None, "no mask key at all");
+    assert!(plain.has_key(0x20), "mask-less content is permissive");
+    assert_eq!(plain.coord, Some([0.0, 0.0, 0.0]));
+    assert_eq!(plain.opacity, Some(10.0));
+    assert_eq!(plain.act.as_deref(), Some("stray"));
+
+    // The sampler honours the same gate: the masked layer's stray `zx`/`opa`
+    // do not reach its transform or alpha, the mask-less layer's do.
+    let items = motion.draw_list("mask_keys", 0.0).expect("sample");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].label.as_deref(), Some("masked"));
+    assert_eq!(
+        [items[0].world_transform[0], items[0].world_transform[3]],
+        [1.0, 1.0],
+        "zx/zy outside the mask stay at the default 1.0"
+    );
+    assert_eq!(items[0].opacity, 1.0, "opa outside the mask stays 255/255");
+    assert_eq!(items[1].label.as_deref(), Some("plain"));
+    assert_eq!(
+        [items[1].world_transform[0], items[1].world_transform[3]],
+        [5.0, 5.0],
+        "mask-less content reads its zx/zy"
+    );
+    assert!((items[1].opacity - 10.0 / 255.0).abs() < 1e-6);
+}
+
+/// The frame `type` values keep their native meanings (0 empty/HOLD, 2
+/// keyframe, 3 interpolating) and a type-0 frame carries no content.
+#[test]
+fn frame_types_keep_their_native_meanings() {
+    let mut writer = PsbWriter::default();
+    let pixels = writer.add_resource(vec![1u8; 16 * 16 * 4]);
+    let root = object(vec![
+        ("id", text("motion")),
+        ("source", object(vec![("hero", freemote_source(&pixels))])),
+        (
+            "object",
+            object(vec![(
+                "hero",
+                object(vec![(
+                    "motion",
+                    object(vec![(
+                        "types",
+                        object(vec![
+                            ("lastTime", int(90)),
+                            (
+                                "layer",
+                                list(vec![object(vec![
+                                    ("label", text("only")),
+                                    ("coordinate", int(0)),
+                                    ("children", list(vec![])),
+                                    (
+                                        "frameList",
+                                        list(vec![
+                                            object(vec![
+                                                (
+                                                    "content",
+                                                    object(vec![
+                                                        ("src", text("hero")),
+                                                        ("icon", text("face")),
+                                                        ("mask", int(0x40020)),
+                                                        ("act", text("blink")),
+                                                        ("zx", int(4)),
+                                                    ]),
+                                                ),
+                                                ("time", int(0)),
+                                                ("type", int(3)),
+                                            ]),
+                                            object(vec![("time", int(60)), ("type", int(0))]),
+                                        ]),
+                                    ),
+                                ])]),
+                            ),
+                        ]),
+                    )]),
+                )]),
+            )]),
+        ),
+    ]);
+    let bytes = writer.finish(4, &root);
+    let motion = Motion::from_bytes(&bytes).expect("typed motion loads");
+
+    let frames = &motion.animations()[0].layers[0].frames;
+    assert!(frames[0].interpolates(), "type 3 interpolates");
+    assert_eq!(
+        frames[0].act.as_deref(),
+        Some("blink"),
+        "act needs bit 0x40000"
+    );
+    assert_eq!(frames[0].opacity, None, "opa was not authored");
+    assert!(frames[1].is_empty(), "type 0 is the empty/HOLD frame");
+    assert_eq!(frames[1].mask, None, "the empty frame has no content");
+    assert_eq!(frames[1].kind, 0);
+
+    // A type-0 successor suppresses the tween, so the type-3 frame's own
+    // zx=4 holds from tick 0 through the clear.
+    let items = motion.draw_list("types", 30.0).expect("sample");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].world_transform[0], 4.0);
+}
+
+/// The reference has no frame or layer `z` key and never sorts the layer
+/// vector: draw order is the PSB emission (layer-list / priority) order, and a
+/// sprite's `z` (the frame `coord`'s z component) is only carried along.
+#[test]
+fn draw_order_follows_the_layer_list_not_the_z_hint() {
+    let mut writer = PsbWriter::default();
+    let pixels = writer.add_resource(vec![1u8; 16 * 16 * 4]);
+    let layer = |label: &'static str, z: i64| {
+        object(vec![
+            ("label", text(label)),
+            ("coordinate", int(0)),
+            ("children", list(vec![])),
+            (
+                "frameList",
+                list(vec![object(vec![
+                    (
+                        "content",
+                        object(vec![
+                            ("src", text("hero")),
+                            ("icon", text("face")),
+                            ("coord", list(vec![int(0), int(0), int(z)])),
+                            ("ox", int(0)),
+                            ("oy", int(0)),
+                        ]),
+                    ),
+                    ("time", int(0)),
+                    ("type", int(2)),
+                ])]),
+            ),
+        ])
+    };
+    let root = object(vec![
+        ("id", text("motion")),
+        ("source", object(vec![("hero", freemote_source(&pixels))])),
+        (
+            "object",
+            object(vec![(
+                "hero",
+                object(vec![(
+                    "motion",
+                    object(vec![(
+                        "order",
+                        object(vec![
+                            ("lastTime", int(30)),
+                            ("layer", list(vec![layer("first", 0), layer("second", 0)])),
+                        ]),
+                    )]),
+                )]),
+            )]),
+        ),
+    ]);
+    let bytes = writer.finish(4, &root);
+    let motion = Motion::from_bytes(&bytes).expect("ordered motion loads");
+
+    let items = motion.draw_list("order", 0.0).expect("sample");
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].label.as_deref(),
+        Some("first"),
+        "the PSB layer-list order is the draw order"
+    );
+    assert_eq!(items[1].label.as_deref(), Some("second"));
+    // The vendored manager sorts its FrameInfo list by the resolved z (the
+    // frame `coord`'s z component); with both layers at z 0 the emission order
+    // is the tie-break and nothing moves.
+    assert_eq!([items[0].z, items[1].z], [0.0, 0.0]);
 }

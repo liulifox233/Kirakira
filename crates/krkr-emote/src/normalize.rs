@@ -20,9 +20,9 @@
 //!   ([`strip_null_parameterize`]).
 //!
 //! `content.opa` is *not* touched: eluna reads it as the file's 0..255 byte
-//! (`emote.rs:2383` defaults it to 255, `ctx_with_opacity` at `emote.rs:2629`
-//! and `build_sprite` at `emote.rs:2999` divide by 255, and the interpolated
-//! frame state rounds it the way the native DLL does at `emote.rs:4061`).
+//! (`emote.rs:2385` defaults it to 255, `ctx_with_opacity` at `emote.rs:2635`
+//! and `build_sprite` at `emote.rs:3013` divide by 255, and the interpolated
+//! frame state rounds it the way the native DLL does at `emote.rs:4172`).
 //! Earlier eluna revisions divided by 10 instead; the adapter rescaled the
 //! field to compensate, and that pass is gone (M127).
 //!
@@ -104,13 +104,13 @@ pub(crate) fn normalize_source_table(psb: &mut PsbFile) -> NormalizeReport {
 /// (every layer of `sd101.mtn`, for one). eluna's `layer_parameter_eval` tests
 /// only for the field's presence: a present-but-null `parameterize` resolves to
 /// no parameter and the layer's local time collapses to 0
-/// (`vendor/eluna/crates/eluna/src/emote.rs:4468-4474`, with
-/// `resolve_parameterize` returning `None` for `Null` at `:4549-4557`), so the
+/// (`vendor/eluna/crates/eluna/src/emote.rs:4625-4631`, with
+/// `resolve_parameterize` returning `None` for `Null` at `:4707-4714`), so the
 /// layer is drawn at its first frame's state forever and any later keyframe —
 /// PARQUET's `opa: 192` fade on `ef_moya/bgef1` at tick 90, for example — never
 /// activates. The reference has no such freeze; removing the null field is the
 /// in-adapter equivalent of eluna's own "absent means not parameterised" path
-/// (`emote.rs:4539-4546` falls back to the layer's own timeline).
+/// (`emote.rs:4699-4702` falls back to the layer's own timeline).
 ///
 /// Re-verified against the fork head `12e4d2f` (M127): the freeze is still
 /// there, so this pass stays.

@@ -21,8 +21,10 @@
 //! (`source.<name>.icon.<icon>.pixel`) with no `texture` sub-object, and name
 //! the icon as `src/<source>/<icon>`. [`NormalizeReport`]-counted adaptation
 //! rewrites the parsed tree into eluna's shape before eluna's schema/scene code
-//! sees it — the vendored library code itself is unpatched (see
-//! `vendor/eluna/UPSTREAM.md`).
+//! sees it. The frame-sampler semantics PARQUET's reference authors
+//! (`content.mask` key gating, the `{c,x,y}` cubic-Bezier easing curves, the
+//! mesh `cc` curve) live in the vendored runtime itself; see
+//! `vendor/eluna/UPSTREAM.md`'s patch ledger.
 //!
 //! ```no_run
 //! use krkr_emote::Motion;

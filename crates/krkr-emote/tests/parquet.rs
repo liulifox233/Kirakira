@@ -312,8 +312,8 @@ fn decodes_every_parquet_icon() {
 /// The `opa` scale, measured on the game's own fade: `sd101.mtn`'s
 /// `ef_moya/bgef1` carries `opa: 192` on its frame at tick 90, so the layer
 /// fades to 192/255 ≈ 0.7529 — the reference's `value & 0xff` reading, which
-/// eluna itself now implements (`vendor/eluna/crates/eluna/src/emote.rs:2383`
-/// reads the byte, `:2999` divides by 255). The adapter does not touch the
+/// eluna itself now implements (`vendor/eluna/crates/eluna/src/emote.rs:2385`
+/// reads the byte, `:3013` divides by 255). The adapter does not touch the
 /// field; before M127 it rescaled 0..255 into the `/10` scale of the older
 /// eluna, and against the new tree that double-scaling showed up here as
 /// 192 → 7.53 → rounded 8 → 8/255 = 0.0314.
@@ -321,7 +321,7 @@ fn decodes_every_parquet_icon() {
 /// This also pins the second half of the same chain: PARQUET writes
 /// `parameterize: null` on non-parameterised layers, and before the adapter
 /// dropped it the layer was frozen at local time 0
-/// (`emote.rs:4468-4474` + `:4549-4557`) and this frame never activated at any
+/// (`emote.rs:4625-4631` + `:4707-4714`) and this frame never activated at any
 /// tick.
 #[test]
 fn opa_is_an_eight_bit_alpha_on_the_games_fade() {
@@ -357,7 +357,7 @@ fn opa_is_an_eight_bit_alpha_on_the_games_fade() {
     );
     // The keyframes at t=90 (`opa: 192`) and t=180 (absent `opa` → 255) are
     // linearly interpolated — the native `sub_1032FB00` behaviour eluna
-    // implements at `emote.rs:4061` (`lerp` then round to the nearest byte).
+    // implements at `emote.rs:4172` (`lerp` then round to the nearest byte).
     // Tick 150 sits halfway: 192 + 63 * 60/90 = 234, i.e. 234/255 ≈ 0.9176.
     // The pinned eluna held the previous keyframe's value here (0.7529); the
     // fork head tweens, which is the reference's behaviour.
@@ -368,6 +368,167 @@ fn opa_is_an_eight_bit_alpha_on_the_games_fade() {
         opacity_at(150.0)
     );
     assert_eq!(opacity_at(0.0), 1.0, "before tick 90 the layer is opaque");
+}
+
+/// The `zcc` on `m2logo.mtn`'s `back_black/main` is a cubic-Bezier easing
+/// curve, not a corner colour. The layer's type-3 frame at tick 0 carries
+/// `zx = zy = 1.5` and `zcc = {c:[1,1], x:[0, 0.21333334, 0.5833333, 1],
+/// y:[0, 0.62, 0.9, 1]}`; the next type-3 frame at tick 43 carries no zoom, so
+/// the tween 1.5 -> 1.0 runs through that curve (`FUN_100087d0`: solve the
+/// segment's x polynomial, evaluate the y polynomial).
+///
+/// At tick 21 the raw factor is 21/43 = 0.488372, which eases to 0.751373, so
+/// the layer scale is `1.5 + (1.0 - 1.5) * 0.751373 = 1.124314`. The naive
+/// linear tween — what the sampler did while the `{c,x,y}` curve shape was not
+/// evaluated — gives 1.255814.
+#[test]
+fn zcc_eases_the_games_zoom_tween() {
+    let Some(path) = parquet_data_xp3() else {
+        eprintln!(
+            "skipping: {} not found (override with KRKR_EMOTE_PARQUET_DIR)",
+            DEFAULT_PARQUET_DIR
+        );
+        return;
+    };
+    let archive = krkr_xp3::Xp3Archive::open_file(&path).expect("data.xp3 opens");
+    let motion = parquet_motion(&archive, "motion/m2logo.mtn");
+
+    let scale_at = |ticks: f32| -> f32 {
+        let items = motion
+            .draw_list("back_black", ticks)
+            .unwrap_or_else(|error| panic!("back_black @ {ticks}: {error}"));
+        let item = items
+            .iter()
+            .find(|item| item.label.as_deref() == Some("レイヤ1"))
+            .unwrap_or_else(|| panic!("back_black @ {ticks} draws レイヤ1"));
+        // `レイヤ1`'s own frames carry no zoom, so the world matrix's 2x2
+        // magnitude is the eased parent (`main`) scale exactly.
+        item.world_transform[0].hypot(item.world_transform[2])
+    };
+
+    // The layer only starts drawing at tick 12; at ticks 21 and 30 the raw
+    // factors 21/43 = 0.488372 and 30/43 = 0.697674 ease to 0.751373 and
+    // 0.888598, i.e. scales 1.124314 and 1.055701 (linear: 1.255814 and
+    // 1.151163).
+    let eased = scale_at(21.0);
+    assert!(
+        (eased - 1.124314).abs() < 1e-4,
+        "the zcc curve eases the zoom, got {eased}"
+    );
+    assert!(
+        (eased - 1.255814).abs() > 0.1,
+        "the value is not the linear tween (1.255814), got {eased}"
+    );
+    let later = scale_at(30.0);
+    assert!(
+        (later - 1.055701).abs() < 1e-4,
+        "the zcc curve eases the zoom at tick 30, got {later}"
+    );
+}
+
+/// `sd101.mtn` is the one PARQUET asset with a Bezier mesh:
+/// `ef_moya/bgef1`'s frames at tick 0 and 180 carry `bp: null` (the native
+/// neutral patch, a 4x4 grid of `col/3, row/3`, which eluna's identity patch
+/// reproduces) and the frame at tick 90 carries the authored 32-value `bp`
+/// (16 (x, y) control points) plus the mesh `cc` curve. Interpolation applies
+/// that curve to the factor (`FUN_100098f0`).
+///
+/// `cc = {x:[0, 0.5706339, 0.42936608, 1], y:[0, 0.1854102, 0.8145898, 1]}`:
+/// at tick 30 the raw factor 1/3 eases to 0.228263, so control point 5 is
+/// `(1/3, 1/3) + ((0.20048445, 0.17175041) - (1/3, 1/3)) * 0.228263 =
+/// (0.303009, 0.296450)`. The linear tween — the behaviour before the curve
+/// was evaluated — gave (0.289050, 0.279472).
+#[test]
+fn mesh_keyframes_take_the_cc_curve() {
+    let Some(path) = parquet_data_xp3() else {
+        eprintln!(
+            "skipping: {} not found (override with KRKR_EMOTE_PARQUET_DIR)",
+            DEFAULT_PARQUET_DIR
+        );
+        return;
+    };
+    let archive = krkr_xp3::Xp3Archive::open_file(&path).expect("data.xp3 opens");
+    let motion = parquet_motion(&archive, "motion/sd/sd101.mtn");
+
+    let mesh_point = |ticks: f32| -> [f32; 2] {
+        let items = motion
+            .draw_list("ef_moya", ticks)
+            .unwrap_or_else(|error| panic!("ef_moya @ {ticks}: {error}"));
+        let item = items
+            .iter()
+            .find(|item| item.label.as_deref() == Some("bgef1"))
+            .unwrap_or_else(|| panic!("ef_moya @ {ticks} draws bgef1"));
+        item.mesh
+            .as_ref()
+            .unwrap_or_else(|| panic!("ef_moya @ {ticks} carries a mesh"))
+            .control_points[5]
+    };
+
+    // The authored keyframe itself.
+    let authored = mesh_point(90.0);
+    assert!(
+        (authored[0] - 0.20048445).abs() < 1e-5 && (authored[1] - 0.17175041).abs() < 1e-5,
+        "the authored bp is read verbatim, got {authored:?}"
+    );
+
+    let at_30 = mesh_point(30.0);
+    assert!(
+        (at_30[0] - 0.303009).abs() < 1e-4 && (at_30[1] - 0.296450).abs() < 1e-4,
+        "the cc curve eases the mesh interpolation, got {at_30:?}"
+    );
+    assert!(
+        (at_30[0] - 0.289050).abs() > 0.005,
+        "the value is not the linear tween (0.289050), got {at_30:?}"
+    );
+
+    // The curve is symmetric about its midpoint, so raw and eased agree at
+    // tick 45 (`(1/3, 1/3)` to the authored point at half the span).
+    let at_45 = mesh_point(45.0);
+    assert!(
+        (at_45[0] - 0.266909).abs() < 1e-4 && (at_45[1] - 0.252542).abs() < 1e-4,
+        "the curve midpoint passes the raw factor through, got {at_45:?}"
+    );
+}
+
+/// `yuzusourlogo.mtn`'s `awa/graycircle` uses a three-segment chained `zcc`
+/// (`x.len() = 3N + 1`): the layer's type-3 frame at tick 0 carries `zx = 0.1`
+/// and the next type-3 frame at 30 carries no zoom, so 0.1 -> 1.0 is eased by
+/// the chained curve. At tick 7 the raw factor 7/30 = 0.233333 lands in the
+/// first segment and evaluates to 0.470825, i.e. a scale of
+/// `0.1 + 0.9 * 0.470825 = 0.523742` (the linear value was 0.31).
+#[test]
+fn chained_curve_segments_ease_the_games_zoom_tween() {
+    let Some(path) = parquet_data_xp3() else {
+        eprintln!(
+            "skipping: {} not found (override with KRKR_EMOTE_PARQUET_DIR)",
+            DEFAULT_PARQUET_DIR
+        );
+        return;
+    };
+    let archive = krkr_xp3::Xp3Archive::open_file(&path).expect("data.xp3 opens");
+    let motion = parquet_motion(&archive, "motion/yuzusourlogo.mtn");
+
+    let scale_at = |ticks: f32| -> f32 {
+        let items = motion
+            .draw_list("awa", ticks)
+            .unwrap_or_else(|error| panic!("awa @ {ticks}: {error}"));
+        let item = items
+            .iter()
+            .find(|item| item.label.as_deref() == Some("graycircle"))
+            .unwrap_or_else(|| panic!("awa @ {ticks} draws graycircle"));
+        item.world_transform[0]
+    };
+
+    assert!((scale_at(0.0) - 0.1).abs() < 1e-4);
+    let eased = scale_at(7.0);
+    assert!(
+        (eased - 0.523742).abs() < 1e-4,
+        "the chained segments ease the zoom, got {eased}"
+    );
+    assert!(
+        (eased - 0.31).abs() > 0.1,
+        "the value is not the linear tween (0.31), got {eased}"
+    );
 }
 
 /// Rendering a real motion writes pixels: `sd101.mtn`'s `SD101AA` covers a

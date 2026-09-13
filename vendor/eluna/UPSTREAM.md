@@ -24,15 +24,18 @@ dependency as `eluna = { package = "eluna_rs", path = "vendor/eluna/crates/eluna
 
 The previous UPSTREAM.md claimed the tree was byte-identical to the pin. That
 claim is **retired**: the vendored tree is byte-identical to the fork head for
-every file that was copied, with exactly four kinds of deliberate deviation,
+every file that was copied, with exactly five kinds of deliberate deviation,
 all listed in the patch ledger below:
 
 1. the pruned directories (`crates/eluna_player`, `images/`),
 2. the licence texts upstream does not ship,
 3. the regenerated `Cargo.lock` (the fork's lock names the pruned player and
-   its ~370-package GUI tree), and
+   its ~370-package GUI tree),
 4. two stale unit tests fixed in place (the fork head's own suite is red
-   without them).
+   without them), and
+5. the frame-sampler semantics `motionplayer_nod3d.dll` authors and the fork
+   does not implement: `content.mask` key gating, the `{c,x,y}` cubic-Bezier
+   easing curves and the mesh `cc` curve (M137; functional, `emote.rs`).
 
 `diff -r` against `/home/ruri/repo/eluna` reports only those, plus this file.
 
@@ -74,6 +77,10 @@ test fixes in the patch ledger). For comparison, the previous pin's own tests
 did not compile at all (a stale unit test referenced a field that no longer
 existed), so eluna's suite was not runnable there.
 
+With M137's frame-sampler patch the vendored tree reports **99 passed;
+0 failed** — the four added tests cover the `content.mask` gate and the
+`{c,x,y}` Bezier evaluator (single segment, chained segments, piece list).
+
 Kirakira's workspace excludes this directory (`exclude = ["vendor/eluna"]`);
 `krkr-emote` consumes it as a path dependency and its own suite covers the
 parser/schema paths Kirakira uses.
@@ -90,11 +97,14 @@ evidence, and whether the fork still needs the same change.
 | `Cargo.lock` | Regenerated for the pruned workspace | The fork lock names `eluna_player` and its ~370 GUI packages; `cargo` rewrites the lock on first build here. Regenerating once keeps the vendored tree clean. | Vendoring artefact (not for upstream) |
 | `crates/eluna/src/vertex.rs` (`builds_single_cell_strip`) | u/v compared with the arithmetic's tolerance instead of exact f32 literals | The test asserts `v == 0.1` while the builder computes `(tex_y + y * v_step) * (1.0 / texture_height)`: `10.0 * (1.0 / 100.0)` is `0.099999994` in f32. Same test and same builder as the previous pin; the pin simply never compiled. | TO MIRROR upstream |
 | `crates/eluna/src/runtime.rs` (`timeline_hold_markers_do_not_pollute_authored_ranges`) | `default_value` expectation `3.0` → `0.0` | The implementation deliberately starts a timeline-only variable at the scalar zero default (`merge_timeline_variable_info`, comment citing `sub_1026FA30`, `timeline_default = 0.0`), and the sibling test `timeline_only_variable_does_not_take_first_key_as_initial_value` already pins that. The stale expectation was the only failure; the hold marker still stays out of the authored 3.0..5.0 range. | TO MIRROR upstream |
+| `crates/eluna/src/emote.rs` (frame sampler) | PARQUET's reference frame semantics: `content.mask` gates every key read (`FUN_1001d000`); the authored `{c,x,y}` easing curve is evaluated by cubic-Bezier parameter inversion (`FUN_100087d0`/`FUN_10008220`, chained `3N+1` segments) for `ccc/acc/zcc/scc/occ`; the mesh interpolates with the frame's mesh `cc` curve (`FUN_100098f0`). Mask-less content keeps the old permissive reads. | `motionplayer_nod3d.dll` (full Ghidra export `/tmp/ghidra-full/motionplayer_nod3d/decompiled`, M134 notes) reads frame keys only under the bitfield and evaluates `x`/`y` Bezier arrays; PARQUET's 23 `.mtn` carry 508 single-segment and 8 chained `{c,x,y}` curves whose `p` (second-derivative) array the fork's spline path needs and the assets never write. M137. | TO MIRROR upstream (functional) |
 
 "TO MIRROR" rows are changes the fork head should receive; they were made in
 this vendored copy only because the fork working tree is outside the mission's
-write scope. Nothing in the library's behaviour was changed — both rows are
-test-side only.
+write scope. The first two rows are test-side only; the `emote.rs` row changes
+the library's behaviour for the reference flavor the fork's spline form did
+not cover, and is covered by new unit tests in that file plus the
+`krkr-emote` asset tests.
 
 ## Adapter passes at this pin (M127)
 
