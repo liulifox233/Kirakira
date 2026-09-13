@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs::{self, File},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
@@ -14,8 +14,8 @@ use flate2::{Compression, write::ZlibEncoder};
 use krkr_core::StoragePort;
 
 use crate::{
-    SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3Error, Xp3OpenOptions, Xp3ResourceProvider,
-    normalize_entry_name,
+    SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3Entry, Xp3Error, Xp3OpenOptions,
+    Xp3ResourceProvider, normalize_entry_name,
     parse::{XP3_INDEX_CONTINUE, XP3_INDEX_ENCODE_RAW, XP3_INDEX_ENCODE_ZLIB, parse_index},
 };
 
@@ -390,6 +390,342 @@ fn xp3_resource_provider_reads_entries_with_patch_priority() {
         Err(error) => error,
     };
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
+
+    fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+/// The provider probe used to normalize once and then let every archive
+/// normalize again for its exact map and once more for the lowercased map.
+/// `Xp3Archive::get_entry`/`get_entry_ascii_case_insensitive` still have
+/// exactly those per-call semantics, so separately-opened handles of the same
+/// archives are the pre-change reference the hoisted provider must reproduce.
+fn per_archive_probe_entry<'a>(
+    archives: &'a [Xp3Archive<File>],
+    path: &str,
+) -> Option<&'a Xp3Entry> {
+    let normalized = normalize_entry_name(path).ok()?;
+    for archive in archives.iter().rev() {
+        if let Some(entry) = archive.get_entry(&normalized) {
+            return Some(entry);
+        }
+        if let Some(entry) = archive.get_entry_ascii_case_insensitive(&normalized) {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// The pre-change `StoragePort::open` over a reference archive list: the
+/// entry name the per-archive walk selects and the bytes it serves.
+fn per_archive_probe_open(archives: &[Xp3Archive<File>], path: &str) -> Option<(String, Vec<u8>)> {
+    let normalized = normalize_entry_name(path).ok()?;
+    for archive in archives.iter().rev() {
+        let entry_name = if archive.get_entry(&normalized).is_some() {
+            normalized.clone()
+        } else if let Some(entry) = archive.get_entry_ascii_case_insensitive(&normalized) {
+            entry.name.clone()
+        } else {
+            continue;
+        };
+        let mut stream = archive.open_by_name(&entry_name).ok().flatten()?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).ok()?;
+        return Some((entry_name, bytes));
+    }
+    None
+}
+
+/// Mirrors `Xp3ResourceProvider::archive_index`, which the probe hoist does
+/// not touch: the reference walk has to visit the mount the provider resolved.
+fn reference_archive_index(names: &[String], archive: &str) -> Option<usize> {
+    let wanted = archive
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()?
+        .to_ascii_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    names.iter().rposition(|name| name.as_str() == wanted)
+}
+
+/// The pre-change lookup inside one named archive: normalize once and let the
+/// archive normalize again for each of its two maps.
+fn per_archive_probe_entry_in<'a>(
+    archives: &'a [Xp3Archive<File>],
+    index: usize,
+    path: &str,
+) -> Option<&'a Xp3Entry> {
+    let normalized = normalize_entry_name(path).ok()?;
+    let archive = &archives[index];
+    archive
+        .get_entry(&normalized)
+        .or_else(|| archive.get_entry_ascii_case_insensitive(&normalized))
+}
+
+/// Reads all bytes a probe resolves to, failing the test on a miss.
+fn read_provider_entry(provider: &Xp3ResourceProvider, path: &str) -> Vec<u8> {
+    let mut stream = provider.open(path).expect("open provider entry");
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).expect("read provider entry");
+    bytes
+}
+
+/// The probe hoist is an optimisation, not a rule change: across case
+/// variants, separator spellings, extensionless and extended bare names and
+/// odd or invalid paths, `get_entry`, `get_entry_in` and `open` answer
+/// exactly like the pre-change walk that re-normalized inside every archive.
+#[test]
+fn hoisted_probe_lookups_agree_with_per_archive_normalization() {
+    let root = temp_root("probe-normalization");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let data_path = root.join("data.xp3");
+    let patch_path = root.join("patch.xp3");
+    let extra_path = root.join("extra.xp3");
+    fs::write(
+        &data_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "scenario/start.ks",
+                    segments: vec![FixtureSegment::raw(b"base")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "scenario/base_only.ks",
+                    segments: vec![FixtureSegment::raw(b"base-only")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "CASE.txt",
+                    segments: vec![FixtureSegment::raw(b"case-data")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "dup.bin",
+                    segments: vec![FixtureSegment::raw(b"dup-data")],
+                    hash: 0,
+                    time: None,
+                },
+                // A case-collapsed pair inside one mount: the lowercased map
+                // keeps the first entry in name order, so a mixed-case probe
+                // reaches `THING.txt` while the exact spelling reaches
+                // `thing.txt`.
+                FixtureEntry {
+                    name: "THING.txt",
+                    segments: vec![FixtureSegment::raw(b"upper-thing")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "thing.txt",
+                    segments: vec![FixtureSegment::raw(b"lower-thing")],
+                    hash: 0,
+                    time: None,
+                },
+                // `to_ascii_lowercase` folds ASCII only.
+                FixtureEntry {
+                    name: "ÄÖÜ.ks",
+                    segments: vec![FixtureSegment::raw(b"umlaut")],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write data archive");
+    fs::write(
+        &patch_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "scenario/start.ks",
+                    segments: vec![FixtureSegment::raw(b"patch")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "scenario/patch_only.ks",
+                    segments: vec![FixtureSegment::raw(b"patch-only")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "dup.bin",
+                    segments: vec![FixtureSegment::raw(b"dup-patch")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "MixedCase.TXT",
+                    segments: vec![FixtureSegment::raw(b"mixed")],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write patch archive");
+    fs::write(
+        &extra_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "only-extra.ks",
+                    segments: vec![FixtureSegment::raw(b"extra")],
+                    hash: 0,
+                    time: None,
+                },
+                // The newest mount holds the upper-case spelling of a name the
+                // older mounts also carry: its case-insensitive hit must beat
+                // their exact hits, because the walk resolves one mount
+                // completely before it moves to the next.
+                FixtureEntry {
+                    name: "DUP.BIN",
+                    segments: vec![FixtureSegment::raw(b"dup-extra")],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write extra archive");
+
+    let provider = Xp3ResourceProvider::open_archives([&data_path, &patch_path, &extra_path])
+        .expect("open provider");
+    let reference = [&data_path, &patch_path, &extra_path].map(|path| {
+        Xp3Archive::open_file(path)
+            .unwrap_or_else(|error| panic!("open reference {path:?}: {error}"))
+    });
+    let names = [&data_path, &patch_path, &extra_path].map(|path| {
+        path.file_name()
+            .expect("fixture file name")
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    });
+
+    // Name shapes the two resolvers can receive: stored spellings, ASCII case
+    // variants (including one the ASCII-only fold cannot reach), an
+    // intra-mount exact-vs-lowercase collision, both separator spellings,
+    // extensionless and extended bare names, trailing delimiters, and the
+    // empty and escaping spellings normalization rejects.
+    const PROBES: &[&str] = &[
+        "scenario/start.ks",
+        "scenario/base_only.ks",
+        "scenario/patch_only.ks",
+        "only-extra.ks",
+        "CASE.txt",
+        "MixedCase.TXT",
+        "SCENARIO/START.KS",
+        "Scenario/Start.Ks",
+        "case.txt",
+        "CASE.TXT",
+        "mixedcase.txt",
+        "MIXEDCASE.TXT",
+        "ÄÖÜ.ks",
+        "äöü.ks",
+        "ÄÖÜ.KS",
+        "thing.txt",
+        "THING.txt",
+        "Thing.txt",
+        "dup.bin",
+        "DUP.BIN",
+        "Dup.Bin",
+        r"scenario\start.ks",
+        r"SCENARIO\START.KS",
+        r"scenario\.\start.ks",
+        r".\scenario\start.ks",
+        "scenario//start.ks",
+        "start",
+        "start.ks",
+        "START",
+        "case",
+        "dup",
+        "scenario/",
+        ".",
+        "./",
+        "",
+        "scenario/../start.ks",
+        "/absolute.ks",
+        "../outside.ks",
+        r"..\outside.ks",
+        r"\scenario\start.ks",
+    ];
+
+    for probe in PROBES {
+        assert_eq!(
+            provider.get_entry(probe).cloned(),
+            per_archive_probe_entry(&reference, probe).cloned(),
+            "get_entry({probe:?})"
+        );
+        let opened = provider.open(probe).ok().map(|mut stream| {
+            let mut bytes = Vec::new();
+            stream
+                .read_to_end(&mut bytes)
+                .expect("read provider stream");
+            bytes
+        });
+        assert_eq!(
+            opened,
+            per_archive_probe_open(&reference, probe).map(|(_, bytes)| bytes),
+            "open({probe:?})"
+        );
+    }
+
+    for archive_name in [
+        "data.xp3",
+        "patch.xp3",
+        "PATCH.XP3",
+        r"sys\extra.xp3",
+        "missing.xp3",
+    ] {
+        for probe in PROBES {
+            let reference_entry = reference_archive_index(&names, archive_name)
+                .and_then(|index| per_archive_probe_entry_in(&reference, index, probe).cloned());
+            assert_eq!(
+                provider.get_entry_in(archive_name, probe).cloned(),
+                reference_entry,
+                "get_entry_in({archive_name:?}, {probe:?})"
+            );
+        }
+    }
+
+    // Concrete answers the differential helpers share too little code with to
+    // prove on their own. The newest mount is searched first; inside one mount
+    // the exact map is consulted before the lowercased one.
+    assert_eq!(
+        read_provider_entry(&provider, r"SCENARIO\START.KS"),
+        b"patch"
+    );
+    assert_eq!(
+        read_provider_entry(&provider, "scenario/base_only.ks"),
+        b"base-only"
+    );
+    assert_eq!(read_provider_entry(&provider, "only-extra.ks"), b"extra");
+    assert_eq!(read_provider_entry(&provider, "dup.bin"), b"dup-extra");
+    assert_eq!(read_provider_entry(&provider, "MixedCase.TXT"), b"mixed");
+    assert_eq!(read_provider_entry(&provider, "mixedcase.txt"), b"mixed");
+    assert_eq!(read_provider_entry(&provider, "thing.txt"), b"lower-thing");
+    assert_eq!(read_provider_entry(&provider, "Thing.txt"), b"upper-thing");
+    assert_eq!(read_provider_entry(&provider, "ÄÖÜ.KS"), b"umlaut");
+    assert!(provider.open("äöü.ks").is_err());
+    assert!(provider.get_entry("start").is_none());
+    assert!(provider.get_entry("../outside.ks").is_none());
+
+    let mut pinned = provider
+        .open_in("patch.xp3", r"SCENARIO\START.KS")
+        .expect("open pinned member");
+    let mut pinned_bytes = Vec::new();
+    pinned
+        .read_to_end(&mut pinned_bytes)
+        .expect("read pinned member");
+    assert_eq!(pinned_bytes, b"patch");
 
     fs::remove_dir_all(root).expect("remove temp dir");
 }

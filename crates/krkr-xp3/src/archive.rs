@@ -82,15 +82,34 @@ where
 
     pub fn get_entry(&self, name: &str) -> Option<&Xp3Entry> {
         let name = normalize_entry_name(name).ok()?;
-        self.by_name
-            .get(&name)
-            .and_then(|index| self.entries.get(*index))
+        self.get_entry_normalized(&name)
     }
 
     pub fn get_entry_ascii_case_insensitive(&self, name: &str) -> Option<&Xp3Entry> {
         let name = normalize_entry_name(name).ok()?;
+        self.get_entry_normalized_ascii_case_insensitive(&name.to_ascii_lowercase())
+    }
+
+    /// Looks up a name the caller has already run through
+    /// [`normalize_entry_name`]. The maps key on normalized names, so a
+    /// caller that resolves one probe against several archives — the
+    /// provider walks every mount per lookup — normalizes once and then uses
+    /// these instead of paying the normalization per archive.
+    pub(crate) fn get_entry_normalized(&self, name: &str) -> Option<&Xp3Entry> {
+        self.by_name
+            .get(name)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    /// [`Self::get_entry_normalized`] with ASCII case folded away:
+    /// `lowercase_name` must be the ASCII-lowercased form of the normalized
+    /// name, which is the key `by_ascii_lowercase_name` stores.
+    pub(crate) fn get_entry_normalized_ascii_case_insensitive(
+        &self,
+        lowercase_name: &str,
+    ) -> Option<&Xp3Entry> {
         self.by_ascii_lowercase_name
-            .get(&name.to_ascii_lowercase())
+            .get(lowercase_name)
             .and_then(|index| self.entries.get(*index))
     }
 
