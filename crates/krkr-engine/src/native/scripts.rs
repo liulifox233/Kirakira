@@ -1,6 +1,6 @@
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{NativeArgCount, ObjectHandle, Runtime, TjsHost, Variant},
+    runtime::{Closure, NativeArgCount, ObjectHandle, Runtime, TjsHost, Variant},
 };
 use std::collections::BTreeSet;
 
@@ -13,10 +13,10 @@ use crate::{
     },
 };
 
-use super::{arg_string, install_static_object, native_void, required_arg_string};
+use super::{arg_string, install_static_class_object, native_void, required_arg_string};
 
 pub(crate) fn install_scripts(runtime: &mut Runtime<KrkrHost>) {
-    let scripts = install_static_object(runtime, "Scripts");
+    let scripts = install_static_class_object(runtime, "Scripts");
     // `tTJSNC_Scripts` declares an empty `finalize` with
     // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`ScriptMgnIntf.cpp:1218`); scripts
     // reach it as `Scripts.finalize(...)` while tearing a session down.
@@ -339,7 +339,7 @@ fn scripts_get_class_names(
 
 fn scripts_foreach(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
+    this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let Some(collection) = args.first().cloned() else {
@@ -351,6 +351,7 @@ fn scripts_foreach(
     let Some(func) = args.get(1).cloned() else {
         return Ok(Variant::Void);
     };
+    let func = bind_foreach_callback(runtime, func, this_obj);
     let entries = match collection.object_handle() {
         Some(handle) => {
             if let Some(items) = runtime.array_elements(handle) {
@@ -380,6 +381,31 @@ fn scripts_foreach(
         }
     }
     Ok(Variant::Void)
+}
+
+/// `scriptsEx`'s callback binding: "an anonymous function runs in the `this`
+/// context" (`functhis = funcClosure.ObjThis; if (functhis == 0) functhis =
+/// objthis;`, krkr2 `src/plugins/win32/scriptsEx/Main.cpp:491-493`).  The
+/// receiver of the `foreach` call supplies the context an unbound callback
+/// runs in; a callback that carries its own binding keeps it.  KAGEnv hands
+/// `Scripts.foreach` literals created inside its own methods and expects the
+/// enclosing instance back (`entryUpdateAll`'s `entryUpdate(a1)`,
+/// `system/KAGEnvironment.tjs`), which is also what the official engine
+/// answers with the reference plugin loaded.  `crates/krkr-plugins`'s
+/// `scripts_ex` module is the same rule.
+fn bind_foreach_callback(
+    runtime: &Runtime<KrkrHost>,
+    func: Variant,
+    this_obj: Option<ObjectHandle>,
+) -> Variant {
+    let receiver = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle));
+    match func {
+        Variant::Closure(closure) => {
+            Variant::Closure(Closure::new(closure.object, closure.this_obj.or(receiver)))
+        }
+        Variant::Object(handle) => Variant::Closure(Closure::new(handle, receiver)),
+        other => other,
+    }
 }
 
 fn scripts_equal_struct(

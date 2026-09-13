@@ -5456,6 +5456,135 @@ mod tests {
         assert_eq!(value, Variant::String("0=a;1=b;name=kirakira".to_string()));
     }
 
+    /// `Scripts.foreach`'s native must reach the *caller's* `this`, not the
+    /// `Scripts` object it is spelled on: the official engine publishes
+    /// `Scripts` as an unbound native class (`REGISTER_OBJECT(Scripts, ...)`
+    /// with `val = tTJSVariant(dsp/*, dsp*/)`, `base/ScriptMgnIntf.cpp:497-505`)
+    /// and `CallFunctionDirect` falls through to `ra[-1]`
+    /// (`tjsInterCodeExec.cpp:2434`), so `scriptsEx`'s `functhis =
+    /// funcClosure.ObjThis; if (functhis == 0) functhis = objthis;`
+    /// (`src/plugins/win32/scriptsEx/Main.cpp:491-493`) hands an unbound
+    /// callback the calling instance.  KAGEnv leans on it: `entryUpdateAll`
+    /// calls `Scripts_foreach(objects, function(a0,a1){ entryUpdate(a1); })`
+    /// (`system/KAGEnvironment.tjs`) and a callback that cannot see
+    /// `entryUpdate` stops the conductor at 少女世界's `[endtrans notrans
+    /// sync]` (`custom.ks:49`, reported at `:48`).
+    ///
+    /// Measured against the official krkrz 1.4.0r2 engine with the reference
+    /// `scriptsEx.dll` loaded (wine harness `scripts/wine/run.sh`):
+    /// `shape.instance|U:ENV:1 U:ENV:2 `, `shape.bound|ENV:07` -- the same
+    /// values asserted here.  M178's capture removal makes the callback
+    /// unbound, which is what exposes the missing receiver.
+    #[test]
+    fn scripts_foreach_callback_runs_on_the_calling_instance() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class Env {
+                    var objects = new Dictionary();
+                    var tag = "ENV";
+                    function entryUpdate(a0) { return "U:" + this.tag + ":" + a0 + " "; }
+                    function entryUpdateAll() {
+                        global.foreachInstanceLog = "";
+                        Scripts.foreach(this.objects, function(a0, a1) { global.foreachInstanceLog += entryUpdate(a1); });
+                        return global.foreachInstanceLog;
+                    }
+                    function boundRun() {
+                        global.foreachBoundLog = "";
+                        Scripts.foreach([7], (function(a0, a1) { global.foreachBoundLog += this.tag + ":" + a0 + a1; }) incontextof this);
+                        return global.foreachBoundLog;
+                    }
+                }
+                var e = new Env();
+                e.objects["a"] = 1;
+                e.objects["b"] = 2;
+                return e.entryUpdateAll() + "|" + e.boundRun();
+                "#,
+            )
+            .expect("script");
+
+        assert_eq!(
+            value,
+            Variant::String("U:ENV:1 U:ENV:2 |ENV:07".to_string())
+        );
+    }
+
+    /// The KAG macro shape the live game stalls on: 少女世界's `[title_bgm]`
+    /// body starts with `@eval exp='tf.titlebgm = typeof global.GetTitleBGM ==
+    /// "Object" ? GetTitleBGM() : SystemConfig.TitleBGM'` (`custom.ks:157`),
+    /// invoked from line 48.  The hook is optional and the fallback branch has
+    /// to answer when it is absent.  Measured against the official engine:
+    /// `eval.macro|hooked`, `eval.fallback|configured`.
+    #[test]
+    fn kag_macro_eval_tag_records_the_hooked_and_fallback_answers() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("fallback.ks"),
+            r#"[macro name=title_bgm]
+@eval exp='tf.titlebgm = typeof global.GetTitleBGM == "Object" ? GetTitleBGM() : SystemConfig.TitleBGM'
+[endmacro]
+*start
+[eval exp='global.tf = %[]']
+[eval exp='global.SystemConfig = %[TitleBGM: "configured"]']
+[title_bgm paused]
+[eval exp='global.recorded = tf.titlebgm']
+"#,
+        )
+        .expect("write fallback scenario");
+        fs::write(
+            root.join("hooked.ks"),
+            r#"[macro name=title_bgm]
+@eval exp='tf.titlebgm = typeof global.GetTitleBGM == "Object" ? GetTitleBGM() : SystemConfig.TitleBGM'
+[endmacro]
+*start
+[eval exp='global.tf = %[]']
+[eval exp='global.GetTitleBGM = function() { return "hooked"; }']
+[title_bgm paused]
+[eval exp='global.recorded = tf.titlebgm']
+"#,
+        )
+        .expect("write hooked scenario");
+
+        let mut engine = KrkrEngine::for_project(&root).expect("engine");
+
+        engine
+            .load_kag_scenario("fallback.ks")
+            .expect("load fallback scenario");
+        assert_eq!(
+            engine.tick().expect("tick fallback").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "global.recorded")
+                .expect("fallback answer"),
+            Variant::String("configured".to_string())
+        );
+
+        engine
+            .execute_script("inline.tjs", "delete global.recorded;")
+            .expect("reset recorded");
+        engine
+            .load_kag_scenario("hooked.ks")
+            .expect("load hooked scenario");
+        assert_eq!(
+            engine.tick().expect("tick hooked").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "global.recorded")
+                .expect("hooked answer"),
+            Variant::String("hooked".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn scripts_foreach_stops_on_and_returns_a_non_void_callback_result() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -5477,6 +5606,12 @@ mod tests {
         assert_eq!(value, Variant::String("10,20,stop".to_string()));
     }
 
+    /// The anonymous callback `Scripts.foreach` runs reaches the enclosing
+    /// instance: measured against the official krkrz 1.4.0r2 engine with the
+    /// reference `scriptsEx.dll` loaded, `Scripts.foreach(..., function(){...
+    /// this.tag ...})` inside a method answers with the *calling* instance
+    /// (`M185|shape.instance|U:ENV:1 U:ENV:2 `), so this expectation is the
+    /// reference behaviour, not an artifact of the VM's old capture.
     #[test]
     fn scripts_foreach_preserves_anonymous_function_this_context() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
