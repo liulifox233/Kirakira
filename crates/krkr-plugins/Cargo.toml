@@ -27,6 +27,14 @@ ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 # authorization header need an IANA-name charset lookup and base64.
 encoding_rs.workspace = true
 base64.workspace = true
+# The `expat` port drives XML with `quick-xml`; the reference links the expat
+# C library instead, and this workspace takes no C dependencies. Already in
+# the lockfile as a transitive dependency.
+quick-xml = "0.39"
+# The `psd` port inflates ZIP-compressed layer channels with `flate2`
+# (miniz_oxide backend); the reference compiles zlib in under `USE_ZLIB`
+# (`psdimage.cpp:5-8`). Already in the lockfile as a transitive dependency.
+flate2 = "1.1"
 
 [dev-dependencies]
 krkr-assets.workspace = true
