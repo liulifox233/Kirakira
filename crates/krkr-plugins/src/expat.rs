@@ -9,8 +9,9 @@
 //! Surface, verified line by line against the source:
 //!
 //! * `XMLParser(target = void)` — the constructor stores `param[0]->AsObject()`
-//!   as the handler target (`:339-355`); a non-object argument (or none) leaves
-//!   it NULL.
+//!   as the handler target (`:344-352`); an omitted argument (or `null`)
+//!   leaves it NULL, while any other non-object throws the reference's
+//!   conversion error.
 //! * `parse(text)` / `parseStorage(filename)` (`:515-540`): both call the
 //!   instance's `init` (`:359-372`), which resets the parser with the
 //!   **UTF-8** protocol encoding and registers a handler for every member
