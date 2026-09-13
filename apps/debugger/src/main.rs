@@ -20,7 +20,10 @@
 //!   --before-expr <expr>    evaluate a TJS expression before the frame loop
 //!   --at-frame <n> --at-script <tjs>
 //!                           execute TJS source when frame n begins (pair in
-//!                           order; repeatable)
+//!                           order; repeatable); while the VM is parked the
+//!                           script waits for the first frame it runs again,
+//!                           and a script that never runs before the frame
+//!                           budget ends fails the run
 //!   --click <n,x,y>         inject a click at (x, y) on frame n, release on
 //!                           frame n+1 (repeatable)
 //!   --move <n,x,y>          move the cursor to (x, y) on frame n without
@@ -121,7 +124,11 @@
 //!   q                           quit the session
 //! An empty line repeats the last control command.
 
-use krkr_debug::{console::*, snapshot};
+use krkr_debug::{
+    console::*,
+    inject::{AtFrameScripts, AtScriptOutcome, AtScriptUnfinished, VM_SUSPENDED},
+    snapshot,
+};
 
 use std::{collections::VecDeque, io::Write, path::PathBuf, sync::Arc, thread, time::Duration};
 
@@ -462,6 +469,46 @@ fn global_member_path(runtime: &Runtime<KrkrHost>, name: &str) -> Variant {
     current
 }
 
+/// How the run ended when the unfinished injections are reported.
+///
+/// A requested termination is not the frame budget running out — the message
+/// must not claim it is: an operator's `q` at frame 5 has 99995 frames left.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunEnd {
+    /// The frame loop ran out its `--max-frames` budget.
+    FrameBudget,
+    /// The run stopped on request (an interactive `q`, a debugger quit).
+    Requested,
+}
+
+/// Names every `--at-frame`/`--at-script` request the run ended without
+/// running, with the cause the queue recorded — the VM stayed parked at the
+/// request's frame — or, for a request whose frame never arrived, the reason
+/// the run ended (`end`). Returns true when something was reported, so the
+/// normal end of the run can exit non-zero; the deliberate terminations (an
+/// interactive `q`, a debugger quit) only report -- their exit code stays what
+/// it was.
+fn report_unfinished_at_scripts(scripts: &AtFrameScripts, max_frames: usize, end: RunEnd) -> bool {
+    let mut any = false;
+    for unfinished in scripts.unfinished() {
+        match unfinished {
+            AtScriptUnfinished::VmStayedParked { requested_frame } => println!(
+                "at-frame error: script for frame={requested_frame} never ran: {VM_SUSPENDED}"
+            ),
+            AtScriptUnfinished::BudgetEnded { requested_frame } => match end {
+                RunEnd::FrameBudget => println!(
+                    "at-frame error: script for frame={requested_frame} never ran: the frame budget (--max-frames {max_frames}) ended first"
+                ),
+                RunEnd::Requested => println!(
+                    "at-frame error: script for frame={requested_frame} never ran: the run ended before that frame"
+                ),
+            },
+        }
+        any = true;
+    }
+    any
+}
+
 fn main() {
     let config = parse_args();
     let root = config
@@ -584,6 +631,24 @@ fn main() {
         stdout.flush().expect("storage dump flush");
     }
 
+    // `--before-script`/`--before-expr` run before the frame loop, where a
+    // parked VM swallows both (they return `void` instead of running). There
+    // is no earlier frame to retry on, so refuse loudly rather than report
+    // success for setup that never happened.
+    if runtime.engine().is_script_suspended()
+        && (config.before_script.is_some() || config.before_expr.is_some())
+    {
+        let option = if config.before_script.is_some() {
+            "--before-script"
+        } else {
+            "--before-expr"
+        };
+        println!("{option} error: {VM_SUSPENDED}; the script was not executed");
+        dump_logs(runtime.engine());
+        dump_stub_calls(runtime.engine());
+        std::process::exit(1);
+    }
+
     if let Some(script) = &config.before_script {
         runtime
             .engine_mut()
@@ -624,6 +689,19 @@ fn main() {
     let mut deferred_interactive_commands = VecDeque::new();
     let mut last_kag_semantic: Option<String> = None;
     let mut watch_values: Vec<Option<String>> = vec![None; config.watch_exprs.len()];
+    // The `--at-frame`/`--at-script` queue: a request whose frame arrives
+    // while the VM is parked waits there for the first frame the VM runs
+    // again (see `krkr_debug::inject`), so this is the record of which
+    // injections are still outstanding.
+    let mut at_scripts = AtFrameScripts::new(
+        config
+            .at_frames
+            .iter()
+            .map(|(frame, script)| (*frame, script.clone().expect("checked in parse_args")))
+            .collect(),
+    );
+    let mut injection_failed = false;
+    let mut kag_auto_click_parked = false;
     for frame_index in 0..config.max_frames {
         // Interactive mode is deliberately deterministic: it starts paused,
         // and only `advance`/`run`/`click` allow another frame to execute.
@@ -663,6 +741,11 @@ fn main() {
                         &mut interactive_auto_click,
                         &mut interactive_auto_point,
                     ) {
+                        report_unfinished_at_scripts(
+                            &at_scripts,
+                            config.max_frames,
+                            RunEnd::Requested,
+                        );
                         dump_stub_calls(runtime.engine());
                         return;
                     }
@@ -700,6 +783,11 @@ fn main() {
                             &mut interactive_auto_click,
                             &mut interactive_auto_point,
                         ) {
+                            report_unfinished_at_scripts(
+                                &at_scripts,
+                                config.max_frames,
+                                RunEnd::Requested,
+                            );
                             dump_stub_calls(runtime.engine());
                             return;
                         }
@@ -708,18 +796,44 @@ fn main() {
                 }
             }
         }
-        for (at_frame, script) in &config.at_frames {
-            if *at_frame == frame_index {
-                let script = script.as_deref().expect("checked in parse_args");
-                println!("executing at frame={frame_index}");
-                runtime
-                    .engine_mut()
-                    .execute_script("krkr_debug_at_frame.tjs", script)
-                    .expect("at-frame script");
+        // Deferred injections run before this frame's own, so a script never
+        // overtakes an earlier one; while the VM is parked nothing runs and
+        // the queue keeps waiting.
+        for outcome in at_scripts.inject(runtime.engine_mut(), frame_index) {
+            match outcome {
+                AtScriptOutcome::Ran {
+                    requested_frame,
+                    frame,
+                    deferred,
+                } => {
+                    if deferred {
+                        println!(
+                            "at-frame script frame={requested_frame} executing at frame={frame} (deferred while the VM was parked)"
+                        );
+                    } else {
+                        println!("executing at frame={frame}");
+                    }
+                }
+                AtScriptOutcome::Deferred { requested_frame } => {
+                    println!(
+                        "at-frame script frame={requested_frame} deferred: {VM_SUSPENDED}; it runs on the first frame the VM runs again"
+                    )
+                }
             }
         }
         for click_frame in &config.kag_clicks {
             if frame_index == *click_frame {
+                // A click is an action tied to its frame, not setup that can
+                // wait a few frames: while the VM is parked the click script
+                // returns `void` without waking anything, so name that and
+                // fail the run instead of dropping the click silently.
+                if runtime.engine().is_script_suspended() {
+                    println!(
+                        "kag-click frame={frame_index} error: {VM_SUSPENDED}; the click was not attempted"
+                    );
+                    injection_failed = true;
+                    continue;
+                }
                 match runtime
                     .engine_mut()
                     .execute_expression("krkr_debug_kag_click.tjs", KAG_CLICK_SOURCE)
@@ -729,17 +843,32 @@ fn main() {
                 }
             }
         }
-        if config.kag_auto_click && kag_awaits_click(runtime.engine()) {
-            match runtime
-                .engine_mut()
-                .execute_expression("krkr_debug_kag_click.tjs", KAG_CLICK_SOURCE)
-            {
-                Ok(value) => {
-                    if !config.quiet {
-                        println!("kag-auto-click frame={frame_index} -> {value}");
+        // A parked VM cannot run the click script either, so the automatic
+        // click skips until the VM runs again. The notice is printed once per
+        // park instead of on every frame of a load window.
+        if config.kag_auto_click {
+            if runtime.engine().is_script_suspended() {
+                if !kag_auto_click_parked {
+                    kag_auto_click_parked = true;
+                    println!("kag-auto-click frame={frame_index} skipped: {VM_SUSPENDED}");
+                }
+            } else {
+                kag_auto_click_parked = false;
+                if kag_awaits_click(runtime.engine()) {
+                    match runtime
+                        .engine_mut()
+                        .execute_expression("krkr_debug_kag_click.tjs", KAG_CLICK_SOURCE)
+                    {
+                        Ok(value) => {
+                            if !config.quiet {
+                                println!("kag-auto-click frame={frame_index} -> {value}");
+                            }
+                        }
+                        Err(error) => {
+                            println!("kag-auto-click frame={frame_index} error: {error}")
+                        }
                     }
                 }
-                Err(error) => println!("kag-auto-click frame={frame_index} error: {error}"),
             }
         }
         // A parked VM (the game suspended inside a resource load) makes every
@@ -965,6 +1094,7 @@ fn main() {
             }
             Err(error) if error.is_debug_quit() => {
                 println!("debug session terminated at frame={frame_index}");
+                report_unfinished_at_scripts(&at_scripts, config.max_frames, RunEnd::Requested);
                 dump_stub_calls(runtime.engine());
                 return;
             }
@@ -978,6 +1108,13 @@ fn main() {
         if config.realtime {
             std::thread::sleep(delta);
         }
+    }
+
+    // An injection the run never got to is a failed probe: name every one of
+    // them with the cause the queue recorded (the run ends non-zero below)
+    // instead of leaving a silent gap where the script should have run.
+    if report_unfinished_at_scripts(&at_scripts, config.max_frames, RunEnd::FrameBudget) {
+        injection_failed = true;
     }
 
     if config.interactive {
@@ -995,6 +1132,15 @@ fn main() {
             .engine_mut()
             .execute_expression("krkr_debug_inline.tjs", expression)
         {
+            // A parked VM answers `void` to every expression without
+            // evaluating it; reporting that as the value hides the failed
+            // probe behind a legitimate-looking `expression=void`.
+            Ok(value)
+                if matches!(value, Variant::Void) && runtime.engine().is_script_suspended() =>
+            {
+                println!("expression_error={VM_SUSPENDED}");
+                injection_failed = true;
+            }
             Ok(value) => println!("expression={}", display_value(runtime.engine(), &value)),
             Err(error) => println!("expression_error={error}\n---debug---\n{error:?}"),
         }
@@ -1117,6 +1263,12 @@ fn main() {
             }
             None => println!("screenshot_error={path}: no frame was rendered"),
         }
+    }
+    // Diagnostics are printed first: a run whose requested injection or
+    // expression never happened must not look like a successful probe.
+    if injection_failed {
+        println!("injection=error");
+        std::process::exit(1);
     }
 }
 

@@ -6,5 +6,6 @@
 
 pub mod cli;
 pub mod console;
+pub mod inject;
 pub mod snapshot;
 pub mod transition;
