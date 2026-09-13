@@ -3212,6 +3212,14 @@ fn install_timer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
 }
 
 fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    // `tTJSNC_WaveSoundBuffer` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`WaveIntf.cpp:1017`); the stream's real
+    // teardown lives in the native instance. Script wrappers call it on the
+    // *class object* -- KAGEX's voice-filter buffer does
+    // `global.EnvWaveSoundBuffer.finalize(...)` while its sessions are
+    // destroyed (`voiceeffect.tjs`) -- so the member must resolve through the
+    // script class's native parent, or the member call aborts the caller.
+    runtime.register_object_native(handle, "finalize", native_void);
     runtime.register_object_native(handle, "open", wave_sound_buffer_open);
     runtime.register_object_native(handle, "play", wave_sound_buffer_play);
     runtime.register_object_native(handle, "stop", wave_sound_buffer_stop);
@@ -11003,5 +11011,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PARQUET's voice-filter wrapper destroys its session buffers through the
+    /// *class object*: `var t2 = global.EnvWaveSoundBuffer; t2.finalize(...)`
+    /// (`sysscn/voiceeffect.tjs`, `FilterHackedEnvWaveSoundBuffer.finalize`).
+    /// The lookup has to fall through the script class to the empty native
+    /// finalizer krkrz declares on `WaveSoundBuffer`
+    /// (`TJS_DECL_EMPTY_FINALIZE_METHOD`, `WaveIntf.cpp:1017`); without it the
+    /// member call aborts the caller with `Member "finalize" does not exist`
+    /// while `title.ks:13` env-initializes the title screen.
+    #[test]
+    fn wave_sound_buffer_finalize_is_reachable_from_a_script_class_object() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_finalize.tjs",
+                r#"
+                global.trace = "";
+                class EnvWaveSoundBuffer extends WaveSoundBuffer {
+                    function EnvWaveSoundBuffer() { super.WaveSoundBuffer(); }
+                }
+                class FilterHackedEnvWaveSoundBuffer extends EnvWaveSoundBuffer {
+                    function FilterHackedEnvWaveSoundBuffer() {
+                        super.EnvWaveSoundBuffer();
+                    }
+                    function finalize() {
+                        global.trace += "F";
+                        var t2 = global.EnvWaveSoundBuffer;
+                        t2.finalize(...);
+                    }
+                }
+                var buffer = new FilterHackedEnvWaveSoundBuffer();
+                invalidate buffer;
+                return global.trace + ":" + (isvalid buffer);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("F:0".to_string()));
     }
 }

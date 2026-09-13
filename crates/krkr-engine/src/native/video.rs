@@ -39,6 +39,7 @@ use krkr_video::{VideoFrame, VideoMetadata, VideoPort};
 use crate::host::KrkrHost;
 
 use super::classes::video_overlay_property_names;
+use super::native_void;
 
 const VIDEO_STATUS_UNLOAD: &str = "unload";
 const VIDEO_STATUS_READY: &str = "ready";
@@ -1003,6 +1004,13 @@ fn video_overlay_prepare(
 }
 
 pub(crate) fn install_video_overlay_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    // `tTJSNC_VideoOverlay` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`VideoOvlIntf.cpp:205`); stopping the
+    // movie and releasing the decoder is the native instance destructor's job.
+    // Script movie wrappers call it on the class object -- PARQUET's `Movie`
+    // does `global.VideoOverlay.finalize(...)` (`Movie.tjs`) after stopping
+    // playback -- so the member must exist on the class surface.
+    runtime.register_object_native(handle, "finalize", native_void);
     runtime.register_object_native(handle, "open", video_overlay_open);
     runtime.register_object_native(handle, "play", video_overlay_play);
     runtime.register_object_native(handle, "stop", video_overlay_stop);
@@ -1690,5 +1698,39 @@ mod tests {
         assert_eq!(session.take_frame_at(0).map(|f| f.pts_ms), Some(0));
         session.seek(5000);
         assert!(session.pending.is_empty());
+    }
+
+    /// PARQUET's `Movie` (a `VideoOverlay` subclass) stops playback and then
+    /// tears the native side down through the *class object*:
+    /// `var t2 = global.VideoOverlay; t2.finalize(...)` (`Movie.tjs`). The
+    /// empty finalizer krkrz declares on `VideoOverlay`
+    /// (`TJS_DECL_EMPTY_FINALIZE_METHOD`, `VideoOvlIntf.cpp:205`) must resolve
+    /// through the class object, or the movie teardown aborts its caller.
+    #[test]
+    fn video_overlay_finalize_is_reachable_from_a_script_class_object() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "video_finalize.tjs",
+                r#"
+                global.trace = "";
+                class Movie extends VideoOverlay {
+                    function Movie() { super.VideoOverlay(); }
+                    function finalize() {
+                        global.trace += "M";
+                        var t2 = global.VideoOverlay;
+                        t2.finalize(...);
+                    }
+                }
+                var movie = new Movie();
+                invalidate movie;
+                return global.trace + ":" + (isvalid movie);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("M:0".to_string()));
     }
 }
