@@ -13,10 +13,21 @@
 //! # What the DLL registers
 //!
 //! Three `SimpleBinder` classes (`krkr2 …/plugins/win32/00_simplebinder`), each
-//! carrying a `WaveSoundBuffer` basename in its chain: `StkFreeVerb`,
-//! `GraphicEqualizer` and `DelayEffect` (the C++ class is `WaveDelay`, the TJS
-//! class name is `DelayEffect` — wide strings at `0x10029a24`, `0x100299c0`,
-//! `0x1002999c`), each with an `interface` property. `SimpleWaveFilter<…>`
+//! anchored on `WaveSoundBuffer`: `StkFreeVerb`, `GraphicEqualizer` and
+//! `DelayEffect` (the C++ class is `WaveDelay`, the TJS class name is
+//! `DelayEffect` — wide strings at `0x10029a24`, `0x100299c0`, `0x1002999c`),
+//! each with an `interface` property. The anchor matters: the binder's
+//! `BindUtil(base, link).Class(name, …)` resolves `base` through
+//! `StoreUtil::GetObject` and then stores the created class object *into* that
+//! object (`simplebinder.hpp`'s `ClassStore::Link` ends in
+//! `obj->PropSet(flag, key, …, obj)`), and all three chains construct the
+//! `WaveSoundBuffer` wide string `0x10029a04` (`push`es at `0x1000962c`,
+//! `0x100099d5` and `0x10009b8a`, immediately after each class name). The
+//! classes are therefore reachable as `WaveSoundBuffer.StkFreeVerb`,
+//! `WaveSoundBuffer.GraphicEqualizer` and `WaveSoundBuffer.DelayEffect` and as
+//! nothing else — the DLL creates no global of these names. That is the shape
+//! the games use: PARQUET's `data.xp3>sysscn/voiceeffect.tjs` objects 48-50
+//! load `WaveSoundBuffer.<name>` and `new` it. `SimpleWaveFilter<…>`
 //! RTTI names (`0x10034004`, `0x1003408c`, `0x10034170`) show the shared audio
 //! adapter, and `stk::FreeVerb` / `stk::Delay` / `stk::OnePole` / `stk::Effect`
 //! RTTI names show the Synthesis ToolKit classes underneath.
@@ -153,12 +164,14 @@ pub(crate) const META: PluginMeta = PluginMeta {
     feature: "GraphicEqualizer / StkFreeVerb / DelayEffect filters on WaveSoundBuffer",
     notes: "Real DSP (10-band peaking EQ, FreeVerb, damped feedback delay) with the recovered \
             member surface and parameter ranges, processing interleaved f32 PCM; the classes \
-            install on the global object like the reference. The engine has no per-buffer filter \
-            chain yet (`WaveSoundBuffer.filters` is the buffer's own read-only array and nothing \
-            consumes it, and `AudioCommand` carries no filter payload), so the filters run only \
-            through their Rust `process` entry points until that seam exists — `interface` answers \
-            a sentinel integer instead of a raw pointer. See the module docs for the re-derived \
-            constants and the parts that are inferred.",
+            install on the `WaveSoundBuffer` class object like the reference \
+            (`WaveSoundBuffer.StkFreeVerb` / `.GraphicEqualizer` / `.DelayEffect`, the binder's \
+            base — PARQUET's voiceeffect.tjs reads them there). The engine has no per-buffer \
+            filter chain yet (`WaveSoundBuffer.filters` is the buffer's own read-only array and \
+            nothing consumes it, and `AudioCommand` carries no filter payload), so the filters run \
+            only through their Rust `process` entry points until that seam exists — `interface` \
+            answers a sentinel integer instead of a raw pointer. See the module docs for the \
+            re-derived constants and the parts that are inferred.",
     install: |engine| engine.register_plugin(WfBasicEffectPlugin),
 };
 
@@ -925,8 +938,9 @@ fn install_wf_basic_effect(runtime: &mut Runtime<KrkrHost>) {
     install_delay_class(runtime);
 }
 
-/// `GraphicEqualizer`: `new GraphicEqualizer()`, `setGain(band, gain)`,
-/// `getGain(band)` and the read-only `interface` property.
+/// `GraphicEqualizer`: `new WaveSoundBuffer.GraphicEqualizer()`,
+/// `setGain(band, gain)`, `getGain(band)` and the read-only `interface`
+/// property.
 fn install_equalizer_class(runtime: &mut Runtime<KrkrHost>) {
     let class = runtime.alloc_native_constructor(
         |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
@@ -943,7 +957,7 @@ fn install_equalizer_class(runtime: &mut Runtime<KrkrHost>) {
     );
     runtime.add_object_class_info(class, "GraphicEqualizer");
     install_equalizer_members(runtime, class);
-    runtime.set_global_member("GraphicEqualizer", Variant::Object(class));
+    publish_filter_class(runtime, "GraphicEqualizer", class);
 }
 
 fn install_equalizer_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -1022,7 +1036,7 @@ fn install_free_verb_class(runtime: &mut Runtime<KrkrHost>) {
     );
     runtime.add_object_class_info(class, "StkFreeVerb");
     install_free_verb_members(runtime, class);
-    runtime.set_global_member("StkFreeVerb", Variant::Object(class));
+    publish_filter_class(runtime, "StkFreeVerb", class);
 }
 
 fn install_free_verb_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -1157,7 +1171,7 @@ fn install_delay_class(runtime: &mut Runtime<KrkrHost>) {
     );
     runtime.add_object_class_info(class, "DelayEffect");
     install_delay_members(runtime, class);
-    runtime.set_global_member("DelayEffect", Variant::Object(class));
+    publish_filter_class(runtime, "DelayEffect", class);
 }
 
 fn install_delay_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -1231,9 +1245,34 @@ fn free_verb_mut(state: &mut EffectState) -> Option<&mut FreeVerb> {
     }
 }
 
+/// Publishes one filter class where the reference's binder puts it: as a
+/// member of the `WaveSoundBuffer` class object.
+///
+/// The DLL's three `SimpleBinder` chains are all anchored on `WaveSoundBuffer`
+/// (`BindUtil(TJS_W("WaveSoundBuffer"), link).Class(TJS_W("StkFreeVerb"), …)`;
+/// see the module docs), so `WaveSoundBuffer.StkFreeVerb` is the class object's
+/// only home — the DLL never registers a global of these names, and PARQUET's
+/// `voiceeffect.tjs` reads them from there (objects 48-50).
+fn publish_filter_class(
+    runtime: &mut Runtime<KrkrHost>,
+    class_name: &'static str,
+    class: ObjectHandle,
+) {
+    if let Some(wave) = runtime.global_member("WaveSoundBuffer").object_handle() {
+        runtime.set_object_member(wave, class_name, Variant::Object(class));
+    }
+}
+
+/// The class object behind `WaveSoundBuffer.<name>`, the one place
+/// [`publish_filter_class`] puts it.
+fn filter_class(runtime: &Runtime<KrkrHost>, class_name: &str) -> Option<ObjectHandle> {
+    let wave = runtime.global_member("WaveSoundBuffer").object_handle()?;
+    runtime.object_member(wave, class_name).object_handle()
+}
+
 /// A fresh instance object of a plugin class: class info, `__className` (the
 /// value a future engine-side filter chain resolves by identity), and the
-/// superclass link to the class object.
+/// superclass link to the class object under `WaveSoundBuffer`.
 fn new_plugin_instance(runtime: &mut Runtime<KrkrHost>, class_name: &'static str) -> ObjectHandle {
     let instance = runtime.alloc_ordinary_object();
     runtime.add_object_class_info(instance, class_name);
@@ -1242,7 +1281,7 @@ fn new_plugin_instance(runtime: &mut Runtime<KrkrHost>, class_name: &'static str
         "__className",
         Variant::String(class_name.to_string()),
     );
-    if let Variant::Object(class) = runtime.global_member(class_name) {
+    if let Some(class) = filter_class(runtime, class_name) {
         runtime.set_object_super_class(instance, class);
     }
     instance
@@ -1340,8 +1379,16 @@ mod tests {
         run(engine, script).to_real().expect("real")
     }
 
+    /// Where the games reach the classes: the binder's base. PARQUET's
+    /// `voiceeffect.tjs` objects 48-50 read `WaveSoundBuffer.<name>` and `new`
+    /// it, so every script-level probe below spells the class that way.
+    const EQ: &str = "WaveSoundBuffer.GraphicEqualizer";
+    const FREE_VERB: &str = "WaveSoundBuffer.StkFreeVerb";
+    const DELAY: &str = "WaveSoundBuffer.DelayEffect";
+
     /// The recovered member set of every class (module docs, binder chain
-    /// `0x10009390`): the class must expose each one.
+    /// `0x10009390`): the class must expose each one, reached the way a game
+    /// reaches it.
     #[test]
     fn the_three_classes_carry_their_recovered_members() {
         let mut engine = engine();
@@ -1362,10 +1409,51 @@ mod tests {
         for (class, member) in members {
             let probe = string(
                 &mut engine,
-                &format!("(function() {{ return typeof {class}.{member}; }})()"),
+                &format!("(function() {{ return typeof WaveSoundBuffer.{class}.{member}; }})()"),
             );
-            assert_ne!(probe, "undefined", "{class}.{member} is not installed");
+            assert_ne!(
+                probe, "undefined",
+                "WaveSoundBuffer.{class}.{member} is not installed"
+            );
         }
+    }
+
+    /// The class-object path the games use, end to end. `voiceeffect.tjs`
+    /// builds its filters through the guarded harness `VoiceEffectFactory`
+    /// (`if (typeof VoiceEffectFactory[a0] == "Object") …`) and its `Verb` /
+    /// `EQ` / `Delay` members resolve the class through the
+    /// `WaveSoundBuffer` object before `new`ing it; the same guarded helper
+    /// here (`typeof a0[a1] == "Object"`) has to find all three classes, and
+    /// what it builds has to be a live filter the buffer's own `filters` array
+    /// accepts. The bare names stay absent: the DLL anchors every class on
+    /// `WaveSoundBuffer` and registers no global of them, so a script probing a
+    /// global sees `void` (`typeof` of the miss answers "undefined").
+    #[test]
+    fn the_guarded_class_object_lookup_builds_live_filters() {
+        let mut engine = engine();
+        let value = string(
+            &mut engine,
+            "(function() {\n\
+                 var l1 = function(a0, a1) {\n\
+                     if (typeof a0[a1] == \"Object\") return new a0[a1]();\n\
+                     return null;\n\
+                 };\n\
+                 var buffer = new WaveSoundBuffer();\n\
+                 buffer.filters.clear();\n\
+                 var eq = l1(WaveSoundBuffer, \"GraphicEqualizer\");\n\
+                 var reverb = l1(WaveSoundBuffer, \"StkFreeVerb\");\n\
+                 var delay = l1(WaveSoundBuffer, \"DelayEffect\");\n\
+                 eq.setGain(9, 2);\n\
+                 buffer.filters.add(eq);\n\
+                 buffer.filters.add(reverb);\n\
+                 buffer.filters.add(delay);\n\
+                 return typeof WaveSoundBuffer.StkFreeVerb + \":\" + eq.getGain(9) + \":\" +\n\
+                     buffer.filters.count + \":\" +\n\
+                     (typeof global.StkFreeVerb) + \":\" + (typeof global.GraphicEqualizer) + \":\" +\n\
+                     (typeof global.DelayEffect);\n\
+             })()",
+        );
+        assert_eq!(value, "Object:2:3:undefined:undefined:undefined");
     }
 
     /// The defaults on a fresh instance: the ten `1.0` band gains, the
@@ -1375,47 +1463,45 @@ mod tests {
         let mut engine = engine();
         let gains = string(
             &mut engine,
-            "(function() {\n\
-                 var eq = new GraphicEqualizer();\n\
-                 var out = [];\n\
-                 for (var band = 0; band < 10; band = band + 1) out.push(eq.getGain(band));\n\
-                 return out.join(\",\");\n\
-             })()",
+            &format!(
+                "(function() {{\n\
+                     var eq = new {EQ}();\n\
+                     var out = [];\n\
+                     for (var band = 0; band < 10; band = band + 1) out.push(eq.getGain(band));\n\
+                     return out.join(\",\");\n\
+                 }})()"
+            ),
         );
         assert_eq!(gains, "1,1,1,1,1,1,1,1,1,1");
 
-        assert_eq!(
+        let reverb = |engine: &mut KrkrEngine, body: &str| {
             real(
-                &mut engine,
-                "(function() { var reverb = new StkFreeVerb(); return reverb.roomSize; })()"
-            ),
+                engine,
+                &format!("(function() {{ var reverb = new {FREE_VERB}(); {body} }})()"),
+            )
+        };
+        assert_eq!(
+            reverb(&mut engine, "return reverb.roomSize;"),
             f64::from(FREEVERB_DEFAULT_ROOM_SIZE)
         );
         assert_eq!(
-            real(
-                &mut engine,
-                "(function() { var reverb = new StkFreeVerb(); return reverb.damping; })()"
-            ),
+            reverb(&mut engine, "return reverb.damping;"),
             f64::from(FREEVERB_DEFAULT_DAMPING)
         );
         assert_eq!(
-            real(
-                &mut engine,
-                "(function() { var reverb = new StkFreeVerb(); return reverb.width; })()"
-            ),
+            reverb(&mut engine, "return reverb.width;"),
             f64::from(FREEVERB_DEFAULT_WIDTH)
         );
         assert_eq!(
-            real(
-                &mut engine,
-                "(function() { var reverb = new StkFreeVerb(); return reverb.effectMix; })()"
-            ),
+            reverb(&mut engine, "return reverb.effectMix;"),
             f64::from(FREEVERB_DEFAULT_EFFECT_MIX)
         );
         assert_eq!(
             run(
                 &mut engine,
-                "(function() { var reverb = new StkFreeVerb(); return reverb.mode; })()"
+                &format!(
+                    "(function() {{ var reverb = new {FREE_VERB}(); return reverb.mode; }})()"
+                )
             ),
             Variant::Integer(0)
         );
@@ -1435,7 +1521,7 @@ mod tests {
         let probe = |engine: &mut KrkrEngine, body: &str| {
             real(
                 engine,
-                &format!("(function() {{ var eq = new GraphicEqualizer(); {body} }})()"),
+                &format!("(function() {{ var eq = new {EQ}(); {body} }})()"),
             )
         };
         assert_eq!(
@@ -1467,12 +1553,14 @@ mod tests {
         let mut engine = engine();
         let values = string(
             &mut engine,
-            "(function() {\n\
-                 var eq = new GraphicEqualizer();\n\
-                 var reverb = new StkFreeVerb();\n\
-                 var delay = new DelayEffect();\n\
-                 return eq.interface + \":\" + reverb.interface + \":\" + reverb.extend + \":\" + delay.interface;\n\
-             })()",
+            &format!(
+                "(function() {{\n\
+                     var eq = new {EQ}();\n\
+                     var reverb = new {FREE_VERB}();\n\
+                     var delay = new {DELAY}();\n\
+                     return eq.interface + \":\" + reverb.interface + \":\" + reverb.extend + \":\" + delay.interface;\n\
+                 }})()"
+            ),
         );
         assert_eq!(
             values,
@@ -1482,7 +1570,7 @@ mod tests {
         );
         let error = try_run(
             &mut engine,
-            "(function() { var eq = new GraphicEqualizer(); eq.interface = 0; return 0; })()",
+            &format!("(function() {{ var eq = new {EQ}(); eq.interface = 0; return 0; }})()"),
         )
         .expect_err("interface is read-only");
         assert_eq!(
@@ -1500,7 +1588,7 @@ mod tests {
         let probe = |engine: &mut KrkrEngine, body: &str| {
             real(
                 engine,
-                &format!("(function() {{ var reverb = new StkFreeVerb(); {body} }})()"),
+                &format!("(function() {{ var reverb = new {FREE_VERB}(); {body} }})()"),
             )
         };
         assert_eq!(
@@ -1550,14 +1638,16 @@ mod tests {
         let mut engine = engine();
         let value = string(
             &mut engine,
-            "(function() {\n\
-                 var delay = new DelayEffect();\n\
-                 delay.init(100, 0.5);\n\
-                 var early = \"ok\";\n\
-                 delay.init(100, 0.5, 0.25, 250);\n\
-                 delay.init(25, 2.0, 0.5);\n\
-                 return early;\n\
-             })()",
+            &format!(
+                "(function() {{\n\
+                     var delay = new {DELAY}();\n\
+                     delay.init(100, 0.5);\n\
+                     var early = \"ok\";\n\
+                     delay.init(100, 0.5, 0.25, 250);\n\
+                     delay.init(25, 2.0, 0.5);\n\
+                     return early;\n\
+                 }})()"
+            ),
         );
         assert_eq!(value, "ok");
         assert!(
@@ -1581,14 +1671,16 @@ mod tests {
         let mut engine = engine();
         let handle = run(
             &mut engine,
-            "(function() {\n\
-                 var buffer = new WaveSoundBuffer();\n\
-                 buffer.filters.clear();\n\
-                 buffer.filters.add(new GraphicEqualizer());\n\
-                 buffer.filters.add(new StkFreeVerb());\n\
-                 global.attached = buffer.filters;\n\
-                 return buffer.filters.count;\n\
-             })()",
+            &format!(
+                "(function() {{\n\
+                     var buffer = new WaveSoundBuffer();\n\
+                     buffer.filters.clear();\n\
+                     buffer.filters.add(new {EQ}());\n\
+                     buffer.filters.add(new {FREE_VERB}());\n\
+                     global.attached = buffer.filters;\n\
+                     return buffer.filters.count;\n\
+                 }})()"
+            ),
         );
         assert_eq!(handle, Variant::Integer(2));
         let object = run(&mut engine, "global.attached[0]")

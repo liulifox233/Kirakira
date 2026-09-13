@@ -12,7 +12,14 @@
 //! * One native class, `WaveDSPFilter` (RTTI `tTJSNC_WaveDSPFilter` /
 //!   `tTJSNI_WaveDSPFilter`), registered against a `WaveSoundBuffer` with the
 //!   same single-buffer invariant as `wfBasicEffect`
-//!   (`TVPCannotConnectMultipleWaveSoundBufferAtOnce`).
+//!   (`TVPCannotConnectMultipleWaveSoundBufferAtOnce`). "Against" is literal:
+//!   the binder chain constructs the `WaveSoundBuffer` wide string (VA
+//!   `0x100d76a8`, at `0x100a557c`) right after the class name
+//!   (`0x100cbcc0`, at `0x100a554d`) and links the created class object into
+//!   *that* object, exactly like `wfBasicEffect`'s three chains — so the class
+//!   lives at `WaveSoundBuffer.WaveDSPFilter` and no global `WaveDSPFilter`
+//!   exists. PARQUET reads it there: `voiceeffect.tjs` object 2 (`DSP`) does
+//!   `gpd WaveSoundBuffer`, `gpd .WaveDSPFilter`, `new`.
 //! * Members referenced by the registration: `name`, `label`, `getParamInfo`,
 //!   `setParams`, `currentValue`, `defaultValue`, `interface`, `finalize`.
 //! * The DLL's own parameter vocabulary. Its identifier strings are the
@@ -117,8 +124,10 @@ pub(crate) const META: PluginMeta = PluginMeta {
             the DLL's own identifiers and the readable spellings for design/response values. The \
             Elliptic design, the DLL's AllPass/BandPass1/BandPass2 identifiers and the non-RBJ \
             shelf responses answer a clear error instead of a wrong filter (see the module docs). \
-            The engine has no per-buffer filter chain yet, so the filter runs through its Rust \
-            `process` entry point only and `interface` answers a sentinel integer.",
+            The class installs on the `WaveSoundBuffer` class object like the reference \
+            (`WaveSoundBuffer.WaveDSPFilter`, the binder's base — PARQUET's voiceeffect.tjs reads \
+            it there). The engine has no per-buffer filter chain yet, so the filter runs through \
+            its Rust `process` entry point only and `interface` answers a sentinel integer.",
     install: |engine| engine.register_plugin(WfTypicalDspPlugin),
 };
 
@@ -1508,7 +1517,7 @@ fn install_wf_typical_dsp(runtime: &mut Runtime<KrkrHost>) {
                 "__className",
                 Variant::String("WaveDSPFilter".to_string()),
             );
-            if let Variant::Object(class) = runtime.global_member("WaveDSPFilter") {
+            if let Some(class) = filter_class(runtime) {
                 runtime.set_object_super_class(instance, class);
             }
             match WaveDspState::new(44100.0) {
@@ -1526,7 +1535,29 @@ fn install_wf_typical_dsp(runtime: &mut Runtime<KrkrHost>) {
     );
     runtime.add_object_class_info(class, "WaveDSPFilter");
     install_members(runtime, class);
-    runtime.set_global_member("WaveDSPFilter", Variant::Object(class));
+    publish_filter_class(runtime, class);
+}
+
+/// Publishes the class where the reference's binder puts it: as a member of the
+/// `WaveSoundBuffer` class object.
+///
+/// The DLL's chain is `BindUtil(TJS_W("WaveSoundBuffer"), link)
+/// .Class(TJS_W("WaveDSPFilter"), …)` — the image constructs both strings
+/// (`0x100a554d`, `0x100a557c`) before linking the class object into the
+/// `WaveSoundBuffer` object, and never registers a global of the class name.
+/// PARQUET's `voiceeffect.tjs` object 2 reads `WaveSoundBuffer.WaveDSPFilter`
+/// and `new`s it.
+fn publish_filter_class(runtime: &mut Runtime<KrkrHost>, class: ObjectHandle) {
+    if let Some(wave) = runtime.global_member("WaveSoundBuffer").object_handle() {
+        runtime.set_object_member(wave, "WaveDSPFilter", Variant::Object(class));
+    }
+}
+
+/// The class object behind `WaveSoundBuffer.WaveDSPFilter`, the one place
+/// [`publish_filter_class`] puts it.
+fn filter_class(runtime: &Runtime<KrkrHost>) -> Option<ObjectHandle> {
+    let wave = runtime.global_member("WaveSoundBuffer").object_handle()?;
+    runtime.object_member(wave, "WaveDSPFilter").object_handle()
 }
 
 fn install_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -1854,6 +1885,10 @@ mod tests {
 
     // ------------------------------------------------------------- surface
 
+    /// The class object a game reaches: the binder anchors `WaveDSPFilter` on
+    /// `WaveSoundBuffer` (`voiceeffect.tjs` object 2 does `gpd
+    /// WaveSoundBuffer`, `gpd .WaveDSPFilter`, `new`), so the probes below
+    /// spell it that way.
     #[test]
     fn the_class_carries_every_recovered_member() {
         let mut engine = engine();
@@ -1869,13 +1904,40 @@ mod tests {
         ] {
             let probe = string(
                 &mut engine,
-                &format!("(function() {{ return typeof WaveDSPFilter.{member}; }})()"),
+                &format!(
+                    "(function() {{ return typeof WaveSoundBuffer.WaveDSPFilter.{member}; }})()"
+                ),
             );
             assert_ne!(
                 probe, "undefined",
-                "WaveDSPFilter.{member} is not installed"
+                "WaveSoundBuffer.WaveDSPFilter.{member} is not installed"
             );
         }
+    }
+
+    /// The class-object path PARQUET's `voiceeffect.tjs` uses: its `DSP` helper
+    /// resolves `global.WaveSoundBuffer` → `.WaveDSPFilter` and `new`s it with
+    /// the response/design arguments. The member has to be there — the game's
+    /// own guards (`typeof` before the lookup) turn a missing one into a silent
+    /// no-op — and it is the class object's only home: the bare global stays
+    /// absent, like the reference's.
+    #[test]
+    fn the_class_object_path_builds_a_filter_the_game_way() {
+        let mut engine = engine();
+        let value = string(
+            &mut engine,
+            "(function() {\n\
+                 var dsp = function(a0, a1) {\n\
+                     var t2 = global.WaveSoundBuffer;\n\
+                     var t3 = t2.WaveDSPFilter;\n\
+                     return new t3(a0, a1);\n\
+                 };\n\
+                 var filter = dsp(\"LowPass\", \"Butterworth\");\n\
+                 return typeof WaveSoundBuffer.WaveDSPFilter + \":\" + filter.name + \":\" +\n\
+                     (typeof global.WaveDSPFilter);\n\
+             })()",
+        );
+        assert_eq!(value, "Object:Low Pass:undefined");
     }
 
     /// `getParamInfo` answers the record shape (name/label/currentValue/
@@ -1886,7 +1948,7 @@ mod tests {
         let value = string(
             &mut engine,
             "(function() {\n\
-                 var filter = new WaveDSPFilter();\n\
+                 var filter = new WaveSoundBuffer.WaveDSPFilter();\n\
                  var by_index = filter.getParamInfo(0);\n\
                  var by_name = filter.getParamInfo(\"cutoff\");\n\
                  return by_index.name + \"/\" + by_index.label + \"/\" + by_index.currentValue + \"/\" + by_index.defaultValue +\n\
@@ -1901,7 +1963,7 @@ mod tests {
         assert_eq!(
             string(
                 &mut engine,
-                "(function() { var f = new WaveDSPFilter(); return f.name + \"/\" + f.label; })()"
+                "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); return f.name + \"/\" + f.label; })()"
             ),
             "Low Pass/Butterworth"
         );
@@ -1916,7 +1978,7 @@ mod tests {
         let value = string(
             &mut engine,
             "(function() {\n\
-                 var filter = new WaveDSPFilter();\n\
+                 var filter = new WaveSoundBuffer.WaveDSPFilter();\n\
                  filter.setParams(%[type: \"High Pass\", cutoff: 250]);\n\
                  filter.setParams(\"design\", \"Chebyshev I\", \"order\", 4);\n\
                  return filter.currentValue(\"type\") + \"/\" + filter.currentValue(\"cutoff\") +\n\
@@ -1934,7 +1996,7 @@ mod tests {
             let error = try_run(
                 &mut engine,
                 &format!(
-                    "(function() {{ var filter = new WaveDSPFilter(); {call}; return 0; }})()"
+                    "(function() {{ var filter = new WaveSoundBuffer.WaveDSPFilter(); {call}; return 0; }})()"
                 ),
             )
             .expect_err("bad ParamInfo usage must fail");
@@ -1953,14 +2015,14 @@ mod tests {
         let mut engine = engine();
         let error = try_run(
             &mut engine,
-            "(function() { var f = new WaveDSPFilter(); f.setParams(\"design\", \"Elliptic\"); return 0; })()",
+            "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); f.setParams(\"design\", \"Elliptic\"); return 0; })()",
         )
         .expect_err("Elliptic must be refused");
         assert!(error.message.contains("Elliptic"), "{}", error.message);
 
         let error = try_run(
             &mut engine,
-            "(function() { var f = new WaveDSPFilter(); f.setParams(\"type\", \"Low Shelf\"); return 0; })()",
+            "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); f.setParams(\"type\", \"Low Shelf\"); return 0; })()",
         )
         .expect_err("a Butterworth shelf must be refused");
         assert!(error.message.contains("shelf"), "{}", error.message);
@@ -1968,7 +2030,7 @@ mod tests {
         // The refused parameter was rolled back: the filter still works.
         let value = string(
             &mut engine,
-            "(function() { var f = new WaveDSPFilter(); try { f.setParams(\"design\", \"Elliptic\"); } catch (e) {} return f.label; })()",
+            "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); try { f.setParams(\"design\", \"Elliptic\"); } catch (e) {} return f.label; })()",
         );
         assert_eq!(value, "Butterworth");
     }
@@ -1987,7 +2049,7 @@ mod tests {
         let value = string(
             &mut engine,
             "(function() {\n\
-                 var f = new WaveDSPFilter();\n\
+                 var f = new WaveSoundBuffer.WaveDSPFilter();\n\
                  f.setParams(\"type\", \"LowPass\", \"design\", \"ChebyshevI\");\n\
                  var first = f.currentValue(\"type\") + \"/\" + f.currentValue(\"design\");\n\
                  f.setParams(%[type: \"HighPass\", design: \"Chebyshev1\"]);\n\
@@ -2008,7 +2070,7 @@ mod tests {
         // typo.
         let error = try_run(
             &mut engine,
-            "(function() { var f = new WaveDSPFilter(); f.setParams(\"type\", \"AllPass\"); return 0; })()",
+            "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); f.setParams(\"type\", \"AllPass\"); return 0; })()",
         )
         .expect_err("AllPass is not modelled");
         assert!(
@@ -2061,13 +2123,13 @@ mod tests {
         assert_eq!(
             run(
                 &mut engine,
-                "(function() { var f = new WaveDSPFilter(); return f.interface; })()"
+                "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); return f.interface; })()"
             ),
             Variant::Integer(INTERFACE_SENTINEL)
         );
         let error = try_run(
             &mut engine,
-            "(function() { var f = new WaveDSPFilter(); f.interface = 0; return 0; })()",
+            "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); f.interface = 0; return 0; })()",
         )
         .expect_err("interface is read-only");
         assert_eq!(
@@ -2421,7 +2483,7 @@ mod tests {
         let mut engine = engine();
         let handle = run(
             &mut engine,
-            "(function() { return new WaveDSPFilter(); })()",
+            "(function() { return new WaveSoundBuffer.WaveDSPFilter(); })()",
         )
         .object_handle()
         .expect("object");
@@ -2434,7 +2496,7 @@ mod tests {
         assert_eq!(
             run(
                 &mut engine,
-                "(function() { var f = new WaveDSPFilter(); return f.name; })()"
+                "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); return f.name; })()"
             ),
             Variant::String("Low Pass".to_string())
         );
