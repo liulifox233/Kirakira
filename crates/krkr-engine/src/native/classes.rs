@@ -8539,6 +8539,31 @@ fn join_native_layer(
     apply_layer_property_to_render(runtime, handle, "parent", &value)
 }
 
+/// Joins `child` under `parent` the way a script's `child.parent = parent`
+/// does, makes the child visible, and gives it the hit threshold the reference
+/// gives its adaptor children.
+///
+/// `motionplayer.dll`'s `Motion.SeparateLayerAdaptor` is such a canvas: the
+/// game constructs it with the owner layer (`new Motion.SeparateLayerAdaptor(
+/// owner incontextof global.Layer)`) and switches that owner to `ltBinder`
+/// right afterwards (`AffineSourceMotion.tjs` `entryOwner`), so the adaptor is
+/// the only thing left drawing for the owner — which is exactly a visible
+/// child the binder passes through to the screen.  The reference creates each
+/// of the adaptor's host layers with `targetLayer` as its parent argument,
+/// visible as soon as it has pixels, and sets `hitThreshold = 0x100` on them
+/// (`motionplayer_nod3d.dll` `FUN_1000d280`, disassembly `0x1000d93d`/`0x1000d96c`):
+/// 256 is above every 8-bit alpha, so the canvas never swallows a mouse hit
+/// that belongs to the layers under or around it.
+pub(crate) fn join_layer_under_parent(
+    runtime: &mut Runtime<KrkrHost>,
+    child: ObjectHandle,
+    parent: ObjectHandle,
+) -> Result<()> {
+    join_native_layer(runtime, child, Some(parent))?;
+    set_layer_int_property(runtime, child, "visible", 1)?;
+    set_layer_int_property(runtime, child, "hitThreshold", 0x100)
+}
+
 /// `tTJSNI_BaseLayer::Join()` (`LayerIntf.cpp:576`): adopting a different
 /// parent parts the old one first, so the manager hears about the layer
 /// leaving the tree before it re-enters.

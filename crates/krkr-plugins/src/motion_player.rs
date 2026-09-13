@@ -8,8 +8,8 @@
 //! (`/tmp/m38/AffineSourceMotion.decomp.tjs`, `/tmp/m38/parquet/motion.tjs`).
 //! PARQUET drives it as: `Motion.ResourceManager(path, cacheSize)` →
 //! `load(file)` → `new Motion.Player(resourceManager)` → `play(motionName,
-//! flags)` → `progress(ticks)` per frame → `draw(workLayer)` → the game's KAG
-//! wrapper copies the work layer onto the visible layer.
+//! flags)` → `progress(milliseconds)` per frame → `draw(workLayer)` → the
+//! game's KAG wrapper copies the work layer onto the visible layer.
 //!
 //! # What is real here
 //!
@@ -17,11 +17,26 @@
 //!   and parse it through [`krkr_emote::Motion`] (eluna's PSB reader plus the
 //!   PARQUET-flavor adaptation). The handle the game gets back carries
 //!   `.metadata`, which its wrapper requires (`!l2.metadata === void`).
-//! * **The state machine** — `play`/`stop`/`progress`/`skip`/`skipToSync`,
-//!   `speed`, `tickCount`, `playing`, `loopTime`/`lastTime`, and
+//! * **The state machine** — `play`/`stop`/`progress`/`frameProgress`/`skip`/
+//!   `skipToSync`, `speed`, `tickCount`, `playing`, `loopTime`/`lastTime`, and
 //!   `setVariable(name, value[, time, easing])` with linear/smoothstep timed
 //!   writes are driven by the adapter's own model; a motion that does not loop
 //!   stops at its duration and clears `playing`.
+//! * **The time model (settled against the DLL)** — the plain time members are
+//!   milliseconds-facing and the `frame*` family is raw 1/60 s ticks, exactly
+//!   like the reference: `progress`'s handler converts with `×60/1000`
+//!   (`0x10030290`), `frameProgress` takes the raw value (`0x10030370`),
+//!   `tickCount`'s getter/setter are `pos×1000/60` / `v×60/1000`
+//!   (`FUN_10045c00`/`FUN_10045ba0`) and `lastTime`/`loopTime` report through
+//!   `FUN_10045ea0`/`FUN_10045ec0` while `frameTickCount`/`frameLastTime`/
+//!   `frameLoopTime` stay raw. The game's own chain is milliseconds end to end
+//!   (`EventIntf.cpp:951,991-997` `TVPGetTickCount` → `addContinuousHandler` →
+//!   `MainWindow` → `AffineLayer` → `_player.progress(_interval)`).
+//! * **The variables** — `setVariable`/`getVariable`/`contains` and the
+//!   `variableKeys` listing the game's `_getOptions` iterates are real: the
+//!   reference's `variableKeys` (handler `FUN_10015690`) collects the player's
+//!   variable-key strings into a TJS array, and this port answers the same
+//!   array shape from the names its `setVariable` writes created.
 //! * **Rendering** — `draw(layer)` samples the current tick, applies the
 //!   player's `setCoord`/`setRotate`/`setScale`/`setDrawAffineTranslateMatrix`
 //!   transform and its colour filter, and composites the draw list into the
@@ -30,11 +45,19 @@
 //!   palettes expanded by [`krkr_emote`].
 //! * **The separate-layer canvas** — `new Motion.SeparateLayerAdaptor(owner)`
 //!   answers a real drawable `Layer` (the engine's plugin canvas seam), sized
-//!   like its owner layer, so the game's `drawAffine` sequence works end to
+//!   like its owner and attached under it as a visible child with
+//!   `hitThreshold = 0x100`, so the game's `drawAffine` sequence works end to
 //!   end: `Motion.Player.clear(adaptor, neutralColor)` and
-//!   `Motion.Player.draw(adaptor)` write its bitmap, and the owner publishes
-//!   it with `Layer.assignImages(adaptor)`. `getSubImageLayers()` stays `void`,
-//!   which is what makes the game take its single-canvas path.
+//!   `Motion.Player.draw(adaptor)` write its bitmap, the owner publishes it
+//!   with `Layer.assignImages(adaptor)`, and the child still draws once
+//!   `drawAffine` restores the owner's `ltBinder` type. The DLL's child model
+//!   is the placement's evidence — the adaptor creates host `Layer`s parented
+//!   to its `targetLayer`, visible as soon as they have pixels, with
+//!   `hitThreshold = 0x100` (`FUN_1000d280`, disasm `0x1000d93d`/`0x1000d96c`)
+//!   — and the game's `entryOwner` rewrites an `ltAlpha` owner to `ltBinder`
+//!   right after constructing it, so only a visible child can reach the
+//!   screen. `getSubImageLayers()` stays `void`, which is what makes the game
+//!   take its single-canvas path (the reference has no such member at all).
 //!
 //! # What is not, and says so
 //!
@@ -80,10 +103,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use krkr_emote::{Motion, MotionDrawItem, TextureCache, Tint, render_draw_list_into};
+use krkr_emote::{
+    EMOTE_TICKS_PER_SECOND, Motion, MotionDrawItem, TextureCache, Tint, render_draw_list_into,
+};
 use krkr_engine::{
     KrkrHost, KrkrPlugin,
-    plugin_api::layer::{create_canvas_layer, fit_canvas_layer, layer_bitmap_write},
+    plugin_api::layer::{
+        attach_canvas_layer, create_canvas_layer, fit_canvas_layer, layer_bitmap_write,
+    },
 };
 use krkr_tjs2::{
     Result, TjsError,
@@ -96,12 +123,16 @@ pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "Motion / Motion.Player / Motion.EmotePlayer (E-mote `.mtn` motion playback)",
     notes: "The `.mtn` motion path is real: ResourceManager.load parses the file through krkr-emote (PSB + PARQUET \
-            flavor adaptation + RL/palette texture decode), Player.play/progress/stop/skip/speed/tickCount and \
-            timed setVariable(name, value, time, easing) drive the model's own clock, and draw(layer) composites \
-            the sampled draw list into the layer bitmap through plugin_api::layer with the player's coord/rotate/\
-            scale/affine transform and colour filter, and Motion.SeparateLayerAdaptor(owner) is a real drawable \
-            Layer (a plugin_api canvas) sized like its owner, so the game's clear/draw/Layer.assignImages publish \
-            path works. Not implemented, and honest: physics (initPhysics, wind/pend), \
+            flavor adaptation + RL/palette texture decode), the time model is milliseconds-facing like the reference \
+            (progress converts ×60/1000, frameProgress is raw, tickCount/lastTime/loopTime report as ms while the \
+            frame* family stays raw ticks, loops wrap to loopTime), play/progress/stop/skip/speed and \
+            timed setVariable(name, value, time, easing) plus getVariable/contains/variableKeys drive the model's \
+            own clock and variable state, and draw(layer) composites the sampled draw list into the layer bitmap \
+            through plugin_api::layer with the player's coord/rotate/scale/affine transform and colour filter. \
+            Motion.SeparateLayerAdaptor(owner) is a real drawable Layer (a plugin_api canvas) sized like its owner \
+            and attached as its visible child, which is how the reference's adaptor reaches the screen under a \
+            ltBinder owner; the game's clear/draw/Layer.assignImages publish path works on top of that. \
+            Not implemented, and honest: physics (initPhysics, wind/pend), \
             timelines, mesh deformation, particles \
             and EmotePlayer's `.psb` model playback; each such member is \
             registered and logs a one-time warning on first call instead of returning a silent success. \
@@ -931,7 +962,10 @@ const ADAPTOR_OWNER_MEMBER: &str = "__motionSeparateAdaptorOwner";
 /// `Motion.Player.clear`/`draw`, reads the drawn pixels back and publishes
 /// them onto the owner with `Layer.assignImages` (the game's `a0 instanceof
 /// "Layer"` publish branch).  It is therefore a real `Layer` — see
-/// [`create_canvas_layer`] — sized like the owner, and not a plain object.
+/// [`create_canvas_layer`] — sized like the owner and attached under it as a
+/// *visible child* ([`attach_canvas_layer`]), which is the only placement that
+/// keeps drawing once the game restores the owner's `ltBinder` type at the end
+/// of `drawAffine` (see the module docs).
 ///
 /// The constructor argument arrives as the `incontextof` closure the VM built
 /// (its closure object *is* the owner; the this-object slot only carries the
@@ -946,6 +980,7 @@ fn separate_layer_adaptor_constructor(runtime: &mut Runtime<KrkrHost>) -> Object
             if let Some(owner) = adaptor_owner(args.first()) {
                 runtime.set_object_member(instance, ADAPTOR_OWNER_MEMBER, Variant::Object(owner));
                 fit_canvas_layer(runtime, instance, owner)?;
+                attach_canvas_layer(runtime, instance, owner)?;
             }
             runtime.register_object_native_with_arg_count(
                 instance,
@@ -1048,6 +1083,7 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
     register_player_readonly_property(runtime, handle, "resourceManager", |state, _runtime| {
         state.manager.map(Variant::Object).unwrap_or(Variant::Void)
     });
+    register_player_variable_keys(runtime, handle);
     register_player_outline_property(runtime, handle);
     register_player_script_member(runtime, handle, "tags");
     register_player_script_member(runtime, handle, "onAction");
@@ -1072,6 +1108,12 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
         "progress",
         NativeArgCount::AtLeast(1),
         player_progress,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "frameProgress",
+        NativeArgCount::AtLeast(1),
+        player_frame_progress,
     );
     runtime.register_object_native_with_arg_count(
         handle,
@@ -1203,6 +1245,7 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
         "playing",
         "allplaying",
         "resourceManager",
+        "variableKeys",
         "outline",
         "tags",
         "onAction",
@@ -1212,6 +1255,7 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
         "play",
         "stop",
         "progress",
+        "frameProgress",
         "setVariable",
         "getVariable",
         "contains",
@@ -1428,6 +1472,30 @@ fn register_player_readonly_property(
     );
 }
 
+/// `variableKeys` — the array the game's `AffineSourceMotion._getOptions`
+/// iterates (`for (i = 0; i < _player.variableKeys.count; i++)` calling
+/// `_player.getVariable(variableKeys[i])`, object 59 bytecode 225/234/245).
+///
+/// The reference's handler (`motionplayer_nod3d.dll` `FUN_10015690`, named by
+/// `FUN_10091f10(0x100e2618, …)`) walks the player's own variable records
+/// (`+0x2e8`, 0x30-byte entries whose first field is the key string, wrapped
+/// into the collection by `FUN_100863b0`) plus its sub-objects
+/// (`FUN_10015930`/`FUN_10017890`) and answers a TJS array of those key
+/// strings.  The port's variable records are exactly the names its
+/// `setVariable` writes create, so this returns those names (the player's
+/// `BTreeMap` order) as a TJS array — `.count`, indexing and `getVariable`
+/// round-trip the way the game uses them.
+fn register_player_variable_keys(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_player_readonly_property(runtime, handle, "variableKeys", |state, runtime| {
+        let keys: Vec<Variant> = state
+            .variables
+            .keys()
+            .map(|name| Variant::String(name.clone()))
+            .collect();
+        Variant::Object(runtime.alloc_array_object(keys))
+    });
+}
+
 /// `outline` holds script data (the reference's outline object); the port keeps
 /// and returns whatever was written.
 fn register_player_outline_property(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -1478,44 +1546,89 @@ fn with_player_mut(this_obj: Option<ObjectHandle>, write: impl FnOnce(&mut Playe
     });
 }
 
-fn numeric_player_member(state: &PlayerState, name: &str) -> Option<f64> {
-    match name {
-        "speed" => Some(state.speed),
-        "tickCount" => Some(state.tick),
-        "completionType" => Some(state.completion_type as f64),
-        "loopTime" => Some(state.loop_time.unwrap_or(-1.0)),
-        "lastTime" => Some(
+/// The player's animation duration in raw ticks, when a motion is loaded.
+fn player_duration_ticks(state: &PlayerState) -> Option<f64> {
+    state
+        .motion
+        .as_ref()
+        .and_then(|motion| motion.animation(&state.animation))
+        .map(|animation| f64::from(animation.duration_ticks))
+}
+
+/// The loop point in raw ticks: a script override, else the animation's own
+/// `loopTime`, else `-1` ("does not loop").
+fn player_loop_ticks(state: &PlayerState) -> f64 {
+    state
+        .loop_time
+        .or_else(|| {
             state
                 .motion
                 .as_ref()
                 .and_then(|motion| motion.animation(&state.animation))
-                .map_or(0.0, |animation| f64::from(animation.duration_ticks)),
-        ),
+                .and_then(|animation| animation.loop_time)
+                .map(f64::from)
+        })
+        .unwrap_or(-1.0)
+}
+
+/// Reads one plain numeric member.  The plain time members report milliseconds
+/// and the `frame*` family reports raw 1/60 s ticks, matching the reference's
+/// handlers (`motionplayer_nod3d.dll`: `tickCount` getter `FUN_10045c00` =
+/// `pos×1000/60`, `lastTime`/`loopTime` getters `FUN_10045ea0`/`FUN_10045ec0`
+/// the same, `frameTickCount` raw at `0x10030230`/`FUN_10045b50`).
+fn numeric_player_member(state: &PlayerState, name: &str) -> Option<f64> {
+    match name {
+        "speed" => Some(state.speed),
+        "tickCount" => Some(ticks_to_milliseconds(state.tick)),
+        "completionType" => Some(state.completion_type as f64),
+        "loopTime" => Some(ticks_to_milliseconds(player_loop_ticks(state))),
+        "lastTime" => Some(ticks_to_milliseconds(
+            player_duration_ticks(state).unwrap_or(0.0),
+        )),
         "opacity" => Some(state.opacity),
         "colorWeight" => Some(state.colour_weight as f64),
         "maskMode" => Some(state.mask_mode as f64),
         "coordinate" => Some(state.coordinate),
         // The frame-granularity counters the reference exposes next to the
-        // tick ones; this model has one timeline, so they mirror it.
+        // millisecond ones: raw ticks, and this model has one timeline, so
+        // they mirror it.
         "frameTickCount" => Some(state.tick),
-        "frameLastTime" => numeric_player_member(state, "lastTime"),
-        "frameLoopTime" => numeric_player_member(state, "loopTime"),
+        "frameLastTime" => Some(player_duration_ticks(state).unwrap_or(0.0)),
+        "frameLoopTime" => Some(player_loop_ticks(state)),
         _ => None,
     }
 }
 
+/// Writes one plain numeric member, converting milliseconds to raw ticks for
+/// the plain time members (`tickCount` setter `FUN_10045ba0` = `v×60/1000`)
+/// while `frameTickCount`/`frameLoopTime` take raw ticks.
 fn set_numeric_player_member(state: &mut PlayerState, name: &str, value: f64) {
     match name {
         "speed" => state.speed = value,
-        "tickCount" => state.tick = value.max(0.0),
+        "tickCount" => state.tick = milliseconds_to_ticks(value).max(0.0),
+        "frameTickCount" => state.tick = value.max(0.0),
         "completionType" => state.completion_type = value as i64,
-        "loopTime" => state.loop_time = Some(value),
+        "loopTime" => state.loop_time = Some(milliseconds_to_ticks(value)),
+        "frameLoopTime" => state.loop_time = Some(value),
         "opacity" => state.opacity = value.clamp(0.0, 255.0),
         "colorWeight" => state.colour_weight = value as u32,
         "maskMode" => state.mask_mode = value as i64,
         "coordinate" => state.coordinate = value,
         _ => {}
     }
+}
+
+/// Milliseconds → the adapter's 1/60 s tick axis (the reference's `progress`
+/// handler multiplies by `60/1000`, `0x10030290`; the shared constant lives in
+/// the adapter).
+fn milliseconds_to_ticks(milliseconds: f64) -> f64 {
+    milliseconds * f64::from(EMOTE_TICKS_PER_SECOND) / 1000.0
+}
+
+/// The adapter's 1/60 s tick axis → milliseconds (the reference's `tickCount`
+/// / `lastTime` / `loopTime` getters multiply by `1000/60`).
+fn ticks_to_milliseconds(ticks: f64) -> f64 {
+    ticks * 1000.0 / f64::from(EMOTE_TICKS_PER_SECOND)
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,12 +1732,32 @@ fn player_stop(
     Ok(Variant::Void)
 }
 
-/// `progress(ticks)`: advances the model's clock by `ticks * speed` and ends a
-/// non-looping motion at its duration.
+/// `progress(milliseconds)`: advances the model's clock by
+/// `milliseconds × 60/1000 × speed` ticks and ends a non-looping motion at its
+/// duration.
 ///
-/// This is the per-frame update the game's wrapper drives (`fix()` calls
-/// `progress(1)`; `_drawAffine` passes the layer's accumulated interval).
+/// This is the per-frame update the game's wrapper drives: the engine's
+/// `onFlipTimerInterval` chain passes milliseconds end to end
+/// (`EventIntf.cpp:951,991-997` `TVPGetTickCount` → `addContinuousHandler` →
+/// `MainWindow` → `AffineLayer` → `_player.progress(_interval)`), and the
+/// reference's handler converts to the 60 Hz tick axis with `×60/1000`
+/// (`0x10030290`).
 fn player_progress(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let milliseconds = args
+        .first()
+        .map(Variant::to_real)
+        .transpose()?
+        .unwrap_or(0.0);
+    player_advance(runtime, this_obj, milliseconds_to_ticks(milliseconds))
+}
+
+/// `frameProgress(ticks)`: the raw handler (`0x10030370`), which advances by
+/// the argument's own 1/60 s ticks without a unit conversion.
+fn player_frame_progress(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
@@ -1634,6 +1767,16 @@ fn player_progress(
         .map(Variant::to_real)
         .transpose()?
         .unwrap_or(0.0);
+    player_advance(runtime, this_obj, ticks)
+}
+
+/// The shared body of `progress`/`frameProgress`: advance `this` by `ticks`
+/// (already on the raw tick axis) and fire `onSync` when a one-shot ends.
+fn player_advance(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    ticks: f64,
+) -> Result<Variant> {
     let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle)) else {
         return Ok(Variant::Void);
     };
@@ -1650,25 +1793,11 @@ fn player_progress(
     Ok(Variant::Void)
 }
 
-/// Advances one player; returns whether a non-looping motion just finished.
+/// Advances one player by `ticks` raw ticks; returns whether a non-looping
+/// motion just finished.
 fn advance_player(state: &mut PlayerState, ticks: f64) -> bool {
-    let duration = state
-        .motion
-        .as_ref()
-        .and_then(|motion| motion.animation(&state.animation))
-        .map(|animation| f64::from(animation.duration_ticks))
-        .filter(|duration| *duration > 0.0);
-    let loop_time = state
-        .loop_time
-        .or_else(|| {
-            state
-                .motion
-                .as_ref()
-                .and_then(|motion| motion.animation(&state.animation))
-                .and_then(|animation| animation.loop_time)
-                .map(f64::from)
-        })
-        .unwrap_or(-1.0);
+    let duration = player_duration_ticks(state).filter(|duration| *duration > 0.0);
+    let loop_time = player_loop_ticks(state);
 
     if !state.playing || ticks == 0.0 {
         apply_variable_tweens(state);
@@ -1683,12 +1812,16 @@ fn advance_player(state: &mut PlayerState, ticks: f64) -> bool {
     };
     if loop_time >= 0.0 {
         if state.tick >= duration {
-            // The reference loops back to the motion's `loopTime`; PARQUET
-            // writes `loopTime: 0` on every looping motion (measured over all
-            // six animations of `sd101.mtn`), so wrapping at the duration
-            // lands on the same tick today. A file with a mid-animation loop
-            // point would need this to loop to `loop_time` instead.
-            state.tick = state.tick.rem_euclid(duration);
+            // The reference wraps to the motion's `loopTime` (+0x150), not to
+            // tick 0: a file with a mid-animation loop point re-enters at that
+            // point. `(position - duration) % (duration - loopTime)` carries
+            // however far past the end the step went.
+            let span = duration - loop_time;
+            state.tick = if span > 0.0 {
+                loop_time + (state.tick - duration) % span
+            } else {
+                loop_time
+            };
         }
         return false;
     }
@@ -2301,10 +2434,11 @@ fn script_callback(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use krkr_assets::ProjectStorage;
-    use krkr_engine::{EngineConfig, KrkrEngine};
+    use krkr_core::{DrawCommand, FrameInput, Size};
+    use krkr_engine::{EngineConfig, EngineInput, KrkrEngine};
 
     use super::MotionPlayerPlugin;
 
@@ -2349,8 +2483,20 @@ mod tests {
         ])
     }
 
-    /// A one-icon, one-layer `idle` motion in the PARQUET source flavor.
+    /// A one-icon, one-layer `idle` motion in the PARQUET source flavor,
+    /// 60 ticks long (the length every fixture except the `ef_moya`-shaped one
+    /// uses).
     fn motion_bytes(icons: Vec<(&'static str, [u8; 4])>, layer: Value, loop_time: i64) -> Vec<u8> {
+        motion_bytes_timed(icons, layer, 60, loop_time)
+    }
+
+    /// [`motion_bytes`] with an explicit `lastTime`.
+    fn motion_bytes_timed(
+        icons: Vec<(&'static str, [u8; 4])>,
+        layer: Value,
+        last_time: i64,
+        loop_time: i64,
+    ) -> Vec<u8> {
         let mut writer = PsbWriter::default();
         let mut icon_fields = Vec::new();
         for (name, colour) in icons {
@@ -2379,7 +2525,7 @@ mod tests {
                             object(vec![(
                                 "idle",
                                 object(vec![
-                                    ("lastTime", int(60)),
+                                    ("lastTime", int(last_time)),
                                     ("loopTime", int(loop_time)),
                                     ("layer", list(vec![layer])),
                                 ]),
@@ -2613,9 +2759,11 @@ mod tests {
         assert_eq!(integer(&mut engine, "layer.getMainPixel(7, 7)"), 0);
 
         engine
-            .execute_script("tick.tjs", "player.progress(10);")
+            .execute_script("tick.tjs", "player.progress(500);")
             .expect("progress");
-        assert_eq!(integer(&mut engine, "player.tickCount"), 10);
+        // `progress` takes milliseconds; the tick axis is 60/s.
+        assert_eq!(integer(&mut engine, "player.frameTickCount"), 30);
+        assert_eq!(integer(&mut engine, "player.tickCount"), 500);
 
         engine
             .execute_script("draw.tjs", "player.draw(layer);")
@@ -2635,9 +2783,10 @@ mod tests {
         );
     }
 
-    /// `play`/`stop`/`progress` are a real state machine: a non-looping motion
-    /// ends at its duration, `stop` freezes the position, `progress(0)` (the
-    /// game's paused frame) does not advance, and `play` restarts.
+    /// `play`/`stop`/`progress` are a real state machine on the millisecond
+    /// axis: a non-looping motion ends at its duration, `stop` freezes the
+    /// position, `progress(0)` (the game's paused frame) does not advance, and
+    /// `play` restarts.
     #[test]
     fn play_stop_progress_is_a_state_machine() {
         let mut engine = engine_with(&[(
@@ -2649,36 +2798,47 @@ mod tests {
             ),
         )]);
         engine.execute_script("setup.tjs", SETUP).expect("setup");
+        // The fixture motion is 60 ticks long: 1000 ms on the script axis.
+        assert_eq!(integer(&mut engine, "player.lastTime"), 0, "no motion yet");
         engine
             .execute_script("play.tjs", "player.play(\"idle\");")
             .expect("play");
+        assert_eq!(integer(&mut engine, "player.lastTime"), 1000);
+        assert_eq!(integer(&mut engine, "player.frameLastTime"), 60);
         engine
-            .execute_script("run.tjs", "player.progress(20); player.progress(0);")
+            .execute_script("run.tjs", "player.progress(250); player.progress(0);")
             .expect("progress");
         assert_eq!(
-            integer(&mut engine, "player.tickCount"),
-            20,
+            integer(&mut engine, "player.frameTickCount"),
+            15,
             "progress(0) pauses"
         );
+        assert_eq!(integer(&mut engine, "player.tickCount"), 250);
         assert_eq!(integer(&mut engine, "player.playing"), 1);
 
         engine
-            .execute_script("speed.tjs", "player.speed = 2; player.progress(5);")
+            .execute_script("speed.tjs", "player.speed = 2; player.progress(250);")
             .expect("speed");
         assert_eq!(
-            integer(&mut engine, "player.tickCount"),
-            30,
+            integer(&mut engine, "player.frameTickCount"),
+            45,
             "speed scales the step"
+        );
+        assert_eq!(
+            integer(&mut engine, "player.tickCount"),
+            750,
+            "45 raw ticks report as 750 ms"
         );
 
         engine
-            .execute_script("finish.tjs", "player.progress(60);")
+            .execute_script("finish.tjs", "player.progress(2000);")
             .expect("finish");
         assert_eq!(
-            integer(&mut engine, "player.tickCount"),
+            integer(&mut engine, "player.frameTickCount"),
             60,
             "clamped at the duration"
         );
+        assert_eq!(integer(&mut engine, "player.tickCount"), 1000);
         assert_eq!(
             integer(&mut engine, "player.playing"),
             0,
@@ -2690,7 +2850,7 @@ mod tests {
             .expect("stop");
         assert_eq!(integer(&mut engine, "player.playing"), 0);
         assert_eq!(
-            integer(&mut engine, "player.tickCount"),
+            integer(&mut engine, "player.frameTickCount"),
             60,
             "stop keeps the position"
         );
@@ -2698,8 +2858,112 @@ mod tests {
         engine
             .execute_script("replay.tjs", "player.speed = 1; player.play(\"idle\");")
             .expect("replay");
-        assert_eq!(integer(&mut engine, "player.tickCount"), 0, "play restarts");
+        assert_eq!(
+            integer(&mut engine, "player.frameTickCount"),
+            0,
+            "play restarts"
+        );
+        assert_eq!(integer(&mut engine, "player.tickCount"), 0);
         assert_eq!(integer(&mut engine, "player.playing"), 1);
+    }
+
+    /// The discriminating unit test from M128's finding: `progress` takes
+    /// milliseconds and lands on the 60 Hz tick axis (`×60/1000`), so a
+    /// 1000 ms step is exactly 60 ticks, while `frameProgress` stays raw. The
+    /// fixture mirrors `sd101.mtn`'s `ef_moya` shape — 180 ticks long, second
+    /// keyframe at tick 90 — so `progress(1500)` has to reach that second
+    /// keyframe.
+    #[test]
+    fn progress_is_milliseconds_and_frame_progress_is_raw_ticks() {
+        /// One layer, two keyframes: `white` at (8, 8) until tick 90, then
+        /// `red` at (16, 16) until the 180-tick end.
+        fn ef_moya_layer() -> Value {
+            object(vec![
+                ("label", text("body")),
+                ("coordinate", int(0)),
+                ("children", list(vec![])),
+                (
+                    "frameList",
+                    list(vec![
+                        object(vec![
+                            ("content", content("src/hero/white", [8, 8], 255)),
+                            ("time", int(0)),
+                            ("type", int(2)),
+                        ]),
+                        object(vec![
+                            ("content", content("src/hero/red", [16, 16], 255)),
+                            ("time", int(90)),
+                            ("type", int(3)),
+                        ]),
+                        object(vec![("time", int(180)), ("type", int(0))]),
+                    ]),
+                ),
+            ])
+        }
+
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes_timed(
+                vec![("white", [255, 255, 255, 255]), ("red", [255, 0, 0, 255])],
+                ef_moya_layer(),
+                180,
+                -1,
+            ),
+        )]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script("play.tjs", "player.play(\"idle\");")
+            .expect("play");
+
+        engine
+            .execute_script("ms.tjs", "player.progress(1000);")
+            .expect("progress(1000)");
+        assert_eq!(
+            integer(&mut engine, "player.frameTickCount"),
+            60,
+            "1000 ms is 60 ticks"
+        );
+        assert_eq!(integer(&mut engine, "player.tickCount"), 1000);
+        assert_eq!(integer(&mut engine, "player.playing"), 1, "180 ticks long");
+
+        engine
+            .execute_script("ms2.tjs", "player.progress(500); player.draw(layer);")
+            .expect("progress(1500)");
+        assert_eq!(
+            integer(&mut engine, "player.frameTickCount"),
+            90,
+            "1500 ms is 90 ticks"
+        );
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(15, 15)"),
+            0x00ff_0000,
+            "the tick-90 keyframe is the one on screen"
+        );
+
+        // `frameProgress` is the raw handler: its argument is already ticks.
+        engine
+            .execute_script(
+                "raw.tjs",
+                "player.play(\"idle\"); player.frameProgress(60);",
+            )
+            .expect("frameProgress");
+        assert_eq!(integer(&mut engine, "player.frameTickCount"), 60);
+        assert_eq!(
+            integer(&mut engine, "player.tickCount"),
+            1000,
+            "60 raw ticks report as 1000 ms"
+        );
+
+        // The setter is milliseconds-facing too (`FUN_10045ba0`), and the
+        // frame-granularity member takes raw ticks.
+        engine
+            .execute_script("set.tjs", "player.tickCount = 1500;")
+            .expect("tickCount setter");
+        assert_eq!(integer(&mut engine, "player.frameTickCount"), 90);
+        engine
+            .execute_script("setraw.tjs", "player.frameTickCount = 30;")
+            .expect("frameTickCount setter");
+        assert_eq!(integer(&mut engine, "player.tickCount"), 500);
     }
 
     /// The per-frame update is real: a two-frame timeline motion draws its
@@ -2753,7 +3017,7 @@ mod tests {
             .execute_script(
                 "second.tjs",
                 "layer.fillRect(0, 0, 32, 32, 0x00000000); \
-                 player.progress(35); player.draw(layer);",
+                 player.progress(750); player.draw(layer);",
             )
             .expect("second frame");
         assert_eq!(
@@ -2761,30 +3025,52 @@ mod tests {
             0x00ff_0000,
             "the second keyframe draws after progress"
         );
-        assert_eq!(integer(&mut engine, "player.tickCount"), 35);
+        assert_eq!(
+            integer(&mut engine, "player.frameTickCount"),
+            45,
+            "750 ms of the 30-tick keyframe gap is 45 ticks"
+        );
+        assert_eq!(integer(&mut engine, "player.tickCount"), 750);
     }
 
-    /// A looping motion keeps playing and wraps at its duration.
+    /// A looping motion keeps playing and wraps to the motion's `loopTime`
+    /// (+0x150), not to tick 0: the fixture loops back at tick 30 of its
+    /// 60-tick span, so a 1250 ms step (75 ticks) re-enters at tick 45 — the
+    /// old `rem_euclid(duration)` wrap would have answered 15.
     #[test]
-    fn a_looping_motion_wraps_and_keeps_playing() {
+    fn a_looping_motion_wraps_to_loop_time_and_keeps_playing() {
         let mut engine = engine_with(&[(
             MOTION_STORAGE,
             motion_bytes(
                 vec![("white", [255, 255, 255, 255])],
                 single_frame_layer("src/hero/white", [8, 8], 255),
-                0,
+                30,
             ),
         )]);
         engine.execute_script("setup.tjs", SETUP).expect("setup");
         engine
-            .execute_script("loop.tjs", "player.play(\"idle\"); player.progress(90);")
+            .execute_script("loop.tjs", "player.play(\"idle\"); player.progress(1250);")
             .expect("loop");
         assert_eq!(integer(&mut engine, "player.playing"), 1);
         assert_eq!(
-            integer(&mut engine, "player.tickCount"),
-            30,
-            "wrapped at 60 ticks"
+            integer(&mut engine, "player.frameTickCount"),
+            45,
+            "75 ticks wrap to loopTime 30 + (75-60)%30"
         );
+        assert_eq!(integer(&mut engine, "player.tickCount"), 750);
+        assert_eq!(
+            integer(&mut engine, "player.loopTime"),
+            500,
+            "loopTime is milliseconds-facing"
+        );
+        assert_eq!(integer(&mut engine, "player.frameLoopTime"), 30);
+
+        // A second wrap lands from wherever the step re-entered: 45 + 30 ticks
+        // is 75 again, so the same loop point answers 45.
+        engine
+            .execute_script("again.tjs", "player.progress(500);")
+            .expect("again");
+        assert_eq!(integer(&mut engine, "player.frameTickCount"), 45);
     }
 
     /// Variable setters change the drawn output: the layer's `x` parameter
@@ -2830,12 +3116,15 @@ mod tests {
         );
         assert_eq!(integer(&mut engine, "player.getVariable(\"x\")"), 1);
 
-        // A timed write eases over the ticks the player advances through.
+        // A timed write eases over the ticks the player advances through; the
+        // `time` argument is already authored in ticks by the game
+        // (`system_AffineSourceMotion.tjs` converts its milliseconds with
+        // `* 60 / 1000`), while `progress` takes milliseconds.
         engine
             .execute_script(
                 "timed.tjs",
                 "player.play(\"idle\"); player.setVariable(\"x\", 0); \
-                 player.setVariable(\"x\", 1, 30, 0); player.progress(15);",
+                 player.setVariable(\"x\", 1, 30, 0); player.progress(250);",
             )
             .expect("timed");
         let halfway = real(&mut engine, "player.getVariable(\"x\")");
@@ -2844,9 +3133,82 @@ mod tests {
             "the timed write is halfway after 15 of 30 ticks: {halfway}"
         );
         engine
-            .execute_script("finish.tjs", "player.progress(15);")
+            .execute_script("finish.tjs", "player.progress(250);")
             .expect("finish");
         assert_eq!(real(&mut engine, "player.getVariable(\"x\")"), 1.0);
+    }
+
+    /// `variableKeys` answers the TJS array `AffineSourceMotion._getOptions`
+    /// iterates (`_player.variableKeys.count`, indexing, then
+    /// `_player.getVariable(key)` per entry — object 59 bytecode 225/234/245).
+    /// The stub this replaces was a native *function*, so the game's `.count`
+    /// read threw `Member "count" does not exist` and killed PARQUET at
+    /// custom.ks:105.
+    #[test]
+    fn variable_keys_lists_the_players_variables() {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [8, 8], 255),
+                -1,
+            ),
+        )]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script("play.tjs", "player.play(\"idle\");")
+            .expect("play");
+
+        assert_eq!(
+            integer(&mut engine, "player.variableKeys.count"),
+            0,
+            "no variables yet"
+        );
+        engine
+            .execute_script(
+                "vars.tjs",
+                "player.setVariable(\"face_eye_open\", 0.5); \
+                 player.setVariable(\"face_mouth\", 0.25);",
+            )
+            .expect("setVariable");
+
+        // The iteration `_getOptions` runs, spelled the way its bytecode does.
+        engine
+            .execute_script(
+                "options.tjs",
+                r#"
+                global.keys = player.variableKeys;
+                global.variables = new Dictionary();
+                for (var i = 0; i < keys.count; i++) {
+                    variables[keys[i]] = player.getVariable(keys[i]);
+                }
+                "#,
+            )
+            .expect("_getOptions-style iteration");
+
+        assert_eq!(integer(&mut engine, "keys.count"), 2);
+        assert_eq!(
+            integer(
+                &mut engine,
+                "keys[0] == \"face_eye_open\" && keys[1] == \"face_mouth\""
+            ),
+            1,
+            "the names the player holds, in the map's order"
+        );
+        assert_eq!(
+            real(&mut engine, "variables[\"face_eye_open\"]"),
+            0.5,
+            "every key reads back through getVariable"
+        );
+        assert_eq!(real(&mut engine, "variables[\"face_mouth\"]"), 0.25);
+        assert_eq!(
+            integer(
+                &mut engine,
+                "typeof player.variableKeys == \"Object\" && typeof player.variableKeys != \"Function\""
+            ),
+            1,
+            "a value-shaped member, not the old method stub"
+        );
     }
 
     /// The reference's failure shapes: an unreadable file yields a null handle
@@ -3021,6 +3383,18 @@ mod tests {
         assert_eq!(integer(&mut engine, "adaptor.imageWidth"), 48);
         assert_eq!(integer(&mut engine, "adaptor.imageHeight"), 48);
 
+        // The placement contract: a visible child of its owner — the shape the
+        // reference's adaptor has (`FUN_1000d280` parents each host `Layer` to
+        // `targetLayer`) and the only one that keeps drawing under the
+        // `ltBinder` owner this game produces (see the module docs). The hit
+        // threshold is the reference's `0x100`: the canvas must not swallow
+        // mouse hits on the art it draws.
+        assert_eq!(integer(&mut engine, "adaptor.parent === owner"), 1);
+        assert_eq!(integer(&mut engine, "adaptor.visible"), 1);
+        assert_eq!(integer(&mut engine, "adaptor.hitThreshold"), 0x100);
+        assert_eq!(integer(&mut engine, "owner.children.count"), 1);
+        assert_eq!(integer(&mut engine, "owner.children[0] === adaptor"), 1);
+
         // `_player.clear(adaptor, neutralColor)` lands pixels.
         engine
             .execute_script("clear.tjs", "player.clear(adaptor, 0xff3366cc);")
@@ -3054,6 +3428,95 @@ mod tests {
             integer(&mut engine, "owner.getMainPixel(4, 4)"),
             0x3366cc,
             "the cleared background travels with it"
+        );
+    }
+
+    /// The adaptor must reach the screen under exactly the owner shape the game
+    /// produces: `entryOwner` rewrites an `ltAlpha` owner to `ltBinder` right
+    /// after constructing the adaptor (`system/AffineSourceMotion.tjs` object
+    /// 25 bytecode 79-96), and `drawAffine` restores that type at the end of
+    /// every frame — so the owner itself never carries an image and the canvas
+    /// is the only drawable in the subtree.  This drives the frame output with
+    /// that shape and checks the canvas is composited at the owner's origin
+    /// (a root draw would sit at (0, 0) instead) with its pixels uploaded.
+    #[test]
+    fn separate_layer_adaptor_draws_through_a_binder_owner() {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [8, 8], 255),
+                -1,
+            ),
+        )]);
+        engine
+            .execute_script(
+                "adaptor.tjs",
+                r#"
+                global.owner = new Layer();
+                owner.setPos(5, 5);
+                owner.setSize(48, 48);
+                owner.visible = true;
+                global.adaptor = new Motion.SeparateLayerAdaptor(owner incontextof global.Layer);
+                owner.type = 0;                      // ltBinder, as entryOwner does
+                global.rm = new Motion.ResourceManager(0, 0);
+                global.res = rm.load("motion/hero.mtn");
+                global.player = new Motion.Player(rm);
+                player.play("idle", Motion.PlayFlagForce);
+                player.clear(adaptor, 0x00000000);
+                player.draw(adaptor);
+                "#,
+            )
+            .expect("draw into the adaptor");
+
+        assert_eq!(
+            integer(&mut engine, "owner.type"),
+            0,
+            "the game's binder owner"
+        );
+        assert_eq!(
+            integer(&mut engine, "owner.hasImage"),
+            0,
+            "a binder frees the owner's own image"
+        );
+        assert_eq!(
+            integer(&mut engine, "adaptor.getMainPixel(7, 7)"),
+            0x00ff_ffff,
+            "the motion landed in the canvas"
+        );
+
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(96.0, 96.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("frame");
+        let image = frame
+            .output
+            .draw_commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Image(image) => Some(image),
+                _ => None,
+            })
+            .expect("the canvas is in the frame's draw commands");
+        assert_eq!(
+            (
+                image.rect.x,
+                image.rect.y,
+                image.rect.width,
+                image.rect.height
+            ),
+            (5.0, 5.0, 48.0, 48.0),
+            "the canvas is positioned by its owner, not as a root"
+        );
+        assert!(
+            frame.output.image_uploads.iter().any(|upload| {
+                upload.width == 48
+                    && upload.rgba.get((7 * 48 + 7) * 4..(7 * 48 + 7) * 4 + 4)
+                        == Some(&[255, 255, 255, 255][..])
+            }),
+            "the canvas's pixels are uploaded for the renderer"
         );
     }
 
