@@ -17,7 +17,7 @@ use krkr_core::{
     LifecycleState, Point, ProjectStoragePort, Rect, ResourceData, StorageMediaProvider,
     StoragePort, TextInputEvent, TextureId, TransitionMethod, TransitionParams,
 };
-use krkr_font::FontSystem;
+use krkr_font::{FontSystem, LanguageAffinity};
 use krkr_kag::KagParser;
 use krkr_tjs2::{
     Result, TjsError,
@@ -157,6 +157,21 @@ fn trace_mask_from_env() -> u8 {
     std::env::var("KRKR_TRACE")
         .map(|value| parse_trace_mask(&value))
         .unwrap_or(0)
+}
+
+/// The project language a `Storages.setTextEncoding` label marks. KRKR builds
+/// set the script encoding per locale — 纸上的魔法使's `patch.tjs` runs
+/// `Storages.setTextEncoding("gbk")` before any scenario loads — so the label
+/// is the engine's project-language signal for the font rasterizer. Only
+/// labels that name one region map to a language; `UTF-8` (the pre-startup
+/// default and the value Japanese builds leave) and anything else stay
+/// [`LanguageAffinity::Unspecified`] and keep the old face choice.
+fn language_affinity_for_text_encoding(encoding: &str) -> LanguageAffinity {
+    match encoding.trim().to_ascii_lowercase().as_str() {
+        "gbk" | "gb2312" | "gb18030" | "x-gbk" | "cp936" => LanguageAffinity::SimplifiedChinese,
+        "shift_jis" | "shift-jis" | "sjis" | "cp932" | "ms_kanji" => LanguageAffinity::Japanese,
+        _ => LanguageAffinity::Unspecified,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1056,8 +1071,18 @@ impl KrkrHost {
             .is_none()
     }
 
+    /// `Storages.setTextEncoding`: the encoding every script and scenario the
+    /// game reads is decoded with. The label is also the engine's only
+    /// project-language signal, and it reaches the font rasterizer so a game
+    /// that resolves no face of its own measures and draws through the loaded
+    /// family's variant of its language (纸上的魔法使's `patch.tjs` sets
+    /// `"gbk"` before any scenario runs). Labels that name no region keep the
+    /// language-neutral default.
     pub fn set_text_encoding(&mut self, encoding: impl Into<String>) {
-        self.text_encoding = encoding.into();
+        let encoding = encoding.into();
+        self.font_system
+            .set_language_affinity(language_affinity_for_text_encoding(&encoding));
+        self.text_encoding = encoding;
     }
 
     pub fn transition_policy(&self) -> TransitionPolicy {
@@ -4694,6 +4719,39 @@ mod tests {
         host.set_trace_categories("ALL");
         assert!(host.trace_enabled(TraceCategory::Audio));
         assert!(host.trace_enabled(TraceCategory::Kag));
+    }
+
+    /// `Storages.setTextEncoding` is the engine's project-language signal: the
+    /// font rasterizer's default being font must follow it, so a GBK game
+    /// (纸上的魔法使's `patch.tjs`) measures and draws through the loaded
+    /// family's Simplified-Chinese variant while a Japanese build's label
+    /// keeps the Japanese one and an unmarked label changes nothing.
+    #[test]
+    fn text_encoding_selects_the_font_language() {
+        let mut host = KrkrHost::default();
+        assert_eq!(
+            host.font_system().language_affinity(),
+            LanguageAffinity::Unspecified
+        );
+
+        host.set_text_encoding("gbk");
+        assert_eq!(host.text_encoding(), "gbk");
+        assert_eq!(
+            host.font_system().language_affinity(),
+            LanguageAffinity::SimplifiedChinese
+        );
+
+        host.set_text_encoding("Shift_JIS");
+        assert_eq!(
+            host.font_system().language_affinity(),
+            LanguageAffinity::Japanese
+        );
+
+        host.set_text_encoding("UTF-8");
+        assert_eq!(
+            host.font_system().language_affinity(),
+            LanguageAffinity::Unspecified
+        );
     }
 
     #[test]
