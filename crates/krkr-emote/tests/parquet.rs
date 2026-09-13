@@ -311,13 +311,18 @@ fn decodes_every_parquet_icon() {
 
 /// The `opa` scale, measured on the game's own fade: `sd101.mtn`'s
 /// `ef_moya/bgef1` carries `opa: 192` on its frame at tick 90, so the layer
-/// fades to 192/255 ≈ 0.7529 — the reference's `value & 0xff` reading, not
-/// eluna's `/10` (which clamps every value ≥ 10 to fully opaque).
+/// fades to 192/255 ≈ 0.7529 — the reference's `value & 0xff` reading, which
+/// eluna itself now implements (`vendor/eluna/crates/eluna/src/emote.rs:2383`
+/// reads the byte, `:2999` divides by 255). The adapter does not touch the
+/// field; before M127 it rescaled 0..255 into the `/10` scale of the older
+/// eluna, and against the new tree that double-scaling showed up here as
+/// 192 → 7.53 → rounded 8 → 8/255 = 0.0314.
 ///
 /// This also pins the second half of the same chain: PARQUET writes
 /// `parameterize: null` on non-parameterised layers, and before the adapter
-/// dropped it the layer was frozen at local time 0 and this frame never
-/// activated at any tick.
+/// dropped it the layer was frozen at local time 0
+/// (`emote.rs:4468-4474` + `:4549-4557`) and this frame never activated at any
+/// tick.
 #[test]
 fn opa_is_an_eight_bit_alpha_on_the_games_fade() {
     let Some(path) = parquet_data_xp3() else {
@@ -330,11 +335,6 @@ fn opa_is_an_eight_bit_alpha_on_the_games_fade() {
     let archive = krkr_xp3::Xp3Archive::open_file(&path).expect("data.xp3 opens");
     let motion = parquet_motion(&archive, "motion/sd/sd101.mtn");
 
-    assert_eq!(
-        motion.normalize_report().rescaled_opacity,
-        1,
-        "sd101's single `opa` value is rescaled"
-    );
     assert!(
         motion.normalize_report().dropped_null_parameterize > 0,
         "PARQUET's `parameterize: null` fields are dropped"
@@ -355,9 +355,17 @@ fn opa_is_an_eight_bit_alpha_on_the_games_fade() {
         "opa 192 renders as 192/255, got {}",
         opacity_at(90.0)
     );
+    // The keyframes at t=90 (`opa: 192`) and t=180 (absent `opa` → 255) are
+    // linearly interpolated — the native `sub_1032FB00` behaviour eluna
+    // implements at `emote.rs:4061` (`lerp` then round to the nearest byte).
+    // Tick 150 sits halfway: 192 + 63 * 60/90 = 234, i.e. 234/255 ≈ 0.9176.
+    // The pinned eluna held the previous keyframe's value here (0.7529); the
+    // fork head tweens, which is the reference's behaviour.
+    let expected_at_150 = 234.0 / 255.0;
     assert!(
-        (opacity_at(150.0) - expected).abs() < 1e-5,
-        "the fade holds until the next keyframe"
+        (opacity_at(150.0) - expected_at_150).abs() < 1e-5,
+        "the fade tweens to 234/255 at tick 150, got {}",
+        opacity_at(150.0)
     );
     assert_eq!(opacity_at(0.0), 1.0, "before tick 90 the layer is opaque");
 }

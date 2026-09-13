@@ -77,10 +77,17 @@ impl fmt::Display for VertexBuildError {
         match self {
             VertexBuildError::ZeroDivisionX => write!(f, "division_x must be greater than zero"),
             VertexBuildError::ZeroDivisionY => write!(f, "division_y must be greater than zero"),
-            VertexBuildError::ZeroTextureWidth => write!(f, "texture_width must be greater than zero"),
-            VertexBuildError::ZeroTextureHeight => write!(f, "texture_height must be greater than zero"),
+            VertexBuildError::ZeroTextureWidth => {
+                write!(f, "texture_width must be greater than zero")
+            }
+            VertexBuildError::ZeroTextureHeight => {
+                write!(f, "texture_height must be greater than zero")
+            }
             VertexBuildError::PositionCountMismatch { expected, actual } => {
-                write!(f, "position count mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "position count mismatch: expected {expected}, got {actual}"
+                )
             }
             VertexBuildError::ColorCountMismatch { expected, actual } => {
                 write!(f, "color count mismatch: expected {expected}, got {actual}")
@@ -164,9 +171,7 @@ pub fn build_d3d_triangle_strips(
         vs.push((tex_y + y as f32 * v_step) * v_scale);
     }
 
-    let strip_vertices = cols
-        .checked_mul(2)
-        .ok_or(VertexBuildError::CountOverflow)?;
+    let strip_vertices = cols.checked_mul(2).ok_or(VertexBuildError::CountOverflow)?;
     let total_vertices = strip_vertices
         .checked_mul(division_y)
         .ok_or(VertexBuildError::CountOverflow)?;
@@ -256,37 +261,42 @@ mod tests {
     fn builds_single_cell_strip() {
         let positions = [[0.0, 0.0], [10.0, 0.0], [0.0, 20.0], [10.0, 20.0]];
         let colors = [0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff];
-        let batch = build_d3d_triangle_strips(
-            &positions,
-            &colors,
-            0.0,
-            0.0,
-            10.0,
-            20.0,
-            1,
-            1,
-            100,
-            200,
-        )
-        .unwrap();
+        let batch =
+            build_d3d_triangle_strips(&positions, &colors, 0.0, 0.0, 10.0, 20.0, 1, 1, 100, 200)
+                .unwrap();
 
         assert_eq!(batch.primitive_count_per_strip, 2);
         assert_eq!(batch.strips, vec![0..4]);
         assert_eq!(batch.vertices.len(), 4);
-        assert_eq!(batch.vertices[0], EmoteVertex::new(0.0, 0.0, 0xffff0000, 0.0, 0.0));
-        assert_eq!(batch.vertices[1], EmoteVertex::new(0.0, 20.0, 0xff0000ff, 0.0, 0.1));
-        assert_eq!(batch.vertices[2], EmoteVertex::new(10.0, 0.0, 0xff00ff00, 0.1, 0.0));
-        assert_eq!(batch.vertices[3], EmoteVertex::new(10.0, 20.0, 0xffffffff, 0.1, 0.1));
+        // u/v are `(tex + index * step) * (1.0 / texture_size)` f32 products,
+        // so a mathematically exact 0.1 comes back as 0.099999994: compare the
+        // coordinates component-wise and give u/v the arithmetic's tolerance.
+        let expected = [
+            ((0.0, 0.0, 0xffff0000u32), (0.0f32, 0.0f32)),
+            ((0.0, 20.0, 0xff0000ff), (0.0, 0.1)),
+            ((10.0, 0.0, 0xff00ff00), (0.1, 0.0)),
+            ((10.0, 20.0, 0xffffffff), (0.1, 0.1)),
+        ];
+        for (vertex, ((x, y, color), (u, v))) in batch.vertices.iter().zip(expected) {
+            assert_eq!(
+                (vertex.x, vertex.y, vertex.diffuse_argb),
+                (x, y, color),
+                "position/colour of {vertex:?}"
+            );
+            assert!(
+                (vertex.u - u).abs() <= 1.0e-6 && (vertex.v - v).abs() <= 1.0e-6,
+                "uv of {vertex:?} should be {u}/{v}"
+            );
+        }
     }
 
     #[test]
     fn expands_strip_to_triangle_list() {
         let positions = [[0.0, 0.0], [10.0, 0.0], [0.0, 20.0], [10.0, 20.0]];
         let colors = [0xffffffff; 4];
-        let batch = build_d3d_triangle_strips(
-            &positions, &colors, 0.0, 0.0, 10.0, 20.0, 1, 1, 10, 20,
-        )
-        .unwrap();
+        let batch =
+            build_d3d_triangle_strips(&positions, &colors, 0.0, 0.0, 10.0, 20.0, 1, 1, 10, 20)
+                .unwrap();
         let list = expand_triangle_strips_to_list(&batch);
         assert_eq!(list.len(), 6);
     }

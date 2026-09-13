@@ -298,7 +298,6 @@ impl PsbDecryptionKey {
         )
     }
 
-
     pub const fn as_words(self) -> [u32; 6] {
         self.words
     }
@@ -383,22 +382,36 @@ impl fmt::Display for PsbError {
                 write!(f, "invalid PSB header offset {field}=0x{offset:x}")
             }
             PsbError::InvalidBruteforceRange { start, end } => {
-                write!(f, "invalid brute-force range: start 0x{start:08x} > end 0x{end:08x}")
+                write!(
+                    f,
+                    "invalid brute-force range: start 0x{start:08x} > end 0x{end:08x}"
+                )
             }
             PsbError::InvalidOffset(off) => write!(f, "invalid PSB offset: 0x{off:x}"),
             PsbError::InvalidUtf8 => write!(f, "invalid UTF-8 string"),
             PsbError::InvalidValueType(ty) => write!(f, "invalid PSB value type: 0x{ty:02x}"),
             PsbError::InvalidArrayType(ty) => write!(f, "invalid PSB array type: 0x{ty:02x}"),
-            PsbError::InvalidIndex { table, index } => write!(f, "invalid PSB index {index} in {table}"),
+            PsbError::InvalidIndex { table, index } => {
+                write!(f, "invalid PSB index {index} in {table}")
+            }
             PsbError::MismatchedObjectArrays { names, values } => {
-                write!(f, "object name/value array length mismatch: {names} != {values}")
+                write!(
+                    f,
+                    "object name/value array length mismatch: {names} != {values}"
+                )
             }
             PsbError::MismatchedResourceArrays { offsets, lengths } => {
-                write!(f, "resource offset/length array length mismatch: {offsets} != {lengths}")
+                write!(
+                    f,
+                    "resource offset/length array length mismatch: {offsets} != {lengths}"
+                )
             }
             PsbError::MdfDecompressionFailed => write!(f, "MDF zlib decompression failed"),
             PsbError::MdfSizeMismatch { expected, actual } => {
-                write!(f, "MDF decompressed size mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "MDF decompressed size mismatch: expected {expected}, got {actual}"
+                )
             }
             PsbError::Lz4DecompressionFailed => write!(f, "LZ4 frame decompression failed"),
             PsbError::WrapperDepthExceeded => write!(f, "nested PSB wrapper depth exceeded"),
@@ -419,7 +432,10 @@ impl Error for PsbError {}
 /// - for PSB v2 files that do not set the body-encrypted bit, optionally try
 ///   body decryption when the root-code byte is not an object tag and a key was
 ///   supplied.
-pub fn normalize_psb_input(data: &[u8], options: &PsbNormalizeOptions) -> Result<Vec<u8>, PsbError> {
+pub fn normalize_psb_input(
+    data: &[u8],
+    options: &PsbNormalizeOptions,
+) -> Result<Vec<u8>, PsbError> {
     let mut plain = decode_wrappers(data, options)?;
     apply_psb_decryption(&mut plain, options.decrypt_key)?;
     Ok(plain)
@@ -468,7 +484,9 @@ pub fn bruteforce_emote_key(
     let encrypted = Arc::new(decode_wrappers(data, &normalize)?);
     let initial_header = PsbHeader::read(&encrypted)?;
 
-    if !initial_header.has_encryption_flag() && root_code_is_plain_object(&encrypted, initial_header.root_offset) {
+    if !initial_header.has_encryption_flag()
+        && root_code_is_plain_object(&encrypted, initial_header.root_offset)
+    {
         return Ok(None);
     }
 
@@ -577,7 +595,10 @@ impl PsbFile {
         })
     }
 
-    pub fn parse_normalized(data: &[u8], options: &PsbNormalizeOptions) -> Result<(Vec<u8>, Self), PsbError> {
+    pub fn parse_normalized(
+        data: &[u8],
+        options: &PsbNormalizeOptions,
+    ) -> Result<(Vec<u8>, Self), PsbError> {
         let plain = normalize_psb_input(data, options)?;
         let psb = Self::parse(&plain)?;
         Ok((plain, psb))
@@ -763,7 +784,8 @@ fn looks_like_psb_body_prefix(sample: &[u8], total_body_len: usize) -> bool {
         return false;
     };
 
-    if first.length == 0 || first.length > 1_000_000 || first.item_size == 0 || first.item_size > 4 {
+    if first.length == 0 || first.length > 1_000_000 || first.item_size == 0 || first.item_size > 4
+    {
         return false;
     }
 
@@ -771,7 +793,11 @@ fn looks_like_psb_body_prefix(sample: &[u8], total_body_len: usize) -> bool {
         let Some(second) = parse_uint_array_prefix(sample, first.total_size, total_body_len) else {
             return false;
         };
-        if second.length == 0 || second.length > 8_000_000 || second.item_size == 0 || second.item_size > 4 {
+        if second.length == 0
+            || second.length > 8_000_000
+            || second.item_size == 0
+            || second.item_size > 4
+        {
             return false;
         }
 
@@ -783,7 +809,11 @@ fn looks_like_psb_body_prefix(sample: &[u8], total_body_len: usize) -> bool {
             let Some(third) = parse_uint_array_prefix(sample, third_offset, total_body_len) else {
                 return false;
             };
-            if third.length == 0 || third.length > 1_000_000 || third.item_size == 0 || third.item_size > 4 {
+            if third.length == 0
+                || third.length > 1_000_000
+                || third.item_size == 0
+                || third.item_size > 4
+            {
                 return false;
             }
         }
@@ -799,7 +829,11 @@ struct UintArrayPrefix {
     total_size: usize,
 }
 
-fn parse_uint_array_prefix(sample: &[u8], offset: usize, max_total_size: usize) -> Option<UintArrayPrefix> {
+fn parse_uint_array_prefix(
+    sample: &[u8],
+    offset: usize,
+    max_total_size: usize,
+) -> Option<UintArrayPrefix> {
     let len_ty = *sample.get(offset)?;
     if !(PSB_TYPE_INTEGER_ARRAY_N + 1..=PSB_TYPE_INTEGER_ARRAY_N + 8).contains(&len_ty) {
         return None;
@@ -923,8 +957,16 @@ fn validate_header_offsets(data: &[u8], header: PsbHeader) -> Result<(), PsbErro
     validate_offset(data, "string_offset", header.string_offset as u64)?;
     validate_offset(data, "string_data_offset", header.string_data_offset as u64)?;
     validate_offset(data, "resource_offset", header.resource_offset as u64)?;
-    validate_offset(data, "resource_length_offset", header.resource_length_offset as u64)?;
-    validate_offset(data, "resource_data_offset", header.resource_data_offset as u64)?;
+    validate_offset(
+        data,
+        "resource_length_offset",
+        header.resource_length_offset as u64,
+    )?;
+    validate_offset(
+        data,
+        "resource_data_offset",
+        header.resource_data_offset as u64,
+    )?;
     validate_offset(data, "root_offset", header.root_offset as u64)?;
     Ok(())
 }
@@ -938,8 +980,14 @@ fn validate_offset(data: &[u8], field: &'static str, offset: u64) -> Result<(), 
 
 fn slice_range(data: &[u8], range: PsbResourceRange) -> Result<&[u8], PsbError> {
     let start = checked_usize(range.offset)?;
-    let end = checked_usize(range.offset.checked_add(range.length).ok_or(PsbError::IntegerOverflow)?)?;
-    data.get(start..end).ok_or(PsbError::InvalidOffset(range.offset))
+    let end = checked_usize(
+        range
+            .offset
+            .checked_add(range.length)
+            .ok_or(PsbError::IntegerOverflow)?,
+    )?;
+    data.get(start..end)
+        .ok_or(PsbError::InvalidOffset(range.offset))
 }
 
 fn read_name_btree_at(data: &[u8], offset: u64) -> Result<Vec<String>, PsbError> {
@@ -950,10 +998,12 @@ fn read_name_btree_at(data: &[u8], offset: u64) -> Result<Vec<String>, PsbError>
 
     let mut out = Vec::with_capacity(indexes.len());
     for index in indexes {
-        let mut id = *tree.get(checked_usize(index)?).ok_or(PsbError::InvalidIndex {
-            table: "name_btree.tree",
-            index,
-        })?;
+        let mut id = *tree
+            .get(checked_usize(index)?)
+            .ok_or(PsbError::InvalidIndex {
+                table: "name_btree.tree",
+                index,
+            })?;
 
         let mut name = Vec::new();
         while id != 0 {
@@ -961,10 +1011,12 @@ fn read_name_btree_at(data: &[u8], offset: u64) -> Result<Vec<String>, PsbError>
                 table: "name_btree.tree",
                 index: id,
             })?;
-            let offset = *offsets.get(checked_usize(next)?).ok_or(PsbError::InvalidIndex {
-                table: "name_btree.offsets",
-                index: next,
-            })?;
+            let offset = *offsets
+                .get(checked_usize(next)?)
+                .ok_or(PsbError::InvalidIndex {
+                    table: "name_btree.offsets",
+                    index: next,
+                })?;
             let decoded = id.checked_sub(offset).ok_or(PsbError::IntegerOverflow)?;
             if decoded > 0xff {
                 return Err(PsbError::InvalidIndex {
@@ -984,16 +1036,25 @@ fn read_name_btree_at(data: &[u8], offset: u64) -> Result<Vec<String>, PsbError>
     Ok(out)
 }
 
-fn read_strings_at(data: &[u8], string_offset: u64, string_data_start: u64) -> Result<Vec<String>, PsbError> {
+fn read_strings_at(
+    data: &[u8],
+    string_offset: u64,
+    string_data_start: u64,
+) -> Result<Vec<String>, PsbError> {
     let mut r = Reader::new_at(data, string_offset)?;
     let offsets = read_uint_array(&mut r)?;
     let mut out = Vec::with_capacity(offsets.len());
 
     for off in offsets {
-        let pos = string_data_start.checked_add(off).ok_or(PsbError::IntegerOverflow)?;
+        let pos = string_data_start
+            .checked_add(off)
+            .ok_or(PsbError::IntegerOverflow)?;
         let start = checked_usize(pos)?;
         let bytes = data.get(start..).ok_or(PsbError::InvalidOffset(pos))?;
-        let nul = bytes.iter().position(|&b| b == 0).ok_or(PsbError::UnexpectedEof)?;
+        let nul = bytes
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(PsbError::UnexpectedEof)?;
         let s = std::str::from_utf8(&bytes[..nul]).map_err(|_| PsbError::InvalidUtf8)?;
         out.push(s.to_owned());
     }
@@ -1022,12 +1083,17 @@ fn read_resource_ranges_at(
 
     let mut out = Vec::with_capacity(offsets.len());
     for (off, len) in offsets.into_iter().zip(lengths.into_iter()) {
-        let absolute = resource_data_start.checked_add(off).ok_or(PsbError::IntegerOverflow)?;
+        let absolute = resource_data_start
+            .checked_add(off)
+            .ok_or(PsbError::IntegerOverflow)?;
         let end = absolute.checked_add(len).ok_or(PsbError::IntegerOverflow)?;
         if checked_usize(end)? > data.len() {
             return Err(PsbError::InvalidOffset(end));
         }
-        out.push(PsbResourceRange { offset: absolute, length: len });
+        out.push(PsbResourceRange {
+            offset: absolute,
+            length: len,
+        });
     }
 
     Ok(out)
@@ -1075,10 +1141,12 @@ fn read_value(
         }
         ty if (PSB_TYPE_STRING_N + 1..=PSB_TYPE_STRING_N + 4).contains(&ty) => {
             let index = r.read_partial_u64(ty - PSB_TYPE_STRING_N)?;
-            let value = strings.get(checked_usize(index)?).ok_or(PsbError::InvalidIndex {
-                table: "strings",
-                index,
-            })?;
+            let value = strings
+                .get(checked_usize(index)?)
+                .ok_or(PsbError::InvalidIndex {
+                    table: "strings",
+                    index,
+                })?;
             Ok(PsbValue::String(value.clone()))
         }
         ty if (PSB_TYPE_RESOURCE_N + 1..=PSB_TYPE_RESOURCE_N + 4).contains(&ty) => {
@@ -1105,7 +1173,9 @@ fn read_list_value(
     let data_start = r.pos_u64();
     let mut values = Vec::with_capacity(offsets.len());
     for off in offsets {
-        let value_pos = data_start.checked_add(off).ok_or(PsbError::IntegerOverflow)?;
+        let value_pos = data_start
+            .checked_add(off)
+            .ok_or(PsbError::IntegerOverflow)?;
         values.push(read_value_at(r.data, names, strings, value_pos, depth + 1)?);
     }
     Ok(PsbValue::List(values))
@@ -1129,11 +1199,15 @@ fn read_object_value(
     let data_start = r.pos_u64();
     let mut fields = Vec::with_capacity(name_ids.len());
     for (name_id, value_off) in name_ids.into_iter().zip(value_offsets.into_iter()) {
-        let key = names.get(checked_usize(name_id)?).ok_or(PsbError::InvalidIndex {
-            table: "names",
-            index: name_id,
-        })?;
-        let value_pos = data_start.checked_add(value_off).ok_or(PsbError::IntegerOverflow)?;
+        let key = names
+            .get(checked_usize(name_id)?)
+            .ok_or(PsbError::InvalidIndex {
+                table: "names",
+                index: name_id,
+            })?;
+        let value_pos = data_start
+            .checked_add(value_off)
+            .ok_or(PsbError::IntegerOverflow)?;
         let value = read_value_at(r.data, names, strings, value_pos, depth + 1)?;
         fields.push((key.clone(), value));
     }
@@ -1161,12 +1235,16 @@ fn read_uint_array(r: &mut Reader<'_>) -> Result<Vec<u64>, PsbError> {
 }
 
 fn read_u16_at(data: &[u8], offset: usize) -> Result<u16, PsbError> {
-    let bytes = data.get(offset..offset + 2).ok_or(PsbError::UnexpectedEof)?;
+    let bytes = data
+        .get(offset..offset + 2)
+        .ok_or(PsbError::UnexpectedEof)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_u32_at(data: &[u8], offset: usize) -> Result<u32, PsbError> {
-    let bytes = data.get(offset..offset + 4).ok_or(PsbError::UnexpectedEof)?;
+    let bytes = data
+        .get(offset..offset + 4)
+        .ok_or(PsbError::UnexpectedEof)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
@@ -1245,7 +1323,10 @@ impl<'a> Reader<'a> {
 
     fn read_slice(&mut self, len: usize) -> Result<&'a [u8], PsbError> {
         let end = self.pos.checked_add(len).ok_or(PsbError::IntegerOverflow)?;
-        let s = self.data.get(self.pos..end).ok_or(PsbError::UnexpectedEof)?;
+        let s = self
+            .data
+            .get(self.pos..end)
+            .ok_or(PsbError::UnexpectedEof)?;
         self.pos = end;
         Ok(s)
     }

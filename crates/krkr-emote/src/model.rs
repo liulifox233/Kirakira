@@ -168,8 +168,9 @@ pub struct MotionFrame {
     /// Verbatim `content.opa`: the file's 0..255 opacity byte
     /// (`motionplayer_nod3d.dll` `FUN_1001d000` keeps it as `value & 0xff`,
     /// defaulting to `0xff`, i.e. fully opaque). This is the raw file value,
-    /// kept for diagnostics — the scene applies it as `opa / 255`, and
-    /// `src/normalize.rs` rescales it into the scale eluna divides by.
+    /// kept for diagnostics — the scene applies it as `opa / 255`
+    /// (`vendor/eluna/crates/eluna/src/emote.rs:2383`, `:2999`), and the
+    /// adapter passes it through unchanged.
     pub opacity: Option<f32>,
 }
 
@@ -200,9 +201,10 @@ pub struct MotionDrawItem {
     pub size: [f32; 2],
     pub scale: [f32; 2],
     pub rotation_degrees: f32,
-    /// The sprite's opacity, `0..=1`. The file's `opa` byte is scaled by
-    /// 1/255 (`src/normalize.rs`), so 192 becomes ≈0.75 exactly as the
-    /// reference renders it.
+    /// The sprite's opacity, `0..=1`. eluna scales the file's `opa` byte by
+    /// 1/255 (`vendor/eluna/crates/eluna/src/emote.rs:2999`, with the
+    /// interpolated frame state rounded the way the native DLL does at
+    /// `:4061`), so 192 becomes ≈0.75 exactly as the reference renders it.
     pub opacity: f32,
     pub z: f32,
     pub visible: bool,

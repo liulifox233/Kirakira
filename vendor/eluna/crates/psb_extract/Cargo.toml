@@ -6,4 +6,4 @@ license = "MIT OR Apache-2.0"
 description = "Command-line PSB unpacker for eluna"
 
 [dependencies]
-eluna = { path = "../eluna" }
+eluna = { package = "eluna_rs", path = "../eluna" }
