@@ -12,8 +12,15 @@
 //! - `Storages.saveOctet` / `Storages.loadOctet`: binary storage I/O.
 //! - `System.urlencode` / `System.urldecode`: UTF-8 percent codec; decoding
 //!   leaves `+` untouched (no form-style space mapping).
-//! - `Scripts.loadDataPack`: decodes the binary dictionary/array formats used
-//!   by packed UI definitions (`KBAD100` and `TJS/ns0`).
+//! - `Scripts.loadDataPack` / `Scripts.saveDataPack` / `Scripts.makeDataPackThumb`
+//!   / `Scripts.makeDataPackDigest`: the tjsDataPack surface. The loader reads
+//!   the binary dictionary/array formats used by packed UI definitions
+//!   (`KBAD100` and `TJS/ns0`) under the exact storage name it is handed (the
+//!   engine's `.pbd` alias stays as the fallback); the writer produces the
+//!   bookmark-file anatomy the game's own IO uses — the captured thumbnail
+//!   image leading, the engine-readable `KBAD100` pack appended, the digest
+//!   seed in a footer. See the `tjsDataPack` section for the reference anchors
+//!   and the deliberate divergences.
 //! - `Scripts.clone`: recursively clones arrays and dictionaries and delegates
 //!   other objects to their own `clone` method, matching scriptsEx.
 //!
@@ -23,11 +30,14 @@
 //! use it to restore system variables before choosing their opening flow.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
-use krkr_engine::{KrkrHost, KrkrPlugin};
+use krkr_engine::{KrkrHost, KrkrPlugin, plugin_api::layer::layer_bitmap_read};
 use krkr_tjs2::{
-    Result, TjsErrorKind,
+    Result, TjsError, TjsErrorKind,
     runtime::{ObjectHandle, Runtime, TjsHost, Variant},
 };
 
@@ -35,8 +45,8 @@ use crate::catalog::{PluginMeta, PluginStatus};
 
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
-    feature: "CSVParser, Scripts.loadDataPack, Storages.saveOctet, System.getOSVersion, Layer effects",
-    notes: "CSVParser, storages octet I/O, URL codecs and Scripts.loadDataPack/clone are functional; the rest of the bundle is no-op surface.",
+    feature: "CSVParser, Scripts DataPack (load/save/thumb/digest), Storages.saveOctet, System.getOSVersion, Layer effects",
+    notes: "CSVParser, storages octet I/O, URL codecs and the DataPack load/save/thumb/digest quartet are functional; the rest of the bundle is no-op surface.",
     install: |engine| engine.register_plugin(PackinOnePlugin),
 };
 
@@ -59,8 +69,9 @@ impl KrkrPlugin for PackinOnePlugin {
         install_misc_classes(runtime);
         runtime.host_mut().log(
             "PackinOne.dll compat registered: CSVParser, Storages octet I/O, System URL \
-             codecs, Scripts.loadDataPack and Scripts.clone functional; fstat/savestruct/\
-             remaining scriptsEx/systemEx/shrinkCopy/layerEx*/process are stubs",
+             codecs, Scripts.clone and the DataPack load/save/thumb/digest quartet are \
+             functional; fstat/savestruct/remaining scriptsEx/systemEx/shrinkCopy/\
+             layerEx*/process are stubs",
         );
         Ok(())
     }
@@ -664,47 +675,570 @@ fn install_layer_effects(runtime: &mut Runtime<KrkrHost>) {
 }
 
 // ---------------------------------------------------------------------------
-// tjsDataPack global functions
+// tjsDataPack: the DataPack container
+
+/// The binary struct pack header (`krkr-tjs2/src/runtime/builtins.rs`,
+/// `BINARY_STRUCT_HEADER`) the engine's struct reader and this writer share.
+const BINARY_STRUCT_HEADER: &[u8; 8] = b"KBAD100\0";
+
+/// The footer this port appends after the pack, laid out
+/// `[u32 pack_offset][u32 pack_len][u32 seed][u8 version]["KDPK"]`.
+///
+/// A file this port writes is `[thumbnail image][pack][footer]`, the anatomy
+/// the game's own bookmark writers use: `BookMarkIO_Standard.rewrite` saves
+/// the layer image and then runs `Dictionary.saveStruct(file, a0.size + "o")`
+/// — the struct lands *after* the image, at the offset the digest
+/// dictionary's `size` member records (system/MainWindow.tjs object 472,
+/// `/tmp/m129/mainwindow.dis`). The same split lets a save slot's thumbnail
+/// be the file itself, which is what the save screen loads
+/// (`drawNormalItem` → `kag.getBookMarkFileNameAtNum` → `loadImages`), and
+/// the pack inside is byte-for-byte the engine serializer's output. The
+/// reference's own container also carries the digest seed and validates the
+/// thumbnail octet ("saveDataPack: unknown thumboct format", PackinOne.dll
+/// tjsDataPack module); the footer is this port's slot for both.
+const DATA_PACK_FOOTER_MAGIC: &[u8; 4] = b"KDPK";
+const DATA_PACK_FOOTER_VERSION: u8 = 1;
+const DATA_PACK_FOOTER_LEN: usize = 17;
 
 fn install_data_pack(runtime: &mut Runtime<KrkrHost>) {
     // tjsDataPack attaches these to the Scripts object (games call
     // `Scripts.loadDataPack(...)`); also expose them as globals for safety.
-    // The engine provides the canonical Scripts implementation.  Do not
-    // replace it when this compatibility bundle is loaded later.
     let scripts = ensure_global_object(runtime, "Scripts");
     let global = runtime.global_handle();
-    if matches!(
-        runtime.object_member(scripts, "loadDataPack"),
-        Variant::Void
-    ) {
-        runtime.register_object_native(scripts, "loadDataPack", load_data_pack);
-    }
-    runtime.register_object_native(global, "loadDataPack", load_data_pack);
+    // The engine's canonical `loadDataPack` resolves a name without a `.pbd`
+    // extension to `name.pbd` (the `PSDInfo.loadPBD` spelling). The reference
+    // `tjsDataPack.dll` decodes the storage name it is handed, and KAGEX hands
+    // it the bookmark's own file name — `BookMarkIO_DataPack.load` receives
+    // `<saveDataLocation>data0.jpg` from `getBookMarkFileNameAtNum` — which the
+    // `.pbd` rule would not find. The wrapper tries the exact name first and
+    // falls back to the previous implementation (the engine's, also on a
+    // `Plugins.link` re-registration) for every other spelling.
+    let previous = runtime.object_member(scripts, "loadDataPack");
     for target in [scripts, global] {
-        runtime.register_object_native(target, "saveDataPack", zero);
-        runtime.register_object_native(target, "makeDataPackThumb", native_void);
-        runtime.register_object_native(target, "makeDataPackDigest", empty_string);
+        runtime.register_object_native(target, "saveDataPack", save_data_pack);
+        runtime.register_object_native(target, "makeDataPackThumb", make_data_pack_thumb);
+        runtime.register_object_native(target, "makeDataPackDigest", make_data_pack_digest);
+        let previous = previous.clone();
+        runtime.register_object_native(
+            target,
+            "loadDataPack",
+            move |runtime: &mut Runtime<KrkrHost>,
+                  this_obj: Option<ObjectHandle>,
+                  args: Vec<Variant>| {
+                load_data_pack(runtime, this_obj, args, &previous)
+            },
+        );
     }
 }
 
+/// `Scripts.loadDataPack(name[, options])`.
+///
+/// The reference `tjsDataPack.dll` reads the storage name it is handed; the
+/// engine's implementation rewrites anything without a `.pbd` extension to
+/// `name.pbd`. The exact name wins here, and the previous implementation —
+/// the engine's, when this bundle is registered over it — handles the rest.
 fn load_data_pack(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+    previous: &Variant,
+) -> Result<Variant> {
+    let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
+    match runtime.host_mut().read_binary(&name, "") {
+        Ok(bytes) => return decode_data_pack(runtime, &bytes, &name),
+        // A lazily materialized Web asset must keep its request alive.
+        Err(error) if error.kind == TjsErrorKind::ResourcePending => return Err(error),
+        Err(_) => {}
+    }
+    if matches!(previous, Variant::Void) {
+        // Registered without the engine's Scripts: resolve the `.pbd` alias
+        // here, the engine's rule.
+        let storage_name = data_pack_storage_name(&name);
+        let bytes = runtime.host_mut().read_binary(&storage_name, "")?;
+        return decode_data_pack(runtime, &bytes, &storage_name);
+    }
+    runtime.call_function(previous.clone(), args)
+}
+
+fn decode_data_pack(
+    runtime: &mut Runtime<KrkrHost>,
+    bytes: &[u8],
+    storage_name: &str,
+) -> Result<Variant> {
+    let Some(payload) = data_pack_payload(bytes) else {
+        return Err(TjsError::runtime(format!(
+            "Scripts.loadDataPack expected a binary data pack in `{storage_name}`"
+        )));
+    };
+    if payload.starts_with(BINARY_STRUCT_HEADER) {
+        return runtime.decode_binary_struct(payload)?.ok_or_else(|| {
+            TjsError::runtime(format!(
+                "Scripts.loadDataPack could not decode `{storage_name}`"
+            ))
+        });
+    }
+    runtime.decode_tjs_ns0(payload)?.ok_or_else(|| {
+        TjsError::runtime(format!(
+            "Scripts.loadDataPack could not decode `{storage_name}`"
+        ))
+    })
+}
+
+/// The pack a `DataPack` storage holds: a plain container (`KBAD100`, or
+/// `TJS/ns0` for the packed UI definitions) *or* the pack inside a bookmark
+/// file this port wrote — `[thumbnail image][pack][footer]`, with the
+/// footer recording where the pack starts and how long it is.
+fn data_pack_payload(bytes: &[u8]) -> Option<&[u8]> {
+    if is_data_pack_container(bytes) {
+        return Some(bytes);
+    }
+    let footer = parse_data_pack_footer(bytes)?;
+    let start = footer.pack_offset as usize;
+    let end = start.checked_add(footer.pack_len as usize)?;
+    let payload = bytes.get(start..end)?;
+    is_data_pack_container(payload).then_some(payload)
+}
+
+fn is_data_pack_container(bytes: &[u8]) -> bool {
+    bytes.starts_with(BINARY_STRUCT_HEADER)
+        || bytes.starts_with(b"TJS/ns0\0")
+        || bytes.starts_with(b"TJS/4s0\0")
+}
+
+/// `Scripts.saveDataPack(name, data[, digest[, thumb]])`.
+///
+/// KAGEX's `BookMarkIO_DataPack.save` calls it with four arguments
+/// (system/MainWindow.tjs object 474): `data` is the bookmark dictionary
+/// (`id`/`core`/`user`/`history`), `digest` is `calcThumbnailSize()`'s
+/// dictionary after `makeDataPackDigest` filled its `seed`, and `thumb` is
+/// `makeDataPackThumb`'s encoded image (or void). The data is the pack's root
+/// — the game's reader checks `id`/`core` on the value `loadDataPack` returns
+/// — the pack is appended after the thumbnail image (so the save file is also
+/// the slot's picture, the anatomy `BookMarkIO_Standard` writes), and the
+/// digest seed rides in the footer. The reference's own container compresses
+/// (LZ4) and/or encrypts the payload according to the digest dictionary's
+/// `cryptmode`/`compress`/`iv` (set from `saveDataMode`, `main/Config.tjs:18`);
+/// this port writes the plain form its own reader decodes.
+fn save_data_pack(
     runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-    let name = data_pack_storage_name(&name);
-    let Ok(bytes) = runtime.host().read_binary_storage(&name) else {
+    let Some(data) = args.get(1).and_then(|value| value.object_handle()) else {
+        // The reference raises `datapack type check failed: %1` for a subject
+        // that is not a struct (PackinOne.dll tjsDataPack string pool).
+        return Err(TjsError::runtime(format!(
+            "saveDataPack: datapack type check failed: {name}"
+        )));
+    };
+    let pack = encode_struct_pack(runtime, data)?;
+    let seed = digest_seed(runtime, args.get(2));
+    let thumb = pack_thumbnail(runtime, args.get(3));
+    let mut bytes =
+        Vec::with_capacity(thumb.as_ref().map_or(0, Vec::len) + pack.len() + DATA_PACK_FOOTER_LEN);
+    if let Some(thumb) = &thumb {
+        bytes.extend_from_slice(thumb);
+    }
+    let pack_offset = bytes.len();
+    bytes.extend_from_slice(&pack);
+    append_data_pack_footer(&mut bytes, pack_offset, pack.len(), seed);
+    runtime.host_mut().write_binary(&name, "b", &bytes)?;
+    Ok(Variant::Void)
+}
+
+/// `Scripts.makeDataPackThumb(layer, ext, quality, component)`.
+///
+/// `BookMarkIO_DataPack` picks the thumbnail format from `saveThumbnail` —
+/// `jpg` for 3, `png` otherwise, `kdt` when thumbnails are off — and the save
+/// path passes the captured layer to this function (object 474) before handing
+/// its result to `saveDataPack`. This port has no JPEG/PNG encoder reachable
+/// from the plugin, so the captured image is a 24-bit BMP of the layer's main
+/// bitmap: the bytes are stored in the pack's footer, never re-encoded. `kdt`
+/// means "no thumbnail", so it produces none.
+fn make_data_pack_thumb(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let extension = args
+        .get(1)
+        .map(Variant::to_tjs_string)
+        .transpose()?
+        .unwrap_or_default();
+    if extension.eq_ignore_ascii_case("kdt") {
+        return Ok(Variant::Void);
+    }
+    let Some(layer) = args.first().and_then(|value| value.object_handle()) else {
         return Ok(Variant::Void);
     };
-    let value = if bytes.starts_with(b"KBAD100\0") {
-        runtime.decode_binary_struct(&bytes)?
-    } else if bytes.starts_with(b"TJS/ns0\0") || bytes.starts_with(b"TJS/4s0\0") {
-        runtime.decode_tjs_ns0(&bytes)?
-    } else {
-        None
+    match encode_layer_thumbnail(runtime, layer) {
+        Ok(bytes) => Ok(Variant::Octet(bytes)),
+        Err(error) => {
+            runtime.host_mut().log(&format!(
+                "PackinOne.dll: makeDataPackThumb could not capture the layer: {error}"
+            ));
+            Ok(Variant::Void)
+        }
+    }
+}
+
+/// `Scripts.makeDataPackDigest(subject, seed, key[, flag])`.
+///
+/// KAGEX derives save key material from it: `BookMarkIO_DataPack.save` calls
+/// `makeDataPackDigest(data, System.getTickCount() & 0xffffffff, saveDataID)`
+/// and stores the result as the digest dictionary's `seed` member (object
+/// 474); `Initialize.tjs`'s `MakeLockKey` and `gridchain.calchash` use the
+/// four-argument form, hashing *storage names* there. The reference DLL
+/// bundles xxHash (and LZ4 for its container); this port keeps a plain FNV-1a
+/// over the serialized subject — or the storage's bytes for a name — mixed
+/// with the seed, key and flag, so the value is deterministic across runs.
+fn make_data_pack_digest(
+    runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let mut hash = 0x811c_9dc5u32;
+    if let Some(subject) = args.first() {
+        match subject.object_handle() {
+            Some(handle) => fnv1a(&mut hash, &encode_struct_pack(runtime, handle)?),
+            None => {
+                let text = subject.to_tjs_string()?;
+                match runtime.host_mut().read_binary(&text, "") {
+                    Ok(bytes) => fnv1a(&mut hash, &bytes),
+                    Err(_) => fnv1a(&mut hash, text.as_bytes()),
+                }
+            }
+        }
+    }
+    let seed = args
+        .get(1)
+        .and_then(|value| value.to_integer().ok())
+        .unwrap_or(0);
+    let key = args.get(2).cloned().unwrap_or_default().to_tjs_string()?;
+    let flag = args
+        .get(3)
+        .and_then(|value| value.to_integer().ok())
+        .unwrap_or(0);
+    fnv1a(&mut hash, &(seed as u32).to_le_bytes());
+    fnv1a(&mut hash, key.as_bytes());
+    fnv1a(&mut hash, &(flag as u32).to_le_bytes());
+    Ok(Variant::Integer(i64::from(hash)))
+}
+
+fn fnv1a(hash: &mut u32, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u32::from(byte);
+        *hash = hash.wrapping_mul(0x0100_0193);
+    }
+}
+
+/// The digest dictionary's `seed`, the value `makeDataPackDigest` produced.
+fn digest_seed(runtime: &Runtime<KrkrHost>, digest: Option<&Variant>) -> Option<u32> {
+    let handle = digest.and_then(|value| value.object_handle())?;
+    match runtime.object_member(handle, "seed") {
+        Variant::Integer(seed) => Some(seed as u32),
+        _ => None,
+    }
+}
+
+/// The thumbnail image the save file should lead with.
+///
+/// The save path hands over `makeDataPackThumb`'s `Octet`; KAGEX's rewrite
+/// path passes the *file name* it is rewriting (object 476 →
+/// `saveDataPack(a0, a1, l0, a0)` in `rewriteBookMarkToFile`), which reuses
+/// the pack's existing thumbnail; a raw layer is accepted the same way
+/// `makeDataPackThumb` takes one.
+fn pack_thumbnail(runtime: &mut Runtime<KrkrHost>, thumb: Option<&Variant>) -> Option<Vec<u8>> {
+    match thumb {
+        Some(Variant::Octet(bytes)) if !bytes.is_empty() => Some(bytes.clone()),
+        Some(Variant::String(name)) => read_pack_thumbnail(runtime, name),
+        Some(value) => value
+            .object_handle()
+            .and_then(|layer| encode_layer_thumbnail(runtime, layer).ok()),
+        None => None,
+    }
+}
+
+/// The image a previous save leads with, so a rewrite that passes its own
+/// file name keeps the slot's picture (`BookMarkIO_Standard.rewrite` loads the
+/// old image and re-saves the layer; the DataPack path's rewrite simply hands
+/// the file back to `saveDataPack`).
+fn read_pack_thumbnail(runtime: &mut Runtime<KrkrHost>, name: &str) -> Option<Vec<u8>> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = match runtime.host_mut().read_binary(name, "") {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let storage_name = data_pack_storage_name(name);
+            runtime.host_mut().read_binary(&storage_name, "").ok()?
+        }
     };
-    Ok(value.unwrap_or(Variant::Void))
+    let footer = parse_data_pack_footer(&bytes)?;
+    let offset = footer.pack_offset as usize;
+    (offset > 0 && offset <= bytes.len()).then(|| bytes[..offset].to_vec())
+}
+
+/// A 24-bit BMP of the layer's main bitmap, top-down in the engine's RGBA
+/// store to bottom-up BGR rows.
+fn encode_layer_thumbnail(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<Vec<u8>> {
+    let layer = runtime.bound_this(layer).unwrap_or(layer);
+    layer_bitmap_read(runtime, layer, |view| {
+        let width = view.bitmap.width as usize;
+        let height = view.bitmap.height as usize;
+        let stride = view.bitmap.pitch as usize;
+        let row_bytes = (width * 3).div_ceil(4) * 4;
+        let image_size = row_bytes * height;
+        let mut out = Vec::with_capacity(54 + image_size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&((54 + image_size) as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(width as i32).to_le_bytes());
+        out.extend_from_slice(&(height as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(image_size as u32).to_le_bytes());
+        out.extend_from_slice(&2835u32.to_le_bytes());
+        out.extend_from_slice(&2835u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for y in (0..height).rev() {
+            let start = (y * stride).min(view.pixels.len());
+            let end = (start + width * 4).min(view.pixels.len());
+            for pixel in view.pixels[start..end].chunks_exact(4) {
+                out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            let row_end = 54 + (height - y) * row_bytes;
+            out.resize(row_end, 0);
+        }
+        out
+    })
+}
+
+fn append_data_pack_footer(
+    out: &mut Vec<u8>,
+    pack_offset: usize,
+    pack_len: usize,
+    seed: Option<u32>,
+) {
+    out.extend_from_slice(&(pack_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(pack_len as u32).to_le_bytes());
+    out.extend_from_slice(&seed.unwrap_or(0).to_le_bytes());
+    out.push(DATA_PACK_FOOTER_VERSION);
+    out.extend_from_slice(DATA_PACK_FOOTER_MAGIC);
+}
+
+/// The footer's contents, when the storage has one: where the pack sits, how
+/// long it is, and the digest seed the save path computed.
+struct DataPackFooter {
+    pack_offset: u32,
+    pack_len: u32,
+    #[allow(dead_code)]
+    seed: u32,
+}
+
+fn parse_data_pack_footer(bytes: &[u8]) -> Option<DataPackFooter> {
+    if bytes.len() < DATA_PACK_FOOTER_LEN {
+        return None;
+    }
+    let footer = &bytes[bytes.len() - DATA_PACK_FOOTER_LEN..];
+    if footer[12] != DATA_PACK_FOOTER_VERSION || &footer[13..17] != DATA_PACK_FOOTER_MAGIC {
+        return None;
+    }
+    Some(DataPackFooter {
+        pack_offset: u32::from_le_bytes(footer[0..4].try_into().ok()?),
+        pack_len: u32::from_le_bytes(footer[4..8].try_into().ok()?),
+        seed: u32::from_le_bytes(footer[8..12].try_into().ok()?),
+    })
+}
+
+/// Encodes `root` as a `KBAD100` struct pack.
+///
+/// The engine exposes only the *decoder* to plugins
+/// (`Runtime::decode_binary_struct`), so the writer mirrors
+/// `krkr-tjs2/src/runtime/builtins.rs`'s `BinaryStructSerializer` tag for tag:
+/// same header, same scalar tags and widths, same string/octet/array/map
+/// headers, cycles degrade to `null`. A `Dictionary` (class info) becomes a
+/// map, an array becomes an array, any other object becomes `null` — exactly
+/// the engine's own binary `saveStruct`.
+fn encode_struct_pack(runtime: &Runtime<KrkrHost>, root: ObjectHandle) -> Result<Vec<u8>> {
+    let mut writer = StructPackWriter::new(runtime);
+    let mut bytes = Vec::from(BINARY_STRUCT_HEADER);
+    writer.value(&Variant::Object(root), &mut bytes)?;
+    Ok(bytes)
+}
+
+struct StructPackWriter<'a> {
+    runtime: &'a Runtime<KrkrHost>,
+    active: BTreeSet<ObjectHandle>,
+}
+
+impl<'a> StructPackWriter<'a> {
+    fn new(runtime: &'a Runtime<KrkrHost>) -> Self {
+        Self {
+            runtime,
+            active: BTreeSet::new(),
+        }
+    }
+
+    fn value(&mut self, value: &Variant, out: &mut Vec<u8>) -> Result<()> {
+        match value {
+            Variant::Void => out.push(0xc1),
+            Variant::Null => out.push(0xc0),
+            Variant::Integer(value) => put_pack_integer(out, *value),
+            Variant::Real(value) => {
+                out.push(0xcb);
+                out.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            Variant::String(value) => put_pack_string(out, value)?,
+            Variant::Octet(value) => put_pack_octet(out, value)?,
+            Variant::Object(handle) => self.object(*handle, out)?,
+            Variant::Closure(closure) => {
+                self.object(closure.this_obj.unwrap_or(closure.object), out)?
+            }
+            Variant::CodeObject(_) => out.push(0xc0),
+        }
+        Ok(())
+    }
+
+    fn object(&mut self, handle: ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+        if !self.active.insert(handle) {
+            out.push(0xc0);
+            return Ok(());
+        }
+        let elements = self.runtime.array_elements(handle).map(Vec::from);
+        if let Some(elements) = elements {
+            put_pack_array_header(out, elements.len())?;
+            for value in elements {
+                self.value(&value, out)?;
+            }
+        } else if self
+            .runtime
+            .object_class_infos(handle)
+            .iter()
+            .any(|info| info == "Dictionary")
+        {
+            let entries = self.runtime.object_members(handle);
+            put_pack_map_header(out, entries.len())?;
+            for (key, value) in entries {
+                put_pack_string(out, &key)?;
+                self.value(&value, out)?;
+            }
+        } else {
+            out.push(0xc0);
+        }
+        self.active.remove(&handle);
+        Ok(())
+    }
+}
+
+fn put_pack_integer(out: &mut Vec<u8>, value: i64) {
+    if value < 0 {
+        if value >= i8::MIN as i64 {
+            out.push(0xd0);
+            out.push(value as i8 as u8);
+        } else if value >= i16::MIN as i64 {
+            out.push(0xd1);
+            out.extend_from_slice(&(value as i16).to_le_bytes());
+        } else if value >= i32::MIN as i64 {
+            out.push(0xd2);
+            out.extend_from_slice(&(value as i32).to_le_bytes());
+        } else {
+            out.push(0xd3);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    } else if value <= 0x7f {
+        out.push(value as u8);
+    } else if value <= u8::MAX as i64 {
+        out.push(0xcc);
+        out.push(value as u8);
+    } else if value <= u16::MAX as i64 {
+        out.push(0xcd);
+        out.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value <= u32::MAX as i64 {
+        out.push(0xce);
+        out.extend_from_slice(&(value as u32).to_le_bytes());
+    } else {
+        out.push(0xcf);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn put_pack_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
+    let units = value.encode_utf16().collect::<Vec<_>>();
+    put_pack_string_header(out, units.len())?;
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn put_pack_string_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len <= 0x1f {
+        out.push(0xa0 + len as u8);
+    } else if len <= u8::MAX as usize {
+        out.push(0xc4);
+        out.push(len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0xc5);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else if len <= u32::MAX as usize {
+        out.push(0xc6);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary string is too large"));
+    }
+    Ok(())
+}
+
+fn put_pack_octet(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    if value.len() <= 5 {
+        out.push(0xd4 + value.len() as u8);
+    } else if value.len() <= u16::MAX as usize {
+        out.push(0xda);
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    } else if value.len() <= u32::MAX as usize {
+        out.push(0xdb);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary octet is too large"));
+    }
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+fn put_pack_array_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len <= 0x0f {
+        out.push(0x90 + len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0xdc);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else if len <= u32::MAX as usize {
+        out.push(0xdd);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary array is too large"));
+    }
+    Ok(())
+}
+
+fn put_pack_map_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len <= 0x0f {
+        out.push(0x80 + len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0xde);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else if len <= u32::MAX as usize {
+        out.push(0xdf);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    } else {
+        return Err(TjsError::runtime("binary dictionary is too large"));
+    }
+    Ok(())
 }
 
 fn data_pack_storage_name(name: &str) -> String {
@@ -984,6 +1518,153 @@ mod tests {
     use krkr_tjs2::runtime::Closure;
 
     use super::*;
+
+    /// `Scripts.saveDataPack` writes the pack KAGEX's save path needs: the
+    /// data dictionary is the root (`id`/`core` are read back by
+    /// `readBookMarkFromFile`), the file leads with the thumbnail image the
+    /// save screen loads, and it is readable under the exact storage name the
+    /// game hands to `loadDataPack` — `data0.jpg`, not its `.pbd` alias.
+    #[test]
+    fn save_data_pack_round_trips_through_the_shared_reader() {
+        let root = test_root("packinone-datapack-save");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var data = %[id => "save-id", core => %[storeTime => 1234],
+                                 user => %[], history => %[]];
+                    var digest = %[width => 4, height => 2, ext => "jpg"];
+                    digest.seed = Scripts.makeDataPackDigest(data, 7, "save-id");
+                    global.thumbLayer = new Layer();
+                    thumbLayer.setImageSize(4, 2);
+                    thumbLayer.fillRect(0, 0, 4, 2, 0x80112233);
+                    var thumb = Scripts.makeDataPackThumb(thumbLayer, "jpg", void, void);
+                    Scripts.saveDataPack("savedata/data0.jpg", data, digest, thumb);
+                    var loaded = Scripts.loadDataPack("savedata/data0.jpg");
+                    return loaded.id + ":" + loaded.core.storeTime + ":" +
+                        digest.seed + ":" +
+                        (Storages.isExistentStorage("savedata/data0.jpg") ? 1 : 0);
+                })()"#,
+            )
+            .expect("save a data pack");
+        let Variant::String(text) = &value else {
+            panic!("unexpected probe value {value:?}");
+        };
+        let fields: Vec<&str> = text.split(':').collect();
+        assert_eq!(fields.len(), 4, "{text}");
+        assert_eq!(&fields[..2], ["save-id", "1234"]);
+        let seed: u32 = fields[2].parse().expect("digest seed");
+        assert_eq!(fields[3], "1", "the pack is readable under its own name");
+
+        let bytes = fs::read(root.join("savedata/data0.jpg")).expect("read the pack");
+        let footer = parse_data_pack_footer(&bytes).expect("pack footer");
+        assert_eq!(footer.seed, seed, "the digest seed travels in the footer");
+        // A 4x2 24-bit BMP leads the file: `0x80112233` is an opaque enough
+        // `112233` pixel, stored bottom-up as BGR with 4-byte row padding.
+        let thumb = &bytes[..footer.pack_offset as usize];
+        assert_eq!(thumb.len(), 54 + 12 * 2);
+        assert_eq!(&thumb[..2], b"BM");
+        assert_eq!(&thumb[54..57], [0x33, 0x22, 0x11]);
+        let pack = &bytes[footer.pack_offset as usize..];
+        assert!(
+            pack.starts_with(b"KBAD100\0"),
+            "the shared struct header follows the image"
+        );
+        assert_eq!(footer.pack_len as usize, pack.len() - DATA_PACK_FOOTER_LEN);
+
+        // The save screen loads the slot's picture from the file itself
+        // (`drawNormalItem` → `DataStore.getFileName` → `loadImages`), so the
+        // leading image has to decode with the pack and footer trailing it.
+        engine
+            .execute_script(
+                "inline.tjs",
+                "global.slotView = new Layer();\n\
+                 slotView.loadImages(\"savedata/data0.jpg\");",
+            )
+            .expect("load the save's leading thumbnail");
+        assert_eq!(
+            engine
+                .execute_expression(
+                    "inline.tjs",
+                    "slotView.imageWidth + \"x\" + slotView.imageHeight",
+                )
+                .expect("thumbnail size"),
+            Variant::String("4x2".to_string())
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "slotView.getMainPixel(0, 0)")
+                .expect("thumbnail pixel"),
+            Variant::Integer(0x112233)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The writer has to agree with the engine's own `saveStruct(..., "b")`
+    /// byte for byte: the reader is shared, and a divergence would corrupt
+    /// every save. With no digest and no thumbnail the pack is exactly the
+    /// engine's output plus this port's fixed-size footer.
+    #[test]
+    fn save_data_pack_matches_the_engine_binary_struct_writer() {
+        let root = test_root("packinone-datapack-bytes");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"(function() {
+                    var data = %[id => "x", core => %[storeTime => 5, name => "あ"],
+                                 list => [1, 2, <% 01 02 %>], flag => null, neg => -2];
+                    (Dictionary.saveStruct incontextof data)("engine.pbd", "b");
+                    Scripts.saveDataPack("mine.pbd", data);
+                })();"#,
+            )
+            .expect("write both packs");
+        let engine_bytes = fs::read(root.join("engine.pbd")).expect("engine pack");
+        let mine = fs::read(root.join("mine.pbd")).expect("plugin pack");
+        assert_eq!(
+            &mine[..mine.len() - DATA_PACK_FOOTER_LEN],
+            engine_bytes.as_slice(),
+            "the payload must be the engine serializer's output"
+        );
+        let footer = parse_data_pack_footer(&mine).expect("footer");
+        assert_eq!(footer.pack_offset, 0, "no thumbnail leads this file");
+        assert_eq!(
+            footer.pack_len as usize,
+            engine_bytes.len(),
+            "the footer points at the whole engine payload"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The digest is deterministic and mixes its arguments; `makeDataPackThumb`
+    /// answers an `Octet` image for a drawable layer and nothing for `kdt`.
+    #[test]
+    fn data_pack_digest_and_thumb_follow_their_contracts() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var data = %[id => "d", core => %[storeTime => 1]];
+                    var first = Scripts.makeDataPackDigest(data, 1, "key");
+                    var second = Scripts.makeDataPackDigest(data, 1, "key");
+                    var other = Scripts.makeDataPackDigest(data, 2, "key");
+                    global.layer = new Layer();
+                    layer.setImageSize(2, 1);
+                    layer.fillRect(0, 0, 2, 1, 0xff102030);
+                    var thumb = Scripts.makeDataPackThumb(layer, "png");
+                    var kdt = Scripts.makeDataPackThumb(layer, "kdt");
+                    return (first == second) + ":" + (first != other) + ":" +
+                        typeof thumb + ":" + typeof kdt;
+                })()"#,
+            )
+            .expect("digest and thumbnail probes");
+        assert_eq!(value, Variant::String("1:1:Octet:void".to_string()));
+    }
 
     #[test]
     fn load_data_pack_decodes_binary_struct_storage() {
@@ -1412,6 +2093,19 @@ mod tests {
             .expect("expression")
             .to_integer()
             .expect("integer")
+    }
+
+    fn test_root(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kirakira-packinone-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create project root");
+        root
     }
 
     fn test_engine(root: &Path) -> KrkrEngine {

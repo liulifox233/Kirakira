@@ -121,10 +121,20 @@ fn install_save_struct(runtime: &mut Runtime<KrkrHost>) {
 /// constructor, so the constructor is wrapped: every instance it produces
 /// (including `[...]` literals, which compile to a call to the global `Array`)
 /// receives the three members.
+///
+/// The engine's own `Array` class object carries the builtin surface
+/// (`add`, `saveStruct`, ...), and scripts read it off the *class object*:
+/// KAGEX's `checkSave` writes its probe through
+/// `(Array.saveStruct incontextof array)(...)` (KAGEX `system/MainWindow.tjs`
+/// `checkSave`). Replacing the global with a bare wrapper made those lookups
+/// fail (`checkSave失敗 : Member "saveStruct" does not exist`) and sent the
+/// game's `saveDataLocation` to the personal path, so the wrapper inherits
+/// every member the class object had.
 fn install_array_writer(runtime: &mut Runtime<KrkrHost>) {
     let Variant::Object(class) = runtime.global_member("Array") else {
         return;
     };
+    let builtin_members = runtime.object_members(class);
     install_array_members(runtime, class);
     let original = runtime.global_member("Array");
     let constructor = runtime.alloc_native_function(
@@ -142,6 +152,11 @@ fn install_array_writer(runtime: &mut Runtime<KrkrHost>) {
     // too: `Array.save2` and the manual's `(Array.save2 incontextof arr)(...)`
     // both read them off the class object.
     install_array_members(runtime, constructor);
+    for (name, value) in builtin_members {
+        if matches!(runtime.object_member(constructor, &name), Variant::Void) {
+            runtime.set_object_member(constructor, name, value);
+        }
+    }
 }
 
 fn install_array_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
@@ -623,6 +638,65 @@ mod tests {
                 Variant::Integer(value)
             );
         }
+    }
+
+    /// KAGEX's `checkSave` writes its probe *through the class object* —
+    /// `(Array.saveStruct incontextof array)("<dir>savecheck")`
+    /// (`system/MainWindow.tjs` `checkSave`) — and reads `Array.add` and the
+    /// kindred builtins off it elsewhere. The wrapper the three writers need
+    /// replaces the global `Array`, so it has to keep the builtin surface: a
+    /// bare wrapper turned those lookups into `checkSave失敗 : Member
+    /// "saveStruct" does not exist` at boot and sent the game's
+    /// `saveDataLocation` to the personal path.
+    #[test]
+    fn array_class_object_keeps_the_builtin_surface() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(SaveStructPlugin).expect("plugin");
+        for name in ["add", "save", "saveStruct", "load", "loadStruct", "assign"] {
+            let value = engine
+                .execute_expression("inline.tjs", &format!("typeof Array.{name}"))
+                .expect("class member probe");
+            assert_ne!(
+                value,
+                Variant::String("undefined".to_string()),
+                "Array.{name} is not installed on the class object"
+            );
+        }
+        for name in ARRAY_MEMBERS {
+            let value = engine
+                .execute_expression("inline.tjs", &format!("typeof Array.{name}"))
+                .expect("class member probe");
+            assert_ne!(
+                value,
+                Variant::String("undefined".to_string()),
+                "Array.{name} is not installed on the class object"
+            );
+        }
+
+        // The idiom itself has to work end to end, and a plain instance keeps
+        // working from the same wrapper: write and read the probe array the
+        // way `checkSave` does, then use the instance methods.
+        let root = test_root("savestruct-class-surface");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(SaveStructPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var probe = new Array();
+                    probe.add(7);
+                    (Array.saveStruct incontextof probe)("savecheck");
+                    var loaded = [];
+                    (Array.loadStruct incontextof loaded)("savecheck");
+                    var items = [];
+                    items.add(1);
+                    items.add(2);
+                    return loaded.count + ":" + loaded[0] + ":" + items.count;
+                })()"#,
+            )
+            .expect("class surface round trip");
+        assert_eq!(value, Variant::String("1:7:2".to_string()));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
