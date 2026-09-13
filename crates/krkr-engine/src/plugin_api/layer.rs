@@ -6,8 +6,10 @@
 //! `Layer.mainImageBuffer`/`mainImageBufferForWrite` — a raw pointer cast to a
 //! TJS integer (`LayerIntf.cpp:9513-9553`).  A memory-safe engine cannot hand
 //! that out, so this module hands out **scoped, typed views with an explicit
-//! commit** instead: the plugin supplies a closure, the engine clones the
-//! plane, lends `&mut [u8]` for the closure's duration, and commits afterwards.
+//! commit** instead: the plugin supplies a closure, the engine lends
+//! `&mut [u8]` for the closure's duration — writing the layer's own buffer when
+//! the call owns it, a private copy when the buffer is shared with an upload
+//! record, a frozen transition face or another layer — and commits afterwards.
 //! The reference's use-after-resize bugs become unrepresentable, and the
 //! `&mut Runtime<KrkrHost>` argument proves at compile time that no view ever
 //! leaves the script thread.
@@ -46,14 +48,21 @@
 //! image the script freed must not be resurrected.
 //!
 //! **Panics**: a panic inside a closure unwinds to the TJS native call handler
-//! like any other host closure; the engine's private copy is discarded, so the
-//! commit is skipped (§B.5.6).  The engine does not catch-unwind.
+//! like any other host closure and the commit never runs.  A closure writing a
+//! private copy (the shared-buffer case) leaves the layer untouched, the way
+//! the old unconditional copy did; a closure writing the layer's own buffer in
+//! place (the exclusively owned case) leaves the bytes written before the
+//! unwind in the bitmap — the reference hands out the live buffer too, so a
+//! crashing plugin leaves partial writes there as well.  The engine does not
+//! catch-unwind (§B.5.6).
 //!
 //! **Registrations**: this facility adds no TJS members.  `mainImageBuffer*`
 //! and the province trio stay registered, read-only and returning `void`
 //! (§B.4), and a ported plugin attaches its own members to the global `Layer`
 //! class exactly like the existing stubs do
 //! (`crates/krkr-plugins/src/layer_ex_draw.rs`).
+
+use std::sync::Arc;
 
 use krkr_core::{LayerImage, LayerNode, ProvinceImage};
 use krkr_tjs2::{
@@ -152,30 +161,35 @@ pub fn layer_bitmap_read<R>(
     Ok(read(&view))
 }
 
-/// Clones the layer's main bitmap, lends the copy to `write`, and commits it.
+/// Lends the layer's main bitmap to `write` and commits the result.
 ///
-/// The commit replaces the layer's image (a fresh `create_layer_image`, so
-/// [`LayerBitmap::generation`] changes) and marks the layer modified exactly
-/// like the native pixel setters (`classes.rs` `mutate_layer_pixels_min_with_host`).
-/// It does **not** run `Layer.update`: the family contract is "mutate, then
-/// `update()`" (`layerExBase.hpp:99-103`), so the plugin calls [`layer_update`]
-/// itself when the repaint is due.
+/// The commit replaces the layer's image with a fresh texture id (so the frame
+/// output re-uploads it) and marks the layer modified exactly like the native
+/// pixel setters (`classes.rs` `mutate_layer_pixels_min_with_host`).  It does
+/// **not** run `Layer.update`: the family contract is "mutate, then `update()`"
+/// (`layerExBase.hpp:99-103`), so the plugin calls [`layer_update`] itself when
+/// the repaint is due.
+///
+/// **The ownership rule**: the closure writes the layer's live buffer *in
+/// place* exactly when this call holds the only reference to it — the image is
+/// lifted out of the node, the bytes are written where they already are, and
+/// the commit puts the same allocation back under a freshly minted texture id.
+/// When any other holder exists the closure writes a private clone instead and
+/// the layer keeps its old bytes until the commit: that covers the host's
+/// upload record for the image's current texture id (the frame that already
+/// published it), a frozen transition face, another layer sharing the image
+/// through `Layer.assignImages`, and any snapshot a caller still owns.  The
+/// check is `Arc::strong_count` on the pixel buffer, so the fallback is the
+/// conservative side of every case; see [`WritePlane`] for the two paths.
 pub fn layer_bitmap_write<R>(
     runtime: &mut Runtime<KrkrHost>,
     layer: ObjectHandle,
     write: impl FnOnce(&mut LayerBitmapViewMut<'_>) -> R,
 ) -> Result<R> {
-    let resolved = resolve_layer(runtime, layer).ok_or(LayerBitmapError::NotDrawable)?;
-    let (bitmap, mut pixels) = plane_snapshot(&resolved.node)?;
-    let result = {
-        let mut view = LayerBitmapViewMut {
-            bitmap,
-            pixels: &mut pixels,
-        };
-        write(&mut view)
+    let Some(taken) = take_write_plane(runtime, layer) else {
+        return Err(LayerBitmapError::NotDrawable.into());
     };
-    commit_bitmap(runtime, &resolved, bitmap, pixels);
-    Ok(result)
+    Ok(run_write(runtime, taken, write))
 }
 
 /// A source snapshot plus a destination write, in one call.
@@ -184,6 +198,13 @@ pub fn layer_bitmap_write<R>(
 /// of the bytes as they were when the call started (the reference shifts rows
 /// inside one buffer, `layerExRaster/main.cpp:38-97`).  Only the destination
 /// commits; the source is never written.  Both layers must have a main image.
+///
+/// The source is always snapshotted first, so a destination that shares the
+/// source's buffer (`Layer.assignImages`, or `src == dest`) still sees the
+/// pre-call bytes for the whole closure.  The destination commits through
+/// [`layer_bitmap_write`]'s ownership rule: in place when nothing else holds
+/// its buffer, over a private clone when a holder exists — including the
+/// source layer itself, whose pixels a shared buffer must not change.
 pub fn layer_bitmap_read_write<R>(
     runtime: &mut Runtime<KrkrHost>,
     src: ObjectHandle,
@@ -192,21 +213,16 @@ pub fn layer_bitmap_read_write<R>(
 ) -> Result<R> {
     let source = resolve_layer(runtime, src).ok_or(LayerBitmapError::NotDrawable)?;
     let (source_bitmap, source_pixels) = plane_snapshot(&source.node)?;
-    let dest_resolved = resolve_layer(runtime, dest).ok_or(LayerBitmapError::NotDrawable)?;
-    let (dest_bitmap, mut dest_pixels) = plane_snapshot(&dest_resolved.node)?;
-    let result = {
-        let source_view = LayerBitmapView {
-            bitmap: source_bitmap,
-            pixels: &source_pixels,
-        };
-        let mut dest_view = LayerBitmapViewMut {
-            bitmap: dest_bitmap,
-            pixels: &mut dest_pixels,
-        };
-        run(&source_view, &mut dest_view)
+    let Some(taken) = take_write_plane(runtime, dest) else {
+        return Err(LayerBitmapError::NotDrawable.into());
     };
-    commit_bitmap(runtime, &dest_resolved, dest_bitmap, dest_pixels);
-    Ok(result)
+    let source_view = LayerBitmapView {
+        bitmap: source_bitmap,
+        pixels: &source_pixels,
+    };
+    Ok(run_write(runtime, taken, |dest_view| {
+        run(&source_view, dest_view)
+    }))
 }
 
 /// `Layer.update()`: set `callOnPaint` and post the window update — what a
@@ -506,20 +522,175 @@ fn plane_snapshot(node: &LayerNode) -> Result<(LayerBitmap, Vec<u8>)> {
     ))
 }
 
-/// Replaces the layer's image with the closure's result, the way
+/// How a write call obtained the buffer it lends to its closure.
+///
+/// The decision is the strong count of the layer image's pixel buffer at the
+/// moment the write looks at it; exactly one of these is chosen per call.
+enum WritePlane {
+    /// Nothing else holds the buffer.  The image is lifted out of the node, the
+    /// closure writes the live bytes, and the commit installs the same
+    /// allocation back under a freshly minted texture id.  This is what keeps a
+    /// per-frame `Player.clear`/`Player.draw` sequence free of full-canvas
+    /// copies: the first commit of a frame publishes a buffer nothing else has
+    /// seen yet, so the later writes of that frame are its sole owner.
+    Exclusive(LayerImage),
+    /// Something else holds the buffer: the host's upload record for its
+    /// current texture id (the last frame that published it), a frozen
+    /// transition face, another layer sharing the image through
+    /// `Layer.assignImages`, or a caller's own snapshot.  The closure writes a
+    /// private clone (`Arc::make_mut`) and the live bytes change only when the
+    /// commit lands, which is the copy-on-write contract the old unconditional
+    /// copy gave every call.
+    Copied(LayerImage),
+}
+
+/// A layer's plane, lifted out of its render node for one write call.
+struct TakenPlane {
+    handle: ObjectHandle,
+    target: LayerRenderTarget,
+    bitmap: LayerBitmap,
+    plane: WritePlane,
+}
+
+/// Lifts the layer's plane out of its node for a write call.
+///
+/// The metadata (`width`, `height`, `clip`, `layer_type`, `generation`) and the
+/// ownership decision come from the same live node the commit writes back to,
+/// so a plugin sees exactly the bitmap the native pixel setters see.
+fn take_write_plane(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Option<TakenPlane> {
+    let (handle, target) = this_render_layer_target(runtime, Some(layer)).ok()?;
+    let target = target?;
+    let (bitmap, plane) = mutate_render_layer(runtime, &target, |node| {
+        let image = node.image.as_ref()?;
+        let bitmap = bitmap_metadata(node, image);
+        let exclusive = Arc::strong_count(&image.upload.rgba) == 1;
+        let plane = if exclusive {
+            WritePlane::Exclusive(node.image.take().expect("the image is present"))
+        } else {
+            WritePlane::Copied(image.clone())
+        };
+        Some((bitmap, plane))
+    })??;
+    Some(TakenPlane {
+        handle,
+        target,
+        bitmap,
+        plane,
+    })
+}
+
+/// Takes the layer's image when this call holds the only reference to its
+/// pixel buffer, so a caller that replaces the whole plane can write the live
+/// bytes in place.
+///
+/// `None` when another holder exists — the host's upload record for the
+/// image's texture id, a frozen transition face, a layer sharing the image
+/// through `Layer.assignImages`, a snapshot a caller owns — or when the layer
+/// has no image at all; a caller that replaces every pixel then builds a fresh
+/// image, exactly like the old unconditional copy did.
+pub(crate) fn take_unique_plane(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &LayerRenderTarget,
+) -> Option<LayerImage> {
+    mutate_render_layer(runtime, target, |node| {
+        let image = node.image.as_ref()?;
+        if Arc::strong_count(&image.upload.rgba) != 1 {
+            return None;
+        }
+        node.image.take()
+    })?
+}
+
+/// Runs the write closure over the taken plane, mints the image's fresh texture
+/// id, and commits the result to the layer.
+///
+/// `Exclusive` writes the layer's live allocation (the bytes are already there,
+/// so nothing is copied); `Copied` writes the private clone the take made.  In
+/// both cases the closure's view is the only way to reach the buffer, and the
+/// commit replaces the layer's image under a new texture id so the upload
+/// pipeline republishes it.
+fn run_write<R>(
+    runtime: &mut Runtime<KrkrHost>,
+    taken: TakenPlane,
+    write: impl FnOnce(&mut LayerBitmapViewMut<'_>) -> R,
+) -> R {
+    let TakenPlane {
+        handle,
+        target,
+        bitmap,
+        plane,
+    } = taken;
+    match plane {
+        WritePlane::Exclusive(image) => {
+            // The image is out of the node, so a panic cannot leave the layer
+            // without its bitmap; the guard puts it back on the way out.
+            let mut restore = RestorePlane {
+                runtime: &mut *runtime,
+                target: target.clone(),
+                image: Some(image),
+            };
+            let result = {
+                let image = restore.image.as_mut().expect("the plane is present");
+                let pixels = Arc::make_mut(&mut image.upload.rgba);
+                let mut view = LayerBitmapViewMut { bitmap, pixels };
+                write(&mut view)
+            };
+            let mut image = restore.image.take().expect("the plane is present");
+            drop(restore);
+            image.upload.texture_id = runtime.host_mut().allocate_video_texture_id();
+            commit_plane(runtime, handle, &target, bitmap, image);
+            result
+        }
+        WritePlane::Copied(mut image) => {
+            let result = {
+                let pixels = Arc::make_mut(&mut image.upload.rgba);
+                let mut view = LayerBitmapViewMut { bitmap, pixels };
+                write(&mut view)
+            };
+            image.upload.texture_id = runtime.host_mut().allocate_video_texture_id();
+            commit_plane(runtime, handle, &target, bitmap, image);
+            result
+        }
+    }
+}
+
+/// Puts an exclusively taken plane back into its layer if the write closure
+/// unwinds, so a panicking plugin never leaves the layer without its bitmap.
+///
+/// The bytes written before the unwind stay in the buffer — the reference hands
+/// plugins the live bitmap (`Layer.mainImageBufferForWrite`), so a crashing
+/// plugin leaves partial writes there too — but the texture id does not change
+/// and the commit never runs.  A `Copied` plane needs no guard: its clone is
+/// simply dropped and the layer was never touched.
+struct RestorePlane<'a> {
+    runtime: &'a mut Runtime<KrkrHost>,
+    target: LayerRenderTarget,
+    image: Option<LayerImage>,
+}
+
+impl Drop for RestorePlane<'_> {
+    fn drop(&mut self) {
+        let Some(image) = self.image.take() else {
+            return;
+        };
+        mutate_render_layer(self.runtime, &self.target, |node| {
+            node.image = Some(image);
+        });
+    }
+}
+
+/// Installs the written plane as the layer's image, the way
 /// `mutate_layer_pixels_min_with_host` does.  `imageWidth`/`imageHeight` keep
 /// their values — they describe the same bitmap the plugin saw — and are only
 /// filled when the layer never had them.
-fn commit_bitmap(
+fn commit_plane(
     runtime: &mut Runtime<KrkrHost>,
-    resolved: &ResolvedLayer,
+    handle: ObjectHandle,
+    target: &LayerRenderTarget,
     bitmap: LayerBitmap,
-    pixels: Vec<u8>,
+    image: LayerImage,
 ) {
-    let image = runtime
-        .host_mut()
-        .create_layer_image(bitmap.width, bitmap.height, pixels);
-    mutate_render_layer(runtime, &resolved.target, |layer| {
+    mutate_render_layer(runtime, target, |layer| {
         layer.image = Some(image);
         if layer.image_width == 0.0 {
             layer.image_width = bitmap.width as f32;
@@ -534,7 +705,7 @@ fn commit_bitmap(
             layer.height = bitmap.height as f32;
         }
     });
-    mark_image_modified(runtime, resolved.handle);
+    mark_image_modified(runtime, handle);
 }
 
 #[cfg(test)]
@@ -681,6 +852,232 @@ mod tests {
             .expect("committed image reaches the frame output");
         let index = offset(1, 1, 4);
         assert_eq!(&upload.rgba[index..index + 4], [0, 0, 255, 255]);
+    }
+
+    /// The render node id `__nativeLayerId` reports.
+    fn native_layer_id(engine: &mut KrkrEngine, name: &str) -> u64 {
+        engine
+            .execute_expression("id.tjs", &format!("{name}.__nativeLayerId"))
+            .expect("layer id")
+            .to_integer()
+            .expect("integer") as u64
+    }
+
+    /// The image a holder keeps alive, cloned out of the render tree the way a
+    /// frozen transition face or the frame pipeline's upload record does.
+    fn held_image(engine: &KrkrEngine, layer_id: u64) -> LayerImage {
+        engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .expect("layer node")
+            .image
+            .clone()
+            .expect("layer image")
+    }
+
+    /// The address of the bytes a plugin view is handed.
+    fn pixel_pointer(engine: &mut KrkrEngine, layer: ObjectHandle) -> usize {
+        layer_bitmap_read(engine.tjs_runtime_mut(), layer, |view| {
+            view.pixels.as_ptr() as usize
+        })
+        .expect("read pointer")
+    }
+
+    #[test]
+    fn bitmap_write_edits_a_uniquely_owned_buffer_in_place() {
+        let mut engine = engine();
+        engine
+            .execute_script("inline.tjs", FILLED_LAYER)
+            .expect("script");
+        let layer = layer_handle(&engine, "layer");
+        let before_generation = generation(&mut engine, layer);
+        let before_pointer = pixel_pointer(&mut engine, layer);
+
+        layer_bitmap_write(engine.tjs_runtime_mut(), layer, |view| {
+            assert_eq!(
+                view.pixels.as_ptr() as usize,
+                before_pointer,
+                "nothing else holds the buffer, so the closure gets the layer's own bytes"
+            );
+            view.pixels[offset(1, 1, 4)] = 0x2a;
+        })
+        .expect("write");
+
+        assert_ne!(
+            generation(&mut engine, layer),
+            before_generation,
+            "the commit still mints a fresh texture id, so the upload pipeline republishes"
+        );
+        assert_eq!(
+            pixel_pointer(&mut engine, layer),
+            before_pointer,
+            "the commit keeps the same allocation: a full-canvas copy is elided"
+        );
+        layer_bitmap_read(engine.tjs_runtime_mut(), layer, |view| {
+            assert_eq!(view.pixels[offset(1, 1, 4)], 0x2a);
+        })
+        .expect("read back");
+    }
+
+    #[test]
+    fn bitmap_write_copies_when_a_holder_shares_the_buffer() {
+        let mut engine = engine();
+        engine
+            .execute_script("inline.tjs", FILLED_LAYER)
+            .expect("script");
+        let layer = layer_handle(&engine, "layer");
+        let layer_id = native_layer_id(&mut engine, "layer");
+        // The holder covers both shapes the frame pipeline produces: a frozen
+        // transition face and the upload record of the frame that published
+        // the image.  Both are `Arc<[u8]>` clones of the live buffer.
+        let held = held_image(&engine, layer_id);
+        let held_bytes = held.upload.rgba.to_vec();
+        let held_texture_id = held.upload.texture_id;
+        let before_pointer = pixel_pointer(&mut engine, layer);
+
+        layer_bitmap_write(engine.tjs_runtime_mut(), layer, |view| {
+            assert_ne!(
+                view.pixels.as_ptr() as usize,
+                before_pointer,
+                "a shared buffer is written through a private copy"
+            );
+            view.pixels[offset(1, 1, 4)] = 0x2a;
+        })
+        .expect("write");
+
+        assert_eq!(
+            held.upload.rgba.as_ref(),
+            held_bytes.as_slice(),
+            "the holder's bytes are untouched"
+        );
+        assert_eq!(
+            held.upload.texture_id, held_texture_id,
+            "the holder's own image keeps its texture id"
+        );
+        assert_ne!(
+            pixel_pointer(&mut engine, layer),
+            before_pointer,
+            "the layer moved to a fresh allocation"
+        );
+        assert_ne!(generation(&mut engine, layer), held_texture_id);
+        let committed = held_image(&engine, layer_id);
+        assert_eq!(committed.upload.rgba[offset(1, 1, 4)], 0x2a);
+    }
+
+    #[test]
+    fn a_later_write_in_the_same_frame_edits_the_buffer_the_first_one_committed() {
+        // The shape of the per-frame `Motion.Player.clear` / `draw` sequence:
+        // the previous frame's published buffer is still held, so the clear
+        // writes a private copy; the buffer it commits is unshared, so the
+        // draw that follows in the same frame writes it in place.  Two calls,
+        // one full-canvas copy.
+        let mut engine = engine();
+        engine
+            .execute_script("inline.tjs", FILLED_LAYER)
+            .expect("script");
+        let layer = layer_handle(&engine, "layer");
+        let layer_id = native_layer_id(&mut engine, "layer");
+        // The holder covers both shapes the frame pipeline produces: a frozen
+        // transition face and the upload record of the frame that published
+        // the image.  Both are `Arc<[u8]>` clones of the live buffer.
+        let published = held_image(&engine, layer_id);
+        let published_bytes = published.upload.rgba.to_vec();
+
+        layer_bitmap_write(engine.tjs_runtime_mut(), layer, |view| {
+            view.pixels.fill(0x11);
+        })
+        .expect("clear");
+        let cleared_pointer = pixel_pointer(&mut engine, layer);
+        assert_ne!(
+            cleared_pointer,
+            published.upload.rgba.as_ptr() as usize,
+            "the clear wrote a private copy"
+        );
+
+        layer_bitmap_write(engine.tjs_runtime_mut(), layer, |view| {
+            assert_eq!(
+                view.pixels.as_ptr() as usize,
+                cleared_pointer,
+                "the draw writes the buffer the clear committed"
+            );
+            view.pixels[0] = 0x22;
+        })
+        .expect("draw");
+
+        assert_eq!(
+            published.upload.rgba.as_ref(),
+            published_bytes.as_slice(),
+            "the buffer the earlier frame published is never mutated"
+        );
+        assert_eq!(
+            pixel_pointer(&mut engine, layer),
+            cleared_pointer,
+            "the second write did not copy"
+        );
+    }
+
+    #[test]
+    fn read_write_leaves_a_layer_that_shares_the_destination_buffer_untouched() {
+        // `Layer.assignImages` points the destination at the source's bitmap
+        // (both nodes hold one `Arc<[u8]>`, `classes.rs` `copy_layer_images`),
+        // so a destination write must not reach the bytes the source layer
+        // still shows.  The sizes match, which is what makes the assignment
+        // share the image instead of resizing a copy into the destination.
+        let mut engine = engine();
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.src = new Layer();
+                src.setImageSize(2, 1);
+                src.fillRect(0, 0, 2, 1, 0xffff0000);
+                src.fillRect(1, 0, 1, 1, 0xff0000ff);
+
+                global.dest = new Layer();
+                dest.setImageSize(2, 1);
+                dest.assignImages(src);
+                "#,
+            )
+            .expect("script");
+        let src = layer_handle(&engine, "src");
+        let dest = layer_handle(&engine, "dest");
+        let src_id = native_layer_id(&mut engine, "src");
+        let dest_id = native_layer_id(&mut engine, "dest");
+        let shared = held_image(&engine, src_id);
+        let shared_bytes = shared.upload.rgba.to_vec();
+        assert!(
+            Arc::ptr_eq(
+                &shared.upload.rgba,
+                &held_image(&engine, dest_id).upload.rgba
+            ),
+            "assignImages shares one buffer between the two layers"
+        );
+
+        layer_bitmap_read_write(engine.tjs_runtime_mut(), src, dest, |source, dest_view| {
+            dest_view.pixels.copy_from_slice(source.pixels);
+        })
+        .expect("read_write");
+
+        assert_eq!(
+            shared.upload.rgba.as_ref(),
+            shared_bytes.as_slice(),
+            "a destination that shares the source's buffer must copy, not write it"
+        );
+        assert_eq!(
+            engine
+                .execute_expression("read.tjs", "src.getMainPixel(1, 0)")
+                .expect("source pixel"),
+            Variant::Integer(0x0000ff),
+            "the source layer keeps its pixels"
+        );
+        assert_eq!(
+            engine
+                .execute_expression("read.tjs", "dest.getMainPixel(0, 0)")
+                .expect("destination pixel"),
+            Variant::Integer(0xff0000),
+            "the destination committed the source's bytes"
+        );
     }
 
     #[test]
@@ -953,13 +1350,21 @@ mod tests {
         assert_eq!(
             generation(&mut engine, layer),
             before,
-            "the engine's private copy is discarded"
+            "the commit never runs, so the texture id is untouched"
         );
+        // The exclusively taken bitmap is put back, with the bytes the closure
+        // wrote before unwinding still in it: the reference hands plugins the
+        // live buffer (`Layer.mainImageBufferForWrite`), so a crashing plugin
+        // leaves partial writes there too.
+        layer_bitmap_read(engine.tjs_runtime_mut(), layer, |view| {
+            assert_eq!(&view.pixels[..4], [7, 0, 0, 255]);
+        })
+        .expect("the layer keeps its bitmap");
         assert_eq!(
             engine
                 .execute_expression("read.tjs", "layer.getMainPixel(0, 0)")
                 .expect("pixel"),
-            Variant::Integer(0xff0000)
+            Variant::Integer(0x070000)
         );
     }
 
