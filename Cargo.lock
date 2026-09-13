@@ -1419,6 +1419,7 @@ name = "krkr-video"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",
+ "ffmpeg-sys-next",
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-core-audio-types",

@@ -1,8 +1,8 @@
 //! Round-trips the FFmpeg fallback backend through the [`krkr_video::VideoPort`]
 //! contract on the committed sample clip.
 //!
-//! The clip is generated with a system FFmpeg (so the repository carries no
-//! encoder dependency):
+//! The clip is generated once with an `ffmpeg` CLI (only to produce the
+//! fixture; the backend itself never shells out):
 //!
 //! ```text
 //! ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=10:duration=2 \
@@ -11,10 +11,11 @@
 //!   -c:a aac -ac 2 -b:a 64k -shortest sample_clip.mp4
 //! ```
 //!
-//! The suite needs the `ffmpeg` feature and system FFmpeg on the host. It is
-//! skipped where the macOS system decoder wins the selection, because then
-//! `create_decoder` opens AVFoundation and this backend is not the one under
-//! test.
+//! The suite needs the `ffmpeg` feature, which builds the embedded FFmpeg from
+//! source (see the `krkr_video::ffmpeg` module docs for the one-command
+//! reproduction). It is skipped where the macOS system decoder wins the
+//! selection, because then `create_decoder` opens AVFoundation and this backend
+//! is not the one under test.
 
 #![cfg(all(
     feature = "ffmpeg",

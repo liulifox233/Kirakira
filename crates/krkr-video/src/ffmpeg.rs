@@ -1,12 +1,32 @@
-//! FFmpeg fallback backend on the host's system FFmpeg libraries.
+//! Embedded FFmpeg fallback backend.
 //!
-//! The `ffmpeg-next` bindings find libavformat/libavcodec/libswscale/
-//! libswresample through pkg-config, so this backend decodes with whatever
-//! FFmpeg the host provides — never a bundled decoder and never the `ffmpeg`
-//! CLI, the same philosophy as the AVFoundation backend using the OS
-//! framework. Sources are opened through a custom AVIO over the host's own
-//! bytes, so in-memory storage never stages a temporary file (unlike the
-//! AVFoundation bindings, which only take URL assets).
+//! The `ffmpeg` feature makes `ffmpeg-sys-next` fetch FFmpeg's `release/9.0`
+//! branch, configure and build it from source, and link the resulting static
+//! libav* archives into the artifact: the shipped binary carries its own
+//! decoder and needs no system FFmpeg at build or run time (no pkg-config
+//! probe, no shared libav*). FFmpeg itself is never shelled out to.
+//!
+//! The vendored build's configure line is fixed by the bindings crate and is
+//! on the record in `AGENTS.md`: FFmpeg's LGPL defaults
+//! (`--disable-gpl --disable-version3 --disable-nonfree`) with
+//! `--disable-autodetect` (no external codec libraries) and only
+//! libavcodec/libavformat/libswscale/libswresample enabled. A direct
+//! `ffmpeg-sys-next` dependency pins `build-portable` so the artifact does not
+//! inherit `-march=native`. The build wants network (a shallow git clone), a C
+//! toolchain (gcc/clang, make, nasm) and libclang for bindgen; it takes about
+//! 3.5 minutes on a 32-core host and is cached afterwards per profile.
+//!
+//! One-command reproduction from a clean worktree (Linux host):
+//!
+//! ```text
+//! nix shell nixpkgs#gcc nixpkgs#gnumake nixpkgs#nasm -c bash -c \
+//!   'LIB=$(nix build --no-link --print-out-paths nixpkgs#llvmPackages.libclang.lib); \
+//!    LIBCLANG_PATH="$LIB/lib" cargo build -p krkr-video --features ffmpeg'
+//! ```
+//!
+//! Sources are opened through a custom AVIO over the host's own bytes, so
+//! in-memory storage never stages a temporary file (unlike the AVFoundation
+//! bindings, which only take URL assets).
 //!
 //! Contract notes that the trait does not spell out:
 //!

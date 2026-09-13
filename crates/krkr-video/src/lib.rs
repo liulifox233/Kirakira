@@ -1,12 +1,15 @@
 //! Video decoding backends for the KRKR VideoOverlay object.
 //!
-//! Like krkr2/krkrz (DirectShow / Media Foundation), this crate does not
-//! bundle a codec; it decodes through the host's own media stack. Backends are
-//! pluggable behind the [`VideoPort`] protocol and its [`VideoDecoder`] decode
-//! stream, and the host platform's own decoder is always primary where one is
-//! compiled in. Where no system decoder exists, the opt-in `ffmpeg` feature
-//! provides a fallback on the host's system FFmpeg libraries (no bundled
-//! decoder, no shelling out to the `ffmpeg` CLI).
+//! Like krkr2/krkrz (DirectShow / Media Foundation), this crate decodes
+//! through the host's media stack rather than shipping its own format code.
+//! Backends are pluggable behind the [`VideoPort`] protocol and its
+//! [`VideoDecoder`] decode stream, and the host platform's own decoder is
+//! always primary where one is compiled in. Where no system decoder exists,
+//! the opt-in `ffmpeg` feature supplies the fallback: an **embedded** FFmpeg
+//! built from source at build time and linked statically, so the artifact
+//! carries its own decoder and needs no system FFmpeg (and never shells out to
+//! the `ffmpeg` CLI). See `crate::ffmpeg` for the vendored configure line and
+//! the one-command reproduction.
 //!
 //! Selection order (see [`platform_capabilities`] and [`create_decoder`]):
 //!
@@ -14,16 +17,17 @@
 //!    BGRA frames out of `CVPixelBuffer`. System decoder, always wins on
 //!    macOS when compiled in — FFmpeg is only used there when that feature is
 //!    off.
-//! 2. `ffmpeg` (Linux/Windows/Android/iOS and any other host with system
-//!    libav* libraries): libavformat/libavcodec demux + decode, swscale to
-//!    RGBA, swresample to the interleaved f32 soundtrack. Sources are read
-//!    through a custom AVIO, so in-memory bytes never touch the filesystem.
+//! 2. `ffmpeg` (Linux/Windows today; any other host once its FFmpeg
+//!    cross-build is wired): the embedded libavformat/libavcodec demux +
+//!    decode, swscale to RGBA, swresample to the interleaved f32 soundtrack.
+//!    Sources are read through a custom AVIO, so in-memory bytes never touch
+//!    the filesystem.
 //! 3. Per-platform declared profiles (Android MediaCodec, iOS AVFoundation,
 //!    Web media element): protocol declarations the corresponding shell
 //!    provides; selected when no decoder is linked in above them.
 //! 4. [`VideoBackendKind::Unavailable`]: no backend at all.
 //!
-//! The rule is compile-time, because linking a system framework is a build
+//! The rule is compile-time, because which decoder is linked is a build
 //! decision; [`PlatformVideoFactory::capabilities`] reports exactly what
 //! [`create_decoder`] on the same build will return.
 
@@ -77,8 +81,8 @@ pub struct AudioChunk {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoBackendKind {
     MacosAvFoundation,
-    /// System FFmpeg libraries, the fallback where no platform decoder is
-    /// compiled in.
+    /// Embedded static FFmpeg (built from source at build time), the fallback
+    /// where no platform decoder is compiled in.
     Ffmpeg,
     AndroidMediaCodec,
     IosAvFoundation,
@@ -117,10 +121,10 @@ impl VideoCapabilities {
 /// Returns the capability profile for the current build and target.
 ///
 /// The order encodes the selection rule: the platform's own decoder wins where
-/// it is compiled in (AVFoundation on macOS), system FFmpeg is the fallback
-/// everywhere else, and the Android/iOS/Web profiles are protocol declarations
-/// whose shells provide a native/media-element `VideoPort` when the crate has
-/// no decoder of its own.
+/// it is compiled in (AVFoundation on macOS), the embedded FFmpeg build is the
+/// fallback everywhere else, and the Android/iOS/Web profiles are protocol
+/// declarations whose shells provide a native/media-element `VideoPort` when
+/// the crate has no decoder of its own.
 pub const fn platform_capabilities() -> VideoCapabilities {
     if cfg!(all(target_os = "macos", feature = "macos-avfoundation")) {
         VideoCapabilities {
@@ -312,8 +316,9 @@ impl Error for VideoError {}
 /// Opens a host-owned source with the best backend for the current build.
 ///
 /// Selection is compile-time and follows [`platform_capabilities`]: the
-/// platform's own system decoder first, system FFmpeg as the fallback when it
-/// is compiled in (and no system decoder is), otherwise `Unsupported`.
+/// platform's own system decoder first, the embedded FFmpeg build as the
+/// fallback when it is compiled in (and no system decoder is), otherwise
+/// `Unsupported`.
 pub fn create_decoder(source: VideoSource) -> Result<Box<dyn VideoPort>, VideoError> {
     // System decoder primary: AVFoundation on macOS.
     #[cfg(all(target_os = "macos", feature = "macos-avfoundation"))]
