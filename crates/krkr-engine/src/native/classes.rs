@@ -2546,6 +2546,52 @@ fn filled_layer_pixels(width: u32, height: u32, fill: [u8; 4]) -> Vec<u8> {
     pixels
 }
 
+/// A fresh layer image at `width`×`height` filled with `fill`.
+///
+/// The plane is written once: `create_layer_image` allocates it and the fill
+/// goes into that same allocation, where the old shape filled a `Vec` and then
+/// copied it into the image (`Arc::<[u8]>::from` copies).
+fn create_filled_layer_image(
+    runtime: &mut Runtime<KrkrHost>,
+    width: u32,
+    height: u32,
+    fill: [u8; 4],
+) -> LayerImage {
+    let mut image = runtime.host_mut().create_layer_image(
+        width,
+        height,
+        vec![0; width as usize * height as usize * 4],
+    );
+    if fill != [0, 0, 0, 0]
+        && let Some(pixels) = Arc::get_mut(&mut image.upload.rgba)
+    {
+        fill_pixel_buffer(pixels, fill);
+    }
+    image
+}
+
+/// Installs a plane the layer now owns: the image, the image size it reports,
+/// and the layer Rect only when it never had one.
+fn install_layer_plane(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &LayerRenderTarget,
+    image: LayerImage,
+    width: u32,
+    height: u32,
+) {
+    mutate_render_layer(runtime, target, |layer| {
+        layer.image = Some(image);
+        layer.image_width = width as f32;
+        layer.image_height = height as f32;
+        if layer.width <= 0.0 {
+            layer.width = width as f32;
+        }
+        if layer.height <= 0.0 {
+            layer.height = height as f32;
+        }
+    });
+}
+
 fn allocate_default_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     // `AllocateDefaultImage` copies the 32×32 transparent-white holder. A
     // second `super.Layer(window, parent)` must not wipe a bitmap already
@@ -2556,15 +2602,12 @@ fn allocate_default_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectH
     if render_layer_snapshot(runtime, &target).is_some_and(|layer| layer.image.is_some()) {
         return;
     }
-    let pixels = filled_layer_pixels(
+    let image = create_filled_layer_image(
+        runtime,
         DEFAULT_LAYER_SIZE,
         DEFAULT_LAYER_SIZE,
         DEFAULT_LAYER_IMAGE_RGBA,
     );
-    let image =
-        runtime
-            .host_mut()
-            .create_layer_image(DEFAULT_LAYER_SIZE, DEFAULT_LAYER_SIZE, pixels);
     mutate_render_layer(runtime, &target, |layer| {
         layer.width = DEFAULT_LAYER_SIZE as f32;
         layer.height = DEFAULT_LAYER_SIZE as f32;
@@ -2598,8 +2641,8 @@ fn restore_default_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
     }
     let width = layer.width.round().max(1.0) as u32;
     let height = layer.height.round().max(1.0) as u32;
-    let pixels = filled_layer_pixels(width, height, layer_neutral_fill(runtime, handle));
-    let image = runtime.host_mut().create_layer_image(width, height, pixels);
+    let image =
+        create_filled_layer_image(runtime, width, height, layer_neutral_fill(runtime, handle));
     mutate_render_layer(runtime, &target, |layer| {
         layer.image_left = 0.0;
         layer.image_top = 0.0;
@@ -2660,8 +2703,8 @@ fn allocate_layer_image(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -
     }
     let width = width as u32;
     let height = height as u32;
-    let pixels = filled_layer_pixels(width, height, layer_neutral_fill(runtime, handle));
-    let image = runtime.host_mut().create_layer_image(width, height, pixels);
+    let image =
+        create_filled_layer_image(runtime, width, height, layer_neutral_fill(runtime, handle));
     mutate_render_layer(runtime, &target, |layer| {
         layer.image_left = 0.0;
         layer.image_top = 0.0;
@@ -3021,6 +3064,7 @@ const WAVE_NATIVE_PROPERTIES: &[&str] = &[
     "sampleValue",
     "sampleCount",
     "sampleAhead",
+    "filters",
     "globalVolume",
     "globalFocusMode",
     "useVisBuffer",
@@ -3048,6 +3092,21 @@ fn wave_native_property_get(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(Variant::Void);
     };
+    if name == "filters" {
+        // `tTJSNC_WaveSoundBuffer`'s NI constructor creates the filter array
+        // (`WaveIntf.cpp:815`) and the getter (`:1540-1554`) hands the same
+        // instance back on every read; `RebuildFilterChain` (`:865-905`) reads
+        // it to build the DSP chain.  Lazily created per instance and cached
+        // under the instance's backing key, so two buffers never share one.
+        let key = wave_property_backing_key(name);
+        let existing = runtime.object_member(this, &key);
+        if !matches!(existing, Variant::Void) {
+            return Ok(existing);
+        }
+        let array = Variant::Object(runtime.alloc_array_object(Vec::new()));
+        runtime.set_object_member(this, &key, array.clone());
+        return Ok(array);
+    }
     if name == "status" {
         return Ok(runtime.object_member(this, &wave_property_backing_key("status")));
     }
@@ -3100,6 +3159,18 @@ fn wave_native_property_set(
     let Some(this) = this_obj.map(|this| runtime.bound_this(this).unwrap_or(this)) else {
         return Ok(());
     };
+    if name == "filters" {
+        // The reference registers the getter only — `TJS_DENY_NATIVE_PROP_SETTER`
+        // (`WaveIntf.cpp:1540-1554`) — and this engine's own filter compat
+        // stores a script's filter array on the member
+        // (`crates/krkr-plugins/src/wf_basic_effect.rs`, whose test pins the
+        // round trip), so the write lands on the backing member the lazy getter
+        // reads back instead of being dropped.  A game that assigns `filters`
+        // therefore replaces the array rather than dying the way the reference
+        // would; PARQUET only ever mutates it in place (`filters.clear()`).
+        runtime.set_object_member(this, wave_property_backing_key(name), value);
+        return Ok(());
+    }
     if name == "status" {
         // Native status is read-only; transitions update it internally.
         return Ok(());
@@ -9470,24 +9541,23 @@ fn fill_layer_pixels(
     }
 
     if x0 == 0 && y0 == 0 && x1 == image_width && y1 == image_height && clip.is_none() {
-        let mut pixels = vec![0; image_width as usize * image_height as usize * 4];
-        if rgba != [0, 0, 0, 0] {
-            fill_pixel_buffer(&mut pixels, rgba);
+        // The whole plane is replaced, so a buffer this call owns exclusively
+        // can be filled where it lies and published under a fresh texture id
+        // (`plugin_api::layer`'s ownership rule); anything shared keeps its
+        // bytes and gets a fresh image, exactly like before — cloning the old
+        // plane first would copy every byte only to overwrite it.
+        let Some(mut image) = crate::plugin_api::layer::take_unique_plane(runtime, target) else {
+            let image = create_filled_layer_image(runtime, image_width, image_height, rgba);
+            install_layer_plane(runtime, target, image, image_width, image_height);
+            return Ok(());
+        };
+        if rgba != [0, 0, 0, 0]
+            && let Some(pixels) = Arc::get_mut(&mut image.upload.rgba)
+        {
+            fill_pixel_buffer(pixels, rgba);
         }
-        let image = runtime
-            .host_mut()
-            .create_layer_image(image_width, image_height, pixels);
-        mutate_render_layer(runtime, target, |layer| {
-            layer.image = Some(image);
-            layer.image_width = image_width as f32;
-            layer.image_height = image_height as f32;
-            if layer.width <= 0.0 {
-                layer.width = image_width as f32;
-            }
-            if layer.height <= 0.0 {
-                layer.height = image_height as f32;
-            }
-        });
+        image.upload.texture_id = runtime.host_mut().allocate_video_texture_id();
+        install_layer_plane(runtime, target, image, image_width, image_height);
         return Ok(());
     }
 
@@ -11251,5 +11321,58 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("F:0".to_string()));
+    }
+
+    /// PARQUET's voice-filter wrapper reads the member first:
+    /// `FilterHackedEnvWaveSoundBuffer.searchPlayableStorage` starts with
+    /// `filters.clear()` (`sysscn/voiceeffect.tjs`), so a native
+    /// `WaveSoundBuffer` that answers `void` aborts the prologue with
+    /// `Cannot convert the variable type ((void) to Object)`.
+    /// `WaveIntf.cpp:815` creates the array in the NI constructor and the
+    /// getter (`:1540-1554`) hands the same array back on every read; the
+    /// script that stores its own filter array on the member
+    /// (`crates/krkr-plugins/src/wf_basic_effect.rs`) reads it back here.
+    #[test]
+    fn wave_sound_buffer_filters_is_a_per_instance_array() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_filters.tjs",
+                r#"
+                class EnvWaveSoundBuffer extends WaveSoundBuffer {
+                    function EnvWaveSoundBuffer() { super.WaveSoundBuffer(); }
+                }
+                class FilterHackedEnvWaveSoundBuffer extends EnvWaveSoundBuffer {
+                    function FilterHackedEnvWaveSoundBuffer() {
+                        super.EnvWaveSoundBuffer();
+                    }
+                }
+                var first = new FilterHackedEnvWaveSoundBuffer();
+                var second = new FilterHackedEnvWaveSoundBuffer();
+                var same = first.filters === first.filters;
+                var perInstance = !(first.filters === second.filters);
+                first.filters.clear();
+                first.filters.add("phase");
+                var mutated = first.filters.count;
+                first.filters = ["a", "b"];
+                var stored = first.filters.count;
+                return "typeof=" + (typeof second.filters)
+                    + " mutated=" + mutated
+                    + " second=" + second.filters.count
+                    + " stored=" + stored
+                    + " same=" + (same ? "y" : "n")
+                    + " perInstance=" + (perInstance ? "y" : "n");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(
+                "typeof=Object mutated=1 second=0 stored=2 same=y perInstance=y".to_string()
+            )
+        );
     }
 }
