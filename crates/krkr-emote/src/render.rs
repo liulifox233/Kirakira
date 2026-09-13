@@ -116,14 +116,20 @@ fn blend(pixels: &mut [u8], width: u32, x: i32, y: i32, rgba: [u8; 4], alpha: f3
     }
     let offset = (y as usize * width as usize + x as usize) * 4;
     let da = pixels[offset + 3] as f32 / 255.0;
-    let out_a = alpha + da * (1.0 - alpha);
+    // `1.0 - alpha`, the destination's weight, is the same subexpression in
+    // `out_a` and in every channel, so it is evaluated once; each channel keeps
+    // its own `dst * da * one_minus_alpha` association, which is not the same
+    // f32 product as `dst * (da * one_minus_alpha)`.
+    let one_minus_alpha = 1.0 - alpha;
+    let out_a = alpha + da * one_minus_alpha;
+    let divisor = out_a.max(f32::EPSILON);
     for channel in 0..3 {
         let src = rgba[channel] as f32;
         let dst = pixels[offset + channel] as f32;
-        let value = (src * alpha + dst * da * (1.0 - alpha)) / out_a.max(f32::EPSILON);
-        pixels[offset + channel] = value.round().clamp(0.0, 255.0) as u8;
+        let value = (src * alpha + dst * da * one_minus_alpha) / divisor;
+        pixels[offset + channel] = round_channel(value);
     }
-    pixels[offset + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+    pixels[offset + 3] = round_channel(out_a * 255.0);
 }
 
 /// The colour filter a player's `setColor` applies to every item.
@@ -171,13 +177,33 @@ impl Tint {
     }
 
     fn applied(self, rgba: [u8; 4]) -> [u8; 4] {
+        if self.red == 1.0 && self.green == 1.0 && self.blue == 1.0 {
+            return rgba;
+        }
         [
-            (rgba[0] as f32 * self.red).round().clamp(0.0, 255.0) as u8,
-            (rgba[1] as f32 * self.green).round().clamp(0.0, 255.0) as u8,
-            (rgba[2] as f32 * self.blue).round().clamp(0.0, 255.0) as u8,
+            round_channel(rgba[0] as f32 * self.red),
+            round_channel(rgba[1] as f32 * self.green),
+            round_channel(rgba[2] as f32 * self.blue),
             rgba[3],
         ]
     }
+}
+
+/// `x.round().clamp(0.0, 255.0) as u8` for the non-negative channel values this
+/// module produces, without the libm `roundf` call the per-channel rounding
+/// storm cost.
+///
+/// `f32::round` rounds halves away from zero; for a non-negative `x` that is
+/// `floor(x + 0.5)` in exact arithmetic. Carrying `x + 0.5` in f64 is exact for
+/// everything but denormal inputs, and there the error stays orders of
+/// magnitude below the `2^-25` that separates the closest f32 from any
+/// half-integer — so truncating the f64 sum reproduces `f32::round` bit for bit
+/// over the values this module sums (bounded by a few hundred). Negative
+/// inputs and NaN, which the original rounding and clamping also folded to 0,
+/// ride the same clamp.
+#[inline]
+fn round_channel(x: f32) -> u8 {
+    ((x as f64 + 0.5) as i32).clamp(0, 255) as u8
 }
 
 /// Decoded textures of one motion, decoded once per resource and reused.
@@ -434,13 +460,19 @@ fn rasterize_triangle(
     let top0 = is_top_left(v0, v1);
     let top1 = is_top_left(v1, v2);
     let top2 = is_top_left(v2, v0);
+    // `edge`'s loop-invariant factors, hoisted by hand; the per-pixel
+    // expressions below evaluate to exactly what `edge(v0, v1, px, py)` and
+    // friends evaluate, same operands in the same association.
+    let (dx01, dy01) = (v1.x - v0.x, v1.y - v0.y);
+    let (dx12, dy12) = (v2.x - v1.x, v2.y - v1.y);
+    let (dx20, dy20) = (v0.x - v2.x, v0.y - v2.y);
     for y in min_y..max_y {
+        let py = y as f32 + 0.5;
         for x in min_x..max_x {
             let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let w0 = edge(v0, v1, px, py);
-            let w1 = edge(v1, v2, px, py);
-            let w2 = edge(v2, v0, px, py);
+            let w0 = dx01 * (py - v0.y) - dy01 * (px - v0.x);
+            let w1 = dx12 * (py - v1.y) - dy12 * (px - v1.x);
+            let w2 = dx20 * (py - v2.y) - dy20 * (px - v2.x);
             let inside = (w0 > 0.0 || (w0 == 0.0 && top0))
                 && (w1 > 0.0 || (w1 == 0.0 && top1))
                 && (w2 > 0.0 || (w2 == 0.0 && top2));
@@ -455,34 +487,84 @@ fn rasterize_triangle(
     }
 }
 
+/// `x.floor()` as an integer and as an f32, without the libm `floorf` call.
+///
+/// Below `2^24` the truncating cast is exact and `t as f32` round-trips, so the
+/// only non-integral truncations are the negative ones, which the branch folds
+/// to the floor below. `tf - 1.0` is exact (both values are integers), so the
+/// caller's `x - floor` keeps the original subtraction's rounding. Values where
+/// the fast path does not apply (NaN, infinities, magnitudes at or above
+/// `2^24`) fall back to `f32::floor`, reproducing the original behaviour
+/// exactly — including how NaN and infinities make it to the caller.
+#[inline]
+fn floor_parts(x: f32) -> (i32, f32) {
+    if x.abs() < 16_777_216.0 {
+        let truncated = x as i32;
+        let truncated_f = truncated as f32;
+        if truncated_f > x {
+            (truncated - 1, truncated_f - 1.0)
+        } else {
+            (truncated, truncated_f)
+        }
+    } else {
+        let floor = x.floor();
+        (floor as i32, floor)
+    }
+}
+
+/// One bilinear tap: `(1 - fx) * (1 - fy)` and companions for the other three
+/// texels, accumulated per channel with the module's per-tap rounding.
+///
+/// A tap whose texel is fully transparent contributes exactly zero to every
+/// channel (`0 * weight` is `+0.0`, and `round(out + 0.0) == out` for the
+/// integer-valued `out` the previous taps left), so it is skipped. A weight of
+/// zero skips too, as it always did.
+#[inline]
+fn accumulate(out: &mut [u8; 4], texel: [u8; 4], weight: f32) {
+    if weight <= 0.0 || texel == [0, 0, 0, 0] {
+        return;
+    }
+    for channel in 0..4 {
+        out[channel] = round_channel(out[channel] as f32 + texel[channel] as f32 * weight);
+    }
+}
+
 /// Bilinear sample at texture coordinates in pixels (the texel centre is at
 /// `x + 0.5`), clamped at the edges.
 fn sample_bilinear(texture: &DecodedTexture, u: f32, v: f32) -> [u8; 4] {
     let x = u - 0.5;
     let y = v - 0.5;
-    let x0 = x.floor();
-    let y0 = y.floor();
-    let fx = x - x0;
-    let fy = y - y0;
-    let x0 = x0 as i32;
-    let y0 = y0 as i32;
+    let (x0, x0f) = floor_parts(x);
+    let (y0, y0f) = floor_parts(y);
+    let fx = x - x0f;
+    let fy = y - y0f;
+    // The four texels share two clamped columns and two clamped rows, so the
+    // clamps `pixel_clamped` would repeat per corner are done once each.
+    let last_x = texture.width.saturating_sub(1) as i32;
+    let last_y = texture.height.saturating_sub(1) as i32;
+    let col0 = x0.clamp(0, last_x) as usize * 4;
+    let col1 = (x0 + 1).clamp(0, last_x) as usize * 4;
+    let row0 = y0.clamp(0, last_y) as usize * texture.width as usize * 4;
+    let row1 = (y0 + 1).clamp(0, last_y) as usize * texture.width as usize * 4;
+    let rgba = texture.rgba.as_slice();
     let mut out = [0u8; 4];
     let corners = [
-        (x0, y0, (1.0 - fx) * (1.0 - fy)),
-        (x0 + 1, y0, fx * (1.0 - fy)),
-        (x0, y0 + 1, (1.0 - fx) * fy),
-        (x0 + 1, y0 + 1, fx * fy),
+        (row0 + col0, (1.0 - fx) * (1.0 - fy)),
+        (row0 + col1, fx * (1.0 - fy)),
+        (row1 + col0, (1.0 - fx) * fy),
+        (row1 + col1, fx * fy),
     ];
-    for (cx, cy, weight) in corners {
-        if weight <= 0.0 {
-            continue;
-        }
-        let texel = texture.pixel_clamped(cx, cy);
-        for channel in 0..4 {
-            out[channel] = (out[channel] as f32 + texel[channel] as f32 * weight)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-        }
+    for (offset, weight) in corners {
+        accumulate(
+            &mut out,
+            [
+                rgba[offset],
+                rgba[offset + 1],
+                rgba[offset + 2],
+                rgba[offset + 3],
+            ],
+            weight,
+        );
     }
     out
 }
@@ -579,5 +661,500 @@ mod tests {
         draw_quad(&mut canvas, &texture, &item, tint, 1.0);
         // 0x40/128 = 0.5, 0x20/128 = 0.25, 0x10/128 = 0.125.
         assert_eq!(canvas.pixel(0, 0), Some([100, 25, 6, 255]));
+    }
+
+    /// The pre-optimisation rasteriser, copied verbatim from the base commit of
+    /// the M154 fast path: the same pixels through the old `f32::round`,
+    /// `f32::floor` and `pixel_clamped` calls are the contract the optimised
+    /// paths are held to, bit for bit.
+    mod reference {
+        use super::*;
+
+        pub(super) fn applied(tint: Tint, rgba: [u8; 4]) -> [u8; 4] {
+            [
+                (rgba[0] as f32 * tint.red).round().clamp(0.0, 255.0) as u8,
+                (rgba[1] as f32 * tint.green).round().clamp(0.0, 255.0) as u8,
+                (rgba[2] as f32 * tint.blue).round().clamp(0.0, 255.0) as u8,
+                rgba[3],
+            ]
+        }
+
+        pub(super) fn blend(
+            pixels: &mut [u8],
+            width: u32,
+            x: i32,
+            y: i32,
+            rgba: [u8; 4],
+            alpha: f32,
+        ) {
+            let alpha = alpha.clamp(0.0, 1.0);
+            if alpha <= 0.0 {
+                return;
+            }
+            let offset = (y as usize * width as usize + x as usize) * 4;
+            let da = pixels[offset + 3] as f32 / 255.0;
+            let out_a = alpha + da * (1.0 - alpha);
+            for channel in 0..3 {
+                let src = rgba[channel] as f32;
+                let dst = pixels[offset + channel] as f32;
+                let value = (src * alpha + dst * da * (1.0 - alpha)) / out_a.max(f32::EPSILON);
+                pixels[offset + channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+            pixels[offset + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+
+        pub(super) fn sample_bilinear(texture: &DecodedTexture, u: f32, v: f32) -> [u8; 4] {
+            let x = u - 0.5;
+            let y = v - 0.5;
+            let x0 = x.floor();
+            let y0 = y.floor();
+            let fx = x - x0;
+            let fy = y - y0;
+            let x0 = x0 as i32;
+            let y0 = y0 as i32;
+            let mut out = [0u8; 4];
+            let corners = [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                (x0 + 1, y0, fx * (1.0 - fy)),
+                (x0, y0 + 1, (1.0 - fx) * fy),
+                (x0 + 1, y0 + 1, fx * fy),
+            ];
+            for (cx, cy, weight) in corners {
+                if weight <= 0.0 {
+                    continue;
+                }
+                let texel = texture.pixel_clamped(cx, cy);
+                for channel in 0..4 {
+                    out[channel] = (out[channel] as f32 + texel[channel] as f32 * weight)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
+            out
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn rasterize_triangle(
+            pixels: &mut [u8],
+            width: u32,
+            height: u32,
+            texture: &DecodedTexture,
+            v0: Vertex,
+            mut v1: Vertex,
+            mut v2: Vertex,
+            tint: Tint,
+            alpha: f32,
+        ) {
+            let mut area = edge(v0, v1, v2.x, v2.y);
+            if !area.is_finite() || area == 0.0 {
+                return;
+            }
+            if area < 0.0 {
+                std::mem::swap(&mut v1, &mut v2);
+                area = -area;
+            }
+
+            let min_x = v0.x.min(v1.x).min(v2.x).floor().max(0.0) as i32;
+            let min_y = v0.y.min(v1.y).min(v2.y).floor().max(0.0) as i32;
+            let max_x = v0.x.max(v1.x).max(v2.x).ceil().min(width as f32) as i32;
+            let max_y = v0.y.max(v1.y).max(v2.y).ceil().min(height as f32) as i32;
+            if min_x >= max_x || min_y >= max_y {
+                return;
+            }
+
+            let top0 = is_top_left(v0, v1);
+            let top1 = is_top_left(v1, v2);
+            let top2 = is_top_left(v2, v0);
+            for y in min_y..max_y {
+                for x in min_x..max_x {
+                    let px = x as f32 + 0.5;
+                    let py = y as f32 + 0.5;
+                    let w0 = edge(v0, v1, px, py);
+                    let w1 = edge(v1, v2, px, py);
+                    let w2 = edge(v2, v0, px, py);
+                    let inside = (w0 > 0.0 || (w0 == 0.0 && top0))
+                        && (w1 > 0.0 || (w1 == 0.0 && top1))
+                        && (w2 > 0.0 || (w2 == 0.0 && top2));
+                    if !inside {
+                        continue;
+                    }
+                    let u = (w1 * v0.u + w2 * v1.u + w0 * v2.u) / area;
+                    let v = (w1 * v0.v + w2 * v1.v + w0 * v2.v) / area;
+                    let rgba = applied(tint, sample_bilinear(texture, u, v));
+                    blend(pixels, width, x, y, rgba, alpha * rgba[3] as f32 / 255.0);
+                }
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn draw_quad_into(
+            pixels: &mut [u8],
+            width: u32,
+            height: u32,
+            texture: &DecodedTexture,
+            item: &MotionDrawItem,
+            tint: Tint,
+            alpha: f32,
+        ) {
+            let (w, h) = (texture.width as f32, texture.height as f32);
+            let quad = [
+                sprite_vertex(
+                    item,
+                    [item.left(), item.top()],
+                    [item.uv[0] * w, item.uv[1] * h],
+                ),
+                sprite_vertex(
+                    item,
+                    [item.right(), item.top()],
+                    [item.uv[2] * w, item.uv[1] * h],
+                ),
+                sprite_vertex(
+                    item,
+                    [item.right(), item.bottom()],
+                    [item.uv[2] * w, item.uv[3] * h],
+                ),
+                sprite_vertex(
+                    item,
+                    [item.left(), item.bottom()],
+                    [item.uv[0] * w, item.uv[3] * h],
+                ),
+            ];
+            rasterize_triangle(
+                pixels, width, height, texture, quad[0], quad[1], quad[2], tint, alpha,
+            );
+            rasterize_triangle(
+                pixels, width, height, texture, quad[0], quad[2], quad[3], tint, alpha,
+            );
+        }
+    }
+
+    /// A texture with per-texel noise: smooth weights alone rarely land the
+    /// per-tap accumulations on a rounding tie, random bytes do.
+    fn noisy_texture(width: u32, height: u32, seed: u64) -> DecodedTexture {
+        let mut state = seed | 1;
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for _ in 0..width as usize * height as usize * 4 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            rgba.push((state >> 33) as u8);
+        }
+        DecodedTexture {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    /// Every sampled value the fast sampler must reproduce: exact texel
+    /// centres, quarter and tenth offsets, values a f32 step below and above a
+    /// half-integer (the rounding ties), negatives, magnitudes around the
+    /// `floor` fast path's `2^24` bound, and the non-finite inputs. `+inf` and
+    /// `f32::MAX` are left out on purpose: both paths compute `x0 + 1` for the
+    /// next corner, which overflows in a debug build (identically) rather than
+    /// sampling anything.
+    fn probe_values() -> Vec<f32> {
+        let mut values = Vec::new();
+        for step in [-3i32, -2, -1, 0, 1, 2, 3, 7] {
+            let base = step as f32;
+            values.extend([
+                base,
+                base + 0.5,
+                base + 0.25,
+                base + 0.75,
+                base + 0.1,
+                base + 0.9,
+            ]);
+            for delta in [f32::EPSILON * 8.0, 1e-7, 2.9e-5, 7e-5] {
+                values.push(base + 0.5 - delta);
+                values.push(base + 0.5 + delta);
+            }
+        }
+        values.extend([
+            0.0,
+            -0.0,
+            1e-30,
+            f32::MIN_POSITIVE,
+            8_388_608.0,
+            16_777_215.0,
+            16_777_216.0,
+            16_777_217.0,
+            -16_777_216.0,
+            1e9,
+            -1e30,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ]);
+        values
+    }
+
+    /// The fast rounding is a claim about *every* f32 in the channel range, not
+    /// just the values the synthetic quads happen to land on: sweep the whole
+    /// f32 domain from 0 to 2^21 in bit-pattern steps (every binade, every
+    /// mantissa phase) plus the negatives, and hold it to `f32::round` and its
+    /// clamp.
+    #[test]
+    fn channel_rounding_matches_f32_round_across_the_channel_range() {
+        let sweep = |from: u32, to: u32| {
+            let mut checked = 0usize;
+            let mut bits = from;
+            while bits <= to {
+                let x = f32::from_bits(bits);
+                let expected = x.round().clamp(0.0, 255.0) as u8;
+                assert_eq!(round_channel(x), expected, "x={x} (bits {bits:#010x})");
+                checked += 1;
+                bits += 4093;
+            }
+            assert!(checked > 250_000, "swept {checked} values");
+        };
+        // 0.0 ..= 2^21 (the blend's and the tint's channels never exceed 511).
+        sweep(0x0000_0000, 0x4a00_0000);
+        // -0.0 ..= -2^21: every one of them must clamp to 0, as `round` did.
+        sweep(0x8000_0000, 0xca00_0000);
+    }
+
+    /// The sampler is the hot path the M154 optimisation rewrote; every probe
+    /// pair must land on the same bytes as the reference sampler.
+    #[test]
+    fn bilinear_sampler_matches_the_reference_bit_for_bit() {
+        let textures = [
+            noisy_texture(1, 1, 7),
+            noisy_texture(3, 2, 11),
+            noisy_texture(5, 4, 13),
+            noisy_texture(16, 9, 17),
+            texture(4, 4, [255, 255, 255, 255]),
+            texture(4, 4, [0, 0, 0, 0]),
+        ];
+        let values = probe_values();
+        for texture in &textures {
+            for &u in &values {
+                for &v in &values {
+                    assert_eq!(
+                        sample_bilinear(texture, u, v),
+                        reference::sample_bilinear(texture, u, v),
+                        "{}x{} at u={u} v={v}",
+                        texture.width,
+                        texture.height
+                    );
+                }
+            }
+        }
+    }
+
+    /// The blend step rounds every channel and the alpha; the fast rounding
+    /// must be indistinguishable from `f32::round` over the whole input domain
+    /// the rasteriser can produce (all byte pairs and a spread of item alphas).
+    #[test]
+    fn blend_matches_the_reference_bit_for_bit() {
+        let alphas = [
+            0.0,
+            1.0,
+            0.5,
+            1.0 / 3.0,
+            0.1,
+            0.999,
+            128.0 / 255.0,
+            1e-6,
+            1e-30,
+            f32::NAN,
+            -0.5,
+            2.0,
+        ];
+        for &alpha in &alphas {
+            for src in 0..=255u8 {
+                for dst_a in 0..=255u8 {
+                    for dst_rgb in [0u8, 1, 127, 128, 254, 255] {
+                        let rgba = [src, src / 2, src.wrapping_add(1), src.wrapping_sub(1)];
+                        let mut old = [dst_rgb, dst_rgb.wrapping_add(3), dst_rgb, dst_a];
+                        let mut new = old;
+                        reference::blend(&mut old, 1, 0, 0, rgba, alpha);
+                        blend(&mut new, 1, 0, 0, rgba, alpha);
+                        assert_eq!(
+                            old, new,
+                            "alpha={alpha} src={src} dst={dst_rgb}/{dst_a} rgba={rgba:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tint filter rounds each channel after scaling; the same fast
+    /// rounding must reproduce it for every byte and filter value the plugin
+    /// can select.
+    #[test]
+    fn tint_filter_matches_the_reference_bit_for_bit() {
+        let tints = [
+            Tint::IDENTITY,
+            Tint::from_emote_colour(0xFF40_2010),
+            Tint::from_emote_colour(0xFF80_8080),
+            Tint::from_emote_colour(0x0080_8080),
+            Tint::from_emote_colour(0xFFFF_FFFF),
+            Tint::from_emote_colour(0xFF00_0000),
+            Tint {
+                red: 0.7,
+                green: 1.3,
+                blue: 0.0,
+                alpha: 0.25,
+            },
+        ];
+        for tint in tints {
+            for value in 0..=255u8 {
+                let rgba = [value, value.wrapping_mul(3), value.wrapping_add(200), value];
+                assert_eq!(
+                    tint.applied(rgba),
+                    reference::applied(tint, rgba),
+                    "tint={tint:?} rgba={rgba:?}"
+                );
+            }
+        }
+    }
+
+    /// Whole quads — geometry, coverage, sampling, filter, blend and all —
+    /// rendered through the optimised and the reference paths must leave
+    /// byte-identical canvases: a fractional-pixel grid of translations,
+    /// scales, rotations, sub-rect uvs, opacities and filters (including the
+    /// no-op ones the tint fast path now shortcuts).
+    #[test]
+    fn rendered_quads_match_the_reference_bit_for_bit() {
+        let textures = [
+            noisy_texture(7, 5, 23),
+            noisy_texture(32, 32, 29),
+            texture(3, 3, [200, 40, 10, 255]),
+            texture(2, 2, [0, 0, 0, 0]),
+        ];
+        let tints = [
+            Tint::IDENTITY,
+            Tint::from_emote_colour(0xFF80_8080),
+            Tint::from_emote_colour(0xFF40_C020),
+            Tint::from_emote_colour(0x8070_9090),
+        ];
+        let mut cases = 0usize;
+        for texture in &textures {
+            for &center_offset in &[0.0f32, 0.25, 0.5, 0.1] {
+                for &scale in &[0.37f32, 1.0, 1.9, 3.0] {
+                    for &rotation in &[0.0f32, 7.3, 45.0, 90.0, 180.0] {
+                        for &opacity in &[1.0f32, 0.5, 0.2] {
+                            for &uv in &[
+                                [0.0f32, 0.0, 1.0, 1.0],
+                                [0.25, 0.25, 0.75, 0.75],
+                                [0.1, 0.2, 0.3, 0.9],
+                            ] {
+                                let mut item = item([12.0, 9.0], [10.0, 7.0], opacity);
+                                item.center = [
+                                    item.center[0] + center_offset,
+                                    item.center[1] + center_offset,
+                                ];
+                                item.scale = [scale, scale * 0.75];
+                                item.rotation_degrees = rotation;
+                                item.uv = uv;
+                                item.world_transform = [1.0, 0.0, 0.0, 1.0, 2.5, -1.5];
+                                for &tint in &tints {
+                                    let mut fast = Canvas::new(24, 18);
+                                    let mut old = Canvas::new(24, 18);
+                                    draw_quad(&mut fast, texture, &item, tint, opacity);
+                                    let (width, height) = (old.width(), old.height());
+                                    reference::draw_quad_into(
+                                        old.pixels_mut(),
+                                        width,
+                                        height,
+                                        texture,
+                                        &item,
+                                        tint,
+                                        opacity,
+                                    );
+                                    assert_eq!(
+                                        fast.pixels(),
+                                        old.pixels(),
+                                        "texture {}x{} center={:?} scale={scale} rot={rotation} \
+                                         opacity={opacity} uv={uv:?} tint={tint:?}",
+                                        texture.width,
+                                        texture.height,
+                                        item.center
+                                    );
+                                    cases += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases >= 1_000, "the matrix rendered {cases} quads");
+    }
+
+    /// A deterministic spread of quads with wilder parameters (reflections,
+    /// off-canvas geometry, tiny and huge scales, alpha-zero filters) through
+    /// both paths, so nothing in the fast paths depends on the tidy cases.
+    #[test]
+    fn randomised_quads_match_the_reference_bit_for_bit() {
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+
+            fn f32(&mut self) -> f32 {
+                (self.next() >> 40) as f32 / 16_777_216.0
+            }
+        }
+
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut digest = 0u64;
+        for case in 0..256 {
+            let texture = noisy_texture(
+                1 + (rng.next() % 40) as u32,
+                1 + (rng.next() % 40) as u32,
+                rng.next(),
+            );
+            let mut item = item([0.0, 0.0], [4.0, 4.0], 1.0);
+            item.center = [rng.f32() * 64.0 - 16.0, rng.f32() * 48.0 - 12.0];
+            item.size = [rng.f32() * 40.0 + 1.0, rng.f32() * 40.0 + 1.0];
+            item.scale = [rng.f32() * 3.0, rng.f32() * 3.0];
+            item.rotation_degrees = rng.f32() * 720.0 - 360.0;
+            item.opacity = rng.f32();
+            item.uv = [
+                rng.f32() - 0.1,
+                rng.f32() - 0.1,
+                rng.f32() + 0.5,
+                rng.f32() + 0.5,
+            ];
+            item.world_transform = [
+                rng.f32() * 2.0 - 1.0,
+                rng.f32() - 0.5,
+                rng.f32() - 0.5,
+                rng.f32() * 2.0 - 1.0,
+                rng.f32() * 8.0 - 4.0,
+                rng.f32() * 8.0 - 4.0,
+            ];
+            let tint = Tint::from_emote_colour(rng.next() as u32);
+            let alpha = rng.f32();
+            let mut fast = Canvas::new(48, 32);
+            let mut old = Canvas::new(48, 32);
+            draw_quad(&mut fast, &texture, &item, tint, alpha);
+            let (width, height) = (old.width(), old.height());
+            reference::draw_quad_into(
+                old.pixels_mut(),
+                width,
+                height,
+                &texture,
+                &item,
+                tint,
+                alpha,
+            );
+            assert_eq!(
+                fast.pixels(),
+                old.pixels(),
+                "case {case}: {item:?} {tint:?}"
+            );
+            for &byte in fast.pixels() {
+                digest = digest.wrapping_mul(31).wrapping_add(u64::from(byte));
+            }
+        }
+        assert_ne!(digest, 0, "the digest saw pixels");
     }
 }
