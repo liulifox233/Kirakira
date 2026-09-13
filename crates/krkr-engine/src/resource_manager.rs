@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use krkr_core::{ProjectStoragePort, ProvinceImage, ResourceData};
+use krkr_core::{AssetKind, ProjectStoragePort, ProvinceImage, ResourceData};
 
 #[cfg(test)]
 use krkr_assets::ProjectStorage;
@@ -53,6 +53,7 @@ enum ResourceTask {
     },
     LoadBytesBlocking {
         storage: String,
+        kind: AssetKind,
         reply_tx: mpsc::Sender<std::result::Result<ResourceData, String>>,
     },
     LoadTextBlocking {
@@ -128,11 +129,33 @@ impl ResourceManager {
         &self,
         storage: impl Into<String>,
     ) -> std::result::Result<ResourceData, String> {
+        self.load_bytes_blocking_for_kind(storage, AssetKind::Binary)
+    }
+
+    /// Image-load counterpart of [`Self::load_bytes_blocking`]: the worker
+    /// resolves the name through
+    /// [`ProjectStoragePort::read_image_storage`], whose candidate list
+    /// suggests only the extensions with a registered graphic handler, the way
+    /// `TVPInternalLoadGraphic` does
+    /// (`visual/GraphicsLoaderIntf.cpp:1478-1506`).
+    pub fn load_image_bytes_blocking(
+        &self,
+        storage: impl Into<String>,
+    ) -> std::result::Result<ResourceData, String> {
+        self.load_bytes_blocking_for_kind(storage, AssetKind::Image)
+    }
+
+    fn load_bytes_blocking_for_kind(
+        &self,
+        storage: impl Into<String>,
+        kind: AssetKind,
+    ) -> std::result::Result<ResourceData, String> {
         let storage = storage.into();
         let (reply_tx, reply_rx) = mpsc::channel();
         self.task_tx
             .send(ResourceTask::LoadBytesBlocking {
                 storage: storage.clone(),
+                kind,
                 reply_tx,
             })
             .map_err(|_| format!("resource worker is not available for `{storage}`"))?;
@@ -239,13 +262,16 @@ fn resource_worker(
             }
             ResourceTask::LoadBytesBlocking {
                 storage: name,
+                kind,
                 reply_tx,
             } => {
-                let _ = reply_tx.send(
-                    storage
-                        .read_binary_storage(&name)
-                        .map_err(|error| error.to_string()),
-                );
+                // `AssetKind::Image` resolves through the graphic loader's
+                // candidate list; every other kind keeps the plain binary read.
+                let result = match kind {
+                    AssetKind::Image => storage.read_image_storage(&name),
+                    _ => storage.read_binary_storage(&name),
+                };
+                let _ = reply_tx.send(result.map_err(|error| error.to_string()));
                 continue;
             }
             ResourceTask::LoadTextBlocking {
@@ -293,8 +319,12 @@ fn decode_image(
         return Ok(image);
     }
 
+    // The decode worker is the image load path for every asynchronous caller
+    // (`Layer.loadImages`, preloads), so it resolves the name with the graphic
+    // loader's suggestions: `PageBreak` must reach `PageBreak.png`, never the
+    // `PageBreak.asd` sidecar.
     let data = storage
-        .read_binary_storage(name)
+        .read_image_storage(name)
         .map_err(|error| error.to_string())?;
     let bytes = data.as_bytes().map_err(|error| error.to_string())?;
     let image = decode_image_bytes(&bytes, name)?;
