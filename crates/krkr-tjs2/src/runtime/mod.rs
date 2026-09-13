@@ -6,7 +6,7 @@ use std::{
 use crate::bytecode::{BytecodeContextType, BytecodeFile, CodeObject, Instruction};
 use crate::debug::{DebugUi, Debugger};
 use crate::error::{Result, TjsError};
-use crate::vm::{SuspendedCallStack, Vm};
+use crate::vm::{JumpTable, SuspendedCallStack, Vm};
 
 pub(crate) mod builtins;
 pub mod object;
@@ -294,7 +294,7 @@ pub struct Runtime<H: TjsHost = NoHost> {
 #[derive(Clone, Debug)]
 pub(crate) struct ScriptFile {
     pub file: Arc<BytecodeFile>,
-    pub code_handles: Vec<ObjectHandle>,
+    pub code_handles: Arc<[ObjectHandle]>,
     pub decoded_objects: Vec<Option<DecodedScriptObject>>,
 }
 
@@ -303,6 +303,9 @@ pub(crate) struct DecodedScriptObject {
     pub object: CodeObject,
     pub instructions: Arc<[Instruction]>,
     pub offset_to_index: Arc<BTreeMap<usize, usize>>,
+    /// Precomputed sequential-next and branch-target indices for
+    /// `instructions`; see [`JumpTable`].
+    pub jump: Arc<JumpTable>,
 }
 
 impl Runtime<NoHost> {
@@ -1328,7 +1331,7 @@ impl<H: TjsHost + 'static> Runtime<H> {
         self.script_files.push(ScriptFile {
             decoded_objects: vec![None; file.objects.len()],
             file,
-            code_handles,
+            code_handles: code_handles.into(),
         });
         file_id
     }
@@ -1406,10 +1409,10 @@ impl<H: TjsHost + 'static> Runtime<H> {
             .ok_or_else(|| TjsError::runtime(format!("script file {file_id} does not exist")))
     }
 
-    pub(crate) fn script_code_handles(&self, file_id: usize) -> Result<Vec<ObjectHandle>> {
+    pub(crate) fn script_code_handles(&self, file_id: usize) -> Result<Arc<[ObjectHandle]>> {
         self.script_files
             .get(file_id)
-            .map(|script| script.code_handles.clone())
+            .map(|script| Arc::clone(&script.code_handles))
             .ok_or_else(|| TjsError::runtime(format!("script file {file_id} does not exist")))
     }
 
@@ -1442,10 +1445,12 @@ impl<H: TjsHost + 'static> Runtime<H> {
             .enumerate()
             .map(|(index, inst)| (inst.offset, index))
             .collect::<BTreeMap<_, _>>();
+        let jump = JumpTable::build(&instructions, &offset_to_index);
         let decoded = DecodedScriptObject {
             object,
             instructions,
             offset_to_index: Arc::new(offset_to_index),
+            jump: Arc::new(jump),
         };
         let Some(slot) = script.decoded_objects.get_mut(object_index) else {
             return Err(TjsError::runtime(format!(
