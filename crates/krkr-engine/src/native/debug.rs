@@ -9,6 +9,10 @@ use super::{install_static_object, native_void};
 
 pub(crate) fn install_debug(runtime: &mut Runtime<KrkrHost>) {
     let debug = install_static_object(runtime, "Debug");
+    // `tTJSNC_Debug` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`DebugIntf.cpp:626`); a script may
+    // call `Debug.finalize()` while tearing a session down.
+    runtime.register_object_native(debug, "finalize", native_void);
     runtime.register_object_native(debug, "message", debug_message);
     runtime.register_object_native(debug, "notice", debug_message);
     runtime.register_object_native(debug, "startLogToFile", native_void);
