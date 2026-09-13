@@ -40,6 +40,12 @@ struct ProjectStorageInner {
     root: Option<PathBuf>,
     fs_layers: Vec<ProjectLayer>,
     lookup_cache: Mutex<HashMap<String, Option<LocatedResource>>>,
+    /// Lookup results for graphic loads, kept apart from [`Self::lookup_cache`]
+    /// because their candidate list suggests only the registered graphic
+    /// handler extensions: an image load of `PageBreak` and a plain read of
+    /// the same name may legitimately resolve to different resources, so they
+    /// must not share one cache entry.
+    image_lookup_cache: Mutex<HashMap<String, Option<LocatedResource>>>,
     case_insensitive_dir_cache: Mutex<HashMap<PathBuf, HashMap<String, PathBuf>>>,
     raw_cache: Mutex<RawDataCache>,
     xp3_provider: Option<Xp3ResourceProvider>,
@@ -301,6 +307,7 @@ impl ProjectStorage {
                 root,
                 fs_layers,
                 lookup_cache: Mutex::new(HashMap::new()),
+                image_lookup_cache: Mutex::new(HashMap::new()),
                 case_insensitive_dir_cache: Mutex::new(HashMap::new()),
                 raw_cache: Mutex::new(RawDataCache::new(
                     RAW_CACHE_CAPACITY_BYTES,
@@ -1107,7 +1114,23 @@ impl ProjectStorage {
     }
 
     pub fn read_data(&self, name: &str) -> Result<StorageData> {
-        let located = self.resolve_storage(name)?;
+        self.read_data_for_kind(name, StorageLoadKind::Generic)
+    }
+
+    /// Reads the bytes a graphic load resolves to. `TVPInternalLoadGraphic`
+    /// suggests only the extensions with a registered graphic handler
+    /// (`visual/GraphicsLoaderIntf.cpp:1478-1506`), so an image load of
+    /// `PageBreak` must reach `PageBreak.png` and never the same-stem
+    /// `PageBreak.asd` sidecar.
+    pub fn read_image_storage(&self, name: &str) -> Result<ResourceData> {
+        self.read_data_for_kind(name, StorageLoadKind::Image)
+            .map(|storage| storage.data)
+    }
+
+    fn read_data_for_kind(&self, name: &str, kind: StorageLoadKind) -> Result<StorageData> {
+        let located = self
+            .resolve_storage_io_for_kind(name, kind)
+            .map_err(io_error)?;
         let storage_name = located.storage_name().to_string();
         let encoding_hint = located.encoding_hint();
         let external_source = located.memory_source_path().map(str::to_owned);
@@ -1268,7 +1291,17 @@ impl ProjectStorage {
     }
 
     pub(crate) fn storage_candidates(&self, name: &str) -> Result<Vec<String>> {
-        storage_candidates_with_auto_paths(name, &self.auto_paths())
+        self.storage_candidates_for_kind(name, StorageLoadKind::Generic)
+    }
+
+    /// Candidate spellings for a lookup of `kind`. An image lookup suggests
+    /// only the registered graphic-handler extensions.
+    pub(crate) fn storage_candidates_for_kind(
+        &self,
+        name: &str,
+        kind: StorageLoadKind,
+    ) -> Result<Vec<String>> {
+        storage_candidates_with_auto_paths(name, &self.auto_paths(), kind)
     }
 
     fn resolve_storage(&self, name: &str) -> Result<LocatedResource> {
@@ -1276,6 +1309,14 @@ impl ProjectStorage {
     }
 
     fn resolve_storage_io(&self, name: &str) -> io::Result<LocatedResource> {
+        self.resolve_storage_io_for_kind(name, StorageLoadKind::Generic)
+    }
+
+    fn resolve_storage_io_for_kind(
+        &self,
+        name: &str,
+        kind: StorageLoadKind,
+    ) -> io::Result<LocatedResource> {
         // A media is live storage, so a miss must not be remembered the way a
         // filesystem miss is: a Steam cloud file can appear, and a script
         // re-probing `steam://` has to see it.
@@ -1295,7 +1336,7 @@ impl ProjectStorage {
             return Ok(storage);
         }
 
-        if let Ok(cache) = self.inner.lookup_cache.lock()
+        if let Ok(cache) = self.lookup_cache_for(kind).lock()
             && let Some(storage) = cache.get(name).cloned()
         {
             // A lookup-cache hit must still refresh the external-memory LRU;
@@ -1307,65 +1348,88 @@ impl ProjectStorage {
             return storage.ok_or_else(|| storage_not_found(name));
         }
 
-        let candidates = self.storage_candidates(name).map_err(tjs_error_to_io)?;
+        let groups =
+            storage_candidate_groups(name, &self.auto_paths(), kind).map_err(tjs_error_to_io)?;
         // Candidates are ordered the way the reference searches: the requested
         // name itself (the project folder) first, then one candidate per auto
         // path in *reverse* declaration order, so the last `Storages.addAutoPath`
-        // wins. A candidate is resolved against every layer it can reach -- the
-        // filesystem, or the one mount an `archive.xp3>` name pins -- before the
-        // walk moves on. Resolving all filesystem candidates in a separate pass
-        // first would let a folder auto path declared *before* a patch archive
-        // shadow the archive's copy; the reference keeps one auto-path table
-        // entry per basename and the latest declaration replaces it
+        // wins. Each requested spelling is resolved completely before the walk
+        // moves on to the next one: the filesystem, the one mount an
+        // `archive.xp3>` candidate pins, and -- only when none of that
+        // spelling's declared candidates matched -- the mount-wide scan for
+        // archives the game never declared as an auto path
+        // (`Xp3ResourceProvider::get_entry` walks the mounts in reverse, so the
+        // later mount wins for a duplicate member).
+        //
+        // The group boundary keeps a declared auto path from being pre-empted
+        // by that fallback. Running the mount-wide scan only once *every*
+        // candidate was tried let the declared `patch3.xp3>PageBreak.asd`
+        // beat the `system/PageBreak.png` that the earlier `system/` auto path
+        // addresses; deferring the scan to the end of each spelling keeps the
+        // qualified spelling the reference's auto-path table yields for a
+        // sidecar (`pagebreak.asd` resolves through `patch3.xp3>`), while an
+        // earlier spelling's mount hit still beats a later spelling, which is
+        // how the graphic loader probes suggested names: a full storage lookup
+        // per `name + extension`, first hit wins (`TVPInternalLoadGraphic`,
+        // `visual/GraphicsLoaderIntf.cpp:1478-1506`).
+        //
+        // Resolving all filesystem candidates in a separate pass first would
+        // also let a folder auto path declared *before* a patch archive shadow
+        // the archive's copy; the reference keeps one auto-path table entry per
+        // basename and the latest declaration replaces it
         // (`tTJSHashTable::Add`, `krkrz/src/core/tjs2/tjsHashSearch.h`),
         // whether that declaration names a folder or an archive.
-        for candidate in &candidates {
-            if let Some((archive, member)) = split_archive_candidate(candidate) {
-                if let Some(provider) = &self.inner.xp3_provider
-                    && let Some(entry) = provider.get_entry_in(archive, member)
-                {
-                    let storage = LocatedResource::Xp3 {
-                        storage_name: candidate.clone(),
-                        archive: Some(archive.to_string()),
-                        entry_name: entry.name.clone(),
-                        byte_len: entry.original_size,
-                    };
-                    self.cache_lookup(name, Some(storage.clone()));
-                    return Ok(storage);
-                }
-                continue;
-            }
-            let relative = clean_relative_path(candidate).map_err(tjs_error_to_io)?;
-            if let Some(storage) = self.find_fs_candidate(candidate, &relative)? {
-                self.cache_lookup(name, Some(storage.clone()));
-                return Ok(storage);
-            }
-        }
-
-        // The name-only scan is the engine's fallback for archives the game
-        // never declared as an auto path. It runs after every declared
-        // candidate so a later declaration always wins, and
-        // `Xp3ResourceProvider::get_entry` walks the mounts in reverse, so the
-        // later mount wins for a duplicate member.
-        if let Some(provider) = &self.inner.xp3_provider {
-            for candidate in &candidates {
-                if split_archive_candidate(candidate).is_some() {
+        for candidates in &groups {
+            for candidate in candidates {
+                if let Some((archive, member)) = split_archive_candidate(candidate) {
+                    if let Some(provider) = &self.inner.xp3_provider
+                        && let Some(entry) = provider.get_entry_in(archive, member)
+                    {
+                        let storage = LocatedResource::Xp3 {
+                            storage_name: candidate.clone(),
+                            archive: Some(archive.to_string()),
+                            entry_name: entry.name.clone(),
+                            byte_len: entry.original_size,
+                        };
+                        self.cache_lookup(kind, name, Some(storage.clone()));
+                        return Ok(storage);
+                    }
                     continue;
                 }
-                if let Some(entry) = provider.get_entry(candidate) {
-                    let storage = LocatedResource::Xp3 {
-                        storage_name: candidate.clone(),
-                        archive: None,
-                        entry_name: entry.name.clone(),
-                        byte_len: entry.original_size,
-                    };
-                    self.cache_lookup(name, Some(storage.clone()));
+                let relative = clean_relative_path(candidate).map_err(tjs_error_to_io)?;
+                if let Some(storage) = self.find_fs_candidate(candidate, &relative)? {
+                    self.cache_lookup(kind, name, Some(storage.clone()));
                     return Ok(storage);
+                }
+            }
+
+            // The name-only scan is the engine's fallback for archives the game
+            // never declared as an auto path. It runs after the declared
+            // candidates of the same spelling, so a qualified candidate of that
+            // spelling still wins over a bare-name mount hit (the reference's
+            // auto-path table reports the archive-qualified placed path), and
+            // before the next spelling's candidates, so an image load's earlier
+            // suggestion wins over a later one.
+            if let Some(provider) = &self.inner.xp3_provider {
+                for candidate in candidates {
+                    if split_archive_candidate(candidate).is_some() {
+                        continue;
+                    }
+                    if let Some(entry) = provider.get_entry(candidate) {
+                        let storage = LocatedResource::Xp3 {
+                            storage_name: candidate.clone(),
+                            archive: None,
+                            entry_name: entry.name.clone(),
+                            byte_len: entry.original_size,
+                        };
+                        self.cache_lookup(kind, name, Some(storage.clone()));
+                        return Ok(storage);
+                    }
                 }
             }
         }
 
-        for candidate in &candidates {
+        for candidate in groups.iter().flatten() {
             if split_archive_candidate(candidate).is_some() {
                 continue;
             }
@@ -1381,7 +1445,7 @@ impl ProjectStorage {
                     encoding_hint: infer_encoding_from_path(Path::new(candidate)),
                     data: Arc::clone(data),
                 };
-                self.cache_lookup(name, Some(storage.clone()));
+                self.cache_lookup(kind, name, Some(storage.clone()));
                 return Ok(storage);
             }
             if let Some((stored_path, data)) = memory_files
@@ -1395,7 +1459,7 @@ impl ProjectStorage {
                     encoding_hint: infer_encoding_from_path(Path::new(stored_path)),
                     data: Arc::clone(data),
                 };
-                self.cache_lookup(name, Some(storage.clone()));
+                self.cache_lookup(kind, name, Some(storage.clone()));
                 return Ok(storage);
             }
         }
@@ -1404,7 +1468,7 @@ impl ProjectStorage {
         // full logical names, but KRKR's auto-path table also exposes a
         // unique basename.  Resolve only an explicitly named candidate here:
         // extension selection remains the caller's responsibility.
-        for candidate in &candidates {
+        for candidate in groups.iter().flatten() {
             if split_archive_candidate(candidate).is_some() {
                 continue;
             }
@@ -1412,7 +1476,7 @@ impl ProjectStorage {
                 continue;
             };
             if let Some(storage) = self.find_catalog_resource(candidate, &alias)? {
-                self.cache_lookup(name, Some(storage.clone()));
+                self.cache_lookup(kind, name, Some(storage.clone()));
                 return Ok(storage);
             }
         }
@@ -1421,7 +1485,7 @@ impl ProjectStorage {
         // auto-path lookup. Mirror that behavior in the memory overlay so a
         // preloaded `main/Config.tjs` also satisfies `Config.tjs` without a
         // duplicate network request.
-        for candidate in &candidates {
+        for candidate in groups.iter().flatten() {
             if split_archive_candidate(candidate).is_some() {
                 continue;
             }
@@ -1455,13 +1519,13 @@ impl ProjectStorage {
                     encoding_hint: infer_encoding_from_path(Path::new(stored_path)),
                     data: Arc::clone(data),
                 };
-                self.cache_lookup(name, Some(storage.clone()));
+                self.cache_lookup(kind, name, Some(storage.clone()));
                 return Ok(storage);
             }
         }
 
         if !media_qualified {
-            self.cache_lookup(name, None);
+            self.cache_lookup(kind, name, None);
         }
         Err(storage_not_found(name))
     }
@@ -1689,8 +1753,18 @@ impl ProjectStorage {
         Ok(data)
     }
 
-    fn cache_lookup(&self, name: &str, storage: Option<LocatedResource>) {
-        if let Ok(mut cache) = self.inner.lookup_cache.lock() {
+    fn lookup_cache_for(
+        &self,
+        kind: StorageLoadKind,
+    ) -> &Mutex<HashMap<String, Option<LocatedResource>>> {
+        match kind {
+            StorageLoadKind::Generic => &self.inner.lookup_cache,
+            StorageLoadKind::Image => &self.inner.image_lookup_cache,
+        }
+    }
+
+    fn cache_lookup(&self, kind: StorageLoadKind, name: &str, storage: Option<LocatedResource>) {
+        if let Ok(mut cache) = self.lookup_cache_for(kind).lock() {
             cache.insert(name.to_string(), storage);
         }
     }
@@ -1715,6 +1789,9 @@ impl ProjectStorage {
     fn invalidate_write_caches(&self) {
         self.inner.revision.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut cache) = self.inner.lookup_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.inner.image_lookup_cache.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.inner.case_insensitive_dir_cache.lock() {
@@ -1809,6 +1886,10 @@ impl krkr_core::ProjectStoragePort for ProjectStorage {
 
     fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData> {
         ProjectStorage::read_binary_storage(self, name).map_err(tjs_error_to_io)
+    }
+
+    fn read_image_storage(&self, name: &str) -> io::Result<ResourceData> {
+        ProjectStorage::read_image_storage(self, name).map_err(tjs_error_to_io)
     }
 
     fn read_text_storage(&self, name: &str, configured_encoding: &str) -> io::Result<String> {
@@ -2104,19 +2185,44 @@ fn infer_encoding_from_path(path: &Path) -> Option<&'static Encoding> {
     })
 }
 
-fn storage_candidates_with_auto_paths(name: &str, auto_paths: &[String]) -> Result<Vec<String>> {
-    let names = storage_lookup_names(name)?;
-    let mut candidates = Vec::with_capacity(names.len() * (auto_paths.len() + 1));
+fn storage_candidates_with_auto_paths(
+    name: &str,
+    auto_paths: &[String],
+    kind: StorageLoadKind,
+) -> Result<Vec<String>> {
+    Ok(storage_candidate_groups(name, auto_paths, kind)?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// Candidate spellings for one lookup, grouped by the requested spelling: the
+/// name itself first, then one candidate per auto path in *reverse* declaration
+/// order, so the last `Storages.addAutoPath` wins. The resolver resolves a
+/// whole group before moving to the next spelling, which is the unit the
+/// reference resolves: `TVPGetPlacedPath` finishes the current-folder check and
+/// the auto-path table for one name before anything else
+/// (`StorageIntf.cpp:1153-1197`), and the graphic loader probes one suggested
+/// name at a time (`visual/GraphicsLoaderIntf.cpp:1478-1506`).
+fn storage_candidate_groups(
+    name: &str,
+    auto_paths: &[String],
+    kind: StorageLoadKind,
+) -> Result<Vec<Vec<String>>> {
+    let names = storage_lookup_names(name, kind)?;
+    let mut groups = Vec::with_capacity(names.len());
     for name in names {
         let clean = clean_relative_path(&name)?;
+        let mut candidates = Vec::with_capacity(auto_paths.len() + 1);
         push_unique_storage_candidate(&mut candidates, &clean);
         for auto_path in auto_paths.iter().rev() {
             for candidate in auto_path_candidates(auto_path, &clean) {
                 push_unique_storage_name(&mut candidates, candidate);
             }
         }
+        groups.push(candidates);
     }
-    Ok(candidates)
+    Ok(groups)
 }
 
 fn exact_storage_candidates_with_auto_paths(
@@ -2187,6 +2293,45 @@ fn path_to_storage_name(path: &Path) -> String {
     normalize_storage_separators(&path.to_string_lossy())
 }
 
+/// The extension set a lookup may suggest, threaded from the loader that asked
+/// for the bytes.
+///
+/// KRKR suggests extensions at the loader layer, not inside `TVPGetPlacedPath`
+/// (`krkrz/base/StorageIntf.cpp:1153-1197` probes the name as given and then
+/// the auto-path table): the graphic loader refuses a name whose extension no
+/// handler serves and, for an extensionless name, tries `name + extension` for
+/// each registered graphic handler and loads the first that exists
+/// (`TVPInternalLoadGraphic`, `krkrz/visual/GraphicsLoaderIntf.cpp:1452`,
+/// suggestion loop `:1478-1506`; `GraphicsLoaderIntf.cpp:2307-2336` in the
+/// stock krkr2 tree). A plain storage read instead completes with the engine's
+/// known storage extensions. Keeping the kind on the candidate list is what
+/// stops an image load of `PageBreak` from reaching the same-stem
+/// `PageBreak.asd` sidecar.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum StorageLoadKind {
+    /// `Storages.open`, script and struct reads, and every non-graphic load.
+    Generic,
+    /// A graphic load (`Layer.loadImages`, `Bitmap.load`, KAG image tags).
+    Image,
+}
+
+/// Extensions of the graphic handlers this engine registers, in the order the
+/// engine's completion list already pinned (TLG first). Only these may be
+/// suggested to a graphic load. The engine registers handlers for TLG
+/// (5/6), PNG, JPEG, BMP and WebP; `dib`/`jif`/`jxr`, which stock KRKR serves
+/// through the same table, have no engine handler and are therefore not
+/// suggested here.
+const GRAPHIC_STORAGE_EXTENSIONS: [&str; 6] = ["tlg", "png", "jpg", "jpeg", "bmp", "webp"];
+
+/// The engine's extension completion for a non-graphic load. The graphic
+/// formats lead, then the names a script may ask for. The order is the
+/// reference-neutral engine order and decides what a bare stem resolves to, so
+/// it stays explicit.
+const STORAGE_EXTENSIONS: [&str; 14] = [
+    "tlg", "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "tcw", "mpg",
+    "mpeg",
+];
+
 /// The engine's extension completion for a name that carries no known
 /// extension. The reference has no completion at this layer:
 /// `TVPGetPlacedPath` (`krkrz/base/StorageIntf.cpp:1153-1197`) probes the name
@@ -2196,8 +2341,8 @@ fn path_to_storage_name(path: &Path) -> String {
 /// `_imageFileExtList`, `system/KAGEnvironment.tjs:60300`, and
 /// `Layer.SupportedExtensions`, `system/Utils.tjs:2409`), while a graphic load
 /// suggests the registered handler's extensions (`TVPInternalLoadGraphic`,
-/// `krkrz/visual/GraphicsLoaderIntf.cpp:1480-1503`). This list is the
-/// engine-side equivalent for the load path, so it stays explicit and
+/// `krkrz/visual/GraphicsLoaderIntf.cpp:1478-1506`). These lists are the
+/// engine-side equivalent for the load path, so they stay explicit and
 /// ordered: the order decides what a bare stem resolves to.
 ///
 /// KAGEX image-source extensions (`stand`, `sinfo`, `event`, `stage`, `emf`)
@@ -2206,47 +2351,47 @@ fn path_to_storage_name(path: &Path) -> String {
 /// `foo.stand` here would answer a call the reference answers with `""` and
 /// flip the branch (`Storages.getPlacedPath(stem)` then
 /// `getPlacedPath(stem + ".stand")`) the framework probes with.
-fn storage_lookup_names(name: &str) -> Result<Vec<String>> {
+///
+/// An image load suggests only [`GRAPHIC_STORAGE_EXTENSIONS`]: `PageBreak` must
+/// reach `PageBreak.png` and never the `PageBreak.asd` sidecar.
+fn storage_lookup_names(name: &str, kind: StorageLoadKind) -> Result<Vec<String>> {
     let name = normalize_storage_separators(name);
     clean_relative_path(&name)?;
     let path = Path::new(&name);
     if path
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(is_known_storage_extension)
+        .is_some_and(|extension| is_known_storage_extension(extension, kind))
     {
         return Ok(vec![name]);
     }
 
-    let mut names = Vec::with_capacity(12);
+    let mut names = Vec::with_capacity(STORAGE_EXTENSIONS.len() + 1);
     names.push(name.clone());
-    for extension in [
-        "tlg", "png", "jpg", "jpeg", "bmp", "webp", "ks", "tjs", "asd", "ogg", "wav", "tcw", "mpg",
-        "mpeg",
-    ] {
+    for extension in storage_extensions(kind) {
         names.push(format!("{name}.{extension}"));
     }
     Ok(names)
 }
 
-fn is_known_storage_extension(extension: &str) -> bool {
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "tlg"
-            | "png"
-            | "jpg"
-            | "jpeg"
-            | "bmp"
-            | "webp"
-            | "ks"
-            | "tjs"
-            | "asd"
-            | "ogg"
-            | "wav"
-            | "tcw"
-            | "mpg"
-            | "mpeg"
-    )
+/// The extensions a lookup of `kind` may suggest. The graphic set is a prefix
+/// of the generic one, so a name with a non-graphic extension completes like an
+/// extensionless one for an image load and can never pick up a non-graphic
+/// sidecar; the reference's graphic loader refuses such a name outright
+/// (`GraphicsLoaderIntf.cpp:1507-1509` throws `TVPUnknownGraphicFormat`) and
+/// only ever completes with handler extensions.
+fn storage_extensions(kind: StorageLoadKind) -> &'static [&'static str] {
+    match kind {
+        StorageLoadKind::Generic => &STORAGE_EXTENSIONS,
+        StorageLoadKind::Image => &GRAPHIC_STORAGE_EXTENSIONS,
+    }
+}
+
+fn is_known_storage_extension(extension: &str, kind: StorageLoadKind) -> bool {
+    let extension = extension.to_ascii_lowercase();
+    storage_extensions(kind)
+        .iter()
+        .any(|known| *known == extension)
 }
 
 pub(crate) fn normalize_auto_path(path: &str) -> Option<String> {
@@ -3219,6 +3364,130 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// 纸上的魔法使's page-break bug. `PageBreak` is a plain storage name: the
+    /// base `data.xp3` ships `system/PageBreak.png` (a real image) while the
+    /// higher-priority `patch3.xp3` carries a root `PageBreak.asd` sidecar, and
+    /// `patch3.xp3>` is declared last, so it heads the candidate list.
+    ///
+    /// The candidate walk is name-major and resolves every spelling before the
+    /// next: `patch3.xp3>PageBreak` (the archive pin), `system/PageBreak`
+    /// (through the mount-wide scan), `PageBreak.tlg`, ... and it reaches
+    /// `system/PageBreak.png` -- found by the mount-wide scan because
+    /// `data.xp3` itself is not an auto path -- before the `.asd` spelling's
+    /// candidates. Before the fold, the qualified `patch3.xp3>PageBreak.asd`
+    /// was resolved in a pass that ran before *any* mount-wide scan, so the
+    /// image load got the sidecar and the PNG decoder failed with "The image
+    /// format could not be determined".
+    #[test]
+    fn pagebreak_reaches_the_png_and_not_the_asd_sidecar() {
+        let root = temp_root("pagebreak");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("data.xp3"),
+            build_xp3_archive(&[
+                ("system/PageBreak.png", b"png-bytes"),
+                ("system/PageBreak.asd", b"base-asd"),
+            ]),
+        )
+        .expect("write data.xp3");
+        fs::write(
+            root.join("patch3.xp3"),
+            build_xp3_archive(&[
+                ("PageBreak.asd", b"patch-asd"),
+                ("LineBreak.asd", b"line-asd"),
+            ]),
+        )
+        .expect("write patch3.xp3");
+
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage.add_auto_path("system/");
+        storage.add_auto_path("patch3.xp3>");
+
+        // The image load's suggestions are graphic-only
+        // (`TVPInternalLoadGraphic`), and the `.png` suggestion resolves
+        // through the `system/` auto path instead of patch3's sidecar.
+        assert_eq!(
+            storage.resolved_storage_name("PageBreak").as_deref(),
+            Some("system/PageBreak.png")
+        );
+        assert_eq!(
+            storage.read_binary_vec("PageBreak").expect("plain read"),
+            b"png-bytes".as_slice()
+        );
+        assert_eq!(
+            storage
+                .read_image_storage("PageBreak")
+                .expect("graphic load")
+                .as_bytes()
+                .expect("bytes")
+                .into_owned(),
+            b"png-bytes".as_slice()
+        );
+
+        // The sidecar keeps the qualified spelling the reference's auto-path
+        // table reports (`TVPGetPlacedPath`, `StorageIntf.cpp:1160-1195`): the
+        // table maps a basename to the prefix of the auto path that carries it,
+        // and the latest declaration replaces an earlier one.
+        assert_eq!(
+            storage.resolved_storage_name("PageBreak.asd").as_deref(),
+            Some("patch3.xp3>PageBreak.asd")
+        );
+        assert_eq!(
+            storage.read_binary_vec("PageBreak.asd").expect("sidecar"),
+            b"patch-asd".as_slice()
+        );
+        assert_eq!(
+            storage.resolved_storage_name("LineBreak.asd").as_deref(),
+            Some("patch3.xp3>LineBreak.asd")
+        );
+
+        // An explicitly spelled member of the base archive reaches the same
+        // resource through the mount-wide scan.
+        assert_eq!(
+            storage.resolved_storage_name("PageBreak.png").as_deref(),
+            Some("system/PageBreak.png")
+        );
+        assert_eq!(
+            storage
+                .resolved_storage_name("system/PageBreak.png")
+                .as_deref(),
+            Some("system/PageBreak.png")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The fold's deliberate reordering across spellings: an earlier suggested
+    /// spelling's mount hit beats a later spelling's filesystem hit. The
+    /// graphic loader probes one suggested name at a time with a full storage
+    /// lookup and takes the first that exists (`TVPInternalLoadGraphic`,
+    /// `visual/GraphicsLoaderIntf.cpp:1478-1506`), so `hero.png` inside an
+    /// archive wins over a loose `hero.jpg` even though every filesystem
+    /// candidate used to be resolved in a pass that ran before any XP3 name
+    /// scan.
+    #[test]
+    fn completion_resolves_one_spelling_before_the_next() {
+        let root = temp_root("spelling-order");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("hero.jpg"), b"jpg-on-disk").expect("write loose file");
+        fs::write(
+            root.join("data.xp3"),
+            build_xp3_archive(&[("hero.png", b"png-in-archive")]),
+        )
+        .expect("write data.xp3");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage.add_auto_path("bgimage/");
+
+        assert_eq!(
+            storage.read_binary_vec("hero").expect("image load"),
+            b"png-in-archive".as_slice()
+        );
+        assert_eq!(
+            storage.resolved_storage_name("hero").as_deref(),
+            Some("hero.png")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn filesystem_storage_lookup_falls_back_to_case_insensitive_match() {
         let root = temp_root("case");
@@ -3505,6 +3774,112 @@ mod tests {
             Some("hero.png")
         );
         assert!(storage.read_binary_vec("hero.png").is_ok());
+    }
+
+    /// An image load suggests only the extensions with a registered graphic
+    /// handler -- `TVPInternalLoadGraphic` walks the graphic handler table and
+    /// takes the first `name + extension` that exists
+    /// (`visual/GraphicsLoaderIntf.cpp:1478-1506`), and the candidate list here
+    /// is that rule's engine-side equivalent. Non-image loads keep the full
+    /// storage extension set, because their completion answers a script's
+    /// plain-name probe rather than a decoder's.
+    #[test]
+    fn image_load_completion_only_suggests_graphic_extensions() {
+        let image = ProjectStorage::from_memory([("hero.png", b"png".to_vec())]);
+        assert_eq!(storage_image_bytes(&image, "hero"), b"png".as_slice());
+
+        // The image suggestion list is the graphic prefix of the storage list,
+        // so a stem that only has a non-graphic same-stem file must miss for a
+        // graphic load while the plain read still resolves it.
+        let sidecar = ProjectStorage::from_memory([("hero.asd", b"sidecar".to_vec())]);
+        assert_eq!(
+            sidecar.read_binary_vec("hero").expect("plain read"),
+            b"sidecar".as_slice()
+        );
+        assert!(sidecar.resolved_storage_name("hero").as_deref() == Some("hero.asd"));
+        assert!(
+            sidecar.read_image_storage("hero").is_err(),
+            "an image load must not complete `hero` with `hero.asd`"
+        );
+
+        // An explicit non-graphic extension is treated like no extension for a
+        // graphic load (the graphic set is the known set), so the exact name is
+        // still probed first: `PageBreak.asd` requested as an image resolves to
+        // the sidecar and fails in the decoder, the way the reference rejects
+        // the name with `TVPUnknownGraphicFormat`.
+        assert_eq!(
+            storage_image_bytes(&sidecar, "hero.asd"),
+            b"sidecar".as_slice()
+        );
+
+        // The completion itself, spelling for spelling.
+        let image_candidates = image
+            .storage_candidates_for_kind("hero2", StorageLoadKind::Image)
+            .expect("image candidates");
+        assert_eq!(
+            image_candidates
+                .into_iter()
+                .filter(|candidate| !candidate.contains('/'))
+                .collect::<Vec<_>>(),
+            [
+                "hero2",
+                "hero2.tlg",
+                "hero2.png",
+                "hero2.jpg",
+                "hero2.jpeg",
+                "hero2.bmp",
+                "hero2.webp"
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            image
+                .storage_candidates("hero2")
+                .expect("generic candidates")
+                .into_iter()
+                .filter(|candidate| !candidate.contains('/'))
+                .collect::<Vec<_>>(),
+            [
+                "hero2",
+                "hero2.tlg",
+                "hero2.png",
+                "hero2.jpg",
+                "hero2.jpeg",
+                "hero2.bmp",
+                "hero2.webp",
+                "hero2.ks",
+                "hero2.tjs",
+                "hero2.asd",
+                "hero2.ogg",
+                "hero2.wav",
+                "hero2.tcw",
+                "hero2.mpg",
+                "hero2.mpeg"
+            ]
+            .map(str::to_string)
+        );
+
+        // An explicitly graphic name is never re-extended for either kind.
+        let explicit = image
+            .storage_candidates_for_kind("hero.png", StorageLoadKind::Image)
+            .expect("image candidates");
+        assert_eq!(
+            explicit
+                .into_iter()
+                .filter(|candidate| !candidate.contains('/'))
+                .collect::<Vec<_>>(),
+            ["hero.png".to_string()]
+        );
+    }
+
+    /// `ProjectStorage::read_image_storage` bytes for a fixture.
+    fn storage_image_bytes(storage: &ProjectStorage, name: &str) -> Vec<u8> {
+        storage
+            .read_image_storage(name)
+            .expect("image load")
+            .as_bytes()
+            .expect("image bytes")
+            .into_owned()
     }
 
     /// The pathological spellings a script can pass. They must stay

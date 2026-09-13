@@ -227,6 +227,23 @@ pub trait ProjectStoragePort: StoragePort {
 
     fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData>;
 
+    /// Reads the bytes a graphic load resolves to.
+    ///
+    /// `TVPInternalLoadGraphic` suggests extensions at the graphics-loader
+    /// layer, not inside storage lookup: an extensionless name is completed
+    /// with the registered graphic handlers' extensions and the first
+    /// `name + extension` that exists wins, while a name whose extension no
+    /// handler serves is rejected outright (`GraphicsLoaderIntf.cpp:2307-2336`
+    /// in the stock krkr2 tree; `krkrz/visual/GraphicsLoaderIntf.cpp:1452`,
+    /// suggestion loop `:1478-1506`). An image load must therefore not complete
+    /// a bare stem with a same-stem non-graphic sidecar -- 纸上的魔法使's
+    /// `PageBreak` reaching `PageBreak.asd` instead of `PageBreak.png` is that
+    /// divergence. Backends without a graphic-aware resolver keep the plain
+    /// binary read.
+    fn read_image_storage(&self, name: &str) -> io::Result<ResourceData> {
+        self.read_binary_storage(name)
+    }
+
     fn read_text_storage(&self, name: &str, configured_encoding: &str) -> io::Result<String>;
 
     /// Reads text with an optional KRKR offset mode. Adapters can preserve

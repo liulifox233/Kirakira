@@ -1273,7 +1273,14 @@ impl KrkrHost {
         name: &str,
         kind: AssetKind,
     ) -> Result<Vec<u8>> {
-        match self.read_binary_storage(name) {
+        let bytes = self
+            .read_resource_storage_for_kind(name, kind)
+            .and_then(|data| {
+                data.as_bytes()
+                    .map(|bytes| bytes.into_owned())
+                    .map_err(storage_error)
+            });
+        match bytes {
             Ok(bytes) => Ok(bytes),
             Err(_) if self.is_external_resource(name) => {
                 Err(self.request_external_resource(name, kind))
@@ -1283,16 +1290,34 @@ impl KrkrHost {
     }
 
     pub(crate) fn read_resource_storage(&self, name: &str) -> Result<ResourceData> {
+        self.read_resource_storage_for_kind(name, AssetKind::Binary)
+    }
+
+    /// Reads raw bytes for a load of `kind`. `AssetKind::Image` resolves
+    /// through [`krkr_core::ProjectStoragePort::read_image_storage`] so the
+    /// candidate list suggests only the registered graphic handler extensions
+    /// (`TVPInternalLoadGraphic`, `visual/GraphicsLoaderIntf.cpp:1478-1506`);
+    /// a graphic load of `PageBreak` must not resolve the `PageBreak.asd`
+    /// sidecar. Every other kind keeps the plain binary read.
+    fn read_resource_storage_for_kind(&self, name: &str, kind: AssetKind) -> Result<ResourceData> {
+        let image = matches!(kind, AssetKind::Image);
         if let Some(manager) = self.resource_manager.as_ref() {
-            return manager
-                .load_bytes_blocking(name.to_string())
-                .map_err(|error| {
-                    TjsError::runtime(format!("failed to read binary storage `{name}`: {error}"))
-                });
+            let result = if image {
+                manager.load_image_bytes_blocking(name.to_string())
+            } else {
+                manager.load_bytes_blocking(name.to_string())
+            };
+            return result.map_err(|error| {
+                TjsError::runtime(format!("failed to read binary storage `{name}`: {error}"))
+            });
         }
-        self.project_storage()?
-            .read_binary_storage(name)
-            .map_err(storage_error)
+        let storage = self.project_storage()?;
+        let result = if image {
+            storage.read_image_storage(name)
+        } else {
+            storage.read_binary_storage(name)
+        };
+        result.map_err(storage_error)
     }
 
     // KRKR keeps the decoded graphic cache alive across storage writes; only
@@ -2582,9 +2607,10 @@ impl KrkrHost {
             return Ok(image.clone());
         }
 
-        // The decoder consumes raw bytes, but the deferred publication must
-        // resolve the name as an image (`TVPInternalLoadGraphic` suggests
-        // graphic extensions only), not as a same-stem `.asd` sidecar.
+        // The decoder consumes raw bytes, but both the storage lookup and a
+        // deferred publication must resolve the name as an image
+        // (`TVPInternalLoadGraphic` suggests graphic extensions only), not as a
+        // same-stem `.asd` sidecar.
         let bytes = self.read_binary_storage_for_kind(name, AssetKind::Image)?;
         let decoded = decode_image_bytes(&bytes, name).map_err(TjsError::runtime)?;
         let texture_id = self.next_texture_id;
@@ -4846,15 +4872,55 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    fn test_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut encoder = png::Encoder::new(&mut cursor, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer
+                .write_image_data(&vec![0x40u8; (width * height * 4) as usize])
+                .expect("png data");
+        }
+        cursor.into_inner()
+    }
+
     fn write_test_png(path: &std::path::Path, width: u32, height: u32) {
-        let file = fs::File::create(path).expect("create png");
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("png header");
-        writer
-            .write_image_data(&vec![0x40u8; (width * height * 4) as usize])
-            .expect("png data");
+        fs::write(path, test_png_bytes(width, height)).expect("write png");
+    }
+
+    /// A graphic load must reach the port's graphic-aware read
+    /// (`ProjectStoragePort::read_image_storage`), while a plain binary read
+    /// keeps `read_binary_storage`. This is the thread the page-break fix
+    /// adds: both the decode worker and the synchronous image path resolve the
+    /// name with the graphic loader's extension suggestions, so a bare stem
+    /// like `PageBreak` can never pick a same-stem sidecar.
+    #[test]
+    fn image_loads_resolve_through_the_graphic_read() {
+        let port = Arc::new(FakePort::default());
+        port.publish("hero.png", &test_png_bytes(2, 1));
+        let mut host = KrkrHost::from_storage_port(
+            Arc::clone(&port) as Arc<dyn ProjectStoragePort>,
+            SystemPaths::default(),
+            Arc::new(UnavailableVideoFactory),
+        )
+        .expect("host");
+
+        let image = host.load_image_storage("hero").expect("image load");
+        assert_eq!((image.upload.width, image.upload.height), (2, 1));
+        assert_eq!(port.image_reads(), vec!["hero".to_string()]);
+        assert!(port.binary_reads().is_empty());
+
+        // A plain read of the same stem stays on the binary path and does not
+        // suggest the graphic extension.
+        assert!(host.read_binary_storage("hero").is_err());
+        assert_eq!(port.binary_reads(), vec!["hero".to_string()]);
+        host.read_binary_storage("hero.png").expect("explicit read");
+        assert_eq!(
+            port.binary_reads(),
+            vec!["hero".to_string(), "hero.png".to_string()]
+        );
     }
 
     fn temp_root(prefix: &str) -> PathBuf {
@@ -4870,11 +4936,14 @@ mod tests {
 
     /// A storage backend with a media registry of its own, so the engine's
     /// registration path (`attach_storage` plus the port call) can be exercised
-    /// without `krkr-assets`.
+    /// without `krkr-assets`. It also records which read kind each lookup
+    /// arrived through, which is how the image/binary split is pinned.
     #[derive(Default)]
     struct FakePort {
         files: Mutex<BTreeMap<String, Vec<u8>>>,
         media: Mutex<Option<Arc<dyn StorageMediaProvider>>>,
+        image_reads: Mutex<Vec<String>>,
+        binary_reads: Mutex<Vec<String>>,
     }
 
     impl FakePort {
@@ -4883,6 +4952,14 @@ mod tests {
                 .lock()
                 .expect("fake port lock")
                 .insert(path.to_string(), bytes.to_vec());
+        }
+
+        fn image_reads(&self) -> Vec<String> {
+            self.image_reads.lock().expect("fake port lock").clone()
+        }
+
+        fn binary_reads(&self) -> Vec<String> {
+            self.binary_reads.lock().expect("fake port lock").clone()
         }
     }
 
@@ -4920,7 +4997,27 @@ mod tests {
         }
 
         fn read_binary_storage(&self, name: &str) -> io::Result<ResourceData> {
+            self.binary_reads
+                .lock()
+                .expect("fake port lock")
+                .push(name.to_string());
             self.data(name)
+        }
+
+        /// Mirrors the graphic loader's suggestion rule in miniature: probe the
+        /// name as given, then the registered graphic handlers' extensions, so
+        /// `hero` reaches `hero.png` like
+        /// `TVPInternalLoadGraphic` (`visual/GraphicsLoaderIntf.cpp:1478`).
+        fn read_image_storage(&self, name: &str) -> io::Result<ResourceData> {
+            self.image_reads
+                .lock()
+                .expect("fake port lock")
+                .push(name.to_string());
+            if name.contains('.') {
+                return self.data(name);
+            }
+            self.data(name)
+                .or_else(|_| self.data(&format!("{name}.png")))
         }
 
         fn read_text_storage(&self, name: &str, _configured_encoding: &str) -> io::Result<String> {
