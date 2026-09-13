@@ -58,9 +58,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
 
     pub(super) fn closure_parts(
         &self,
-        value: Variant,
+        value: &Variant,
     ) -> Result<(ObjectHandle, Option<ObjectHandle>)> {
-        match self.materialize_code_object(value) {
+        match self.materialize_code_object(value.clone()) {
             Variant::Object(handle) => Ok((handle, None)),
             Variant::Closure(closure) => Ok((closure.object, closure.this_obj)),
             Variant::Null => Err(TjsError::null_access()),
@@ -75,7 +75,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         flags: DispatchFlags,
         caller_this: Option<ObjectHandle>,
     ) -> Result<Variant> {
-        let receiver_type = self.value_debug_type(&target);
         // A receiver that is not an object fails the member read up front:
         // `GetPropertyDirect` converts the object expression with
         // `AsObjectClosureNoAddRef` before it looks at the name
@@ -89,12 +88,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             _ => {}
         }
 
-        let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
+        // The receiver's debug rendering walks the heap and allocates several
+        // strings: computed only where the access actually fails.
+        let (handle, closure_this) = self.closure_parts(&target).map_err(|error| {
             label_in_flight_call(
                 error,
                 TjsMemberAccess {
                     operation: TjsMemberOperation::Getting,
-                    receiver_type: receiver_type.clone(),
+                    receiver_type: self.value_debug_type(&target),
                     member_name: Some(name.to_string()),
                     callee_type: None,
                 },
@@ -107,7 +108,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     error,
                     TjsMemberAccess {
                         operation: TjsMemberOperation::Getting,
-                        receiver_type,
+                        receiver_type: self.value_debug_type(&target),
                         member_name: Some(name.to_string()),
                         callee_type: None,
                     },
@@ -359,7 +360,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         flags: DispatchFlags,
         caller_this: Option<ObjectHandle>,
     ) -> Result<()> {
-        let receiver_type = self.value_debug_type(&target);
         // `tTJSInterCodeContext::SetPropertyDirect` reaches `SetStringProperty`
         // / `SetOctetProperty` directly for a string/octet receiver
         // (`tjsInterCodeExec.cpp:1624-1656`), before any object conversion,
@@ -381,19 +381,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     error,
                     TjsMemberAccess {
                         operation: TjsMemberOperation::Setting,
-                        receiver_type,
+                        receiver_type: self.value_debug_type(&target),
                         member_name: Some(name.to_string()),
                         callee_type: None,
                     },
                 )
             });
         }
-        let (handle, closure_this) = self.closure_parts(target).map_err(|error| {
+        let (handle, closure_this) = self.closure_parts(&target).map_err(|error| {
             label_in_flight_call(
                 error,
                 TjsMemberAccess {
                     operation: TjsMemberOperation::Setting,
-                    receiver_type: receiver_type.clone(),
+                    receiver_type: self.value_debug_type(&target),
                     member_name: Some(name.to_string()),
                     callee_type: None,
                 },
@@ -406,7 +406,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     error,
                     TjsMemberAccess {
                         operation: TjsMemberOperation::Setting,
-                        receiver_type,
+                        receiver_type: self.value_debug_type(&target),
                         member_name: Some(name.to_string()),
                         callee_type: None,
                     },
@@ -751,7 +751,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         target: Variant,
         caller_this: Option<ObjectHandle>,
     ) -> Result<Variant> {
-        let (handle, closure_this) = self.closure_parts(target)?;
+        let (handle, closure_this) = self.closure_parts(&target)?;
         let kind = self.runtime.heap[handle.0].kind.clone();
         if let ObjectKind::InterCode {
             file_id,
@@ -801,7 +801,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         value: Variant,
         caller_this: Option<ObjectHandle>,
     ) -> Result<()> {
-        let (handle, closure_this) = self.closure_parts(target)?;
+        let (handle, closure_this) = self.closure_parts(&target)?;
         let kind = self.runtime.heap[handle.0].kind.clone();
         if let ObjectKind::InterCode {
             file_id,
@@ -857,7 +857,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         value: Variant,
         caller_this: Option<ObjectHandle>,
     ) -> Result<Option<Variant>> {
-        let Ok((handle, closure_this)) = self.closure_parts(value) else {
+        let Ok((handle, closure_this)) = self.closure_parts(&value) else {
             return Ok(None);
         };
         match self.runtime.heap[handle.0].kind {
@@ -928,7 +928,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         value: Variant,
         caller_this: Option<ObjectHandle>,
     ) -> Result<Option<()>> {
-        let Ok((handle, closure_this)) = self.closure_parts(target) else {
+        let Ok((handle, closure_this)) = self.closure_parts(&target) else {
             return Ok(None);
         };
         match self.runtime.heap[handle.0].kind {
@@ -1272,7 +1272,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         caller_this: Option<ObjectHandle>,
         op: impl FnOnce(Variant, Option<Variant>) -> Result<Variant>,
     ) -> Result<Variant> {
-        let (handle, closure_this) = self.closure_parts(object_value)?;
+        let (handle, closure_this) = self.closure_parts(&object_value)?;
         let receiver = match closure_this {
             Some(this_obj) => Variant::Closure(Closure::new(handle, Some(this_obj))),
             None => Variant::Object(handle),
@@ -1459,7 +1459,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         dest_reg: i16,
     ) -> Result<Variant> {
         let base_depth = self.runtime.call_depth;
-        let receiver_type = self.value_debug_type(&object_value);
         // Host code has no frame, so nothing supplies `ra[-1]`: the object the
         // host is calling through stands in for it, which is what the
         // reference does when it drives a member call from C++ with an
@@ -1469,8 +1468,13 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             Variant::Closure(closure) => closure.this_obj.or(Some(closure.object)),
             _ => None,
         };
-        match self.call_member_direct_cont(object_value, name, args, caller_this, Continuation::Root)?
-        {
+        match self.call_member_direct_cont(
+            &object_value,
+            name,
+            args,
+            caller_this,
+            Continuation::Root,
+        )? {
             CallOutcome::Immediate(value, Continuation::Root) => {
                 Ok(if dest_reg == 0 { Variant::Void } else { value })
             }
@@ -1485,7 +1489,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                             error,
                             TjsMemberAccess {
                                 operation: TjsMemberOperation::Calling,
-                                receiver_type: receiver_type.clone(),
+                                receiver_type: self.value_debug_type(&object_value),
                                 member_name: Some(name.to_string()),
                                 callee_type: None,
                             },
@@ -1498,32 +1502,31 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
 
     pub(super) fn call_member_direct_cont(
         &mut self,
-        object_value: Variant,
+        object_value: &Variant,
         name: &str,
         args: Vec<Variant>,
         caller_this: Option<ObjectHandle>,
         continuation: Continuation,
     ) -> Result<CallOutcome> {
-        let receiver_type = self.value_debug_type(&object_value);
-        if let Variant::String(value) = &object_value {
+        if let Variant::String(value) = object_value {
             return Ok(CallOutcome::Immediate(
                 self.call_string_method(value.clone(), name, args)?,
                 continuation,
             ));
         }
-        if let Variant::Octet(value) = &object_value {
+        if let Variant::Octet(value) = object_value {
             return Ok(CallOutcome::Immediate(
                 self.call_octet_method(value.clone(), name, args)?,
                 continuation,
             ));
         }
 
-        let (handle, closure_this) = self.closure_parts(object_value.clone()).map_err(|error| {
+        let (handle, closure_this) = self.closure_parts(object_value).map_err(|error| {
             label_in_flight_call(
                 error,
                 TjsMemberAccess {
                     operation: TjsMemberOperation::Calling,
-                    receiver_type: receiver_type.clone(),
+                    receiver_type: self.value_debug_type(object_value),
                     member_name: Some(name.to_string()),
                     callee_type: None,
                 },
@@ -1587,7 +1590,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         error,
                         TjsMemberAccess {
                             operation: TjsMemberOperation::Calling,
-                            receiver_type: receiver_type.clone(),
+                            receiver_type: self.value_debug_type(object_value),
                             member_name: Some(name.to_string()),
                             callee_type: None,
                         },
@@ -1607,7 +1610,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
         let bind_this = self.bound_super_this(handle, caller_this)?;
         let member = self.bind_proxy_value(member, bind_this);
-        let callee_type = self.value_debug_type(&member);
         // `TJSDefaultFuncCall` (`tjsObject.cpp:1280-1312`) forwards a member
         // call only when the member *is* an object; every other value type is
         // `TJS_E_INVALIDTYPE` (-1005).  Calling a value rather than a named
@@ -1618,9 +1620,9 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Err(
                 TjsError::invalid_type().with_member_access(TjsMemberAccess {
                     operation: TjsMemberOperation::Calling,
-                    receiver_type,
+                    receiver_type: self.value_debug_type(object_value),
                     member_name: Some(name.to_string()),
-                    callee_type: Some(callee_type),
+                    callee_type: Some(self.value_debug_type(&member)),
                 }),
             );
         }
@@ -1645,15 +1647,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             .or(closure_this)
             .or_else(|| self.receiver_supplies_call_this(handle, name).then_some(handle))
             .or(caller_this);
+        // Deferred like the receiver's label: the callee is an object handle
+        // either way, so the error path can still name it after `call_value`
+        // takes ownership of the value itself.
+        let callee = member.clone();
         self.call_value(member, call_this, args, false, continuation)
             .map_err(|error| {
                 label_in_flight_call(
                     error,
                     TjsMemberAccess {
                         operation: TjsMemberOperation::Calling,
-                        receiver_type,
+                        receiver_type: self.value_debug_type(object_value),
                         member_name: Some(name.to_string()),
-                        callee_type: Some(callee_type),
+                        callee_type: Some(self.value_debug_type(&callee)),
                     },
                 )
             })
@@ -4050,7 +4056,7 @@ mod tests {
         let mut runtime = Runtime::new();
         let mut vm = vm_with(&mut runtime);
         let error = match vm.call_member_direct_cont(
-            Variant::Octet(vec![1, 2, 3]),
+            &Variant::Octet(vec![1, 2, 3]),
             "bogusMethod",
             Vec::new(),
             None,

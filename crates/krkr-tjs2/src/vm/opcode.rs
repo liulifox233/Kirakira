@@ -88,36 +88,97 @@ pub(super) fn opcode_form(opcode: u8) -> OpcodeForm {
     }
 }
 
-pub(super) fn next_instruction_index(
-    offset_to_index: &BTreeMap<usize, usize>,
-    instructions: &[Instruction],
-    pc: usize,
-) -> Result<usize> {
-    let next_offset = instructions[pc].offset + instructions[pc].len_words;
-    if next_offset
-        == instructions.last().expect("nonempty").offset
-            + instructions.last().expect("nonempty").len_words
-    {
-        return Ok(instructions.len());
-    }
-    offset_to_index
-        .get(&next_offset)
-        .copied()
-        .ok_or_else(|| TjsError::runtime(format!("no instruction at offset {next_offset}")))
+/// Instruction-index tables built once per decoded code object.
+///
+/// Both answers the dispatch loop needs -- the index of the sequential next
+/// instruction and the index a branch operand targets -- follow from the
+/// instruction stream alone, so they are resolved at decode time instead of
+/// by a `BTreeMap<offset, index>` lookup per executed instruction and per
+/// taken branch.  An entry the stream does not resolve (a gap after the
+/// instruction, a negative target, a target that is not an instruction
+/// start) stays [`MISSING`], and the VM rebuilds the reference's diagnostic
+/// from the instruction itself -- the slow path only runs on bytecode the
+/// decoder cannot have produced.
+#[derive(Clone, Debug)]
+pub(crate) struct JumpTable {
+    next: Box<[u32]>,
+    branch: Box<[u32]>,
 }
 
-pub(super) fn branch_index(
-    offset_to_index: &BTreeMap<usize, usize>,
-    inst: &Instruction,
-) -> Result<usize> {
-    let target = inst.offset as isize + isize::from(inst.operands[0]);
-    if target < 0 {
-        return Err(TjsError::runtime(format!(
-            "negative branch target {target}"
-        )));
+/// Marks a table entry the instruction stream does not resolve.
+const MISSING: u32 = u32::MAX;
+
+impl JumpTable {
+    pub(crate) fn build(
+        instructions: &[Instruction],
+        offset_to_index: &BTreeMap<usize, usize>,
+    ) -> Self {
+        let end_offset = instructions
+            .last()
+            .map(|instruction| instruction.offset + instruction.len_words);
+        let mut next = Vec::with_capacity(instructions.len());
+        let mut branch = Vec::with_capacity(instructions.len());
+        for instruction in instructions {
+            let next_offset = instruction.offset + instruction.len_words;
+            next.push(if Some(next_offset) == end_offset {
+                instructions.len() as u32
+            } else {
+                resolve(offset_to_index, next_offset)
+            });
+            branch.push(resolve_branch(instruction, offset_to_index));
+        }
+        Self {
+            next: next.into_boxed_slice(),
+            branch: branch.into_boxed_slice(),
+        }
     }
+
+    /// The index the dispatch loop continues at when `pc` does not branch.
+    #[inline]
+    pub(super) fn next_index(&self, instructions: &[Instruction], pc: usize) -> Result<usize> {
+        let index = self.next[pc];
+        if index != MISSING {
+            return Ok(index as usize);
+        }
+        let instruction = &instructions[pc];
+        Err(TjsError::runtime(format!(
+            "no instruction at offset {}",
+            instruction.offset + instruction.len_words
+        )))
+    }
+
+    /// The index a branch operand of `instruction` resolves to.
+    #[inline]
+    pub(super) fn branch_index(&self, instruction: &Instruction, pc: usize) -> Result<usize> {
+        let index = self.branch[pc];
+        if index != MISSING {
+            return Ok(index as usize);
+        }
+        let target = instruction.offset as isize + isize::from(instruction.operands[0]);
+        if target < 0 {
+            return Err(TjsError::runtime(format!(
+                "negative branch target {target}"
+            )));
+        }
+        Err(TjsError::runtime(format!(
+            "no instruction at branch target {target}"
+        )))
+    }
+}
+
+fn resolve(offset_to_index: &BTreeMap<usize, usize>, offset: usize) -> u32 {
     offset_to_index
-        .get(&(target as usize))
-        .copied()
-        .ok_or_else(|| TjsError::runtime(format!("no instruction at branch target {target}")))
+        .get(&offset)
+        .map_or(MISSING, |index| *index as u32)
+}
+
+fn resolve_branch(instruction: &Instruction, offset_to_index: &BTreeMap<usize, usize>) -> u32 {
+    let Some(operand) = instruction.operands.first() else {
+        return MISSING;
+    };
+    let target = instruction.offset as isize + isize::from(*operand);
+    if target < 0 {
+        return MISSING;
+    }
+    resolve(offset_to_index, target as usize)
 }

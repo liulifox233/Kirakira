@@ -14,7 +14,7 @@ mod opcode;
 pub(crate) use frame::Frame;
 pub(crate) use frame::SuspendedCallStack;
 use frame::{CallFrame, Continuation, ExceptionEntry};
-use opcode::{branch_index, next_instruction_index};
+pub(crate) use opcode::JumpTable;
 
 pub fn execute_bytecode(bytes: &[u8]) -> Result<Variant> {
     Runtime::new().execute_bytecode(bytes)
@@ -39,7 +39,7 @@ pub struct Vm<'bc, 'rt, H: TjsHost = NoHost> {
     file_id: usize,
     file: Arc<BytecodeFile>,
     runtime: &'rt mut Runtime<H>,
-    code_handles: Vec<ObjectHandle>,
+    code_handles: Arc<[ObjectHandle]>,
     // A mixin class initializes its members by executing several class bodies
     // against the same instance.  Some of those bodies (notably the
     // `__missing` mixin) enable missing-member dispatch before a later body
@@ -275,6 +275,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 object: decoded.object,
                 instructions: decoded.instructions,
                 offset_to_index: decoded.offset_to_index,
+                jump: decoded.jump,
                 frame,
                 pc,
                 continuation,
@@ -303,36 +304,40 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             }
 
             let pc = call_frame.pc;
-            let inst = call_frame.instructions[pc].clone();
-            let next_pc = match next_instruction_index(
-                &call_frame.offset_to_index,
-                &call_frame.instructions,
-                pc,
-            ) {
+            // Only copies are taken out of the instruction: holding a borrow
+            // of `call_frame.instructions` would collide with the mutable
+            // borrows of sibling fields below, and cloning the instruction
+            // allocated its operand and call-argument vectors once per
+            // executed instruction.
+            let inst_offset = call_frame.instructions[pc].offset;
+            let inst_opcode = call_frame.instructions[pc].opcode;
+            let next_pc = match call_frame.jump.next_index(&call_frame.instructions, pc) {
                 Ok(next_pc) => next_pc,
                 Err(error) => {
                     break Err(self.with_active_stack(
                         error,
                         &stack,
-                        Some((&call_frame, inst.offset)),
+                        Some((&call_frame, inst_offset)),
                     ));
                 }
             };
 
             if self.runtime.debugger.is_some()
-                && let Err(error) = self.debug_pre_execute(&mut call_frame, &stack, &inst)
+                && let Err(error) =
+                    self.debug_pre_execute(&mut call_frame, &stack, inst_offset, inst_opcode)
             {
                 break Err(error);
             }
 
-            match self.execute_instruction(
-                &call_frame.object,
-                call_frame.object_handle,
-                &mut call_frame.frame,
-                &inst,
+            match self.execute_instruction(InstructionContext {
+                object: &call_frame.object,
+                object_handle: call_frame.object_handle,
+                frame: &mut call_frame.frame,
+                inst: &call_frame.instructions[pc],
+                index: pc,
                 next_pc,
-                &call_frame.offset_to_index,
-            ) {
+                jump: &call_frame.jump,
+            }) {
                 Ok(Step::Next(next)) => {
                     call_frame.pc = next;
                     if self.runtime.suspended_call.is_some() {
@@ -356,7 +361,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                         // native call, on the other hand, has already
                         // committed its side effects and should continue at
                         // the next instruction as before.
-                        if matches!(inst.opcode, 103 | 107 | 115) {
+                        if matches!(inst_opcode, 103 | 107 | 115) {
                             call_frame.pc = pc;
                         }
                         self.merge_nested_suspend(&mut stack, call_frame);
@@ -402,7 +407,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     // above.  Native calls do not return an error while a
                     // nested resource stack is parked, so this is limited to
                     // the call opcodes.
-                    if self.runtime.suspended_call.is_some() && matches!(inst.opcode, 99..=102) {
+                    if self.runtime.suspended_call.is_some() && matches!(inst_opcode, 99..=102) {
                         call_frame.pc = pc;
                         self.merge_nested_suspend(&mut stack, call_frame);
                         break Ok(Variant::Void);
@@ -434,7 +439,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     let error = error.with_stack_frame(self.stack_frame_for(
                         &call_frame.file,
                         &call_frame.object,
-                        inst.offset,
+                        inst_offset,
                     ));
                     if self
                         .runtime
@@ -463,7 +468,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                             &mut call_frame,
                             &stack,
                             reason,
-                            inst.offset,
+                            inst_offset,
                             object_index,
                         ) {
                             break Err(quit);
@@ -625,7 +630,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     fn activate_call_frame(&mut self, frame: &CallFrame) {
         self.file_id = frame.file_id;
         self.file = Arc::clone(&frame.file);
-        self.code_handles = frame.code_handles.clone();
+        self.code_handles = Arc::clone(&frame.code_handles);
     }
 
     fn with_active_stack(
@@ -662,7 +667,8 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         &mut self,
         call_frame: &mut CallFrame,
         stack: &[CallFrame],
-        inst: &Instruction,
+        offset: usize,
+        opcode: u8,
     ) -> Result<()> {
         let depth = stack.len() + 1;
         let object_index = match self.runtime.heap.get(call_frame.object_handle.0) {
@@ -680,13 +686,13 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             call_frame.file_id,
             object_index,
             &call_frame.object,
-            inst.offset,
-            inst.opcode,
+            offset,
+            opcode,
             depth,
         ) else {
             return Ok(());
         };
-        self.debug_pause(call_frame, stack, reason, inst.offset, object_index)
+        self.debug_pause(call_frame, stack, reason, offset, object_index)
     }
 
     /// Builds the backtrace, invokes the registered debug UI synchronously,
@@ -761,15 +767,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.runtime.suspended_call = Some(suspended);
     }
 
-    fn execute_instruction(
-        &mut self,
-        object: &CodeObject,
-        object_handle: ObjectHandle,
-        frame: &mut Frame,
-        inst: &Instruction,
-        next_pc: usize,
-        offset_to_index: &BTreeMap<usize, usize>,
-    ) -> Result<Step> {
+    fn execute_instruction(&mut self, ctx: InstructionContext<'_>) -> Result<Step> {
+        let InstructionContext {
+            object,
+            object_handle,
+            frame,
+            inst,
+            index: inst_index,
+            next_pc,
+            jump,
+        } = ctx;
         let mut pc = next_pc;
         match inst.opcode {
             0 | 127 => {}
@@ -835,15 +842,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             14 => frame.flag = !frame.flag,
             15 => {
                 if frame.flag {
-                    pc = branch_index(offset_to_index, inst)?;
+                    pc = jump.branch_index(inst, inst_index)?;
                 }
             }
             16 => {
                 if !frame.flag {
-                    pc = branch_index(offset_to_index, inst)?;
+                    pc = jump.branch_index(inst, inst_index)?;
                 }
             }
-            17 => pc = branch_index(offset_to_index, inst)?,
+            17 => pc = jump.branch_index(inst, inst_index)?,
             18 | 22 => {
                 let value = if inst.opcode == 18 {
                     frame.get(inst.operands[0])?.increment()?
@@ -965,7 +972,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     dest: (inst.operands[0] != 0).then_some(inst.operands[0]),
                 };
                 match self.call_member_direct_cont(
-                    object_value,
+                    &object_value,
                     &name,
                     args,
                     frame.this_obj,
@@ -1001,7 +1008,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     dest: (inst.operands[0] != 0).then_some(inst.operands[0]),
                 };
                 match self.call_member_direct_cont(
-                    object_value,
+                    &object_value,
                     &name,
                     args,
                     frame.this_obj,
@@ -1103,7 +1110,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             118 => frame.result = frame.get(inst.operands[0])?,
             119 => return Ok(Step::Return(frame.result.clone())),
             120 => {
-                let catch_pc = branch_index(offset_to_index, inst)?;
+                let catch_pc = jump.branch_index(inst, inst_index)?;
                 frame.entries.push(ExceptionEntry {
                     catch_pc,
                     exception_reg: inst.operands[1],
@@ -1537,6 +1544,20 @@ impl DispatchFlags {
             ..self
         }
     }
+}
+
+/// The decoded pieces of one instruction a dispatch step works on: the code
+/// object it belongs to, its execution frame, the instruction itself and the
+/// decode-time index tables.  Grouped so the dispatcher call stays a single
+/// borrowed context instead of seven separate arguments.
+struct InstructionContext<'a> {
+    object: &'a CodeObject,
+    object_handle: ObjectHandle,
+    frame: &'a mut Frame,
+    inst: &'a Instruction,
+    index: usize,
+    next_pc: usize,
+    jump: &'a JumpTable,
 }
 
 enum Step {

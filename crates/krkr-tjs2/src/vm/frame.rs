@@ -4,14 +4,17 @@ use crate::bytecode::{BytecodeFile, CodeObject, Instruction};
 use crate::error::{Result, TjsError};
 use crate::runtime::{ObjectHandle, Variant};
 
+use super::JumpTable;
+
 pub(super) struct CallFrame {
     pub(super) file_id: usize,
     pub(super) file: Arc<BytecodeFile>,
-    pub(super) code_handles: Vec<ObjectHandle>,
+    pub(super) code_handles: Arc<[ObjectHandle]>,
     pub(super) object_handle: ObjectHandle,
     pub(super) object: CodeObject,
     pub(super) instructions: Arc<[Instruction]>,
     pub(super) offset_to_index: Arc<BTreeMap<usize, usize>>,
+    pub(super) jump: Arc<JumpTable>,
     pub(super) frame: Frame,
     pub(super) pc: usize,
     pub(super) continuation: Continuation,
