@@ -1,0 +1,5 @@
+// Minimal project entry point for the krkr-video fixture project.
+//
+// The engine's project dispatcher executes `startup.tjs` when a project is
+// opened; the movie harness (`krkr-debug <this dir> --before-script ...`)
+// drives VideoOverlay itself, so this file only has to exist.

@@ -15,12 +15,18 @@ krkr-video.workspace = true
 libtlg-rs.workspace = true
 png.workspace = true
 
-# The VideoOverlay native object decodes through the host platform's media
-# framework (krkr2/krkrz use DirectShow / Media Foundation); on macOS that is
-# AVFoundation. Other platforms get an "unsupported" backend until their
-# decoders are implemented.
+# The VideoOverlay native object decodes through the host platform's own media
+# framework where there is one (krkr2/krkrz use DirectShow / Media Foundation);
+# on macOS that is AVFoundation. Everywhere else the embedded FFmpeg fallback
+# is the decoder: krkr-video's `ffmpeg` feature compiles FFmpeg from source and
+# links it statically, so the artifact needs no system FFmpeg. Web keeps the
+# engine's media-element path, and the mobile shells will enable the same
+# feature when their FFmpeg cross-builds (cargo-ndk / Xcode sysroot) land.
 [target.'cfg(target_os = "macos")'.dependencies]
 krkr-video = { workspace = true, features = ["macos-avfoundation"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+krkr-video = { workspace = true, features = ["ffmpeg"] }
 
 [dev-dependencies]
 krkr-assets.workspace = true

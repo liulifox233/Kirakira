@@ -13,8 +13,32 @@ objc2-core-video = { version = "0.3", optional = true }
 objc2-core-audio-types = { version = "0.3", optional = true }
 objc2-av-foundation = { version = "0.3", optional = true, features = ["objc2-core-media"] }
 
+# Embedded FFmpeg. The `build` feature makes `ffmpeg-sys-next` fetch the FFmpeg
+# release branch, configure it, build it from source and link the resulting
+# static libav* archives into the artifact — the shipped binary carries its own
+# decoder and never needs a system FFmpeg (no pkg-config probe, no shared
+# libav*). The direct `ffmpeg-sys-next` entry exists only to pin
+# `build-portable`: without it the vendored build adds `-march=native`, which
+# would make the artifact refuse to start on older CPUs than the build host.
+# Excluded on wasm32, where no C toolchain/FFmpeg build exists (the Web shell
+# presents movies through a media element instead).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ffmpeg-next = { version = "9.0", optional = true, default-features = false, features = [
+    "build",
+    "codec",
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
+ffmpeg-sys-next = { version = "9.0", optional = true, default-features = false, features = [
+    "build-portable",
+] }
+
 [features]
 default = []
+# Embedded FFmpeg fallback decoder. The platform's own system decoder stays
+# primary wherever one is compiled in; see `platform_capabilities`.
+ffmpeg = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next"]
 macos-avfoundation = [
     "objc2",
     "objc2-foundation",
