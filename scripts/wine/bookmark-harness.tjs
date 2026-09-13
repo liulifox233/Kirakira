@@ -12,6 +12,8 @@
 //   digest.cryptmode = (saveDataMode != "")     -> 1, 少女世界 Config.tjs: saveDataMode = "z"
 //   digest.compress  = (saveDataMode == "z")    -> 1
 //   digest.iv        = System.title
+//     the plugin writes ivlen = 2*(chars+1) — UTF-16LE bytes including the
+//     string's NUL terminator (container offset 0x0e; 42 for the 20-char title)
 //   digest.seed      = Scripts.makeDataPackDigest(data, tick & 0xffffffff, saveDataID)
 //   thumb            = Scripts.makeDataPackThumb(layer, digest.ext, digest.quality, digest.component)
 //   Scripts.saveDataPack(name, data, digest, thumb)
@@ -62,7 +64,9 @@ digest.compress = 1;
 digest.iv = System.title;
 digest.ext = "jpg";
 digest.seed = Scripts.makeDataPackDigest(data, 305419896, saveDataID); // fixed seed: reproducible
-Debug.message("M142 digest.seed=" + digest.seed + " ivbytes=" + (System.title.length * 2));
+// The plugin writes ivlen = 2*(chars+1): the UTF-16LE bytes *including* the
+// string's NUL terminator (verified against the container header, offset 0x0e).
+Debug.message("M142 digest.seed=" + digest.seed + " ivbytes=" + ((System.title.length + 1) * 2));
 
 Scripts.saveDataPack("savedata_cn/data0.jpg", data, digest, void);
 Debug.message("M142 saved savedata_cn/data0.jpg");

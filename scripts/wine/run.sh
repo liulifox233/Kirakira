@@ -34,6 +34,11 @@
 #                       headless VM: drive the real display and the window is
 #                       visible/clickable), to :97 (an Xvfb this script
 #                       starts) otherwise, which is the CI case.
+#                       Screenshots need an X display: `import` fails on this
+#                       machine's Wayland session (:0) for the root window and
+#                       for a window alike, so `shot` fails loudly there and
+#                       `game` warns instead of silently skipping the picture;
+#                       point KIRA_WINE_DISPLAY at :97 when one is wanted.
 #   KIRA_WINE_ENGINE    engine release name to require (default krkrz_20171225)
 #   KRKRZ_RELEASE_URL   engine release URL override
 #   KRKRZ_RELEASE_SHA256 engine release .7z sha-256 (verified on download)
@@ -73,7 +78,8 @@
 # CI note: `scripts/wine/run.sh setup && scripts/wine/run.sh smoke` is the
 # headless base a CI job needs — nix provides Wine/Xvfb, the engine is pinned
 # by hash, and the smoke test needs no game assets (a scratch startup.tjs
-# makes the engine boot, write a file through PackinOne, and exit 0).
+# makes the engine boot and exit 0; when the game's PackinOne.dll is staged
+# next to the engine it also writes and re-reads a container through it).
 #
 set -euo pipefail
 
@@ -99,7 +105,9 @@ export WINEDLLOVERRIDES='mscoree,mshtml='
 export DISPLAY=$KIRA_WINE_DISPLAY
 
 die() { printf 'wine-run: %s\n' "$*" >&2; exit 1; }
-note() { printf 'wine-run: %s\n' "$*"; }
+# Status messages go to stderr so command substitutions like
+# `engine_dir=$(fetch_engine)` capture the value and nothing else.
+note() { printf 'wine-run: %s\n' "$*" >&2; }
 
 # The script re-enters itself inside `nix develop`, so the original argument
 # list has to survive that hop: inside a function, "$@" is the function's own
@@ -107,7 +115,10 @@ note() { printf 'wine-run: %s\n' "$*"; }
 cli_args=("$@")
 
 usage() {
-    sed -n '3,60p' "$0" | sed 's/^# \{0,1\}//'
+    # The whole header is the usage text; print every leading comment line
+    # (shebang aside) so nothing — the caveats, the harness paragraph, the CI
+    # note — is cut off.
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
 }
 
 # ---------------------------------------------------------------------------
@@ -172,27 +183,51 @@ wineboot_once() {
 # engine
 # ---------------------------------------------------------------------------
 
+engine_exe_matches() { # <engine dir>
+    local exe=$1/tvpwin32.exe got
+    [ -f "$exe" ] || return 1
+    got=$(md5sum "$exe" | cut -d' ' -f1)
+    [ "$got" = "$KRKRZ_EXE_MD5" ]
+}
+
+engine_tarball_matches() { # <tarball>
+    echo "$KRKRZ_RELEASE_SHA256  $1" | sha256sum -c - >/dev/null 2>&1
+}
+
 fetch_engine() {
     local tarball=$engine_root/krkrz_20171225r2.7z
     local dir=$engine_root/$KIRA_WINE_ENGINE
+    mkdir -p "$engine_root"
+    # Cached exe: still re-check its md5, so a tampered or half-extracted tree
+    # is replaced instead of silently used.
+    if [ -f "$dir/tvpwin32.exe" ] && ! engine_exe_matches "$dir"; then
+        note "cached engine exe failed its md5 check; re-extracting"
+        rm -rf "$dir"
+    fi
     if [ -f "$dir/tvpwin32.exe" ]; then
         echo "$dir"
         return 0
     fi
-    mkdir -p "$engine_root"
+    # Cached archive: a partial download from an earlier run fails the
+    # checksum, so say that and fetch again rather than reporting a mismatch.
+    if [ -f "$tarball" ] && ! engine_tarball_matches "$tarball"; then
+        note "cached engine archive failed its checksum; downloading again"
+        rm -f "$tarball"
+    fi
     if [ ! -f "$tarball" ]; then
         note "downloading official krkrz release ($KRKRZ_RELEASE_URL)"
-        curl -fL --retry 3 -o "$tarball.part" "$KRKRZ_RELEASE_URL"
+        rm -f "$tarball.part"
+        curl -fL --retry 3 -o "$tarball.part" "$KRKRZ_RELEASE_URL" \
+            || die "engine download failed: $KRKRZ_RELEASE_URL (network problem?)"
         mv "$tarball.part" "$tarball"
     fi
-    echo "$KRKRZ_RELEASE_SHA256  $tarball" | sha256sum -c - >/dev/null \
-        || die "engine archive checksum mismatch: $tarball"
+    engine_tarball_matches "$tarball" \
+        || die "engine archive checksum mismatch: $tarball (expected $KRKRZ_RELEASE_SHA256); delete it and retry"
     rm -rf "$dir"
     7z x -y -o"$engine_root" "$tarball" >/dev/null
     [ -f "$dir/tvpwin32.exe" ] || die "engine archive layout changed: no tvpwin32.exe under $dir"
-    local got
-    got=$(md5sum "$dir/tvpwin32.exe" | cut -d' ' -f1)
-    [ "$got" = "$KRKRZ_EXE_MD5" ] || die "tvpwin32.exe md5 mismatch ($got)"
+    engine_exe_matches "$dir" \
+        || die "tvpwin32.exe md5 mismatch (expected $KRKRZ_EXE_MD5): $dir/tvpwin32.exe"
     echo "$dir"
 }
 
@@ -262,6 +297,26 @@ run_engine() {
 }
 
 stop_all() { wineserver -k 2>/dev/null || true; }
+
+# Screen capture differs per display flavour: on an Xvfb screen the root
+# window holds the pixels and `import -window root` works, while on this
+# machine's Wayland session (:0) ImageMagick's X capture fails for the root
+# window *and* for a specific window — XWayland does not hand those pixels
+# out.  So: try the root, fall back to the engine's window, and when both
+# fail say so instead of pretending a screenshot happened (on :0 use the
+# session's own screenshot tool if a picture is needed).
+capture() { # <out.png>
+    local out=$1 wid
+    if import -window root "$out" 2>/dev/null; then
+        return 0
+    fi
+    wid=$(xdotool search --class 'tvpwin32' 2>/dev/null | head -1)
+    if [ -n "$wid" ] && import -window "$wid" "$out" 2>/dev/null; then
+        note "captured the engine window ($wid) instead of the root screen on $KIRA_WINE_DISPLAY"
+        return 0
+    fi
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 # bookmark harness
@@ -355,11 +410,16 @@ cmd_smoke() {
     mkdir -p "$scratch/savedata_cn"
     cp -f "$engine_dir/tvpwin32.exe" "$scratch/"
     cat >"$scratch/startup.tjs" <<'TJS'
-// CI-friendly: links the game plug-in when one was staged, then exits 0 so
-// the run needs neither a display interaction nor a game tree.
+// CI-friendly: with the game's plug-in staged this writes and re-reads a real
+// container through the reference implementation, then exits 0.
 if (Storages.isExistentStorage("PackinOne.dll")) {
     Plugins.link("PackinOne.dll");
-    Debug.message("smoke: PackinOne.dll linked");
+    var data = %[ "id" => "smoke" ];
+    var digest = %[ "compress" => 1, "cryptmode" => 1, "iv" => "smoke", "ext" => "jpg" ];
+    digest.seed = Scripts.makeDataPackDigest(data, 305419896, "smoke");
+    Scripts.saveDataPack("savedata_cn/smoke.ksd", data, digest, void);
+    var back = Scripts.loadDataPack("savedata_cn/smoke.ksd");
+    Debug.message("smoke: container written and read back, id=" + back.id);
 } else {
     Debug.message("smoke: no PackinOne.dll staged, engine-only check");
 }
@@ -373,13 +433,20 @@ TJS
     ( cd "$scratch" && wine "$hello" ) | tee "$run_dir/smoke-hello.log"
     grep -q 'Hello, world' "$run_dir/smoke-hello.log" || die "hello.exe did not print on wine"
     cp -f /home/ruri/games/GINKA/plugin/PackinOne.dll "$scratch/PackinOne.dll" 2>/dev/null || true
+    rm -f "$scratch/savedata_cn/smoke.ksd"
     start_display
     ( cd "$scratch" && timeout 90 wine ./tvpwin32.exe . ) >"$run_dir/smoke-engine.log" 2>&1 || true
     grep -q 'Loading startup script' "$run_dir/smoke-engine.log" \
         || die "engine did not load startup.tjs; see $run_dir/smoke-engine.log"
     grep -q 'smoke: ' "$run_dir/smoke-engine.log" \
         || die "startup.tjs did not run to completion; see $run_dir/smoke-engine.log"
-    note "smoke ok: hello.exe printed, engine booted and ran startup.tjs"
+    if [ -f "$scratch/savedata_cn/smoke.ksd" ]; then
+        grep -q 'container written and read back' "$run_dir/smoke-engine.log" \
+            || die "saveDataPack wrote a file but the read-back did not run; see $run_dir/smoke-engine.log"
+        note "smoke ok: hello.exe printed, engine booted, PackinOne wrote and re-read $(stat -c %s "$scratch/savedata_cn/smoke.ksd") bytes"
+    else
+        note "smoke ok: hello.exe printed, engine booted and ran startup.tjs (no PackinOne.dll staged, so no container was written)"
+    fi
 }
 
 cmd_game() {
@@ -406,13 +473,20 @@ cmd_game() {
     note "log: $log; screenshots: $run_dir/$name-t*.png"
     local pid
     pid=$(run_engine "$tree" "$log" "$seconds" "$name")
-    import -window root "$run_dir/$name-final.png" 2>/dev/null || true
+    if ! capture "$run_dir/$name-final.png"; then
+        note "warning: no screenshot on $KIRA_WINE_DISPLAY (ImageMagick's X capture failed for the root and the engine window; on a Wayland session use the session's screenshot tool)"
+    fi
     if [ "$keep" = 0 ]; then stop_all; fi
     note "done; window list follows"
     xdotool search --name '.' getwindowname %@ 2>/dev/null | grep -v '^$' || true
 }
 
-cmd_shot() { ensure_shell; start_display; import -window root "${1:?shot needs an output path}"; }
+cmd_shot() {
+    ensure_shell; start_display
+    local out=${1:?shot needs an output path}
+    capture "$out" || die "could not capture $KIRA_WINE_DISPLAY (ImageMagick's X capture failed for the root and the engine window; on a Wayland session use the session's screenshot tool)"
+    note "wrote $out"
+}
 cmd_click() { ensure_shell; start_display; xdotool mousemove "${1:?click needs x}" "${2:?click needs y}" click 1; }
 cmd_key() { ensure_shell; start_display; xdotool key --clearmodifiers "${1:?key needs a key}"; }
 cmd_dialogs() { ensure_shell; start_display; xdotool search --name '.' getwindowname %@ 2>/dev/null | grep -v '^$' || true; }
