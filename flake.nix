@@ -80,11 +80,14 @@
             python3
             # The embedded-FFmpeg feature (`cargo build -p krkr-video
             # --features ffmpeg`) compiles FFmpeg from source through
-            # ffmpeg-sys-next: nasm assembles FFmpeg's x86 SIMD kernels, and
-            # the build script's bindgen run needs libclang — LIBCLANG_PATH
-            # below points it at this same store path.  (gcc, make, git and
-            # perl are already reachable from the shell.)
+            # ffmpeg-sys-next: nasm assembles FFmpeg's x86 SIMD kernels,
+            # the build script's `git clone` fetches the FFmpeg sources,
+            # and its bindgen run needs libclang — LIBCLANG_PATH below
+            # points it at this same store path.  (perl is deliberately
+            # absent: FFmpeg's configure wants it only for docs and the
+            # Solaris version script, and this build disables docs.)
             nasm
+            git
             llvmPackages.libclang
           ];
 
