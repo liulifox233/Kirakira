@@ -2105,9 +2105,10 @@ fn fire_window_hook(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use krkr_engine::{EngineConfig, KrkrEngine};
+    use krkr_core::{FrameInput, Size};
+    use krkr_engine::{EngineConfig, EngineInput, KrkrEngine};
     use krkr_tjs2::runtime::{ObjectHandle, Variant};
 
     use super::LayerExSavePlugin;
@@ -2139,6 +2140,46 @@ mod tests {
                 .expect("helpers");
         }
         engine.execute_script(name, script).expect(name);
+        settle(engine);
+    }
+
+    /// Drives the engine until no script call is parked on a resource load.
+    ///
+    /// A script image load decodes on the resource worker; when the decode
+    /// misses the engine's 4 ms synchronous budget the call returns the
+    /// pending form, which parks the VM. Every later script call then merges
+    /// into that parked stack and answers `void` without running its
+    /// statement (`krkr-tjs2/src/vm/mod.rs`, the `suspended_call` check after
+    /// each instruction), so a test that never pumps the engine silently
+    /// stops executing its scripts instead of failing — the M108
+    /// `save_layer_image_png_levels` flake, where the saves after
+    /// `level0.png` never wrote and only the final host read noticed.
+    ///
+    /// The parked call resumes when a frame applies its decode completion,
+    /// so this pumps frames. It reads a storage name through the worker first:
+    /// the parked decode task was queued ahead of the read and the worker
+    /// answers in order, so once the read returns the completion is already
+    /// in hand. Pumping frames alone races the worker — under the workspace
+    /// suite's parallel load a freshly woken worker thread can take longer to
+    /// be scheduled than a busy frame loop takes to run out, which is what
+    /// kept the parked VM parked in every load-flaky run.
+    fn settle(engine: &mut KrkrEngine) {
+        let mut rounds = 0;
+        while engine.tjs_runtime().is_suspended() {
+            let _ = engine.host().read_binary_storage("settle-worker-barrier");
+            engine
+                .update(
+                    EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                    Duration::ZERO,
+                )
+                .expect("frame");
+            rounds += 1;
+            assert!(
+                rounds < 10_000,
+                "a script call stayed parked on a resource load: {:?}",
+                engine.host().pending_resource_diagnostics()
+            );
+        }
     }
 
     fn saved(engine: &KrkrEngine, name: &str) -> Vec<u8> {
