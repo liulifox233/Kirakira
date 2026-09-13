@@ -279,7 +279,10 @@ fn install_window_native_properties(
     preserve_script_properties: bool,
 ) {
     for &property in WINDOW_NATIVE_PROPERTIES {
-        if preserve_script_properties && runtime.object_member_is_property(handle, property) {
+        if preserve_script_properties
+            && (runtime.object_member_is_property(handle, property)
+                || script_property_declares(runtime, handle, property))
+        {
             continue;
         }
         let property_handle = runtime.register_object_native_property_with_access(
@@ -2110,10 +2113,53 @@ fn set_window_property_storage(
     // A denied accessor must survive the engine's own writes: replacing it with
     // a plain member would re-open the property to script writes. Every other
     // member is stored directly, which is what the engine's raw-member readers
-    // (and `Window.left`-style assertions) have always seen.
-    if !member_is_denied_property(runtime, handle, name) {
+    // (and `Window.left`-style assertions) have always seen -- except for the
+    // two members a script class may override (`primaryLayer`, `focusedLayer`),
+    // where the script declaration has to keep winning. Everything else keeps
+    // the store: KAGEX's zoom menu reads the mirrored `zoomNumer`/`zoomDenom`
+    // values, and the host mirror carries the engine's value for the getters
+    // either way.
+    let script_owns_member = matches!(name, "primaryLayer" | "focusedLayer")
+        && script_property_declares(runtime, handle, name);
+    if !member_is_denied_property(runtime, handle, name) && !script_owns_member {
         runtime.set_object_member(handle, name, value);
     }
+}
+
+/// Whether `name` is declared as a *script* property by the object itself or by
+/// a class in its chain.
+///
+/// The reference keeps Window's native members on the class object
+/// (`tTJSNC_Window`'s `TJS_BEGIN_NATIVE_PROP_DECL(primaryLayer)`,
+/// `WindowIntf.cpp:1856-1874`), so a script subclass's declaration wins a
+/// script read. Kirakira installs the natives per instance and mirrors engine
+/// state into the window's script members (`set_window_property_storage`), and
+/// such a store shadows the declaration: KAGEX's `KAGWindow.primaryLayer`
+/// (`MainWindow.tjs:4839`, `sysbase` or the image-less `_primaryLayer`) stopped
+/// being consulted once `Window.add`/`Layer.add` stored the first layer over
+/// it, so `kag.primaryLayer` answered `_primaryLayer` and
+/// `temp.piledCopy(0, 0, kag.primaryLayer, ...)` (`custom.tjs:196`) threw
+/// `Source layer has no image` (`scnchart.ks:28`).
+///
+/// The twin of `video::chain_has_script_property`, which keeps a game `Movie`'s
+/// `left`/`top`/... declarations from being shadowed by `VideoOverlay`'s
+/// per-instance native members.
+fn script_property_declares(runtime: &Runtime<KrkrHost>, handle: ObjectHandle, name: &str) -> bool {
+    let own = runtime.object_member(handle, name);
+    if runtime.variant_is_property(&own) && !runtime.variant_is_native_property(&own) {
+        return true;
+    }
+    let mut current = runtime.object_super_class(handle);
+    while let Some(class_handle) = current {
+        if runtime.object_member_is_property(class_handle, name) {
+            let member = runtime.object_member(class_handle, name);
+            if !runtime.variant_is_native_property(&member) {
+                return true;
+            }
+        }
+        current = runtime.object_super_class(class_handle);
+    }
+    false
 }
 
 /// Whether `name` is a native property of `object` whose access policy refuses
@@ -7357,33 +7403,24 @@ fn layer_draw_text(
     };
     let effect = text_draw_effect(&args, opacity)?;
     let layout = runtime.host().font_system().layout_text(&font, &text);
-    let metrics = layout.metrics();
-    let min_width =
-        (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
-    let min_height =
-        (y.max(0) as f32 + metrics.height.ceil() + effect.max_bottom() as f32).max(1.0) as u32;
-    mutate_layer_pixels_min_with_host(
-        runtime,
-        &target,
-        min_width,
-        min_height,
-        |host, pixels, width, height| {
-            let font_system = host.font_system();
-            effect.draw(
-                font_system,
-                &font,
-                &layout,
-                pixels,
-                width,
-                height,
-                x as i32,
-                y as i32,
-            );
-            font_system.draw_text_layout_to_rgba(
-                &font, style, pixels, width, height, x as i32, y as i32, &layout,
-            );
-        },
-    )?;
+    if !draw_into_layer_image(runtime, &target, |host, pixels, width, height| {
+        let font_system = host.font_system();
+        effect.draw(
+            font_system,
+            &font,
+            &layout,
+            pixels,
+            width,
+            height,
+            x as i32,
+            y as i32,
+        );
+        font_system.draw_text_layout_to_rgba(
+            &font, style, pixels, width, height, x as i32, y as i32, &layout,
+        );
+    }) {
+        return Err(not_drawable_layer_type());
+    }
     runtime
         .host_mut()
         .record_native_text_draw(&target, text, x, y);
@@ -7429,33 +7466,24 @@ fn layer_draw_glyph(
     };
     let effect = text_draw_effect(&args, opacity)?;
     let layout = runtime.host().font_system().layout_text(&font, &text);
-    let metrics = layout.metrics();
-    let min_width =
-        (x.max(0) as f32 + metrics.width.ceil() + effect.max_right() as f32).max(1.0) as u32;
-    let min_height =
-        (y.max(0) as f32 + metrics.height.ceil() + effect.max_bottom() as f32).max(1.0) as u32;
-    mutate_layer_pixels_min_with_host(
-        runtime,
-        &target,
-        min_width,
-        min_height,
-        |host, pixels, width, height| {
-            let font_system = host.font_system();
-            effect.draw(
-                font_system,
-                &font,
-                &layout,
-                pixels,
-                width,
-                height,
-                x as i32,
-                y as i32,
-            );
-            font_system.draw_text_layout_to_rgba(
-                &font, style, pixels, width, height, x as i32, y as i32, &layout,
-            );
-        },
-    )?;
+    if !draw_into_layer_image(runtime, &target, |host, pixels, width, height| {
+        let font_system = host.font_system();
+        effect.draw(
+            font_system,
+            &font,
+            &layout,
+            pixels,
+            width,
+            height,
+            x as i32,
+            y as i32,
+        );
+        font_system.draw_text_layout_to_rgba(
+            &font, style, pixels, width, height, x as i32, y as i32, &layout,
+        );
+    }) {
+        return Err(not_drawable_layer_type());
+    }
     runtime
         .host_mut()
         .record_native_text_draw(&target, text, x, y);
@@ -7485,20 +7513,6 @@ impl TextDrawEffect {
 
     fn is_visible(self) -> bool {
         self.color[3] != 0 && (self.width > 0 || self.offset_x != 0 || self.offset_y != 0)
-    }
-
-    fn max_right(self) -> i32 {
-        if !self.is_visible() {
-            return 0;
-        }
-        (self.offset_x + self.width).max(self.width).max(0)
-    }
-
-    fn max_bottom(self) -> i32 {
-        if !self.is_visible() {
-            return 0;
-        }
-        (self.offset_y + self.width).max(self.width).max(0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9790,6 +9804,87 @@ where
         }
     });
     Ok(())
+}
+
+/// Draw into the layer's *existing* main image, clipped to that image and to
+/// the layer's `ClipRect`, without ever changing the image size.
+///
+/// The reference draws text through `MainImage->DrawText(ClipRect, x, y, ...)`
+/// (`LayerIntf.cpp:4046`, `:4089`): `MainImage` only changes size through
+/// `setImageSize`/`setSizeToImageSize`/`LoadImages`, and a draw that reaches
+/// past the bitmap is clipped. Growing the plane here is what turned PARQUET's
+/// 792x53 name layer into a 792x57 one between `transCapture` and
+/// `assignImages`, so the `crossfade` in `CustomNameLayer.beginTrans`
+/// (`sysscn/msghack.tjs:844`) threw `Transition layer size mismatch`.
+///
+/// Returns false when the layer is not drawable, the caller's
+/// `TVPNotDrawableLayerType` (`LayerIntf.cpp:4020`, `:4064`): a freed bitmap is
+/// not resurrected by a draw.
+fn draw_into_layer_image<F>(
+    runtime: &mut Runtime<KrkrHost>,
+    target: &LayerRenderTarget,
+    draw: F,
+) -> bool
+where
+    F: FnOnce(&KrkrHost, &mut [u8], u32, u32),
+{
+    let Some(layer) = render_layer_snapshot(runtime, target) else {
+        return true;
+    };
+    let Some(image) = layer.image else {
+        return false;
+    };
+    let clip = layer_clip_bounds(runtime, target);
+    let (width, height) = (image.upload.width, image.upload.height);
+    let mut pixels = image.upload.rgba.as_ref().to_vec();
+    // The glyph blitter already clips at the image edges; the layer's
+    // `ClipRect` is applied by putting back whatever the draw changed outside
+    // it.
+    let unclipped = clip.map(|_| pixels.clone());
+    draw(runtime.host(), &mut pixels, width, height);
+    if let (Some(clip), Some(unclipped)) = (clip, unclipped) {
+        restore_pixels_outside_clip(&mut pixels, width, height, clip, &unclipped);
+    }
+    let image = runtime.host_mut().create_layer_image(width, height, pixels);
+    mutate_render_layer(runtime, target, |layer| layer.set_image(image));
+    true
+}
+
+/// Put back the pixels a draw changed outside `clip`'s rectangle, the
+/// `ClipRect` the reference hands to `MainImage->DrawText`
+/// (`LayerIntf.cpp:4046`).
+fn restore_pixels_outside_clip(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    clip: (i64, i64, i64, i64),
+    original: &[u8],
+) {
+    let stride = width as usize * 4;
+    let rows = height as usize;
+    if stride == 0 || pixels.len() < stride * rows {
+        return;
+    }
+    let x0 = clip.0.clamp(0, i64::from(width)) as usize;
+    let y0 = clip.1.clamp(0, i64::from(height)) as usize;
+    let x1 = clip.2.clamp(0, i64::from(width)) as usize;
+    let y1 = clip.3.clamp(0, i64::from(height)) as usize;
+    for row in 0..rows {
+        let start = row * stride;
+        let end = start + stride;
+        if row < y0 || row >= y1 || x1 <= x0 {
+            pixels[start..end].copy_from_slice(&original[start..end]);
+            continue;
+        }
+        let left = start + x0 * 4;
+        let right = start + x1 * 4;
+        if left > start {
+            pixels[start..left].copy_from_slice(&original[start..left]);
+        }
+        if right < end {
+            pixels[right..end].copy_from_slice(&original[right..end]);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12470,5 +12565,169 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("ok".to_string()));
+    }
+
+    /// PARQUET's `CustomNameLayer.beginTrans` (`sysscn/msghack.tjs:844-857`)
+    /// captures `transFrom` before `processNameText` draws the name text and
+    /// assigns `transTo` from the name layer right after, then runs a
+    /// `crossfade` between the two. Our `drawText` used to grow the name
+    /// layer's image to fit the text (792x53 -> 792x82 at font height 60), so
+    /// the layers `beginTransition` compares had different `MainImage` sizes
+    /// and the call threw `Transition layer size mismatch 792x82 and 792x53`.
+    /// The reference draws through `MainImage->DrawText(ClipRect, ...)`
+    /// (`LayerIntf.cpp:4014-4057`), so both stay 792x53 and the transition
+    /// starts.
+    #[test]
+    fn layer_draw_text_keeps_the_image_size_and_starts_a_crossfade() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var name = new Layer();
+                name.setImageSize(792, 53);
+                name.font.height = 60;
+                name.drawText(0, 0, "NAME", 0xffffff, 255);
+                var from = new Layer();
+                from.setImageSize(792, 53);
+                var to = new Layer();
+                to.assignImages(name);
+                to.setSizeToImageSize();
+                global.transition = "";
+                try {
+                    from.beginTransition("crossfade", 0, to, %[time: 500]);
+                    global.transition = "started";
+                } catch (e) {
+                    global.transition = e.message;
+                }
+                return name.imageWidth + "x" + name.imageHeight + ":" +
+                    from.imageWidth + "x" + from.imageHeight + ":" +
+                    to.imageWidth + "x" + to.imageHeight + ":" + global.transition;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("792x53:792x53:792x53:started".to_string())
+        );
+    }
+
+    /// A draw never changes the plane's size and never loses what it does not
+    /// touch: the same 40x60 image is still 40x60 after a draw whose text is
+    /// taller than the image, pixels outside the layer's `ClipRect` keep the
+    /// white the earlier fill wrote, and pixels inside it took the draw.
+    #[test]
+    fn layer_draw_text_clips_to_the_clip_rect_without_losing_pixels() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.clipLayer = new Layer();
+                clipLayer.setImageSize(40, 60);
+                clipLayer.fillRect(0, 0, 40, 60, 0xffffffff);
+                clipLayer.setClip(0, 0, 8, 60);
+                clipLayer.font.height = 60;
+                // The glyph's ink sits well below the origin at this size; the
+                // negative y brings it into the bitmap so the clip is what
+                // trims it.
+                clipLayer.drawText(0, -30, "M", 0xff0000, 255);
+                return clipLayer.__nativeLayerId + ":" +
+                    clipLayer.imageWidth + "x" + clipLayer.imageHeight;
+                "#,
+            )
+            .expect("script");
+        let Variant::String(value) = value else {
+            panic!("expected string result");
+        };
+        let (layer_id, size) = value.split_once(':').expect("layer id and size");
+        assert_eq!(size, "40x60");
+        let layer_id = layer_id.parse::<u64>().expect("layer id");
+        let rgba = engine
+            .host()
+            .layer_tree()
+            .layer(layer_id)
+            .and_then(|layer| layer.image.as_ref())
+            .map(|image| image.upload.rgba.as_ref().to_vec())
+            .expect("drawText image");
+        let pixel = |x: usize, y: usize| {
+            let index = (y * 40 + x) * 4;
+            [
+                rgba[index],
+                rgba[index + 1],
+                rgba[index + 2],
+                rgba[index + 3],
+            ]
+        };
+        // Outside the clip rect: untouched by the draw.
+        for y in 0..60 {
+            for x in 8..40 {
+                assert_eq!(pixel(x, y), [0xff, 0xff, 0xff, 0xff], "({x}, {y})");
+            }
+        }
+        // Inside it, the glyph painted over the fill the earlier `fillRect`
+        // wrote.
+        assert!(
+            (0..8).any(|x| (0..60).any(|y| pixel(x, y) != [0xff, 0xff, 0xff, 0xff])),
+            "the clipped draw painted nothing"
+        );
+    }
+
+    fn global_object(engine: &crate::KrkrEngine, name: &str) -> krkr_tjs2::runtime::ObjectHandle {
+        engine
+            .tjs_runtime()
+            .global_member(name)
+            .object_handle()
+            .unwrap_or_else(|| panic!("{name} missing"))
+    }
+
+    /// The engine mirrors the primary layer into the window's script member
+    /// (`Window.add` / `Layer.add` -> `set_window_property_storage`). A script
+    /// class that declares that property must keep winning it: KAGEX's
+    /// `KAGWindow.primaryLayer` (`MainWindow.tjs:4839`, `sysbase` or the
+    /// image-less `_primaryLayer`) stopped being consulted once the first
+    /// layer was added, so `kag.primaryLayer` answered `_primaryLayer` and
+    /// `temp.piledCopy(0, 0, kag.primaryLayer, ...)` (`custom.tjs:196`) threw
+    /// `Source layer has no image` (`scnchart.ks:28`). A plain window keeps
+    /// the native value, and the host keeps the engine-side state either way.
+    #[test]
+    fn window_script_property_primary_layer_wins_over_the_engine_member() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                class GameWindow extends Window {
+                    function GameWindow() { super.Window(...); }
+                    property primaryLayer { getter() { return "SCRIPT"; } }
+                }
+                global.game = new GameWindow();
+                global.gameLayer = new Layer(game, null);
+                global.plain = new Window();
+                global.plainLayer = new Layer(plain, null);
+                return game.primaryLayer + ":" +
+                    (game.primaryLayer == gameLayer) + ":" +
+                    (plain.primaryLayer == plainLayer);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("SCRIPT:0:1".to_string()));
+
+        let game = global_object(&engine, "game");
+        let game_layer = global_object(&engine, "gameLayer");
+        assert_eq!(
+            engine.host().native_window_primary_layer(game),
+            Some(game_layer),
+            "the engine's own view of the primary layer is unchanged"
+        );
     }
 }
