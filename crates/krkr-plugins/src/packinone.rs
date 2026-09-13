@@ -1401,7 +1401,11 @@ fn blake2s(parts: &[&[u8]], param: &[u8; 32]) -> [u8; 32] {
     }
     let mut counter = 0u64;
     let mut offset = 0usize;
-    while offset + 64 <= data.len() {
+    // Every full block *except the last* is compressed as a non-final block;
+    // an input whose length is a multiple of 64 (including zero) ends with
+    // its final block already full — the reference's update/final pair never
+    // appends a synthetic empty block.
+    while offset + 64 < data.len() {
         let block = &data[offset..offset + 64];
         counter += 64;
         blake2s_compress(&mut state, block, counter, false);
@@ -1946,22 +1950,30 @@ fn encode_jpeg(rgba: &[u8], width: usize, height: usize, quality: u8) -> Vec<u8>
         200 - quality * 2
     };
     let scaled = |base: &[u8; 64]| {
-        let mut table = [0f32; 64];
+        let mut table = [0u8; 64];
         for (index, value) in base.iter().enumerate() {
-            let quantised = ((u32::from(*value) * scale + 50) / 100).clamp(1, 255);
-            table[index] = quantised as f32;
+            table[index] = ((u32::from(*value) * scale + 50) / 100).clamp(1, 255) as u8;
         }
         table
     };
-    let luma = scaled(&JPEG_LUMA_QUANT);
-    let chroma = scaled(&JPEG_CHROMA_QUANT);
+    let luma_table = scaled(&JPEG_LUMA_QUANT);
+    let chroma_table = scaled(&JPEG_CHROMA_QUANT);
+    let as_quantiser = |table: &[u8; 64]| {
+        let mut quantiser = [0f32; 64];
+        for (index, value) in table.iter().enumerate() {
+            quantiser[index] = f32::from(*value);
+        }
+        quantiser
+    };
+    let luma = as_quantiser(&luma_table);
+    let chroma = as_quantiser(&chroma_table);
 
     let mut out = Vec::new();
     out.extend_from_slice(&[0xFF, 0xD8]);
     out.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
     out.extend_from_slice(b"JFIF\0");
     out.extend_from_slice(&[1, 1, 0, 0, 1, 0, 1, 0, 0]);
-    for (id, table) in [(0x00u8, &JPEG_LUMA_QUANT), (0x01, &JPEG_CHROMA_QUANT)] {
+    for (id, table) in [(0x00u8, &luma_table), (0x01, &chroma_table)] {
         out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43]);
         out.push(id);
         for zigzag in 0..64 {
@@ -2000,12 +2012,21 @@ fn encode_jpeg(rgba: &[u8], width: usize, height: usize, quality: u8) -> Vec<u8>
         ac: JpegHuffman::new(&JPEG_AC_LUMA_BITS, &JPEG_AC_LUMA_VALUES),
         previous_dc: 0,
     };
-    let mut chroma_component = JpegComponent {
+    // Cb and Cr are the same quantisation/Huffman configuration but each
+    // keeps its own DC predictor (they are separate components on the wire).
+    let mut cb_component = JpegComponent {
         quant: chroma,
         dc: JpegHuffman::new(&JPEG_DC_CHROMA_BITS, &JPEG_DC_CHROMA_VALUES),
         ac: JpegHuffman::new(&JPEG_AC_CHROMA_BITS, &JPEG_AC_CHROMA_VALUES),
         previous_dc: 0,
     };
+    let mut cr_component = JpegComponent {
+        quant: chroma,
+        dc: JpegHuffman::new(&JPEG_DC_CHROMA_BITS, &JPEG_DC_CHROMA_VALUES),
+        ac: JpegHuffman::new(&JPEG_AC_CHROMA_BITS, &JPEG_AC_CHROMA_VALUES),
+        previous_dc: 0,
+    };
+
     let mut writer = JpegBits::new();
     for block_y in (0..height).step_by(8) {
         for block_x in (0..width).step_by(8) {
@@ -2024,8 +2045,8 @@ fn encode_jpeg(rgba: &[u8], width: usize, height: usize, quality: u8) -> Vec<u8>
                 }
             }
             luma_component.encode(&samples[0], &mut writer);
-            chroma_component.encode(&samples[1], &mut writer);
-            chroma_component.encode(&samples[2], &mut writer);
+            cb_component.encode(&samples[1], &mut writer);
+            cr_component.encode(&samples[2], &mut writer);
         }
     }
     writer.flush();
@@ -2688,6 +2709,53 @@ mod tests {
             ])),
             "67fd820ca5fc08d07885343b87e622cc553e9a2b27ace65d3579605dc5657ea9"
         );
+
+        // Lengths around the block boundary: a 64-multiple input must end with
+        // its full final block, not a synthetic empty one. The key preimage is
+        // `64 + 2*(title_chars+1)` bytes, so a 31-mod-32-character title lands
+        // exactly on a multiple of 64.
+        let vectors: &[(usize, &str)] = &[
+            (
+                55,
+                "f4495470f226c8c214be08fdfad4bc4a2a9dbea9136a210df0d4b64929e6fc14",
+            ),
+            (
+                56,
+                "e290dd270b467f34ab1c002d340fa016257ff19e5833fdbbf2cb401c3b2817de",
+            ),
+            (
+                63,
+                "e57cb79487dd57902432b250733813bd96a84efce59f650fac26e6696aefafc3",
+            ),
+            (
+                64,
+                "56f34e8b96557e90c1f24b52d0c89d51086acf1b00f634cf1dde9233b8eaaa3e",
+            ),
+            (
+                65,
+                "1b53ee94aaf34e4b159d48de352c7f0661d0a40edff95a0b1639b4090e974472",
+            ),
+            (
+                127,
+                "f18417b39d617ab1c18fdf91ebd0fc6d5516bb34cf39364037bce81fa04cecb1",
+            ),
+            (
+                128,
+                "1fa877de67259d19863a2a34bcc6962a2b25fcbf5cbecd7ede8f1fa36688a796",
+            ),
+            (
+                129,
+                "5bd169e67c82c2c2e98ef7008bdf261f2ddf30b1c00f9e7f275bb3e8a28dc9a2",
+            ),
+        ];
+        let pattern: Vec<u8> = (0..200).map(|index| (index % 251) as u8).collect();
+        for (length, expected) in vectors {
+            assert_eq!(
+                hex(blake2s(&[&pattern[..*length]], &unkeyed)),
+                *expected,
+                "length {length}"
+            );
+        }
     }
 
     /// The four containers M142's real-engine session wrote (`m144-*.ksd`,
@@ -2850,6 +2918,92 @@ mod tests {
         // Truncated images have no end.
         assert_eq!(image_end(&jpeg[..jpeg.len() - 3]), None);
         assert_eq!(image_end(&png[..png.len() - 3]), None);
+    }
+
+    /// The DQT values of a baseline JPEG, in file order.
+    fn jpeg_quantisation_tables(jpeg: &[u8]) -> Vec<[u8; 64]> {
+        let mut tables = Vec::new();
+        let mut index = 2;
+        while index + 4 <= jpeg.len() {
+            if jpeg[index] != 0xFF {
+                break;
+            }
+            let marker = jpeg[index + 1];
+            if marker == 0xDA {
+                break;
+            }
+            let length = usize::from(u16::from_be_bytes([jpeg[index + 2], jpeg[index + 3]]));
+            if marker == 0xDB {
+                let mut position = index + 4;
+                while position + 65 <= index + 2 + length {
+                    tables.push(jpeg[position + 1..position + 65].try_into().unwrap());
+                    position += 65;
+                }
+            }
+            index += 2 + length;
+        }
+        tables
+    }
+
+    /// The DQT segment must carry the *scaled* tables the encoder quantises
+    /// with: quantising by one table and advertising another made every
+    /// quality but 50 needlessly lossy.
+    #[test]
+    fn jpeg_encoder_writes_the_scaled_quantisation_tables() {
+        let rgba = [0x11u8, 0x22, 0x33, 0xFF].repeat(16 * 8);
+        let tables = jpeg_quantisation_tables(&encode_jpeg(&rgba, 16, 8, 100));
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0], [1u8; 64], "q100 scales every entry to 1");
+        assert_eq!(tables[1], [1u8; 64]);
+        let tables = jpeg_quantisation_tables(&encode_jpeg(&rgba, 16, 8, 75));
+        assert_eq!(tables[0][0], 8, "q75 scales the luma 16 to 8");
+        assert_eq!(tables[1][0], 9, "q75 scales the chroma 17 to 9");
+        assert_ne!(tables[0], tables[1]);
+    }
+
+    /// Flat colours survive the JPEG round trip through the engine's own
+    /// decoder: both chroma components need their own DC predictor and the
+    /// quantisation has to match the DQT. The tolerance is deliberately tight
+    /// (the pre-review encoder decoded the left block as (0, 47, 219) instead
+    /// of (0x11, 0x22, 0x33)).
+    #[test]
+    fn jpeg_thumbnail_keeps_flat_colours_through_the_engines_decoder() {
+        let root = test_root("packinone-jpeg");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.thumb = new Layer();
+                thumb.setImageSize(32, 8);
+                thumb.fillRect(0, 0, 16, 8, 0xff112233);
+                thumb.fillRect(16, 0, 16, 8, 0xffcc4411);
+                var jpeg = Scripts.makeDataPackThumb(thumb, "jpg", 75, void);
+                Storages.saveOctet("thumb.jpg", jpeg);
+                global.view = new Layer();
+                view.loadImages("thumb.jpg");
+                "#,
+            )
+            .expect("encode and reload the thumbnail");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "view.imageWidth + \"x\" + view.imageHeight")
+                .expect("thumbnail size"),
+            Variant::String("32x8".to_string())
+        );
+        for (x, expected) in [(4i64, 0x112233i64), (28, 0xCC4411)] {
+            let pixel = read_integer(&mut engine, &format!("view.getMainPixel({x}, 4)"));
+            for shift in [16u32, 8, 0] {
+                let actual = (pixel >> shift) & 0xFF;
+                let want = (expected >> shift) & 0xFF;
+                assert!(
+                    (actual - want).abs() <= 6,
+                    "pixel {x}: {pixel:#08x} should be near {expected:#08x}"
+                );
+            }
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
