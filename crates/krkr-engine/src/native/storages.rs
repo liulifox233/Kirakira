@@ -1,6 +1,6 @@
 use krkr_tjs2::{
     Result,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 
 use crate::host::KrkrHost;
@@ -13,22 +13,87 @@ pub(crate) fn install_storages(runtime: &mut Runtime<KrkrHost>) {
     // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`StorageIntf.cpp:1357`); scripts reach
     // it as `Storages.finalize(...)` while tearing a session down.
     runtime.register_object_native(storages, "finalize", native_void);
-    runtime.register_object_native(storages, "addAutoPath", storages_add_auto_path);
-    runtime.register_object_native(storages, "removeAutoPath", storages_remove_auto_path);
+    // The `tTJSNC_Storages` / `TVPCreateNativeClass_Storages` members that
+    // declare `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carry the floor at
+    // the registration site, so a short call reports `TJS_E_BADPARAMCOUNT`
+    // (-1004) before the handler runs (`base/StorageIntf.cpp:1365-1471`,
+    // `base/win32/StorageImpl.cpp:1130-1158`).
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "addAutoPath",
+        NativeArgCount::AtLeast(1),
+        storages_add_auto_path,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "removeAutoPath",
+        NativeArgCount::AtLeast(1),
+        storages_remove_auto_path,
+    );
     runtime.register_object_native(storages, "setTextEncoding", storages_set_text_encoding);
-    runtime.register_object_native(storages, "getFullPath", storages_get_full_path);
-    runtime.register_object_native(storages, "getPlacedPath", storages_get_placed_path);
-    runtime.register_object_native(storages, "isExistentStorage", storages_exists);
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "getFullPath",
+        NativeArgCount::AtLeast(1),
+        storages_get_full_path,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "getPlacedPath",
+        NativeArgCount::AtLeast(1),
+        storages_get_placed_path,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "isExistentStorage",
+        NativeArgCount::AtLeast(1),
+        storages_exists,
+    );
     runtime.register_object_native(storages, "isExistentDirectory", storages_is_directory);
     runtime.register_object_native(storages, "dirlist", storages_dirlist);
-    runtime.register_object_native(storages, "extractStorageExt", storages_extract_ext);
-    runtime.register_object_native(storages, "extractStorageName", storages_extract_name);
-    runtime.register_object_native(storages, "extractStoragePath", storages_extract_path);
-    runtime.register_object_native(storages, "chopStorageExt", storages_chop_ext);
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "extractStorageExt",
+        NativeArgCount::AtLeast(1),
+        storages_extract_ext,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "extractStorageName",
+        NativeArgCount::AtLeast(1),
+        storages_extract_name,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "extractStoragePath",
+        NativeArgCount::AtLeast(1),
+        storages_extract_path,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "chopStorageExt",
+        NativeArgCount::AtLeast(1),
+        storages_chop_ext,
+    );
     runtime.register_object_native(storages, "clearArchiveCache", storages_clear_archive_cache);
-    runtime.register_object_native(storages, "getLocalName", storages_get_local_name);
-    runtime.register_object_native(storages, "selectFile", native_void);
-    runtime.register_object_native(storages, "searchCD", native_void);
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "getLocalName",
+        NativeArgCount::AtLeast(1),
+        storages_get_local_name,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "selectFile",
+        NativeArgCount::AtLeast(1),
+        native_void,
+    );
+    runtime.register_object_native_with_arg_count(
+        storages,
+        "searchCD",
+        NativeArgCount::AtLeast(1),
+        native_void,
+    );
 }
 
 fn storages_add_auto_path(
@@ -467,5 +532,89 @@ mod tests {
                 .remove_auto_path("psb://container.psb")
         );
         assert!(storage.auto_paths().is_empty());
+    }
+
+    /// M175.  Every `tTJSNC_Storages` method whose reference declares
+    /// `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carries that floor at
+    /// its registration site (`base/StorageIntf.cpp:1365-1471`,
+    /// `base/win32/StorageImpl.cpp:1130-1158`), so a short call reports
+    /// `TJS_E_BADPARAMCOUNT` (-1004) before the handler runs -- including the
+    /// two stub members (`searchCD`, `selectFile`) whose handlers ignore the
+    /// argument entirely.
+    #[test]
+    fn storages_method_floors_reject_short_calls() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "storages_floors.tjs",
+                r#"
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                return [
+                    message(function() { Storages.addAutoPath(); }),
+                    message(function() { Storages.removeAutoPath(); }),
+                    message(function() { Storages.getFullPath(); }),
+                    message(function() { Storages.getPlacedPath(); }),
+                    message(function() { Storages.isExistentStorage(); }),
+                    message(function() { Storages.extractStorageExt(); }),
+                    message(function() { Storages.extractStorageName(); }),
+                    message(function() { Storages.extractStoragePath(); }),
+                    message(function() { Storages.chopStorageExt(); }),
+                    message(function() { Storages.searchCD(); }),
+                    message(function() { Storages.getLocalName(); }),
+                    message(function() { Storages.selectFile(); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(["Invalid argument count"; 12].join("|"))
+        );
+        // The identity from Rust: the dispatch check answers
+        // `TJS_E_BADPARAMCOUNT` (-1004) before the handler.
+        let error = engine
+            .execute_expression("storages_floors.tjs", "Storages.getFullPath()")
+            .expect_err("a short getFullPath call must fail");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+        assert_eq!(error.tjs_error_code(), Some(-1004));
+        assert_eq!(error.message, "Invalid argument count");
+    }
+
+    /// The other half of the contract: every floor accepts the reference
+    /// arity, so a floor that is too high (the failure mode that breaks
+    /// working game scripts) cannot slip in.
+    #[test]
+    fn storages_reference_arity_calls_are_not_rejected() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "storages_floors_exact.tjs",
+                r#"
+                var problems = "";
+                function check(body) {
+                    try { body(); } catch (e) {
+                        if (e.message === "Invalid argument count") { problems += "bad; "; }
+                    }
+                }
+                check(function() { Storages.addAutoPath("extra/"); });
+                check(function() { Storages.removeAutoPath("extra/"); });
+                check(function() { Storages.getFullPath("missing/"); });
+                check(function() { Storages.getPlacedPath("missing.txt"); });
+                check(function() { Storages.isExistentStorage("missing.txt"); });
+                check(function() { Storages.extractStorageExt("a/b.txt"); });
+                check(function() { Storages.extractStorageName("a/b.txt"); });
+                check(function() { Storages.extractStoragePath("a/b.txt"); });
+                check(function() { Storages.chopStorageExt("a/b.txt"); });
+                check(function() { Storages.searchCD("missing"); });
+                check(function() { Storages.getLocalName("missing.txt"); });
+                check(function() { Storages.selectFile("missing"); });
+                return problems;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String(String::new()));
     }
 }

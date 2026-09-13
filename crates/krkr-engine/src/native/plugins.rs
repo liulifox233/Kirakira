@@ -1,6 +1,6 @@
 use krkr_tjs2::{
     Result,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 
 use crate::host::KrkrHost;
@@ -13,8 +13,21 @@ pub(crate) fn install_plugins(runtime: &mut Runtime<KrkrHost>) {
     // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`PluginIntf.cpp:27`); scripts reach it
     // as `Plugins.finalize(...)` while tearing a session down.
     runtime.register_object_native(plugins, "finalize", native_void);
-    runtime.register_object_native(plugins, "link", plugins_link);
-    runtime.register_object_native(plugins, "unlink", plugins_unlink);
+    // `link`/`unlink` declare `if(numparams < 1) return TJS_E_BADPARAMCOUNT;`
+    // in `TVPCreateNativeClass_Plugins` (`base/win32/PluginImpl.cpp:957`,
+    // `:970`), so the floor sits at the registration site.
+    runtime.register_object_native_with_arg_count(
+        plugins,
+        "link",
+        NativeArgCount::AtLeast(1),
+        plugins_link,
+    );
+    runtime.register_object_native_with_arg_count(
+        plugins,
+        "unlink",
+        NativeArgCount::AtLeast(1),
+        plugins_unlink,
+    );
     runtime.register_object_native(plugins, "getList", plugins_get_list);
     // KAG3/KAGEX games guard every optional plugin with the *global*
     // `CanLoadPlugin`; a game that carries its own definition replaces this
@@ -316,5 +329,52 @@ mod tests {
             .expect("project definition");
 
         assert_eq!(probe(&mut engine, "CanLoadPlugin(\"motionplayer.dll\")"), 7);
+    }
+
+    /// M175.  `Plugins.link`/`unlink` declare
+    /// `if(numparams < 1) return TJS_E_BADPARAMCOUNT;`
+    /// (`base/win32/PluginImpl.cpp:957`, `:970`), so a short call reports
+    /// `TJS_E_BADPARAMCOUNT` (-1004) before the handler runs, while the
+    /// reference arity keeps working for a module this build actually ships.
+    #[test]
+    fn plugins_method_floors_reject_short_calls() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(ShippedModule).expect("register");
+        let value = engine
+            .execute_script(
+                "plugins_floors.tjs",
+                r#"
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var rejected = [
+                    message(function() { Plugins.link(); }),
+                    message(function() { Plugins.unlink(); })
+                ].join("|");
+                function check(body) {
+                    try { body(); } catch (e) {
+                        if (e.message === "Invalid argument count") { return "bad"; }
+                    }
+                    return "ok";
+                }
+                return rejected + "@"
+                    + check(function() { Plugins.link("shipped.dll"); }) + ":"
+                    + check(function() { Plugins.unlink("shipped.dll"); });
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("Invalid argument count|Invalid argument count@ok:ok".to_string())
+        );
+        // The identity from Rust: the dispatch check answers
+        // `TJS_E_BADPARAMCOUNT` (-1004) before the handler.
+        let error = engine
+            .execute_expression("plugins_floors.tjs", "Plugins.link()")
+            .expect_err("a short link call must fail");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+        assert_eq!(error.tjs_error_code(), Some(-1004));
+        assert_eq!(error.message, "Invalid argument count");
     }
 }
