@@ -58,6 +58,63 @@ fn is_resource_pending_error(error: &TjsError) -> bool {
         || error.to_string().contains("KAG resource is pending:")
 }
 
+/// The exception contract every script callback the engine runs on the game's
+/// behalf follows, in one place.
+///
+/// `TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION` (`base/ScriptMgnIntf.h:94`) hands the
+/// escaping exception to `TVPProcessUnhandledException`
+/// (`base/ScriptMgnIntf.cpp:929`), whose `res = TVPExecuteScriptExceptionHandler()`
+/// -- i.e. `System.exceptionHandler`'s own return value, computed in
+/// `:950`-`:963` -- decides everything: truthy means the project claimed the
+/// exception and the engine carries on, anything else falls through to
+/// `TVPShowScriptException` (`:1107`) and `TVPTerminateSync(1)`
+/// (`base/win32/SysInitImpl.cpp:1445`). A claimed exception is logged here and
+/// the caller continues; an unclaimed one comes back unchanged, so each call
+/// site keeps the error identity, message and contexts it had before.
+#[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
+fn handle_escaped_script_exception(
+    runtime: &mut Runtime<KrkrHost>,
+    context: &str,
+    error: TjsError,
+) -> Result<()> {
+    if is_resource_pending_error(&error) || error.is_debug_quit() {
+        return Err(error);
+    }
+    if runtime.process_unhandled_exception(&error)? {
+        runtime
+            .host_mut()
+            .log(&format!("handled {context}: {}", error.message));
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// [`handle_escaped_script_exception`] for a KAG-side failure that reached the
+/// engine as a [`KagError`].
+///
+/// The parser's host callbacks wrap the escaping `TjsError` in
+/// `KagError::Host` (`kag_tjs_error`), so the error is rebuilt from its
+/// `Display` -- the same text the call site would have reported -- before the
+/// project's handler sees it. A parked host call
+/// (`KagError::ResourcePending` / `KagError::HostSuspended`) is a wait, not an
+/// exception: it is handed back the way these call sites have always
+/// converted it.
+#[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
+fn handle_escaped_kag_error(
+    runtime: &mut Runtime<KrkrHost>,
+    context: &str,
+    error: KagError,
+) -> Result<()> {
+    if matches!(
+        error,
+        KagError::ResourcePending { .. } | KagError::HostSuspended { .. }
+    ) {
+        return Err(TjsError::runtime(error.to_string()));
+    }
+    handle_escaped_script_exception(runtime, context, TjsError::runtime(error.to_string()))
+}
+
 /// Wall-clock budget timer that remains safe on browser WASM targets. The
 /// standard library's `Instant` is unavailable there; the browser host still
 /// supplies frame pacing through `EngineInput.delta`, so a zero elapsed value
@@ -2395,17 +2452,7 @@ impl KrkrEngine {
     /// fatal path and error text -- `TVPShowScriptException` shows the
     /// reference's error dialog and terminates there too.
     fn handle_resumed_callback_error(&mut self, context: &str, error: TjsError) -> Result<()> {
-        if is_resource_pending_error(&error) || error.is_debug_quit() {
-            return Err(error);
-        }
-        if self.tjs_runtime.process_unhandled_exception(&error)? {
-            self.tjs_runtime
-                .host_mut()
-                .log(&format!("handled {context}: {}", error.message));
-            Ok(())
-        } else {
-            Err(error)
-        }
+        handle_escaped_script_exception(&mut self.tjs_runtime, context, error)
     }
 
     fn dispatch_window_mouse_wheel(&mut self, delta: i32) -> Result<()> {
@@ -3274,7 +3321,19 @@ impl KagSession {
                             .map(|value| value.as_ref().map(|_| "value")),
                         still_suspended
                     ));
-                    resumed?;
+                    // The resume finishes the call the parked tag handler (or
+                    // the parser's own `onScript`/`[eval]` script) was in, so
+                    // an exception it throws is that script callback's
+                    // exception and goes through the project's
+                    // `System.exceptionHandler` (see
+                    // `handle_escaped_script_exception`).
+                    if let Err(error) = resumed {
+                        handle_escaped_script_exception(
+                            runtime,
+                            "resumed KAG script callback",
+                            error,
+                        )?;
+                    }
                     if !runtime.is_suspended() {
                         runtime
                             .host_mut()
@@ -3326,6 +3385,35 @@ impl KagSession {
                         }
                         Err(error) => {
                             let message = error.to_string();
+                            // `KagError::Host` is what the engine's own KAG
+                            // host wraps an escaping `TjsError` into
+                            // (`EngineKagHost::call_event`, `eval_bool`,
+                            // `on_script`, `on_scenario_load`): the project's
+                            // `onScript`/`onLabel`/`onJump`/`onCall`/`onReturn`
+                            // handlers and the expressions the parser
+                            // evaluates for `[if exp=...]`, entities and
+                            // attribute expressions. KRKR runs all of them
+                            // from KAG's own conductor (game TJS), i.e. inside
+                            // `TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION`
+                            // (`base/ScriptMgnIntf.h:94`; see
+                            // `handle_escaped_script_exception`), so a claimed
+                            // exception yields this frame and the session
+                            // continues at the next item; an unclaimed one
+                            // keeps today's `KagTaskState::Error` and error
+                            // object. Parser/engine failures (`KagError::Parse`
+                            // and friends) are not script callbacks and stay
+                            // fatal.
+                            if matches!(error, KagError::Host { .. })
+                                && handle_escaped_kag_error(runtime, "KAG parser callback", error)
+                                    .is_ok()
+                            {
+                                return Ok(EngineTickResult {
+                                    state: self.state.clone(),
+                                    reason: KagYieldReason::HandlerYield,
+                                    tags_processed,
+                                    elapsed: started.elapsed(),
+                                });
+                            }
                             self.state = KagTaskState::Error {
                                 message: message.clone(),
                             };
@@ -3556,16 +3644,42 @@ impl KagSession {
         name: &str,
         args: Vec<Variant>,
     ) -> Result<Variant> {
-        call_tag_handler(runtime, handler, name, args).inspect_err(|error| {
-            if error.kind != krkr_tjs2::TjsErrorKind::ResourcePending {
+        match call_tag_handler(runtime, handler, name, args) {
+            Ok(value) => Ok(value),
+            Err(error) if is_resource_pending_error(&error) => Err(error),
+            Err(error) => {
                 runtime
                     .host_mut()
                     .log(&format!("KAG handler `{name}` failed:\n{error}"));
-                self.state = KagTaskState::Error {
-                    message: error.to_string(),
-                };
+                // KAG3 runs its tag handlers out of a `Timer` callback
+                // (`Conductor.tjs:30`, `:55`) on the project's own side, so
+                // they are always inside the reference's script-callback
+                // boundary (`base/ScriptMgnIntf.h:94`; see
+                // `handle_escaped_script_exception`). The engine-driven session
+                // is that boundary here: a claimed exception leaves the failed
+                // tag unapplied -- the handler threw before it could apply it --
+                // and the session `Running` at the next item, while an
+                // unclaimed one keeps today's `KagTaskState::Error` and `Err`.
+                match handle_escaped_script_exception(
+                    runtime,
+                    &format!("KAG tag handler `{name}`"),
+                    error,
+                ) {
+                    // Void is the same "handler produced no step" answer an
+                    // `onUnknownTag` falling off its end gives, so a built-in
+                    // tag the handler failed on still reaches the engine's own
+                    // implementation and an unknown one is simply skipped
+                    // (`apply_tjs_handler_step`).
+                    Ok(()) => Ok(Variant::Void),
+                    Err(error) => {
+                        self.state = KagTaskState::Error {
+                            message: error.to_string(),
+                        };
+                        Err(error)
+                    }
+                }
             }
-        })
+        }
     }
 
     fn process_native_fallback_tag(
@@ -3645,11 +3759,22 @@ impl KagSession {
                 None => self.wait_click(false),
             }),
             NativeFallbackTag::Eval => {
-                execute_eval_tag(runtime, tag)?;
+                // `[eval exp=...]` is game script in every KAG flavour the
+                // reference ships: the engine's own implementation of the tag
+                // is one more caller of it, so the project's
+                // `System.exceptionHandler` decides whether a throwing
+                // expression is fatal here too (see
+                // `handle_escaped_script_exception`). A claimed failure leaves
+                // the tag without an effect and processing on the next tag.
+                if let Err(error) = execute_eval_tag(runtime, tag) {
+                    handle_escaped_script_exception(runtime, "KAG `[eval]` tag", error)?;
+                }
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::Trace => {
-                execute_trace_tag(runtime, tag)?;
+                if let Err(error) = execute_trace_tag(runtime, tag) {
+                    handle_escaped_script_exception(runtime, "KAG `[trace]` tag", error)?;
+                }
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::ClearText => {
@@ -3786,14 +3911,19 @@ impl KagSession {
                     return Ok(TagAction::Continue);
                 };
                 let mut host = EngineKagHost::for_owner(runtime, owner);
-                if hook.call {
-                    parser
-                        .call_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
-                        .map_err(|error| TjsError::runtime(error.to_string()))?;
+                // `[syshook]`/`[syscall]` run the hooked scenario through the
+                // parser, which dispatches `onJump`/`onCall`/`onScenarioLoad`
+                // into game script first: a claimed exception leaves the hook
+                // unentered (the session keeps its current item) instead of
+                // killing the frame.
+                let hooked = if hook.call {
+                    parser.call_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
                 } else {
-                    parser
-                        .go_to_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
-                        .map_err(|error| TjsError::runtime(error.to_string()))?;
+                    parser.go_to_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
+                };
+                if let Err(error) = hooked {
+                    handle_escaped_kag_error(runtime, "KAG system hook callback", error)?;
+                    return Ok(TagAction::Continue);
                 }
                 self.pending_tags.clear();
                 self.state = KagTaskState::Running;
@@ -3809,14 +3939,18 @@ impl KagSession {
                     format!("{target}.ks")
                 };
                 let mut host = EngineKagHost::for_owner(runtime, owner);
-                parser
-                    .load_scenario_with(storage, &mut host)
-                    .map_err(|error| match error {
-                        krkr_kag::KagError::ResourcePending { storage } => {
-                            TjsError::resource_pending(storage)
-                        }
-                        error => TjsError::runtime(error.to_string()),
-                    })?;
+                // `[sysjump]` loads the target scenario through the parser,
+                // which runs the project's `onScenarioLoad`/`onScenarioLoaded`
+                // first: a claimed exception means the jump did not happen, so
+                // the session keeps its own scenario and message layer instead
+                // of killing the frame.
+                if let Err(error) = parser.load_scenario_with(storage, &mut host) {
+                    if let krkr_kag::KagError::ResourcePending { storage } = error {
+                        return Err(TjsError::resource_pending(storage));
+                    }
+                    handle_escaped_kag_error(runtime, "KAG `[sysjump]` scenario load", error)?;
+                    return Ok(TagAction::Continue);
+                }
                 self.pending_tags.clear();
                 self.message_layer.clear();
                 self.state = KagTaskState::Running;
@@ -3998,15 +4132,19 @@ impl KagSession {
         }
 
         let mut host = EngineKagHost::for_owner(runtime, owner);
-        if self.right_click.call {
-            parser
-                .call_with(storage.as_deref(), target.as_deref(), &mut host)
-                .map_err(|error| TjsError::runtime(error.to_string()))?;
+        // The right-click `[call]`/`[jump]` machinery dispatches into game
+        // script through the parser (`onCall`/`onJump`); a claimed exception
+        // leaves the jump unapplied and the session waiting for the next
+        // input instead of killing the frame.
+        let jumped = if self.right_click.call {
+            parser.call_with(storage.as_deref(), target.as_deref(), &mut host)
         } else if self.right_click.jump {
-            parser
-                .go_to_with(storage.as_deref(), target.as_deref(), &mut host)
-                .map_err(|error| TjsError::runtime(error.to_string()))?;
+            parser.go_to_with(storage.as_deref(), target.as_deref(), &mut host)
         } else {
+            return Ok(());
+        };
+        if let Err(error) = jumped {
+            handle_escaped_kag_error(runtime, "KAG right-click jump callback", error)?;
             return Ok(());
         }
 
@@ -20311,6 +20449,491 @@ mod tests {
             "unexpected error text: {}",
             error.message
         );
+    }
+
+    /// The engine-driven KAG session's tag handlers are game script the engine
+    /// calls itself (`KrkrEngine::call_tag_handler`). KAG3 has them called
+    /// from the project's own conductor `Timer` callback (`Conductor.tjs:30`,
+    /// `:55`), i.e. inside `TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION`
+    /// (`base/ScriptMgnIntf.h:94`), so a project handler that claims the
+    /// exception keeps its session: the throwing tag is consumed, the scenario
+    /// continues with the next item, and the handler sees the thrown class.
+    #[test]
+    fn kag_tag_handler_exception_handler_receives_escaped_tjs_exception() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[probe]after[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "kag-tag-handler.tjs",
+                r#"
+                global.handled = 0;
+                global.classSeen = false;
+                System.exceptionHandler = function(e) {
+                    global.handled++;
+                    global.classSeen = e instanceof "ConductorException";
+                    return true;
+                };
+                global.handlerProbe = new Dictionary();
+                handlerProbe.onUnknownTag = function(name, elm) {
+                    class ConductorException extends Exception {
+                        function ConductorException(message) { super.Exception(message); }
+                    }
+                    throw new ConductorException("boom");
+                };
+                "#,
+            )
+            .expect("install exception handler");
+        let handler = expression_object(&mut engine, "handlerProbe");
+        engine.set_kag_handler(handler);
+
+        let tick = engine.tick().expect("handled tag handler error");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(1)
+        );
+        assert_eq!(engine.message_layer().lines, vec!["after".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The unclaimed twin of
+    /// `kag_tag_handler_exception_handler_receives_escaped_tjs_exception`: a
+    /// project with no `System.exceptionHandler` keeps the fatal path and the
+    /// exact error the handler call produced (`TVPShowScriptException`,
+    /// `base/ScriptMgnIntf.cpp:1107`), plus the session's `Error` state.
+    #[test]
+    fn unclaimed_kag_tag_handler_exception_stays_fatal() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[probe]after[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "kag-tag-handler-unclaimed.tjs",
+                r#"
+                global.handlerProbe = new Dictionary();
+                handlerProbe.onUnknownTag = function(name, elm) {
+                    class ConductorException extends Exception {
+                        function ConductorException(message) { super.Exception(message); }
+                    }
+                    throw new ConductorException("boom");
+                };
+                "#,
+            )
+            .expect("install tag handler");
+        let handler = expression_object(&mut engine, "handlerProbe");
+        engine.set_kag_handler(handler);
+
+        let error = engine.tick().expect_err("unclaimed tag handler error");
+
+        assert!(
+            error.message.contains("uncaught exception"),
+            "unexpected error text: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("class=ConductorException|Exception (message=\"boom\")"),
+            "unexpected error text: {}",
+            error.message
+        );
+        assert!(
+            matches!(
+                engine.kag_state(),
+                KagTaskState::Error { message } if message.contains("boom")
+            ),
+            "unexpected session state: {:?}",
+            engine.kag_state()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `[eval exp=...]` is game script in every KAG flavour the reference
+    /// ships, so the engine's own implementation of the tag is one more
+    /// script callback under the project's `System.exceptionHandler`: a
+    /// claimed failure leaves the tag without an effect and the scenario
+    /// continues.
+    #[test]
+    fn kag_eval_tag_exception_handler_receives_escaped_tjs_exception() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[eval exp=\"throwingKAG()\"]after[s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "kag-eval-handler.tjs",
+                r#"
+                class ConductorException extends Exception {
+                    function ConductorException(message) { super.Exception(message); }
+                }
+                global.handled = 0;
+                global.classSeen = false;
+                System.exceptionHandler = function(e) {
+                    global.handled++;
+                    global.classSeen = e instanceof "ConductorException";
+                    return true;
+                };
+                global.throwingKAG = function() {
+                    throw new ConductorException("boom");
+                };
+                "#,
+            )
+            .expect("install exception handler");
+
+        let tick = engine.tick().expect("handled eval error");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(1)
+        );
+        assert_eq!(engine.message_layer().lines, vec!["after".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The unclaimed twin of
+    /// `kag_eval_tag_exception_handler_receives_escaped_tjs_exception`: the
+    /// throwing expression keeps the raw error it produced before.
+    #[test]
+    fn unclaimed_kag_eval_tag_exception_stays_fatal() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[eval exp=\"throwingKAG()\"]after[s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "kag-eval-unclaimed.tjs",
+                r#"
+                class ConductorException extends Exception {
+                    function ConductorException(message) { super.Exception(message); }
+                }
+                global.throwingKAG = function() {
+                    throw new ConductorException("boom");
+                };
+                "#,
+            )
+            .expect("install throwing expression");
+
+        let error = engine.tick().expect_err("unclaimed eval error");
+
+        assert!(
+            error.message.contains("uncaught exception"),
+            "unexpected error text: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("class=ConductorException|Exception (message=\"boom\")"),
+            "unexpected error text: {}",
+            error.message
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The parser's own host callbacks (`onLabel`, `onScript`, `onJump`,
+    /// `onCall`, `onReturn`, `onScenarioLoad`/`Loaded`) and the expressions it
+    /// evaluates for `[if exp=...]`, entities and attribute expressions run
+    /// game script too, so their exceptions go through the project's
+    /// `System.exceptionHandler` as well: the item whose callback threw is
+    /// consumed (only a park rewinds the parser checkpoint,
+    /// `KagParser::next_tag_with`), the session yields that frame and
+    /// continues at the next item.
+    #[test]
+    fn kag_parser_callback_exception_handler_receives_escaped_tjs_exception() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "*start\nafter[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("activeParser", Variant::Object(parser));
+        engine
+            .execute_script(
+                "kag-parser-callbacks.tjs",
+                r#"
+                global.handled = 0;
+                global.classSeen = false;
+                System.exceptionHandler = function(e) {
+                    global.handled++;
+                    global.classSeen = e instanceof "ConductorException";
+                    return true;
+                };
+                activeParser.onLabel = function(label, page) {
+                    class ConductorException extends Exception {
+                        function ConductorException(message) { super.Exception(message); }
+                    }
+                    throw new ConductorException("boom");
+                };
+                "#,
+            )
+            .expect("install parser callbacks");
+
+        let first = engine.tick().expect("handled parser callback error");
+
+        assert_eq!(first.state, KagTaskState::Running);
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        // The engine-driven session's parser callbacks reach the handler with
+        // the rendered error text only: `EngineKagHost` wraps the escaping
+        // `TjsError` in `KagError::Host` (`crates/krkr-engine/src/kag.rs`), so
+        // the reconstructed exception carries the `Exception` class instead of
+        // the project's own. The game-driven path keeps it
+        // (`kag_parser_native_callback_exception_reaches_the_handler_with_its_class`);
+        // this is the filed follow-up, not a silent difference.
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(0)
+        );
+
+        let second = engine.tick().expect("continued session");
+        assert_eq!(second.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["after".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The unclaimed twin of
+    /// `kag_parser_callback_exception_handler_receives_escaped_tjs_exception`:
+    /// the parser's own error object and the session's `Error` state stay what
+    /// they were.
+    #[test]
+    fn unclaimed_kag_parser_callback_exception_stays_fatal() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "*start\nafter[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("activeParser", Variant::Object(parser));
+        engine
+            .execute_script(
+                "kag-parser-callbacks-unclaimed.tjs",
+                r#"
+                activeParser.onLabel = function(label, page) {
+                    class ConductorException extends Exception {
+                        function ConductorException(message) { super.Exception(message); }
+                    }
+                    throw new ConductorException("boom");
+                };
+                "#,
+            )
+            .expect("install parser callbacks");
+
+        let error = engine.tick().expect_err("unclaimed parser callback error");
+
+        assert!(
+            error
+                .message
+                .contains("class=ConductorException|Exception (message=\"boom\")"),
+            "unexpected error text: {}",
+            error.message
+        );
+        assert!(
+            matches!(engine.kag_state(), KagTaskState::Error { .. }),
+            "unexpected session state: {:?}",
+            engine.kag_state()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The KAG loop's own resume (`KagParser`/`run_until_yield_with_parser`):
+    /// when a host tears down the modal a tag handler parked on, the session
+    /// resumes that callback itself, and the exception it throws on the way
+    /// back is the callback's -- it reaches `System.exceptionHandler` and a
+    /// claimed one clears the wait instead of killing the frame.
+    #[test]
+    fn kag_session_resume_exception_handler_receives_escaped_tjs_exception() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "parked-kag.tjs",
+                r#"
+                class ConductorException extends Exception {
+                    function ConductorException(message) { super.Exception(message); }
+                }
+                global.handled = 0;
+                global.classSeen = false;
+                System.exceptionHandler = function(e) {
+                    global.handled++;
+                    global.classSeen = e instanceof "ConductorException";
+                    return true;
+                };
+                global.modal = new Window();
+                global.modal.showModal();
+                throw new ConductorException("boom");
+                "#,
+            )
+            .expect("park the script on a modal");
+        assert!(engine.is_script_suspended());
+
+        // A host that tears the modal down without resuming leaves the session
+        // with no modal to wait for; the KAG loop resumes the parked script.
+        let modal = object_handle(&engine, "modal");
+        engine.tjs_runtime_mut().host_mut().pop_modal_window(modal);
+        engine.kag_session.state = KagTaskState::Running;
+
+        let tick = engine.tick().expect("handled resumed KAG callback error");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert!(!engine.is_script_suspended());
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(1)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The unclaimed twin of
+    /// `kag_session_resume_exception_handler_receives_escaped_tjs_exception`.
+    #[test]
+    fn unclaimed_kag_session_resume_exception_stays_fatal() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "A[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "parked-kag-unclaimed.tjs",
+                r#"
+                class ConductorException extends Exception {
+                    function ConductorException(message) { super.Exception(message); }
+                }
+                global.modal = new Window();
+                global.modal.showModal();
+                throw new ConductorException("boom");
+                "#,
+            )
+            .expect("park the script on a modal");
+        assert!(engine.is_script_suspended());
+
+        let modal = object_handle(&engine, "modal");
+        engine.tjs_runtime_mut().host_mut().pop_modal_window(modal);
+        engine.kag_session.state = KagTaskState::Running;
+
+        let error = engine
+            .tick()
+            .expect_err("unclaimed resumed KAG callback error");
+
+        assert!(
+            error
+                .message
+                .contains("class=ConductorException|Exception (message=\"boom\")"),
+            "unexpected error text: {}",
+            error.message
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The game-driven flavour of the same contract: KAG3's Conductor calls
+    /// `KAGParser.getNextTag()` from its own `Timer` callback
+    /// (`Conductor.tjs:30`, `:55`), so the exception a parser host callback
+    /// raises has to reach `System.exceptionHandler` with the project's thrown
+    /// object intact -- `KagError` carries only the rendered text, and
+    /// `Initialize.tjs:18-36` decides on `e instanceof "ConductorException"`.
+    #[test]
+    fn kag_parser_native_callback_exception_reaches_the_handler_with_its_class() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "*start\nA[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine
+            .execute_script(
+                "kag-parser-timer.tjs",
+                r#"
+                global.handled = 0;
+                global.classSeen = false;
+                System.exceptionHandler = function(e) {
+                    global.handled++;
+                    global.classSeen = e instanceof "ConductorException";
+                    return true;
+                };
+                global.parserProbe = new KAGParser();
+                global.parserProbe.onLabel = function(label, page) {
+                    class ConductorException extends Exception {
+                        function ConductorException(message) { super.Exception(message); }
+                    }
+                    throw new ConductorException("boom");
+                };
+                global.parserProbe.loadScenario("first.ks");
+                global.conductorProbe = new Timer(function() {
+                    global.parserProbe.getNextTag();
+                }, "");
+                conductorProbe.interval = 1000;
+                conductorProbe.enabled = true;
+                "#,
+            )
+            .expect("install parser probe");
+        let timer = object_handle(&engine, "conductorProbe");
+        force_timer_due(&mut engine, timer);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(16),
+            )
+            .expect("handled parser callback error");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(1)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Closes the fixture's modal window so the next `update` resumes the

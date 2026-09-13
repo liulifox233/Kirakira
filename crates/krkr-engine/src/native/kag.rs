@@ -175,9 +175,8 @@ fn kag_load_scenario(
         true,
         |parser, vm, owner| {
             let mut host = TjsKagHost::new(vm, owner);
-            parser
-                .load_scenario_with(storage, &mut host)
-                .map_err(kag_to_tjs)?;
+            let loaded = parser.load_scenario_with(storage, &mut host);
+            loaded.map_err(|error| host.script_exception_or(error))?;
             Ok(Variant::Void)
         },
     )
@@ -266,7 +265,10 @@ fn kag_get_next_tag(
             // consumed, so the retry cannot silently skip startup hooks such
             // as a game's opening/logo sequence).  The VM retries this native
             // call once the asset arrives.
-            let Some(tag) = parser.next_tag_with(&mut host).map_err(kag_to_tjs)? else {
+            let Some(tag) = parser
+                .next_tag_with(&mut host)
+                .map_err(|error| host.script_exception_or(error))?
+            else {
                 host.vm
                     .runtime_mut()
                     .host_mut()
@@ -678,9 +680,8 @@ fn sync_parser_from_members(
         && parser.cur_storage() != Some(storage.as_str())
     {
         let mut host = TjsKagHost::new(vm, handle);
-        parser
-            .load_scenario_with(storage, &mut host)
-            .map_err(kag_to_tjs)?;
+        let loaded = parser.load_scenario_with(storage, &mut host);
+        loaded.map_err(|error| host.script_exception_or(error))?;
     }
 
     Ok(())
@@ -762,28 +763,72 @@ fn refresh_kag_parser_members_from_parser(
 struct TjsKagHost<'a, 'bc, 'rt> {
     vm: &'a mut Vm<'bc, 'rt, KrkrHost>,
     owner: ObjectHandle,
+    /// The `TjsError` behind the last script failure this host wrapped into a
+    /// `KagError::Host`, kept until the native method that drove the parser
+    /// can hand it back to the VM.
+    ///
+    /// A KAG host callback (`onScenarioLoad`/`onLabel`/`onScript`/`onJump`/
+    /// `onCall`/`onReturn`) and every expression the parser evaluates run game
+    /// script, and the reference delivers the exception that escapes them to
+    /// `System.exceptionHandler` unchanged (`TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION`,
+    /// `base/ScriptMgnIntf.h:94`; see `handle_escaped_script_exception`).
+    /// `KagError` can only carry the rendered text, so without this the
+    /// handler would see a plain `Exception` where the game threw e.g. a
+    /// `ConductorException` -- `e instanceof ConductorException` in
+    /// `Initialize.tjs:18-36` would stop deciding.
+    script_exception: Option<TjsError>,
 }
 
 impl<'a, 'bc, 'rt> TjsKagHost<'a, 'bc, 'rt> {
     fn new(vm: &'a mut Vm<'bc, 'rt, KrkrHost>, owner: ObjectHandle) -> Self {
-        Self { vm, owner }
+        Self {
+            vm,
+            owner,
+            script_exception: None,
+        }
+    }
+
+    /// Wraps a script failure for the parser (the `kag_tjs_error` mapping)
+    /// while remembering the original error for [`Self::script_exception_or`].
+    fn script_error(&mut self, error: TjsError) -> KagError {
+        let wrapped = kag_tjs_error(error.clone());
+        if matches!(wrapped, KagError::Host { .. }) {
+            self.script_exception = Some(error);
+        }
+        wrapped
+    }
+
+    /// [`Self::script_error`] for a whole script result.
+    fn wrap_script<T>(&mut self, result: Result<T>) -> krkr_kag::Result<T> {
+        result.map_err(|error| self.script_error(error))
+    }
+
+    /// The `TjsError` the VM should see for a parser failure: the original
+    /// script exception when the parser's error came from a host callback,
+    /// otherwise the plain host conversion. A park
+    /// (`KagError::ResourcePending` / `KagError::HostSuspended`) never sets
+    /// the stash, so those keep their own marker.
+    fn script_exception_or(&mut self, error: KagError) -> TjsError {
+        match self.script_exception.take() {
+            Some(script) if matches!(error, KagError::Host { .. }) => script,
+            _ => kag_to_tjs(error),
+        }
     }
 
     fn call_event(&mut self, name: &str, args: Vec<Variant>) -> krkr_kag::Result<Option<Variant>> {
         self.ensure_not_suspended()?;
-        if matches!(
-            self.vm
-                .runtime_mut()
-                .resolve_object_member(self.owner, name)
-                .map_err(kag_tjs_error)?,
-            Variant::Void
-        ) {
+        let member = self
+            .vm
+            .runtime_mut()
+            .resolve_object_member(self.owner, name);
+        if matches!(member.map_err(kag_tjs_error)?, Variant::Void) {
             return Ok(None);
         }
-        self.vm
-            .call_object_method(self.owner, name, args)
-            .map(Some)
-            .map_err(kag_tjs_error)
+        let value = self.vm.call_object_method(self.owner, name, args);
+        match value {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(self.script_error(error)),
+        }
     }
 
     /// Rejects a host callback while a nested script call is parked on an
@@ -825,16 +870,20 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
     }
 
     fn load_scenario(&mut self, storage: &str) -> krkr_kag::Result<String> {
-        self.vm
+        let text = self
+            .vm
             .runtime_mut()
             .host_mut()
-            .read_text_storage_for_tjs(storage)
-            .map_err(|error| match error.kind {
-                TjsErrorKind::ResourcePending => krkr_kag::KagError::ResourcePending {
+            .read_text_storage_for_tjs(storage);
+        match text {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind == TjsErrorKind::ResourcePending => {
+                Err(krkr_kag::KagError::ResourcePending {
                     storage: storage.to_string(),
-                },
-                _ => kag_tjs_error(error),
-            })
+                })
+            }
+            Err(error) => Err(self.script_error(error)),
+        }
     }
 
     fn on_scenario_load(
@@ -862,19 +911,22 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
 
     fn eval_bool(&mut self, expression: &str) -> krkr_kag::Result<bool> {
         self.ensure_not_suspended()?;
-        Ok(eval_expression(self.vm.runtime_mut(), self.owner, expression)?.is_truthy())
+        let value = eval_expression(self.vm.runtime_mut(), self.owner, expression);
+        Ok(self.wrap_script(value)?.is_truthy())
     }
 
     fn eval_string(&mut self, expression: &str) -> krkr_kag::Result<String> {
         self.ensure_not_suspended()?;
-        eval_expression(self.vm.runtime_mut(), self.owner, expression)?
+        let value = eval_expression(self.vm.runtime_mut(), self.owner, expression);
+        self.wrap_script(value)?
             .to_tjs_string()
             .map_err(kag_host_error)
     }
 
     fn eval_attribute(&mut self, expression: &str) -> krkr_kag::Result<Option<String>> {
         self.ensure_not_suspended()?;
-        match eval_expression(self.vm.runtime_mut(), self.owner, expression)? {
+        let value = eval_expression(self.vm.runtime_mut(), self.owner, expression);
+        match self.wrap_script(value)? {
             Variant::Void => Ok(None),
             value => value.to_tjs_string().map(Some).map_err(kag_host_error),
         }
@@ -914,9 +966,9 @@ impl KagHost for TjsKagHost<'_, '_, '_> {
             )?
             .is_none()
         {
-            execute_script_on_runtime(self.vm.runtime_mut(), event.storage, event.script)
-                .map(|_| ())
-                .map_err(kag_tjs_error)?;
+            let script =
+                execute_script_on_runtime(self.vm.runtime_mut(), event.storage, event.script);
+            self.wrap_script(script.map(|_| ()))?;
         }
         Ok(())
     }
@@ -1222,9 +1274,8 @@ fn ensure_snapshot_storage_loaded(
         Ok(()) => Ok(()),
         Err(KagError::ScenarioNotLoaded { .. }) => {
             let mut host = TjsKagHost::new(vm, owner);
-            parser
-                .load_scenario_with(storage.to_string(), &mut host)
-                .map_err(kag_to_tjs)
+            let loaded = parser.load_scenario_with(storage.to_string(), &mut host);
+            loaded.map_err(|error| host.script_exception_or(error))
         }
         Err(error) => Err(kag_to_tjs(error)),
     }
@@ -1262,13 +1313,16 @@ pub(crate) fn kag_to_tjs(error: krkr_kag::KagError) -> TjsError {
     }
 }
 
+/// Evaluates a KAG expression as the hosting parser object: the caller maps
+/// the failure itself (`TjsKagHost::script_error`) so the original exception
+/// survives the parser round trip.
+#[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
 fn eval_expression(
     runtime: &mut Runtime<KrkrHost>,
     owner: ObjectHandle,
     expression: &str,
-) -> krkr_kag::Result<Variant> {
+) -> Result<Variant> {
     execute_expression_on_runtime_with_this(runtime, expression, expression, Some(owner))
-        .map_err(kag_tjs_error)
 }
 
 fn kag_host_error(error: impl std::fmt::Display) -> KagError {
