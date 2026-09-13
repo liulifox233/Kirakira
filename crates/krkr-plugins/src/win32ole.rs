@@ -70,11 +70,18 @@
 //!   `getConstant` converts a given target with `AsObject` (`:621`);
 //!   `setPos`/`setSize` need two each, because ncbind's `Method` wrapper
 //!   rejects a short call (`ncbind.hpp:1186`).
-//! * Any member reached without a native instance — `WIN32OLE.invoke(...)` on
+//! * A member reached without a native instance — `WIN32OLE.invoke(...)` on
 //!   the class object, and an object whose factory never ran — answers
 //!   `TJS_E_NATIVECLASSCRASH`, not an instance answer (`ncbind.hpp:1547` for
-//!   `RawCallback`, `:1133` for `Method`, `:1486` for a property); the factory
-//!   that removes that state is the subject of the next section.
+//!   the `T *` `RawCallback` flavour, `:1191` for `Method`, `:1486` for a
+//!   property). The exception is the arity three of them validate first:
+//!   `addEvent` counts in the callback body ahead of its `!self` check
+//!   (`main.cpp:517-522`, the `tTJSNativeClassMethodCallback` wrapper at
+//!   `ncbind.hpp:1566-1589` has no instance check of its own) and
+//!   `setPos`/`setSize` count inside `Method` ahead of its instance getter
+//!   (`ncbind.hpp:1186` then `:1191`), so a short call to those is
+//!   `TJS_E_BADPARAMCOUNT` on every receiver. The factory that removes the
+//!   no-instance state is the subject of the next section.
 //!
 //! # The split this port is built on
 //!
@@ -119,10 +126,12 @@
 //!   without one (`tTJSNativeClass::FuncCall`, `tjsNative.cpp:302-321`, whose
 //!   `CreateNativeInstance` answers NULL, `tjsNative.h:204`), so a
 //!   `class X extends WIN32OLE` instance that never calls
-//!   `super.WIN32OLE(name)` answers `TJS_E_NATIVECLASSCRASH` from every
-//!   member — the same NULL instance lookup as a class-object call
-//!   (`ncbind.hpp:1049-1052`, `:1547`). `super.WIN32OLE(name)` runs the
-//!   factory on the instance and attaches it (`main.cpp:225-233`).
+//!   `super.WIN32OLE(name)` answers `TJS_E_NATIVECLASSCRASH` from its members
+//!   — the same NULL instance lookup as a class-object call
+//!   (`ncbind.hpp:1049-1052`, `:1547`) — except for `addEvent` and
+//!   `setPos`/`setSize`, which reject a short call first as above.
+//!   `super.WIN32OLE(name)` runs the factory on the instance and attaches it
+//!   (`main.cpp:225-233`).
 //! * `missing(set, name, value)` — the instance's missing-member hook
 //!   (`main.cpp:213-214`). It answers 0/false in both directions because the
 //!   guarded `invoke` fails, i.e. it *declines* (`ret` is assigned, `:322-324`
@@ -207,7 +216,9 @@ pub(crate) const META: PluginMeta = PluginMeta {
             rule), the ActiveX geometry state, and every error answer. The classes' constructor \
             members (`WIN32OLE`/`ActiveX`, NCB's class-name NCM) run the factory on the instance, \
             so `super.WIN32OLE(name)` attaches the OLE instance while members reached without one \
-            answer TJS_E_NATIVECLASSCRASH, like the reference's missing native instance. The \
+            answer TJS_E_NATIVECLASSCRASH, like the reference's missing native instance — a short \
+            call to addEvent/setPos/setSize reports its count first, as the reference validates \
+            those ahead of the instance lookup. The \
             COM/IDispatch transport is Windows-only and absent on every target this crate builds \
             for, so every object is created in the state the reference leaves when \
             CLSIDFromProgID/CoCreateInstance fail: invoke/set/get always report TJS_E_FAIL, \
@@ -282,10 +293,34 @@ const OLE_INSTANCE_MARKER: &str = "__win32ole_instance";
 /// minus `finalize`: ncbind adds that one as a native class *method*
 /// (`ncbind.hpp:1875-1877`, whose callback is empty), so it answers void on
 /// every receiver instead of going through the instance lookup.
-const OLE_METHODS: &[&str] = &["invoke", "set", "get", "missing", "addEvent", "getConstant"];
+///
+/// The count column is the arity the reference validates *before* it looks for
+/// a native instance, which is what makes a short call `TJS_E_BADPARAMCOUNT`
+/// rather than `TJS_E_NATIVECLASSCRASH`: `addEvent` binds the
+/// `tTJSNativeClassMethodCallback` flavour of `RawCallback`, whose wrapper
+/// only forwards to the callback (`ncbind.hpp:1566-1589`) and leaves
+/// `numparams < 1` to the body, ahead of its own `!self` check
+/// (`main.cpp:517-522`). The other members check the instance first
+/// (`ncbind.hpp:1547` for the `T *` flavour `invoke`/`set`/`get`/`missing` use,
+/// `main.cpp:617-619` for `getConstant`).
+const OLE_METHODS: &[(&str, NativeArgCount)] = &[
+    ("invoke", NativeArgCount::Any),
+    ("set", NativeArgCount::Any),
+    ("get", NativeArgCount::Any),
+    ("missing", NativeArgCount::Any),
+    ("addEvent", NativeArgCount::AtLeast(1)),
+    ("getConstant", NativeArgCount::Any),
+];
 
-/// `ActiveX`'s own additions to that list (`main.cpp:1177-1179`).
-const ACTIVEX_METHODS: &[&str] = &["setExternalUI", "setPos", "setSize"];
+/// `ActiveX`'s own additions to that list (`main.cpp:1177-1179`), with the
+/// arity ncbind's `Method` wrapper validates ahead of the instance getter
+/// (`ncbind.hpp:1186`, then `:1191`) — `setPos` and `setSize` declare two
+/// parameters, `setExternalUI` none.
+const ACTIVEX_METHODS: &[(&str, NativeArgCount)] = &[
+    ("setExternalUI", NativeArgCount::Any),
+    ("setPos", NativeArgCount::AtLeast(2)),
+    ("setSize", NativeArgCount::AtLeast(2)),
+];
 
 /// `ActiveX`'s properties (`main.cpp:1180-1185`).
 const ACTIVEX_PROPERTIES: &[(&str, NativePropertyAccess)] = &[
@@ -335,24 +370,27 @@ fn install_class_name_constructor(
 }
 
 /// The class object carries the reference's member table because NCB registers
-/// the members on it (`main.cpp:644-652`, `:1169-1186`), and every one of them
-/// answers `TJS_E_NATIVECLASSCRASH` there: NCB looks the calling object's
+/// the members on it (`main.cpp:644-652`, `:1169-1186`), and a member reached
+/// there answers `TJS_E_NATIVECLASSCRASH`: NCB looks the calling object's
 /// native instance up before it runs a callback and reports exactly that when
-/// there is none (`ncbind.hpp:1547`, `:1133`, `:1486`). `activex` selects the
-/// `ActiveX` additions.
+/// there is none (`ncbind.hpp:1547`, `:1133`, `:1486`). The three members whose
+/// wrapper or body validates `numparams` first answer `TJS_E_BADPARAMCOUNT` to
+/// a short call instead, and declare that count here so the engine rejects it
+/// before this handler runs (`ncbind.hpp:1186` before `:1191`, `:1566-1589`
+/// with `main.cpp:517-522`). `activex` selects the `ActiveX` additions.
 fn install_class_members(runtime: &mut Runtime<KrkrHost>, class: ObjectHandle, activex: bool) {
     // ncbind's empty `finalize` is a native class method, not a callback with
     // an instance lookup, so it answers void on the class object too
     // (`ncbind.hpp:1875-1877`).
     runtime.register_object_native(class, "finalize", returns_void);
-    for name in OLE_METHODS {
-        runtime.register_object_native(class, *name, no_native_instance);
+    for (name, arg_count) in OLE_METHODS {
+        runtime.register_object_native_with_arg_count(class, *name, *arg_count, no_native_instance);
     }
     if !activex {
         return;
     }
-    for name in ACTIVEX_METHODS {
-        runtime.register_object_native(class, *name, no_native_instance);
+    for (name, arg_count) in ACTIVEX_METHODS {
+        runtime.register_object_native_with_arg_count(class, *name, *arg_count, no_native_instance);
     }
     for (name, access) in ACTIVEX_PROPERTIES {
         runtime.register_object_native_property_with_access(
@@ -366,7 +404,10 @@ fn install_class_members(runtime: &mut Runtime<KrkrHost>, class: ObjectHandle, a
 }
 
 /// A class-object call: `GetNativeInstance` finds nothing, which NCB answers
-/// with `TJS_E_NATIVECLASSCRASH` (`ncbind.hpp:1547`).
+/// with `TJS_E_NATIVECLASSCRASH` (`ncbind.hpp:1547`). Members that validate
+/// `numparams` before the lookup never reach it with too few arguments
+/// (`ncbind.hpp:1186`, `main.cpp:517-522`), which is why the arity is declared
+/// at the registration site.
 fn no_native_instance(
     _runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -675,14 +716,22 @@ fn is_clsid_text(text: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The members `NCB_REGISTER_CLASS(WIN32OLE)` registers (`main.cpp:644-652`)
-/// plus ncbind's `finalize` (`ncbind.hpp:1875-1877`).
+/// plus ncbind's `finalize` (`ncbind.hpp:1875-1877`), with the same declared
+/// arities as the class object above — the callback reads its arguments in the
+/// same order on an instance, so a short call is `TJS_E_BADPARAMCOUNT` there
+/// too, ahead of the instance lookup (`main.cpp:517-522`).
 fn install_ole_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.register_object_native(handle, "finalize", returns_void);
     runtime.register_object_native(handle, "invoke", dispatch_member);
     runtime.register_object_native(handle, "set", dispatch_member);
     runtime.register_object_native(handle, "get", dispatch_member);
     runtime.register_object_native(handle, "missing", ole_missing);
-    runtime.register_object_native(handle, "addEvent", ole_add_event);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "addEvent",
+        NativeArgCount::AtLeast(1),
+        ole_add_event,
+    );
     runtime.register_object_native(handle, "getConstant", ole_get_constant);
 }
 
@@ -721,17 +770,20 @@ fn ole_missing(
     Ok(Variant::Integer(0))
 }
 
-/// `WIN32OLE::_addEventMethod` (`main.cpp:516-538`).
+/// `WIN32OLE::_addEventMethod` (`main.cpp:516-538`). The reference validates
+/// `numparams < 1` in the callback body (`:517-519`) and only then the native
+/// instance (`:520-522`), so a short call is `TJS_E_BADPARAMCOUNT` even on a
+/// receiver whose instance lookup would fail; the count is declared at the
+/// registration sites and re-checked here in that order.
 fn ole_add_event(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    require_ole_instance(runtime, this_obj)?;
-    // `numparams < 1` (`main.cpp:517-519`).
     let Some(name) = args.first() else {
         return Err(TjsError::bad_param_count());
     };
+    require_ole_instance(runtime, this_obj)?;
     let name = name.to_tjs_string()?;
     if let Some(receiver) = args.get(1) {
         // `param[1]->AsObject()` (`main.cpp:526`); the null object answers a
@@ -1451,9 +1503,13 @@ mod tests {
         ));
     }
 
-    /// `ncbind.hpp:1547`, `:1133`, `:1486`: a class-object call has no native
+    /// `ncbind.hpp:1547`, `:1191`, `:1486`: a class-object call has no native
     /// instance behind it, so it answers `TJS_E_NATIVECLASSCRASH` rather than
-    /// running an instance member.
+    /// running an instance member — except for the three members whose arity is
+    /// validated first, which reject a short call with
+    /// `TJS_E_BADPARAMCOUNT` (`ncbind.hpp:1186` before `:1191`,
+    /// `main.cpp:517-522` behind the `tTJSNativeClassMethodCallback` wrapper's
+    /// forwarding `ncbind.hpp:1566-1589`).
     #[test]
     fn class_object_calls_have_no_native_instance() {
         let mut engine = engine();
@@ -1476,6 +1532,17 @@ mod tests {
             let error = eval_error(&mut engine, source);
             assert_eq!(error.kind, TjsErrorKind::NativeClassCrash, "{source}");
             assert_eq!(error.message, "Invalid object context", "{source}");
+        }
+
+        // Arity first, instance lookup second.
+        for source in [
+            "WIN32OLE.addEvent()",
+            "ActiveX.setPos(1)",
+            "ActiveX.setSize(1)",
+        ] {
+            let error = eval_error(&mut engine, source);
+            assert_eq!(error.kind, TjsErrorKind::BadParamCount, "{source}");
+            assert_eq!(error.message, "Invalid argument count", "{source}");
         }
 
         // A read-only class property still refuses the write first: NCB's
@@ -1550,9 +1617,10 @@ mod tests {
     /// instance is registered by the factory (`ncbind.hpp:186-192`), and the
     /// class-body call that `class X extends WIN32OLE` makes only copies the
     /// class members (`tTJSNativeClass::FuncCall`, `tjsNative.cpp:302-321`).
-    /// Every member then answers `TJS_E_NATIVECLASSCRASH`
+    /// Its members then answer `TJS_E_NATIVECLASSCRASH`
     /// (`ncbind.hpp:1049-1052`, `:1547`), the geometry and window properties
-    /// included.
+    /// included, and only the arity three reject a short call first
+    /// (`ncbind.hpp:1186` before `:1191`, `main.cpp:517-522`).
     #[test]
     fn a_subclass_without_the_super_call_has_no_ole_instance() {
         let mut engine = engine();
@@ -1585,6 +1653,13 @@ mod tests {
             let error = eval_error(&mut engine, source);
             assert_eq!(error.kind, TjsErrorKind::NativeClassCrash, "{source}");
             assert_eq!(error.message, "Invalid object context", "{source}");
+        }
+
+        // Arity before the instance lookup, on this receiver too.
+        for source in ["bare.addEvent()", "bareAx.setPos(1)", "bareAx.setSize(1)"] {
+            let error = eval_error(&mut engine, source);
+            assert_eq!(error.kind, TjsErrorKind::BadParamCount, "{source}");
+            assert_eq!(error.message, "Invalid argument count", "{source}");
         }
 
         // The instance's own members and the class-name member keep working:
