@@ -442,7 +442,7 @@ pub const CATALOG: &[PluginEntry] = &[
         name: "layerExShimmer.dll",
         aliases: &["LayerExShimmer.dll"],
         family: PluginFamily::Layer,
-        source: "http://keepcreating.g2.xrea.com/krkrplugins/ShimmerPlugin/layerExShimmer.zip",
+        source: "https://github.com/uyjulian/layerExShimmer (KAICHO Soft ShimmerPlugin 0.3.1.0; also http://keepcreating.g2.xrea.com/krkrplugins/ShimmerPlugin/layerExShimmer.zip)",
         parquet: false,
         meta: crate::layer_ex_shimmer::META,
     },
