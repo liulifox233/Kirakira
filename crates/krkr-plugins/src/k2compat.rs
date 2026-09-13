@@ -16,17 +16,25 @@
 //! Kirakira delivers touch and mouse input as the ordinary KRKR pointer
 //! callbacks (`Window.onMouseDown/Move/Up`, `Layer.onMouse*`) — see
 //! `EngineEvent::TouchInput` in krkr-engine — and no engine code dispatches
-//! `onTouchMouse*`. A plugin module installs its surface at registration time
-//! and cannot hook that dispatch from here, so `TouchMouse` is inert beyond its
-//! shape: `enabled` stores the flag and the five callbacks are callable no-ops.
-//! Handlers a script assigns to them are kept but never invoked.
+//! `onTouchMouse*`, so a game that drives its touch input through these
+//! callbacks does not receive the engine's input that way. The five callbacks
+//! are not inert, though: they carry the *reference's* arities and forwarding
+//! (`k2compat.dll` `0x10004390`-`0x100048d0`, each `SimpleBinder` member
+//! rejecting short calls), so a script — or a hook list, as GINKA's
+//! `MouseGestureBase` hands its instance to one — that calls one lands on the
+//! Window's same-kind `on*` event with the arguments converted to integers.
+//! The Window is `Window.mainWindow` (the object the engine delivers its own
+//! pointer events to); which window the DLL resolves internally is the one gap
+//! this port cannot pin from the binary, as is the reference's delivery — its
+//! handler path posts through the Window's draw device, so the reference's
+//! `on*` may run on a later turn where the port's runs inline.
 //! `ModelessOwnerWindow` is an empty class object, enough for the dossier's
 //! `typeof`-only probe; no member is claimed because none was recovered.
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
     Result,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 
 use crate::catalog::{PluginMeta, PluginStatus};
@@ -34,7 +42,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "Window.TouchMouse and ModelessOwnerWindow",
-    notes: "TouchMouse is the WindowTouchMouse class object the DLL binds: `new Window.TouchMouse(owner)` yields an instance carrying `enabled` and the five onTouchMouse* callbacks (the class object carries them too, so a script can read `Window.TouchMouse.enabled` without constructing one). The surface is inert: `enabled` stores the flag and the callbacks are callable no-ops the engine never invokes (Kirakira routes touch/mouse input to the KRKR pointer callbacks Window/Layer onMouseDown/Move/Up, and a plugin module cannot hook that dispatch). ModelessOwnerWindow is an empty class object: the dossier could not recover its member list, so none is claimed.",
+    notes: "TouchMouse is the WindowTouchMouse class object the DLL binds: `new Window.TouchMouse(owner)` yields an instance carrying `enabled` and the five onTouchMouse* callbacks (the class object carries them too, so a script can read `Window.TouchMouse.enabled` without constructing one). The five callbacks carry the reference's arities (onTouchMouseDown/Up >=4, onTouchMouseMove >=3, onTouchMouseClick/DblClick >=2; ncbind/SimpleBinder reject short calls) and the reference's forwarding: each calls the Window's same-kind `on*` event (onMouseDown/Up/Move, onClick, onDoubleClick) with the arguments converted to integers. The port forwards to `Window.mainWindow`, the object the engine delivers its own pointer events to; which window the DLL resolves internally could not be pinned from the binary. The engine itself never dispatches onTouchMouse* (Kirakira routes touch/mouse input to the KRKR pointer callbacks Window/Layer onMouseDown/Move/Up, and a plugin module cannot hook that dispatch). ModelessOwnerWindow is an empty class object: the dossier could not recover its member list, so none is claimed.",
     install: |engine| engine.register_plugin(K2CompatPlugin),
 };
 pub struct K2CompatPlugin;
@@ -51,13 +59,28 @@ impl KrkrPlugin for K2CompatPlugin {
     }
 }
 
-/// The callbacks the DLL's class carries (`docs/plugins/k2compat.md`).
-const TOUCH_MOUSE_EVENTS: &[&str] = &[
-    "onTouchMouseDown",
-    "onTouchMouseMove",
-    "onTouchMouseUp",
-    "onTouchMouseClick",
-    "onTouchMouseDblClick",
+/// The five callbacks, with the reference's `ArgsCount` and the `Window` event
+/// each one forwards to.
+///
+/// The arities are `cmpl` thresholds in `k2compat.dll`'s SimpleBinder members,
+/// cross-checked against the ncbind rule `numparams < ArgsCount` →
+/// `TJS_E_BADPARAMCOUNT`: `onTouchMouseDown` ≥4 (`0x100044d0`, `cmpl $0x4` at
+/// `0x100044f4`), `onTouchMouseUp` ≥4 (`0x10004640`, `0x10004664`),
+/// `onTouchMouseMove` ≥3 (`0x10004390`, `0x100043b4`), `onTouchMouseClick` ≥2
+/// (`0x100047b0`, `0x100047d3`), `onTouchMouseDblClick` ≥2 (`0x100048d0`,
+/// `0x100048f3`).
+///
+/// Each body resolves the Window's same-kind handler and calls it with the
+/// arguments converted to integers, in order: `onMouseDown`/`onMouseUp` get all
+/// four (`0x10004563-0x10004621` pushes args[3], args[2], args[1], args[0] into
+/// the call), `onMouseMove` three, `onClick`/`onDoubleClick` two. The class
+/// table that installs them is built in `FUN_10004cc0`.
+const TOUCH_MOUSE_EVENTS: &[(&str, usize, &str)] = &[
+    ("onTouchMouseDown", 4, "onMouseDown"),
+    ("onTouchMouseUp", 4, "onMouseUp"),
+    ("onTouchMouseMove", 3, "onMouseMove"),
+    ("onTouchMouseClick", 2, "onClick"),
+    ("onTouchMouseDblClick", 2, "onDoubleClick"),
 ];
 
 /// Members the dossier recovered for `ModelessOwnerWindow`: none. The empty
@@ -95,6 +118,10 @@ fn install_window_touch_mouse(runtime: &mut Runtime<KrkrHost>) {
     runtime.set_object_member(window, "TouchMouse", Variant::Object(touch_mouse));
 }
 
+// `result_large_err` is the crate-wide `TjsError` size lint every native
+// handler closure carries (`http_request.rs`/`sqlite3.rs` allow it too); the
+// new forwarding closures must not add instances of it.
+#[allow(clippy::result_large_err)]
 fn install_touch_mouse_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.set_object_member(handle, "__enabled", Variant::Integer(0));
     runtime.register_object_native_property(
@@ -123,9 +150,53 @@ fn install_touch_mouse_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHa
             Ok(())
         },
     );
-    for event in TOUCH_MOUSE_EVENTS {
-        runtime.register_object_native(handle, *event, native_void);
+    for (event, arg_count, target) in TOUCH_MOUSE_EVENTS {
+        let (event, target) = (*event, *target);
+        runtime.register_object_native_with_arg_count(
+            handle,
+            event,
+            NativeArgCount::AtLeast(*arg_count),
+            move |runtime: &mut Runtime<KrkrHost>,
+                  _this_obj: Option<ObjectHandle>,
+                  args: Vec<Variant>| {
+                let Some(window) = main_window(runtime) else {
+                    return Ok(Variant::Void);
+                };
+                // Through the dispatch path: the handler may be a script
+                // function (a raw member) or a native property.
+                let handler = runtime.resolve_object_member(window, target)?;
+                if matches!(handler, Variant::Void) {
+                    return Ok(Variant::Void);
+                }
+                // The DLL hands the event on with every argument converted to
+                // an integer (`tTJSVariant::operator tjs_int`), in order.
+                let forwarded = args
+                    .iter()
+                    .map(Variant::to_integer)
+                    .collect::<Result<Vec<i64>>>()?
+                    .into_iter()
+                    .map(Variant::Integer)
+                    .collect();
+                runtime.call_function(handler, forwarded)?;
+                Ok(Variant::Void)
+            },
+        );
     }
+}
+
+/// The Window the touch-mouse callbacks forward to: the engine's main window
+/// (`Window.mainWindow`, the object its own pointer events are delivered to).
+///
+/// The DLL resolves the target itself (`FUN_100040e0` reads the Window handler
+/// through the class store and posts the event to it); a script-side probe of
+/// which window that is would need the real engine, so the port pins it to the
+/// process's main window and reports the gap.
+fn main_window(runtime: &mut Runtime<KrkrHost>) -> Option<ObjectHandle> {
+    let class = runtime.global_member("Window").object_handle()?;
+    runtime
+        .resolve_object_member(class, "mainWindow")
+        .ok()?
+        .object_handle()
 }
 
 fn install_modeless_owner_window(runtime: &mut Runtime<KrkrHost>) {
@@ -210,7 +281,7 @@ mod tests {
             !matches!(runtime.object_member(touch_mouse, "enabled"), Variant::Void),
             "Window.TouchMouse.enabled is missing"
         );
-        for event in TOUCH_MOUSE_EVENTS {
+        for (event, _, _) in TOUCH_MOUSE_EVENTS {
             assert!(
                 !matches!(runtime.object_member(touch_mouse, event), Variant::Void),
                 "Window.TouchMouse.{event} is missing"
@@ -241,16 +312,13 @@ mod tests {
                 if (typeof instance.onTouchMouseDblClick != "undefined") declared++;
                 var before = instance.enabled;
                 instance.enabled = true;
-                var callable = typeof instance.onTouchMouseDown(0, 0) == "void";
+                var callable = typeof instance.onTouchMouseDown(0, 0, 0, 0) == "void";
                 return typeof Window.TouchMouse + "|" + typeof instance + "|" +
                     before + "|" + instance.enabled + "|" + declared + "|" + callable;
                 "#,
             )
             .expect("construct Window.TouchMouse");
-        assert_eq!(
-            value,
-            Variant::String("Object|Object|0|1|5|1".to_string())
-        );
+        assert_eq!(value, Variant::String("Object|Object|0|1|5|1".to_string()));
     }
 
     #[test]
@@ -381,19 +449,128 @@ mod tests {
         );
     }
 
+    /// The reference's arities: each member rejects one-argument-short calls
+    /// with `TJS_E_BADPARAMCOUNT` (ncbind's `numparams < ArgsCount`, the
+    /// `cmpl` thresholds in `k2compat.dll`) and accepts the reference count.
     #[test]
-    fn the_declared_touch_mouse_events_are_callable_no_ops() {
+    fn the_touch_mouse_arities_match_the_reference() {
+        let mut engine = engine();
+        engine
+            .execute_script(
+                "setup.tjs",
+                "global.accepted = 0; global.rejected = 0;\
+                 function probe(f) {\
+                     try { f(); global.accepted++; } catch (e) { global.rejected++; }\
+                 }",
+            )
+            .expect("setup probe");
+        for (call, short) in [
+            (
+                "probe(function() { Window.TouchMouse.onTouchMouseDown(1, 2, 3, 4); });",
+                "probe(function() { Window.TouchMouse.onTouchMouseDown(1, 2, 3); });",
+            ),
+            (
+                "probe(function() { Window.TouchMouse.onTouchMouseUp(1, 2, 3, 4); });",
+                "probe(function() { Window.TouchMouse.onTouchMouseUp(1, 2, 3); });",
+            ),
+            (
+                "probe(function() { Window.TouchMouse.onTouchMouseMove(1, 2, 3); });",
+                "probe(function() { Window.TouchMouse.onTouchMouseMove(1, 2); });",
+            ),
+            (
+                "probe(function() { Window.TouchMouse.onTouchMouseClick(1, 2); });",
+                "probe(function() { Window.TouchMouse.onTouchMouseClick(1); });",
+            ),
+            (
+                "probe(function() { Window.TouchMouse.onTouchMouseDblClick(1, 2); });",
+                "probe(function() { Window.TouchMouse.onTouchMouseDblClick(1); });",
+            ),
+        ] {
+            let accepted_before = integer(&mut engine, "accepted");
+            let rejected_before = integer(&mut engine, "rejected");
+            engine
+                .execute_script("call.tjs", call)
+                .expect("minimum call");
+            assert_eq!(
+                integer(&mut engine, "accepted"),
+                accepted_before + 1,
+                "{call} is the reference minimum and must be accepted"
+            );
+            engine
+                .execute_script("call.tjs", short)
+                .expect("short call");
+            assert_eq!(
+                integer(&mut engine, "rejected"),
+                rejected_before + 1,
+                "{short} is one argument short of the reference floor"
+            );
+        }
+    }
+
+    /// The recovered forwarding: each callback calls the Window's same-kind
+    /// `on*` event with its arguments converted to integers, in order
+    /// (`onTouchMouseDown` → `onMouseDown(1, 2, 3, 4)` and so on).
+    #[test]
+    fn the_touch_mouse_callbacks_forward_to_the_windows_same_kind_event() {
         let mut engine = engine();
         let value = engine
             .execute_script(
                 "probe.tjs",
                 r#"
-                return typeof Window.TouchMouse.onTouchMouseDown(1, 2) + "|" +
-                    typeof Window.TouchMouse.onTouchMouseDblClick();
+                global.log = "";
+                var window = new Window();
+                window.onMouseDown = function(x, y, button, shift) {
+                    global.log += "down(" + x + "," + y + "," + button + "," + shift + ");";
+                };
+                window.onMouseUp = function(x, y, button, shift) {
+                    global.log += "up(" + x + "," + y + "," + button + "," + shift + ");";
+                };
+                window.onMouseMove = function(x, y, shift) {
+                    global.log += "move(" + x + "," + y + "," + shift + ");";
+                };
+                window.onClick = function(x, y) { global.log += "click(" + x + "," + y + ");"; };
+                window.onDoubleClick = function(x, y) { global.log += "dbl(" + x + "," + y + ");"; };
+                var touch = new Window.TouchMouse(0);
+                touch.onTouchMouseDown(1, 2, 3, 4);
+                touch.onTouchMouseUp(5, 6, 7, 8);
+                touch.onTouchMouseMove(9, 10, 11);
+                touch.onTouchMouseClick(12, 13);
+                touch.onTouchMouseDblClick(14, 15);
+                return log;
+                "#,
+            )
+            .expect("forward the touch events");
+        assert_eq!(
+            value,
+            Variant::String(
+                "down(1,2,3,4);up(5,6,7,8);move(9,10,11);click(12,13);dbl(14,15);".to_string()
+            )
+        );
+    }
+
+    /// Without a Window the callbacks are callable no-ops — the same early-out
+    /// the DLL's handler resolution has when it finds no window handler.
+    #[test]
+    fn the_touch_mouse_callbacks_without_a_window_are_callable_no_ops() {
+        let mut engine = engine();
+        let value = engine
+            .execute_script(
+                "probe.tjs",
+                r#"
+                return typeof Window.TouchMouse.onTouchMouseDown(1, 2, 3, 4) + "|" +
+                    typeof Window.TouchMouse.onTouchMouseDblClick(1, 2);
                 "#,
             )
             .expect("call the declared events");
         assert_eq!(value, Variant::String("void|void".to_string()));
+    }
+
+    fn integer(engine: &mut KrkrEngine, expression: &str) -> i64 {
+        engine
+            .execute_expression("read.tjs", expression)
+            .unwrap_or_else(|error| panic!("{expression}: {error}"))
+            .to_integer()
+            .expect("integer")
     }
 
     #[test]

@@ -13,7 +13,8 @@
 //!
 //! # What is real here
 //!
-//! * **Loading** — `ResourceManager.load` / `Motion.load` read the storage file
+//! * **Loading** — `ResourceManager.load` (and the class-object spelling
+//!   `Motion.ResourceManager.load`) read the storage file
 //!   and parse it through [`krkr_emote::Motion`] (eluna's PSB reader plus the
 //!   PARQUET-flavor adaptation). The handle the game gets back carries
 //!   `.metadata`, which its wrapper requires (`!l2.metadata === void`).
@@ -136,6 +137,11 @@ pub(crate) const META: PluginMeta = PluginMeta {
             timelines, mesh deformation, particles \
             and EmotePlayer's `.psb` model playback; each such member is \
             registered and logs a one-time warning on first call instead of returning a silent success. \
+            The recovered ResourceManager member table (loadSource/load/unload/unloadAll/isExistMotion/ \
+            findMotion/findSource/random/requireLayerId/releaseLayerId/clearCache/bufLayer) is registered on \
+            Motion.ResourceManager, where the reference's own table lives - the reference Motion class carries \
+            only its constants, doAlphaMaskOperation and the sub-class items - and every declared floor is the \
+            reference's ArgsCount (ncbind rejects short calls, drops surplus arguments). \
             Motion.Player.useD3D is absent on purpose (the game's probe then sets Motion.enableD3D = 0, the nod3d \
             reference behaviour). The `opa` scale is settled against motionplayer_nod3d.dll's frame parser and \
             applied in krkr-emote's normalization (0..255 byte, absent = 0xff).",
@@ -269,7 +275,9 @@ thread_local! {
     /// Players by object handle.
     static PLAYERS: RefCell<BTreeMap<ObjectHandle, PlayerState>> =
         const { RefCell::new(BTreeMap::new()) };
-    /// The class-level pools behind `Motion.load`/`unload`/`findMotion`.
+    /// The class-level pool behind the class-object spellings
+    /// (`Motion.ResourceManager.load`/`unload`/`findMotion`, …), which reach the
+    /// same members as an instance call but have no manager of their own.
     static GLOBAL_POOL: RefCell<ManagerState> = const { RefCell::new(ManagerState {
         loaded: BTreeMap::new(),
     }) };
@@ -315,21 +323,71 @@ fn warn_stored_but_unused(runtime: &mut Runtime<KrkrHost>, member: &str) {
 // Registration
 // ---------------------------------------------------------------------------
 
-/// The reference's `Motion` registration (`FUN_1005a530`, dossier §TJS surface).
-const MOTION_METHODS: &[(&str, NativeArgCount)] = &[
-    ("loadSource", NativeArgCount::AtLeast(1)),
-    ("clearCache", NativeArgCount::Any),
-    ("bufLayer", NativeArgCount::AtLeast(1)),
-    ("load", NativeArgCount::AtLeast(1)),
-    ("unload", NativeArgCount::AtLeast(1)),
-    ("unloadAll", NativeArgCount::Any),
-    ("isExistMotion", NativeArgCount::AtLeast(1)),
-    ("findMotion", NativeArgCount::AtLeast(1)),
-    ("findSource", NativeArgCount::AtLeast(1)),
-    ("random", NativeArgCount::Any),
-    ("requireLayerId", NativeArgCount::AtLeast(1)),
+/// The reference's `ResourceManager` class table (`motionplayer.dll:0x1005a530`,
+/// `motionplayer_nod3d.dll:0x10050d40`) beyond the three members with real
+/// behaviour here (`load`/`unload`/`clearCache`, registered separately).
+///
+/// The table's *placement* is the `ResourceManager` class, not `Motion`: every
+/// member object it installs is a
+/// `ncbNativeClassMethod<InvokeCommand<ResourceManager, …>>` (e.g.
+/// `0x10099240` = `void (ResourceManager::*)(tTJSString)` for `unload`), and
+/// the class builder that calls the table (`0x1008b690` → `0x1008f690`) is the
+/// `ResourceManager` wrapper. The reference's `Motion` class registers only its
+/// constants, `getD3DAvailable` (D3D build) and `doAlphaMaskOperation`
+/// (`0x1007c040`, `0x100900d0`), plus the sub-class items (`Motion.Player`,
+/// `Motion.EmotePlayer`, `Motion.ResourceManager`, `Motion.SeparateLayerAdaptor`,
+/// `0x100897e0`/`0x10089860`/`0x100899e0`/`0x10089a60`).
+///
+/// The arities are the reference's `ArgsCount` in ncbind terms — the member
+/// pointer's parameter count, checked as `numparams < ArgsCount` → so the
+/// reference accepts `ArgsCount` **or more** (extra arguments are dropped), and
+/// `AtLeast(n)` is the faithful port. A `0`-argument member therefore accepts
+/// any call (surplus arguments discarded), which is what `Any` spells here.
+///
+/// Each entry carries its `file:func@addr` anchor from the M170 disassembly pass
+/// (`motionplayer.dll`, image base `0x10000000`); the ctor named after the
+/// *preceding* `FUN_10097d30(ResourceManager, name)` is the one registered under
+/// that name — the table builds the member object first and hands it over in
+/// `ESI`, so M166's "name → the object constructed after it" pairing is shifted
+/// by one. The game's own call shapes (`data.xp3/system/motion.tjs`:
+/// `resourceManager.load(prefix + a0)`, `unload(prefix + a0)`, `clearCache()`)
+/// agree with this ordering, and `getVariable(name)` (1 arg) on
+/// `Motion.EmotePlayer` is the decisive one: the shifted reading gave it 6.
+const RESOURCE_MANAGER_METHODS: &[(&str, NativeArgCount)] = &[
+    // `tTJSVariant (SourceCache::*)(tTJSVariant, tTJSVariant)` @0x10099060.
+    ("loadSource", NativeArgCount::AtLeast(2)),
+    // A property in the reference (get/set `tTJSVariant (void)` @0x1009f3e0);
+    // kept callable here so a `rm.bufLayer()` probe does not die on
+    // "not callable", with the warning telling the truth.
+    ("bufLayer", NativeArgCount::AtLeast(0)),
+    // `void (ResourceManager::*)(void)` @0x100992e0 — 0 args, so any call.
+    ("unloadAll", NativeArgCount::AtLeast(0)),
+    // `bool (ResourceManager::*)(tTJSVariant, tTJSVariant)` @0x10099380.
+    ("isExistMotion", NativeArgCount::AtLeast(2)),
+    // `tTJSVariant (ResourceManager::*)(tTJSVariant, tTJSVariant)` @0x10099420.
+    ("findMotion", NativeArgCount::AtLeast(2)),
+    // `tTJSVariant (ResourceManager::*)(tTJSString, tTJSString)` @0x100994c0.
+    ("findSource", NativeArgCount::AtLeast(2)),
+    // `double (ResourceManager::*)(void)` @0x10099560 — 0 args, so any call.
+    ("random", NativeArgCount::AtLeast(0)),
+    // `unsigned int (ResourceManager::*)(void)` @0x10099600 — 0 args. The M166
+    // survey paired this name with the *next* object (`void (unsigned int)`),
+    // which made our old `AtLeast(1)` look like a match; it would in fact
+    // reject the 0-argument call the reference accepts.
+    ("requireLayerId", NativeArgCount::AtLeast(0)),
+    // `void (ResourceManager::*)(unsigned int)` @0x100996a0 — the arity M166
+    // could not recover because it read the name as the table's last entry.
     ("releaseLayerId", NativeArgCount::AtLeast(1)),
 ];
+
+/// The reference `Motion` class's own member besides the constants and the
+/// sub-class items: a free function taking eleven arguments
+/// (`?$InvokeCommand@VMotion@@P6AXVtTJSVariant@@HH0HHHHHII@Z`, the only
+/// `Motion` member RTTI in either build; ctor `0x100900d0` nod3d /
+/// `0x1009a960` D3D). Registered so the member exists, with the port's usual
+/// first-call warning: the alpha-mask operation itself is not implemented.
+const MOTION_METHODS: &[(&str, NativeArgCount)] =
+    &[("doAlphaMaskOperation", NativeArgCount::AtLeast(11))];
 
 /// Class constants recovered from the reference's string pool. Only
 /// `PlayFlagForce` and `MaskModeAlpha` are used by the game; the values of the
@@ -496,7 +554,10 @@ pub(crate) fn install_motionplayer_compat(runtime: &mut Runtime<KrkrHost>) {
             *arg_count,
             move |runtime: &mut Runtime<KrkrHost>,
                   _this_obj: Option<ObjectHandle>,
-                  args: Vec<Variant>| { motion_class_method(runtime, member, &args) },
+                  _args: Vec<Variant>| {
+                warn_unsupported(runtime, &format!("Motion.{member}"));
+                Ok(Variant::Void)
+            },
         );
     }
 
@@ -537,34 +598,28 @@ impl Class {
     }
 }
 
-/// `Motion.load` and friends act on the class-level pool; the game's own
-/// wrapper only uses the `ResourceManager` instance methods, so these stay
-/// thin.
-fn motion_class_method(
+/// The `ResourceManager` table's members that have no behaviour here (all of
+/// [`RESOURCE_MANAGER_METHODS`] bar the implemented `load`/`unload`/
+/// `clearCache`). The pool they report against is the instance's own when the
+/// call arrives on a live manager, and the class-level pool when the script
+/// calls `Motion.ResourceManager.unloadAll()` on the class object.
+fn resource_manager_member_method(
     runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
     member: &str,
     args: &[Variant],
 ) -> Result<Variant> {
+    let manager = resource_manager_this(runtime, this_obj);
     match member {
-        "load" => {
-            let path = args
-                .first()
-                .map(Variant::to_tjs_string)
-                .transpose()?
-                .unwrap_or_default();
-            Ok(load_into(runtime, &GLOBAL_POOL, &path))
-        }
-        "unload" => {
-            let path = args
-                .first()
-                .map(Variant::to_tjs_string)
-                .transpose()?
-                .unwrap_or_default();
-            unload_from(&GLOBAL_POOL, &path);
-            Ok(Variant::Void)
-        }
-        "unloadAll" | "clearCache" => {
-            GLOBAL_POOL.with(|pool| pool.borrow_mut().loaded.clear());
+        "unloadAll" => {
+            match manager {
+                Some(manager) => MANAGERS.with(|managers| {
+                    if let Some(state) = managers.borrow_mut().get_mut(&manager) {
+                        state.loaded.clear();
+                    }
+                }),
+                None => GLOBAL_POOL.with(|pool| pool.borrow_mut().loaded.clear()),
+            }
             Ok(Variant::Void)
         }
         "isExistMotion" | "findMotion" => {
@@ -573,12 +628,7 @@ fn motion_class_method(
                 .map(Variant::to_tjs_string)
                 .transpose()?
                 .unwrap_or_default();
-            let exists = GLOBAL_POOL.with(|pool| {
-                pool.borrow()
-                    .loaded
-                    .values()
-                    .any(|loaded| loaded.motion.animation(&name).is_some())
-            });
+            let exists = any_loaded_motion(manager, |motion| motion.animation(&name).is_some());
             Ok(Variant::Integer(i64::from(exists)))
         }
         "findSource" => {
@@ -587,22 +637,51 @@ fn motion_class_method(
                 .map(Variant::to_tjs_string)
                 .transpose()?
                 .unwrap_or_default();
-            let exists = GLOBAL_POOL.with(|pool| {
-                pool.borrow()
-                    .loaded
-                    .values()
-                    .any(|loaded| loaded.motion.source(&name).is_some())
-            });
+            let exists = any_loaded_motion(manager, |motion| motion.source(&name).is_some());
             Ok(Variant::Integer(i64::from(exists)))
         }
         "loadSource" | "bufLayer" | "random" | "requireLayerId" | "releaseLayerId" => {
-            warn_unsupported(runtime, &format!("Motion.{member}"));
+            warn_unsupported(runtime, &format!("ResourceManager.{member}"));
             Ok(Variant::Integer(0))
         }
         other => {
-            warn_unsupported(runtime, &format!("Motion.{other}"));
+            warn_unsupported(runtime, &format!("ResourceManager.{other}"));
             Ok(Variant::Void)
         }
+    }
+}
+
+/// The manager object a `ResourceManager` method call acts on: its own when
+/// `this` is a live manager instance, otherwise none (the class object and any
+/// other receiver fall back to the class-level pool).
+fn resource_manager_this(
+    runtime: &Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+) -> Option<ObjectHandle> {
+    let this = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))?;
+    MANAGERS
+        .with(|managers| managers.borrow().contains_key(&this))
+        .then_some(this)
+}
+
+/// Whether any file loaded behind `manager` (or in the class-level pool when
+/// the call arrived on the class object) satisfies `predicate`.
+fn any_loaded_motion(manager: Option<ObjectHandle>, predicate: impl Fn(&Motion) -> bool) -> bool {
+    match manager {
+        Some(manager) => MANAGERS.with(|managers| {
+            managers.borrow().get(&manager).is_some_and(|state| {
+                state
+                    .loaded
+                    .values()
+                    .any(|loaded| predicate(&loaded.motion))
+            })
+        }),
+        None => GLOBAL_POOL.with(|pool| {
+            pool.borrow()
+                .loaded
+                .values()
+                .any(|loaded| predicate(&loaded.motion))
+        }),
     }
 }
 
@@ -756,9 +835,16 @@ fn resource_manager_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle
     handle
 }
 
-/// `MotionResourceManager` in the game's own wrapper calls these five
-/// (`motion.tjs`, decompiled); the reference's `loadResource`/`unloadResource`
-/// spellings stay for scripts written against the older census.
+/// The `ResourceManager` class's member table. The three members with real
+/// behaviour are `MotionResourceManager`'s five call shapes from the game's own
+/// wrapper (`motion.tjs`, decompiled: `load(prefix + a0)`, `unload(prefix + a0)`,
+/// `clearCache()`); the reference's `loadResource`/`unloadResource` spellings
+/// stay for scripts written against the older census, and
+/// [`RESOURCE_MANAGER_METHODS`] adds the recovered names that have no behaviour
+/// here.
+// `result_large_err` is the crate-wide `TjsError` size lint every native
+// handler closure carries (`http_request.rs`/`sqlite3.rs` allow it too).
+#[allow(clippy::result_large_err)]
 fn install_resource_manager_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.register_object_native_with_arg_count(
         handle,
@@ -775,9 +861,22 @@ fn install_resource_manager_members(runtime: &mut Runtime<KrkrHost>, handle: Obj
     runtime.register_object_native_with_arg_count(
         handle,
         "clearCache",
-        NativeArgCount::Any,
+        NativeArgCount::AtLeast(0),
         resource_manager_clear_cache,
     );
+    for (name, arg_count) in RESOURCE_MANAGER_METHODS {
+        let member = *name;
+        runtime.register_object_native_with_arg_count(
+            handle,
+            member,
+            *arg_count,
+            move |runtime: &mut Runtime<KrkrHost>,
+                  this_obj: Option<ObjectHandle>,
+                  args: Vec<Variant>| {
+                resource_manager_member_method(runtime, this_obj, member, &args)
+            },
+        );
+    }
     runtime.register_object_native(handle, "loadResource", resource_manager_load);
     runtime.register_object_native(handle, "unloadResource", resource_manager_unload);
     runtime.register_object_native(handle, "addRef", return_this);
@@ -1096,10 +1195,14 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
     }
 
     // -- Methods -------------------------------------------------------------
+    // `play(name, flags)`: `void (tTJSString, unsigned int)` on `EmotePlayer`
+    // (ctor `0x100999c0`) and a raw callback that rejects `numparams < 2` on
+    // `Player` (`0x1004d140`); the game calls it as
+    // `_player.play(motion, Motion.PlayFlagForce)`.
     runtime.register_object_native_with_arg_count(
         handle,
         "play",
-        NativeArgCount::AtLeast(1),
+        NativeArgCount::AtLeast(2),
         player_play,
     );
     runtime.register_object_native_with_arg_count(handle, "stop", NativeArgCount::Any, player_stop);
@@ -1115,6 +1218,10 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
         NativeArgCount::AtLeast(1),
         player_frame_progress,
     );
+    // `setVariable` accepts 2..4 (`0x1005c400`), `getVariable` is
+    // `double (EmotePlayer::*)(tTJSString) const` = one argument
+    // (`0x10099a60`) — the game's `_player.getVariable(name)` shape, which the
+    // M166 survey's shifted pairing misread as a six-double method.
     runtime.register_object_native_with_arg_count(
         handle,
         "setVariable",
@@ -1127,10 +1234,17 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
         NativeArgCount::AtLeast(1),
         player_get_variable,
     );
+    // `contains` is `bool (EmotePlayer::*)(tTJSString, double, double)` (ctor
+    // `0x1009a280`) on the emote class and `bool (Player::*)(double, double)`
+    // (ctor `0x10098ac0`) on the plain one — the game calls the emote form as
+    // `_player.contains("hit_" + label, x, y)`.
     runtime.register_object_native_with_arg_count(
         handle,
         "contains",
-        NativeArgCount::AtLeast(1),
+        match class {
+            Class::EmotePlayer => NativeArgCount::AtLeast(3),
+            Class::Player => NativeArgCount::AtLeast(2),
+        },
         player_contains,
     );
     runtime.register_object_native_with_arg_count(
@@ -1139,12 +1253,25 @@ fn install_player_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle,
         NativeArgCount::AtLeast(1),
         player_draw,
     );
+    // `clear(layer, colour)` is `void (Player::*)(tTJSVariant, tTJSVariant)`
+    // (`0x100987a0`); the reference never registers it on `EmotePlayer` — the
+    // game guards its call with `typeof _player.clear != "undefined"` — but the
+    // port keeps it on both classes so the emote path's canvas clearing runs.
     runtime.register_object_native_with_arg_count(
         handle,
         "clear",
-        NativeArgCount::AtLeast(1),
+        NativeArgCount::AtLeast(2),
         player_clear,
     );
+    // The EmotePlayer `set*` family, with the reference's accepted argument
+    // *ranges* (the raw-callback bodies compare `numparams - k` against the
+    // span and reject both ends, so these are ranges, not the `AtLeast(n)`
+    // floors ncbind's `NumT` members give): `setColor` 1..3 (`0x1005bc90`),
+    // `setCoord` 2..4 (`0x1005b9d0`), `setRotate` 1..3 (`0x1005be40`),
+    // `setScale` 1..3 (`0x1005bb60`), `setDrawAffineTranslateMatrix` six
+    // doubles exactly (`0x10099b00`). `AtLeast(min)` is the faithful floor: the
+    // reference drops arguments beyond its range's end, so a longer call
+    // succeeds in both.
     runtime.register_object_native_with_arg_count(
         handle,
         "setColor",
@@ -2643,7 +2770,10 @@ mod tests {
     "#;
 
     /// The dossier's 81 `Player` members plus the `EmotePlayer`-only members
-    /// the game calls, and the `Motion` class surface.
+    /// the game calls, and the class surface: the recovered twelve names live
+    /// on `Motion.ResourceManager` (their registration table's class), the
+    /// `Motion` class object carries its constants, its one own member and the
+    /// sub-class items.
     #[test]
     fn surface_matches_the_reference_tables() {
         let mut engine = engine_with(&[(
@@ -2669,11 +2799,50 @@ mod tests {
             "releaseLayerId",
         ] {
             let found = engine
-                .execute_expression("surface.tjs", &format!("typeof Motion.{name} != \"void\""))
+                .execute_expression(
+                    "surface.tjs",
+                    &format!("typeof Motion.ResourceManager.{name} != \"void\""),
+                )
                 .expect("read")
                 .is_truthy();
-            assert!(found, "Motion.{name} is registered");
+            assert!(found, "Motion.ResourceManager.{name} is registered");
         }
+        // The reference `Motion` class registers no such members: its table is
+        // constants + `doAlphaMaskOperation` + the sub-class items, and a
+        // script that reads `Motion.loadSource` gets `void` on the real DLL.
+        for name in [
+            "loadSource",
+            "clearCache",
+            "bufLayer",
+            "load",
+            "unload",
+            "unloadAll",
+            "isExistMotion",
+            "findMotion",
+            "findSource",
+            "random",
+            "requireLayerId",
+            "releaseLayerId",
+        ] {
+            let missing = engine
+                .execute_expression("surface.tjs", &format!("typeof Motion.{name}"))
+                .expect("read")
+                .to_tjs_string()
+                .expect("string");
+            assert_eq!(missing, "undefined", "Motion.{name} must not be registered");
+        }
+        // The one member the reference `Motion` does register next to its
+        // constants (`0x100900d0`, the only `InvokeCommand<Motion, …>` RTTI).
+        assert!(
+            engine
+                .execute_expression(
+                    "surface.tjs",
+                    "typeof Motion.doAlphaMaskOperation != \"void\""
+                )
+                .expect("read")
+                .is_truthy(),
+            "Motion.doAlphaMaskOperation is registered"
+        );
         for (name, value) in [("PlayFlagForce", 1), ("MaskModeAlpha", 1)] {
             assert_eq!(
                 integer(&mut engine, &format!("Motion.{name}")),
@@ -2721,6 +2890,226 @@ mod tests {
                 "Motion.EmotePlayer.{name} is reachable"
             );
         }
+    }
+
+    /// Runs `expression` and answers whether it threw ("err") or not ("ok").
+    fn call_outcome(engine: &mut KrkrEngine, expression: &str) -> &'static str {
+        engine
+            .execute_script(
+                "call.tjs",
+                &format!(
+                    "global.outcome = \"ok\"; \
+                     try {{ {expression} }} catch (e) {{ global.outcome = \"err\"; }}"
+                ),
+            )
+            .unwrap_or_else(|error| panic!("{expression}: {error}"));
+        if engine
+            .execute_expression("call.tjs", "outcome == \"ok\"")
+            .expect("read outcome")
+            .is_truthy()
+        {
+            "ok"
+        } else {
+            "err"
+        }
+    }
+
+    /// `ResourceManager`'s argument floors against the reference's `ArgsCount`
+    /// (ncbind rejects `numparams < ArgsCount`, so the reference accepts the
+    /// count and above; extra arguments are dropped). The anchors per member are
+    /// in [`super::RESOURCE_MANAGER_METHODS`] — in particular `requireLayerId`
+    /// takes **no** argument in the reference, which the M166 survey read as
+    /// `AtLeast(1)`.
+    #[test]
+    fn resource_manager_floors_are_the_reference_arities() {
+        let mut engine = engine_with(&[]);
+        engine
+            .execute_script("setup.tjs", "global.rm = new Motion.ResourceManager(0, 0);")
+            .expect("manager");
+        for (minimum, short) in [
+            ("rm.load(\"m\")", "rm.load()"),
+            ("rm.unload(\"m\")", "rm.unload()"),
+            ("rm.loadSource(0, 0)", "rm.loadSource(0)"),
+            ("rm.isExistMotion(\"a\", \"b\")", "rm.isExistMotion(\"a\")"),
+            ("rm.findMotion(\"a\", \"b\")", "rm.findMotion(\"a\")"),
+            ("rm.findSource(\"a\", \"b\")", "rm.findSource(\"a\")"),
+            ("rm.releaseLayerId(1)", "rm.releaseLayerId()"),
+        ] {
+            assert_eq!(
+                call_outcome(&mut engine, &format!("{minimum};")),
+                "ok",
+                "{minimum} is the reference minimum and must be accepted"
+            );
+            assert_eq!(
+                call_outcome(&mut engine, &format!("{short};")),
+                "err",
+                "{short} is one argument short of the reference floor"
+            );
+        }
+        // `ArgsCount` 0: the reference's check never fires, so any argument
+        // count passes and surplus arguments are dropped.
+        for call in [
+            "rm.clearCache()",
+            "rm.clearCache(1, 2)",
+            "rm.unloadAll()",
+            "rm.bufLayer()",
+            "rm.random()",
+            "rm.requireLayerId()",
+            "rm.requireLayerId(1, 2)",
+        ] {
+            assert_eq!(
+                call_outcome(&mut engine, &format!("{call};")),
+                "ok",
+                "{call} is a 0-argument reference member"
+            );
+        }
+    }
+
+    /// The `Player`/`EmotePlayer` floors against the reference's member
+    /// signatures (`EmotePlayer` ctor anchors beside
+    /// [`super::install_player_members`]). `getVariable(name)` is the decisive
+    /// one: the M166 survey read it as a six-double method, but the game's
+    /// 1-argument call works on the shipped DLL, and the corrected pairing is
+    /// `double (EmotePlayer::*)(tTJSString) const` (`0x10099a60`).
+    #[test]
+    fn player_floors_are_the_reference_arities() {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [8, 8], 255),
+                -1,
+            ),
+        )]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script("emote.tjs", "global.emote = new Motion.EmotePlayer(rm);")
+            .expect("emote player");
+
+        for (minimum, short) in [
+            (
+                "player.play(\"idle\", Motion.PlayFlagForce)",
+                "player.play(\"idle\")",
+            ),
+            ("player.progress(0)", "player.progress()"),
+            ("player.frameProgress(0)", "player.frameProgress()"),
+            ("player.getVariable(\"x\")", "player.getVariable()"),
+            ("player.setVariable(\"x\", 1)", "player.setVariable(\"x\")"),
+            ("player.setCoord(1, 2)", "player.setCoord(1)"),
+            ("player.setColor(0xFF808080)", "player.setColor()"),
+            ("player.setRotate(0)", "player.setRotate()"),
+            ("player.setScale(1)", "player.setScale()"),
+            (
+                "player.setDrawAffineTranslateMatrix(1, 0, 0, 1, 0, 0)",
+                "player.setDrawAffineTranslateMatrix(1, 0, 0, 1, 0)",
+            ),
+            ("player.clear(layer, 0)", "player.clear(layer)"),
+            ("player.draw(layer)", "player.draw()"),
+            ("player.unserialize(1)", "player.unserialize()"),
+            // `contains` is class-shaped: `bool (EmotePlayer::*)(tTJSString,
+            // double, double)` on the emote class, `bool (Player::*)(double,
+            // double)` on the plain one.
+            (
+                "emote.contains(\"hit_bust\", 0, 0)",
+                "emote.contains(\"hit_bust\", 0)",
+            ),
+            ("player.contains(0, 0)", "player.contains(0)"),
+        ] {
+            assert_eq!(
+                call_outcome(&mut engine, &format!("{minimum};")),
+                "ok",
+                "{minimum} is the reference minimum and must be accepted"
+            );
+            assert_eq!(
+                call_outcome(&mut engine, &format!("{short};")),
+                "err",
+                "{short} is one argument short of the reference floor"
+            );
+        }
+        // 0-argument members (`skip`/`skipToSync`/`pass`/`stop`/`serialize`).
+        for call in ["player.serialize()", "player.stop()", "player.skip()"] {
+            assert_eq!(
+                call_outcome(&mut engine, &format!("{call};")),
+                "ok",
+                "{call}"
+            );
+        }
+    }
+
+    /// PARQUET's `AffineSourceMotion` emote path, spelled as the decompiled
+    /// wrapper spells it (`data.xp3` `system/AffineSourceMotion.tjs`):
+    /// `new Motion.ResourceManager(path, cache)` → `rm.load(file)` →
+    /// `new Motion.EmotePlayer(rm)` → `play(name, Motion.PlayFlagForce)`,
+    /// `setVariable`/`getVariable`/`variableKeys`, `setCoord`, the six-argument
+    /// affine matrix, `contains("hit_" + label, x, y)`, `clear(adaptor, colour)`
+    /// and `rm.unload(file)`. Every one of these shapes has to resolve and run.
+    #[test]
+    fn parquet_emote_call_shapes_still_resolve() {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [8, 8], 255),
+                -1,
+            ),
+        )]);
+        engine
+            .execute_script(
+                "parquet.tjs",
+                r#"
+                global.rm = new Motion.ResourceManager("motion", 20971520);
+                global.res = rm.load("motion/hero.mtn");
+                global.owner = new Layer();
+                owner.setPos(0, 0);
+                owner.setSize(48, 48);
+                global.adaptor = new Motion.SeparateLayerAdaptor(owner incontextof global.Layer);
+                global._player = new Motion.EmotePlayer(rm);
+                _player.maskMode = Motion.MaskModeAlpha;
+                _player.chara = "hero";
+                _player.play("idle", Motion.PlayFlagForce);
+                _player.initPhysics(%[ "base" => %[ "chara" => "hero", "motion" => "idle" ] ]);
+                _player.progress(0);
+                _player.setVariable("face_mouth", 1, 0, 0);
+                _player.setCoord(3, 4);
+                _player.setColor(0xFF808080);
+                _player.setDrawAffineTranslateMatrix(1, 0, 0, 1, 0, 0);
+                _player.progress(0);
+                _player.clear(adaptor, 0xFF808080);
+                _player.draw(adaptor);
+                _player.setVariable("x", 0.5);
+                global.v = _player.getVariable("x");
+                global.keys = _player.variableKeys.count;
+                global.hit = _player.contains("hit_bust", 10, 10);
+                global.serial = _player.serialize();
+                _player.unserialize(serial);
+                owner.assignImages(adaptor);
+                rm.unload("motion/hero.mtn");
+                rm.clearCache();
+                "#,
+            )
+            .expect("the game's emote call shapes");
+        assert_eq!(real(&mut engine, "v"), 0.5, "variables round-trip");
+        assert_eq!(
+            integer(&mut engine, "keys"),
+            2,
+            "variableKeys is an array of both written names"
+        );
+        // `setCoord(3, 4)` shifts the icon from its authored coord (8, 8): the
+        // 4x4 quad covers pixels 9..13 × 10..14 instead of 6..10 × 6..10.
+        assert_eq!(
+            integer(&mut engine, "adaptor.getMainPixel(11, 12)"),
+            0x00ff_ffff,
+            "the drawn motion reaches the adaptor the game publishes"
+        );
+        assert_eq!(
+            integer(&mut engine, "owner.getMainPixel(11, 12)"),
+            0x00ff_ffff
+        );
+        assert_eq!(
+            integer(&mut engine, "owner.getMainPixel(2, 2)"),
+            0x808080,
+            "the cleared background travels with the canvas"
+        );
     }
 
     /// The end-to-end path: load, play, progress and draw reaching the layer
@@ -2801,7 +3190,7 @@ mod tests {
         // The fixture motion is 60 ticks long: 1000 ms on the script axis.
         assert_eq!(integer(&mut engine, "player.lastTime"), 0, "no motion yet");
         engine
-            .execute_script("play.tjs", "player.play(\"idle\");")
+            .execute_script("play.tjs", "player.play(\"idle\", 0);")
             .expect("play");
         assert_eq!(integer(&mut engine, "player.lastTime"), 1000);
         assert_eq!(integer(&mut engine, "player.frameLastTime"), 60);
@@ -2856,7 +3245,7 @@ mod tests {
         );
 
         engine
-            .execute_script("replay.tjs", "player.speed = 1; player.play(\"idle\");")
+            .execute_script("replay.tjs", "player.speed = 1; player.play(\"idle\", 0);")
             .expect("replay");
         assert_eq!(
             integer(&mut engine, "player.frameTickCount"),
@@ -2912,7 +3301,7 @@ mod tests {
         )]);
         engine.execute_script("setup.tjs", SETUP).expect("setup");
         engine
-            .execute_script("play.tjs", "player.play(\"idle\");")
+            .execute_script("play.tjs", "player.play(\"idle\", 0);")
             .expect("play");
 
         engine
@@ -2944,7 +3333,7 @@ mod tests {
         engine
             .execute_script(
                 "raw.tjs",
-                "player.play(\"idle\"); player.frameProgress(60);",
+                "player.play(\"idle\", 0); player.frameProgress(60);",
             )
             .expect("frameProgress");
         assert_eq!(integer(&mut engine, "player.frameTickCount"), 60);
@@ -3005,7 +3394,7 @@ mod tests {
         )]);
         engine.execute_script("setup.tjs", SETUP).expect("setup");
         engine
-            .execute_script("first.tjs", "player.play(\"idle\"); player.draw(layer);")
+            .execute_script("first.tjs", "player.play(\"idle\", 0); player.draw(layer);")
             .expect("first frame");
         assert_eq!(
             integer(&mut engine, "layer.getMainPixel(7, 7)"),
@@ -3049,7 +3438,10 @@ mod tests {
         )]);
         engine.execute_script("setup.tjs", SETUP).expect("setup");
         engine
-            .execute_script("loop.tjs", "player.play(\"idle\"); player.progress(1250);")
+            .execute_script(
+                "loop.tjs",
+                "player.play(\"idle\", 0); player.progress(1250);",
+            )
             .expect("loop");
         assert_eq!(integer(&mut engine, "player.playing"), 1);
         assert_eq!(
@@ -3087,7 +3479,7 @@ mod tests {
         )]);
         engine.execute_script("setup.tjs", SETUP).expect("setup");
         engine
-            .execute_script("play.tjs", "player.play(\"idle\");")
+            .execute_script("play.tjs", "player.play(\"idle\", 0);")
             .expect("play");
 
         engine
@@ -3123,7 +3515,7 @@ mod tests {
         engine
             .execute_script(
                 "timed.tjs",
-                "player.play(\"idle\"); player.setVariable(\"x\", 0); \
+                "player.play(\"idle\", 0); player.setVariable(\"x\", 0); \
                  player.setVariable(\"x\", 1, 30, 0); player.progress(250);",
             )
             .expect("timed");
@@ -3156,7 +3548,7 @@ mod tests {
         )]);
         engine.execute_script("setup.tjs", SETUP).expect("setup");
         engine
-            .execute_script("play.tjs", "player.play(\"idle\");")
+            .execute_script("play.tjs", "player.play(\"idle\", 0);")
             .expect("play");
 
         assert_eq!(
@@ -3246,7 +3638,7 @@ mod tests {
 
         engine.execute_script("setup.tjs", SETUP).expect("setup");
         engine
-            .execute_script("play.tjs", "player.play(\"nope\");")
+            .execute_script("play.tjs", "player.play(\"nope\", 0);")
             .expect("unknown motion");
         assert_eq!(integer(&mut engine, "player.playing"), 0);
         assert!(
@@ -3284,7 +3676,7 @@ mod tests {
             .execute_script(
                 "draw.tjs",
                 "layer.fillRect(0, 0, 32, 32, 0xff000000); \
-                 player.play(\"idle\"); player.draw(layer);",
+                 player.play(\"idle\", 0); player.draw(layer);",
             )
             .expect("draw");
         let half = integer(&mut engine, "layer.getMainPixel(7, 7)");
@@ -3309,7 +3701,7 @@ mod tests {
             .execute_script(
                 "draw.tjs",
                 "layer.fillRect(0, 0, 32, 32, 0xff000000); \
-                 player.play(\"idle\"); player.draw(layer);",
+                 player.play(\"idle\", 0); player.draw(layer);",
             )
             .expect("draw");
         assert_eq!(
@@ -3618,7 +4010,7 @@ mod tests {
                 "affine.tjs",
                 // 90° (`cos 0, sin 1`) about the origin, then translate by
                 // (32, 0), spelled the way the game spells it.
-                "player.play(\"idle\"); \
+                "player.play(\"idle\", 0); \
                  player.setDrawAffineTranslateMatrix(0, 1, -1, 0, 32, 0); \
                  player.draw(layer);",
             )
