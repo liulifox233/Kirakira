@@ -90,31 +90,6 @@ fn handle_escaped_script_exception(
     }
 }
 
-/// [`handle_escaped_script_exception`] for a KAG-side failure that reached the
-/// engine as a [`KagError`].
-///
-/// The parser's host callbacks wrap the escaping `TjsError` in
-/// `KagError::Host` (`kag_tjs_error`), so the error is rebuilt from its
-/// `Display` -- the same text the call site would have reported -- before the
-/// project's handler sees it. A parked host call
-/// (`KagError::ResourcePending` / `KagError::HostSuspended`) is a wait, not an
-/// exception: it is handed back the way these call sites have always
-/// converted it.
-#[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
-fn handle_escaped_kag_error(
-    runtime: &mut Runtime<KrkrHost>,
-    context: &str,
-    error: KagError,
-) -> Result<()> {
-    if matches!(
-        error,
-        KagError::ResourcePending { .. } | KagError::HostSuspended { .. }
-    ) {
-        return Err(TjsError::runtime(error.to_string()));
-    }
-    handle_escaped_script_exception(runtime, context, TjsError::runtime(error.to_string()))
-}
-
 /// Wall-clock budget timer that remains safe on browser WASM targets. The
 /// standard library's `Instant` is unavailable there; the browser host still
 /// supplies frame pacing through `EngineInput.delta`, so a zero elapsed value
@@ -1197,9 +1172,15 @@ impl KrkrEngine {
         let waiting_for_resource = self.kag_session.state == KagTaskState::WaitingResource
             && (self.tjs_runtime.host().has_pending_external_resources()
                 || self.tjs_runtime.host().has_pending_resource_loads());
+        // A park crossing either boundary is a wait, not a frame error: the
+        // predicate accepts the `ResourcePending` marker as well as the
+        // "KAG resource is pending:" text the parser renders, so an input
+        // dispatch or a modal resume that parked again (for example the
+        // right-click jump's parser callback while the VM is parked) keeps
+        // the session waiting instead of killing the frame.
         if !waiting_for_resource
             && let Err(error) = self.pump_runtime_scheduler(RuntimeSchedulerPump::Full)
-            && !(error.to_string().contains("KAG resource is pending:") && {
+            && !(is_resource_pending_error(&error) && {
                 self.kag_session.state = KagTaskState::WaitingResource;
                 true
             })
@@ -1208,7 +1189,7 @@ impl KrkrEngine {
         }
         if !waiting_for_resource
             && let Err(error) = self.resume_modal_call_if_ready()
-            && !(error.to_string().contains("KAG resource is pending:") && {
+            && !(is_resource_pending_error(&error) && {
                 self.kag_session.state = KagTaskState::WaitingResource;
                 true
             })
@@ -3403,16 +3384,28 @@ impl KagSession {
                             // object. Parser/engine failures (`KagError::Parse`
                             // and friends) are not script callbacks and stay
                             // fatal.
-                            if matches!(error, KagError::Host { .. })
-                                && handle_escaped_kag_error(runtime, "KAG parser callback", error)
-                                    .is_ok()
-                            {
-                                return Ok(EngineTickResult {
-                                    state: self.state.clone(),
-                                    reason: KagYieldReason::HandlerYield,
-                                    tags_processed,
-                                    elapsed: started.elapsed(),
-                                });
+                            if matches!(error, KagError::Host { .. }) {
+                                // The host kept the thrown object across the
+                                // `KagError` round trip (`EngineKagHost`'s
+                                // stash), so the handler sees the class it
+                                // decides on (`e instanceof "ConductorException"`,
+                                // `Initialize.tjs:18-36`) exactly like the
+                                // game-driven `KAGParser` path.
+                                let escaped = host.script_exception_or(error);
+                                if handle_escaped_script_exception(
+                                    runtime,
+                                    "KAG parser callback",
+                                    escaped,
+                                )
+                                .is_ok()
+                                {
+                                    return Ok(EngineTickResult {
+                                        state: self.state.clone(),
+                                        reason: KagYieldReason::HandlerYield,
+                                        tags_processed,
+                                        elapsed: started.elapsed(),
+                                    });
+                                }
                             }
                             self.state = KagTaskState::Error {
                                 message: message.clone(),
@@ -3915,14 +3908,29 @@ impl KagSession {
                 // parser, which dispatches `onJump`/`onCall`/`onScenarioLoad`
                 // into game script first: a claimed exception leaves the hook
                 // unentered (the session keeps its current item) instead of
-                // killing the frame.
+                // killing the frame, and a park (`KagError::ResourcePending` /
+                // `HostSuspended`, mapped by `script_exception_or`) requeues the
+                // tag like any other pending tag resource.
+                let checkpoint = parser.store();
                 let hooked = if hook.call {
                     parser.call_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
                 } else {
                     parser.go_to_with(hook.storage.as_deref(), hook.target.as_deref(), &mut host)
                 };
                 if let Err(error) = hooked {
-                    handle_escaped_kag_error(runtime, "KAG system hook callback", error)?;
+                    let escaped = host.script_exception_or(error);
+                    if is_resource_pending_error(&escaped) {
+                        // A park leaves the call halfway applied (`call_with`
+                        // pushes its frame before `move_to`, and the target
+                        // scenario is installed before its callbacks run):
+                        // rewind to the item so the requeued tag retries it
+                        // from where the parser's own park handling does
+                        // (`next_tag_with` restores its checkpoint).
+                        parser
+                            .restore(checkpoint)
+                            .map_err(|error| TjsError::runtime(error.to_string()))?;
+                    }
+                    handle_escaped_script_exception(runtime, "KAG system hook callback", escaped)?;
                     return Ok(TagAction::Continue);
                 }
                 self.pending_tags.clear();
@@ -3943,12 +3951,26 @@ impl KagSession {
                 // which runs the project's `onScenarioLoad`/`onScenarioLoaded`
                 // first: a claimed exception means the jump did not happen, so
                 // the session keeps its own scenario and message layer instead
-                // of killing the frame.
+                // of killing the frame, and a park keeps its
+                // `ResourcePending` marker so the tag loop requeues the tag
+                // (`handle_escaped_script_exception` never consults the handler
+                // for a wait). The park also rewinds the parser to the tag, so
+                // the retry re-runs the load and its callbacks from the start
+                // even when the scenario was already installed when the call
+                // was aborted.
+                let checkpoint = parser.store();
                 if let Err(error) = parser.load_scenario_with(storage, &mut host) {
-                    if let krkr_kag::KagError::ResourcePending { storage } = error {
-                        return Err(TjsError::resource_pending(storage));
+                    let escaped = host.script_exception_or(error);
+                    if is_resource_pending_error(&escaped) {
+                        parser
+                            .restore(checkpoint)
+                            .map_err(|error| TjsError::runtime(error.to_string()))?;
                     }
-                    handle_escaped_kag_error(runtime, "KAG `[sysjump]` scenario load", error)?;
+                    handle_escaped_script_exception(
+                        runtime,
+                        "KAG `[sysjump]` scenario load",
+                        escaped,
+                    )?;
                     return Ok(TagAction::Continue);
                 }
                 self.pending_tags.clear();
@@ -4135,7 +4157,14 @@ impl KagSession {
         // The right-click `[call]`/`[jump]` machinery dispatches into game
         // script through the parser (`onCall`/`onJump`); a claimed exception
         // leaves the jump unapplied and the session waiting for the next
-        // input instead of killing the frame.
+        // input instead of killing the frame. A park (the VM is still parked
+        // on a modal/resource, so the parser's callback cannot run) keeps its
+        // `ResourcePending` marker and is served by the frame boundary as a
+        // wait -- the jump stays unapplied and the next right-click retries
+        // it. The park also rewinds the parser to the state before the call
+        // (the same rewind `next_tag_with` performs for the item it parks on),
+        // so a partially applied jump cannot leak into that retry.
+        let checkpoint = parser.store();
         let jumped = if self.right_click.call {
             parser.call_with(storage.as_deref(), target.as_deref(), &mut host)
         } else if self.right_click.jump {
@@ -4144,7 +4173,13 @@ impl KagSession {
             return Ok(());
         };
         if let Err(error) = jumped {
-            handle_escaped_kag_error(runtime, "KAG right-click jump callback", error)?;
+            let escaped = host.script_exception_or(error);
+            if is_resource_pending_error(&escaped) {
+                parser
+                    .restore(checkpoint)
+                    .map_err(|error| TjsError::runtime(error.to_string()))?;
+            }
+            handle_escaped_script_exception(runtime, "KAG right-click jump callback", escaped)?;
             return Ok(());
         }
 
@@ -20709,16 +20744,15 @@ mod tests {
             engine.tjs_runtime().global_member("handled"),
             Variant::Integer(1)
         );
-        // The engine-driven session's parser callbacks reach the handler with
-        // the rendered error text only: `EngineKagHost` wraps the escaping
-        // `TjsError` in `KagError::Host` (`crates/krkr-engine/src/kag.rs`), so
-        // the reconstructed exception carries the `Exception` class instead of
-        // the project's own. The game-driven path keeps it
-        // (`kag_parser_native_callback_exception_reaches_the_handler_with_its_class`);
-        // this is the filed follow-up, not a silent difference.
+        // The thrown class survives the `KagError::Host` round trip exactly as
+        // it does on the game-driven path
+        // (`kag_parser_native_callback_exception_reaches_the_handler_with_its_class`):
+        // `EngineKagHost` keeps the escaping `TjsError` (`script_exception_or`,
+        // `crates/krkr-engine/src/kag.rs`) and the frame boundary hands that
+        // original object to the project's handler.
         assert_eq!(
             engine.tjs_runtime().global_member("classSeen"),
-            Variant::Integer(0)
+            Variant::Integer(1)
         );
 
         let second = engine.tick().expect("continued session");
@@ -20773,6 +20807,209 @@ mod tests {
             "unexpected session state: {:?}",
             engine.kag_state()
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Parks the VM on a modal window from the project's `onScenarioLoad`
+    /// handler the first time a scenario is loaded, the shape a game's own
+    /// `onScenarioLoad` has when it opens a dialog before a jump: the callback
+    /// runs (and suspends the VM) and the parser then wants its next callback
+    /// (`onScenarioLoaded`/`onLabel`) while the VM is parked, which
+    /// `EngineKagHost::ensure_not_suspended` reports as
+    /// `KagError::HostSuspended`.
+    fn park_vm_on_scenario_load(engine: &mut KrkrEngine) {
+        let parser = engine
+            .active_kag_parser_handle()
+            .expect("active parser handle");
+        engine
+            .tjs_runtime_mut()
+            .set_global_member("activeParser", Variant::Object(parser));
+        engine
+            .execute_script(
+                "park-on-scenario-load.tjs",
+                r#"
+                global.parkOnLoad = true;
+                activeParser.onScenarioLoad = function(storage) {
+                    if (!global.parkOnLoad) { return; }
+                    global.parkOnLoad = false;
+                    global.modal = new Window();
+                    global.modal.showModal();
+                };
+                "#,
+            )
+            .expect("install onScenarioLoad park");
+    }
+
+    /// Closes the modal [`park_vm_on_scenario_load`] parked on; the parked call
+    /// itself is resumed by the KAG loop's "resume without modal" branch on the
+    /// next frame, which is when the requeued tag is retried.
+    fn close_park_modal(engine: &mut KrkrEngine) {
+        let modal = object_handle(engine, "modal");
+        engine.tjs_runtime_mut().host_mut().pop_modal_window(modal);
+    }
+
+    /// A system hook (`[syshook]`/`[syscall]`/`[sysgo]`) drives the parser from
+    /// the engine, and the parser's host callbacks cannot run while the VM is
+    /// parked (`EngineKagHost::ensure_not_suspended`): the tag has to be
+    /// requeued and the session has to wait, exactly like a scenario the host
+    /// still has to fetch (`KagError::ResourcePending`). A `HostSuspended` park
+    /// escaping as `TjsError::runtime` kills the frame on a state the engine
+    /// resumes from.
+    #[test]
+    fn kag_syshook_host_suspension_parks_the_tag_instead_of_aborting() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[syshook name=probe][s]").expect("write scenario");
+        fs::write(
+            root.join("custom.ks"),
+            "[addSysHook name=\"probe\" storage=\"hook.ks\" target=\"*probe\"]",
+        )
+        .expect("write hook declarations");
+        fs::write(root.join("hook.ks"), "*probe\nHOOK[s]").expect("write hook scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        park_vm_on_scenario_load(&mut engine);
+
+        let parked = engine.tick().expect("a parked system hook must not abort");
+        assert_eq!(parked.state, KagTaskState::WaitingResource);
+        assert!(engine.message_layer().lines.is_empty());
+
+        // The modal closing ends the park; the requeued tag is retried and the
+        // hook scenario is entered (whose `[s]` stops the scenario).
+        close_park_modal(&mut engine);
+        let tick = engine.tick().expect("retried system hook");
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["HOOK".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The `call` flavour of the hook (`[syscall]`, `call=true`):
+    /// `KagParser::call_with` parks the same way and the requeued tag enters the
+    /// hook once the parked call has finished.
+    #[test]
+    fn kag_syscall_host_suspension_parks_the_tag_instead_of_aborting() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[syshook name=probe][s]").expect("write scenario");
+        fs::write(
+            root.join("custom.ks"),
+            "[addSysHook name=\"probe\" storage=\"hook.ks\" target=\"*probe\" call]",
+        )
+        .expect("write hook declarations");
+        fs::write(root.join("hook.ks"), "*probe\nHOOK[return]").expect("write hook scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        park_vm_on_scenario_load(&mut engine);
+
+        let parked = engine.tick().expect("a parked system call must not abort");
+        assert_eq!(parked.state, KagTaskState::WaitingResource);
+        assert!(engine.message_layer().lines.is_empty());
+
+        close_park_modal(&mut engine);
+        let tick = engine.tick().expect("retried system call");
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["HOOK".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `[sysjump]` loads its target through the parser, so the same park hits
+    /// `KagParser::load_scenario_with`: the tag loop requeues the tag and the
+    /// session waits for the parked call to finish instead of aborting.
+    #[test]
+    fn kag_sysjump_host_suspension_parks_the_tag_instead_of_aborting() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[sysjump to=second][s]").expect("write scenario");
+        fs::write(root.join("second.ks"), "B[s]").expect("write target scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        park_vm_on_scenario_load(&mut engine);
+
+        let parked = engine.tick().expect("a parked system jump must not abort");
+        assert_eq!(parked.state, KagTaskState::WaitingResource);
+        assert!(engine.message_layer().lines.is_empty());
+
+        close_park_modal(&mut engine);
+        let tick = engine.tick().expect("retried system jump");
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["B".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The right-click jump site: `[rclick]`'s `call`/`jump` dispatch runs the
+    /// parser's `onScenarioLoad`/`onCall` callbacks, and a VM that is already
+    /// parked cannot run them (`EngineKagHost::ensure_not_suspended`). The park
+    /// keeps its `ResourcePending` marker -- the frame boundary (`update`'s
+    /// pump and modal-resume checks) serves that marker as a wait -- instead of
+    /// escaping as the fatal `Runtime` error it used to be, the jump stays
+    /// unapplied, and the next right-click performs it.
+    ///
+    /// The engine's input path never reaches this shape on its own
+    /// (`handle_input_events` ignores a secondary click while a modal is
+    /// active, and a resource park skips the scheduler pump in `update`), so
+    /// the site is driven directly here.
+    #[test]
+    fn kag_right_click_host_suspension_returns_a_park_instead_of_a_fatal_error() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "*start\n[rclick jump=true storage=second.ks target=*config enabled=true]A[s]",
+        )
+        .expect("write scenario");
+        fs::write(root.join("second.ks"), "*config\nC[s]").expect("write target scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        assert_eq!(
+            engine.tick().expect("first tick").state,
+            KagTaskState::Finished
+        );
+        assert_eq!(engine.message_layer().lines, vec!["A".to_string()]);
+
+        engine
+            .execute_script(
+                "parked-right-click.tjs",
+                "global.modal = new Window();\nglobal.modal.showModal();",
+            )
+            .expect("park the VM on a modal");
+        assert!(engine.is_script_suspended());
+
+        let error = engine
+            .kag_session
+            .fire_right_click(&mut engine.tjs_runtime)
+            .expect_err("a parked right-click parks instead of aborting");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::ResourcePending);
+        assert!(is_resource_pending_error(&error));
+        assert_eq!(engine.message_layer().lines, vec!["A".to_string()]);
+
+        // The park ends when the modal closes; the configured jump survives and
+        // the next right-click applies it.
+        close_park_modal(&mut engine);
+        engine.kag_session.state = KagTaskState::Running;
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("resume the parked VM");
+        assert!(!engine.is_script_suspended());
+        engine
+            .update(
+                EngineInput::new(
+                    FrameInput::new(Size::new(320.0, 240.0), 0.0),
+                    vec![EngineEvent::PointerInput {
+                        button: PointerButton::Secondary,
+                        state: ButtonState::Pressed,
+                    }],
+                ),
+                Duration::ZERO,
+            )
+            .expect("right click after the park ends");
+        assert_eq!(engine.message_layer().lines, vec!["AC".to_string()]);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
