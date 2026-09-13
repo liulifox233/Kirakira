@@ -121,23 +121,36 @@
 //!   recovered).
 //!
 //! **Unit conversions.** The library feeds the value after the frequency into
-//! `sin/(2·x)` for three of the RBJ responses — TypeI's `x` is the `Resonance`
-//! (Q), TypeII's the octave bandwidth, TypeIII's the shelf slope — while this
-//! port's `quality()` computes `sin/(2·Q)` from its `bandwidthOctaves`
-//! (`Q = 1/(2·sinh(ln2/2·BW))`). Those three slots are therefore stored as the
-//! octave bandwidth that reproduces the library's `x` exactly (the conversion
-//! is the exact inverse of `quality()`, so the chain matches; the shelf slope's
-//! conversion additionally depends on the gain, which is why a shelf's `gain`
-//! slot has been applied first). Two consequences are visible and deliberate:
-//! a `void` Q or bandwidth slot stores the converted default (`Q = 1` →
-//! ≈1.3886 octaves), and `currentValue("bandwidthOctaves")` reports the stored
-//! octave value, not the script's `x`. Because the port keeps one bandwidth
-//! field, changing a shelf's `gain` later does not re-derive the slope it was
-//! converted for; the reference keeps `(gain, slope)` separately. TypeIV's
-//! bandwidth goes through the library's `sinh(ln2/2·BW·w0/sn)` octave form and
-//! stays a raw octave value; a non-positive `x` has no octave equivalent and
-//! reports the port's `invalid usage of ParamInfo` error, unlike the reference,
-//! which would build a nonsense filter.
+//! `sin/(2·x)` for two of the RBJ responses — TypeI's `x` is the `Resonance`
+//! (Q), TypeII's the octave bandwidth — while this port's `quality()` computes
+//! `sin/(2·Q)` from its `bandwidthOctaves` (`Q = 1/(2·sinh(ln2/2·BW))`). Those
+//! two slots are therefore stored as the octave bandwidth that reproduces the
+//! library's `x` exactly (the conversion is the exact inverse of `quality()`,
+//! so the chain matches), and two consequences are visible and deliberate: a
+//! `void` Q or bandwidth slot stores the converted default (`Q = 1` → ≈1.3886
+//! octaves), and `currentValue("bandwidthOctaves")` reports the stored octave
+//! value, not the script's `x`. TypeIII's slot is the library's shelf `Slope`,
+//! stored verbatim: the port's shelf branch reads it with the gain exactly as
+//! the library's `AL = sn/2·sqrt((A + 1/A)(1/S − 1) + 2)` does, so a later gain
+//! change re-derives the shelf the way the reference would. TypeIV's bandwidth
+//! goes through the library's `sinh(ln2/2·BW·w0/sn)` octave form — the port's
+//! band shelf is the library's (`RBJ.cpp` `BandShelf::setup`), wedge included —
+//! and stays a raw octave value. A value whose conversion has no positive
+//! radicand — a non-positive `x`, or a shelf slope whose
+//! `(A + 1/A)(1/S − 1) + 2` is not positive, e.g. slope `2` at `−24 dB` —
+//! answers an error rather than the reference's nonsense filter: the
+//! conversion refuses with the port's `invalid usage of ParamInfo`, and the
+//! designer refuses a slope or bandwidth it cannot use with its own message
+//! (the parameter is rolled back, so the filter keeps a working chain).
+//!
+//! **Which bandwidth field carries the Q.** The library's parameter lists
+//! decide: the RBJ designs declare the octave bandwidth, so `quality()` reads
+//! the octave field for them (with the Hz form as this port's fallback), while
+//! the prototype designs declare only `Bandwidth (Hz)`
+//! (`Butterworth.h`/`ChebyshevI.h`… `TypeIIBase` → `defaultBandwidthHzParam`),
+//! so `quality()` reads the Hz field for them. Before this, the octave field's
+//! default (1.0) shadowed the Hz slot value, and a `setParams(void, order,
+//! center, bandwidthHz)` on a prototype band designed the wrong width.
 //!
 //! The dictionary/name-value pair forms are this port's extension (the
 //! reference would read a dictionary as slot 0's value). They are checked
@@ -182,8 +195,9 @@
 //! built from the selected design and response:
 //!
 //! * `RBJ` — the cookbook coefficients for every response the class names;
-//!   `Band Shelf` maps to the cookbook's **peaking** section (RBJ has no
-//!   band-shelf formula), which the arm comment in `rbj_sections` records.
+//!   `Band Shelf` uses the library's own band-shelf form (`AL =
+//!   sn·sinh(ln2/2·BW·w0/sn)`, `RBJ.cpp` `BandShelf::setup`), and the shelves
+//!   their `sqrt((A + 1/A)(1/S − 1) + 2)` form.
 //! * `Butterworth`, `Chebyshev I`, `Chebyshev II`, `Bessel`, `Legendre` —
 //!   an analog prototype (computed here: closed forms for Butterworth and the
 //!   two Chebyshev families, the roots of the reverse Bessel polynomial and of
@@ -196,11 +210,10 @@
 //! **Not implemented** (documented, not silently substituted): the
 //! `Elliptic` design and the shelf responses for the non-RBJ designs need the
 //! elliptic function machinery / polynomial shelf algebra of the reference
-//! matrix; the DLL's `AllPass`, `BandPass1` and `BandPass2` response
+//! matrix, and the DLL's `AllPass`, `BandPass1` and `BandPass2` response
 //! identifiers are recognised but unmodelled (this port names them in its
-//! refusal instead of treating them as typos); and the RBJ `Band Shelf` is the
-//! peaking approximation above. All of them answer a clear error rather than a
-//! wrong filter. The DLL's own Bessel/Legendre pole tables were not extracted
+//! refusal instead of treating them as typos). All of them answer a clear error
+//! rather than a wrong filter. The DLL's own Bessel/Legendre pole tables were not extracted
 //! (that is a second RE pass on the 1.1 MB image), so those two prototypes are
 //! computed numerically here.
 //!
@@ -232,7 +245,7 @@ pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "WaveDSPFilter (tTJSNC_WaveDSPFilter / tTJSNI_WaveDSPFilter) on WaveSoundBuffer",
     notes: "Real IIR designer and processor behind the recovered member surface: RBJ cookbook \
-            (with Band Shelf mapped to the peaking section), Butterworth / Chebyshev I / \
+            (the band shelf in the library's own sinh-octave form), Butterworth / Chebyshev I / \
             Chebyshev II / Bessel / Legendre analog prototypes through the bilinear transform, \
             and custom pole placement; the parameter table carries the recovered labels and both \
             the DLL's own identifiers and the readable spellings for design/response values. The \
@@ -572,11 +585,19 @@ impl FilterSpec {
         }
     }
 
-    /// The resonant `Q` the RBJ designs and the band transforms use. A
-    /// bandwidth in octaves wins over the Hz form when both are set (octaves
-    /// are the musical unit and the DLL ships labels for both).
+    /// The resonant `Q` the RBJ designs and the band transforms use. Which
+    /// field carries it follows the library's parameter lists: the RBJ designs
+    /// declare an octave bandwidth (`RBJ.h` `TypeIIBase` → `Bandwidth
+    /// (Octaves)`), so their octave field wins when it is set, with the Hz form
+    /// as the port's fallback; the prototype designs declare only `Bandwidth
+    /// (Hz)` (`Butterworth.h` `TypeIIBase` → `defaultBandwidthHzParam`), so
+    /// they always read the Hz field — otherwise the octave field's default
+    /// (1.0) would shadow the reference's Hz slot value.
     fn quality(&self) -> f64 {
         let frequency = f64::from(self.design_frequency().max(1.0));
+        if self.design != DesignKind::Rbj {
+            return (frequency / f64::from(self.bandwidth_hz.max(1.0))).max(0.001);
+        }
         if self.bandwidth_octaves > 0.0 {
             let bandwidth = f64::from(self.bandwidth_octaves);
             let sinh = ((std::f64::consts::LN_2 / 2.0) * bandwidth).sinh();
@@ -584,8 +605,7 @@ impl FilterSpec {
                 return 1.0 / (2.0 * sinh);
             }
         }
-        let hz = f64::from(self.bandwidth_hz.max(1.0));
-        (frequency / hz).max(0.001)
+        (frequency / f64::from(self.bandwidth_hz.max(1.0))).max(0.001)
     }
 
     /// The band edge in radians, clamped below Nyquist so the bilinear
@@ -1089,7 +1109,6 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
     let q = spec.quality().max(0.001);
     let alpha = sin / (2.0 * q);
     let a = 10.0_f64.powf(f64::from(spec.gain_db) / 40.0);
-    let sqrt_a = a.sqrt();
     let section = |b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64| Biquad {
         b0: (b0 / a0) as f32,
         b1: (b1 / a0) as f32,
@@ -1121,7 +1140,7 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
             section(1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha)
         }
         ResponseType::LowShelf => {
-            let beta = 2.0 * sqrt_a * alpha;
+            let beta = shelf_sq(spec, a, sin)?;
             section(
                 a * ((a + 1.0) - (a - 1.0) * cos + beta),
                 2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
@@ -1132,7 +1151,7 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
             )
         }
         ResponseType::HighShelf => {
-            let beta = 2.0 * sqrt_a * alpha;
+            let beta = shelf_sq(spec, a, sin)?;
             section(
                 a * ((a + 1.0) + (a - 1.0) * cos + beta),
                 -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
@@ -1142,18 +1161,47 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
                 (a + 1.0) - (a - 1.0) * cos - beta,
             )
         }
-        // RBJ's cookbook has no band-shelf section; the peaking response is
-        // the closest member of the family, and the port documents the mapping.
-        ResponseType::BandShelf => section(
-            1.0 + alpha * a,
-            -2.0 * cos,
-            1.0 - alpha * a,
-            1.0 + alpha / a,
-            -2.0 * cos,
-            1.0 - alpha / a,
-        ),
+        // The library's band shelf (`RBJ.cpp` `BandShelf::setup`), not the
+        // cookbook's peaking section: `AL = sn·sinh(ln2/2·BW·w0/sn)` — the
+        // `w0/sn` wedge is what makes the octave bandwidth mean an octave away
+        // from DC — with `b0 = 1 + AL·A`, `b2 = 1 − AL·A`, `a0 = 1 + AL/A`,
+        // `a2 = 1 − AL/A`.
+        ResponseType::BandShelf => {
+            let bandwidth = f64::from(spec.bandwidth_octaves);
+            let al = sin * ((std::f64::consts::LN_2 / 2.0) * bandwidth * omega / sin).sinh();
+            if !al.is_finite() || al <= 0.0 {
+                return Err(DesignError::BadParameter(format!(
+                    "Band Shelf bandwidth {bandwidth} has no finite form at {} Hz",
+                    spec.center
+                )));
+            }
+            section(
+                1.0 + al * a,
+                -2.0 * cos,
+                1.0 - al * a,
+                1.0 + al / a,
+                -2.0 * cos,
+                1.0 - al / a,
+            )
+        }
     };
     Ok(vec![coefficients])
+}
+
+/// The shelf's `sq` term: the library's `2·sqrt(A)·AL` with `AL =
+/// sn/2·sqrt((A + 1/A)(1/S − 1) + 2)` (`RBJ.cpp` `LowShelf::setup` /
+/// `HighShelf::setup`), where `S` is the stored `Slope` value. `S` doubles as
+/// the port's octave field, and must leave the radicand positive.
+fn shelf_sq(spec: &FilterSpec, a: f64, sin: f64) -> std::result::Result<f64, DesignError> {
+    let slope = f64::from(spec.bandwidth_octaves);
+    let radicand = (a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0;
+    if !radicand.is_finite() || radicand <= 0.0 {
+        return Err(DesignError::BadParameter(format!(
+            "the RBJ shelf slope {slope} has no finite form at {} dB",
+            spec.gain_db
+        )));
+    }
+    Ok(a.sqrt() * sin * radicand.sqrt())
 }
 
 fn custom_one_pole(spec: &FilterSpec) -> Biquad {
@@ -1440,7 +1488,7 @@ pub struct ParamInfo {
 /// recovered from the DLL's strings; the numeric defaults are the DLL's own
 /// `ParamInfo` defaults (its inlined constructors — see the module docs for the
 /// builder addresses), and the parameter names are this port's (documented in
-/// the module docs). The four labels marked `(port)` were not in the recovered
+/// the module docs). The five labels marked `(port)` were not in the recovered
 /// string list — they name parameters the designs need.
 pub const PARAMETER_TABLE: [ParamInfo; 13] = [
     ParamInfo {
@@ -1548,21 +1596,6 @@ fn octaves_for_quality(q: f64) -> std::result::Result<f64, String> {
     Ok((2.0 / std::f64::consts::LN_2) * (1.0 / (2.0 * q)).asinh())
 }
 
-/// The RBJ shelf slope's `Q` equivalent for the gain in effect. The library's
-/// shelf uses `AL = sn/2·sqrt((A + 1/A)(1/S − 1) + 2)` (`RBJ::LowShelf::setup`)
-/// where this port's uses `AL = sn/(2Q)`, with `A = 10^(gain/40)`; `S = 1`
-/// (the default) is gain-independent.
-fn octaves_for_slope(slope: f64, gain_db: f64) -> std::result::Result<f64, String> {
-    let a = 10.0_f64.powf(gain_db / 40.0);
-    let radicand = (a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0;
-    if !(radicand.is_finite() && radicand > 0.0) {
-        return Err(format!(
-            "invalid usage of ParamInfo: the reference's shelf slope `{slope}` has no bandwidth equivalent at {gain_db} dB"
-        ));
-    }
-    octaves_for_quality(1.0 / radicand.sqrt())
-}
-
 /// What one slot of the reference's positional `setParams` vector addresses.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Slot {
@@ -1580,8 +1613,8 @@ pub enum Slot {
     /// Stored the same way, so the chain matches the library's `AL`.
     BandwidthAsQuality,
     /// The reference's shelf slope — RBJ TypeIII, whose `AL` is the library's
-    /// `sqrt((A + 1/A)(1/S − 1) + 2)` form. Stored as the octave bandwidth that
-    /// reproduces it for the gain in effect.
+    /// `sqrt((A + 1/A)(1/S − 1) + 2)` form. Stored verbatim; the port's shelf
+    /// designer reads it together with the gain.
     ShelfSlope,
 }
 
@@ -2186,18 +2219,15 @@ fn set_positional_params(this: ObjectHandle, args: &[Variant]) -> Result<Variant
                     Err(message) => Err(message),
                 }
             }
-            // The shelf's `AL` depends on the gain, which the slot before this
-            // one has already stored; the conversion is exact for that gain.
+            // The shelf slope is stored verbatim: the port's shelf branch reads
+            // it with the gain the way the library's `AL` does, so a later gain
+            // change re-derives the shelf as the reference would.
             Slot::ShelfSlope => {
                 let slope = supplied.unwrap_or(SLOPE_DEFAULT);
-                let gain = with_state(this, |state| state.real("gain")).unwrap_or(0.0);
-                match octaves_for_slope(slope, gain) {
-                    Ok(octaves) => with_state(this, |state| {
-                        state.set("bandwidthOctaves", ParamValue::Real(octaves))
-                    })
-                    .unwrap_or(Ok(())),
-                    Err(message) => Err(message),
-                }
+                with_state(this, |state| {
+                    state.set("bandwidthOctaves", ParamValue::Real(slope))
+                })
+                .unwrap_or(Ok(()))
             }
         };
         if let Err(message) = result {
@@ -2546,39 +2576,6 @@ mod tests {
             (state.real("cutoff"), state.spec().quality())
         })
         .expect("the filter is live")
-    }
-
-    /// The converted slots reproduce the library exactly: TypeIII's shelf slope
-    /// becomes the Q the library's `sn/2·sqrt((A + 1/A)(1/S − 1) + 2)` form uses
-    /// for the gain in effect (the gain slot has been applied first).
-    #[test]
-    fn the_rbj_slope_slot_reproduces_the_library() {
-        let mut engine = engine();
-        let handle = match try_run(
-            &mut engine,
-            "(function() {\n\
-                 var f = new WaveSoundBuffer.WaveDSPFilter(\"HighShelf\", \"RBJ\");\n\
-                 f.setParams(void, 2000, 6, 0.5);\n\
-                 return f;\n\
-             })()",
-        )
-        .expect("the shelf's positional call must be accepted")
-        {
-            Variant::Object(handle) => handle,
-            Variant::Closure(closure) => closure.object,
-            other => panic!("the script returned {other:?}"),
-        };
-        let (gain, quality) =
-            with_state(handle, |state| (state.real("gain"), state.spec().quality()))
-                .expect("the filter is live");
-        assert_eq!(gain, 6.0);
-        // `A = 10^(6/40)`, `Q = 1/sqrt((A + 1/A)(1/0.5 − 1) + 2)`.
-        let a = 10.0_f64.powf(6.0 / 40.0);
-        let expected = 1.0 / ((a + 1.0 / a) * (1.0 / 0.5 - 1.0) + 2.0).sqrt();
-        assert!(
-            (quality - expected).abs() < 1e-6,
-            "slope Q {quality} vs {expected}"
-        );
     }
 
     /// Slot 0 is the sample rate the chain is designed against, and slot 1 of a
@@ -2956,6 +2953,8 @@ mod tests {
         let gain = 10.0_f64.powf(6.0 / 20.0);
         let mut low = spec(DesignKind::Rbj, ResponseType::LowShelf);
         low.gain_db = 6.0;
+        // The shelf slope: the library's `Slope` parameter, default 1.
+        low.bandwidth_octaves = 1.0;
         assert!((response_of(&low, 0.0) - gain).abs() < 1e-3, "low shelf DC");
         assert!(
             (response_of(&low, 24000.0) - 1.0).abs() < 0.02,
@@ -2964,6 +2963,7 @@ mod tests {
 
         let mut high = spec(DesignKind::Rbj, ResponseType::HighShelf);
         high.gain_db = 6.0;
+        high.bandwidth_octaves = 1.0;
         assert!(
             (response_of(&high, 24000.0) - gain).abs() < 0.02,
             "high shelf Nyquist"
@@ -2972,6 +2972,181 @@ mod tests {
             (response_of(&high, 0.0) - 1.0).abs() < 1e-3,
             "high shelf DC"
         );
+    }
+
+    /// `|H(e^{jω})|` of a biquad at `frequency`, so a test can compare a
+    /// designed chain against coefficients written out from the reference's
+    /// source (the denominator's `a0` normalises both rows).
+    fn biquad_magnitude(
+        frequency: f64,
+        sample_rate: f32,
+        [b0, b1, b2]: [f64; 3],
+        [a0, a1, a2]: [f64; 3],
+    ) -> f64 {
+        let omega = 2.0 * std::f64::consts::PI * frequency / f64::from(sample_rate);
+        let (b0, b1, b2) = (b0 / a0, b1 / a0, b2 / a0);
+        let (a1, a2) = (a1 / a0, a2 / a0);
+        let re_b = b0 + b1 * (-omega).cos() + b2 * (-2.0 * omega).cos();
+        let im_b = b1 * (-omega).sin() + b2 * (-2.0 * omega).sin();
+        let re_a = 1.0 + a1 * (-omega).cos() + a2 * (-2.0 * omega).cos();
+        let im_a = a1 * (-omega).sin() + a2 * (-2.0 * omega).sin();
+        re_b.hypot(im_b) / re_a.hypot(im_a)
+    }
+
+    /// The shelf slot is the library's `Slope`, stored verbatim; the port's
+    /// shelf branch computes the library's `AL` — the `sn/2·sqrt((A + 1/A)(1/S
+    /// − 1) + 2)` form — and `sq = 2·sqrt(A)·AL` from it and the gain, so the
+    /// chain reproduces `RBJ.cpp` `HighShelf::setup`. Unlike a stored
+    /// conversion, a later gain change re-derives it.
+    #[test]
+    fn the_rbj_slope_slot_reproduces_the_library() {
+        let mut engine = engine();
+        let handle = match try_run(
+            &mut engine,
+            "(function() {\n\
+                 var f = new WaveSoundBuffer.WaveDSPFilter(\"HighShelf\", \"RBJ\");\n\
+                 f.setParams(void, 2000, 6, 0.5);\n\
+                 return f;\n\
+             })()",
+        )
+        .expect("the shelf's positional call must be accepted")
+        {
+            Variant::Object(handle) => handle,
+            Variant::Closure(closure) => closure.object,
+            other => panic!("the script returned {other:?}"),
+        };
+        let (gain, slope, rate, designed) = with_state(handle, |state| {
+            let rate = state.sample_rate;
+            (
+                state.real("gain"),
+                state.real("bandwidthOctaves"),
+                rate,
+                [500.0, 2000.0, 8000.0]
+                    .map(|frequency| state.chain.magnitude_at_hz(frequency, rate)),
+            )
+        })
+        .expect("the filter is live");
+        assert_eq!(gain, 6.0);
+        assert_eq!(slope, 0.5, "the slope is stored verbatim");
+
+        // `RBJ.cpp` `HighShelf::setup` at the live cutoff and sample rate.
+        let a = 10.0_f64.powf(6.0 / 40.0);
+        let omega = 2.0 * std::f64::consts::PI * 2000.0 / f64::from(rate);
+        let (sin, cos) = (omega.sin(), omega.cos());
+        let al = sin / 2.0 * ((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0).sqrt();
+        let sq = 2.0 * a.sqrt() * al;
+        let b = [
+            a * ((a + 1.0) + (a - 1.0) * cos + sq),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
+            a * ((a + 1.0) + (a - 1.0) * cos - sq),
+        ];
+        let denominator = [
+            (a + 1.0) - (a - 1.0) * cos + sq,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos),
+            (a + 1.0) - (a - 1.0) * cos - sq,
+        ];
+        for (index, frequency) in [500.0, 2000.0, 8000.0].into_iter().enumerate() {
+            let expected = biquad_magnitude(frequency, rate, b, denominator);
+            assert!(
+                (designed[index] - expected).abs() < 1e-5,
+                "at {frequency} Hz: {} vs {}",
+                designed[index],
+                expected
+            );
+        }
+    }
+
+    /// The port's band shelf is the library's `BandShelf::setup`, including the
+    /// `w0/sn` wedge in `AL = sn·sinh(ln2/2·BW·w0/sn)`: at 10 kHz/44.1 kHz the
+    /// wedge moves the sinh argument by about 47 %, so its absence is visible
+    /// away from the center (at the center this coefficient family's gain is
+    /// `A²` whatever `AL` is).
+    #[test]
+    fn the_rbj_band_shelf_uses_the_librarys_octave_wedge() {
+        let mut spec = spec(DesignKind::Rbj, ResponseType::BandShelf);
+        spec.center = 10_000.0;
+        spec.bandwidth_octaves = 1.0;
+        spec.gain_db = 6.0;
+
+        // The library's arithmetic, written out from `RBJ.cpp`: the coefficients
+        // come from the design center, the response is sampled at `frequency`.
+        let a = 10.0_f64.powf(6.0 / 40.0);
+        let omega0 = 2.0 * std::f64::consts::PI * 10_000.0 / f64::from(spec.sample_rate);
+        let magnitude = |frequency: f64, al: f64| {
+            let omega = 2.0 * std::f64::consts::PI * frequency / f64::from(spec.sample_rate);
+            let cos0 = omega0.cos();
+            let (b0, b1, b2) = (1.0 + al * a, -2.0 * cos0, 1.0 - al * a);
+            let (a0, a1, a2) = (1.0 + al / a, -2.0 * cos0, 1.0 - al / a);
+            let (b0, b1, b2) = (b0 / a0, b1 / a0, b2 / a0);
+            let (a1, a2) = (a1 / a0, a2 / a0);
+            let re_b = b0 + b1 * (-omega).cos() + b2 * (-2.0 * omega).cos();
+            let im_b = b1 * (-omega).sin() + b2 * (-2.0 * omega).sin();
+            let re_a = 1.0 + a1 * (-omega).cos() + a2 * (-2.0 * omega).cos();
+            let im_a = a1 * (-omega).sin() + a2 * (-2.0 * omega).sin();
+            re_b.hypot(im_b) / re_a.hypot(im_a)
+        };
+        let arg = std::f64::consts::LN_2 / 2.0;
+        let wedged = |frequency: f64| {
+            magnitude(
+                frequency,
+                omega0.sin() * (arg * omega0 / omega0.sin()).sinh(),
+            )
+        };
+        let unwarped = |frequency: f64| magnitude(frequency, omega0.sin() * arg.sinh());
+
+        assert!(
+            (response_of(&spec, 10_000.0) - wedged(10_000.0)).abs() < 1e-5,
+            "the port's band shelf is {}, the library's {}",
+            response_of(&spec, 10_000.0),
+            wedged(10_000.0)
+        );
+        assert!(
+            (response_of(&spec, 7_000.0) - wedged(7_000.0)).abs() < 1e-5,
+            "the port's band shelf at 7 kHz is {}, the library's {}",
+            response_of(&spec, 7_000.0),
+            wedged(7_000.0)
+        );
+        assert!(
+            (wedged(7_000.0) - unwarped(7_000.0)).abs() > 0.05,
+            "the wedge must matter at 10 kHz: {} vs {} unwarped",
+            wedged(7_000.0),
+            unwarped(7_000.0)
+        );
+    }
+
+    /// The prototype designs' band slots take their width from `bandwidthHz`
+    /// (their `TypeIIBase` declares `defaultBandwidthHzParam` and no octave
+    /// parameter), so the octave field's default must not shadow it: a
+    /// `setParams(void, order, center, bandwidthHz)` designs `center /
+    /// bandwidthHz` as the Q.
+    #[test]
+    fn the_prototype_band_slot_uses_its_hz_bandwidth() {
+        let mut engine = engine();
+        let handle = match try_run(
+            &mut engine,
+            "(function() {\n\
+                 var f = new WaveSoundBuffer.WaveDSPFilter(\"BandPass\", \"Butterworth\");\n\
+                 f.setParams(void, 4, 1000, 500);\n\
+                 return f;\n\
+             })()",
+        )
+        .expect("the positional call must be accepted")
+        {
+            Variant::Object(handle) => handle,
+            Variant::Closure(closure) => closure.object,
+            other => panic!("the script returned {other:?}"),
+        };
+        let (center, bandwidth, quality) = with_state(handle, |state| {
+            (
+                state.real("center"),
+                state.real("bandwidthHz"),
+                state.spec().quality(),
+            )
+        })
+        .expect("the filter is live");
+        assert_eq!(center, 1000.0);
+        assert_eq!(bandwidth, 500.0);
+        assert!((quality - 2.0).abs() < 1e-6, "Q came out as {quality}");
     }
 
     // ------------------------------------------- analog prototype designs
