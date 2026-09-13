@@ -4,12 +4,17 @@
 //! itself instead of quietly disappearing.
 
 use std::collections::BTreeSet;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
-use krkr_engine::{EngineConfig, KrkrEngine};
+use krkr_engine::{EngineConfig, KrkrEngine, KrkrHost, KrkrPlugin};
 use krkr_plugins::{
     CATALOG, GIST_PLUGIN_NAMES, GameProfile, PARQUET_PLUGIN_FILES, canonical_name, missing_plugins,
     register_profile_plugins, register_reference_plugins, resolve,
 };
+use krkr_tjs2::{Result, runtime::Runtime};
 
 fn test_engine() -> KrkrEngine {
     KrkrEngine::new(EngineConfig::default()).expect("engine")
@@ -106,34 +111,64 @@ fn a_profile_built_from_aliases_installs_the_canonical_plugins() {
 
 #[test]
 fn a_case_variant_link_reaches_the_registered_plugin() {
-    // A link that reached the registered plugin re-installs it, and the only
-    // module-side evidence a link can leave is the "not implemented" report a
-    // placeholder emits — so the subject has to be an entry that is still
-    // missing. Take whichever one that is instead of pinning a name a later
-    // mission implements: k2compat held this spot until M44 implemented it, and
-    // windowEx, csvParser, scriptsEx, saveStruct, fstat, wuvorbis and wuopus
-    // are being implemented in parallel missions right now.
-    let Some(entry) = missing_plugins().next() else {
-        // Every catalog entry is implemented, so no module reports itself and
-        // this check has no evidence left to read. Name resolution is still
-        // covered by the catalog tests above and `crates/krkr-plugins/src`.
-        return;
-    };
+    // `Plugins.link` resolves its argument among the registered plugin names
+    // case-insensitively and runs `register` on the module again on the first
+    // explicit link (`crates/krkr-engine/src/native/plugins.rs`) — the
+    // behaviour that cures a class a `patch.tjs` shadowed at boot.
+    //
+    // The evidence has to be that registration, and no catalog module can
+    // supply it: the modules disagree on what a repeated `register` leaves
+    // behind. A `Missing` entry such as xp3filter.dll reports itself once per
+    // instance by contract (`crates/krkr-plugins/src/xp3_filter.rs` pins it),
+    // so a case-variant link adds no log line, and an implemented module
+    // re-installs its surface idempotently. Count the `register` calls a
+    // probe receives instead, through a plugin registered by the same
+    // `KrkrEngine::register_plugin` call the catalog's install functions make.
+    struct CountingPlugin {
+        calls: Arc<AtomicUsize>,
+    }
 
+    impl KrkrPlugin for CountingPlugin {
+        fn name(&self) -> &str {
+            "CountingProbe.dll"
+        }
+
+        fn register(&self, _runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut engine = test_engine();
-    register_profile_plugins(&mut engine, &GameProfile::only([entry.name])).expect("register");
-    let before = placeholder_reports(&engine, entry.name);
+    engine
+        .register_plugin(CountingPlugin {
+            calls: Arc::clone(&calls),
+        })
+        .expect("register the probe");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "boot registration must run"
+    );
 
     engine
-        .execute_expression(
-            "link.tjs",
-            &format!(r#"Plugins.link("{}")"#, entry.name.to_ascii_uppercase()),
-        )
+        .execute_expression("link.tjs", r#"Plugins.link("COUNTINGPROBE.DLL")"#)
         .expect("link");
-
     assert_eq!(
-        placeholder_reports(&engine, entry.name),
-        before + 1,
+        calls.load(Ordering::SeqCst),
+        2,
         "Plugins.link did not reach the registered plugin"
+    );
+
+    // A spelling no registered plugin answers re-installs nothing, so the
+    // second call above is the case-variant resolution's own doing.
+    engine
+        .execute_expression("link.tjs", r#"Plugins.link("Nowhere.dll")"#)
+        .expect("link an unknown name");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "an unknown name reached a registered plugin"
     );
 }
