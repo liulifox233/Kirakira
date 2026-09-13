@@ -28,6 +28,13 @@
 //!   layer's bitmap through the engine's plugin-facing layer path
 //!   ([`krkr_engine::plugin_api::layer`]). Icon resources are RL-decoded and
 //!   palettes expanded by [`krkr_emote`].
+//! * **The separate-layer canvas** — `new Motion.SeparateLayerAdaptor(owner)`
+//!   answers a real drawable `Layer` (the engine's plugin canvas seam), sized
+//!   like its owner layer, so the game's `drawAffine` sequence works end to
+//!   end: `Motion.Player.clear(adaptor, neutralColor)` and
+//!   `Motion.Player.draw(adaptor)` write its bitmap, and the owner publishes
+//!   it with `Layer.assignImages(adaptor)`. `getSubImageLayers()` stays `void`,
+//!   which is what makes the game take its single-canvas path.
 //!
 //! # What is not, and says so
 //!
@@ -35,8 +42,7 @@
 //! (`playTimeline`/`setTimelineBlendRatio`/`fadeOutTimeline` and the
 //! `*Timeline*` listings beyond the loaded animation names), mesh deformation
 //! (`LayerMeshSupport`, `meshDivisionRatio`, `processedMeshVerticesNum`),
-//! particles, separate-layer mode (`SeparateLayerAdaptor` reports no
-//! sub-layers, which selects the game's single-canvas path), the D3D camera
+//! particles, the D3D camera
 //! members, and `EmotePlayer`'s `.psb` *model* playback (the `.mtn` motion path
 //! is the one wired to the adapter). Every such member is still registered, so
 //! a script never dies on `MemberNotFound`, and its first call logs a warning
@@ -75,7 +81,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use krkr_emote::{Motion, MotionDrawItem, TextureCache, Tint, render_draw_list_into};
-use krkr_engine::{KrkrHost, KrkrPlugin, plugin_api::layer::layer_bitmap_write};
+use krkr_engine::{
+    KrkrHost, KrkrPlugin,
+    plugin_api::layer::{create_canvas_layer, fit_canvas_layer, layer_bitmap_write},
+};
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
@@ -90,9 +99,11 @@ pub(crate) const META: PluginMeta = PluginMeta {
             flavor adaptation + RL/palette texture decode), Player.play/progress/stop/skip/speed/tickCount and \
             timed setVariable(name, value, time, easing) drive the model's own clock, and draw(layer) composites \
             the sampled draw list into the layer bitmap through plugin_api::layer with the player's coord/rotate/\
-            scale/affine transform and colour filter. Not implemented, and honest: physics (initPhysics, wind/pend), \
-            timelines, mesh deformation, particles, separate-layer mode (SeparateLayerAdaptor reports no sub-layers \
-            so the game takes its single-canvas path) and EmotePlayer's `.psb` model playback; each such member is \
+            scale/affine transform and colour filter, and Motion.SeparateLayerAdaptor(owner) is a real drawable \
+            Layer (a plugin_api canvas) sized like its owner, so the game's clear/draw/Layer.assignImages publish \
+            path works. Not implemented, and honest: physics (initPhysics, wind/pend), \
+            timelines, mesh deformation, particles \
+            and EmotePlayer's `.psb` model playback; each such member is \
             registered and logs a one-time warning on first call instead of returning a silent success. \
             Motion.Player.useD3D is absent on purpose (the game's probe then sets Motion.enableD3D = 0, the nod3d \
             reference behaviour). The `opa` scale is settled against motionplayer_nod3d.dll's frame parser and \
@@ -907,11 +918,35 @@ fn player_constructor(runtime: &mut Runtime<KrkrHost>, class: Class) -> ObjectHa
     handle
 }
 
+/// Where an adaptor records the layer it stands in for (the constructor's
+/// argument), so `clear`/`draw` can keep its canvas that layer's size.
+const ADAPTOR_OWNER_MEMBER: &str = "__motionSeparateAdaptorOwner";
+
+/// `new Motion.SeparateLayerAdaptor(owner)` — a drawable canvas layer.
+///
+/// The reference class (registered by `motionplayer.dll`/`nod3d`, constructed
+/// by the game as `new Motion.SeparateLayerAdaptor(owner incontextof
+/// global.Layer)` in `system/AffineSourceMotion.tjs` `entryOwner`) is the
+/// canvas the KAG motion layer draws each frame into: `drawAffine` hands it to
+/// `Motion.Player.clear`/`draw`, reads the drawn pixels back and publishes
+/// them onto the owner with `Layer.assignImages` (the game's `a0 instanceof
+/// "Layer"` publish branch).  It is therefore a real `Layer` — see
+/// [`create_canvas_layer`] — sized like the owner, and not a plain object.
+///
+/// The constructor argument arrives as the `incontextof` closure the VM built
+/// (its closure object *is* the owner; the this-object slot only carries the
+/// class context), and the owner is recorded on the adaptor so
+/// [`refit_adaptor_canvas`] can follow later resizes of it.
 fn separate_layer_adaptor_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
     let handle = runtime.alloc_native_constructor_with_arg_count(
         NativeArgCount::Any,
-        |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, _args: Vec<Variant>| {
-            let instance = bound_instance(runtime, this_obj, "SeparateLayerAdaptor");
+        |runtime: &mut Runtime<KrkrHost>, _this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
+            let instance = create_canvas_layer(runtime)?;
+            runtime.add_object_class_info(instance, "SeparateLayerAdaptor");
+            if let Some(owner) = adaptor_owner(args.first()) {
+                runtime.set_object_member(instance, ADAPTOR_OWNER_MEMBER, Variant::Object(owner));
+                fit_canvas_layer(runtime, instance, owner)?;
+            }
             runtime.register_object_native_with_arg_count(
                 instance,
                 "getSubImageLayers",
@@ -931,6 +966,37 @@ fn separate_layer_adaptor_constructor(runtime: &mut Runtime<KrkrHost>) -> Object
     );
     runtime.register_object_native(handle, "addRef", return_this);
     handle
+}
+
+/// The adaptor constructor's parent-layer argument.
+///
+/// The game spells it `owner incontextof global.Layer`, which the VM
+/// materializes as a closure whose closure object is the owner itself
+/// (`change_this`, `vm/dispatch.rs`), so the owner is the closure's object and
+/// not something the constructor could unwrap by calling it.
+fn adaptor_owner(arg: Option<&Variant>) -> Option<ObjectHandle> {
+    match arg? {
+        Variant::Closure(closure) => Some(closure.object),
+        Variant::Object(handle) => Some(*handle),
+        _ => None,
+    }
+}
+
+/// Keeps an adaptor canvas the size of the layer it was created for.
+///
+/// The game constructs the adaptor while its owner layer exists but need not
+/// have its final rect yet (`system/AffineLayer.tjs` runs `entryOwner` before
+/// its `onResize`), so every write into the adaptor re-fits it;
+/// [`fit_canvas_layer`] does nothing once the sizes match.  A target that is
+/// not an adaptor (no owner member) is left to the engine's own sizing.
+fn refit_adaptor_canvas(runtime: &mut Runtime<KrkrHost>, target: ObjectHandle) -> Result<()> {
+    let Some(owner) = runtime
+        .object_member(target, ADAPTOR_OWNER_MEMBER)
+        .object_handle()
+    else {
+        return Ok(());
+    };
+    fit_canvas_layer(runtime, target, owner)
 }
 
 /// `SeparateLayerAdaptor.getSubImageLayers()` answers `void` — "no sub-layer
@@ -1778,6 +1844,7 @@ fn player_draw(
         .first()
         .and_then(Variant::object_handle)
         .ok_or_else(|| TjsError::runtime("Motion::Player::draw requires a layer"))?;
+    refit_adaptor_canvas(runtime, layer)?;
 
     let prepared = PLAYERS.with(|players| {
         let mut players = players.borrow_mut();
@@ -1917,6 +1984,7 @@ fn player_clear(
         .transpose()?
         .map(|value| value as u32)
         .unwrap_or(0);
+    refit_adaptor_canvas(runtime, layer)?;
     layer_bitmap_write(runtime, layer, |view| {
         for pixel in view.pixels.as_chunks_mut::<4>().0 {
             pixel[0] = ((argb >> 16) & 0xff) as u8;
@@ -2896,6 +2964,121 @@ mod tests {
                 .expect("read")
                 .is_truthy(),
             "void selects the game's single-canvas path"
+        );
+    }
+
+    /// The adaptor is a real drawable canvas: construct it with the owner
+    /// layer the way the game does (`new Motion.SeparateLayerAdaptor(owner
+    /// incontextof global.Layer)`), clear and draw into it through
+    /// `Motion.Player`, then publish it with `Layer.assignImages`.
+    ///
+    /// This is the game's `drawAffine` sequence (`system/AffineSourceMotion.tjs`
+    /// object 65: `_player.clear(a0, neutralColor)` → `_drawAffine` →
+    /// `a0 instanceof "Layer"` → `l2.assignImages(a0)`).  The old plain-object
+    /// stub answered "Not drawable layer type" on the clear and killed PARQUET
+    /// at ~frame 15060 of the ev scene.
+    #[test]
+    fn separate_layer_adaptor_is_a_drawable_canvas_the_owner_can_publish() {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [8, 8], 255),
+                -1,
+            ),
+        )]);
+        engine
+            .execute_script(
+                "adaptor.tjs",
+                r#"
+                global.owner = new Layer();
+                owner.setPos(0, 0);
+                owner.setSize(48, 48);
+                global.adaptor = new Motion.SeparateLayerAdaptor(owner incontextof global.Layer);
+                global.rm = new Motion.ResourceManager(0, 0);
+                global.res = rm.load("motion/hero.mtn");
+                global.player = new Motion.Player(rm);
+                "#,
+            )
+            .expect("adaptor");
+
+        // The identity and shape the game relies on: a `Layer` with its own
+        // bitmap, sized like the owner (not the 32x32 holder).
+        assert_eq!(integer(&mut engine, "adaptor instanceof \"Layer\""), 1);
+        assert_eq!(integer(&mut engine, "adaptor.width"), 48);
+        assert_eq!(integer(&mut engine, "adaptor.height"), 48);
+        assert_eq!(integer(&mut engine, "adaptor.imageWidth"), 48);
+        assert_eq!(integer(&mut engine, "adaptor.imageHeight"), 48);
+
+        // `_player.clear(adaptor, neutralColor)` lands pixels.
+        engine
+            .execute_script("clear.tjs", "player.clear(adaptor, 0xff3366cc);")
+            .expect("clear");
+        assert_eq!(integer(&mut engine, "adaptor.getMainPixel(4, 4)"), 0x3366cc);
+
+        // `_player.draw(adaptor)` composites the motion into the same canvas:
+        // the 4x4 white icon at coord (8, 8) covers pixels 6..10.
+        engine
+            .execute_script(
+                "draw.tjs",
+                "player.play(\"idle\", Motion.PlayFlagForce); player.draw(adaptor);",
+            )
+            .expect("draw");
+        assert_eq!(
+            integer(&mut engine, "adaptor.getMainPixel(7, 7)"),
+            0x00ff_ffff
+        );
+
+        // The publish branch: the owner copies the canvas's image with
+        // `Layer.assignImages`, and the engine's own accessor reads the copy.
+        engine
+            .execute_script("publish.tjs", "owner.assignImages(adaptor);")
+            .expect("publish");
+        assert_eq!(
+            integer(&mut engine, "owner.getMainPixel(7, 7)"),
+            0x00ff_ffff,
+            "the drawn motion reaches the owner"
+        );
+        assert_eq!(
+            integer(&mut engine, "owner.getMainPixel(4, 4)"),
+            0x3366cc,
+            "the cleared background travels with it"
+        );
+    }
+
+    /// The game constructs the adaptor before its owner has its final rect
+    /// (`system/AffineLayer.tjs` runs `entryOwner` before its `onResize`), so
+    /// the canvas re-fits to the owner on the next write instead of staying at
+    /// the 32x32 `Layer` default — which would clip a full-screen motion.
+    #[test]
+    fn separate_layer_adaptor_follows_a_later_owner_resize() {
+        let mut engine = engine_with(&[]);
+        engine
+            .execute_script(
+                "setup.tjs",
+                "global.owner = new Layer(); \
+                 global.adaptor = new Motion.SeparateLayerAdaptor(owner); \
+                 global.p = new Motion.Player(0);",
+            )
+            .expect("setup");
+        assert_eq!(
+            integer(&mut engine, "adaptor.imageWidth"),
+            32,
+            "the owner is still at the default size"
+        );
+
+        engine
+            .execute_script("resize.tjs", "owner.setPos(0, 0); owner.setSize(64, 64);")
+            .expect("resize");
+        engine
+            .execute_script("clear.tjs", "p.clear(adaptor, 0xff112233);")
+            .expect("clear");
+        assert_eq!(integer(&mut engine, "adaptor.width"), 64);
+        assert_eq!(integer(&mut engine, "adaptor.imageHeight"), 64);
+        assert_eq!(
+            integer(&mut engine, "adaptor.getMainPixel(60, 60)"),
+            0x112233,
+            "the pixel outside the old 32x32 canvas is addressable"
         );
     }
 

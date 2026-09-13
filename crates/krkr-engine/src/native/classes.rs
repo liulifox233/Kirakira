@@ -95,7 +95,7 @@ fn install_class_name_constructor(
     );
 }
 
-fn construct_native_instance(
+pub(crate) fn construct_native_instance(
     runtime: &mut Runtime<KrkrHost>,
     spec: &'static NativeClassSpec,
     this_obj: Option<ObjectHandle>,
@@ -2741,7 +2741,7 @@ fn set_layer_geographical_height(
     image_layer_size_changed(runtime, handle)
 }
 
-fn set_layer_geographical_size(
+pub(crate) fn set_layer_geographical_size(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
     width: i64,
@@ -2765,7 +2765,7 @@ fn set_layer_geographical_size(
     image_layer_size_changed(runtime, handle)
 }
 
-fn internal_set_layer_image_size(
+pub(crate) fn internal_set_layer_image_size(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
     width: i64,
