@@ -18,6 +18,11 @@
 //!   plane (`layerExBTOA`'s `copyAlphaToProvince`/`fillByProvince`).
 //! * [`layer_update`] — `Layer.update()`, the explicit repaint step the family
 //!   contract calls after a mutation.
+//! * [`create_canvas_layer`] / [`fit_canvas_layer`] — a detached, invisible
+//!   native `Layer` for a plugin that needs a private draw target and a
+//!   publishable image, as `motionplayer.dll`'s `Motion.SeparateLayerAdaptor`
+//!   is (the KAG motion layer draws into it and copies it onto the visible
+//!   layer with `Layer.assignImages`).
 //!
 //! **Byte order**: the views expose the engine's own store — R, G, B, A per
 //! pixel, top-down, tightly packed.  The reference's buffer is B, G, R, A
@@ -57,8 +62,10 @@ use krkr_tjs2::{
 
 use crate::host::{KrkrHost, LayerRenderTarget};
 use crate::native::classes::{
-    allocate_layer_province_plane, layer_update_by_script, mark_image_modified,
-    mutate_render_layer, not_drawable_layer_type, render_layer_snapshot, this_render_layer_target,
+    LAYER_CLASS, allocate_layer_province_plane, construct_native_instance,
+    internal_set_layer_image_size, layer_update_by_script, mark_image_modified,
+    mutate_render_layer, not_drawable_layer_type, render_layer_snapshot,
+    set_layer_geographical_size, this_render_layer_target,
 };
 
 /// Failure of a plugin-facing layer bitmap call.
@@ -207,6 +214,88 @@ pub fn layer_bitmap_read_write<R>(
 pub fn layer_update(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<()> {
     let layer = runtime.bound_this(layer).unwrap_or(layer);
     layer_update_by_script(runtime, layer)
+}
+
+/// Creates a detached canvas layer: a real native `Layer` a plugin can draw
+/// into and publish from, without it ever reaching the screen on its own.
+///
+/// `motionplayer.dll`'s `Motion.SeparateLayerAdaptor` is exactly such a
+/// canvas.  The KAG motion layer constructs one per owner
+/// (`system/AffineSourceMotion.tjs` `entryOwner`), hands it to
+/// `Motion.Player.clear`/`draw` as the draw target, and then publishes it with
+/// `Layer.assignImages` on the visible layer — so the object the plugin works
+/// with must be a real layer (`instanceof "Layer"`, a `__nativeLayerId`, a
+/// `LayerBitmap` to write) while never appearing in a draw list itself.
+///
+/// The object is built the way `new Layer()` with no arguments is: the full
+/// native method surface, class info `Layer`, no window and no parent (an
+/// invisible render root the draw lists skip), and the constructor's 32×32
+/// holder bitmap, so [`layer_bitmap_write`] has pixels to lend immediately.
+/// [`fit_canvas_layer`] sizes it to the layer whose content it stands in for.
+pub fn create_canvas_layer(runtime: &mut Runtime<KrkrHost>) -> Result<ObjectHandle> {
+    let layer = construct_native_instance(runtime, &LAYER_CLASS, None, Vec::new())?;
+    layer
+        .object_handle()
+        .ok_or_else(|| TjsError::runtime("canvas layer construction produced no object"))
+}
+
+/// Sizes a canvas layer to `source` — the layer whose content it stands in for
+/// — matching both the layer rect and the main bitmap.
+///
+/// The adaptor is constructed with its owner layer, but the owner need not
+/// have its final rect yet when that happens (`system/AffineLayer.tjs` runs
+/// `entryOwner` before its `onResize`), so the caller re-runs this before each
+/// write; once the sizes match it is a no-op.  A `source` that is not a layer
+/// attached to a render node, or that has no positive size yet, leaves the
+/// canvas untouched.
+pub fn fit_canvas_layer(
+    runtime: &mut Runtime<KrkrHost>,
+    canvas: ObjectHandle,
+    source: ObjectHandle,
+) -> Result<()> {
+    let Some((width, height)) = layer_draw_size(runtime, source) else {
+        return Ok(());
+    };
+    if canvas_matches_size(runtime, canvas, width, height) {
+        return Ok(());
+    }
+    set_layer_geographical_size(runtime, canvas, i64::from(width), i64::from(height))?;
+    internal_set_layer_image_size(runtime, canvas, i64::from(width), i64::from(height))?;
+    Ok(())
+}
+
+/// The drawable size of a layer: its rect when non-empty, else its bitmap.
+fn layer_draw_size(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Option<(u32, u32)> {
+    let (_, target) = this_render_layer_target(runtime, Some(layer)).ok()?;
+    let node = render_layer_snapshot(runtime, &target?)?;
+    let (width, height) = if node.width > 0.0 && node.height > 0.0 {
+        (node.width, node.height)
+    } else {
+        let image = node.image.as_ref()?;
+        (image.upload.width as f32, image.upload.height as f32)
+    };
+    (width > 0.0 && height > 0.0).then(|| (width.round() as u32, height.round() as u32))
+}
+
+/// Whether a canvas already has the requested rect *and* bitmap.
+fn canvas_matches_size(
+    runtime: &mut Runtime<KrkrHost>,
+    canvas: ObjectHandle,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Ok((_, target)) = this_render_layer_target(runtime, Some(canvas)) else {
+        return false;
+    };
+    let Some(node) = target.and_then(|target| render_layer_snapshot(runtime, &target)) else {
+        return false;
+    };
+    let rect = (node.width.round(), node.height.round());
+    let image = node
+        .image
+        .as_ref()
+        .map(|image| (image.upload.width, image.upload.height));
+    rect == (width as f32, height as f32) && image == Some((width, height))
 }
 
 /// One layer's province plane size, as handed to a plugin closure.
