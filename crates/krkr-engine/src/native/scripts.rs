@@ -17,6 +17,10 @@ use super::{arg_string, install_static_object, native_void, required_arg_string}
 
 pub(crate) fn install_scripts(runtime: &mut Runtime<KrkrHost>) {
     let scripts = install_static_object(runtime, "Scripts");
+    // `tTJSNC_Scripts` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`ScriptMgnIntf.cpp:1218`); scripts
+    // reach it as `Scripts.finalize(...)` while tearing a session down.
+    runtime.register_object_native(scripts, "finalize", native_void);
     runtime.register_object_native(scripts, "execStorage", scripts_exec_storage);
     runtime.register_object_native(scripts, "evalStorage", scripts_eval_storage);
     runtime.register_object_native(scripts, "loadDataPack", scripts_load_data_pack);

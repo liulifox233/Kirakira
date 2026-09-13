@@ -9,6 +9,10 @@ use super::{arg_string, install_static_object, native_void};
 
 pub(crate) fn install_storages(runtime: &mut Runtime<KrkrHost>) {
     let storages = install_static_object(runtime, "Storages");
+    // `tTJSNC_Storages` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`StorageIntf.cpp:1357`); scripts reach
+    // it as `Storages.finalize(...)` while tearing a session down.
+    runtime.register_object_native(storages, "finalize", native_void);
     runtime.register_object_native(storages, "addAutoPath", storages_add_auto_path);
     runtime.register_object_native(storages, "removeAutoPath", storages_remove_auto_path);
     runtime.register_object_native(storages, "setTextEncoding", storages_set_text_encoding);

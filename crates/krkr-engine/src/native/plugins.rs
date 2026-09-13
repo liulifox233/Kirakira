@@ -5,10 +5,14 @@ use krkr_tjs2::{
 
 use crate::host::KrkrHost;
 
-use super::{install_static_object, required_arg_string};
+use super::{install_static_object, native_void, required_arg_string};
 
 pub(crate) fn install_plugins(runtime: &mut Runtime<KrkrHost>) {
     let plugins = install_static_object(runtime, "Plugins");
+    // `tTJSNC_Plugins` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`PluginIntf.cpp:27`); scripts reach it
+    // as `Plugins.finalize(...)` while tearing a session down.
+    runtime.register_object_native(plugins, "finalize", native_void);
     runtime.register_object_native(plugins, "link", plugins_link);
     runtime.register_object_native(plugins, "unlink", plugins_unlink);
     runtime.register_object_native(plugins, "getList", plugins_get_list);

@@ -8,12 +8,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::host::KrkrHost;
 
-use super::{install_static_object, register_stub_method};
+use super::{install_static_object, native_void, register_stub_method};
 
 static UUID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     let system = install_static_object(runtime, "System");
+    // `tTJSNC_System` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`SystemIntf.cpp:92`); scripts reach it
+    // as `System.finalize(...)` while tearing a session down.
+    runtime.register_object_native(system, "finalize", native_void);
     for method in [
         // Implemented below with a portable message table.
         // addFont is implemented below; keep the remaining legacy methods as

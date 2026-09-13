@@ -875,7 +875,31 @@ fn install_special_methods(
         install_wave_sound_buffer_methods(runtime, handle);
     } else if class_name == "VideoOverlay" {
         install_video_overlay_methods(runtime, handle);
+    } else if matches!(
+        class_name,
+        "Rect" | "Bitmap" | "BitmapLayerTreeOwner" | "PhaseVocoder" | "BasicDrawDevice"
+    ) {
+        // Classes whose only special method is the empty native `finalize`:
+        // Rect (`RectItf.cpp:44`), Bitmap (`BitmapIntf.cpp:195`),
+        // BitmapLayerTreeOwner (`BitmapLayerTreeOwner.cpp:200`), PhaseVocoder
+        // (`PhaseVocoderFilter.cpp:29`) and BasicDrawDevice
+        // (`win32/BasicDrawDevice.cpp:855`), all declaring
+        // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`tjsNative.h:380-383`).
+        install_empty_finalize_method(runtime, handle);
     }
+}
+
+/// The no-op `finalize` krkrz declares on a native class with
+/// `TJS_DECL_EMPTY_FINALIZE_METHOD` (`tjsNative.h:380-383`). The native
+/// instance's real teardown lives in its destructor, so the member only has to
+/// exist: scripts reach it on the class object (`global.Rect.finalize(...)`)
+/// and through a script subclass's `super.finalize(...)`, and a missing member
+/// aborts the caller with `Member "finalize" does not exist`. The
+/// script-preserving shape keeps a subclass's own `finalize` when the native
+/// constructor runs on its instance, the same rule the class's other methods
+/// follow.
+fn install_empty_finalize_method(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    register_native_method_preserving_script(runtime, handle, "finalize", native_void);
 }
 
 fn alloc_menu_item_object(
@@ -944,6 +968,13 @@ fn install_menu_item_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHand
     // subclass instance (`super.MenuItem(...)`).  KRKR keeps native methods
     // on the native class, so that constructor must not replace overrides
     // such as KAGMenuItem.click/onClick on the leaf instance.
+    //
+    // The menu plugin's `tTJSNC_MenuItem` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`MenuItemIntf.cpp:249`; the krkrz tree
+    // carries the menu plugin out of tree, so the anchor is its
+    // kirikiroid2/plugin copy); KAGEX's `KAGMenuItem` subclasses it and a
+    // class-qualified or `super.*` finalize call must resolve to the no-op.
+    register_native_method_preserving_script(runtime, handle, "finalize", native_void);
     register_native_method_preserving_script(runtime, handle, "add", menu_item_add);
     register_native_method_preserving_script(runtime, handle, "insert", menu_item_insert);
     register_native_method_preserving_script(runtime, handle, "remove", menu_item_remove);
@@ -1536,6 +1567,13 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
 }
 
 fn install_font_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    // `tTJSNC_Font` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`LayerIntf.cpp:9903`); the font
+    // handle's real teardown lives in the native instance. Scripts reach the
+    // member on the *class object* (`global.Font.finalize(...)`) and through a
+    // script subclass's `super.finalize(...)`; without it the member call
+    // aborts the caller with `Member "finalize" does not exist`.
+    register_native_method_preserving_script(runtime, handle, "finalize", native_void);
     register_native_method_preserving_script(runtime, handle, "getTextWidth", font_get_text_width);
     register_native_method_preserving_script(
         runtime,
@@ -1579,6 +1617,13 @@ fn install_font_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
 }
 
 fn install_image_function_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    // `tTJSNC_ImageFunction` declares an empty `finalize` with
+    // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`ImageFunction.cpp:114`); the bitmap
+    // work happens in this instance's methods, so its `finalize` is the
+    // reference's no-op. Scripts reach it on the class object
+    // (`global.ImageFunction.finalize(...)`) and through a script subclass's
+    // `super.finalize(...)`.
+    register_native_method_preserving_script(runtime, handle, "finalize", native_void);
     register_native_method_preserving_script(runtime, handle, "drawText", image_function_draw_text);
     register_native_method_preserving_script(
         runtime,
@@ -11011,6 +11056,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every krkrz native class that declares an empty `finalize` with
+    /// `TJS_DECL_EMPTY_FINALIZE_METHOD` (`tjsNative.h:380-383`) and that this
+    /// engine installs must answer the member on its class object: scripts
+    /// reach it as `global.<Class>.finalize(...)` or through a script
+    /// subclass's `super.finalize(...)`, and a missing member aborts the
+    /// caller with `Member "finalize" does not exist` -- the fatal shape M141
+    /// hit on PARQUET's title screen (`title.ks:13`). A class added to the
+    /// port without its empty finalizer fails here, in one place.
+    ///
+    /// The TJS2-side classes (`Exception` `tjsException.cpp:30`, `Math`
+    /// `tjsMath.cpp:108`, `RegExp` `tjsRegExp.cpp:210`, `RandomGenerator`
+    /// `tjsRandomGenerator.cpp:267`, `Date` `tjsDate.cpp:51`) are installed by
+    /// `krkr-tjs2`; this engine-side list deliberately does not cover them.
+    #[test]
+    fn every_krkrz_empty_finalize_class_answers_a_finalize_member() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let cases: &[(&str, &str)] = &[
+            ("global.Timer", "TimerIntf.cpp:142"),
+            ("global.Layer", "LayerIntf.cpp:6715"),
+            ("global.Window", "WindowIntf.cpp:751"),
+            ("global.AsyncTrigger", "EventIntf.cpp:1287"),
+            ("global.MenuItem", "MenuItemIntf.cpp:249 (menu plugin)"),
+            ("global.KAGParser", "KAGParser.cpp:3306 (ExtKAGParser)"),
+            ("global.WaveSoundBuffer", "WaveIntf.cpp:1017"),
+            ("global.VideoOverlay", "VideoOvlIntf.cpp:205"),
+            ("global.Font", "LayerIntf.cpp:9903"),
+            ("global.Bitmap", "BitmapIntf.cpp:195"),
+            ("global.Rect", "RectItf.cpp:44"),
+            ("global.ImageFunction", "ImageFunction.cpp:114"),
+            (
+                "global.BitmapLayerTreeOwner",
+                "BitmapLayerTreeOwner.cpp:200",
+            ),
+            (
+                "global.WaveSoundBuffer.PhaseVocoder",
+                "PhaseVocoderFilter.cpp:29",
+            ),
+            ("global.Window.BasicDrawDevice", "BasicDrawDevice.cpp:855"),
+            (
+                "global.Window.PassThroughDrawDevice",
+                "BasicDrawDevice.cpp:855",
+            ),
+            ("global.Clipboard", "ClipboardIntf.cpp:41"),
+            ("global.Debug", "DebugIntf.cpp:626"),
+            ("global.Scripts", "ScriptMgnIntf.cpp:1218"),
+            ("global.Storages", "StorageIntf.cpp:1357"),
+            ("global.Plugins", "PluginIntf.cpp:27"),
+            ("global.System", "SystemIntf.cpp:92"),
+        ];
+        for (path, anchor) in cases {
+            let source = format!("return typeof {path}.finalize;");
+            let value = engine
+                .execute_script("empty_finalize_probe.tjs", &source)
+                .unwrap_or_else(|error| panic!("{path} ({anchor}): probe failed: {error}"));
+            assert_eq!(
+                value,
+                Variant::String("Object".to_string()),
+                "{path} ({anchor})"
+            );
+        }
+    }
+
+    /// The classes this registration added a `finalize` member to, called the
+    /// way a game calls it: on the class object. Every entry here aborted with
+    /// `Member "finalize" does not exist` before the registration.
+    #[test]
+    fn krkrz_empty_finalize_classes_accept_a_class_object_call() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let cases: &[(&str, &str)] = &[
+            ("global.Font.finalize()", "LayerIntf.cpp:9903"),
+            ("global.Bitmap.finalize()", "BitmapIntf.cpp:195"),
+            ("global.Rect.finalize()", "RectItf.cpp:44"),
+            ("global.ImageFunction.finalize()", "ImageFunction.cpp:114"),
+            (
+                "global.BitmapLayerTreeOwner.finalize()",
+                "BitmapLayerTreeOwner.cpp:200",
+            ),
+            (
+                "global.MenuItem.finalize()",
+                "MenuItemIntf.cpp:249 (menu plugin)",
+            ),
+            (
+                "global.WaveSoundBuffer.PhaseVocoder.finalize()",
+                "PhaseVocoderFilter.cpp:29",
+            ),
+            (
+                "global.Window.BasicDrawDevice.finalize()",
+                "BasicDrawDevice.cpp:855",
+            ),
+            (
+                "global.Window.PassThroughDrawDevice.finalize()",
+                "BasicDrawDevice.cpp:855",
+            ),
+            ("global.Clipboard.finalize()", "ClipboardIntf.cpp:41"),
+            ("global.Debug.finalize()", "DebugIntf.cpp:626"),
+            ("global.Scripts.finalize()", "ScriptMgnIntf.cpp:1218"),
+            ("global.Storages.finalize()", "StorageIntf.cpp:1357"),
+            ("global.Plugins.finalize()", "PluginIntf.cpp:27"),
+            ("global.System.finalize()", "SystemIntf.cpp:92"),
+        ];
+        for (call, anchor) in cases {
+            let source = format!("{call}; return 1;");
+            let value = engine
+                .execute_script("empty_finalize_call.tjs", &source)
+                .unwrap_or_else(|error| panic!("{call} ({anchor}) failed: {error}"));
+            assert_eq!(value, Variant::Integer(1), "{call} ({anchor})");
+        }
+    }
+
+    /// The other reach path: a script subclass whose `finalize` forwards with
+    /// `super.finalize(...)` (KAGEX's `KAGMenuItem` shape), invoked through
+    /// `invalidate`. The subclass's own `finalize` must survive the native
+    /// constructor running on the instance, and `super.finalize(...)` must
+    /// land on the empty native member.
+    #[test]
+    fn empty_finalize_resolves_through_a_script_subclass_super_call() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "empty_finalize_super.tjs",
+                r#"
+                global.trace = "";
+                class EnvFont extends Font {
+                    function EnvFont() { super.Font(); }
+                    function finalize() { global.trace += "F"; super.finalize(...); }
+                }
+                class EnvRect extends Rect {
+                    function EnvRect() { super.Rect(); }
+                    function finalize() { global.trace += "R"; super.finalize(...); }
+                }
+                class EnvMenuItem extends MenuItem {
+                    function EnvMenuItem(owner, caption) { super.MenuItem(owner, caption); }
+                    function finalize() { global.trace += "M"; super.finalize(...); }
+                }
+                var font = new EnvFont();
+                var rect = new EnvRect();
+                var item = new EnvMenuItem(global, "caption");
+                invalidate font; invalidate rect; invalidate item;
+                return global.trace + ":" + (isvalid font) + (isvalid rect) + (isvalid item);
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("FRM:000".to_string()));
     }
 
     /// PARQUET's voice-filter wrapper destroys its session buffers through the
