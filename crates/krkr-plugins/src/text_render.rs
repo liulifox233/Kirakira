@@ -63,6 +63,78 @@
 //! `begin`/`end` 10 each) and `kinsoku_max` 1 with `word_break` on; those are
 //! stored when a script passes them but not applied yet — see below.
 //!
+//! # The message text format
+//!
+//! `render`'s text is not plain text. The games' `TagTextConverter`
+//! (`system\TagTextConverter.tjs`, an identical copy in both in-repo games)
+//! turns KAG tags into escape sequences, `option.tjs` rewrites a raw newline
+//! as the two characters `\n` (`split("\n").join(a1 + "\\n")`, GINKA
+//! `sysscn\option.tjs` :4218), and `textrender.dll` interprets the result
+//! while it lays text out. [`parse_message_text`] implements that grammar;
+//! the anchors are the DLL's layout walker `FUN_1000b8c0` (one `switch` arm
+//! per directive character; the addresses below are decimal member offsets in
+//! its pseudocode) and the converter functions that emit each code:
+//!
+//! - `\n` — line break (`case 0x5c`/`n`, the same arm a raw 0x0A takes) —
+//!   `parseR` :160 of the decompiled converter.
+//! - `\k` — a click wait (`case 0x5c`/`k` records the position in the vector
+//!   `getKeyWait` reports through `pos`/`time`) — `parseL` :163.
+//! - `\w` — one blank character cell (the `k` arm's neighbour advances the pen
+//!   by member 0x47, the line advance, and inserts nothing) — `parseSP` :176.
+//! - `\x` — nothing at all (`case 0x5c`/`x` only clears the two walk flags) —
+//!   `parseNUL` :173.
+//! - `\i` / `\r` — the indent markers (`case 0x5c`/`i` calls `FUN_1000d8b0`,
+//!   which sets the line-origin member 0x94 from the box's origin; `r` zeroes
+//!   it) — `parseIndent` :179 / `parseEndIndent` :182.
+//! - `\` + any other character — that character (`\[`, `\%`, `\#`, `\&`, `\$`
+//!   when the games quote user text; `option.tjs` :4225 escapes exactly the
+//!   set `[ \ % # & $`).
+//! - `[ruby]` / `[ruby,count]` — a ruby annotation over the following
+//!   `count + 1` characters (`case 0x5b`, `FUN_1000b180`) — `parseCh` :107-122.
+//! - `$expr;` / `${expr}` — inline evaluation through `onEval`
+//!   (`case 0x24`); the game overrides `onEval` with `Scripts.eval`
+//!   (`system\TextRender.tjs` :23) — `parseEmb` :192-200.
+//! - `&name;` — an inline image; the DLL calls `onGetGraphSize(name)` and
+//!   reads `width`/`height` off its answer (`FUN_100154a0`, `case 0x26`) —
+//!   `parseGraph` :185.
+//! - `#rrggbb;` / `#;` — the text colour (member 0x4b; `case 0x23` ORs
+//!   0xff000000 and falls back to the default colour for an empty value) —
+//!   `addColor` :223.
+//! - `%f<face>;` / `%f;` — the face, or the default face (`case 0x66`, which
+//!   compares the parsed name against the empty string at 0x10027340) —
+//!   `parseFont` :349-357.
+//! - `%r` — reset the font attributes to the defaults (`case 0x72` →
+//!   `FUN_1000d440`, the same copy `resetFont` performs) — `parseResetfont`
+//!   :202.
+//! - `%<percent>;` / `%;` / `%B` / `%S` — glyph size: the default size times
+//!   percent/100 (the `.rdata` single 100.0 at 0x100277d0), the default size,
+//!   the big size, the small size (`case 0x25`, the digit arm and B/S) —
+//!   `parseFont` :288-323.
+//! - `%b`/`%i`/`%s`/`%e` with `0`, `1` or `d` — bold/italic/shadow/edge on,
+//!   off or the default (`case 0x25`; `addFont` :210-222 writes the three
+//!   characters) — plus the `%e#…;` / `%s#…;` colour forms.
+//! - `%p<n>;` / `%p;` — pitch or the default pitch (`case 0x70`, members
+//!   0x32/0x31) — `parseStyle` :479-489.
+//! - `%a<n>;` / `%d<n>;` / `%d;` — the per-character delay (member 0x5d):
+//!   absolute, percent of the base delay, or the base delay (`case 0x25`,
+//!   the `a`/`d` arms) — `parseDelay` :528-562.
+//! - `%t<n>;` / `%w<n>;` / `%D<n>;` and their `$name;` forms — wait time
+//!   added to the display clock (member 0x76); the `$` forms evaluate the
+//!   name through `onEval` first (`case 0x25`, the `t`/`w`/`D` arms) —
+//!   `parseWait` :502 / `parseWC` :514 / `parseTalkWait` :568.
+//! - `%n<n>;` — that many line breaks (`case 0x25`, the `n` arm calls the
+//!   line-break routine `FUN_10007440` per unit) — `parseXR` :493.
+//! - `%l<name>;` / `%l;` — link span start/end (`case 0x6c`) — `parseLink`
+//!   :580-585.
+//! - `%L` / `%C` / `%R` — align (`case 0x25`, member 0x34).
+//! - `%k0`/`%k1`/`%kd` — a flag the DLL stores at member +0x49; no converter
+//!   in the in-repo games emits it, so this module consumes it and does not
+//!   guess what the flag does.
+//!
+//! Every other `%X` is consumed up to its `;` and draws nothing — that is the
+//! DLL's own `default` arm, and it is why the converters escape a literal `%`
+//! as `\%`.
+//!
 //! # What the engine cannot do yet
 //!
 //! These members are registered with reference kinds and honest values, but
@@ -73,6 +145,24 @@
 //!   like the DLL, but glyphs are still laid out horizontally because the text
 //!   drawing path performs no glyph rotation. The game drives that rotation
 //!   through the Font (`onFontChange` sets `font.angle = 2700`).
+//! - the message format's directives move a *render-local* style (the shape
+//!   the character records and `onFontChange` see) and start from the
+//!   instance's effective style; the DLL writes its active members instead, so
+//!   a directive survives the pass there.
+//! - `%L`/`%C`/`%R` are parsed and stored in that local style but the layout
+//!   does not shift lines: the DLL's line-shift formula (`FUN_10007440` reads
+//!   member 0x34 and the half-width constant 0x100277c8) was only partially
+//!   recovered, and no in-repo game text carries the codes.
+//! - `\i`/`\r` are consumed without a layout effect: the DLL moves its line
+//!   origin member, and this module lays every line out from x = 0 (the
+//!   auto-indent `render` argument is not applied — see below).
+//! - `&name;` records carry `text` (the name), a truthy `graph`,
+//!   `cw`/`width` from `onGetGraphSize`'s `width` and `size`/`height` from its
+//!   `height`, which is the field set `system\TextRender.tjs` `drawGraph`
+//!   reads; the DLL's remaining graph-record fields were not recovered.
+//! - the `%t`/`%w`/`%D` `$name;` forms evaluate the name through `onEval` and
+//!   add the parsed number; the DLL routes the same three codes through its
+//!   commit routine, so their pausing behaviour beyond that is not modelled.
 //! - the link model: `getLinkNames`/`getLinkRects`/`getLinkCharacters` return
 //!   empty arrays, `isLinkContains` false and `getLinkOfPosition` -1 because no
 //!   engine object tracks link spans or `linkName`s.
@@ -115,6 +205,8 @@
 //!   measurement is delegated to the game's `onGetTextWidth`; this fallback
 //!   keeps the engine's own font path working for the in-repo games.
 
+use std::collections::VecDeque;
+
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
     Result,
@@ -126,7 +218,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "TextRenderBase",
-    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model, inline onEval evaluation and the auto-indent/kinsoku rules still need engine work.",
+    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. render parses the message text format the games' TagTextConverter emits and the DLL's layout walker FUN_1000b8c0 interprets: \\n/raw newline/%n breaks, \\k key waits for getKeyWait(), \\w/\\x/\\i/\\r, $expr; through onEval, &name; through onGetGraphSize, %f/%r/%<n>;/%;/%B/%S/%b/%i/%s/%e/%p/%a/%d/%t/%w/%D/%l/#…; style and timing codes (the last group's line-shift, indent and named-wait details are documented gaps), [ruby,count], and \\X as the literal X. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and the auto-indent/kinsoku rules still need engine work.",
     install: |engine| engine.register_plugin(TextRenderPlugin),
 };
 
@@ -142,7 +234,9 @@ impl KrkrPlugin for TextRenderPlugin {
         runtime.host_mut().log(
             "textrender.dll compat registered: TextRenderBase with the 55-member surface \
              (22 methods, 33 properties), setOption/setDefault key sets and reference \
-             defaults; layout wraps through the game's onGetTextWidth or the engine Font",
+             defaults; the message text format's escapes are parsed (line breaks, key \
+             waits, style codes, $…; evaluation, &…; graphs, [ruby,count]) and glyphs \
+             measure through the game's onGetTextWidth or the engine Font",
         );
         Ok(())
     }
@@ -1312,6 +1406,11 @@ fn notify_font_change(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle) {
         };
         runtime.set_object_member(report, key, value);
     }
+    fire_font_change(runtime, instance, report);
+}
+
+/// Call the instance's `onFontChange` with an already-built report.
+fn fire_font_change(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle, report: ObjectHandle) {
     let Ok(handler) = runtime.resolve_object_member(instance, "onFontChange") else {
         return;
     };
@@ -1321,6 +1420,43 @@ fn notify_font_change(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle) {
     if runtime.object_is_callable(handler) {
         let _ = runtime.call_object_method(instance, "onFontChange", vec![Variant::Object(report)]);
     }
+}
+
+/// The `onFontChange` notification for a style a message-text directive moved
+/// (`%f`, `%r`, the size and attribute codes). The DLL fires the same event
+/// from every one of its style setters (`FUN_1000d6e0` and friends call the
+/// vtable slot `FUN_10016bb0` builds the report from, and that report carries
+/// `face`/`bold`/`italic` plus the attribute set); GINKA's handler pushes the
+/// values into its Font, which is what makes a `%f…;` span measure with the
+/// switched face.
+fn call_font_change(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle, style: &GlyphStyle) {
+    let report = runtime.alloc_dictionary_object();
+    for (key, value) in [
+        ("face", Variant::String(style.face.clone())),
+        ("bold", Variant::Integer(i64::from(style.bold))),
+        ("italic", Variant::Integer(i64::from(style.italic))),
+        ("size", Variant::Real(style.size as f64)),
+        (
+            "rubysize",
+            Variant::Real(effective_real(runtime, instance, "defaultRubySize")),
+        ),
+        (
+            "rubyoffset",
+            Variant::Real(effective_real(runtime, instance, "defaultRubyOffset")),
+        ),
+        ("color", Variant::Integer(style.color)),
+        ("shadow", Variant::Integer(i64::from(style.shadow))),
+        ("shadowColor", Variant::Integer(style.shadow_color)),
+        (
+            "shadowDiff",
+            Variant::Integer(effective_int(runtime, instance, "defaultShadowDiff")),
+        ),
+        ("edge", Variant::Integer(i64::from(style.edge))),
+        ("edgeColor", Variant::Integer(style.edge_color)),
+    ] {
+        runtime.set_object_member(report, key, value);
+    }
+    fire_font_change(runtime, instance, report);
 }
 
 /// The layout results, which are also the get-only result properties: a `render`
@@ -1345,6 +1481,7 @@ fn reset_layout(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle) {
         LAYOUT_LINE_ORIGINS,
         LAYOUT_EXTENT,
         LAYOUT_COUNT,
+        LAYOUT_KEY_WAITS,
     ] {
         state_clear(runtime, instance, key);
     }
@@ -1366,6 +1503,166 @@ const LAYOUT_EXTENT: &str = "extent";
 const LAYOUT_COUNT: &str = "count";
 const LAYOUT_DELAY: &str = "delay";
 const LAYOUT_WIDTH_TIME_SCALE: &str = "width_time_scale";
+const LAYOUT_KEY_WAITS: &str = "keyWaits";
+
+/// The active glyph attributes the layout carries while it walks message text.
+///
+/// textrender.dll keeps the *active* style in the members its `set*` commands
+/// and the text's own directives write (`%f` → `FUN_1000d7c0`, `%<n>;` →
+/// `FUN_1000d830`, `#`/`%e#`/`%s#` → the colour members 0x4b/0x4e/0x53, `%p` →
+/// 0x32, `%d`/`%a` → 0x5d, `%b`/`%i`/`%s`/`%e` → the flags at +4/+5/+0x131/
+/// +0x145), and every character record is built from that copy. This struct is
+/// the same idea for one render pass: it starts from the instance's effective
+/// style and each directive moves it.
+struct GlyphStyle {
+    /// The face name the character records carry (`onFontChange` passes it on
+    /// to the game's Font).
+    face: String,
+    /// The current glyph size in pixels.
+    size: i64,
+    /// `defaultFontSize` x `fontScale`: what `%;` restores and `%<n>;` takes
+    /// its percentage of (the DLL's member 0x2a).
+    base_size: i64,
+    big_size: i64,
+    small_size: i64,
+    color: i64,
+    edge_color: i64,
+    shadow_color: i64,
+    shadow_diff: i64,
+    bold: bool,
+    italic: bool,
+    shadow: bool,
+    edge: bool,
+    /// The extra advance per character (`%p`; the DLL's member 0x32).
+    pitch: f64,
+    /// `%L`/`%C`/`%R`: stored, not applied (see the module docs).
+    align: i64,
+    /// The per-character delay `%d`/`%a` move (the DLL's member 0x5d).
+    char_delay: f64,
+    /// The link name the character records carry (`%l…;`), empty outside a
+    /// link span.
+    link: String,
+}
+
+impl GlyphStyle {
+    /// `%r`: copy the stored defaults back into the active attributes — the
+    /// same reset `resetFont` performs (`FUN_1000d440` reads the default
+    /// members 0x48/0x58/0x161/0x2a/0x4a/0x4c/0x4d/0x51/0x52).
+    fn reset_font(&mut self, runtime: &Runtime<KrkrHost>, instance: ObjectHandle) {
+        self.face = effective_text(runtime, instance, "defaultFace");
+        self.size = self.base_size;
+        self.color = effective_int(runtime, instance, "defaultChColor");
+        self.edge_color = effective_int(runtime, instance, "defaultEdgeColor");
+        self.shadow_color = effective_int(runtime, instance, "defaultShadowColor");
+        self.shadow_diff = effective_int(runtime, instance, "defaultShadowDiff");
+        self.bold = effective_bool(runtime, instance, "defaultBold");
+        self.italic = effective_bool(runtime, instance, "defaultItalic");
+        self.shadow = effective_bool(runtime, instance, "defaultShadow");
+        self.edge = effective_bool(runtime, instance, "defaultEdge");
+    }
+}
+
+/// Where one character record sits and when it shows, for
+/// [`build_character_record`].
+struct RecordPlacement {
+    x: i64,
+    y: i64,
+    line: i64,
+    width: i64,
+    height: i64,
+    delay: f64,
+}
+
+/// Build one character object for the layout: the reference member names the
+/// DLL's record builder registers (`text`, `graph`, `face`, `size`, `italic`,
+/// `bold`, `color`, `shadow`, `shadowColor`, `shadowDiff`, `edge`,
+/// `edgeColor`, `delay`, `link`, `linkName`, `left`, `width`, `height`,
+/// `vertical`) plus the engine-facing aliases the in-repo game scripts read
+/// (`x`, `y`, `cw`, `line`, `index`). A `graph` record's `text` is the image
+/// name and its geometry comes from `onGetGraphSize`.
+fn build_character_record(
+    runtime: &mut Runtime<KrkrHost>,
+    style: &GlyphStyle,
+    placement: RecordPlacement,
+    vertical: bool,
+    text: &str,
+    graph: Option<&str>,
+    index: i64,
+) -> ObjectHandle {
+    let record = runtime.alloc_dictionary_object();
+    runtime.set_object_member(record, "text", Variant::String(text.to_string()));
+    runtime.set_object_member(
+        record,
+        "graph",
+        match graph {
+            Some(name) => Variant::String(name.to_string()),
+            None => Variant::Void,
+        },
+    );
+    runtime.set_object_member(record, "face", Variant::String(style.face.clone()));
+    runtime.set_object_member(record, "size", Variant::Integer(placement.height));
+    runtime.set_object_member(record, "italic", Variant::Integer(i64::from(style.italic)));
+    runtime.set_object_member(record, "bold", Variant::Integer(i64::from(style.bold)));
+    runtime.set_object_member(record, "color", Variant::Integer(style.color));
+    runtime.set_object_member(record, "shadow", Variant::Integer(i64::from(style.shadow)));
+    runtime.set_object_member(record, "shadowColor", Variant::Integer(style.shadow_color));
+    runtime.set_object_member(record, "shadowDiff", Variant::Integer(style.shadow_diff));
+    runtime.set_object_member(record, "edge", Variant::Integer(i64::from(style.edge)));
+    runtime.set_object_member(record, "edgeColor", Variant::Integer(style.edge_color));
+    runtime.set_object_member(record, "delay", Variant::Real(placement.delay));
+    runtime.set_object_member(record, "link", Variant::String(style.link.clone()));
+    runtime.set_object_member(record, "linkName", Variant::String(style.link.clone()));
+    runtime.set_object_member(record, "left", Variant::Integer(placement.x));
+    runtime.set_object_member(record, "width", Variant::Integer(placement.width));
+    runtime.set_object_member(record, "height", Variant::Integer(placement.height));
+    runtime.set_object_member(record, "vertical", Variant::Integer(i64::from(vertical)));
+    runtime.set_object_member(record, "x", Variant::Integer(placement.x));
+    runtime.set_object_member(record, "y", Variant::Integer(placement.y));
+    runtime.set_object_member(record, "cw", Variant::Integer(placement.width));
+    runtime.set_object_member(record, "line", Variant::Integer(placement.line));
+    runtime.set_object_member(record, "index", Variant::Integer(index));
+    record
+}
+
+/// Evaluate message text in the DLL's `$…;` code: the instance's `onEval`
+/// (`case 0x24`). The game overrides it with `Scripts.eval`; this module's
+/// base slot returns its argument, which is the honest answer for a plugin
+/// with no evaluator, and a failing handler inserts nothing.
+fn evaluate_expression(
+    runtime: &mut Runtime<KrkrHost>,
+    instance: ObjectHandle,
+    expression: &str,
+) -> String {
+    match runtime.call_object_method(
+        instance,
+        "onEval",
+        vec![Variant::String(expression.to_string())],
+    ) {
+        Ok(Variant::Void | Variant::Null) | Err(_) => String::new(),
+        Ok(value) => value.to_tjs_string().unwrap_or_default(),
+    }
+}
+
+/// Ask the instance's `onGetGraphSize` for an inline image's size
+/// (`FUN_100154a0` calls the handler and reads `width`/`height` off the
+/// Dictionary it answers with; a handler that answers nothing leaves a
+/// zero-sized graph).
+fn graph_size(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle, name: &str) -> (i64, i64) {
+    let Some(answer) = runtime
+        .call_object_method(
+            instance,
+            "onGetGraphSize",
+            vec![Variant::String(name.to_string())],
+        )
+        .ok()
+        .and_then(|value| value.object_handle())
+    else {
+        return (0, 0);
+    };
+    let width = resolve_font_member_int(runtime, answer, "width").unwrap_or(0);
+    let height = resolve_font_member_int(runtime, answer, "height").unwrap_or(0);
+    (width.max(0), height.max(0))
+}
 
 /// `newline()` forces the next `render` to start on a fresh line: the DLL's
 /// layout is incremental, this module's is a single pass, so the break is
@@ -1425,15 +1722,54 @@ fn contains(
     Ok(Variant::Integer(i64::from(inside)))
 }
 
-/// `getKeyWait()` answers the array of wait states the renderer is holding.
-/// Rendering is immediate here, so the array is always empty — but it must be
-/// an Array: the conductors read `.count` off it straight away.
+/// `getKeyWait()` answers the waits the last layout recorded — one entry per
+/// `\k` (and `%D…;`) in the text, each a Dictionary `{pos, time}`:
+///
+/// - `pos` is the number of characters laid out up to the wait. The conductor
+///   reveals exactly that many (`rendermsgwin.tjs`: `drawCount(keyWait[0].pos
+///   - cpos)`) and treats the wait as due once `calcShowCount` reaches it
+///   (`if (hasAnyKeyWait && !(keyWait[0].pos > l1)) waitClick()`).
+/// - `time` is the display time (the `delay` accumulator) reached at the
+///   wait, times the current `timeScale` — the field the conductor rewinds
+///   its typewriter clock with (`startTime = System.getTickCount() -
+///   keyWait[0].time`).
+///
+/// The DLL stores the same pair per wait (`FUN_10009bb0` reads the position,
+/// `FUN_10009be0` the time and multiplies by `timeScale`) and builds a fresh
+/// Dictionary per entry in `FUN_10015790`, which is why this getter builds a
+/// fresh array: a `timeScale` write after the render must change the answer.
 fn get_key_wait(
     runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
+    this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
-    Ok(Variant::Object(runtime.alloc_array_object(Vec::new())))
+    let Some(this) = bound_this(runtime, this_obj) else {
+        return Ok(Variant::Object(runtime.alloc_array_object(Vec::new())));
+    };
+    let time_scale = value_real(runtime, this, "timeScale");
+    let waits = match state_member(runtime, this, LAYOUT_KEY_WAITS) {
+        Variant::Object(handle) => runtime
+            .array_elements(handle)
+            .map(<[Variant]>::to_vec)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let entries = waits
+        .into_iter()
+        .filter_map(|wait| wait.object_handle())
+        .map(|wait| {
+            let entry = runtime.alloc_dictionary_object();
+            let pos = runtime.object_member(wait, "pos").to_integer().unwrap_or(0);
+            let delay = runtime
+                .object_member(wait, "delay")
+                .to_real()
+                .unwrap_or(0.0);
+            runtime.set_object_member(entry, "pos", Variant::Integer(pos));
+            runtime.set_object_member(entry, "time", Variant::Real(delay * time_scale));
+            Variant::Object(entry)
+        })
+        .collect::<Vec<_>>();
+    Ok(Variant::Object(runtime.alloc_array_object(entries)))
 }
 
 /// `calcLineOffset(line)` — the origin of a laid-out line, 0 when out of range.
@@ -1616,33 +1952,51 @@ fn render(
     // `system/TextRender.tjs` → `TextRenderBase.render(a3, a4, a7, a8, 0)`),
     // so reading it as a font size would lay every glyph out one pixel wide.
     // The size comes from the instance font, else the active/default font size.
-    let font_size = font
-        .and_then(|font| resolve_font_size(runtime, font))
-        .unwrap_or_else(|| effective_real(runtime, this, "defaultFontSize") as i64)
-        .max(1);
     let font_scale = value_real(runtime, this, "fontScale");
-    let font_size = ((font_size as f64) * font_scale).round().max(1.0) as i64;
-    let color = font
-        .and_then(|font| resolve_font_int(runtime, font, &["color"]))
-        .unwrap_or_else(|| effective_int(runtime, this, "defaultChColor"));
+    // The default glyph size the `%<n>;` code takes its percentage of (the
+    // DLL's member 0x2a) and the size the first glyph starts out with: the
+    // font a game handed to `setFont`, else the default.
+    let base_size = (effective_real(runtime, this, "defaultFontSize") * font_scale)
+        .round()
+        .max(1.0) as i64;
+    let start_size = font
+        .and_then(|font| resolve_font_size(runtime, font))
+        .map(|size| ((size as f64) * font_scale).round().max(1.0) as i64)
+        .unwrap_or(base_size);
+    let mut style = GlyphStyle {
+        face: effective_text(runtime, this, "defaultFace"),
+        size: start_size,
+        base_size,
+        big_size: (effective_real(runtime, this, "defaultBigFontSize") * font_scale)
+            .round()
+            .max(1.0) as i64,
+        small_size: (effective_real(runtime, this, "defaultSmallFontSize") * font_scale)
+            .round()
+            .max(1.0) as i64,
+        color: font
+            .and_then(|font| resolve_font_int(runtime, font, &["color"]))
+            .unwrap_or_else(|| effective_int(runtime, this, "defaultChColor")),
+        edge_color: effective_int(runtime, this, "defaultEdgeColor"),
+        shadow_color: effective_int(runtime, this, "defaultShadowColor"),
+        shadow_diff: effective_int(runtime, this, "defaultShadowDiff"),
+        bold: effective_bool(runtime, this, "defaultBold"),
+        italic: effective_bool(runtime, this, "defaultItalic"),
+        shadow: effective_bool(runtime, this, "defaultShadow"),
+        edge: effective_bool(runtime, this, "defaultEdge"),
+        pitch: effective_real(runtime, this, "defaultPitch"),
+        align: effective_int(runtime, this, "defaultAlign"),
+        char_delay: 1.0,
+        link: String::new(),
+    };
     let width = state_int(runtime, this, RENDER_WIDTH).unwrap_or(0).max(0);
-    let line_size = effective_real(runtime, this, "defaultLineSize").max(font_size as f64);
+    let line_size = effective_real(runtime, this, "defaultLineSize").max(start_size as f64);
     let line_spacing = effective_real(runtime, this, "defaultLineSpacing").max(0.0);
-    let pitch = effective_real(runtime, this, "defaultPitch");
     let line_height = (line_size + line_spacing).max(1.0);
     let ruby_size = effective_real(runtime, this, "defaultRubySize")
-        .max(font_size as f64 / RUBY_FONT_DIVISOR)
+        .max(start_size as f64 / RUBY_FONT_DIVISOR)
         .max(1.0);
     let ruby_offset = effective_real(runtime, this, "defaultRubyOffset");
     let width_time_scale = state_bool(runtime, this, LAYOUT_WIDTH_TIME_SCALE);
-    let bold = effective_bool(runtime, this, "defaultBold");
-    let italic = effective_bool(runtime, this, "defaultItalic");
-    let shadow = effective_bool(runtime, this, "defaultShadow");
-    let shadow_color = effective_int(runtime, this, "defaultShadowColor");
-    let shadow_diff = effective_int(runtime, this, "defaultShadowDiff");
-    let edge = effective_bool(runtime, this, "defaultEdge");
-    let edge_color = effective_int(runtime, this, "defaultEdgeColor");
-    let face = effective_text(runtime, this, "defaultFace");
     let vertical = value_bool(runtime, this, "vertical");
 
     let mut x = 0_i64;
@@ -1663,9 +2017,17 @@ fn render(
     let mut ruby_remaining = 0_usize;
     let mut group_first_record: Option<ObjectHandle> = None;
     let mut group_base_width = 0_i64;
-    for token in parse_ruby_annotations(&text) {
+    // The `\k` waits: the position (the number of characters laid out so far —
+    // the `pos` the conductor reveals up to) and the display time reached
+    // there (the `time` it resumes the typewriter clock from). The DLL keeps
+    // the same pairs at +0x1c4 and hands them out through `FUN_10015790`.
+    let mut key_waits: Vec<(i64, f64)> = Vec::new();
+    // An evaluated `$…;` inserts the characters of its result where the code
+    // stood, so the walk consumes a queue it can push them back onto.
+    let mut queue: VecDeque<TextToken> = parse_message_text(&text).into();
+    while let Some(token) = queue.pop_front() {
         let character = match token {
-            RubyToken::Ruby { text: ruby, count } => {
+            TextToken::Ruby { text: ruby, count } => {
                 pending_ruby = Some(ruby);
                 // A count read out of message text must not overflow the group
                 // counter; a group longer than the rest of the text just ends
@@ -1673,7 +2035,179 @@ fn render(
                 ruby_remaining = count.saturating_add(1);
                 continue;
             }
-            RubyToken::Char(character) => character,
+            TextToken::LineBreak => {
+                x = 0;
+                y = y.saturating_add(line_height as i64);
+                line += 1;
+                lines += 1;
+                line_origins.push(y as f64);
+                continue;
+            }
+            TextToken::LineBreaks(count) => {
+                for _ in 0..count {
+                    x = 0;
+                    y = y.saturating_add(line_height as i64);
+                    line += 1;
+                    lines += 1;
+                    line_origins.push(y as f64);
+                }
+                continue;
+            }
+            TextToken::KeyWait => {
+                key_waits.push((records.len() as i64, delay));
+                continue;
+            }
+            // `\w` is a blank character cell — it moves the pen by the line
+            // advance and draws nothing; `\x` is nothing at all.
+            TextToken::Space => {
+                x = x.saturating_add(style.size);
+                continue;
+            }
+            TextToken::Invisible | TextToken::Indent | TextToken::IndentEnd | TextToken::Flag => {
+                continue;
+            }
+            TextToken::Eval { expression } => {
+                // An empty expression inserts nothing: the DLL compares the
+                // run against the empty string before it calls `onEval`.
+                let evaluated = if expression.is_empty() {
+                    String::new()
+                } else {
+                    evaluate_expression(runtime, this, &expression)
+                };
+                for character in evaluated.chars().rev() {
+                    queue.push_front(TextToken::Char(character));
+                }
+                continue;
+            }
+            TextToken::Graph { name } => {
+                let (graph_width, graph_height) = graph_size(runtime, this, &name);
+                let char_delay = if width_time_scale {
+                    graph_width as f64
+                } else {
+                    style.char_delay
+                };
+                delay += char_delay;
+                let record = build_character_record(
+                    runtime,
+                    &style,
+                    RecordPlacement {
+                        x,
+                        y,
+                        line,
+                        width: graph_width,
+                        height: graph_height,
+                        delay,
+                    },
+                    vertical,
+                    &name,
+                    // `drawGraph` truth-tests `graph` and loads the image by
+                    // `text`; the record carries the image size in `cw` and
+                    // `size`, the two fields `drawGraph` reads.
+                    Some(&name),
+                    records.len() as i64,
+                );
+                records.push(Variant::Object(record));
+                min_left = Some(min_left.map_or(x, |left| left.min(x)));
+                max_right = max_right.max(x.saturating_add(graph_width));
+                max_bottom = max_bottom.max(y.saturating_add(graph_height));
+                x = x.saturating_add(graph_width);
+                continue;
+            }
+            TextToken::Face { face } => {
+                let face = if face.is_empty() {
+                    effective_text(runtime, this, "defaultFace")
+                } else {
+                    face
+                };
+                if face != style.face {
+                    style.face = face;
+                    call_font_change(runtime, this, &style);
+                }
+                continue;
+            }
+            TextToken::ResetFont => {
+                style.reset_font(runtime, this);
+                call_font_change(runtime, this, &style);
+                continue;
+            }
+            TextToken::FontSize(code) => {
+                style.size = match code {
+                    FontSizeCode::Default => style.base_size,
+                    FontSizeCode::Big => style.big_size,
+                    FontSizeCode::Small => style.small_size,
+                    FontSizeCode::Percent(percent) => ((style.base_size as f64) * percent / 100.0)
+                        .round()
+                        .max(1.0) as i64,
+                };
+                call_font_change(runtime, this, &style);
+                continue;
+            }
+            TextToken::Attribute { attribute, value } => {
+                let value = value.unwrap_or_else(|| match attribute {
+                    FontAttribute::Bold => effective_bool(runtime, this, "defaultBold"),
+                    FontAttribute::Italic => effective_bool(runtime, this, "defaultItalic"),
+                    FontAttribute::Shadow => effective_bool(runtime, this, "defaultShadow"),
+                    FontAttribute::Edge => effective_bool(runtime, this, "defaultEdge"),
+                });
+                match attribute {
+                    FontAttribute::Bold => style.bold = value,
+                    FontAttribute::Italic => style.italic = value,
+                    FontAttribute::Shadow => style.shadow = value,
+                    FontAttribute::Edge => style.edge = value,
+                }
+                call_font_change(runtime, this, &style);
+                continue;
+            }
+            TextToken::Color { target, value } => {
+                let value = value.unwrap_or_else(|| match target {
+                    ColorTarget::Text => effective_int(runtime, this, "defaultChColor"),
+                    ColorTarget::Edge => effective_int(runtime, this, "defaultEdgeColor"),
+                    ColorTarget::Shadow => effective_int(runtime, this, "defaultShadowColor"),
+                });
+                match target {
+                    ColorTarget::Text => style.color = value,
+                    ColorTarget::Edge => style.edge_color = value,
+                    ColorTarget::Shadow => style.shadow_color = value,
+                }
+                continue;
+            }
+            TextToken::Align(align) => {
+                // Stored like the DLL's active alignment member; the layout
+                // does not shift lines yet (see the module docs).
+                style.align = align;
+                continue;
+            }
+            TextToken::Pitch(pitch) => {
+                style.pitch =
+                    pitch.unwrap_or_else(|| effective_real(runtime, this, "defaultPitch"));
+                continue;
+            }
+            TextToken::Delay { absolute, value } => {
+                style.char_delay = match (absolute, value) {
+                    (true, Some(value)) => value,
+                    (false, Some(percent)) => percent / 100.0,
+                    (_, None) => 1.0,
+                };
+                continue;
+            }
+            TextToken::Wait { value, percent } => {
+                let value = match value {
+                    WaitValue::Time(value) => value,
+                    WaitValue::Named(name) => {
+                        let evaluated = evaluate_expression(runtime, this, &name);
+                        evaluated.trim().parse::<f64>().unwrap_or(0.0)
+                    }
+                };
+                // A `%w` value counts hundredths of a character delay, the
+                // other wait codes count display time directly.
+                delay += if percent { value / 100.0 } else { value };
+                continue;
+            }
+            TextToken::Link { name } => {
+                style.link = name;
+                continue;
+            }
+            TextToken::Char(character) => character,
         };
         if character == '\r' {
             continue;
@@ -1687,8 +2221,8 @@ fn render(
             continue;
         }
         let character = character.to_string();
-        let char_width = measure_character_width(runtime, this, font, &character, font_size)
-            .unwrap_or(font_size)
+        let char_width = measure_character_width(runtime, this, font, &character, style.size)
+            .unwrap_or(style.size)
             .max(1);
         if width > 0 && x > 0 && x.saturating_add(char_width) > width {
             x = 0;
@@ -1698,22 +2232,6 @@ fn render(
             line_origins.push(y as f64);
         }
         let in_ruby_group = ruby_remaining > 0;
-        let record = runtime.alloc_dictionary_object();
-        // Reference character-object names (the DLL's character objects carry
-        // these; `x`/`y`/`cw`/`line` are the engine-facing aliases the in-repo
-        // game scripts read).
-        runtime.set_object_member(record, "text", Variant::String(character.clone()));
-        runtime.set_object_member(record, "graph", Variant::Void);
-        runtime.set_object_member(record, "face", Variant::String(face.clone()));
-        runtime.set_object_member(record, "size", Variant::Integer(font_size));
-        runtime.set_object_member(record, "italic", Variant::Integer(i64::from(italic)));
-        runtime.set_object_member(record, "bold", Variant::Integer(i64::from(bold)));
-        runtime.set_object_member(record, "color", Variant::Integer(color));
-        runtime.set_object_member(record, "shadow", Variant::Integer(i64::from(shadow)));
-        runtime.set_object_member(record, "shadowColor", Variant::Integer(shadow_color));
-        runtime.set_object_member(record, "shadowDiff", Variant::Integer(shadow_diff));
-        runtime.set_object_member(record, "edge", Variant::Integer(i64::from(edge)));
-        runtime.set_object_member(record, "edgeColor", Variant::Integer(edge_color));
         // Character timing: `delay` is this glyph's *display time* — the wait
         // accumulated through it — which is the field the DLL's layout writes
         // (`record[+0x64] = accumulator + char_delay`, 0x10013ac3), registers
@@ -1723,30 +2241,36 @@ fn render(
         // Nothing is visible at elapsed 0. `width_time_scale` charges the wait
         // by advance width instead of one tick per glyph; `renderDelay` reports
         // the total wait times `timeScale` (the DLL's `[+0x220] x timeScale`).
+        // The `%d`/`%a` codes move the per-character delay (the DLL's member
+        // 0x5d).
         let char_delay = if width_time_scale {
             char_width as f64
         } else {
-            1.0
+            style.char_delay
         };
         delay += char_delay;
-        runtime.set_object_member(record, "delay", Variant::Real(delay));
-        runtime.set_object_member(record, "link", Variant::Integer(0));
-        runtime.set_object_member(record, "linkName", Variant::String(String::new()));
-        runtime.set_object_member(record, "left", Variant::Integer(x));
-        runtime.set_object_member(record, "width", Variant::Integer(char_width));
-        runtime.set_object_member(record, "height", Variant::Integer(font_size));
-        runtime.set_object_member(record, "vertical", Variant::Integer(i64::from(vertical)));
-        runtime.set_object_member(record, "x", Variant::Integer(x));
-        runtime.set_object_member(record, "y", Variant::Integer(y));
-        runtime.set_object_member(record, "cw", Variant::Integer(char_width));
-        runtime.set_object_member(record, "line", Variant::Integer(line));
-        runtime.set_object_member(record, "index", Variant::Integer(records.len() as i64));
+        let record = build_character_record(
+            runtime,
+            &style,
+            RecordPlacement {
+                x,
+                y,
+                line,
+                width: char_width,
+                height: style.size,
+                delay,
+            },
+            vertical,
+            &character,
+            None,
+            records.len() as i64,
+        );
         records.push(Variant::Object(record));
         min_left = Some(min_left.map_or(x, |left| left.min(x)));
         max_right = max_right.max(x.saturating_add(char_width));
         max_bottom = max_bottom.max(y.saturating_add(line_height as i64));
         x = x.saturating_add(char_width);
-        x = x.saturating_add(pitch as i64);
+        x = x.saturating_add(style.pitch as i64);
         if in_ruby_group {
             if group_first_record.is_none() {
                 group_first_record = Some(record);
@@ -1786,6 +2310,23 @@ fn render(
     // The accumulator is stored unscaled: `renderDelay` multiplies it by the
     // current `timeScale` on every read, like the DLL's getter.
     state_store(runtime, this, LAYOUT_DELAY, Variant::Real(delay));
+    // The waits are stored unscaled too; `getKeyWait` builds its answer with
+    // the `timeScale` of the moment, the way `FUN_10009be0` multiplies on
+    // every read.
+    let waits = key_waits
+        .into_iter()
+        .map(|(pos, time)| {
+            let entry = runtime.alloc_dictionary_object();
+            runtime.set_object_member(entry, "pos", Variant::Integer(pos));
+            runtime.set_object_member(entry, "delay", Variant::Real(time));
+            Variant::Object(entry)
+        })
+        .collect::<Vec<_>>();
+    let waits = runtime.alloc_array_object(waits);
+    state_store(runtime, this, LAYOUT_KEY_WAITS, Variant::Object(waits));
+    // The alignment the text ended with, stored like the DLL's active member;
+    // the line layout does not shift lines (see the module docs).
+    state_store(runtime, this, "align", Variant::Integer(style.align));
     state_store(runtime, this, "renderCount", Variant::Integer(count));
     state_store(runtime, this, "renderLines", Variant::Integer(lines));
     let origins = line_origins
@@ -1926,50 +2467,344 @@ fn arguments(args: &[Variant], index: usize) -> Variant {
     args.get(index).cloned().unwrap_or(Variant::Void)
 }
 
-enum RubyToken {
+/// One element of the message text format — the escape sequences the games'
+/// `TagTextConverter` writes and `textrender.dll` reads back. The variant
+/// names carry the DLL anchor for each code in the module docs.
+enum TextToken {
+    /// An ordinary character.
     Char(char),
+    /// `[ruby]` / `[ruby,count]` over the following `count + 1` characters.
     Ruby { text: String, count: usize },
+    /// `\n`, a raw 0x0A, or one unit of `%n…;`.
+    LineBreak,
+    /// `%n<count>;`: that many line breaks.
+    LineBreaks(usize),
+    /// `\k`: a click wait at the current position.
+    KeyWait,
+    /// `\w`: one blank character cell, no glyph.
+    Space,
+    /// `\x`: nothing at all.
+    Invisible,
+    /// `\i`: the indent marker.
+    Indent,
+    /// `\r`: the indent-end marker.
+    IndentEnd,
+    /// `$expr;` / `${expr}`: inline evaluation through `onEval`.
+    Eval { expression: String },
+    /// `&name;`: an inline image measured through `onGetGraphSize`.
+    Graph { name: String },
+    /// `%f<face>;` / `%f;` (empty = the default face).
+    Face { face: String },
+    /// `%r`: reset the font attributes to the defaults.
+    ResetFont,
+    /// `%;`, `%<percent>;`, `%B`, `%S`.
+    FontSize(FontSizeCode),
+    /// `%b`/`%i`/`%s`/`%e` with `0`, `1` or `d` (the `d` and anything else
+    /// mean "the default", which is the `None` value).
+    Attribute {
+        attribute: FontAttribute,
+        value: Option<bool>,
+    },
+    /// `#rrggbb;` / `#;` and the `%e#…;` / `%s#…;` forms; `None` is the
+    /// default colour.
+    Color {
+        target: ColorTarget,
+        value: Option<i64>,
+    },
+    /// `%L` / `%C` / `%R`.
+    Align(i64),
+    /// `%p<n>;` / `%p;` (`None` = the default pitch).
+    Pitch(Option<f64>),
+    /// `%a<n>;` (absolute) / `%d<n>;` (percent of the base delay) / `%d;`
+    /// (the base delay).
+    Delay { absolute: bool, value: Option<f64> },
+    /// `%t…;` / `%w…;` / `%D…;`: wait time, literal or named; `percent` marks
+    /// the `%w` spelling, whose value counts hundredths of a character delay
+    /// rather than display time.
+    Wait { value: WaitValue, percent: bool },
+    /// `%l<name>;` / `%l;` (empty = end the link span).
+    Link { name: String },
+    /// `%k<0|1|d>`: a flag with no converter emitting it.
+    Flag,
 }
 
-/// Split raw message text into characters and `[ruby,count]` annotations.
-/// Bracket runs without a comma are literal text (e.g. English asides).
-fn parse_ruby_annotations(text: &str) -> Vec<RubyToken> {
+#[derive(Clone, Copy)]
+enum FontSizeCode {
+    Default,
+    Big,
+    Small,
+    Percent(f64),
+}
+
+#[derive(Clone, Copy)]
+enum FontAttribute {
+    Bold,
+    Italic,
+    Shadow,
+    Edge,
+}
+
+#[derive(Clone, Copy)]
+enum ColorTarget {
+    Text,
+    Edge,
+    Shadow,
+}
+
+/// The payload of a wait code: a literal count, or the name of an expression
+/// the DLL evaluates through `onEval` before reading the number.
+enum WaitValue {
+    Time(f64),
+    Named(String),
+}
+
+/// Split message text into tokens — the DLL's `FUN_1000b8c0` walk (see the
+/// module docs for the code-by-code anchors). `[ruby]` runs without a comma
+/// are literal text (e.g. English asides).
+fn parse_message_text(text: &str) -> Vec<TextToken> {
     let mut tokens = Vec::new();
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {
-        if character != '[' {
-            tokens.push(RubyToken::Char(character));
-            continue;
-        }
-        let mut content = String::new();
-        let mut closed = false;
-        for next in chars.by_ref() {
-            if next == ']' {
-                closed = true;
-                break;
-            }
-            content.push(next);
-        }
-        let annotation = closed.then(|| {
-            let (ruby, count) = content.split_once(',')?;
-            let count = count.trim().parse::<usize>().ok()?;
-            (!ruby.is_empty()).then_some(RubyToken::Ruby {
-                text: ruby.to_string(),
-                count,
-            })
-        });
-        match annotation.flatten() {
-            Some(ruby) => tokens.push(ruby),
-            None => {
-                tokens.push(RubyToken::Char('['));
-                tokens.extend(content.chars().map(RubyToken::Char));
-                if closed {
-                    tokens.push(RubyToken::Char(']'));
+        match character {
+            '\\' => match chars.next() {
+                Some('n') => tokens.push(TextToken::LineBreak),
+                Some('k') => tokens.push(TextToken::KeyWait),
+                Some('w') => tokens.push(TextToken::Space),
+                Some('x') => tokens.push(TextToken::Invisible),
+                Some('i') => tokens.push(TextToken::Indent),
+                Some('r') => tokens.push(TextToken::IndentEnd),
+                // The DLL turns `\t` into an ordinary tab glyph.
+                Some('t') => tokens.push(TextToken::Char('\t')),
+                // Any other escape is the literal character: `\[` is "[",
+                // `\\` is "\", and so on.
+                Some(escaped) => tokens.push(TextToken::Char(escaped)),
+                None => {}
+            },
+            '[' => {
+                let mut content = String::new();
+                let mut closed = false;
+                for next in chars.by_ref() {
+                    if next == ']' {
+                        closed = true;
+                        break;
+                    }
+                    content.push(next);
+                }
+                let annotation = closed.then(|| {
+                    let (ruby, count) = content.split_once(',')?;
+                    let count = count.trim().parse::<usize>().ok()?;
+                    (!ruby.is_empty()).then_some(TextToken::Ruby {
+                        text: ruby.to_string(),
+                        count,
+                    })
+                });
+                match annotation.flatten() {
+                    Some(ruby) => tokens.push(ruby),
+                    None => {
+                        tokens.push(TextToken::Char('['));
+                        tokens.extend(content.chars().map(TextToken::Char));
+                        if closed {
+                            tokens.push(TextToken::Char(']'));
+                        }
+                    }
                 }
             }
+            '%' => parse_percent_code(&mut chars, &mut tokens),
+            '#' => tokens.push(TextToken::Color {
+                target: ColorTarget::Text,
+                value: parse_color(&take_to_semicolon(&mut chars)),
+            }),
+            '$' => {
+                let expression = if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut expression = String::new();
+                    for next in chars.by_ref() {
+                        if next == '}' {
+                            break;
+                        }
+                        expression.push(next);
+                    }
+                    expression
+                } else {
+                    take_to_semicolon(&mut chars)
+                };
+                tokens.push(TextToken::Eval { expression });
+            }
+            '&' => tokens.push(TextToken::Graph {
+                name: take_to_semicolon(&mut chars),
+            }),
+            other => tokens.push(TextToken::Char(other)),
         }
     }
     tokens
+}
+
+/// The `%` codes (`FUN_1000b8c0` case 0x25). A `%` the walk cannot place is a
+/// directive whose payload is consumed to the next `;` and dropped — the
+/// DLL's own `default` arm.
+fn parse_percent_code(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    tokens: &mut Vec<TextToken>,
+) {
+    let Some(code) = chars.peek().copied() else {
+        return;
+    };
+    if code.is_ascii_digit() {
+        if let Some(percent) = take_digits(chars, false) {
+            tokens.push(TextToken::FontSize(FontSizeCode::Percent(percent)));
+        }
+        return;
+    }
+    chars.next();
+    match code {
+        ';' => tokens.push(TextToken::FontSize(FontSizeCode::Default)),
+        'B' => tokens.push(TextToken::FontSize(FontSizeCode::Big)),
+        'S' => tokens.push(TextToken::FontSize(FontSizeCode::Small)),
+        'L' => tokens.push(TextToken::Align(-1)),
+        'C' => tokens.push(TextToken::Align(0)),
+        'R' => tokens.push(TextToken::Align(1)),
+        'a' => tokens.push(TextToken::Delay {
+            absolute: true,
+            value: take_digits(chars, false),
+        }),
+        'd' => tokens.push(TextToken::Delay {
+            absolute: false,
+            value: take_digits(chars, false),
+        }),
+        'n' => {
+            // The DLL breaks the line once when the code carries no number and
+            // not at all for a count below 1.
+            let count = match take_digits(chars, true) {
+                Some(value) if value >= 1.0 => value as usize,
+                Some(_) => 0,
+                None => 1,
+            };
+            tokens.push(TextToken::LineBreaks(count));
+        }
+        'p' => tokens.push(TextToken::Pitch(take_digits(chars, true))),
+        'r' => tokens.push(TextToken::ResetFont),
+        'f' => tokens.push(TextToken::Face {
+            face: take_to_semicolon(chars),
+        }),
+        'l' => tokens.push(TextToken::Link {
+            name: take_to_semicolon(chars),
+        }),
+        't' | 'w' | 'D' => tokens.push(TextToken::Wait {
+            value: parse_wait_value(chars),
+            percent: code == 'w',
+        }),
+        'b' | 'i' => {
+            let attribute = if code == 'b' {
+                FontAttribute::Bold
+            } else {
+                FontAttribute::Italic
+            };
+            tokens.push(TextToken::Attribute {
+                attribute,
+                value: take_switch(chars),
+            });
+        }
+        's' | 'e' => {
+            let attribute = if code == 's' {
+                FontAttribute::Shadow
+            } else {
+                FontAttribute::Edge
+            };
+            if chars.peek() == Some(&'#') {
+                chars.next();
+                let target = if code == 's' {
+                    ColorTarget::Shadow
+                } else {
+                    ColorTarget::Edge
+                };
+                tokens.push(TextToken::Color {
+                    target,
+                    value: parse_color(&take_to_semicolon(chars)),
+                });
+            } else {
+                tokens.push(TextToken::Attribute {
+                    attribute,
+                    value: take_switch(chars),
+                });
+            }
+        }
+        'k' => {
+            take_switch(chars);
+            tokens.push(TextToken::Flag);
+        }
+        _ => {
+            // The DLL's default arm: the rest of the directive is swallowed.
+            if code != ';' {
+                take_to_semicolon(chars);
+            }
+        }
+    }
+}
+
+/// The `%t`/`%w`/`%D` payload: digits, or `$name;` to be evaluated.
+fn parse_wait_value(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> WaitValue {
+    if chars.peek() == Some(&'$') {
+        chars.next();
+        WaitValue::Named(take_to_semicolon(chars))
+    } else {
+        WaitValue::Time(take_digits(chars, false).unwrap_or(0.0))
+    }
+}
+
+/// Read up to the next `;` (consuming it); at the end of the text the run
+/// simply stops, which is what the DLL's loops do.
+fn take_to_semicolon(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut content = String::new();
+    for next in chars.by_ref() {
+        if next == ';' {
+            break;
+        }
+        content.push(next);
+    }
+    content
+}
+
+/// The decimal digits of a numeric code, with the optional leading `-` of
+/// `%n`/`%p`. A `;` is consumed when it follows; any other character is left
+/// for the main walk, as the DLL's `break` does.
+fn take_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, signed: bool) -> Option<f64> {
+    let mut digits = String::new();
+    if signed && chars.peek() == Some(&'-') {
+        digits.push(chars.next()?);
+    }
+    while let Some(next) = chars.peek().copied() {
+        if !next.is_ascii_digit() {
+            break;
+        }
+        digits.push(chars.next()?);
+    }
+    if chars.peek() == Some(&';') {
+        chars.next();
+    }
+    if digits.is_empty() || digits == "-" {
+        return None;
+    }
+    digits.parse::<f64>().ok()
+}
+
+/// The `0`/`1`/`d` value of a boolean code: `d` (or anything else) means the
+/// default.
+fn take_switch(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<bool> {
+    match chars.next() {
+        Some('1') => Some(true),
+        Some('0') => Some(false),
+        _ => None,
+    }
+}
+
+/// A `#…;` colour value: the hex digits OR the alpha byte the DLL adds
+/// (`uVar9 | 0xff000000`). An empty run is the default colour.
+fn parse_color(content: &str) -> Option<i64> {
+    if content.is_empty() {
+        return None;
+    }
+    let value = i64::from_str_radix(content.trim(), 16).unwrap_or(0);
+    Some((value & 0xffff_ffff) | 0xff00_0000)
 }
 
 /// Query glyph advance through the same virtual callback as textrender.dll.
@@ -2858,4 +3693,220 @@ mod tests {
         assert!(member("setRender").is_none());
     }
 
+    /// The message text format's line break: `\n` is the two characters the
+    /// games' `TagTextConverter` writes (`parseR` → `addText("\\n")`) and
+    /// `sysscn\option.tjs` rewrites a real newline into; `render` must break
+    /// the line there instead of drawing a backslash and an `n`. M85's live
+    /// probe on the game's own renderer saw four glyph records with `\` at
+    /// x=24 and `n` at x=48 on line 0; this pins the two-record answer.
+    #[test]
+    fn render_breaks_lines_on_the_message_text_escape() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("A\\nB");
+            var chars = render.getCharacters(0, 0);
+            var texts = "";
+            var i = 0;
+            while (i < chars.count) { texts += chars[i].text, i = i + 1; }
+            return chars.count + "/" + texts + "/" + chars[0].line + "/" + chars[1].line + "/"
+                + chars[1].y + "/" + render.renderLines;
+            "#);
+        // Two glyphs, `B` on the second line one line height (24 + 6) down.
+        assert_eq!(value, "2/AB/0/1/30/2");
+    }
+
+    /// `\k` records a click wait for the conductor: `getKeyWait()[0].pos` is
+    /// the number of characters laid out up to it (`rendermsgwin.tjs` draws
+    /// `pos - cpos` more and stops showing when `calcShowCount` reaches it)
+    /// and `.time` is the display time reached there times the current
+    /// `timeScale` (the clock rewind in `continueClick`).
+    #[test]
+    fn render_key_wait_reports_position_and_time() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("あ\\kい");
+            var chars = render.getCharacters(0, 0);
+            var waits = render.getKeyWait();
+            var first = waits[0];
+            render.timeScale = 2;
+            var scaled = render.getKeyWait()[0].time;
+            return chars.count + "/" + chars[0].text + "/" + chars[1].text + "/" + waits.count + "/"
+                + first.pos + "/" + first.time + "/" + scaled;
+            "#);
+        // The `\k` sits between the two glyphs: one wait at pos 1, its time the
+        // one displayed character. The getter scales on every read, so the
+        // later `timeScale` write changes the answer.
+        assert_eq!(value, "2/あ/い/1/1/1/2");
+    }
+
+    /// `%f<face>;` switches the face of the following characters and
+    /// `$expr;` runs through `onEval` and lays out the result. M85's live
+    /// probe saw `render("A%fuser;B$記号$;C")` draw all 15 characters
+    /// literally; the reference answer draws only the real glyphs.
+    #[test]
+    fn render_switches_the_face_and_evaluates_inline_expressions() {
+        let value = run(r#"
+            class ProbeRender extends TextRenderBase {
+                function ProbeRender() {
+                    TextRenderBase.TextRenderBase();
+                    this.evaluated = "";
+                }
+                function onEval(text) {
+                    this.evaluated = text;
+                    return "eval";
+                }
+            }
+            var render = new ProbeRender();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("A%fuser;B$記号$;C");
+            var chars = render.getCharacters(0, 0);
+            var texts = "";
+            var i = 0;
+            while (i < chars.count) { texts += chars[i].text, i = i + 1; }
+            return chars.count + "/" + texts + "/" + chars[0].face + "/" + chars[1].face + "/"
+                + render.evaluated;
+            "#);
+        // `%fuser;` reaches the characters after it only, and the evaluated
+        // text replaces the code ($記号$; evaluates to `記号$`).
+        assert_eq!(value, "7/ABevalC/normal/user/記号$");
+    }
+
+    /// The attribute codes the converters emit: `%i1…%id` (italic on and back
+    /// to the default), `%120;` (120% of the default size, the `.rdata` 100.0
+    /// divisor), `#rrggbb;` (the colour, ORed with the DLL's 0xff000000).
+    /// A directive moves the render's own style; the instance properties stay
+    /// untouched.
+    #[test]
+    fn render_moves_the_active_style_with_the_attribute_codes() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("a%i1b%idc%120;d#ff0000;e");
+            var chars = render.getCharacters(0, 0);
+            var texts = "";
+            var i = 0;
+            while (i < chars.count) { texts += chars[i].text, i = i + 1; }
+            return chars.count + "/" + texts + "/" + chars[0].italic + "/" + chars[1].italic + "/"
+                + chars[2].italic + "/" + chars[2].size + "/" + chars[3].size + "/" + chars[4].color + "/"
+                + render.defaultChColor;
+            "#);
+        // The size is the default size (24) times the percentage, not the
+        // Font's 20: 24 x 1.2 rounds to 29.
+        assert_eq!(value, "5/abcde/0/1/0/20/29/4294901760/4294967295");
+    }
+
+    /// The pausing and blank codes: `%t<ms>;` adds its time to the display
+    /// clock (the DLL's wait accumulator 0x76), `\w` advances the pen one
+    /// character cell without a record and `\x` does nothing at all, and
+    /// `%n<count>;` is that many line breaks.
+    #[test]
+    fn render_waits_advance_the_clock_and_blank_codes_draw_nothing() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("a\\w\\x%t1000;b%n2;c");
+            var chars = render.getCharacters(0, 0);
+            var texts = "";
+            var i = 0;
+            while (i < chars.count) { texts += chars[i].text, i = i + 1; }
+            var glyph = chars[0].width;
+            return chars.count + "/" + texts + "/" + (chars[1].left - glyph) + "/"
+                + chars[1].delay + "/" + chars[1].line + "/" + chars[2].line + "/"
+                + render.renderLines + "/" + render.renderDelay;
+            "#);
+        // `b` sits one blank cell — the current glyph size, 20 — after `a`
+        // (whose advance the Font measured), carries the 1000 the wait added
+        // plus its own tick, and `c` lands two lines below it.
+        assert_eq!(value, "3/abc/20/1002/0/2/3/1003");
+    }
+
+    /// A `%…;` the walk cannot place is consumed up to its `;` and draws
+    /// nothing — the DLL's own `default` arm, which is why the games quote a
+    /// literal `%` as `\%`. Quoted punctuation comes back through the same
+    /// backslash rule (`\[` is "[", `\\` is "\").
+    #[test]
+    fn render_consumes_directives_it_does_not_know() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.render("a%zz;b\\[c\\\\d");
+            var chars = render.getCharacters(0, 0);
+            var texts = "";
+            var i = 0;
+            while (i < chars.count) { texts += chars[i].text, i = i + 1; }
+            return chars.count + "/" + texts;
+            "#);
+        assert_eq!(value, "6/ab[c\\d");
+    }
+
+    /// GINKA's `cr_data.xp3 > scn101.ks.scn`, scene `*start`, texts[137] (the
+    /// same string is in scn114 texts[226]/[237]): the stored field is
+    /// `「それはない」\n「ないない」` — 15 characters, the escape counted as the
+    /// two characters it is. The reference must draw two lines holding the 13
+    /// real glyphs.
+    #[test]
+    fn render_draws_the_ginka_escaped_game_string_on_two_lines() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(800, 0);
+            render.render("「それはない」\\n「ないない」");
+            var chars = render.getCharacters(0, 0);
+            var texts = "";
+            var i = 0;
+            while (i < chars.count) { texts += chars[i].text, i = i + 1; }
+            return chars.count + "/" + texts + "/" + chars[7].text + "/" + chars[7].line + "/"
+                + chars[7].y + "/" + render.renderLines;
+            "#);
+        // The seventh character closes the first quotation, and the eighth
+        // opens the second line.
+        assert_eq!(value, "13/「それはない」「ないない」/「/1/30/2");
+    }
+
+    /// 少女世界的生存之道's `data.xp3 > scn/a01_1.txt.scn` (scene `*start`)
+    /// opens with `一连串的爆炸平息之后，\n我将枪管架在沙袋的凹槽上，悄悄探出头观察外面的情况。`
+    /// — one of the 141 distinct strings in that scene carrying the escape.
+    #[test]
+    fn render_draws_the_qtsj_escaped_game_string_on_two_lines() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(800, 0);
+            render.render("一连串的爆炸平息之后，\\n我将枪管架在沙袋的凹槽上，悄悄探出头观察外面的情况。");
+            var chars = render.getCharacters(0, 0);
+            var texts = "";
+            var i = 0;
+            while (i < chars.count) { texts += chars[i].text, i = i + 1; }
+            return chars.count + "/" + texts + "/" + chars[11].text + "/" + chars[11].line + "/"
+                + chars[11].y + "/" + render.renderLines;
+            "#);
+        assert_eq!(
+            value,
+            "37/一连串的爆炸平息之后，我将枪管架在沙袋的凹槽上，悄悄探出头观察外面的情况。/我/1/30/2"
+        );
+    }
 }
