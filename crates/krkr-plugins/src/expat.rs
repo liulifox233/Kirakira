@@ -21,7 +21,11 @@
 //!   document as one buffer (`:413-421`); `parseStorage` streams the
 //!   storage's raw bytes in 8 KiB chunks, the last one flagged final
 //!   (`:435-455`). A missing storage throws `cannot open : <filename>`
-//!   (`:442-445`) — the only exception either method raises itself.
+//!   (`:442-445`) — the only exception either method raises itself. Both
+//!   methods act on the native instance, so a call with no instance —
+//!   `XMLParser.parse(text)` on the class object — is the reference's
+//!   `TJS_GET_NATIVE_INSTANCE` failure, `Invalid object context`
+//!   (`TJS_E_NATIVECLASSCRASH`, `:517`/`:533`, `tjsNative.h:312-320`).
 //! * Parse errors **never throw**: `parse` returns the `XML_Parse` status
 //!   (`:424`, `:453`) and the caller inspects the properties.
 //! * Read-only properties (getters only, `TJS_DENY_NATIVE_PROP_SETTER`
@@ -200,6 +204,11 @@ fn parser_constructor(
     let instance = instance_for(runtime, this_obj);
     runtime.add_object_class_info(instance, "XMLParser");
     install_members(runtime, instance);
+    // The reference's native instance registration happens in
+    // `tTJSNativeClass::FuncCall` with no member name (`tjsNative.cpp:321`),
+    // on the object the class is initialised on — which is this constructor's
+    // receiver.  The class object never sees it.
+    runtime.set_object_member(instance, INSTANCE_MEMBER, Variant::Integer(1));
     // `Construct` stores `param[0]->AsObject()` (`:344-352`), and that
     // conversion throws for every non-object variant but `null`
     // (`tjsVariant.h:668-679`).
@@ -321,13 +330,28 @@ fn parse_storage(
     )?)))
 }
 
+/// The object a native member acts on: the reference's
+/// `TJS_GET_NATIVE_INSTANCE` answer (`tjsNative.h:312-320`).
+///
+/// Every method and property of the reference's class opens with that macro
+/// (`Main.cpp:517`, `:545`, …), so a receiver carrying no native instance —
+/// the class object, the global object, an unrelated object — fails the
+/// member with `TJS_E_NATIVECLASSCRASH`, the "Invalid object context" `parse`
+/// and `parseStorage` report.  `None` here is that failure: the caller raises
+/// it.  The reference registers the instance on the object the class is
+/// initialised on (`tjsNative.cpp:321`, inside `tTJSNativeClass::FuncCall`
+/// with no member name), which is what [`INSTANCE_MEMBER`] marks.
 fn plugin_this(
     runtime: &Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
 ) -> Option<ObjectHandle> {
-    this_obj
-        .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
-        .filter(|handle| *handle != runtime.global_handle())
+    let handle = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))?;
+    (handle != runtime.global_handle()
+        && matches!(
+            runtime.object_member(handle, INSTANCE_MEMBER),
+            Variant::Integer(1)
+        ))
+    .then_some(handle)
 }
 
 fn object_argument(args: &[Variant], index: usize) -> Result<Option<ObjectHandle>> {
@@ -356,6 +380,12 @@ fn target_argument(value: &Variant) -> Result<Option<ObjectHandle>> {
 // ---------------------------------------------------------------------------
 
 const STATE_MEMBER: &str = "__expatParserState";
+
+/// Set on the objects the class initialises — the port's `TJS_NIS_REGISTER`
+/// mark; `install_members` runs on the class object too, so the state member
+/// alone cannot tell an instance from the class object. Written only by
+/// `parser_constructor`.
+const INSTANCE_MEMBER: &str = "__expatParserInstance";
 const TARGET: &str = "target";
 const ERROR_CODE: &str = "errorCode";
 const ERROR_STRING: &str = "errorString";
@@ -1965,17 +1995,65 @@ mod tests {
         assert_eq!(value, Variant::String("Object".to_string()));
     }
 
-    /// The constructible class object works without an instance, exactly as
-    /// `Class.method()` on a native class does in TJS2.
+    /// A native-class member called on the class object with no instance is
+    /// `TJS_E_NATIVECLASSCRASH` ("Invalid object context"), not a parse.
+    ///
+    /// `CallFunctionDirect` resolves the callee's `this` with
+    /// `clo.ObjThis ? clo.ObjThis : ra[-1]` (`tjsInterCodeExec.cpp:2406`,
+    /// fallback at `:2434-2438`), and a class object's published value carries
+    /// no ObjThis — `REGISTER_OBJECT` stores every native class as
+    /// `val = tTJSVariant(dsp/*, dsp*/)`, the ObjThis operand commented out
+    /// (`base/ScriptMgnIntf.cpp:498-503`; the plugin's own class comes from
+    /// `Main.cpp:500` `TJSCreateNativeClassForPlugin`, whose members are
+    /// stored the same way, `tjsNative.cpp:280-281`) — so the call site's
+    /// `this` is what arrives.  At the top level that is the **global
+    /// object**: `tTJS::ExecScript`'s `context` argument defaults to NULL
+    /// (`tjs.h:140-146`), but the `ctTopLevel` branch substitutes the global
+    /// for a NULL context (`tjsInterCodeExec.cpp:3083-3087`), which
+    /// `ExecuteAsFunction` then stores into `ra[-1]` (`:839`) — exactly what
+    /// this port's `execute_file` does (`runtime/mod.rs:967-968`).  The member
+    /// fails there in its own `TJS_GET_NATIVE_INSTANCE` (`Main.cpp:517`;
+    /// macro at `tjsNative.h:312-320`): the native instance is registered on
+    /// the object the class initialises (`tjsNative.cpp:321`), never on the
+    /// class object, the global object or an unrelated object.  A frame that
+    /// carries no ObjThis at all fails one step earlier, the NULL check in
+    /// `tTJSNativeClassMethod::FuncCall` (`tjsNative.cpp:92`); either way the
+    /// text is "Invalid object context" (`tjsError.h:363`, krkr2 trunk).
     #[test]
-    fn the_class_object_parses() {
+    fn the_class_object_call_throws_the_reference_error() {
         let mut engine = engine();
+        let error = engine
+            .execute_expression("inline.tjs", "XMLParser.parse(\"<a/>\")")
+            .expect_err("class object");
+        assert_eq!(error.kind, TjsErrorKind::NativeClassCrash);
+        assert_eq!(error.message, "Invalid object context");
+
+        // The KAGEX-style wrapper shape: a method of another class calls the
+        // class object, and the caller's instance is delivered as `this`.
+        // It is not a parser either, so the reference raises the same error.
+        engine
+            .execute_script(
+                "harness.tjs",
+                r#"class Wrapper {
+                    function Wrapper() { }
+                    function load() { return XMLParser.parse("<a/>"); }
+                }"#,
+            )
+            .expect("harness");
+        let error = engine
+            .execute_expression("inline.tjs", "(new Wrapper()).load()")
+            .expect_err("foreign receiver");
+        assert_eq!(error.kind, TjsErrorKind::NativeClassCrash);
+        assert_eq!(error.message, "Invalid object context");
+
+        // An instance is what the members act on; there the call parses.
         let value = engine
             .execute_expression(
                 "inline.tjs",
-                "XMLParser.parse(\"<a/>\") + \":\" + XMLParser.errorCode",
+                "(function() { var parser = new XMLParser(); return \
+                 parser.parse(\"<a/>\") + \":\" + parser.errorCode; })()",
             )
-            .expect("class object");
+            .expect("instance");
         assert_eq!(value, Variant::String("1:0".to_string()));
     }
 
