@@ -1,3 +1,25 @@
+//! Font discovery, metrics, glyph rasterization and RGBA text images for the
+//! engine's layers.
+//!
+//! A font spec resolves to one being face ([`FontSystem::select_primary_face`]):
+//! the first requested candidate that exists, else the default being font. The
+//! default is chosen for capability first — the probe coverage M152 pinned and
+//! its UI-shape rank (`DEFAULT_BEING_FONT_PROBE`, `being_font_rank`) — and,
+//! between faces those two already call peers, for the *project's language*
+//! ([`LanguageAffinity`]), read off the region variant the face's own family
+//! names declare. The language is the script encoding the game configures
+//! (`Storages.setTextEncoding`, wired in `krkr-engine`'s host), because the
+//! regional faces a CJK vendor ships cover the same characters and differ only
+//! in the variant their names select: M156 measured Noto CJK's JP/KR/SC/TC/HK
+//! faces as byte-identical for `「」`, while 纸上的魔法使 — a GBK project whose
+//! `华文细黑` message face resolves to nothing — got the JP variant's `“ ”` and
+//! `！？：；·` placement (`“` ink x[64,312] of the em where the SC variant draws
+//! x[644,951]; `！` x[460,540] where SC draws x[210,290]) plus six hanzi
+//! variants (骨/直/海/逢/郎/今). Language affinity therefore outranks the fontdb
+//! order that put the JP face first on this host, but never the coverage and
+//! shape rules: a face whose names carry no region marker stays neutral, and a
+//! host with no face for the project's language keeps the old choice.
+
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 use fontdb::{Database, Family, Query, Source, Stretch, Style as FontStyle, Weight};
@@ -413,6 +435,27 @@ fn file_key(name: &str) -> String {
     region_free_key(&stem).unwrap_or(stem)
 }
 
+/// The language a project's text follows, resolved by the engine from the
+/// script encoding the game configures (`Storages.setTextEncoding` — 纸上的
+/// 魔法使's `patch.tjs` sets `"gbk"`; a Japanese build leaves Shift-JIS or the
+/// UTF-8 default). It selects which regional variant of a family the *default
+/// being font* prefers when the requested face resolves to nothing: M156
+/// measured that this Chinese game's inner quotes `“ ”` and `！？：；·` plus six
+/// hanzi (骨/直/海/逢/郎/今) are drawn by the JP variant's convention under
+/// M152's default (Noto Sans CJK JP on this host) — `“` ink x[64,312] of the
+/// em where the SC variant draws x[644,951], `！` x[460,540] where SC draws
+/// x[210,290] — even though both variants cover the game's text and are
+/// byte-identical for its `「」`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LanguageAffinity {
+    /// No project-language signal: the fallback keeps the plain fontdb order,
+    /// the way every build before this one selected.
+    #[default]
+    Unspecified,
+    Japanese,
+    SimplifiedChinese,
+}
+
 #[derive(Debug)]
 pub struct FontSystem {
     db: Database,
@@ -426,6 +469,10 @@ pub struct FontSystem {
     font_aliases: Vec<(String, String)>,
     loaded_face_names: BTreeMap<String, fontdb::ID>,
     prerendered_fonts: BTreeMap<PrerenderedFontKey, PrerenderedFont>,
+    /// The project's language, as the engine resolves it from the game's text
+    /// encoding ([`FontSystem::set_language_affinity`]); it decides which
+    /// region variant the default being font prefers.
+    language_affinity: LanguageAffinity,
     /// The being font each spec resolves to: a requested candidate when one
     /// answers, else the default being font (`query_default_faces`). One entry
     /// per spec — the reference resolves `GetBeingFont` once per font spec
@@ -454,6 +501,7 @@ impl Clone for FontSystem {
             font_aliases: self.font_aliases.clone(),
             loaded_face_names: self.loaded_face_names.clone(),
             prerendered_fonts: self.prerendered_fonts.clone(),
+            language_affinity: self.language_affinity,
             primary_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
@@ -483,6 +531,7 @@ impl FontSystem {
             font_aliases: Vec::new(),
             loaded_face_names: BTreeMap::new(),
             prerendered_fonts: BTreeMap::new(),
+            language_affinity: LanguageAffinity::Unspecified,
             primary_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
@@ -548,6 +597,25 @@ impl FontSystem {
     /// `register_font_aliases` on the table's source text.
     pub fn register_font_alias_text(&mut self, text: &str) {
         self.register_font_aliases(parse_font_alias_pairs(text));
+    }
+
+    /// Tells the rasterizer which language the project's text follows. Only
+    /// the *default being font* of an unresolvable request consults it, to
+    /// prefer the loaded family's variant of that language
+    /// (`LanguageAffinity`); `Unspecified` restores the plain fontdb order.
+    /// Cached spec-to-face selections are dropped when the value changes, so a
+    /// face resolved before the game announced its encoding (纸上的魔法使's
+    /// `patch.tjs` runs `Storages.setTextEncoding("gbk")` at startup) cannot
+    /// pin the wrong variant.
+    pub fn set_language_affinity(&mut self, language: LanguageAffinity) {
+        if self.language_affinity != language {
+            self.language_affinity = language;
+            self.primary_faces.borrow_mut().clear();
+        }
+    }
+
+    pub fn language_affinity(&self) -> LanguageAffinity {
+        self.language_affinity
     }
 
     pub fn load_font_data(&mut self, name: impl Into<String>, data: Vec<u8>) -> Result<(), String> {
@@ -1273,8 +1341,17 @@ impl FontSystem {
     /// in the reference's order, the game's own `System.addFont` faces
     /// (`registered_faces`, the closest thing to the platform list), then the
     /// generic families, then any loaded face; within a set the best probe
-    /// coverage wins and a sans-shaped family breaks ties (`best_probe_face`,
-    /// `being_font_rank`), the way the reference's default is a sans UI face.
+    /// coverage wins, a sans-shaped family breaks ties (`best_probe_face`,
+    /// `being_font_rank`) the way the reference's default is a sans UI face,
+    /// and the project's language variant (`language_preference`) breaks what
+    /// is left — the reference's own default is language-specific (`ＭＳ Ｐ
+    /// ゴシック` against `微软雅黑`), and on this host the plain fontdb order
+    /// answers a Chinese game with the Japanese variant of Noto CJK, whose
+    /// `“ ”`/`！？：；·`/hanzi forms M156 measured against the game's text.
+    /// Language affinity is the *last* component, deliberately: it may not
+    /// override coverage or shape, or a host without a face of the project's
+    /// language would stop on a bitmap fallback font such as Unifont that
+    /// merely covers everything.
     /// One face is picked per spec, like `GetBeingFont`, so no advance depends
     /// on the rest of the string; a character the chosen face still lacks
     /// draws its own default character
@@ -1320,29 +1397,85 @@ impl FontSystem {
 
     /// The best face of a candidate set to become the default being font: the
     /// highest probe coverage, a UI-shaped family over a serif/mono/unlabeled
-    /// one, the earliest candidate over a later one. Early exits when the
-    /// first candidate is already a full-coverage UI face, so the common case
-    /// does not score every loaded face.
+    /// one, the project's own regional variant over another's, the earliest
+    /// candidate over a later one. Early exits when the first candidate is
+    /// already an ideal full-coverage UI face, so the common case does not
+    /// score every loaded face.
     fn best_probe_face<I: Iterator<Item = fontdb::ID>>(&self, candidates: I) -> Option<fontdb::ID> {
-        let mut best: Option<(usize, u8, fontdb::ID)> = None;
+        // The best language component a face could carry here: the neutral
+        // default unless the project declared a language, in which case only a
+        // face of that variant is ideal.
+        let ideal_language = if self.language_affinity == LanguageAffinity::Unspecified {
+            1
+        } else {
+            2
+        };
+        let mut best: Option<(usize, u8, u8, fontdb::ID)> = None;
         for face in candidates {
             let score = self.probe_coverage(face);
             if score == 0 {
                 continue;
             }
             let rank = self.being_font_rank(face);
-            if score == DEFAULT_BEING_FONT_PROBE.len() && rank == 0 {
+            let language = self.language_preference(face);
+            if score == DEFAULT_BEING_FONT_PROBE.len() && rank == 0 && language == ideal_language {
                 return Some(face);
             }
             // Lower rank wins; `u8::MAX - rank` turns it into a larger-is-
-            // better component beside the score.
-            if best.is_none_or(|(best_score, best_rank, _)| {
-                (score, u8::MAX - rank) > (best_score, u8::MAX - best_rank)
+            // better component beside the score, and the language preference
+            // decides between faces the two already call peers — it never
+            // outranks coverage or shape, so M152's rules hold on a host
+            // without a face of the project's language.
+            if best.is_none_or(|(best_score, best_rank, best_language, _)| {
+                (score, u8::MAX - rank, language) > (best_score, u8::MAX - best_rank, best_language)
             }) {
-                best = Some((score, rank, face));
+                best = Some((score, rank, language, face));
             }
         }
-        best.map(|(_, _, face)| face)
+        best.map(|(_, _, _, face)| face)
+    }
+
+    /// How well a face fits the project's language: a face whose names carry
+    /// the project's own variant beats one with no region marker, which beats
+    /// one that names another region's variant. With no project-language
+    /// signal every face is neutral — and no face names are read at all, so
+    /// the fallback keeps the plain fontdb order it has always used.
+    fn language_preference(&self, face: fontdb::ID) -> u8 {
+        if self.language_affinity == LanguageAffinity::Unspecified {
+            return 1;
+        }
+        match self.face_language_affinity(face) {
+            LanguageAffinity::Unspecified => 1,
+            variant if variant == self.language_affinity => 2,
+            _ => 0,
+        }
+    }
+
+    /// The region variant a face declares in its own family names, or
+    /// `Unspecified` when the names carry no region marker (or markers of two
+    /// regions, which no vendor spells as one face). The name is the only
+    /// per-face signal that separates the variants: the regional faces a
+    /// vendor ships cover the same characters (M156: every Noto CJK face
+    /// answers for the game's probe characters and their OS/2 code-page ranges
+    /// are identical) and differ only in the default glyph their cmap picks.
+    fn face_language_affinity(&self, face: fontdb::ID) -> LanguageAffinity {
+        let mut names = Vec::new();
+        self.with_font(face, |font| {
+            collect_face_names(font, &mut names, false);
+            Some(())
+        });
+        let mut languages = names
+            .iter()
+            .map(|name| name_language_affinity(name))
+            .filter(|language| *language != LanguageAffinity::Unspecified);
+        let Some(first) = languages.next() else {
+            return LanguageAffinity::Unspecified;
+        };
+        if languages.all(|language| language == first) {
+            first
+        } else {
+            LanguageAffinity::Unspecified
+        }
     }
 
     /// How many characters of the default probe a face carries.
@@ -1661,6 +1794,63 @@ impl FontSystem {
 /// gives; a face covering part of it still beats a Latin-only fallback, and a
 /// character outside even that draws the face's own default glyph.
 const DEFAULT_BEING_FONT_PROBE: [char; 4] = ['忆', 'あ', '漢', '。'];
+
+/// The region words a CJK family names itself with in Latin script ("Noto Sans
+/// CJK SC", "Source Han Sans JP", "Hiragino Sans GB") — the convention
+/// fontconfig's CJK alias files and the reference's own default faces follow.
+const JAPANESE_NAME_WORDS: [&str; 3] = ["jp", "jpn", "japan"];
+const SIMPLIFIED_CHINESE_NAME_WORDS: [&str; 6] = ["sc", "cn", "hans", "gb", "gbk", "gb2312"];
+
+/// How the same regions name themselves in their own script, for the faces
+/// whose Latin name carries no region word: `微软雅黑`/宋体/黑体 (Simplified
+/// Chinese) and `ＭＳ Ｐゴシック`/メイリオ/明朝 (Japanese) are the reference's own
+/// default faces and the ubiquitous system faces beside them.
+const JAPANESE_SCRIPT_WORDS: [&str; 4] = ["ゴシック", "明朝", "メイリオ", "ヒラギノ"];
+const SIMPLIFIED_CHINESE_SCRIPT_WORDS: [&str; 4] = ["雅黑", "黑体", "宋体", "等线"];
+
+/// The region variant a family name declares: the region word it carries
+/// (`Noto Sans CJK SC`, `Source Han Sans JP`) or the region's own script word
+/// (`微软雅黑`, `ＭＳ Ｐゴシック`). `Unspecified` when the name carries no marker,
+/// and also when it mixes markers of two regions — no vendor spells one face
+/// that way, so such a name stays neutral instead of guessing.
+fn name_language_affinity(name: &str) -> LanguageAffinity {
+    let name = name.to_lowercase();
+    let mut markers = Vec::new();
+    for word in name.split(|ch: char| !ch.is_alphanumeric()) {
+        markers.extend(region_word(word));
+    }
+    for word in JAPANESE_SCRIPT_WORDS {
+        if name.contains(word) {
+            markers.push(LanguageAffinity::Japanese);
+        }
+    }
+    for word in SIMPLIFIED_CHINESE_SCRIPT_WORDS {
+        if name.contains(word) {
+            markers.push(LanguageAffinity::SimplifiedChinese);
+        }
+    }
+
+    let mut markers = markers.into_iter();
+    let Some(first) = markers.next() else {
+        return LanguageAffinity::Unspecified;
+    };
+    if markers.all(|marker| marker == first) {
+        first
+    } else {
+        LanguageAffinity::Unspecified
+    }
+}
+
+/// The language a single name word declares, if it is a region word.
+fn region_word(word: &str) -> Option<LanguageAffinity> {
+    if JAPANESE_NAME_WORDS.contains(&word) {
+        Some(LanguageAffinity::Japanese)
+    } else if SIMPLIFIED_CHINESE_NAME_WORDS.contains(&word) {
+        Some(LanguageAffinity::SimplifiedChinese)
+    } else {
+        None
+    }
+}
 
 const MAX_FONT_ALIAS_DEPTH: usize = 8;
 
@@ -2394,6 +2584,31 @@ mod tests {
         )
     }
 
+    /// The JP counterpart of `sc_bold_test_font` with the *same* probe
+    /// coverage — the real regional variants cover the same characters (M156
+    /// measured Noto CJK's `「」` as byte-identical across the JP/KR/SC/TC/HK
+    /// faces) — so the only signal that can decide between the two loaded
+    /// faces is the project's language. Its advances are the JP face's 0.8 em.
+    fn jp_probe_test_font() -> Vec<u8> {
+        build_test_font(
+            &[
+                (1, 0x0409, "Source Han Sans JP"),
+                (1, 0x0411, "源ノ角ゴシック"),
+                (6, 0x0409, "SourceHanSansJP-Regular"),
+            ],
+            &[
+                ('忆', 800),
+                ('あ', 800),
+                ('い', 800),
+                ('♪', 800),
+                ('□', 800),
+                ('?', 800),
+                (' ', 300),
+            ],
+            Some((800, 400)),
+        )
+    }
+
     /// `sourcehansansjp-bold.otf` as the second game ships it: a renamed
     /// `Source Han Sans CN Medium` carrying the localized family name the
     /// table declares.
@@ -2867,5 +3082,168 @@ mod tests {
         // from the other loaded face.
         let latin = system.text_metrics(&spec("NunitoSans-SB", 48.0), "あ");
         assert_eq!(latin.width, 24.0);
+    }
+
+    /// Whether the face's own family names carry `region` as a word — the
+    /// tests' discriminating signal for a region variant, kept independent of
+    /// the production face scoring so a test cannot pass by begging the
+    /// question.
+    fn face_region_word(system: &FontSystem, face: fontdb::ID, region: &str) -> bool {
+        system.db.face(face).is_some_and(|info| {
+            info.families.iter().any(|(name, _)| {
+                name.to_lowercase()
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .any(|word| word == region)
+            })
+        })
+    }
+
+    /// Whether any face the host loaded carries `region`; the live-host tests
+    /// say so and skip their region assertions on a host without one.
+    fn host_has_region_face(system: &FontSystem, region: &str) -> bool {
+        system
+            .db
+            .faces()
+            .any(|face| face_region_word(system, face.id, region))
+    }
+
+    /// The name table is where a face declares its region variant, in the
+    /// region word (`Noto Sans CJK SC`) or in the language's own script
+    /// (`微软雅黑`, `ＭＳ Ｐゴシック`); a name with no marker — or with markers of
+    /// two regions — stays neutral.
+    #[test]
+    fn family_names_declare_their_region_variant() {
+        assert_eq!(
+            name_language_affinity("Noto Sans CJK SC"),
+            LanguageAffinity::SimplifiedChinese
+        );
+        assert_eq!(
+            name_language_affinity("Source Han Sans CN Medium"),
+            LanguageAffinity::SimplifiedChinese
+        );
+        assert_eq!(
+            name_language_affinity("微软雅黑"),
+            LanguageAffinity::SimplifiedChinese
+        );
+        assert_eq!(
+            name_language_affinity("黑体"),
+            LanguageAffinity::SimplifiedChinese
+        );
+        assert_eq!(
+            name_language_affinity("Noto Sans CJK JP"),
+            LanguageAffinity::Japanese
+        );
+        assert_eq!(
+            name_language_affinity("源ノ角ゴシック JP Bold"),
+            LanguageAffinity::Japanese
+        );
+        assert_eq!(
+            name_language_affinity("ＭＳ Ｐゴシック"),
+            LanguageAffinity::Japanese
+        );
+        // No marker, another region's marker, or two markers at once: the
+        // face is neutral, never guessed at.
+        assert_eq!(
+            name_language_affinity("Noto Sans"),
+            LanguageAffinity::Unspecified
+        );
+        assert_eq!(
+            name_language_affinity("Noto Sans CJK TC"),
+            LanguageAffinity::Unspecified
+        );
+        assert_eq!(
+            name_language_affinity("Source Han Sans JP SC"),
+            LanguageAffinity::Unspecified
+        );
+    }
+
+    /// The language decides between two loaded faces of the same family and
+    /// probe coverage: the same unresolvable spec measures through the SC face
+    /// for a GBK project and the JP face for a Shift-JIS one, and the unmarked
+    /// order keeps whatever it picked before. 忆 advances 1000 units in the SC
+    /// fixture and 800 in the JP one, so the measured width names the face
+    /// that served the spec.
+    #[test]
+    fn the_project_language_selects_between_equal_coverage_variants() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansansjp-regular.otf", jp_probe_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+        let unresolved = spec("华文细黑", 48.0);
+
+        system.set_language_affinity(LanguageAffinity::SimplifiedChinese);
+        assert_eq!(
+            system.text_metrics(&unresolved, "忆").width,
+            48.0,
+            "a GBK project must measure through the SC variant"
+        );
+
+        system.set_language_affinity(LanguageAffinity::Japanese);
+        assert_eq!(
+            system.text_metrics(&unresolved, "忆").width,
+            38.4,
+            "a Shift-JIS project must measure through the JP variant"
+        );
+
+        system.set_language_affinity(LanguageAffinity::Unspecified);
+        assert_eq!(
+            system.text_metrics(&unresolved, "忆").width,
+            38.4,
+            "without a language signal the first loaded face keeps the default"
+        );
+    }
+
+    /// The live case on a host with real regional faces (this one has Noto CJK
+    /// JP/KR/SC/TC/HK): 纸上的魔法使's `华文细黑` resolves to nothing, and its
+    /// GBK text must fall back to a face whose names carry the
+    /// Simplified-Chinese marker rather than the JP face the plain fontdb
+    /// order picks first.
+    #[test]
+    fn a_chinese_project_falls_back_to_a_simplified_chinese_face() {
+        let mut system = FontSystem::new();
+        if !host_has_region_face(&system, "sc") {
+            eprintln!("no Simplified-Chinese-labelled face installed; nothing to check");
+            return;
+        }
+        let unresolved = spec("华文细黑", 24.0);
+
+        system.set_language_affinity(LanguageAffinity::Unspecified);
+        let unmarked = system.select_primary_face(&unresolved);
+        system.set_language_affinity(LanguageAffinity::SimplifiedChinese);
+        let chosen = system.select_primary_face(&unresolved);
+
+        let chosen = chosen.expect("an unresolvable face must still have a default");
+        assert!(
+            face_region_word(&system, chosen, "sc"),
+            "a GBK project must fall back to the host's Simplified-Chinese face"
+        );
+        if unmarked.is_some_and(|face| face_region_word(&system, face, "jp")) {
+            assert_ne!(
+                Some(chosen),
+                unmarked,
+                "the JP face the plain order answers with must yield to the SC face"
+            );
+        }
+    }
+
+    /// A Japanese project keeps the face the unmarked order picks — the JP
+    /// variant on this host — so GINKA and 少女世界 render as they always did.
+    #[test]
+    fn a_japanese_project_keeps_the_default_face() {
+        let mut system = FontSystem::new();
+        let unresolved = spec("華文細黒", 24.0);
+
+        system.set_language_affinity(LanguageAffinity::Unspecified);
+        let unmarked = system.select_primary_face(&unresolved);
+        system.set_language_affinity(LanguageAffinity::Japanese);
+        let chosen = system.select_primary_face(&unresolved);
+
+        assert_eq!(
+            chosen, unmarked,
+            "a Japanese project must keep the default the unmarked order picks"
+        );
     }
 }
