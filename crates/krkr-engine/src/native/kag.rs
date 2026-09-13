@@ -207,6 +207,11 @@ fn register_system_hooks(host: &mut KrkrHost, text: &str) {
     }
 }
 
+/// One `name=value` attribute of a `custom.ks` hook declaration. Values follow
+/// the reference tag parser (`KAGParser.cpp:2126-2152`): a quoted value runs to
+/// its matching quote, an unquoted one ends at the first whitespace or `]`.
+/// The engine-side twin (`engine::hook_attr`) reads the same spellings for the
+/// engine-driven scan.
 fn kag_decl_attr(command: &str, name: &str) -> Option<String> {
     let marker = format!("{name}=");
     let start = command.find(&marker)? + marker.len();
@@ -217,7 +222,9 @@ fn kag_decl_attr(command: &str, name: &str) -> Option<String> {
         return Some(body[..end].to_string());
     }
     Some(
-        rest.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ']' || ch == ';')
+        rest.split(|ch: char| ch.is_whitespace() || ch == ']')
+            .next()
+            .unwrap_or_default()
             .to_string(),
     )
 }
@@ -1343,5 +1350,53 @@ fn kag_tjs_error(error: TjsError) -> KagError {
         KagError::ResourcePending { storage }
     } else {
         kag_host_error(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register_system_hooks;
+    use crate::{EngineConfig, KrkrEngine};
+
+    /// The native scenario-load scan must read the same declaration spellings
+    /// as the engine-side `hook_attr` (`KAGParser.cpp:2126-2152`): a quoted
+    /// value runs to its matching quote, an unquoted one ends at the first
+    /// whitespace or `]`. Before the fix an unquoted declaration landed in the
+    /// hook table under the whole remainder of the line, so `[syshook]` never
+    /// found it.
+    #[test]
+    fn register_system_hooks_takes_unquoted_declarations_like_quoted_ones() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        register_system_hooks(
+            engine.host_mut(),
+            "\t[addSysScript name=\"game\" storage=\"start\"]\n\
+             \t[addSysHook name=\"probe\" storage=\"quoted.ks\" target=\"*quoted\"]\n\
+             \t[addSysHook name=probe storage=unquoted.ks target=*unquoted]\n\
+             \t[addSysHook name=probe.call call storage=hook.ks target=*probe]\n",
+        );
+
+        let game = engine
+            .host()
+            .system_hook("game")
+            .expect("quoted script hook");
+        assert_eq!(game.storage.as_deref(), Some("start"));
+        assert_eq!(game.target, None);
+        assert!(!game.call);
+
+        // The unquoted line is the later declaration of the same name, so the
+        // table ends on its values: a key built from the whole remainder would
+        // have left the quoted declaration in place.
+        let probe = engine.host().system_hook("probe").expect("probe hook");
+        assert_eq!(probe.storage.as_deref(), Some("unquoted.ks"));
+        assert_eq!(probe.target.as_deref(), Some("*unquoted"));
+        assert!(!probe.call);
+
+        let unquoted = engine
+            .host()
+            .system_hook("probe.call")
+            .expect("unquoted hook");
+        assert_eq!(unquoted.storage.as_deref(), Some("hook.ks"));
+        assert_eq!(unquoted.target.as_deref(), Some("*probe"));
+        assert!(unquoted.call);
     }
 }
