@@ -13,6 +13,20 @@ krkr-emote.workspace = true
 # The `lzfs` media decodes LZ4 frames with `lz4_flex`'s frame API (the same
 # crate `krkr-emote` already pulls into the workspace).
 lz4_flex = "0.11"
+# `sqlite3.dll` talks to the SQLite C API directly: the reference plugin wraps
+# the bundled amalgamation and keeps prepared statements alive across script
+# calls, which needs the raw `sqlite3_stmt` lifecycle. `bundled` compiles the
+# official amalgamation (3.x, the reference's version line) with the host C
+# compiler, exactly like the reference's `sqlite3.c`.
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+# `httprequest.dll` needs an HTTP(S) client. `ureq` is blocking and
+# pure-Rust (rustls) with no async runtime, matching this engine's dependency
+# style; the reference is equally synchronous inside its worker thread.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# `httprequest.dll`'s request/response text conversion and its Basic
+# authorization header need an IANA-name charset lookup and base64.
+encoding_rs.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 krkr-assets.workspace = true
