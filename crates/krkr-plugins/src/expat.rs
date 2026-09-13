@@ -31,8 +31,13 @@
 //! * Read-only properties (getters only, `TJS_DENY_NATIVE_PROP_SETTER`
 //!   `:541-618`): `errorCode` (`XML_GetErrorCode`), `errorString`
 //!   (`XML_ErrorString`), `currentByteIndex`, `currentLineNumber`,
-//!   `currentColumnNumber`, `currentByteCount` (`:472-491`). A non-object
-//!   handler target throws the reference's variant-conversion error.
+//!   `currentColumnNumber`, `currentByteCount` (`:472-491`). Every getter
+//!   opens with `TJS_GET_NATIVE_INSTANCE` like the methods (`:545`-`:610`),
+//!   so a read on a receiver that never went through the class's
+//!   initialisation — the class object, the global object, a foreign
+//!   receiver — is the same `Invalid object context` the calls report, not
+//!   an answer. A non-object handler target throws the reference's
+//!   variant-conversion error.
 //! * Handler members (`:147-292`, registered only when the target has such a
 //!   member, `:359-371`): `startElement(name, attrs)` (attrs is a TJS
 //!   `Dictionary` built in document order, `:158-163`), `endElement(name)`,
@@ -250,10 +255,15 @@ fn install_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
             name,
             NativePropertyAccess::ReadOnly,
             move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
-                let Some(object) =
-                    this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
-                else {
-                    return Ok(Variant::Void);
+                // The reference's getters open with the same
+                // `TJS_GET_NATIVE_INSTANCE` as its methods (`Main.cpp:545`),
+                // so a receiver with no parser instance — the class object,
+                // the global object a class-object read falls back to, a
+                // foreign receiver, or a NULL `objthis`
+                // (`tjsNative.cpp:185-192`) — raises that error instead of
+                // answering from state the receiver does not have.
+                let Some(object) = plugin_this(runtime, this_obj) else {
+                    return Err(TjsError::native_class_crash());
                 };
                 if key == ERROR_STRING {
                     return Ok(error_string(state_int(runtime, object, ERROR_CODE)));
@@ -2055,6 +2065,83 @@ mod tests {
             )
             .expect("instance");
         assert_eq!(value, Variant::String("1:0".to_string()));
+    }
+
+    /// A *read* of one of the six read-only properties on a receiver with no
+    /// parser instance is the same `TJS_E_NATIVECLASSCRASH` ("Invalid object
+    /// context") a method call raises, because the reference's getters open
+    /// with the same `TJS_GET_NATIVE_INSTANCE` the methods do
+    /// (`Main.cpp:545`, `:558`, `:571`, `:584`, `:597`, `:610`, against
+    /// `:517`/`:530` — the krkr2 trunk `plugins/win32/expat/Main.cpp`; macro
+    /// at `tjsNative.h:312-320`, krkrz, error `-1008` with the text at
+    /// `tjsError.h:363`, krkr2 trunk `src/core/tjs2/`).
+    ///
+    /// Which object the getter receives follows the same rules as the call
+    /// shape: a class object's own member values are stored without an
+    /// ObjThis (`RegisterNCM`'s `val = dsp`, `tjsNative.cpp:280-286`, krkrz),
+    /// while the copies a created instance receives are bound through
+    /// `val.ChangeClosureObjThis(Dest)` (`:353-354`), so
+    /// `TJSDefaultPropGet`'s `TJS_SELECT_OBJTHIS` (`tjsObject.cpp:1358-1367`;
+    /// macro `tjsObject.h:81-82`) falls back to the receiver the VM derived
+    /// from `ra[-1]` (`tjsInterCodeExec.cpp:1617-1619`) — the global object
+    /// at top level, a foreign instance inside another class's method — and
+    /// hands it to the getter through `tTJSNativeClassProperty::PropGet`
+    /// (`tjsNative.cpp:185-192`), which rejects a NULL `objthis` itself.  The
+    /// instance is the normal path: the getter reads the registered
+    /// `NI_XMLParser` state, which this port keeps in the hidden state member.
+    #[test]
+    fn property_reads_beyond_the_instance_throw_the_reference_error() {
+        let mut engine = engine();
+        // The class object at top level: `this` at the read is the global
+        // object, so no getter may answer from it.
+        for name in [
+            "errorCode",
+            "errorString",
+            "currentByteIndex",
+            "currentLineNumber",
+            "currentColumnNumber",
+            "currentByteCount",
+        ] {
+            let error = engine
+                .execute_expression("inline.tjs", &format!("XMLParser.{name}"))
+                .expect_err("class object");
+            assert_eq!(error.kind, TjsErrorKind::NativeClassCrash, "{name}");
+            assert_eq!(error.message, "Invalid object context", "{name}");
+        }
+
+        // The KAGEX-style wrapper shape: a method of another class reads
+        // through the class object, and the caller's instance — not a parser
+        // — is the receiver the reference's getter check rejects.
+        engine
+            .execute_script(
+                "harness.tjs",
+                r#"class Reader {
+                    function Reader() { }
+                    function code() { return XMLParser.errorCode; }
+                }"#,
+            )
+            .expect("harness");
+        let error = engine
+            .execute_expression("inline.tjs", "(new Reader()).code()")
+            .expect_err("foreign receiver");
+        assert_eq!(error.kind, TjsErrorKind::NativeClassCrash);
+        assert_eq!(error.message, "Invalid object context");
+
+        // An instance is the receiver the getters act on, and its answers
+        // are the parser state's, unchanged.
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() { var parser = new XMLParser(); parser.parse(\"<a></b>\"); return \
+                 parser.errorCode + \":\" + parser.errorString + \":\" + \
+                 parser.currentByteIndex + \":\" + parser.currentLineNumber + \":\" + \
+                 parser.currentColumnNumber + \":\" + parser.currentByteCount; })()",
+            )
+            .expect("instance");
+        assert_eq!(
+            value,
+            Variant::String("7:mismatched tag:5:1:5:0".to_string())
+        );
     }
 
     /// The fresh state of a parser that never parsed: `currentByteIndex` is
