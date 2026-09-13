@@ -6560,6 +6560,77 @@ fn layer_color_rect(
     Ok(Variant::Void)
 }
 
+/// `TVPSpecifyLayerOrBitmap` (`string_table_en.rc:121`, "Specify Layer or
+/// Bitmap class object"): the official TJS blit wrappers resolve their source
+/// argument themselves and report this when it holds no usable bitmap
+/// (`LayerIntf.cpp:7150` `copyRect`, `:7234` `operateRect`, `:7289`
+/// `stretchCopy`, `:7343` `operateStretch`, `:7410` `affineCopy`, `:7484`
+/// `operateAffine`).
+fn specify_layer_or_bitmap() -> TjsError {
+    TjsError::runtime("Specify Layer or Bitmap class object")
+}
+
+/// `TVPSourceLayerHasNoImage` (`string_table_en.rc:133`, "Source layer has no
+/// image"): the blit methods report a NULL source bitmap
+/// (`LayerIntf.cpp:4160` `CopyRect`, `:4377` `OperateRect`, `:4246`/`:4418`
+/// `StretchCopy`/`OperateStretch`, `:4288`/`:4454` the affine pair). A script
+/// reaches it only through `copyRect`: its wrapper alone accepts a
+/// province-only source (`:7136-7137`), which the copy then cannot use on a
+/// main-image face. The other five wrappers reject that source themselves
+/// (`:7234`, `:7289`, `:7343`, `:7410`, `:7484`).
+fn source_layer_has_no_image() -> TjsError {
+    TjsError::runtime("Source layer has no image")
+}
+
+/// The source resolution the official TJS blit wrappers perform *before* the
+/// blit method runs: the argument is read as a Layer's main image
+/// (`LayerIntf.cpp:7136` `copyRect`, `:7222` `operateRect`, `:7277`
+/// `stretchCopy`, `:7331` `operateStretch`, `:7398` `affineCopy`, `:7472`
+/// `operateAffine`), `copyRect`'s additionally accepts a Layer that only has
+/// its province plane (`:7137`), and then the `tTJSNC_Bitmap` interface is
+/// tried (`:7140-7148`). `None` is everything that resolves to nothing -- a
+/// void, a non-object, another native class, or a Layer with neither plane --
+/// which the wrapper turns into `TVPSpecifyLayerOrBitmap` (`:7150`); that
+/// happens before the blit method runs, so the error precedes every check the
+/// method itself makes.
+fn blit_source_object(
+    runtime: &mut Runtime<KrkrHost>,
+    source: Option<&Variant>,
+    allow_province: bool,
+) -> Option<ObjectHandle> {
+    let handle = source.and_then(variant_object)?;
+    // `render_layer_target` only wraps the host's infallible layer lookup
+    // (`register_kag_layer_slots_from_tjs` plus `Host::layer_render_target`),
+    // so an absent target means a non-Layer object. The reference falls back
+    // to `tTJSNC_Bitmap` there; Kirakira's `Bitmap` class is a spec-only
+    // placeholder with no bitmap behind it
+    // (`install_bitmap_native_properties`), so only a Layer resolves and a
+    // Bitmap object lands on the same error.
+    let target = render_layer_target(runtime, handle).ok().flatten()?;
+    let snapshot = render_layer_snapshot(runtime, &target);
+    let has_image = snapshot.as_ref().is_some_and(|layer| layer.image.is_some());
+    let has_province = snapshot
+        .as_ref()
+        .is_some_and(|layer| layer.province.is_some());
+    (has_image || (allow_province && has_province)).then_some(handle)
+}
+
+/// `piledCopy`'s wrapper takes a Layer and nothing else
+/// (`LayerIntf.cpp:7095-7108`): a void, a non-object or any other native class
+/// is not a Layer here, and the wrapper reports `TVPSpecifyLayer` ("Specify
+/// Layer class object", `string_table_en.rc:120`) before the method's bitmap
+/// checks (`:4111-4112`) run.
+fn piled_copy_source_object(
+    runtime: &mut Runtime<KrkrHost>,
+    source: Option<&Variant>,
+) -> Option<ObjectHandle> {
+    let handle = source.and_then(variant_object)?;
+    render_layer_target(runtime, handle)
+        .ok()
+        .flatten()
+        .map(|_| handle)
+}
+
 fn layer_copy_rect(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -6587,8 +6658,10 @@ fn layer_piled_copy(
     // (`LayerIntf.cpp:4102-4142`), so a `dfProvince` layer composes normally.
     let dx = optional_integer(&args, 0)?.unwrap_or(0);
     let dy = optional_integer(&args, 1)?.unwrap_or(0);
-    let Some(source_object) = args.get(2).and_then(variant_object) else {
-        return Ok(Variant::Void);
+    // The source must be a Layer: its wrapper reports `TVPSpecifyLayer`
+    // before this method's bitmap checks (`LayerIntf.cpp:7095-7108`).
+    let Some(source_object) = piled_copy_source_object(runtime, args.get(2)) else {
+        return Err(TjsError::runtime("Specify Layer class object"));
     };
     let sx = optional_integer(&args, 3)?.unwrap_or(0);
     let sy = optional_integer(&args, 4)?.unwrap_or(0);
@@ -6605,12 +6678,12 @@ fn layer_piled_copy(
     require_drawable_layer_image(runtime, &dest_target)?;
     complete_layer_subtree_before_draw(runtime, source_object, &mut BTreeSet::new())?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
-        return Ok(Variant::Void);
+        return Err(TjsError::runtime("Specify Layer class object"));
     };
     // `if(!src->MainImage) TVPThrowExceptionMessage(TVPSourceLayerHasNoImage);`
     // (`LayerIntf.cpp:4112`).
     if !render_layer_snapshot(runtime, &source_target).is_some_and(|layer| layer.image.is_some()) {
-        return Err(TjsError::runtime("Source layer has no image"));
+        return Err(source_layer_has_no_image());
     }
     if width <= 0 || height <= 0 {
         return Ok(Variant::Void);
@@ -6766,6 +6839,12 @@ fn stretch_copy_impl(
     operate: bool,
 ) -> Result<Variant> {
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
+    // The wrapper resolves the source first and reports `TVPSpecifyLayerOrBitmap`
+    // when nothing resolves, so that precedes even the method's face switch
+    // (`LayerIntf.cpp:7269-7289` `stretchCopy`, `:7322-7343` `operateStretch`).
+    let Some(source_object) = blit_source_object(runtime, args.get(4), false) else {
+        return Err(specify_layer_or_bitmap());
+    };
     // `StretchCopy`'s `switch(DrawFace)` throws on every face it does not
     // handle (`LayerIntf.cpp:4260-4262`). `OperateStretch` has no face switch:
     // it throws only when `GetBltMethodFromOperationModeAndDrawFace` fails,
@@ -6778,9 +6857,6 @@ fn stretch_copy_impl(
     let dy = optional_integer(&args, 1)?.unwrap_or(0);
     let dest_width = optional_integer(&args, 2)?.unwrap_or(0);
     let dest_height = optional_integer(&args, 3)?.unwrap_or(0);
-    let Some(source_object) = args.get(4).and_then(variant_object) else {
-        return Ok(Variant::Void);
-    };
     let sx = optional_integer(&args, 5)?.unwrap_or(0);
     let sy = optional_integer(&args, 6)?.unwrap_or(0);
     let source_width = optional_integer(&args, 7)?.unwrap_or(0);
@@ -6831,12 +6907,12 @@ fn stretch_copy_impl(
     }
     complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
-        return Ok(Variant::Void);
+        return Err(source_layer_has_no_image());
     };
     let Some(source_image) =
         render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
     else {
-        return Ok(Variant::Void);
+        return Err(source_layer_has_no_image());
     };
     let source_pixels = source_image.upload.rgba.as_ref().to_vec();
     let source_texture_width = source_image.upload.width;
@@ -6935,6 +7011,12 @@ fn affine_copy_impl(
         return Err(TjsError::runtime("Layer.affineCopy requires 12 arguments"));
     }
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
+    // The wrapper resolves the source first and reports `TVPSpecifyLayerOrBitmap`
+    // when nothing resolves, so that precedes even the method's face switch
+    // (`LayerIntf.cpp:7390-7410` `affineCopy`, `:7463-7484` `operateAffine`).
+    let Some(source_object) = blit_source_object(runtime, args.first(), false) else {
+        return Err(specify_layer_or_bitmap());
+    };
     // `AffineCopy`'s `switch(DrawFace)` throws on every face it does not handle
     // (`LayerIntf.cpp:4303-4305`); `OperateAffine` has no face switch and
     // throws only when the blt lookup fails (`:4447-4452`), so the universal
@@ -6942,11 +7024,6 @@ fn affine_copy_impl(
     if is_province_face(runtime, this) && !operate {
         return Err(not_drawable_face_type());
     }
-    let Some(source_object) = args.first().and_then(variant_object) else {
-        return Err(TjsError::runtime(
-            "Layer.affineCopy requires a source Layer",
-        ));
-    };
     let sx = args[1].to_integer()?;
     let sy = args[2].to_integer()?;
     let source_width = args[3].to_integer()?;
@@ -7016,12 +7093,12 @@ fn affine_copy_impl(
     require_drawable_layer_image(runtime, &dest_target)?;
     complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
-        return Ok(Variant::Void);
+        return Err(source_layer_has_no_image());
     };
     let Some(source_image) =
         render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
     else {
-        return Ok(Variant::Void);
+        return Err(source_layer_has_no_image());
     };
     let source_pixels = source_image.upload.rgba.as_ref().to_vec();
     let texture_width = source_image.upload.width;
@@ -7265,8 +7342,14 @@ fn copy_rect_impl(
     let (this, dest_target) = this_render_layer_target(runtime, this_obj)?;
     let dx = optional_integer(&args, 0)?.unwrap_or(0);
     let dy = optional_integer(&args, 1)?.unwrap_or(0);
-    let Some(source_object) = args.get(2).and_then(variant_object) else {
-        return Ok(Variant::Void);
+    // Both wrappers resolve the source before the copy runs
+    // (`LayerIntf.cpp:7127-7150` `copyRect`, `:7213-7234` `operateRect`);
+    // `copyRect`'s also accepts a Layer that only has its province plane,
+    // which the copy then uses on a `dfProvince` destination (`:4179-4195`).
+    let Some(source_object) =
+        blit_source_object(runtime, args.get(2), matches!(kind, LayerCopyKind::Copy))
+    else {
+        return Err(specify_layer_or_bitmap());
     };
     let sx = optional_integer(&args, 3)?.unwrap_or(0);
     let sy = optional_integer(&args, 4)?.unwrap_or(0);
@@ -7280,7 +7363,7 @@ fn copy_rect_impl(
     };
     complete_layer_before_draw(runtime, source_object)?;
     let Some(source_target) = render_layer_target(runtime, source_object)? else {
-        return Ok(Variant::Void);
+        return Err(source_layer_has_no_image());
     };
 
     // `CopyRect`'s dfProvince branch copies the source's province plane (or
@@ -7330,10 +7413,13 @@ fn copy_rect_impl(
     // (`LayerIntf.cpp:4159`/`:4376`); the face dispatch above runs first.
     require_drawable_layer_image(runtime, &dest_target)?;
 
+    // `copyRect`'s wrapper accepted a province-only source; on a face other
+    // than `dfProvince` the method itself still has no source bitmap
+    // (`LayerIntf.cpp:4160`).
     let Some(source_image) =
         render_layer_snapshot(runtime, &source_target).and_then(|layer| layer.image)
     else {
-        return Ok(Variant::Void);
+        return Err(source_layer_has_no_image());
     };
     let source_pixels = source_image.upload.rgba.as_ref().to_vec();
     let source_width = source_image.upload.width;
@@ -12806,6 +12892,293 @@ mod tests {
                 .expect_err("a freed destination image is not drawable");
             assert_eq!(error.message, "Not drawable layer type", "{call}");
         }
+    }
+
+    /// The official TJS blit wrappers resolve their source argument before the
+    /// blit runs and report `TVPSpecifyLayerOrBitmap` ("Specify Layer or
+    /// Bitmap class object", `string_table_en.rc:121`) when it yields no
+    /// bitmap: `LayerIntf.cpp:7150` `copyRect`, `:7234` `operateRect`, `:7289`
+    /// `stretchCopy`, `:7343` `operateStretch`, `:7410` `affineCopy`,
+    /// `:7484` `operateAffine`. A Layer whose main image was freed and that
+    /// carries no province plane resolves to nothing, so every one of the six
+    /// reports the error where the port used to return `Ok(Void)` silently.
+    /// `copyRect` alone accepts a province-only source in its wrapper
+    /// (`:7136-7137`), which this test does not give it.
+    #[test]
+    fn layer_blits_reject_a_source_without_an_image() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                source.freeImage();
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "dest.copyRect(0, 0, source, 0, 0, 2, 2);",
+            "dest.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);",
+            "dest.stretchCopy(0, 0, 2, 2, source, 0, 0, 2, 2, stNearest);",
+            "dest.operateStretch(0, 0, 2, 2, source, 0, 0, 2, 2, omAlpha);",
+            "dest.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("an image-less source has no bitmap to blit");
+            assert_eq!(
+                error.message, "Specify Layer or Bitmap class object",
+                "{call}"
+            );
+        }
+        // `piledCopy`'s wrapper checks the *class* first and its method the
+        // destination bitmap before the source one (`LayerIntf.cpp:7106`,
+        // `:4111-4112`), so the image-less source still reports the source
+        // error M26 pinned.
+        let error = engine
+            .execute_script("inline.tjs", "dest.piledCopy(0, 0, source, 0, 0, 2, 2);")
+            .expect_err("an image-less source cannot be piled");
+        assert_eq!(error.message, "Source layer has no image");
+    }
+
+    /// The province-only distinction: `copyRect`'s wrapper resolves the
+    /// source's main image *or* its province plane (`LayerIntf.cpp:7136-7137`)
+    /// and throws only when both are NULL (`:7150`), while the other five --
+    /// `operateRect` included (`:7213-7222`, throw `:7234`) -- look at the
+    /// main image alone. So a Layer with a province plane but no main image is
+    /// accepted by `copyRect`: on a `dfProvince` destination it copies that
+    /// plane (`:4179-4195`), and on a main-image face the method itself has no
+    /// source bitmap and reports `TVPSourceLayerHasNoImage` (`:4160`). The
+    /// other five report `TVPSpecifyLayerOrBitmap` before their method runs.
+    /// The plane is built with `setProvincePixel`, which allocates it when
+    /// absent (`AllocateProvinceImage`, `:2647-2663`), after `freeImage` has
+    /// cleared both planes.
+    #[test]
+    fn layer_copy_rect_accepts_a_province_only_source() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 2);
+                source.freeImage();
+                source.setProvincePixel(0, 0, 0x80);
+
+                var dest = new Layer();
+                dest.setImageSize(2, 2);
+
+                var provinceDest = new Layer();
+                provinceDest.setImageSize(2, 2);
+                provinceDest.face = 3; // dfProvince
+                provinceDest.copyRect(0, 0, source, 0, 0, 2, 2);
+                return provinceDest.getProvincePixel(0, 0);
+                "#,
+            )
+            .expect("a province-only source is accepted by copyRect");
+        assert_eq!(value, krkr_tjs2::runtime::Variant::Integer(0x80));
+
+        let error = engine
+            .execute_script("inline.tjs", "dest.copyRect(0, 0, source, 0, 0, 2, 2);")
+            .expect_err("a main-image face has no source bitmap");
+        assert_eq!(error.message, "Source layer has no image");
+        for call in [
+            "dest.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);",
+            "dest.stretchCopy(0, 0, 2, 2, source, 0, 0, 2, 2, stNearest);",
+            "dest.operateStretch(0, 0, 2, 2, source, 0, 0, 2, 2, omAlpha);",
+            "dest.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("these wrappers never look at the province plane");
+            assert_eq!(
+                error.message, "Specify Layer or Bitmap class object",
+                "{call}"
+            );
+        }
+    }
+
+    /// A source argument that is not a Layer at all: `copyRect` and the other
+    /// five wrappers report `TVPSpecifyLayerOrBitmap` for a void argument
+    /// (`clo.Object` is null, `LayerIntf.cpp:7127-7150`) and for any other
+    /// native class. A `Bitmap` object lands here too: the reference's
+    /// `tTJSNC_Bitmap` fallback (`:7140-7148`) has nothing to resolve in this
+    /// engine -- `Bitmap` is a spec-only placeholder with no bitmap payload
+    /// (`install_bitmap_native_properties`) -- so it reports the same error
+    /// rather than silently dropping the blit. Accepting a Bitmap source is a
+    /// documented deviation, owned by the open `20260912-layer-leftovers`
+    /// finding (`...bitmap-arguments-unsupported-and-missing-source`), not a
+    /// behaviour this test claims the reference has. `piledCopy` requires a
+    /// Layer outright and reports `TVPSpecifyLayer` ("Specify Layer class
+    /// object", `string_table_en.rc:120`; `:7095-7108`).
+    #[test]
+    fn layer_blits_reject_a_source_that_is_not_a_layer() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                "global.dest = new Layer(); dest.setImageSize(4, 4);",
+            )
+            .expect("script");
+        for call in [
+            "dest.copyRect(0, 0, void, 0, 0, 2, 2);",
+            "dest.operateRect(0, 0, void, 0, 0, 2, 2, omAlpha);",
+            "dest.stretchCopy(0, 0, 2, 2, void, 0, 0, 2, 2, stNearest);",
+            "dest.operateStretch(0, 0, 2, 2, void, 0, 0, 2, 2, omAlpha);",
+            "dest.affineCopy(void, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(void, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
+            "dest.copyRect(0, 0, new Window(), 0, 0, 2, 2);",
+            "dest.copyRect(0, 0, new Bitmap(), 0, 0, 2, 2);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("a non-Layer source cannot resolve to a bitmap");
+            assert_eq!(
+                error.message, "Specify Layer or Bitmap class object",
+                "{call}"
+            );
+        }
+        for call in [
+            "dest.piledCopy(0, 0, void, 0, 0, 2, 2);",
+            "dest.piledCopy(0, 0, new Bitmap(), 0, 0, 2, 2);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("piledCopy requires a Layer source");
+            assert_eq!(error.message, "Specify Layer class object", "{call}");
+        }
+    }
+
+    /// The wrapper guard runs before every check the blit method makes, so a
+    /// call whose source *and* destination have no image reports the source
+    /// error: the source resolution (and its throw) happens in the TJS wrapper
+    /// (`LayerIntf.cpp:7289` `stretchCopy`), while `Not drawable layer type` is
+    /// raised inside the method (`:4245`) the wrapper only calls once a source
+    /// resolved. `piledCopy` inverts the pair -- its wrapper only checks that
+    /// the source is a Layer, so its method's destination check (`:4111`)
+    /// reports first, as M182 pinned.
+    #[test]
+    fn layer_blits_reject_the_source_before_the_destination() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                source.freeImage();
+                global.dest = new Layer();
+                dest.setImageSize(2, 2);
+                dest.freeImage();
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "dest.copyRect(0, 0, source, 0, 0, 2, 2);",
+            "dest.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);",
+            "dest.stretchCopy(0, 0, 2, 2, source, 0, 0, 2, 2, stNearest);",
+            "dest.operateStretch(0, 0, 2, 2, source, 0, 0, 2, 2, omAlpha);",
+            "dest.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("neither layer has a bitmap");
+            assert_eq!(
+                error.message, "Specify Layer or Bitmap class object",
+                "{call}"
+            );
+        }
+        let error = engine
+            .execute_script("inline.tjs", "dest.piledCopy(0, 0, source, 0, 0, 2, 2);")
+            .expect_err("neither layer has a bitmap");
+        assert_eq!(error.message, "Not drawable layer type");
+    }
+
+    /// The guard leaves a resolvable source alone: all six members still copy
+    /// and resample the source's pixels exactly as before it was added. Every
+    /// destination starts blue, the 2x2 source is red, and only the blitted
+    /// rectangles turn red (`stretchCopy` scales 2x2 to 4x4).
+    #[test]
+    fn layer_blits_with_a_valid_source_still_copy() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 2);
+                source.fillRect(0, 0, 2, 2, 0xffff0000);
+
+                var copied = new Layer();
+                copied.setImageSize(4, 4);
+                copied.fillRect(0, 0, 4, 4, 0xff0000ff);
+                copied.copyRect(0, 0, source, 0, 0, 2, 2);
+
+                var operated = new Layer();
+                operated.setImageSize(4, 4);
+                operated.fillRect(0, 0, 4, 4, 0xff0000ff);
+                operated.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);
+
+                var stretched = new Layer();
+                stretched.setImageSize(4, 4);
+                stretched.fillRect(0, 0, 4, 4, 0xff0000ff);
+                stretched.stretchCopy(0, 0, 4, 4, source, 0, 0, 2, 2, stNearest);
+
+                var operatedStretch = new Layer();
+                operatedStretch.setImageSize(4, 4);
+                operatedStretch.fillRect(0, 0, 4, 4, 0xff0000ff);
+                operatedStretch.operateStretch(0, 0, 4, 4, source, 0, 0, 2, 2, omAlpha);
+
+                var affined = new Layer();
+                affined.setImageSize(4, 4);
+                affined.fillRect(0, 0, 4, 4, 0xff0000ff);
+                affined.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 4, 0, 0, 4);
+
+                var operatedAffine = new Layer();
+                operatedAffine.setImageSize(4, 4);
+                operatedAffine.fillRect(0, 0, 4, 4, 0xff0000ff);
+                operatedAffine.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 4, 0, 0, 4, omAlpha);
+
+                return copied.getMainPixel(0, 0) + ":" + copied.getMaskPixel(0, 0) + ":" +
+                    operated.getMainPixel(0, 0) + ":" +
+                    stretched.getMainPixel(0, 0) + ":" + stretched.getMainPixel(3, 3) + ":" +
+                    operatedStretch.getMainPixel(0, 0) + ":" +
+                    affined.getMainPixel(0, 0) + ":" +
+                    operatedAffine.getMainPixel(0, 0) + ":" +
+                    copied.getMainPixel(3, 3);
+                "#,
+            )
+            .expect("script");
+        // 0xff0000 = 16711680 (the source), 255 (0x0000ff) is the blue fill
+        // the copies did not cover and the full source alpha. The three
+        // operate members go through the reference's `omAlpha` functor
+        // `d + ((s - d) * a >> 8)` (`blend_functor_c.h:64`, ported in
+        // `blend.rs`), so an opaque source over the blue destination lands one
+        // step below 0xff0000 (16646144) instead of exactly on it.
+        assert_eq!(
+            value,
+            Variant::String(
+                "16711680:255:16646144:16711680:16711680:16646144:16711680:16646144:255"
+                    .to_string()
+            )
+        );
     }
 
     fn global_object(engine: &crate::KrkrEngine, name: &str) -> krkr_tjs2::runtime::ObjectHandle {
