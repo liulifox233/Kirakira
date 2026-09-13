@@ -90,4 +90,5 @@ krkr-video = { path = "crates/krkr-video" }
 krkr-xp3 = { path = "crates/krkr-xp3" }
 
 # Vendored eluna fork; version and patches are tracked in vendor/eluna/UPSTREAM.md.
-eluna = { path = "vendor/eluna/crates/eluna" }
+# The fork head renamed the package to `eluna_rs` (its lib target is still `eluna`).
+eluna = { package = "eluna_rs", path = "vendor/eluna/crates/eluna" }

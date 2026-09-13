@@ -148,11 +148,11 @@ fn parse_args() -> Result<Options, Box<dyn Error>> {
             "--bruteforce-start" => {
                 bruteforce_start = next_u32_arg(&mut args, "--bruteforce-start")?
             }
-            "--bruteforce-end" => {
-                bruteforce_end = next_u32_arg(&mut args, "--bruteforce-end")?
-            }
+            "--bruteforce-end" => bruteforce_end = next_u32_arg(&mut args, "--bruteforce-end")?,
             _ if arg_text.starts_with("--input=") => input = Some(PathBuf::from(&arg_text[8..])),
-            _ if arg_text.starts_with("--output=") => output_dir = Some(PathBuf::from(&arg_text[9..])),
+            _ if arg_text.starts_with("--output=") => {
+                output_dir = Some(PathBuf::from(&arg_text[9..]))
+            }
             _ if arg_text.starts_with("--key=") => key = Some(parse_u32_value(&arg_text[6..])?),
             _ if arg_text.starts_with("--bruteforce-threads=") => {
                 bruteforce_threads = parse_usize_value(&arg_text[21..])?
@@ -183,7 +183,10 @@ fn parse_args() -> Result<Options, Box<dyn Error>> {
 
     let input = input.ok_or_else(|| make_io_error(ErrorKind::InvalidInput, "missing --input"))?;
     if !bruteforce_key && output_dir.is_none() {
-        return Err(Box::new(make_io_error(ErrorKind::InvalidInput, "missing --output")));
+        return Err(Box::new(make_io_error(
+            ErrorKind::InvalidInput,
+            "missing --output",
+        )));
     }
 
     Ok(Options {
@@ -206,22 +209,30 @@ fn parse_args() -> Result<Options, Box<dyn Error>> {
     })
 }
 
-
-fn next_path_arg(args: &mut impl Iterator<Item = OsString>, option: &'static str) -> Result<PathBuf, Box<dyn Error>> {
+fn next_path_arg(
+    args: &mut impl Iterator<Item = OsString>,
+    option: &'static str,
+) -> Result<PathBuf, Box<dyn Error>> {
     let value = args
         .next()
         .ok_or_else(|| make_io_error(ErrorKind::InvalidInput, option))?;
     Ok(PathBuf::from(value))
 }
 
-fn next_u32_arg(args: &mut impl Iterator<Item = OsString>, option: &'static str) -> Result<u32, Box<dyn Error>> {
+fn next_u32_arg(
+    args: &mut impl Iterator<Item = OsString>,
+    option: &'static str,
+) -> Result<u32, Box<dyn Error>> {
     let value = args
         .next()
         .ok_or_else(|| make_io_error(ErrorKind::InvalidInput, option))?;
     parse_u32_value(&value.to_string_lossy())
 }
 
-fn next_usize_arg(args: &mut impl Iterator<Item = OsString>, option: &'static str) -> Result<usize, Box<dyn Error>> {
+fn next_usize_arg(
+    args: &mut impl Iterator<Item = OsString>,
+    option: &'static str,
+) -> Result<usize, Box<dyn Error>> {
     let value = args
         .next()
         .ok_or_else(|| make_io_error(ErrorKind::InvalidInput, option))?;
@@ -230,7 +241,10 @@ fn next_usize_arg(args: &mut impl Iterator<Item = OsString>, option: &'static st
 
 fn parse_u32_value(value: &str) -> Result<u32, Box<dyn Error>> {
     let trimmed = value.trim();
-    let parsed = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         u32::from_str_radix(hex, 16)?
     } else {
         trimmed.parse::<u32>()?
@@ -240,7 +254,10 @@ fn parse_u32_value(value: &str) -> Result<u32, Box<dyn Error>> {
 
 fn parse_usize_value(value: &str) -> Result<usize, Box<dyn Error>> {
     let trimmed = value.trim();
-    let parsed = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         usize::from_str_radix(hex, 16)?
     } else {
         trimmed.parse::<usize>()?
@@ -288,7 +305,11 @@ fn print_usage() {
     println!("  extra_resource_0000.bin ...");
 }
 
-fn write_manifest(output_dir: &Path, psb: &PsbFile, normalized_len: usize) -> Result<(), Box<dyn Error>> {
+fn write_manifest(
+    output_dir: &Path,
+    psb: &PsbFile,
+    normalized_len: usize,
+) -> Result<(), Box<dyn Error>> {
     let path = output_dir.join("manifest.txt");
     let mut out = BufWriter::new(File::create(path)?);
 
@@ -299,10 +320,22 @@ fn write_manifest(output_dir: &Path, psb: &PsbFile, normalized_len: usize) -> Re
     writeln!(out, "header_offset=0x{:x}", psb.header.header_offset)?;
     writeln!(out, "name_offset=0x{:x}", psb.header.name_offset)?;
     writeln!(out, "string_offset=0x{:x}", psb.header.string_offset)?;
-    writeln!(out, "string_data_offset=0x{:x}", psb.header.string_data_offset)?;
+    writeln!(
+        out,
+        "string_data_offset=0x{:x}",
+        psb.header.string_data_offset
+    )?;
     writeln!(out, "resource_offset=0x{:x}", psb.header.resource_offset)?;
-    writeln!(out, "resource_length_offset=0x{:x}", psb.header.resource_length_offset)?;
-    writeln!(out, "resource_data_offset=0x{:x}", psb.header.resource_data_offset)?;
+    writeln!(
+        out,
+        "resource_length_offset=0x{:x}",
+        psb.header.resource_length_offset
+    )?;
+    writeln!(
+        out,
+        "resource_data_offset=0x{:x}",
+        psb.header.resource_data_offset
+    )?;
     writeln!(out, "root_offset=0x{:x}", psb.header.root_offset)?;
     match psb.header.extra {
         Some(extra) => writeln!(out, "checksum=0x{extra:08x}")?,
@@ -365,7 +398,6 @@ fn write_string_list(path: &Path, values: &[String]) -> Result<(), Box<dyn Error
     }
     Ok(())
 }
-
 
 fn write_emote_schema_dump(output_dir: &Path, psb: &PsbFile) -> Result<(), Box<dyn Error>> {
     let (schema, scene) = load_emote_static_scene(psb)?;
@@ -497,8 +529,11 @@ fn extract_resource_group(
 fn range_bytes(data: &[u8], range: PsbResourceRange) -> Result<&[u8], Box<dyn Error>> {
     let start = usize::try_from(range.offset)?;
     let length = usize::try_from(range.length)?;
-    let end = start.checked_add(length).ok_or_else(|| make_io_error(ErrorKind::InvalidData, "resource range overflow"))?;
-    data.get(start..end).ok_or_else(|| make_error(ErrorKind::InvalidData, "resource range outside source data"))
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| make_io_error(ErrorKind::InvalidData, "resource range overflow"))?;
+    data.get(start..end)
+        .ok_or_else(|| make_error(ErrorKind::InvalidData, "resource range outside source data"))
 }
 
 fn write_value(out: &mut dyn Write, value: &PsbValue, indent: usize) -> std::io::Result<()> {

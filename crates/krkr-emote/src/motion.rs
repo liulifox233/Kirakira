@@ -192,8 +192,10 @@ impl Motion {
     /// Samples `animation` at `ticks` and returns the draw list in draw order.
     ///
     /// One tick is 1/60 s ([`crate::EMOTE_TICKS_PER_SECOND`]); the caller advances its
-    /// own clock and passes the accumulated ticks. Sampling past the animation
-    /// duration wraps around it.
+    /// own clock and passes the accumulated ticks. Sampling at or past the
+    /// animation's duration holds its final frame — eluna does not wrap, the
+    /// caller does (`crates/krkr-plugins/src/motion_player.rs`'s
+    /// `advance_player` wraps on the motion's `loopTime`).
     pub fn draw_list(
         &self,
         animation: &str,

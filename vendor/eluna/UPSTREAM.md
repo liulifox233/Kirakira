@@ -1,55 +1,111 @@
 # vendored eluna
 
 This directory is a vendored copy of the local eluna fork, consumed by the
-`krkr-emote` adaptation crate (`crates/krkr-emote`) as a path dependency.
+`krkr-emote` adaptation crate (`crates/krkr-emote`) as a path dependency. It is
+the fork's own workspace tree, pruned, kept in-repo as a working tree (not a
+submodule and not `git`-excluded), and it builds and tests on its own from this
+directory.
 
 ## Provenance
 
 | Field | Value |
 | ----- | ----- |
 | Upstream URL | `https://github.com/xmoezzz/eluna` (`git@github.com:xmoezzz/eluna.git`) |
-| Local fork | `/Users/ruri/repo/eluna` (single-commit fork of upstream) |
-| Pinned commit | `d172fefd29b10e99844028d2e0e499f1c55b166a` ("initial release", 2026-05-14) |
-| Vendored on | 2026-09-12 |
-| Vendored by | Kirakira mission M50 (`crates/krkr-emote`) |
+| Local fork | `/home/ruri/repo/eluna` (single squashed commit, no per-patch history) |
+| Pinned commit | `12e4d2fa03b64714a83a0363eaadf26a125d9fe6` ("update readme", 2026-08-10) |
+| Vendored on | 2026-09-13 |
+| Vendored by | Kirakira mission M127 (re-vendored from M50's `d172fef` pin) |
 
-The vendored tree is byte-identical to the pinned fork for every file that was
-copied; `diff -r --exclude=eluna_player /Users/ruri/repo/eluna vendor/eluna`
-reports only this file, the added licence texts and the pruned directory.
+The fork head renames the library package from `eluna` to `eluna_rs` (its lib
+target is still `eluna`), so Kirakira's workspace manifest declares the
+dependency as `eluna = { package = "eluna_rs", path = "vendor/eluna/crates/eluna" }`.
+
+### Fidelity
+
+The previous UPSTREAM.md claimed the tree was byte-identical to the pin. That
+claim is **retired**: the vendored tree is byte-identical to the fork head for
+every file that was copied, with exactly four kinds of deliberate deviation,
+all listed in the patch ledger below:
+
+1. the pruned directories (`crates/eluna_player`, `images/`),
+2. the licence texts upstream does not ship,
+3. the regenerated `Cargo.lock` (the fork's lock names the pruned player and
+   its ~370-package GUI tree), and
+4. two stale unit tests fixed in place (the fork head's own suite is red
+   without them).
+
+`diff -r` against `/home/ruri/repo/eluna` reports only those, plus this file.
 
 ## What is vendored
 
-- `Cargo.toml`, `Cargo.lock`, `README.md`, `.gitignore` — upstream workspace root.
-- `crates/eluna` — the library crate (PSB parser, Emote schema/runtime, vertex
-  and shader helpers). This is the crate `krkr-emote` depends on.
-- `crates/psb_extract` — the standalone PSB unpacker/schema dumper. Vendored so
-  the upstream workspace still builds in place; nothing in Kirakira depends on
-  it, but it is the tool used to produce the evidence behind the
-  `krkr-emote` normalisation.
+- `Cargo.toml`, `Cargo.lock`, `README.md`, `.gitignore` — workspace root.
+- `crates/eluna` — the library crate (`eluna_rs`, lib name `eluna`): PSB parser
+  with MDF/LZ4/key handling, Emote schema/runtime extraction, the static scene
+  builder, the recovered `StepFrame` pipeline (particles, stencil ancestry,
+  camera/stereovision, timelines, wind/physics) and the `sdk` player facade.
+  This is the crate `krkr-emote` depends on.
+- `crates/psb_extract` — the standalone PSB unpacker/schema dumper (`--input`,
+  `--bruteforce-key`). Vendored so the upstream workspace still builds in
+  place; nothing in Kirakira depends on it, but it is the tool used to produce
+  the evidence behind the `krkr-emote` normalisation.
 
 ## What is pruned
 
-- `crates/eluna_player/**` — upstream's winit + wgpu + egui preview player.
-  It is not needed by the library and pulls a 7.5 MB `default.ttf` plus the
-  whole GUI stack that would otherwise appear in our tree and lockfile. Pruned
-  in full; the upstream workspace `members = ["./crates/*"]` glob simply no
-  longer matches it. Re-adding it means copying the directory back from the
-  fork and adding nothing else.
+- `crates/eluna_player/**` — upstream's winit + wgpu + egui preview player
+  (7.5 MB `default.ttf`, the whole GUI stack, ~370 lockfile packages). Not
+  needed by the library. The workspace `members = ["./crates/*"]` glob simply
+  no longer matches it; re-adding it means copying the directory back and
+  regenerating the lock.
+- `images/**` — the README screenshot referenced by `README.md`. Metadata only.
 
-## Working in the vendored tree
+Pruning the player is what makes the vendored lock differ from the fork's
+(395 packages → 25). The vendored lock is generated for the pruned workspace,
+so `cargo build`/`cargo test` inside this directory do not rewrite it.
 
-The crate builds on its own (`cargo build --manifest-path
-vendor/eluna/Cargo.toml -p eluna`), but cargo rewrites `vendor/eluna/Cargo.lock`
-while running there, because the pruned `eluna_player` is still named in the
-upstream lock. Use `CARGO_TARGET_DIR=<our target>/...` for build output and
-restore the lock afterwards (`git checkout -- vendor/eluna/Cargo.lock`) so the
-vendored tree stays byte-identical.
+## Building and testing
 
-Upstream's own `cargo test -p eluna` does not compile at this pin (a stale unit
-test at `crates/eluna/src/emote.rs:1980` is missing the `draw_frame_info`
-field), so eluna's tests are not part of our suite — `krkr-emote`'s tests cover
-the same parser/schema paths, and the vendored tree is excluded from our
-workspace.
+```bash
+# standalone, from this directory; keep the target dir outside the tree
+CARGO_TARGET_DIR=<repo>/target/eluna-vendor cargo test
+```
+
+At the fork head this reports **95 passed; 0 failed** (93/95 before the two
+test fixes in the patch ledger). For comparison, the previous pin's own tests
+did not compile at all (a stale unit test referenced a field that no longer
+existed), so eluna's suite was not runnable there.
+
+Kirakira's workspace excludes this directory (`exclude = ["vendor/eluna"]`);
+`krkr-emote` consumes it as a path dependency and its own suite covers the
+parser/schema paths Kirakira uses.
+
+## Patch ledger
+
+Every file in this tree that differs from the fork head, with the reason, the
+evidence, and whether the fork still needs the same change.
+
+| File | Patch | Reason / evidence | Upstream status |
+| ---- | ----- | ----------------- | --------------- |
+| `crates/eluna/LICENSE-MPL-2.0` | Added licence text | Upstream ships no licence files, only the SPDX `license = "MPL-2.0"` field. Distribution needs the text. | TO MIRROR upstream |
+| `crates/psb_extract/LICENSE-MIT`, `LICENSE-APACHE-2.0` | Added licence texts | Same, for `license = "MIT OR Apache-2.0"`. | TO MIRROR upstream |
+| `Cargo.lock` | Regenerated for the pruned workspace | The fork lock names `eluna_player` and its ~370 GUI packages; `cargo` rewrites the lock on first build here. Regenerating once keeps the vendored tree clean. | Vendoring artefact (not for upstream) |
+| `crates/eluna/src/vertex.rs` (`builds_single_cell_strip`) | u/v compared with the arithmetic's tolerance instead of exact f32 literals | The test asserts `v == 0.1` while the builder computes `(tex_y + y * v_step) * (1.0 / texture_height)`: `10.0 * (1.0 / 100.0)` is `0.099999994` in f32. Same test and same builder as the previous pin; the pin simply never compiled. | TO MIRROR upstream |
+| `crates/eluna/src/runtime.rs` (`timeline_hold_markers_do_not_pollute_authored_ranges`) | `default_value` expectation `3.0` → `0.0` | The implementation deliberately starts a timeline-only variable at the scalar zero default (`merge_timeline_variable_info`, comment citing `sub_1026FA30`, `timeline_default = 0.0`), and the sibling test `timeline_only_variable_does_not_take_first_key_as_initial_value` already pins that. The stale expectation was the only failure; the hold marker still stays out of the authored 3.0..5.0 range. | TO MIRROR upstream |
+
+"TO MIRROR" rows are changes the fork head should receive; they were made in
+this vendored copy only because the fork working tree is outside the mission's
+write scope. Nothing in the library's behaviour was changed — both rows are
+test-side only.
+
+## Adapter passes at this pin (M127)
+
+The `krkr-emote` normalisation (`crates/krkr-emote/src/normalize.rs`) exists to
+bridge PARQUET's `.mtn` flavor to eluna's. Re-verified against the fork head:
+
+| Adapter pass | Verdict | Evidence at the fork head |
+| ------------ | ------- | ------------------------- |
+| `content.opa` rescale (0..255 → eluna's old 0..10 scale) | **DELETED** | eluna now reads the byte natively: `emote.rs:2383` (`opa` default 255), `:2629-2631` (`opa_raw / 255.0`), `:2999` (sprite opacity), `:4061` (interpolated state rounded like the native DLL). Keeping the rescale double-scaled: sd101's `opa: 192` came out as 8/255 = 0.0314. |
+| `parameterize: null` stripped | **KEPT** | Still required: `layer_parameter_eval` (`emote.rs:4468-4474`) enters the parameterised branch for a present-but-null field and `resolve_parameterize` (`:4549-4557`) resolves `Null` to no parameter, freezing the layer at local time 0; the un-parameterised path is the absent-field branch at `:4539-4546`. Test: `tests/synthetic.rs::parameterize_null_freezes_without_the_strip` (raw scene 1.0 vs adapted 128/255) and the game's own fade (sd101 `ef_moya/bgef1`). |
+| Per-icon `pixel` → synthetic `source["<source>/<icon>"]` + `src/` rewrite | **KEPT** | Still required: `collect_textures` skips a source without a `texture` sub-object (`emote.rs:1585-1587`) and only reads `texture.pixel`/`data`/`resource` (`:1588-1594`); no code resolves `src/<source>/<icon>`. Test: `tests/synthetic.rs::parquet_flavor_icons_need_the_synthesized_sources`. |
 
 ## Licence
 
@@ -75,22 +131,94 @@ Obligations for Kirakira (AGPL-3.0-or-later):
   are metadata; everything we write ourselves (`crates/krkr-emote`) is
   AGPL-3.0-or-later like the rest of the repository.
 
-## Local patches
+## Capabilities the fork head adds (hand-off for the plugin wiring)
 
-None. The pinned commit is vendored verbatim; the difference in behaviour that
-PARQUET's `.mtn` models need (source-table shape, `src/<source>/<icon>` layer
-content) is implemented entirely in `crates/krkr-emote` by rewriting the parsed
-`eluna::PsbFile` tree before handing it to eluna's schema/scene builder. See
-`crates/krkr-emote/src/normalize.rs`.
+The `krkr-plugins` motionplayer surface still registers physics, timelines,
+mesh deformation, particles, separate-layer mode and `.psb` model playback as
+warn-once stubs. The fork head now carries recovered implementations behind
+these entry points (paths under `crates/eluna/src`):
 
-Any future patch to a vendored file must be listed here with file, reason and
-a diff summary, and should be upstreamed to
-`git@github.com:xmoezzz/eluna.git` when possible.
+- **Particles** — `ParticleStaticConfig` (`emote.rs:563`), the per-scene
+  persistent `ParticleEmitterRuntime` (`emote.rs:593`, held by
+  `EmoteStaticScene.particle_emitters` at `emote.rs:240`), spawn/instance/random
+  helpers (`emote.rs:5990-6372`), parity claims at `sdk.rs:250-251`.
+- **Stencil / alpha-mask** — `EmoteStaticScene.composite_mask_owners`
+  (`emote.rs:232`) and `composite_mask_sources_by_key` (`emote.rs:237`), the
+  per-frame `stencil_type`/`stencil_phase`/`stencil_composite_item`/
+  `stencil_wipe_*` metadata (`emote.rs:399-406`), the
+  `EmoteDrawPass::{MaskGeneration, StencilCompositeMask, Filtered}` passes
+  (`emote.rs:428-433`), `EmoteMaskMode` (`api.rs:27`) and
+  `EmoteDeviceRenderOptions` (`api.rs:38`).
+- **Camera / stereovision** — `EmoteCameraRuntimeState` (`emote.rs:506`) with
+  per-scope state on the scene (`camera_runtimes`, `emote.rs:254`),
+  `EmoteStereovisionControl`/`EmoteStereovisionProfile` (`emote.rs:35-48`),
+  `EmoteStereovisionScreen` (`runtime.rs:416`), driven through
+  `EmoteRuntime::camera_runtimes` (`sdk.rs:1057`) and the stereovision setters
+  (`sdk.rs:983-1048`).
+- **transformOrder** — `EmoteDrawFrameInfo.transform_order` (`emote.rs:390`),
+  the native mask constants in `api::transform_order_mask` (`api.rs:55-70`),
+  `EmoteRuntime::set_transform_order_mask` (`sdk.rs:860`) and
+  `EmoteTransformMode` (`sdk.rs:32`).
+- **Mesh deformation** — `EmoteMeshPatch` (`emote.rs:93-202`) with the native
+  patch ops `sample`/`combined_with`/`interpolate`/`control_bounds`, the
+  per-frame `mesh_transform`/`mesh_combine`/`mesh_sync_child_*` flags
+  (`emote.rs:377-383`), the retained per-layer `mesh_chain`
+  (`EmoteStepFrameLayerState`, `emote.rs:460`) and the meshCombinator split
+  (`evaluate_mesh_combinator_split`, `emote.rs:4585`); `EmoteStepFrameMeshState`/
+  `EmoteMeshChainNode` (`emote.rs:693`, `:702`) expose the recovered chain.
+- **Feedback / previous framebuffer** — type-10 sprites carry
+  `EmoteStaticSprite.feedback_history` (`emote.rs:333`) and are materialised by
+  `build_feedback_history_sprite` (`emote.rs:3021`) from
+  `EmoteFeedbackRuntimeState` (`emote.rs:518`); the decay math and sampling are
+  in the parity report's confirmed list (`sdk.rs:253`).
+- **Model pass (type 6)** — `EmoteModelRuntimeState` (`emote.rs:497`) carries
+  the recovered local-time/direction state; loading and drawing
+  `referenceModelFileList` resources stays a host 3-D-backend responsibility
+  (`sdk.rs:264`).
+- **Timeline lifecycle** — `EmoteTimeline`/`EmoteTimelineFrame`/
+  `EmoteTimelineVariable` (`runtime.rs:56-74`), `collect_emote_timelines`
+  (`runtime.rs:5371`), and on the runtime `play_timeline`/`fade_in_timeline`/
+  `fade_out_timeline`/`set_timeline_blend_ratio`/`set_timeline_time`/
+  `stop_timeline` (`sdk.rs:678-735`) plus the `is_timeline_playing`/
+  `is_loop_timeline`/`timeline_blend_ratio` queries (`sdk.rs:747-759`) and
+  `TimelinePlayMode` with PARALLEL/DIFFERENCE modes (`api.rs:79`).
+- **Wind / physics** — `WindPulse`/`WindState` (`runtime.rs:190`, `:207`),
+  `HairPhysicsState`/`BustPhysicsState` (`runtime.rs:260`, `:230`),
+  `PhysicsControlDefinition`/`ClampControl`/`SelectorControl`/`LoopControl`/
+  `MirrorControl`/`OpaqueControl`/`TransitionControl` (`runtime.rs:368-591`),
+  `ElunaPlayer` (`runtime.rs:280`), and the runtime knobs
+  `set_physics_enabled`/`reset_physics`/`set_outer_force`/`set_outer_rot`/
+  `start_wind`/`stop_wind`/`set_hair_scale`/`set_parts_scale`/`set_bust_scale`
+  (`sdk.rs:809-877`) with `EmoteGroundCorrectionHook` (`emote.rs:541`) wired
+  through `set_ground_correction_hook` (`sdk.rs:438`).
+- **Whole-player façade** — `EmoteRuntime` (`sdk.rs:278`) already implements
+  `emote_show`/`emote_hide`/`emote_motion`/`emote_variable`/`emote_trans`
+  (`sdk.rs:471-567`) with their option structs (`sdk.rs:49-128`), colour and
+  grayscale filters (`sdk.rs:622-632`), smoothing/queuing/mesh-division
+  (`sdk.rs:601-618`), an API-log recorder/replayer (`sdk.rs:1079-1115`) and the
+  chara profile reader (`sdk.rs:1120-1144`). `emote_runtime_parity_report()`
+  (`sdk.rs:238`) lists what upstream considers confirmed/partial/missing; its
+  "missing" list still includes running these paths under `cargo test`, which
+  this vendored tree now does (95/95) and `crates/krkr-emote`'s PARQUET suite
+  exercises over the game's 23 `.mtn` files.
+- **Metadata readers** — `collect_emote_runtime_pipeline` (`runtime.rs:3265`),
+  `collect_emote_timelines` (`runtime.rs:5371`), `collect_emote_variables`
+  (`runtime.rs:5484`) and `load_emote_static_scene` (`emote.rs:1546`) build the
+  pipeline/timeline/variable tables straight from a `PsbFile`;
+  `EmoteModelSchema::motion_infos`/`default_motion_name` (`emote.rs:858`, `:884`)
+  list a model's motions. `crates/krkr-emote` re-exports the types its own
+  signatures use (`EmoteModelSchema`, `EmoteStaticScene`, `EmoteStaticSprite`,
+  `EmoteDrawFrameInfo`, `EmoteDrawPass`, `EmoteMeshPatch`, …) so the plugin side
+  can reach them without naming the vendored path dependency.
 
 ## Updating the vendored copy
 
-1. `git -C /Users/ruri/repo/eluna pull` (or check out the new pin).
-2. Re-copy the files listed under "What is vendored" with the same prune.
-3. Update the pin and date in this file.
-4. Re-run `cargo test -p krkr-emote`; the PARQUET tests exercise the parser
-   against real PSB v3/v4 game data.
+1. Update `/home/ruri/repo/eluna` to the new head and note the commit.
+2. Re-copy the files listed under "What is vendored" with the same prune
+   (`crates/eluna_player`, `images/`).
+3. Regenerate `Cargo.lock` in the pruned tree
+   (`CARGO_TARGET_DIR=<repo>/target/eluna-vendor cargo generate-lockfile`).
+4. Re-check the patch ledger: drop rows upstream no longer needs, re-apply the
+   rest (or take upstream's fix if it landed), and update "Upstream status".
+5. Update the pin and date here, then re-run `cargo test` here (standalone) and
+   `KRKR_EMOTE_PARQUET_DIR=<game> cargo test -p krkr-emote` in the workspace.

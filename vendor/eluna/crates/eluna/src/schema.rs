@@ -135,7 +135,10 @@ mod tests {
     fn collects_refs() {
         let root = PsbValue::Object(vec![
             ("a".to_owned(), PsbValue::Resource(3)),
-            ("b".to_owned(), PsbValue::List(vec![PsbValue::ExtraResource(7)])),
+            (
+                "b".to_owned(),
+                PsbValue::List(vec![PsbValue::ExtraResource(7)]),
+            ),
         ]);
         let refs = collect_resource_refs(&root);
         assert!(refs.resources.contains(&3));

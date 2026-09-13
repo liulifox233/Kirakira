@@ -2413,6 +2413,16 @@ mod tests {
     }
 
     /// A parameterised layer: the variable `x` picks between two frames.
+    ///
+    /// `division` is the parameter-to-time scale: the reference's
+    /// `EPParameter::SetValue` maps the value as
+    /// `(value - rangeBegin) * division / (rangeEnd - rangeBegin)`
+    /// (`vendor/eluna/crates/eluna/src/emote.rs:4527-4531`, which eluna
+    /// implements at the fork head), so `x` in 0..1 has to reach the frame
+    /// list's 100-tick span through the field. The previous eluna pin scaled
+    /// the value over the frame list's own span instead and this fixture
+    /// carried no `division`; with `division: 100`, `x = 1` lands on the red
+    /// frame at t=100.
     fn parameterised_layer() -> Value {
         object(vec![
             ("label", text("body")),
@@ -2424,6 +2434,7 @@ mod tests {
                     ("id", text("x")),
                     ("rangeBegin", int(0)),
                     ("rangeEnd", int(1)),
+                    ("division", int(100)),
                 ]),
             ),
             (

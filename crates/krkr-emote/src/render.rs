@@ -8,7 +8,7 @@
 //!
 //! A draw item is a textured quad. Its four corners are the sprite rectangle
 //! (`center` ± `size` / 2) transformed the way eluna's own
-//! `transform_emote_sprite_point` (`vendor/eluna/crates/eluna/src/emote.rs:367-380`)
+//! `transform_emote_sprite_point` (`vendor/eluna/crates/eluna/src/emote.rs:776-791`)
 //! defines the model: scale and rotation about `center` first, then the
 //! sprite's `world_transform` (the accumulated layer transforms). The item's
 //! `uv` rectangle is bilinearly sampled across the quad, so a sprite that
@@ -21,7 +21,8 @@
 //! engine's own layer store — and items are composited source-over:
 //! `dst = src * a + dst * (1 - a)` with `a = pixel_alpha * item.opacity *
 //! tint.alpha`. `item.opacity` is the sprite's own opacity, which is where the
-//! motion's `opa` value ends up (see [`crate::normalize`] for the scaling).
+//! motion's `opa` value ends up (eluna divides the file's byte by 255; the
+//! adapter passes the field through).
 //!
 //! # Not yet rendered
 //!
@@ -359,7 +360,7 @@ fn draw_quad_into(
 
 /// Maps one sprite-local point onto the canvas: scale/rotation about the
 /// sprite's centre, then the sprite's accumulated `world_transform`
-/// (eluna's `transform_emote_sprite_point`, `emote.rs:367-380`).
+/// (eluna's `transform_emote_sprite_point`, `emote.rs:776-791`).
 fn sprite_vertex(item: &MotionDrawItem, point: [f32; 2], uv: [f32; 2]) -> Vertex {
     let sx = finite_or(item.scale[0], 1.0);
     let sy = finite_or(item.scale[1], 1.0);
@@ -374,7 +375,7 @@ fn sprite_vertex(item: &MotionDrawItem, point: [f32; 2], uv: [f32; 2]) -> Vertex
     let m = item.world_transform.map(|value| finite_or(value, 0.0));
     // `world_transform` is eluna's `EmoteTransform2D::as_array`:
     // `x' = m11*x + m12*y + tx`, `y' = m21*x + m22*y + ty`
-    // (`vendor/eluna/crates/eluna/src/emote.rs:754-763`).
+    // (`vendor/eluna/crates/eluna/src/emote.rs:1776-1778`).
     Vertex {
         x: m[0] * local[0] + m[1] * local[1] + m[4],
         y: m[2] * local[0] + m[3] * local[1] + m[5],

@@ -72,10 +72,7 @@ impl ScreenUvConstants {
         let inv_w = 1.0 / clip_xyzw[3];
         let ndc_x = clip_xyzw[0] * inv_w;
         let ndc_y = clip_xyzw[1] * inv_w;
-        Some([
-            ndc_x * 0.5 + self.offset_x,
-            ndc_y * -0.5 + self.offset_y,
-        ])
+        Some([ndc_x * 0.5 + self.offset_x, ndc_y * -0.5 + self.offset_y])
     }
 }
 

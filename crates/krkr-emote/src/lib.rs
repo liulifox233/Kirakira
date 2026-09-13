@@ -21,7 +21,7 @@
 //! (`source.<name>.icon.<icon>.pixel`) with no `texture` sub-object, and name
 //! the icon as `src/<source>/<icon>`. [`NormalizeReport`]-counted adaptation
 //! rewrites the parsed tree into eluna's shape before eluna's schema/scene code
-//! sees it — the vendored code itself is unpatched (see
+//! sees it — the vendored library code itself is unpatched (see
 //! `vendor/eluna/UPSTREAM.md`).
 //!
 //! ```no_run

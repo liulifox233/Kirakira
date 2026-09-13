@@ -1,6 +1,8 @@
 # eluna
 
-`eluna` is an open-source Emote/PSB reverse-engineering and reimplementation work made with Rust.
+`eluna` is an open-source PSB and relevant animation reimplementation work made with Rust.
+
+![Eluna](./images/screenshot.png)
 
 ### Workspace members:
 
@@ -10,7 +12,7 @@
 
 ### Current library scope:
 
-- PSB parsing with MDF/LZ4 normalization and optional Emote key decryption. The canonical Emote key state is `0x075BCD15, 0x159A55E5, 0x1F123BB5, key, 0, 0`; only `key` varies for normal use. `psb_extract` also has a multi-threaded `--bruteforce-key` mode for this single DWORD.
+- PSB parsing with MDF/LZ4 normalization and optional PSB key decryption. The canonical PSB key state is `0x075BCD15, 0x159A55E5, 0x1F123BB5, key, 0, 0`; only `key` varies for normal use. `psb_extract` also has a multi-threaded `--bruteforce-key` mode for this single DWORD.
 - PSB resource extraction.
 - D3D9-compatible Emote vertex layout and triangle-strip helpers.
 - Emote schema/runtime extraction for `source`, `texture`, `icon`, `object`, `motion`, `layer`, `frameList`, `timelineControl`, controller metadata, and drawFrameInfo.
@@ -27,3 +29,10 @@ cargo run -p eluna_player -- --input model.psb --key 0x12345678 --motion main
 ```
 
 If `--motion` is omitted, the first motion under the base object is used.
+
+### Disclaimer
+- Eluna is an independent, binary-compatible runtime implementation intended solely for loading and executing existing compatible content.
+
+- This project does not provide any authoring, model generation, model conversion, migration, or transformation functionality. In particular, it does not provide tools for creating new models or converting existing models from or to other formats.
+
+- Such authoring and conversion functionality is intentionally outside the scope of this project and will not be implemented.

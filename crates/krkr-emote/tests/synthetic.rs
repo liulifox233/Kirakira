@@ -228,15 +228,14 @@ fn parquet_flavor_motion_loads() {
     assert_eq!(binding.icon, "body");
     assert_eq!(binding.resource_index, 0);
 
-    // The adaptation: one synthetic texture per icon, and the file's 0..255
-    // `opa` rescaled into eluna's 0..10 scale.
+    // The adaptation: one synthetic texture per icon. The file's 0..255 `opa`
+    // is *not* touched — eluna reads it as a byte and divides by 255.
     let report = motion.normalize_report();
     assert_eq!(report.sources, 1);
     assert_eq!(report.synthesized_textures, 2);
     assert_eq!(report.rewritten_contents, 2);
     assert_eq!(report.unresolved_icon_references, 0);
     assert_eq!(report.icons_without_pixel, 0);
-    assert_eq!(report.rescaled_opacity, 2);
     assert!(motion.schema().textures.contains_key("hero/body"));
     assert!(motion.schema().textures.contains_key("hero/face"));
 
@@ -272,11 +271,13 @@ fn parquet_flavor_motion_loads() {
         Some(&[9u8, 8, 7][..])
     );
 
-    // Sampling later in the animation keeps the layer state; the tick past the
-    // duration wraps back to the start (the clear frame at 60 sits exactly on
-    // the wrap point, so it is never sampled).
+    // Sampling later in the animation keeps the layer state; at the clear
+    // frame's own tick (60) the layer is cleared. eluna does not wrap the
+    // clock itself — the caller does (`motion_player.rs`'s `advance_player`
+    // wraps on `loopTime`); the pinned tree wrapped here instead.
     assert_eq!(motion.draw_list("idle", 30.0).unwrap().len(), 2);
-    assert_eq!(motion.draw_list("idle", 60.0).unwrap().len(), 2);
+    assert_eq!(motion.draw_list("idle", 59.9).unwrap().len(), 2);
+    assert_eq!(motion.draw_list("idle", 60.0).unwrap().len(), 0);
     assert_eq!(motion.scene_at("idle", 0.0).unwrap().base_object, "hero");
 
     assert!(matches!(
@@ -417,4 +418,164 @@ fn freemote_sub_rect_icons_decode_their_shared_texture() {
         "the icon travels as its sub-rectangle of the texture"
     );
     assert_eq!(items[0].size, [8.0, 4.0], "the icon's own size");
+}
+
+// ---------------------------------------------------------------------------
+// Why the remaining adaptation passes are still needed (M127)
+//
+// Each test drives the same bytes through the raw eluna schema/scene path and
+// through `Motion` (which normalises), so the vendored behaviour that forces
+// the pass is pinned next to the pass itself.
+// ---------------------------------------------------------------------------
+
+/// PARQUET's per-icon `pixel` flavor is still not served by the vendored tree:
+/// `collect_textures` skips a source that has no `texture` sub-object
+/// (`vendor/eluna/crates/eluna/src/emote.rs:1585-1587`), and `src/<source>/
+/// <icon>` is not a texture key. The adapter's synthesis is what makes those
+/// files load, so the pass stays.
+#[test]
+fn parquet_flavor_icons_need_the_synthesized_sources() {
+    let mut writer = PsbWriter::default();
+    let body_pixels = writer.add_resource(vec![1u8, 2, 3, 4, 5, 6]);
+    let face_pixels = writer.add_resource(vec![9u8, 8, 7]);
+    let root = motion_root(
+        parquet_source(&body_pixels, &face_pixels),
+        "src/hero/body",
+        "src/hero/face",
+        None,
+    );
+    let bytes = writer.finish(4, &root);
+
+    // Raw: the schema sees no texture for the source at all, and a layer
+    // naming `src/hero/body` draws nothing.
+    let raw = krkr_emote::PsbFile::parse(&bytes).expect("raw parse");
+    let raw_schema = krkr_emote::EmoteModelSchema::from_psb(&raw).expect("raw schema");
+    assert!(
+        raw_schema.textures.is_empty(),
+        "the vendored tree reads no `texture` entry for PARQUET's per-icon sources"
+    );
+    let raw_scene = raw_schema
+        .build_motion_scene_at_with_resources_and_variables(
+            &raw,
+            &bytes,
+            "idle",
+            0.0,
+            &Default::default(),
+        )
+        .expect("raw scene builds");
+    assert!(
+        raw_scene.sprites.is_empty(),
+        "`src/<source>/<icon>` resolves to no texture in the raw tree"
+    );
+
+    // Adapted: the synthetic sources exist and the same frame draws.
+    let motion = Motion::from_bytes(&bytes).expect("adapted load");
+    assert!(motion.schema().textures.contains_key("hero/body"));
+    assert!(motion.schema().textures.contains_key("hero/face"));
+    assert_eq!(motion.draw_list("idle", 0.0).expect("sample").len(), 2);
+}
+
+/// A one-layer `fade` motion with `parameterize: null` — PARQUET's spelling
+/// for a layer that is *not* parameterised — whose second keyframe (opa 128)
+/// sits at tick 30.
+fn fade_root(source: Value) -> Value {
+    let frame = |time: i64, opa: i64| {
+        object(vec![
+            (
+                "content",
+                object(vec![
+                    ("src", text("hero")),
+                    ("icon", text("face")),
+                    ("coord", list(vec![int(0), int(0), int(0)])),
+                    ("opa", int(opa)),
+                ]),
+            ),
+            ("time", int(time)),
+            ("type", int(2)),
+        ])
+    };
+    object(vec![
+        ("id", text("motion")),
+        ("label", text("Synthetic")),
+        ("source", object(vec![("hero", source)])),
+        (
+            "object",
+            object(vec![(
+                "hero",
+                object(vec![(
+                    "motion",
+                    object(vec![(
+                        "fade",
+                        object(vec![
+                            ("lastTime", int(60)),
+                            (
+                                "layer",
+                                list(vec![object(vec![
+                                    ("label", text("body")),
+                                    ("coordinate", int(0)),
+                                    ("parameterize", Value::Null),
+                                    ("children", list(vec![])),
+                                    ("frameList", list(vec![frame(0, 255), frame(30, 128)])),
+                                ])]),
+                            ),
+                        ]),
+                    )]),
+                )]),
+            )]),
+        ),
+    ])
+}
+
+/// A present-but-null `parameterize` still freezes the layer at local time 0
+/// in the vendored tree (`emote.rs:4468-4474` with `resolve_parameterize`
+/// returning `None` for `Null` at `:4549-4557`), so dropping the field is what
+/// lets the later keyframe activate. The same bytes are sampled raw and
+/// through the adapter, and the file's `opa` byte reaches eluna's `/255`
+/// reading untouched (raw 128 → 128/255).
+#[test]
+fn parameterize_null_freezes_without_the_strip() {
+    let mut writer = PsbWriter::default();
+    let pixels = writer.add_resource(vec![1u8; 16 * 16 * 4]);
+    let root = fade_root(freemote_source(&pixels));
+    let bytes = writer.finish(4, &root);
+
+    // Raw: at tick 30 the frozen layer still shows its tick-0 frame (opa 255).
+    let raw = krkr_emote::PsbFile::parse(&bytes).expect("raw parse");
+    let raw_schema = krkr_emote::EmoteModelSchema::from_psb(&raw).expect("raw schema");
+    let raw_scene = raw_schema
+        .build_motion_scene_at_with_resources_and_variables(
+            &raw,
+            &bytes,
+            "fade",
+            30.0,
+            &Default::default(),
+        )
+        .expect("raw scene builds");
+    assert_eq!(raw_scene.sprites.len(), 1);
+    assert_eq!(
+        raw_scene.sprites[0].opacity, 1.0,
+        "null `parameterize` freezes the layer at local time 0"
+    );
+
+    // Adapted: the field is gone, the tick-30 frame applies, and the `opa`
+    // byte is passed through unchanged (no rescale).
+    let motion = Motion::from_bytes(&bytes).expect("adapted load");
+    assert_eq!(motion.normalize_report().dropped_null_parameterize, 1);
+    assert_eq!(
+        motion.animations()[0].layers[0].frames[1].opacity,
+        Some(128.0),
+        "the model keeps the file's verbatim `opa` byte"
+    );
+    let items = motion.draw_list("fade", 30.0).expect("sample");
+    assert_eq!(items.len(), 1);
+    assert!(
+        (items[0].opacity - 128.0 / 255.0).abs() < 1e-6,
+        "opa 128 renders as 128/255, got {}",
+        items[0].opacity
+    );
+    assert_eq!(
+        motion.draw_list("fade", 0.0).expect("sample")[0].opacity,
+        1.0,
+        "the tick-0 frame is fully opaque"
+    );
 }
