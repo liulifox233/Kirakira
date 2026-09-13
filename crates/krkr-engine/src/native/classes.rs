@@ -12902,8 +12902,8 @@ mod tests {
     /// `:7484` `operateAffine`. A Layer whose main image was freed and that
     /// carries no province plane resolves to nothing, so every one of the six
     /// reports the error where the port used to return `Ok(Void)` silently.
-    /// `copyRect`/`operateRect` accept a province-only source in the wrapper
-    /// (`:7136-7137`), which this test does not give them.
+    /// `copyRect` alone accepts a province-only source in its wrapper
+    /// (`:7136-7137`), which this test does not give it.
     #[test]
     fn layer_blits_reject_a_source_without_an_image() {
         use crate::{EngineConfig, KrkrEngine};
@@ -12947,6 +12947,66 @@ mod tests {
         assert_eq!(error.message, "Source layer has no image");
     }
 
+    /// The province-only distinction: `copyRect`'s wrapper resolves the
+    /// source's main image *or* its province plane (`LayerIntf.cpp:7136-7137`)
+    /// and throws only when both are NULL (`:7150`), while the other five --
+    /// `operateRect` included (`:7213-7222`, throw `:7234`) -- look at the
+    /// main image alone. So a Layer with a province plane but no main image is
+    /// accepted by `copyRect`: on a `dfProvince` destination it copies that
+    /// plane (`:4179-4195`), and on a main-image face the method itself has no
+    /// source bitmap and reports `TVPSourceLayerHasNoImage` (`:4160`). The
+    /// other five report `TVPSpecifyLayerOrBitmap` before their method runs.
+    /// The plane is built with `setProvincePixel`, which allocates it when
+    /// absent (`AllocateProvinceImage`, `:2647-2663`), after `freeImage` has
+    /// cleared both planes.
+    #[test]
+    fn layer_copy_rect_accepts_a_province_only_source() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.setImageSize(2, 2);
+                source.freeImage();
+                source.setProvincePixel(0, 0, 0x80);
+
+                var dest = new Layer();
+                dest.setImageSize(2, 2);
+
+                var provinceDest = new Layer();
+                provinceDest.setImageSize(2, 2);
+                provinceDest.face = 3; // dfProvince
+                provinceDest.copyRect(0, 0, source, 0, 0, 2, 2);
+                return provinceDest.getProvincePixel(0, 0);
+                "#,
+            )
+            .expect("a province-only source is accepted by copyRect");
+        assert_eq!(value, krkr_tjs2::runtime::Variant::Integer(0x80));
+
+        let error = engine
+            .execute_script("inline.tjs", "dest.copyRect(0, 0, source, 0, 0, 2, 2);")
+            .expect_err("a main-image face has no source bitmap");
+        assert_eq!(error.message, "Source layer has no image");
+        for call in [
+            "dest.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);",
+            "dest.stretchCopy(0, 0, 2, 2, source, 0, 0, 2, 2, stNearest);",
+            "dest.operateStretch(0, 0, 2, 2, source, 0, 0, 2, 2, omAlpha);",
+            "dest.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("these wrappers never look at the province plane");
+            assert_eq!(
+                error.message, "Specify Layer or Bitmap class object",
+                "{call}"
+            );
+        }
+    }
+
     /// A source argument that is not a Layer at all: `copyRect` and the other
     /// five wrappers report `TVPSpecifyLayerOrBitmap` for a void argument
     /// (`clo.Object` is null, `LayerIntf.cpp:7127-7150`) and for any other
@@ -12954,9 +13014,12 @@ mod tests {
     /// `tTJSNC_Bitmap` fallback (`:7140-7148`) has nothing to resolve in this
     /// engine -- `Bitmap` is a spec-only placeholder with no bitmap payload
     /// (`install_bitmap_native_properties`) -- so it reports the same error
-    /// rather than silently dropping the blit. `piledCopy` requires a Layer
-    /// outright and reports `TVPSpecifyLayer` ("Specify Layer class object",
-    /// `string_table_en.rc:120`; `:7095-7108`).
+    /// rather than silently dropping the blit. Accepting a Bitmap source is a
+    /// documented deviation, owned by the open `20260912-layer-leftovers`
+    /// finding (`...bitmap-arguments-unsupported-and-missing-source`), not a
+    /// behaviour this test claims the reference has. `piledCopy` requires a
+    /// Layer outright and reports `TVPSpecifyLayer` ("Specify Layer class
+    /// object", `string_table_en.rc:120`; `:7095-7108`).
     #[test]
     fn layer_blits_reject_a_source_that_is_not_a_layer() {
         use crate::{EngineConfig, KrkrEngine};
@@ -13025,6 +13088,7 @@ mod tests {
             .expect("script");
         for call in [
             "dest.copyRect(0, 0, source, 0, 0, 2, 2);",
+            "dest.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);",
             "dest.stretchCopy(0, 0, 2, 2, source, 0, 0, 2, 2, stNearest);",
             "dest.operateStretch(0, 0, 2, 2, source, 0, 0, 2, 2, omAlpha);",
             "dest.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
