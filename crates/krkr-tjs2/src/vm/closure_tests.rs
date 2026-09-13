@@ -26,7 +26,10 @@
 //! builder at the bottom of this file, so an accidental JavaScript-style
 //! capture -- in either direction -- cannot land unnoticed.
 
-use crate::bytecode::{BytecodeFile, DataSlot, DataSlotType};
+use std::sync::Arc;
+
+use super::Vm;
+use crate::bytecode::{BytecodeContextType, BytecodeFile, DataSlot, DataSlotType};
 use crate::compiler::compile_source_to_bytecode;
 use crate::error::{Result, TjsError, TjsErrorKind};
 use crate::runtime::{NoHost, ObjectHandle, Runtime, Variant};
@@ -568,6 +571,219 @@ fn proxy_miss_everywhere_reports_the_official_member_error() {
     );
     assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
     assert_eq!(error.message, "Member \"no_such_name\" does not exist");
+}
+
+// ---------------------------------------------------------------------------
+// `this` at the top level and when a call carries no ObjThis of its own.
+//
+// `tTJSInterCodeContext::FuncCall` is where the reference splits the cases.
+// A **top-level** context substitutes the global object for a NULL context
+// (`objthis?objthis:Block->GetTJS()->GetGlobalNoAddRef()`,
+// `tjsInterCodeExec.cpp:3083-3087`), so `Scripts.exec` / `Scripts.eval`
+// without their context argument (`base/ScriptMgnIntf.cpp:1283-1341`) --
+// and `TVPExecuteExpression(content, result)` (`:650-653`) -- run with `this`
+// = the global object.
+//
+// Every *other* context kind hands its objthis straight to
+// `ExecuteAsFunction` (`:3089-3099`), which stores it with
+// `ra[-1].SetObject(objthis, objthis)` (`:839`) and points the `%-2`
+// this-proxy register at it, or at the global object when there is none
+// (`proxy.SetObjects(objthis, global)`, `:789-806`).  A NULL survives into
+// such a frame only through a *direct* dispatch call (`PropGetter->FuncCall`
+// at `:3135`, the setter funnel `:3172`, `SuperClassGetter->ExecuteAsFunction(NULL, ...)`
+// at `:3063`), where `this` then reads as the null object.  Every
+// variant/closure call -- the host shape `FuncCall(0, NULL, NULL, ...)` and
+// `VM_CALL`, whose call sites pass `clo.ObjThis ? clo.ObjThis : ra[-1]`
+// (`:2372`, `:2438`) as `tTJSVariantClosure::FuncCall`'s `objthis` argument
+// -- substitutes the callee's own `Object` when both are NULL
+// (`ObjThis?ObjThis:(objthis?objthis:Object)`, `tjsVariant.h:226-232`), so
+// the callee runs on itself, self-bound.
+
+/// Calls the value `source` returns (a function value the script hands to the
+/// host) the way host code that holds a bare value calls it:
+/// `FuncCall(0, NULL, NULL, result, 0, NULL, NULL)` -- the shape the
+/// reference uses for `System.exceptionHandler`
+/// (`base/ScriptMgnIntf.cpp:950`) and for a transition's tick callback
+/// (`visual/LayerIntf.cpp:6694`).  No receiver argument is passed, so
+/// `tTJSVariantClosure::FuncCall` falls back to the callee's own `Object`
+/// (`tjsVariant.h:226-232`).
+///
+/// The value is an expression function (`var probe = function() {...}`),
+/// which the compiler leaves unbound at the top level; a *declared* top-level
+/// function carries the global as its ObjThis instead (`RegisterFunction`
+/// queues it with `changethis`, `tjsInterCodeGen.cpp:935-947`, and `FixCode`
+/// emits `chgthis %1, %-1` before the store, `:763-766`), and that binding is
+/// consulted by a call site (`clo.ObjThis ? clo.ObjThis : ra[-1]`,
+/// `tjsInterCodeExec.cpp:2372`).
+fn call_without_this(runtime: &mut Runtime<NoHost>, source: &str) -> Variant {
+    let file = compile_source_to_bytecode("closure-test.tjs", source).expect("compile");
+    let probe = runtime.execute_file(&file).expect("install probe");
+    runtime.call_function(probe, Vec::new()).expect("host call")
+}
+
+/// The `ctTopLevel` substitution: a script run without a context has the
+/// global object as `this`, not the null object.
+///
+/// `this == global` holds because `NormalCompare` compares only the object
+/// pointer for `tvtObject` values (`tjsVariant.cpp:693-696`, the ObjThis
+/// comparison commented out).  `this === global` is *false* in the reference
+/// -- `this` is stored as `tTJSVariant(dsp, dsp)` (`tjsInterCodeExec.cpp:839`)
+/// while the `global` keyword loads `GetGlobalNoAddRef()` unbound
+/// (`VM_GLOBAL`, `:1454-1456`), and `DiscernCompare` compares ObjThis too
+/// (`tjsVariant.cpp:778-780`) -- so the identity assertion uses `==` and the
+/// null check uses `===`.
+#[test]
+fn top_level_this_is_the_global_object() {
+    assert_eq!(
+        ok("return (global == this) + \":\" + (this === null);"),
+        Variant::String("1:0".to_string())
+    );
+}
+
+/// `this` at the top level carries the global object's members, in both
+/// directions.
+#[test]
+fn top_level_this_reads_and_writes_the_global_object() {
+    assert_eq!(
+        ok("this.answer = 42; return global.answer;"),
+        Variant::Integer(42)
+    );
+    assert_eq!(
+        ok("global.answer = 7; return this.answer;"),
+        Variant::Integer(7)
+    );
+}
+
+/// An unqualified name at the top level compiles to a `%-2` this-proxy read
+/// (`tjsInterCodeGen.cpp:2149-2166`), and the proxy's first target is the
+/// global it was built for (`proxy.SetObjects(objthis, global)`,
+/// `tjsInterCodeExec.cpp:794-797`), so reads and writes of an existing
+/// global land on the global object.  A *new* name needs the explicit
+/// receiver: an unqualified store compiles to `VM_SPD` (flags 0,
+/// `tjsInterCodeGen.cpp:1909-1912`) while `global.name = ...` compiles to
+/// `VM_SPDE` (MEMBERENSURE, `:1915-1917`), which is why KRKR's scripts write
+/// the `global.` prefix to create a global.
+#[test]
+fn top_level_unqualified_names_read_and_write_the_global_object() {
+    assert_eq!(
+        ok("var answer = 40; answer = answer + 2; return global.answer;"),
+        Variant::Integer(42)
+    );
+    assert_eq!(
+        ok("var answer = 0; global.answer = 7; return answer;"),
+        Variant::Integer(7)
+    );
+    let error = failure("answer = 42; return global.answer;");
+    assert_eq!(error.message, "Member \"answer\" does not exist");
+}
+
+/// A function value called with no receiver at all runs on itself: both the
+/// closure's ObjThis and the call's `objthis` argument are NULL, so
+/// `tTJSVariantClosure::FuncCall` substitutes the closure's own `Object`
+/// (`ObjThis?ObjThis:(objthis?objthis:Object)`, `tjsVariant.h:226-232`), and
+/// `ExecuteAsFunction` stores it self-bound (`ra[-1].SetObject(objthis, objthis)`,
+/// `tjsInterCodeExec.cpp:839`).  `Runtime::call_function` drives exactly this
+/// shape -- the one `System.exceptionHandler` (`base/ScriptMgnIntf.cpp:950`)
+/// and transition tick callbacks (`visual/LayerIntf.cpp:6694`) use.
+#[test]
+fn a_bare_function_call_runs_on_the_callee_object() {
+    let mut runtime = Runtime::new();
+    let value = call_without_this(
+        &mut runtime,
+        "var probe = function() { return (this == probe) + \":\" + (this === null); };\n\
+         return probe;",
+    );
+    assert_eq!(value, Variant::String("1:0".to_string()));
+}
+
+/// The member a bare-function frame writes through `this` lands on the callee
+/// object, not on the global and not on a null receiver: `this` is the frame's
+/// self-bound `ra[-1]` (`tjsInterCodeExec.cpp:839`), and nothing in that frame
+/// is a null dispatch.
+#[test]
+fn a_bare_function_frame_writes_through_this_onto_the_callee() {
+    let mut runtime = Runtime::new();
+    let file = compile_source_to_bytecode(
+        "closure-test.tjs",
+        "var probe = function() { this.x = 1; return this.x; };\nreturn probe;",
+    )
+    .expect("compile");
+    let probe = runtime.execute_file(&file).expect("install probe");
+    let callee = probe.object_handle().expect("function object");
+    assert_eq!(
+        runtime.call_function(probe, Vec::new()).expect("host call"),
+        Variant::Integer(1)
+    );
+    assert_eq!(runtime.object_member(callee, "x"), Variant::Integer(1));
+    assert_eq!(runtime.global_member("x"), Variant::Void);
+}
+
+/// Unqualified *reads* from a bare-function frame still fall through to the
+/// global object: `%-2` is the this-proxy built with
+/// `proxy.SetObjects(objthis, global)` (`tjsInterCodeExec.cpp:789-806`), and
+/// `tTJSObjectProxy::PropGet` moves on to the second object for
+/// `TJS_E_MEMBERNOTFOUND` only (`:284-299`).  (The matching unqualified
+/// *store* path is a known divergence tracked separately: this engine lands
+/// an existing global's unqualified store on the callee object's table where
+/// the reference's proxy falls through to the global's, `:318-320` with
+/// `OBJ2` = `objthis ? objthis : Dispatch2` at `:264`.)
+#[test]
+fn a_bare_function_frame_reads_unqualified_globals_through_the_proxy() {
+    let mut runtime = Runtime::new();
+    let value = call_without_this(
+        &mut runtime,
+        "var shared = 7;\n\
+         var probe = function() { return shared; };\n\
+         return probe;",
+    );
+    assert_eq!(value, Variant::Integer(7));
+}
+
+/// A call made *from* a bare-function frame hands the callee that frame's own
+/// `this`: the nested closure's ObjThis is null, so the call site supplies
+/// `ra[-1]` (`clo.ObjThis ? clo.ObjThis : ra[-1]`, `tjsInterCodeExec.cpp:2372`),
+/// which this frame holds as the callee object itself (`:839`) -- the inner
+/// fallback to its own `Object` (`tjsVariant.h:226-232`) never fires.
+#[test]
+fn a_nested_call_inherits_the_bare_frames_this() {
+    let mut runtime = Runtime::new();
+    let value = call_without_this(
+        &mut runtime,
+        "var inner = function() { return this == probe; };\n\
+         var probe = function() { return inner(); };\n\
+         return probe;",
+    );
+    assert_eq!(value, Variant::Integer(1));
+}
+
+/// The null-object rule lives at the *direct* dispatch entries the reference
+/// keeps for it: an explicit `objthis = NULL` handed to
+/// `tTJSInterCodeContext::FuncCall` (`PropGetter->FuncCall(..., objthis)` at
+/// `tjsInterCodeExec.cpp:3135`, the setter funnel at `:3172`,
+/// `SuperClassGetter->ExecuteAsFunction(NULL, ...)` at `:3063`) runs the
+/// context with `ra[-1].SetObject(NULL, NULL)` (`:839`) while `%-2` is the
+/// global object itself (`ra[-2].SetObject(global, global)`, `:805`).
+/// Executing a function context directly with no objthis is that shape.
+#[test]
+fn a_direct_dispatch_with_no_objthis_reads_the_null_object() {
+    let file = compile_source_to_bytecode(
+        "closure-test.tjs",
+        "function probe() { return (this === null) + \":\" + (global == this); }",
+    )
+    .expect("compile");
+    let index = file
+        .objects
+        .iter()
+        .position(|object| object.context_type == BytecodeContextType::Function)
+        .expect("function context");
+    let mut runtime = Runtime::new();
+    let file_id = runtime.install_script_file(Arc::new(file));
+    let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
+    assert_eq!(
+        vm.execute_object_with_this(index, Vec::new(), None)
+            .expect("direct dispatch"),
+        Variant::String("1:0".to_string())
+    );
 }
 
 /// Official bytecode fixtures. The builder writes the exact binary layout the

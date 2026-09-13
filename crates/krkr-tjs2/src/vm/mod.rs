@@ -223,8 +223,31 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let result = (|| {
             let caller_args = args.clone();
             let global = self.runtime.global;
-            let this_obj = this_obj.or(Some(global));
-            let this_proxy = self.runtime.alloc_proxy_bound(this_obj, global, None);
+            // `tTJSInterCodeContext::FuncCall` runs a context entered with no
+            // ObjThis on the global object only when it *is* the top-level
+            // context (`objthis?objthis:Block->GetTJS()->GetGlobalNoAddRef()`,
+            // `tjsInterCodeExec.cpp:3083-3087`).  Every other kind keeps the
+            // NULL ObjThis: `ExecuteAsFunction` then sets `this` to the null
+            // object (`ra[-1].SetObject(objthis, objthis)`, `:839`) and `%-2`,
+            // the this-proxy, to the global object itself
+            // (`ra[-2].SetObject(global, global)`, `:805`), which is what lets
+            // unqualified globals keep working in a frame with no `this`.
+            //
+            // A NULL can only reach a non-top-level frame through a *direct*
+            // dispatch call now -- `PropGetter->FuncCall(..., objthis)` and the
+            // setter funnel (`:3135`, `:3172`), or the super-class getter's
+            // `ExecuteAsFunction(NULL, ...)` (`:3063`) -- because every
+            // variant/closure call substitutes an object first
+            // (`ObjThis?ObjThis:(objthis?objthis:Object)`, `tjsVariant.h:226-232`,
+            // applied in `Vm::call_value`).
+            let this_obj = match decoded.object.context_type {
+                BytecodeContextType::TopLevel => this_obj.or(Some(global)),
+                _ => this_obj,
+            };
+            let this_proxy = match this_obj {
+                Some(handle) => self.runtime.alloc_proxy_bound(Some(handle), global, None),
+                None => global,
+            };
             let mut frame = Frame::new(&decoded.object, args, this_obj, this_proxy)?;
             if let Some(collapse_base) = decoded.object.func_decl_collapse_base {
                 let base = collapse_base as usize;

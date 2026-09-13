@@ -970,7 +970,16 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     /// Executes a compiled top-level script with an explicit TJS `this`
     /// context.  Native APIs such as `Scripts.exec` and `Scripts.eval` expose
-    /// this as their fourth `context` parameter.
+    /// this as their fourth `context` parameter, and `None` models the NULL
+    /// context of their omitted/void argument (`base/ScriptMgnIntf.cpp:1283-1341`):
+    /// because the file is a top-level context, `tTJSInterCodeContext::FuncCall`
+    /// substitutes the global object for it
+    /// (`tjsInterCodeExec.cpp:3083-3087`), so `None` still runs the script
+    /// with `this` = the global object.  A *function* only reads `this` as the
+    /// null object when it is dispatched directly with a NULL context
+    /// (`:3089-3099`, `:839`, reached at `:3063`, `:3135`, `:3172`); a
+    /// variant/closure call first substitutes the callee object itself
+    /// (`tjsVariant.h:226-232`).
     pub fn execute_file_with_this(
         &mut self,
         file: &BytecodeFile,
