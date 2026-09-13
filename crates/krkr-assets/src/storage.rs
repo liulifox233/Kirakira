@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File},
     hash::Hash,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
@@ -59,6 +59,11 @@ struct ProjectStorageInner {
     /// native views also keep memory writes here so directory enumeration has
     /// one backend-neutral source of truth.
     catalog_paths: RwLock<BTreeMap<String, String>>,
+    /// Index over `catalog_paths`, rebuilt under that lock whenever the map is
+    /// written, so the two can never disagree. Lock order is `catalog_paths`
+    /// first, this one second: a reader must not wait for the catalogue while
+    /// holding the index.
+    catalog_index: RwLock<CatalogIndex>,
     /// Files written through a memory-backed storage view since the last
     /// drain. Browser hosts persist this journal in their own origin storage;
     /// native filesystem-backed views never use it.
@@ -75,6 +80,61 @@ struct ProjectStorageInner {
     /// lookup and raw-byte caches stay coherent, but leave this alone:
     /// official KRKR never drops decoded graphics because a file was written.
     graphic_revision: AtomicU64,
+}
+
+/// Case-insensitive index over [`ProjectStorageInner::catalog_paths`].
+///
+/// `Storages.isExistentStorage` reaches `catalog_contains`, which used to walk
+/// every catalogued name twice with `eq_ignore_ascii_case` plus a `rsplit('/')`
+/// per entry. Games that probe storage names from a per-frame script — GINKA's
+/// logo sequence spends most of its frame time there — made that scan the
+/// dominant cost, so the same two matching rules are answered from a keyed
+/// structure instead: exact case-insensitive equality against every name, and
+/// a unique basename for an explicitly extended bare name.
+#[derive(Default)]
+struct CatalogIndex {
+    /// Every catalogued name, ASCII-lowercased. `eq_ignore_ascii_case` holds
+    /// exactly between two strings whose lowercased forms are equal.
+    names: HashSet<String>,
+    /// ASCII-lowercased basename of each catalogued name. A basename claimed
+    /// by one entry maps to that name; a shared basename maps to `None`, which
+    /// keeps ambiguous basenames unresolved.
+    basenames: HashMap<String, Option<String>>,
+}
+
+impl CatalogIndex {
+    fn from_catalog(catalog: &BTreeMap<String, String>) -> Self {
+        let mut index = Self::default();
+        index.extend(catalog.values().map(String::as_str));
+        index
+    }
+
+    fn extend<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        for name in names {
+            self.names.insert(name.to_ascii_lowercase());
+            let basename = name
+                .rsplit_once('/')
+                .map_or(name, |(_, file)| file)
+                .to_ascii_lowercase();
+            self.basenames
+                .entry(basename)
+                .and_modify(|unique| *unique = None)
+                .or_insert_with(|| Some(name.to_string()));
+        }
+    }
+
+    /// Whether a separator-normalized name is catalogued, ignoring case.
+    fn contains_name(&self, normalized_lower: &str) -> bool {
+        self.names.contains(normalized_lower)
+    }
+
+    /// The catalogued name behind a lowercased basename, when exactly one
+    /// entry claims it.
+    fn unique_basename(&self, basename_lower: &str) -> Option<&str> {
+        self.basenames
+            .get(basename_lower)
+            .and_then(|path| path.as_deref())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +362,7 @@ impl ProjectStorage {
                 }
             }
         }
+        let catalog_index = CatalogIndex::from_catalog(&catalog_paths);
         Self {
             inner: Arc::new(ProjectStorageInner {
                 root,
@@ -317,6 +378,7 @@ impl ProjectStorage {
                 memory_files: RwLock::new(memory_files),
                 external_memory_cache: Mutex::new(ExternalMemoryCache::new()),
                 catalog_paths: RwLock::new(catalog_paths),
+                catalog_index: RwLock::new(catalog_index),
                 memory_writes: Mutex::new(BTreeMap::new()),
                 auto_paths: RwLock::new(auto_paths),
                 media_providers: RwLock::new(BTreeMap::new()),
@@ -428,6 +490,7 @@ impl ProjectStorage {
         }
         if let Ok(mut target) = self.inner.catalog_paths.write() {
             *target = catalog;
+            self.rebuild_catalog_index(&target);
         }
         // A catalogue replacement changes both positive and negative lookup
         // results. Drop the resolver/raw caches so a newly announced Web
@@ -444,14 +507,20 @@ impl ProjectStorage {
     {
         let mut changed = false;
         if let Ok(mut catalog) = self.inner.catalog_paths.write() {
+            let mut added = Vec::new();
             for path in paths {
                 let path = path.into();
                 if let Some(key) = catalog_path(&path) {
                     if let std::collections::btree_map::Entry::Vacant(entry) = catalog.entry(key) {
-                        entry.insert(normalize_storage_separators(&path));
+                        let name = normalize_storage_separators(&path);
+                        entry.insert(name.clone());
+                        added.push(name);
                         changed = true;
                     }
                 }
+            }
+            if changed && let Ok(mut index) = self.inner.catalog_index.write() {
+                index.extend(added.iter().map(String::as_str));
             }
         }
         if changed {
@@ -511,8 +580,12 @@ impl ProjectStorage {
         }
         if let Some(path) = catalog_entry
             && let Ok(mut catalog) = self.inner.catalog_paths.write()
+            && let std::collections::btree_map::Entry::Vacant(entry) = catalog.entry(path.clone())
         {
-            catalog.entry(path.clone()).or_insert(path);
+            entry.insert(path.clone());
+            if let Ok(mut index) = self.inner.catalog_index.write() {
+                index.extend([path.as_str()]);
+            }
         }
     }
 
@@ -810,13 +883,11 @@ impl ProjectStorage {
     /// appear present because `title.ks` exists.
     pub fn catalog_contains(&self, name: &str) -> bool {
         let normalized = normalize_storage_separators(name);
-        let Ok(catalog) = self.inner.catalog_paths.read() else {
+        let lower = normalized.to_ascii_lowercase();
+        let Ok(index) = self.inner.catalog_index.read() else {
             return false;
         };
-        if catalog
-            .values()
-            .any(|path| path.eq_ignore_ascii_case(&normalized))
-        {
+        if index.contains_name(&lower) {
             return true;
         }
         // An explicitly extended bare name may use a unique auto-path
@@ -826,12 +897,7 @@ impl ProjectStorage {
         if normalized.contains('/') || !normalized.contains('.') {
             return false;
         }
-        let mut matches = catalog.values().filter(|path| {
-            path.rsplit('/')
-                .next()
-                .is_some_and(|file| file.eq_ignore_ascii_case(&normalized))
-        });
-        matches.next().is_some() && matches.next().is_none()
+        index.unique_basename(&lower).is_some()
     }
 
     /// Returns whether a deferred publication catalogue can satisfy a *load*
@@ -870,13 +936,11 @@ impl ProjectStorage {
         if normalized.contains('/') || !normalized.contains('.') {
             return None;
         }
-        let mut matches = catalog.values().filter(|path| {
-            path.rsplit('/')
-                .next()
-                .is_some_and(|file| file.eq_ignore_ascii_case(&normalized))
-        });
-        let first = matches.next()?;
-        matches.next().is_none().then(|| first.clone())
+        drop(catalog);
+        let index = self.inner.catalog_index.read().ok()?;
+        index
+            .unique_basename(&normalized.to_ascii_lowercase())
+            .map(str::to_string)
     }
 
     /// Returns whether a logical directory exists in the filesystem, XP3
@@ -1530,26 +1594,20 @@ impl ProjectStorage {
         Err(storage_not_found(name))
     }
 
+    /// The catalogued name behind an explicitly extended bare name, when
+    /// exactly one entry claims that basename. Ambiguous basenames stay
+    /// unresolved, the rule [`Self::catalog_contains`] documents.
     fn catalog_alias(&self, name: &str) -> Option<String> {
         let normalized = normalize_storage_separators(name);
         if normalized.contains('/') || !normalized.contains('.') {
             return None;
         }
-        let catalog = self.inner.catalog_paths.read().ok()?;
-        let mut matched = None;
-        for path in catalog.values() {
-            if path
-                .rsplit('/')
-                .next()
-                .is_some_and(|basename| basename.eq_ignore_ascii_case(&normalized))
-            {
-                if matched.is_some() {
-                    return None;
-                }
-                matched = Some(path.clone());
-            }
-        }
-        matched
+        self.inner
+            .catalog_index
+            .read()
+            .ok()?
+            .unique_basename(&normalized.to_ascii_lowercase())
+            .map(str::to_string)
     }
 
     fn find_catalog_resource(
@@ -1775,6 +1833,15 @@ impl ProjectStorage {
             .read()
             .map(|paths| paths.clone())
             .unwrap_or_default()
+    }
+
+    /// Rebuilds [`Self::inner`]'s catalogue index from the catalogue the
+    /// caller has just written. The index is written nowhere else, so a reader
+    /// can never observe the two disagreeing.
+    fn rebuild_catalog_index(&self, catalog: &BTreeMap<String, String>) {
+        if let Ok(mut index) = self.inner.catalog_index.write() {
+            *index = CatalogIndex::from_catalog(catalog);
+        }
     }
 
     fn invalidate_caches(&self) {
@@ -3611,6 +3678,176 @@ mod tests {
         );
         assert!(!ambiguous.storage_exists_exact("portrait.txt"));
         assert!(ambiguous.read_binary_vec("portrait.txt").is_err());
+    }
+
+    /// The catalogue index answers exactly like the scan it replaced: full
+    /// names compare case-insensitively, a qualified name never falls back to
+    /// the basename rule, and an explicitly extended bare name resolves only
+    /// while exactly one entry claims that basename.
+    #[test]
+    fn catalog_index_answers_the_documented_matching_rules() {
+        let storage = ProjectStorage::from_memory_with_catalog(
+            Vec::<(String, Vec<u8>)>::new(),
+            ["Append/Vol1/Only.KS", "append/vol1/other.bin"],
+        );
+
+        assert!(storage.catalog_contains("append/vol1/only.ks"));
+        assert!(storage.catalog_contains("APPEND/VOL1/ONLY.KS"));
+        assert!(storage.catalog_contains("append\\vol1\\only.ks"));
+        assert!(storage.catalog_contains("Only.KS"));
+        assert!(storage.catalog_contains("only.KS"));
+        assert!(storage.storage_exists_exact("only.ks"));
+
+        assert!(!storage.catalog_contains("append/vol1/only.tjs"));
+        assert!(!storage.catalog_contains("only"));
+        assert!(!storage.catalog_contains("only.tjs"));
+        assert!(!storage.catalog_contains("missing/only.ks"));
+
+        storage.add_catalog_paths(["append/vol2/ONLY.ks"]);
+        assert!(!storage.catalog_contains("only.ks"));
+        assert!(!storage.storage_exists_exact("only.ks"));
+        assert!(storage.catalog_contains("append/vol1/only.ks"));
+        assert!(storage.catalog_contains("append/vol2/only.ks"));
+    }
+
+    /// Every catalogue write rebuilds the index: adding an entry makes a bare
+    /// name ambiguous at once, replacing the catalogue can make it unique
+    /// again, and a memory insert announces its file the same way.
+    #[test]
+    fn catalog_index_follows_catalogue_writes() {
+        let storage = ProjectStorage::from_memory_with_catalog(
+            Vec::<(String, Vec<u8>)>::new(),
+            ["append/vol1/only.ks"],
+        );
+        assert!(storage.catalog_contains("only.ks"));
+        assert!(storage.catalog_contains_for_load("only.ks"));
+
+        storage.add_catalog_paths(["append/vol2/only.ks"]);
+        assert!(!storage.catalog_contains("only.ks"));
+        assert!(!storage.catalog_contains_for_load("only.ks"));
+
+        storage.set_catalog_paths(["append/vol2/only.ks"]);
+        assert!(storage.catalog_contains("only.ks"));
+        assert!(storage.catalog_contains_for_load("ONLY.KS"));
+        assert!(storage.catalog_contains("append/vol2/only.ks"));
+        assert!(!storage.catalog_contains("append/vol1/only.ks"));
+
+        storage.set_catalog_paths(Vec::<String>::new());
+        assert!(!storage.catalog_contains("only.ks"));
+        assert!(!storage.catalog_contains("append/vol2/only.ks"));
+
+        storage.insert_memory("append/vol3/only.ks", b"bytes".to_vec());
+        assert!(storage.catalog_contains("only.ks"));
+        assert!(storage.catalog_contains("APPEND/VOL3/ONLY.KS"));
+    }
+
+    /// The index is an optimisation of the catalogue scan, not a redefinition
+    /// of it: across a deterministic corpus of catalogues and probes, the
+    /// indexed answers equal the brute-force scan they replaced — including
+    /// spelled-out case variants, mixed separators and duplicate basenames.
+    #[test]
+    fn catalog_index_agrees_with_the_reference_scan() {
+        fn scan_contains(catalog: &BTreeMap<String, String>, name: &str) -> bool {
+            let normalized = normalize_storage_separators(name);
+            if catalog
+                .values()
+                .any(|path| path.eq_ignore_ascii_case(&normalized))
+            {
+                return true;
+            }
+            if normalized.contains('/') || !normalized.contains('.') {
+                return false;
+            }
+            let mut matches = catalog.values().filter(|path| {
+                path.rsplit('/')
+                    .next()
+                    .is_some_and(|file| file.eq_ignore_ascii_case(&normalized))
+            });
+            matches.next().is_some() && matches.next().is_none()
+        }
+
+        fn scan_unique_basename(catalog: &BTreeMap<String, String>, name: &str) -> Option<String> {
+            let normalized = normalize_storage_separators(name);
+            if normalized.contains('/') || !normalized.contains('.') {
+                return None;
+            }
+            let mut matched = None;
+            for path in catalog.values() {
+                if path
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|file| file.eq_ignore_ascii_case(&normalized))
+                {
+                    if matched.is_some() {
+                        return None;
+                    }
+                    matched = Some(path.clone());
+                }
+            }
+            matched
+        }
+
+        let segments = ["data", "Data", "sys", "bgimage", "fgimage", "vol1", "Vol2"];
+        let stems = ["only", "Only", "config", "title"];
+        let suffix = ["ks", "KS", "tjs", "png", "noext"];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+
+        for case in 0..64 {
+            let mut catalog = BTreeMap::new();
+            for _ in 0..random() % 8 + 1 {
+                let name = format!(
+                    "{}/{}_{}.{}",
+                    segments[random() % segments.len()],
+                    stems[random() % stems.len()],
+                    random() % 3,
+                    suffix[random() % suffix.len()]
+                );
+                if let Some(key) = catalog_path(&name) {
+                    catalog.entry(key).or_insert(name);
+                }
+            }
+            let storage = ProjectStorage::from_memory_with_catalog(
+                Vec::<(String, Vec<u8>)>::new(),
+                catalog.values().cloned(),
+            );
+            assert_eq!(
+                *storage.inner.catalog_paths.read().expect("catalogue"),
+                catalog,
+                "case {case} catalogued a different set of names"
+            );
+
+            for _ in 0..16 {
+                let dir = segments[random() % segments.len()];
+                let stem = stems[random() % stems.len()];
+                let extension = suffix[random() % suffix.len()];
+                let probes = [
+                    format!("{dir}/{stem}_{}.{extension}", random() % 3),
+                    format!("{stem}_{}.{extension}", random() % 3),
+                    stem.to_string(),
+                    format!("{stem}.{extension}"),
+                    format!("{dir}/{stem}.{extension}").replace('/', "\\"),
+                    format!("{dir}//{stem}_{}.{extension}", random() % 3),
+                ];
+                for probe in probes {
+                    assert_eq!(
+                        storage.catalog_contains(&probe),
+                        scan_contains(&catalog, &probe),
+                        "case {case} probe {probe:?}"
+                    );
+                    assert_eq!(
+                        storage.catalog_alias(&probe),
+                        scan_unique_basename(&catalog, &probe),
+                        "case {case} probe {probe:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
