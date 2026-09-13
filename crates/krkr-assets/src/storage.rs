@@ -59,10 +59,15 @@ struct ProjectStorageInner {
     /// native views also keep memory writes here so directory enumeration has
     /// one backend-neutral source of truth.
     catalog_paths: RwLock<BTreeMap<String, String>>,
-    /// Index over `catalog_paths`, rebuilt under that lock whenever the map is
-    /// written, so the two can never disagree. Lock order is `catalog_paths`
-    /// first, this one second: a reader must not wait for the catalogue while
-    /// holding the index.
+    /// Index over `catalog_paths`, updated (rebuilt or extended) only while
+    /// that map's write lock is held, so the two are never written apart. A
+    /// reader of the index alone — `catalog_contains`, `catalog_alias` — sees
+    /// one consistent generation; a reader that takes the map first and the
+    /// index second (`catalog_load_path`) may pair two adjacent generations
+    /// under a concurrent write, and every name either answer returns still
+    /// belongs to one of them. Lock order is `catalog_paths` first, this one
+    /// second: a reader must not wait for the catalogue while holding the
+    /// index.
     catalog_index: RwLock<CatalogIndex>,
     /// Files written through a memory-backed storage view since the last
     /// drain. Browser hosts persist this journal in their own origin storage;
@@ -86,11 +91,12 @@ struct ProjectStorageInner {
 ///
 /// `Storages.isExistentStorage` reaches `catalog_contains`, which used to walk
 /// every catalogued name twice with `eq_ignore_ascii_case` plus a `rsplit('/')`
-/// per entry. Games that probe storage names from a per-frame script — GINKA's
-/// logo sequence spends most of its frame time there — made that scan the
-/// dominant cost, so the same two matching rules are answered from a keyed
-/// structure instead: exact case-insensitive equality against every name, and
-/// a unique basename for an explicitly extended bare name.
+/// per entry. GINKA probes storage names while its bootstrap runs, so that
+/// scan dominated the run's first seconds — 24% of the run's samples, and
+/// under 1% inside the logo frames, which are renderer-bound. The same two
+/// matching rules are answered from a keyed structure instead: exact
+/// case-insensitive equality against every name, and a unique basename for an
+/// explicitly extended bare name.
 #[derive(Default)]
 struct CatalogIndex {
     /// Every catalogued name, ASCII-lowercased. `eq_ignore_ascii_case` holds
@@ -1836,8 +1842,10 @@ impl ProjectStorage {
     }
 
     /// Rebuilds [`Self::inner`]'s catalogue index from the catalogue the
-    /// caller has just written. The index is written nowhere else, so a reader
-    /// can never observe the two disagreeing.
+    /// caller has just written. This is one of the index's three update sites
+    /// — `add_catalog_paths` and `insert_memory_with_policy` extend it
+    /// instead of rebuilding — and all three run while the catalogue's write
+    /// lock is held, so the index never moves except with the map.
     fn rebuild_catalog_index(&self, catalog: &BTreeMap<String, String>) {
         if let Ok(mut index) = self.inner.catalog_index.write() {
             *index = CatalogIndex::from_catalog(catalog);
