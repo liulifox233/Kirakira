@@ -119,7 +119,7 @@
 //! **Not reachable from the audio path yet**: the engine's `WaveSoundBuffer`
 //! owns a per-instance `filters` array (read-only member — the reference's
 //! `TJSCreateArrayObject` at `sound/WaveIntf.cpp:815` with a denied setter at
-//! `:1560-1562`) but neither reads it nor carries a filter chain through
+//! `:1552`) but neither reads it nor carries a filter chain through
 //! `AudioCommand` (`crates/krkr-core/src/lib.rs:665` has no filter payload),
 //! so nothing calls [`FreeVerb::process`] while a buffer plays. The filters'
 //! `interface` property returns a **sentinel** integer instead of the
@@ -1574,7 +1574,7 @@ mod tests {
     /// the one script-visible half of the reference contract — and the Rust
     /// side can resolve it by identity for processing (the dossier's
     /// pointer-free mapping).  The member itself is read-only
-    /// (`TJS_DENY_NATIVE_PROP_SETTER`, `WaveIntf.cpp:1560-1562`), so the script
+    /// (`TJS_DENY_NATIVE_PROP_SETTER`, `WaveIntf.cpp:1552`), so the script
     /// fills the buffer's own array instead of replacing the member.
     #[test]
     fn filters_array_keeps_the_object_and_identity_resolves_it() {

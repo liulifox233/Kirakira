@@ -447,7 +447,7 @@ fn install_wave_native_properties(
             continue;
         }
         // `filters` is `TJS_DENY_NATIVE_PROP_SETTER` in the reference
-        // (`WaveIntf.cpp:1560-1562`): script may read the instance's array but
+        // (`WaveIntf.cpp:1552`): script may read the instance's array but
         // a write fails with `TJS_E_ACCESSDENYED` (-1007) before any accessor
         // runs.  Every other member of the list is a normal read/write
         // property.
@@ -2559,9 +2559,11 @@ fn filled_layer_pixels(width: u32, height: u32, fill: [u8; 4]) -> Vec<u8> {
 
 /// A fresh layer image at `width`×`height` filled with `fill`.
 ///
-/// The plane is written once: `create_layer_image` allocates it and the fill
-/// goes into that same allocation, where the old shape filled a `Vec` and then
-/// copied it into the image (`Arc::<[u8]>::from` copies).
+/// `create_layer_image` still copies the zeroed `Vec` into the image's `Arc`
+/// (`Arc::<[u8]>::from` copies), so this does not remove a pass from the
+/// allocate paths — the fill just writes the image's own allocation instead of
+/// the temporary `Vec`.  Colour 0 skips the fill because the plane the image
+/// was built from is already zeroed.
 fn create_filled_layer_image(
     runtime: &mut Runtime<KrkrHost>,
     width: u32,
@@ -9545,10 +9547,14 @@ fn fill_layer_pixels(
     if x1 <= x0 || y1 <= y0 {
         return Ok(());
     }
+    // The snapshot above shares the layer's pixel buffer, so it has to go
+    // before the whole-plane branch below asks whether this call owns that
+    // buffer: an outstanding clone always reads as a second holder.
+    drop(layer);
 
     if x0 == 0 && y0 == 0 && x1 == image_width && y1 == image_height && clip.is_none() {
         // The whole plane is replaced, so a buffer this call owns exclusively
-        // can be filled where it lies and published under a fresh texture id
+        // is filled where it lies and published under a fresh texture id
         // (`plugin_api::layer`'s ownership rule); anything shared keeps its
         // bytes and gets a fresh image, exactly like before — cloning the old
         // plane first would copy every byte only to overwrite it.
@@ -9557,9 +9563,14 @@ fn fill_layer_pixels(
             install_layer_plane(runtime, target, image, image_width, image_height);
             return Ok(());
         };
-        if rgba != [0, 0, 0, 0]
-            && let Some(pixels) = Arc::get_mut(&mut image.upload.rgba)
-        {
+        // `fillRect(0, 0, w, h, 0)` is a clear, not a no-op: the owned plane is
+        // zeroed before it is published, exactly like the fresh-plane path
+        // (`create_layer_image` starts zeroed).  `make_mut` writes in place
+        // because the take proved this call is the buffer's only holder.
+        let pixels = Arc::make_mut(&mut image.upload.rgba);
+        if rgba == [0, 0, 0, 0] {
+            pixels.fill(0);
+        } else {
             fill_pixel_buffer(pixels, rgba);
         }
         image.upload.texture_id = runtime.host_mut().allocate_video_texture_id();
@@ -11336,7 +11347,7 @@ mod tests {
     /// `Cannot convert the variable type ((void) to Object)`.
     /// `WaveIntf.cpp:815` creates the array in the NI constructor, the getter
     /// (`:1540-1554`) hands the same array back on every read, and the setter
-    /// is denied (`TJS_DENY_NATIVE_PROP_SETTER`, `:1560-1562`): a script write
+    /// is denied (`TJS_DENY_NATIVE_PROP_SETTER`, `:1552`): a script write
     /// fails with `TJS_E_ACCESSDENYED` and leaves the instance's array alone.
     #[test]
     fn wave_sound_buffer_filters_is_a_per_instance_array() {
@@ -11389,6 +11400,154 @@ mod tests {
                  kept=1 second=0 same=y perInstance=y"
                     .to_string()
             )
+        );
+    }
+
+    /// The address of the plane a plugin read view is handed.
+    fn layer_plane_address(engine: &mut crate::KrkrEngine, layer: ObjectHandle) -> usize {
+        crate::plugin_api::layer::layer_bitmap_read(engine.tjs_runtime_mut(), layer, |view| {
+            view.pixels.as_ptr() as usize
+        })
+        .expect("read pointer")
+    }
+
+    fn layer_main_pixel(engine: &mut crate::KrkrEngine, expression: &str) -> i64 {
+        engine
+            .execute_expression("read.tjs", expression)
+            .expect("pixel")
+            .to_integer()
+            .expect("integer")
+    }
+
+    /// A whole-plane `fillRect` writes the layer's own buffer (the plane keeps
+    /// its address across the call) and colour 0 **clears** it: the
+    /// fresh-image path always built a zeroed plane, so the in-place path must
+    /// zero the owned one instead of skipping the fill.
+    #[test]
+    fn whole_plane_fills_edit_the_owned_buffer_in_place_and_clear_with_zero() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                "global.layer = new Layer();\n\
+                 layer.setImageSize(8, 8);\n\
+                 layer.fillRect(0, 0, 8, 8, 0xffff0000);\n",
+            )
+            .expect("script");
+        let layer = engine
+            .tjs_runtime()
+            .global_member("layer")
+            .object_handle()
+            .expect("layer");
+        assert_eq!(
+            layer_main_pixel(&mut engine, "layer.getMainPixel(0, 0)"),
+            0xff0000
+        );
+        let address = layer_plane_address(&mut engine, layer);
+
+        engine
+            .execute_script("fill.tjs", "layer.fillRect(0, 0, 8, 8, 0xff00ff00);")
+            .expect("fill");
+        assert_eq!(
+            layer_main_pixel(&mut engine, "layer.getMainPixel(0, 0)"),
+            0x00ff00
+        );
+        assert_eq!(
+            layer_plane_address(&mut engine, layer),
+            address,
+            "an owned plane is filled where it lies, not replaced"
+        );
+
+        engine
+            .execute_script("clear.tjs", "layer.fillRect(0, 0, 8, 8, 0);")
+            .expect("clear");
+        assert_eq!(
+            layer_main_pixel(&mut engine, "layer.getMainPixel(0, 0)"),
+            0,
+            "colour 0 clears the plane"
+        );
+        assert_eq!(
+            layer_main_pixel(&mut engine, "layer.getMaskPixel(0, 0)"),
+            0,
+            "colour 0 clears alpha too"
+        );
+        assert_eq!(
+            layer_plane_address(&mut engine, layer),
+            address,
+            "the clear writes the same owned plane"
+        );
+    }
+
+    /// A whole-plane fill over a buffer somebody else still holds
+    /// (`Layer.assignImages` shares one image between two layers) must not
+    /// touch the shared bytes: the destination gets a fresh plane, exactly like
+    /// the old unconditional copy.
+    #[test]
+    fn a_shared_whole_plane_fill_leaves_the_other_holder_untouched() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                "global.src = new Layer();\n\
+                 src.setImageSize(2, 1);\n\
+                 src.fillRect(0, 0, 2, 1, 0xffff0000);\n\
+                 global.dest = new Layer();\n\
+                 dest.setImageSize(2, 1);\n\
+                 dest.assignImages(src);\n",
+            )
+            .expect("script");
+        let src_id = engine
+            .execute_expression("id.tjs", "src.__nativeLayerId")
+            .expect("id")
+            .to_integer()
+            .expect("integer") as u64;
+        let dest_id = engine
+            .execute_expression("id.tjs", "dest.__nativeLayerId")
+            .expect("id")
+            .to_integer()
+            .expect("integer") as u64;
+        let held = |engine: &crate::KrkrEngine, id: u64| {
+            engine
+                .host()
+                .layer_tree()
+                .layer(id)
+                .expect("layer node")
+                .image
+                .clone()
+                .expect("layer image")
+        };
+        assert!(
+            Arc::ptr_eq(
+                &held(&engine, src_id).upload.rgba,
+                &held(&engine, dest_id).upload.rgba
+            ),
+            "assignImages shares one buffer between the two layers"
+        );
+
+        engine
+            .execute_script("fill.tjs", "dest.fillRect(0, 0, 2, 1, 0xff00ff00);")
+            .expect("fill");
+
+        assert_eq!(
+            layer_main_pixel(&mut engine, "src.getMainPixel(0, 0)"),
+            0xff0000,
+            "the holder keeps its bytes"
+        );
+        assert_eq!(
+            layer_main_pixel(&mut engine, "dest.getMainPixel(0, 0)"),
+            0x00ff00,
+            "the destination committed the fill"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &held(&engine, src_id).upload.rgba,
+                &held(&engine, dest_id).upload.rgba
+            ),
+            "the destination moved to a fresh plane"
         );
     }
 }
