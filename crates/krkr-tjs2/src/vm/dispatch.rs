@@ -262,14 +262,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         //
         // Native *constructors* are the exception: `RegisterNCM` stores the
         // class's own constructor with `val = dsp` and no ObjThis
-        // (tjsNative.cpp:246, `TJS_END_NATIVE_CONSTRUCTOR_DECL`), and
-        // instances receive their copy already bound when the native class is
-        // initialized on them (`tTJSVariant(val, objthis)`, tjsNative.cpp:295
-        // -> `install_class_name_constructor`).  Binding one here would make
+        // (tjsNative.cpp:280-281, `TJS_END_NATIVE_CONSTRUCTOR_DECL`,
+        // tjsNative.h:408-411), and instances receive their copy already bound
+        // when the native class is initialized on them
+        // (`val.ChangeClosureObjThis(Dest)`, tjsNative.cpp:343-360 ->
+        // `install_class_name_constructor`).  Binding one here would make
         // `Layer.Layer(win, this)` -- read through `global.Layer` -- run on
         // whichever object the class was looked up from instead of on the
         // caller's `this`, which is what VM_CALLD resolves
-        // (tjsInterCodeExec.cpp:2015).
+        // (tjsInterCodeExec.cpp:2434).
+        //
+        // A member that resolves *on a class object* is bound to the receiver
+        // of record rather than to that class object: the class object's own
+        // member table holds the unbound copy (`RegisterNCM` stores it with
+        // `val = dsp`, tjsNative.cpp:280-281), the bound copy lives on the
+        // instance the member was reached through (`regmember`,
+        // tjsInterCodeExec.cpp:3033), and `TJSDefaultFuncCall` then uses the
+        // instance with `TJS_SELECT_OBJTHIS` (`tjsObject.cpp:1281-1312`) --
+        // or falls back to `ra[-1]` for a class-qualified call, which is what
+        // `caller_this` holds here.  Without this, a class-qualified call
+        // such as KAGEX's `global.Layer.loadImages(a0, a1)` handed the native
+        // method the class object as `this`.
         if bind_this.is_none()
             && let Variant::Object(native) = &value
             && matches!(
@@ -280,7 +293,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 } | ObjectKind::VmNativeFunction { .. }
             )
         {
-            return Ok(self.bind_proxy_value(value, Some(handle)));
+            let bind_target = if self.is_class_object(handle) {
+                caller_this.or(Some(handle))
+            } else {
+                Some(handle)
+            };
+            return Ok(self.bind_proxy_value(value, bind_target));
         }
         Ok(self.bind_proxy_value(value, bind_this))
     }
@@ -1660,23 +1678,57 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// `KAGLayer`) and the native `Layer.Layer(win, this)` constructor must
     /// run on the caller's object, and `bound_super_this` already covers the
     /// class-qualified cases that do belong to the calling instance.
+    ///
+    /// That extends to *native* class objects, which is what KAGEX's
+    /// `system/KAGLayer.tjs` wrapper relies on:
+    ///
+    /// ```text
+    /// function loadImages(a0, a1) { global.Layer.loadImages(a0, a1); }
+    /// ```
+    ///
+    /// A receiver that is a class object carries no ObjThis in krkr --
+    /// `base/ScriptMgnIntf.cpp:497-505` publishes every native class with
+    /// `val = tTJSVariant(dsp/*, dsp*/)`, the ObjThis operand commented out
+    /// with `REGISTER_OBJECT(Layer, ...)` right below it (`:508`), and
+    /// `RegisterNCM` stores the class's own members the same way with
+    /// `val = dsp` (`tjsNative.cpp:280-281`) -- so `CallFunctionDirect` falls
+    /// through to `ra[-1]`, the instance whose method is making the call
+    /// (`tjsInterCodeExec.cpp:2434`).  Letting the class object stand in
+    /// instead sent `loadImages` to the class: the pixels landed on the
+    /// staging layer behind `kag:base` and the stand and portrait layers
+    /// stayed empty.
     fn receiver_supplies_call_this(&self, handle: ObjectHandle, name: &str) -> bool {
         // `handle_class_name_matches` covers the native class objects too:
         // `Layer.Layer(win, this)` reads the constructor stored under the class
         // name, and that member is what makes the call a class-qualified
         // construction instead of a method invocation.
-        !self.handle_class_name_matches(handle, name)
+        !self.is_class_object(handle)
+            && !self.handle_class_name_matches(handle, name)
             && handle != self.runtime.global
             // A `%-2` this-proxy receiver already forwards property access to
             // the instance that made it, so it keeps the caller's `this`
             // instead of turning the proxy itself into the callee's receiver.
-            && !matches!(
+            && !matches!(self.runtime.heap[handle.0].kind, ObjectKind::Proxy { .. })
+    }
+
+    /// Whether `handle` is a class object rather than an instance of one.
+    ///
+    /// A script class is an `InterCode` object with the class context; a
+    /// native or plugin class is the object `install_native_class` allocated
+    /// with `alloc_native_constructor`, whose members are the official
+    /// `RegisterNCM` table.  Both are published into the global table as
+    /// `tTJSVariant(dsp, NULL)` (`base/ScriptMgnIntf.cpp:497-505`) while every
+    /// *instance* the engine hands out is self-bound (`Variant::self_bound`),
+    /// so a class object is the one receiver shape whose `clo.ObjThis` is
+    /// always null and which therefore never supplies the callee's `this`.
+    fn is_class_object(&self, handle: ObjectHandle) -> bool {
+        self.is_bytecode_class(handle)
+            || matches!(
                 self.runtime.heap[handle.0].kind,
-                ObjectKind::Proxy { .. }
-                    | ObjectKind::InterCode {
-                        context: BytecodeContextType::Class,
-                        ..
-                    }
+                ObjectKind::NativeFunction {
+                    constructable: true,
+                    ..
+                }
             )
     }
 
@@ -2924,7 +2976,25 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     }
 
     fn bind_proxy_value(&self, value: Variant, bind_this: Option<ObjectHandle>) -> Variant {
-        let Some(this_obj) = bind_this else {
+        // Only an *instance* binds the members read through it, because only
+        // an instance receives the bound member copies the reference's
+        // `regmember`/native-class initialisation hands out
+        // (`val.ChangeClosureObjThis(Dest)`, `tjsInterCodeExec.cpp:3033`,
+        // `tjsNative.cpp:343-360`).  A class object's own members are stored
+        // unbound -- `RegisterNCM` writes them with `val = dsp`
+        // (`tjsNative.cpp:280-281`) and the global table publishes the class
+        // itself with the ObjThis operand commented out
+        // (`base/ScriptMgnIntf.cpp:497-508`) -- so a member read off a class
+        // object or off the global object comes back exactly as stored, and
+        // the call's `this` stays whatever `clo.ObjThis ? clo.ObjThis : ra[-1]`
+        // picks (`tjsInterCodeExec.cpp:2434`).  Binding such a read to the
+        // class object (or to the global) instead handed KAGEX's class-object
+        // call form `Closure{ Layer.loadImages, ObjThis = the class object }`,
+        // which then overrode `ra[-1]` and sent the stand, portrait and window
+        // images to the wrong layer -- the invisible stand.
+        let Some(this_obj) = bind_this
+            .filter(|handle| *handle != self.runtime.global && !self.is_class_object(*handle))
+        else {
             return value;
         };
         match self.materialize_code_object(value) {
@@ -4261,6 +4331,228 @@ mod tests {
                 "#)
             .expect("stored self-binding"),
             Variant::String("1:0".to_string())
+        );
+    }
+
+    /// Reports the handle it was called with as `this`, so a test can tell
+    /// whose instance a native method ran on.
+    ///
+    /// Every native handler in this crate answers `Result<Variant>`, so the
+    /// `result_large_err` lint fires on them the same way it does on the
+    /// engine's own handlers (which carry a module-wide allow).
+    #[allow(clippy::result_large_err)]
+    fn native_this_handle(
+        _runtime: &mut Runtime<NoHost>,
+        this_obj: Option<ObjectHandle>,
+        _args: Vec<Variant>,
+    ) -> Result<Variant> {
+        Ok(Variant::Integer(
+            this_obj.map(|handle| handle.0 as i64).unwrap_or(-1),
+        ))
+    }
+
+    /// Stands in for `tTJSNativeClassConstructor::FuncCall`
+    /// (`tjsNative.cpp:119-137`), which clears the result and so answers void
+    /// when a class object is called as a plain function.
+    #[allow(clippy::result_large_err)]
+    fn native_class_constructor(
+        _runtime: &mut Runtime<NoHost>,
+        _this_obj: Option<ObjectHandle>,
+        _args: Vec<Variant>,
+    ) -> Result<Variant> {
+        Ok(Variant::Void)
+    }
+
+    /// A native class the way `install_native_class` (`classes.rs:43-56`)
+    /// builds one: the class object is a `constructable` native function
+    /// carrying the class name, its members hang off that same object, and the
+    /// global table publishes it as `Variant::Object` -- the bare
+    /// `tTJSVariant(dsp)` krkr writes in `base/ScriptMgnIntf.cpp:497-505`.
+    fn install_fake_layer_class(runtime: &mut Runtime<NoHost>) -> ObjectHandle {
+        let class = runtime.alloc_native_constructor(native_class_constructor);
+        runtime.add_object_class_info(class, "FakeLayer");
+        runtime.set_object_member(
+            class,
+            "FakeLayer",
+            Variant::Closure(Closure::new(class, None)),
+        );
+        for name in ["loadImages", "identity"] {
+            let method = runtime.alloc_native_function(native_this_handle);
+            runtime.set_object_member(class, name, Variant::Object(method));
+        }
+        runtime.set_global_member("FakeLayer", Variant::Object(class));
+        class
+    }
+
+    /// The mission's regression: KAGEX paints its stand and portrait with the
+    /// class-object call form spelled out in `system/KAGLayer.tjs:57-63` --
+    /// `function loadImages(a0, a1) { global.Layer.loadImages(a0, a1); }`.  The
+    /// reference resolves that call with `clo.ObjThis ? clo.ObjThis : ra[-1]`
+    /// (`tjsInterCodeExec.cpp:2406`) and a native class object's value carries
+    /// no ObjThis (`base/ScriptMgnIntf.cpp:497-505`, `val = tTJSVariant(dsp)`,
+    /// the ObjThis operand commented out), so the *caller's* instance -- the
+    /// layer whose wrapper is running -- is the method's `this`.  Handing the
+    /// method the class object instead put the decoded image on the staging
+    /// layer behind `kag:base` while the stand and portrait layers stayed
+    /// empty.
+    #[test]
+    fn a_class_object_call_runs_on_the_callers_instance() {
+        let mut runtime = Runtime::new();
+        let class = install_fake_layer_class(&mut runtime);
+        let value = run_with(
+            &mut runtime,
+            "class Wrapper {\n\
+             \x20   function loadImages(a0, a1) {\n\
+             \x20       return global.FakeLayer.loadImages(a0, a1);\n\
+             \x20   }\n\
+             }\n\
+             var wrapper = new Wrapper();\n\
+             return wrapper.loadImages(\"window_name\");",
+        )
+        .expect("wrapper call");
+        let wrapper = runtime
+            .global_member("wrapper")
+            .object_handle()
+            .expect("wrapper");
+        assert_eq!(
+            value,
+            Variant::Integer(wrapper.0 as i64),
+            "the class-object call must run on the caller's instance"
+        );
+        assert_ne!(
+            value,
+            Variant::Integer(class.0 as i64),
+            "the class object must not supply itself as `this`"
+        );
+    }
+
+    /// Call shape 2: a member call on an instance resolves the class's member
+    /// through the instance's super-class link and runs it on the instance.
+    /// The reference gives the instance its own member copy, already bound to
+    /// it (`val.ChangeClosureObjThis(Dest)`, `tjsNative.cpp:343-360`), and
+    /// `TJSDefaultFuncCall` prefers that ObjThis over the receiver's
+    /// (`tjsObject.cpp:1281-1312`).
+    #[test]
+    fn an_instance_call_runs_on_the_instance() {
+        let mut runtime = Runtime::new();
+        let class = install_fake_layer_class(&mut runtime);
+        let instance = runtime.alloc_ordinary_object();
+        runtime.set_object_super_class(instance, class);
+        runtime.set_global_member("layer", Variant::self_bound(instance));
+        let value = run_with(&mut runtime, "return layer.loadImages(\"window_name\");")
+            .expect("instance call");
+        assert_eq!(value, Variant::Integer(instance.0 as i64));
+    }
+
+    /// A native method read off a *class object* comes back exactly as stored
+    /// -- unbound -- so it runs on whatever `this` its call site supplies.
+    ///
+    /// The reference stores a class's own member copies with `val = dsp`
+    /// (`RegisterNCM`, `tjsNative.cpp:280-281`, and the global table publishes
+    /// the class itself with the ObjThis operand commented out,
+    /// `base/ScriptMgnIntf.cpp:497-508`), so a read hands the value back
+    /// unchanged and the *later* call picks `clo.ObjThis ? clo.ObjThis :
+    /// ra[-1]` (`tjsInterCodeExec.cpp:2434`).  Binding the read to the object
+    /// it came through instead made `system/KAGLayer.tjs`'s chain run its
+    /// native `loadImages` on the class object when a top-level read carried
+    /// that binding down into the layer's own method, which sent the stand,
+    /// portrait and window images to the staging layer behind `kag:base` --
+    /// the invisible stand.
+    #[test]
+    fn a_class_method_read_stays_unbound() {
+        let mut runtime = Runtime::new();
+        let class = install_fake_layer_class(&mut runtime);
+        let value = run_with(
+            &mut runtime,
+            "class Wrapper {\n\
+             \x20   function Wrapper() {}\n\
+             \x20   function use(fetched) { return fetched(); }\n\
+             }\n\
+             var wrapper = new Wrapper();\n\
+             var fetched = global.FakeLayer.identity;\n\
+             return wrapper.use(fetched);",
+        )
+        .expect("fetched class method");
+        let wrapper = runtime
+            .global_member("wrapper")
+            .object_handle()
+            .expect("wrapper");
+        assert_eq!(
+            value,
+            Variant::Integer(wrapper.0 as i64),
+            "the read must not bind the method to the class object or the caller"
+        );
+        assert_ne!(value, Variant::Integer(class.0 as i64));
+    }
+
+    /// The same rule for the global object: `krkr` publishes every native
+    /// class into it with `val = tTJSVariant(dsp)` (`base/ScriptMgnIntf.cpp:500`)
+    /// and stores global functions as plain members, so a read there binds
+    /// nothing either.
+    #[test]
+    fn a_global_native_read_stays_unbound() {
+        let mut runtime = Runtime::new();
+        runtime.register_global_native("identity", native_this_handle);
+        let value = run_with(
+            &mut runtime,
+            "class Wrapper {\n\
+             \x20   function Wrapper() {}\n\
+             \x20   function use(fetched) { return fetched(); }\n\
+             }\n\
+             var wrapper = new Wrapper();\n\
+             var fetched = global.identity;\n\
+             return wrapper.use(fetched);",
+        )
+        .expect("fetched global function");
+        let wrapper = runtime
+            .global_member("wrapper")
+            .object_handle()
+            .expect("wrapper");
+        assert_eq!(value, Variant::Integer(wrapper.0 as i64));
+    }
+
+    /// Call shape 3: `(f incontextof o)` binds `this` to `o`, and that binding
+    /// wins over `ra[-1]` -- `VM_CHGTHIS` sets the value's ObjThis
+    /// (`tjsInterCodeExec.cpp:1448-1452`) and both call opcodes prefer it
+    /// (`:2295`, `:2434`).
+    #[test]
+    fn an_incontextof_closure_beats_the_callers_this() {
+        let mut runtime = Runtime::new();
+        install_fake_layer_class(&mut runtime);
+        let value = run_with(
+            &mut runtime,
+            "class Wrapper {\n\
+             \x20   function fetch(other) {\n\
+             \x20       return (global.FakeLayer.identity incontextof other)();\n\
+             \x20   }\n\
+             }\n\
+             var wrapper = new Wrapper();\n\
+             var other = new Wrapper();\n\
+             return wrapper.fetch(other);",
+        )
+        .expect("bound call");
+        let other = runtime
+            .global_member("other")
+            .object_handle()
+            .expect("other");
+        assert_eq!(value, Variant::Integer(other.0 as i64));
+    }
+
+    /// Call shape 4: `new` hands the fresh object to its constructor as `this`
+    /// and publishes the result already self-bound
+    /// (`tTJSVariant(dsp, dsp)`, `tjsInterCodeExec.cpp:2372-2385`), so a call
+    /// on that value keeps binding to it.
+    #[test]
+    fn a_new_result_is_its_own_this() {
+        assert_eq!(
+            run("class Box {\n\
+                 \x20   function Box() { this.owner = this; }\n\
+                 \x20   function tag() { return this; }\n\
+                 }\n\
+                 var box = new Box();\n\
+                 return (box.owner === box) + \":\" + (box.tag() === box);")
+            .expect("new call"),
+            Variant::String("1:1".to_string())
         );
     }
 
