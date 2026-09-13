@@ -1582,6 +1582,8 @@ mod tests {
     use crate::bytecode::{
         BytecodeContextType, BytecodeFile, CodeObject, DataPool, DataSlot, DataSlotType,
     };
+    use crate::compiler::compile_source_to_bytecode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -1738,6 +1740,96 @@ mod tests {
             runtime.global_member("seen"),
             Variant::String("instance".to_string())
         );
+    }
+
+    /// A global property's getter runs on the *global*, whatever `this` the
+    /// reading frame has.  A top-level `property` declaration installs the
+    /// property with the global as its ObjThis -- the reference's prologue is
+    /// `const %1, #prop; chgthis %1, %-1; spds %-1.#name, %1`, emitted with
+    /// `changethis` set for `ctProperty` (`tjsInterCodeGen.cpp:747-781`,
+    /// `:946`) -- and `TJS_SELECT_OBJTHIS` (`tjsObject.h:81-82`) therefore
+    /// hands the getter that ObjThis instead of the reader's `this`
+    /// (`tjsObject.cpp:1364`, `:1452`).
+    ///
+    /// Answering the reader's `this` instead makes the getter's this-proxy
+    /// start at that object, and a `Dictionary` answers every unqualified
+    /// global name it does not hold with `void` (`tjsDictionary.cpp:734-745`),
+    /// so the getter reads void where the global holds the value.  That is
+    /// what killed PARQUET's Extra screen: the `.func` eval
+    /// `this.enabled=(.checkAnyClear)` ran with a KAG UI part table (a
+    /// `Dictionary`) as `this`, `default.tjs:981`'s getter read `tf` as void
+    /// and `tf.allseen` raised "Cannot convert the variable type ((void) to
+    /// Object)" at `voicemode.ks:35`.
+    #[test]
+    fn global_property_getter_runs_on_the_global_not_on_the_reader_this() {
+        let file = compile_source_to_bytecode(
+            "shadowed-global.tjs",
+            r#"
+            property probe { getter { return value; } }
+            global.value = 7;
+            function read() { return .probe; }
+            var shadow = new Dictionary();
+            return (read incontextof shadow)();
+            "#,
+        )
+        .expect("compile");
+        let mut runtime = Runtime::new();
+        let file_id = runtime.install_script_file(Arc::new(file));
+        let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
+        assert_eq!(
+            vm.execute_top_level().expect("execute"),
+            Variant::Integer(7),
+            "the getter must read `value` on the global, not through the Dictionary"
+        );
+    }
+
+    /// A read whose getter parks on a pending resource observes the *loaded*
+    /// value after the resume, not the temporary `void` the dispatch layer
+    /// answers while the getter's stack is parked.  The getter's own frame
+    /// stays in the suspended stack and finishes first, then the rewound read
+    /// instruction re-enters it (`Vm::run_call_stack`).
+    #[test]
+    fn a_read_parked_on_a_pending_resource_observes_the_loaded_value() {
+        static LOADS: AtomicUsize = AtomicUsize::new(0);
+
+        fn load(
+            _runtime: &mut Runtime<NoHost>,
+            _this_obj: Option<ObjectHandle>,
+            _args: Vec<Variant>,
+        ) -> Result<Variant> {
+            if LOADS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(TjsError::resource_pending("lazy.ks"))
+            } else {
+                Ok(Variant::Integer(42))
+            }
+        }
+
+        let file = compile_source_to_bytecode(
+            "parked-read.tjs",
+            r#"
+            property probe { getter { return Load(); } }
+            var seen = .probe;
+            return seen;
+            "#,
+        )
+        .expect("compile");
+
+        let mut runtime = Runtime::new();
+        runtime.register_global_native("Load", load);
+        let file_id = runtime.install_script_file(Arc::new(file));
+        {
+            let mut vm = Vm::new(file_id, &mut runtime).expect("vm");
+            assert_eq!(
+                vm.execute_top_level().expect("execute"),
+                Variant::Void,
+                "the first pass hands the caller the parking placeholder"
+            );
+        }
+        assert!(runtime.is_suspended(), "the getter parked on the load");
+
+        let resumed = runtime.resume_suspended().expect("resume");
+        assert_eq!(resumed, Some(Variant::Integer(42)));
+        assert!(!runtime.is_suspended());
     }
 
     fn file_with_code(
