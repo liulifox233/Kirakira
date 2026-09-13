@@ -446,9 +446,20 @@ fn install_wave_native_properties(
         if preserve_script_properties && runtime.object_member_is_property(handle, property) {
             continue;
         }
-        let property_handle = runtime.register_object_native_property(
+        // `filters` is `TJS_DENY_NATIVE_PROP_SETTER` in the reference
+        // (`WaveIntf.cpp:1560-1562`): script may read the instance's array but
+        // a write fails with `TJS_E_ACCESSDENYED` (-1007) before any accessor
+        // runs.  Every other member of the list is a normal read/write
+        // property.
+        let access = if property == "filters" {
+            NativePropertyAccess::ReadOnly
+        } else {
+            NativePropertyAccess::ReadWrite
+        };
+        let property_handle = runtime.register_object_native_property_with_access(
             handle,
             property,
+            access,
             move |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>| {
                 wave_native_property_get(runtime, this_obj, property)
             },
@@ -3161,14 +3172,9 @@ fn wave_native_property_set(
     };
     if name == "filters" {
         // The reference registers the getter only — `TJS_DENY_NATIVE_PROP_SETTER`
-        // (`WaveIntf.cpp:1540-1554`) — and this engine's own filter compat
-        // stores a script's filter array on the member
-        // (`crates/krkr-plugins/src/wf_basic_effect.rs`, whose test pins the
-        // round trip), so the write lands on the backing member the lazy getter
-        // reads back instead of being dropped.  A game that assigns `filters`
-        // therefore replaces the array rather than dying the way the reference
-        // would; PARQUET only ever mutates it in place (`filters.clear()`).
-        runtime.set_object_member(this, wave_property_backing_key(name), value);
+        // (`WaveIntf.cpp:1540-1554`) — `TJS_DENY_NATIVE_PROP_SETTER`: script
+        // writes are refused by the property's access before this runs, and the
+        // engine itself never writes the array through TJS dispatch.
         return Ok(());
     }
     if name == "status" {
@@ -11328,10 +11334,10 @@ mod tests {
     /// `filters.clear()` (`sysscn/voiceeffect.tjs`), so a native
     /// `WaveSoundBuffer` that answers `void` aborts the prologue with
     /// `Cannot convert the variable type ((void) to Object)`.
-    /// `WaveIntf.cpp:815` creates the array in the NI constructor and the
-    /// getter (`:1540-1554`) hands the same array back on every read; the
-    /// script that stores its own filter array on the member
-    /// (`crates/krkr-plugins/src/wf_basic_effect.rs`) reads it back here.
+    /// `WaveIntf.cpp:815` creates the array in the NI constructor, the getter
+    /// (`:1540-1554`) hands the same array back on every read, and the setter
+    /// is denied (`TJS_DENY_NATIVE_PROP_SETTER`, `:1560-1562`): a script write
+    /// fails with `TJS_E_ACCESSDENYED` and leaves the instance's array alone.
     #[test]
     fn wave_sound_buffer_filters_is_a_per_instance_array() {
         use crate::{EngineConfig, KrkrEngine};
@@ -11357,12 +11363,19 @@ mod tests {
                 first.filters.clear();
                 first.filters.add("phase");
                 var mutated = first.filters.count;
-                first.filters = ["a", "b"];
-                var stored = first.filters.count;
+                var denied = (function () {
+                    try {
+                        first.filters = ["a", "b"];
+                        return "no";
+                    } catch (e) {
+                        return e.message;
+                    }
+                })();
                 return "typeof=" + (typeof second.filters)
                     + " mutated=" + mutated
+                    + " denied=" + denied
+                    + " kept=" + first.filters.count
                     + " second=" + second.filters.count
-                    + " stored=" + stored
                     + " same=" + (same ? "y" : "n")
                     + " perInstance=" + (perInstance ? "y" : "n");
                 "#,
@@ -11371,7 +11384,10 @@ mod tests {
         assert_eq!(
             value,
             Variant::String(
-                "typeof=Object mutated=1 second=0 stored=2 same=y perInstance=y".to_string()
+                "typeof=Object mutated=1 \
+                 denied=Invalid operation for Read-only or Write-only property \
+                 kept=1 second=0 same=y perInstance=y"
+                    .to_string()
             )
         );
     }

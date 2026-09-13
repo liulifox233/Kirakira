@@ -117,13 +117,14 @@
 //! `interface`).
 //!
 //! **Not reachable from the audio path yet**: the engine's `WaveSoundBuffer`
-//! lists a `filters` property (`crates/krkr-engine/src/native/classes.rs:10929`)
-//! but neither reads it nor carries a filter chain through `AudioCommand`
-//! (`crates/krkr-core/src/lib.rs:665` has no filter payload), so nothing calls
-//! [`FreeVerb::process`] while a buffer plays. The filters' `interface`
-//! property returns a **sentinel** integer instead of the reference's raw
-//! `iTVPBasicWaveFilter*`: the missing engine seam is filed as a finding, and
-//! [`GraphicEqualizer::process`] / [`FreeVerb::process`] /
+//! owns a per-instance `filters` array (read-only member — the reference's
+//! `TJSCreateArrayObject` at `sound/WaveIntf.cpp:815` with a denied setter at
+//! `:1560-1562`) but neither reads it nor carries a filter chain through
+//! `AudioCommand` (`crates/krkr-core/src/lib.rs:665` has no filter payload),
+//! so nothing calls [`FreeVerb::process`] while a buffer plays. The filters'
+//! `interface` property returns a **sentinel** integer instead of the
+//! reference's raw `iTVPBasicWaveFilter*`: the missing engine seam is filed as
+//! a finding, and [`GraphicEqualizer::process`] / [`FreeVerb::process`] /
 //! [`DelayEffect::process`] are the entry points a future chain would call.
 
 // The DSP types and their `process`/`reset` entry points are the module's
@@ -153,11 +154,11 @@ pub(crate) const META: PluginMeta = PluginMeta {
     notes: "Real DSP (10-band peaking EQ, FreeVerb, damped feedback delay) with the recovered \
             member surface and parameter ranges, processing interleaved f32 PCM; the classes \
             install on the global object like the reference. The engine has no per-buffer filter \
-            chain yet (`WaveSoundBuffer.filters` is stored but nothing consumes it, and \
-            `AudioCommand` carries no filter payload), so the filters run only through their \
-            Rust `process` entry points until that seam exists — `interface` answers a sentinel \
-            integer instead of a raw pointer. See the module docs for the re-derived constants \
-            and the parts that are inferred.",
+            chain yet (`WaveSoundBuffer.filters` is the buffer's own read-only array and nothing \
+            consumes it, and `AudioCommand` carries no filter payload), so the filters run only \
+            through their Rust `process` entry points until that seam exists — `interface` answers \
+            a sentinel integer instead of a raw pointer. See the module docs for the re-derived \
+            constants and the parts that are inferred.",
     install: |engine| engine.register_plugin(WfBasicEffectPlugin),
 };
 
@@ -1569,10 +1570,12 @@ mod tests {
         );
     }
 
-    /// A filter object survives being stored in a `WaveSoundBuffer.filters`
-    /// array — the one script-visible half of the reference contract — and the
-    /// Rust side can resolve it by identity for processing (the dossier's
-    /// pointer-free mapping).
+    /// A filter object added to a `WaveSoundBuffer.filters` array survives —
+    /// the one script-visible half of the reference contract — and the Rust
+    /// side can resolve it by identity for processing (the dossier's
+    /// pointer-free mapping).  The member itself is read-only
+    /// (`TJS_DENY_NATIVE_PROP_SETTER`, `WaveIntf.cpp:1560-1562`), so the script
+    /// fills the buffer's own array instead of replacing the member.
     #[test]
     fn filters_array_keeps_the_object_and_identity_resolves_it() {
         let mut engine = engine();
@@ -1580,7 +1583,9 @@ mod tests {
             &mut engine,
             "(function() {\n\
                  var buffer = new WaveSoundBuffer();\n\
-                 buffer.filters = [new GraphicEqualizer(), new StkFreeVerb()];\n\
+                 buffer.filters.clear();\n\
+                 buffer.filters.add(new GraphicEqualizer());\n\
+                 buffer.filters.add(new StkFreeVerb());\n\
                  global.attached = buffer.filters;\n\
                  return buffer.filters.count;\n\
              })()",
