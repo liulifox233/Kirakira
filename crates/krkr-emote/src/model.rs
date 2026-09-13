@@ -156,22 +156,52 @@ impl MotionLayer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MotionFrame {
     pub time: f32,
-    /// `frameList[i].type`: `0` clears the layer, `2` carries content.
+    /// `frameList[i].type`, as the reference's frame reader decodes it:
+    /// `0` is the empty/HOLD frame (`FUN_1001cdc0` marks `frame+0x18`), `2`
+    /// is a plain keyframe and `3` a keyframe that interpolates toward its
+    /// successor (`frame+0x19`). Only a type-3 frame tweens.
     pub kind: i64,
+    /// `content.mask`, the native key-presence bitfield (`FUN_1001cdc0` stores
+    /// it at `frame+0x14`). `None` when the frame carries no mask key — the
+    /// mask-less FreeMote flavor, whose keys are read by presence alone.
+    pub mask: Option<i64>,
     /// Verbatim `content.src`, e.g. `src/SD101/bg` or `motion/SD101/ef_moya`.
     pub src: Option<String>,
     /// Verbatim `content.icon`, when the flavor separates it from `src`.
     pub icon: Option<String>,
     /// `src`/`icon` resolved against the source table.
     pub binding: Option<MotionBinding>,
+    /// `content.coord`, only when the mask carries bit `0x2`.
     pub coord: Option<[f32; 3]>,
-    /// Verbatim `content.opa`: the file's 0..255 opacity byte
-    /// (`motionplayer_nod3d.dll` `FUN_1001d000` keeps it as `value & 0xff`,
-    /// defaulting to `0xff`, i.e. fully opaque). This is the raw file value,
-    /// kept for diagnostics — the scene applies it as `opa / 255`
-    /// (`vendor/eluna/crates/eluna/src/emote.rs:2383`, `:2999`), and the
-    /// adapter passes it through unchanged.
+    /// `content.opa`, only when the mask carries bit `0x400`: the file's
+    /// 0..255 opacity byte (`motionplayer_nod3d.dll` `FUN_1001d000` keeps it
+    /// as `value & 0xff`, defaulting to `0xff`, i.e. fully opaque). This is
+    /// the raw file value, kept for diagnostics — the scene applies it as
+    /// `opa / 255` (`vendor/eluna/crates/eluna/src/emote.rs:2385`,
+    /// `:3013`), and the adapter passes it through unchanged.
     pub opacity: Option<f32>,
+    /// `content.act`, only when the mask carries bit `0x40000`: the action name
+    /// the frame triggers.
+    pub act: Option<String>,
+}
+
+impl MotionFrame {
+    /// The native empty frame (`type` 0): it carries no content and leaves the
+    /// layer's previous state untouched.
+    pub fn is_empty(&self) -> bool {
+        self.kind == 0
+    }
+
+    /// A frame allowed to interpolate toward its successor (`type` 3).
+    pub fn interpolates(&self) -> bool {
+        self.kind == 3
+    }
+
+    /// Whether the frame's mask carries a key bit. `true` for mask-less
+    /// content, which is read permissively.
+    pub fn has_key(&self, bit: i64) -> bool {
+        self.mask.is_none_or(|mask| mask & bit != 0)
+    }
 }
 
 /// A frame's `src` reference resolved to a concrete source icon.
@@ -386,6 +416,13 @@ fn build_layer(value: &PsbValue, sources: &BTreeMap<String, MotionSource>) -> Mo
 
 fn build_frame(value: &PsbValue, sources: &BTreeMap<String, MotionSource>) -> MotionFrame {
     let content = value.field("content");
+    // The key-presence bitfield decides which content keys the frame carries;
+    // a key outside the mask is not read (`FUN_1001d000`). Mask-less content
+    // stays permissive for the FreeMote flavor.
+    let mask = content.and_then(|content| content.field_i64("mask"));
+    let has_key = |bit: i64| mask.is_none_or(|mask| mask & bit != 0);
+    let gated = |bit: i64| content.filter(|_| has_key(bit));
+
     let src = content
         .and_then(|content| content.field_str("src"))
         .map(str::to_owned);
@@ -396,11 +433,15 @@ fn build_frame(value: &PsbValue, sources: &BTreeMap<String, MotionSource>) -> Mo
     MotionFrame {
         time: value.field_f32("time").unwrap_or(0.0),
         kind: value.field_i64("type").unwrap_or(3),
+        mask,
         binding: resolve_binding(sources, src.as_deref().unwrap_or_default(), icon.as_deref()),
         src,
         icon,
-        coord: content.and_then(content_coord),
-        opacity: content.and_then(|content| content.field_f32("opa")),
+        coord: gated(0x2).and_then(content_coord),
+        opacity: gated(0x400).and_then(|content| content.field_f32("opa")),
+        act: gated(0x40000)
+            .and_then(|content| content.field_str("act"))
+            .map(str::to_owned),
     }
 }
 

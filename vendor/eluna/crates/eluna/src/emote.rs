@@ -2380,7 +2380,11 @@ fn travel_layer(
                 continue;
             };
 
-            let opa_raw = content.field_f32("opa").unwrap_or(255.0);
+            // The static snapshot follows the same mask gate as the frame
+            // applier: opa/bm/color are read only when their bit is set.
+            let opa_raw = masked_field(&content, 0x400, "opa", &[])
+                .and_then(PsbValue::as_f32)
+                .unwrap_or(255.0);
             let time = frame_value.field_i64("time").unwrap_or(0);
             let visible = ctx.base_visible && time <= 0 && opa_raw > 0.0;
             let suggest_visible = ctx.base_visible && time <= 0 && opa_raw > 0.0;
@@ -2433,7 +2437,9 @@ fn travel_layer(
                             0.0,
                             visible,
                             opa_raw,
-                            content.field_u32("bm").unwrap_or(0x10),
+                            masked_field(&content, 0x20000, "bm", &[])
+                                .and_then(PsbValue::as_u32)
+                                .unwrap_or(0x10),
                             content.field_f32("bp").unwrap_or(0.0),
                             frame_content_colors(&content),
                             ctx.clone(),
@@ -2916,9 +2922,14 @@ fn prepare_child_inherit_source(
 }
 
 fn frame_content_colors(content: &PsbValue) -> [u32; 4] {
-    let blend_mode = content.field_u32("bm").unwrap_or(0x10);
-    let Some(color) = content.field("color") else {
-        return if (blend_mode & 0xF0) == 0 {
+    // Masked frames read only the keys their bitfield carries; the white
+    // fallback is the native `mask & 0x20600` block (see
+    // `native_white_color_fallback`).
+    let blend_mode = masked_field(content, 0x20000, "bm", &[])
+        .and_then(PsbValue::as_u32)
+        .unwrap_or(0x10);
+    let Some(color) = masked_field(content, 0x200, "color", &[]) else {
+        return if native_white_color_fallback(content, blend_mode) {
             [0xFFFF_FFFF; 4]
         } else {
             [0x8080_80FF; 4]
@@ -3730,11 +3741,22 @@ fn evaluate_frame_list(
     }
 
     let mut elapsed = (time_ticks - current_time).max(0.0);
-    // frameInfo+8 (`ti`) is an integer time-quantization interval.  Native
-    // truncates elapsed/ti toward zero then multiplies back before deriving t.
-    let ti = current_content
-        .field_i64("ti")
-        .or_else(|| current_frame.field_i64("ti"))
+    // frameInfo+8 (`ti`) is an integer time-quantization interval, read from
+    // the content's mask bit 0x4000000. The native `FUN_10024fd0` truncates
+    // elapsed/ti toward zero and multiplies back before deriving t: it loads
+    // `fnstcw`/`or $0xc00` (RC=11) at 1002509e..100250ad and stores with
+    // `fistpll` at 100250b0, with the `fildl` at 1002508f loading the
+    // interval itself. Truncation, not rounding.
+    let ti = masked_field(current_content, 0x4000000, "ti", &[])
+        .or_else(|| {
+            // The frame-level spelling is an extension for mask-less flavors
+            // only; a masked frame's `ti` is the content key gated above.
+            frame_key_mask(current_content)
+                .is_none()
+                .then(|| current_frame.field("ti"))
+                .flatten()
+        })
+        .and_then(PsbValue::as_i64)
         .unwrap_or(0);
     if ti > 0 {
         let ti = ti as f32;
@@ -3817,7 +3839,13 @@ fn easing_piece_values(piece: &PsbValue) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>
 }
 
 fn evaluate_native_easing_piece(piece: &PsbValue, x: f32) -> Option<f32> {
-    let (xs, ys, ps) = easing_piece_values(piece)?;
+    if let Some((xs, ys, ps)) = easing_piece_values(piece) {
+        return Some(evaluate_native_spline_values(&xs, &ys, &ps, x));
+    }
+    evaluate_bezier_easing_piece(piece, x)
+}
+
+fn evaluate_native_spline_values(xs: &[f32], ys: &[f32], ps: &[f32], x: f32) -> f32 {
     let mut interval = 0usize;
     while interval + 1 < xs.len() - 1 && x > xs[interval + 1] {
         interval += 1;
@@ -3829,7 +3857,7 @@ fn evaluate_native_easing_piece(piece: &PsbValue, x: f32) -> Option<f32> {
     let x1 = xs[interval + 1];
     let h = x1 - x0;
     if !h.is_finite() || h.abs() <= f32::EPSILON {
-        return Some(ys[interval]);
+        return ys[interval];
     }
     let u = (x - x0) / h;
     let one_minus_u = 1.0 - u;
@@ -3839,12 +3867,90 @@ fn evaluate_native_easing_piece(piece: &PsbValue, x: f32) -> Option<f32> {
     let cubic_u = u * u * u - u;
     let cubic_v = one_minus_u * one_minus_u * one_minus_u - one_minus_u;
     let linear = one_minus_u * ys[interval] + u * ys[interval + 1];
-    Some(
-        linear
-            + h * h
-                * (cubic_u * ps[interval + 1] + cubic_v * ps[interval])
-                / 6.0,
-    )
+    linear + h * h * (cubic_u * ps[interval + 1] + cubic_v * ps[interval]) / 6.0
+}
+
+/// Cubic-Bezier easing curve as the PARQUET reference (`motionplayer_nod3d.dll`)
+/// authors it: `x`/`y` hold `3N+1` chained cubic Bezier control values and the
+/// curve object carries no second-derivative array.
+///
+/// `FUN_100087d0` picks the segment whose end (`x[3k+3]`) is the first that is
+/// not below the input, solves that segment's x-polynomial for the Bezier
+/// parameter (`FUN_10008220`), then evaluates the y-polynomial with the
+/// Bernstein basis. `c` (per-segment flags) is not read by the evaluator.
+fn evaluate_bezier_easing_piece(piece: &PsbValue, x: f32) -> Option<f32> {
+    let xs = easing_curve_axis(piece, "x")?;
+    let ys = easing_curve_axis(piece, "y")?;
+    if xs.len() < 4 || xs.len() != ys.len() || (xs.len() - 1) % 3 != 0 {
+        return None;
+    }
+    let last = xs.len() - 1;
+    if x <= xs[0] {
+        return Some(ys[0]);
+    }
+    if x >= xs[last] {
+        return Some(ys[last]);
+    }
+    // Native advance rule: while the next segment's end is still below x.
+    let mut segment = 0usize;
+    while segment + 3 < last && xs[segment + 3] < x {
+        segment += 3;
+    }
+    let x_control: [f32; 4] = xs[segment..segment + 4].try_into().ok()?;
+    let y_control: [f32; 4] = ys[segment..segment + 4].try_into().ok()?;
+    let parameter = solve_cubic_bezier_axis(x_control, x)?;
+    Some(cubic_bezier_value(y_control, parameter))
+}
+
+fn easing_curve_axis(piece: &PsbValue, name: &str) -> Option<Vec<f32>> {
+    piece
+        .field(name)?
+        .as_list()?
+        .iter()
+        .map(PsbValue::as_f32)
+        .collect::<Option<Vec<_>>>()
+}
+
+fn cubic_bezier_value(control: [f32; 4], s: f32) -> f32 {
+    let v = 1.0 - s;
+    v * v * v * control[0]
+        + 3.0 * v * v * s * control[1]
+        + 3.0 * v * s * s * control[2]
+        + s * s * s * control[3]
+}
+
+/// Invert one monotonic cubic-Bezier x segment (`FUN_10008220`'s intersection
+/// solve) by bisection: authored easing curves are monotonic in x and the
+/// segment was selected so the input lies inside its x range.
+fn solve_cubic_bezier_axis(control: [f32; 4], target: f32) -> Option<f32> {
+    let start = cubic_bezier_value(control, 0.0);
+    let end = cubic_bezier_value(control, 1.0);
+    if !(start <= target && target <= end) {
+        return None;
+    }
+    if end - start <= f32::EPSILON {
+        return Some(1.0);
+    }
+    let (mut low, mut high) = (0.0f32, 1.0f32);
+    for _ in 0..64 {
+        let middle = (low + high) * 0.5;
+        if cubic_bezier_value(control, middle) < target {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Some((low + high) * 0.5)
+}
+
+/// First/last authored x value of an easing piece, for the list-of-pieces
+/// lookup. Both authored representations expose their x domain this way.
+fn easing_piece_x_bounds(piece: &PsbValue) -> Option<(f32, f32)> {
+    if let Some((xs, _, _)) = easing_piece_values(piece) {
+        return Some((*xs.first()?, *xs.last()?));
+    }
+    let xs = easing_curve_axis(piece, "x")?;
+    Some((*xs.first()?, *xs.last()?))
 }
 
 fn evaluate_native_easing_curve(curve: &PsbValue, x: f32) -> Option<f32> {
@@ -3859,10 +3965,10 @@ fn evaluate_native_easing_curve(curve: &PsbValue, x: f32) -> Option<f32> {
     // selected piece's first/last authored x value. Stateless lookup gives the
     // same result for a single evaluation.
     for piece in pieces {
-        let Some((xs, _, _)) = easing_piece_values(piece) else {
+        let Some((first, last)) = easing_piece_x_bounds(piece) else {
             continue;
         };
-        if x >= xs[0] && x <= *xs.last().unwrap_or(&xs[0]) {
+        if x >= first && x <= last {
             return evaluate_native_easing_piece(piece, x);
         }
     }
@@ -3871,12 +3977,10 @@ fn evaluate_native_easing_curve(curve: &PsbValue, x: f32) -> Option<f32> {
     // rather than inventing a non-native smoothstep fallback.
     let mut closest: Option<(&PsbValue, f32)> = None;
     for piece in pieces {
-        let Some((xs, _, _)) = easing_piece_values(piece) else {
+        let Some((first, last)) = easing_piece_x_bounds(piece) else {
             continue;
         };
-        let d = (x - xs[0])
-            .abs()
-            .min((x - *xs.last().unwrap_or(&xs[0])).abs());
+        let d = (x - first).abs().min((x - last).abs());
         if closest.map_or(true, |(_, best)| d < best) {
             closest = Some((piece, d));
         }
@@ -4033,11 +4137,17 @@ fn interpolate_frame_content(
     // Native per-property curves live on the CURRENT type-3 frame:
     //   ccc = coordinate, acc = angle, zcc = zoom, scc = shear,
     //   occ = color. Opacity uses raw t.  They all resolve through the
-    // top-level easing table at MMotionPlayer+844.
-    let coord_t = frame_easing(t, current_content.field("ccc"), easing_table);
-    let angle_t = frame_easing(t, current_content.field("acc"), easing_table);
-    let zoom_t = frame_easing(t, current_content.field("zcc"), easing_table);
-    let shear_t = frame_easing(t, current_content.field("scc"), easing_table);
+    // top-level easing table at MMotionPlayer+844, and a frame whose mask
+    // omits the curve's bit is identity (the native frame buffer's curve
+    // variant stays void).
+    let coord_curve = masked_field(current_content, 0x800, "ccc", &[]);
+    let angle_curve = masked_field(current_content, 0x1000, "acc", &[]);
+    let zoom_curve = masked_field(current_content, 0x2000, "zcc", &[]);
+    let shear_curve = masked_field(current_content, 0x4000, "scc", &[]);
+    let coord_t = frame_easing(t, coord_curve, easing_table);
+    let angle_t = frame_easing(t, angle_curve, easing_table);
+    let zoom_t = frame_easing(t, zoom_curve, easing_table);
+    let shear_t = frame_easing(t, shear_curve, easing_table);
 
     // sub_103A5190 first applies ccc, then optionally evaluates the authored
     // MBeziersPathEntity (`cp`). MMotionPlayer+848 is only a lazy cache for
@@ -4049,7 +4159,7 @@ fn interpolate_frame_content(
         b,
         coord_t,
         coordinate_plane,
-        current_content.field("cp"),
+        masked_field(current_content, 0x10000, "cp", &[]),
     ));
 
     // ox/oy are not part of the recovered StepFrame interpolation block; keep
@@ -4071,6 +4181,8 @@ fn interpolate_frame_content(
     // sub_10355BF0 direction mode 3 samples the exact same authored
     // coordinate path twice at t and t+0.0001. Near the end it shifts the
     // pair back to [1-0.0001, 1] instead of sampling beyond the keyframe.
+    // Both samples go through the same gated `ccc`/`cp` values the coordinate
+    // interpolation above used, or p0/p1 would read two different paths.
     if state.motion_direction_type == 3 {
         let mut tangent_t0 = t;
         let mut tangent_t1 = t + 0.0001;
@@ -4078,24 +4190,11 @@ fn interpolate_frame_content(
             tangent_t1 = 1.0;
             tangent_t0 = 1.0 - 0.0001;
         }
-        let tangent_coord_t0 =
-            frame_easing(tangent_t0, current_content.field("ccc"), easing_table);
-        let tangent_coord_t1 =
-            frame_easing(tangent_t1, current_content.field("ccc"), easing_table);
-        let p0 = interpolate_native_coordinate(
-            a,
-            b,
-            tangent_coord_t0,
-            coordinate_plane,
-            current_content.field("cp"),
-        );
-        let p1 = interpolate_native_coordinate(
-            a,
-            b,
-            tangent_coord_t1,
-            coordinate_plane,
-            current_content.field("cp"),
-        );
+        let cp = masked_field(current_content, 0x10000, "cp", &[]);
+        let tangent_coord_t0 = frame_easing(tangent_t0, coord_curve, easing_table);
+        let tangent_coord_t1 = frame_easing(tangent_t1, coord_curve, easing_table);
+        let p0 = interpolate_native_coordinate(a, b, tangent_coord_t0, coordinate_plane, cp);
+        let p1 = interpolate_native_coordinate(a, b, tangent_coord_t1, coordinate_plane, cp);
         let tangent = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
         state.motion_path_tangent_vector = Some(tangent);
         state.motion_path_tangent_degrees = match coordinate_plane {
@@ -4119,7 +4218,8 @@ fn interpolate_frame_content(
     // sub_1032FB00 uses OCC only for packed corner colors.  It performs the
     // interpolation in integer byte lanes with weight=floor(t*256), not with
     // floating RGBA. Preserve that exact quantization here.
-    let color_t = frame_easing(t, current_content.field("occ"), easing_table);
+    let occ_curve = masked_field(current_content, 0x8000, "occ", &[]);
+    let color_t = frame_easing(t, occ_curve, easing_table);
     if state.single_color && next_state.single_color {
         let c = interpolate_native_packed_color(state.colors[0], next_state.colors[0], color_t);
         state.colors = [c; 4];
@@ -4163,6 +4263,11 @@ fn interpolate_frame_content(
         state.feedback_timespan = Some(lerp(a, b, t));
     }
     // Type-12 uses WCC for wrt/wsf and recomputes the native scale/bias.
+    // `wcc` rides the fork's own stencil-wipe key family (stc/wrv/wrt/wsf);
+    // `motionplayer_nod3d.dll`'s FUN_1001d000 bit table defines no bit for
+    // that family and PARQUET authors none of those keys, so it stays a
+    // presence read — the mask gate covers the vocabulary the reference's
+    // applier defines.
     if let (Some(a), Some(b)) = (state.stencil_wipe, next_state.stencil_wipe) {
         if a.enabled {
             let wipe_t = frame_easing(t, current_content.field("wcc"), easing_table);
@@ -4175,10 +4280,21 @@ fn interpolate_frame_content(
         }
     }
 
-    if let (Some(mut a), Some(mut b)) = (
-        parse_content_mesh_patch(current_content, 1, 1),
-        parse_content_mesh_patch(next_content, 1, 1),
-    ) {
+    // FUN_1001d000 only decodes the mesh when the frame's mask carries bit
+    // 0x2000000, and a frame without a decoded mesh interpolates against the
+    // player's global neutral patch (FUN_10006a80's 4x4 identity grid), which
+    // is what an absent side becomes here. FUN_100098f0 then applies the
+    // current frame's mesh `cc` curve to the interpolation factor before
+    // lerping every (x, y) control point.
+    let current_mesh = frame_has_key(current_content, 0x2000000)
+        .then(|| parse_content_mesh_patch(current_content, 1, 1))
+        .flatten();
+    let next_mesh = frame_has_key(next_content, 0x2000000)
+        .then(|| parse_content_mesh_patch(next_content, 1, 1))
+        .flatten();
+    if current_mesh.is_some() || next_mesh.is_some() {
+        let mut a = current_mesh.unwrap_or_else(|| EmoteMeshPatch::identity(1, 1));
+        let mut b = next_mesh.unwrap_or_else(|| EmoteMeshPatch::identity(1, 1));
         if a.domain.is_none() {
             a.domain = current_content
                 .field_str("icon")
@@ -4189,7 +4305,10 @@ fn interpolate_frame_content(
                 .field_str("icon")
                 .and_then(parse_mesh_domain_icon);
         }
-        state.mesh_patch = Some(EmoteMeshPatch::interpolate(&a, &b, t));
+        let mesh_curve =
+            masked_field(current_content, 0x2000000, "mesh", &[]).and_then(|mesh| mesh.field("cc"));
+        let mesh_t = frame_easing(t, mesh_curve, easing_table);
+        state.mesh_patch = Some(EmoteMeshPatch::interpolate(&a, &b, mesh_t));
     }
 }
 
@@ -4252,81 +4371,109 @@ fn content_coord(content: &PsbValue) -> Option<[f32; 3]> {
     ])
 }
 
-fn content_scale_x(content: &PsbValue) -> Option<f32> {
-    content
-        .field_f32("zx")
-        .or_else(|| content.field_f32("scale_x"))
-        .or_else(|| content.field_f32("scaleX"))
-        .or_else(|| content.field_f32("scale"))
-        .or_else(|| content.field_f32("zoom"))
-}
-
-fn content_scale_y(content: &PsbValue) -> Option<f32> {
-    content
-        .field_f32("zy")
-        .or_else(|| content.field_f32("scale_y"))
-        .or_else(|| content.field_f32("scaleY"))
-        .or_else(|| content.field_f32("scale"))
-        .or_else(|| content.field_f32("zoom"))
-}
-
-fn content_shear_x(content: &PsbValue) -> Option<f32> {
-    content.field_f32("sx")
-}
-
-fn content_shear_y(content: &PsbValue) -> Option<f32> {
-    content.field_f32("sy")
-}
-
 fn content_bool_like(content: &PsbValue, name: &str) -> Option<bool> {
-    match content.field(name)? {
-        PsbValue::Bool(value) => Some(*value),
-        value => value.as_i64().map(|value| value != 0),
-    }
+    psb_value_bool(content.field(name)?)
 }
 
-fn content_rotation(content: &PsbValue) -> Option<f32> {
-    content
-        .field_f32("angle")
-        .or_else(|| content.field_f32("rot"))
-        .or_else(|| content.field_f32("rotation"))
+/// Frame key-presence bitfield (`content.mask`, the native `FUN_1001cdc0`
+/// `frame+20` word). A frame without the key is read permissively: the
+/// mask-less FreeMote flavor relies on key presence alone.
+fn frame_key_mask(content: &PsbValue) -> Option<i64> {
+    content.field_i64("mask")
+}
+
+fn frame_has_key(content: &PsbValue, bit: i64) -> bool {
+    frame_key_mask(content).is_none_or(|mask| mask & bit != 0)
+}
+
+/// The native white-corner fallback (`FUN_1001d000`'s `mask & 0x20600`
+/// block): a frame whose color bit is clear and whose `bm` high nibble is 0
+/// paints white instead of the neutral gray, and a frame whose mask carries
+/// neither the color bit nor the `bm` bit keeps the gray.
+///
+/// Mask-less content keeps the legacy presence rule: reaching this fallback
+/// at all means the frame has no `color` key to read.
+fn native_white_color_fallback(content: &PsbValue, blend_mode: u32) -> bool {
+    if (blend_mode & 0xF0) != 0 {
+        return false;
+    }
+    frame_key_mask(content).is_none_or(|mask| mask & 0x200 == 0 && mask & 0x20600 != 0)
+}
+
+/// `content.<name>` only when the frame's mask says the key is present.
+///
+/// Mask-less (FreeMote-flavor) content keeps the alias spellings the model
+/// always accepted; a masked frame reads the canonical native key only, so a
+/// stray aliased key cannot sneak past the bitfield.
+fn masked_field<'a>(
+    content: &'a PsbValue,
+    bit: i64,
+    name: &str,
+    aliases: &[&str],
+) -> Option<&'a PsbValue> {
+    if !frame_has_key(content, bit) {
+        return None;
+    }
+    content.field(name).or_else(|| {
+        if frame_key_mask(content).is_none() {
+            aliases.iter().find_map(|alias| content.field(alias))
+        } else {
+            None
+        }
+    })
 }
 
 fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
-    if let Some(coord) = content.field("coord").and_then(PsbValue::as_list) {
-        if coord.len() >= 3 {
-            state.coord = Some([
-                coord[0].as_f32().unwrap_or(0.0),
-                coord[1].as_f32().unwrap_or(0.0),
-                coord[2].as_f32().unwrap_or(0.0),
-            ]);
+    // FUN_1001d000 reads each key only when its bit is set in `content.mask`
+    // (0x1 ox/oy, 0x2 coord, 0x4/0x8 fx/fy, 0x10 angle, 0x20/0x40 zx/zy,
+    // 0x80/0x100 sx/sy, 0x200 color, 0x400 opa, 0x20000 bm, 0x80000 motion,
+    // 0x100000 prt, 0x200000 camera, 0x1000000 model, 0x2000000 mesh,
+    // 0x800000 anchor, 0x8000000 feedback). A key present in the object but
+    // outside the mask is not a frame key.
+    if frame_has_key(content, 0x2) {
+        if let Some(coord) = content.field("coord").and_then(PsbValue::as_list) {
+            if coord.len() >= 3 {
+                state.coord = Some([
+                    coord[0].as_f32().unwrap_or(0.0),
+                    coord[1].as_f32().unwrap_or(0.0),
+                    coord[2].as_f32().unwrap_or(0.0),
+                ]);
+            }
         }
     }
-    if let Some(ox) = content.field_f32("ox") {
+    if let Some(ox) = masked_field(content, 0x1, "ox", &[]).and_then(PsbValue::as_f32) {
         state.ox = ox;
     }
-    if let Some(oy) = content.field_f32("oy") {
+    if let Some(oy) = masked_field(content, 0x1, "oy", &[]).and_then(PsbValue::as_f32) {
         state.oy = oy;
     }
-    if let Some(flip_x) = content_bool_like(content, "fx") {
+    if let Some(flip_x) = masked_field(content, 0x4, "fx", &[]).and_then(psb_value_bool) {
         state.flip_x = flip_x;
     }
-    if let Some(flip_y) = content_bool_like(content, "fy") {
+    if let Some(flip_y) = masked_field(content, 0x8, "fy", &[]).and_then(psb_value_bool) {
         state.flip_y = flip_y;
     }
-    if let Some(scale_x) = content_scale_x(content) {
+    if let Some(scale_x) =
+        masked_field(content, 0x20, "zx", &["scale_x", "scaleX", "scale", "zoom"])
+            .and_then(PsbValue::as_f32)
+    {
         state.scale_x = scale_x;
     }
-    if let Some(scale_y) = content_scale_y(content) {
+    if let Some(scale_y) =
+        masked_field(content, 0x40, "zy", &["scale_y", "scaleY", "scale", "zoom"])
+            .and_then(PsbValue::as_f32)
+    {
         state.scale_y = scale_y;
     }
-    if let Some(rotation) = content_rotation(content) {
+    if let Some(rotation) =
+        masked_field(content, 0x10, "angle", &["rot", "rotation"]).and_then(PsbValue::as_f32)
+    {
         state.rotation_degrees = rotation;
     }
-    if let Some(shear_x) = content_shear_x(content) {
+    if let Some(shear_x) = masked_field(content, 0x80, "sx", &[]).and_then(PsbValue::as_f32) {
         state.shear_x = shear_x;
     }
-    if let Some(shear_y) = content_shear_y(content) {
+    if let Some(shear_y) = masked_field(content, 0x100, "sy", &[]).and_then(PsbValue::as_f32) {
         state.shear_y = shear_y;
     }
     if let Some(src) = content.field_str("src") {
@@ -4335,16 +4482,16 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
     if let Some(icon) = content.field_str("icon") {
         state.icon = Some(icon.to_owned());
     }
-    if let Some(opa) = content.field_f32("opa") {
+    if let Some(opa) = masked_field(content, 0x400, "opa", &[]).and_then(PsbValue::as_f32) {
         state.opa = opa;
     }
-    if let Some(bm) = content.field_u32("bm") {
+    if let Some(bm) = masked_field(content, 0x20000, "bm", &[]).and_then(PsbValue::as_u32) {
         state.blend_mode = bm;
     }
     if let Some(bp) = content.field_f32("bp") {
         state.blend_parameter = bp;
     }
-    if let Some(color) = content.field("color") {
+    if let Some(color) = masked_field(content, 0x200, "color", &[]) {
         state.default_color = false;
         if let Some(values) = color.as_list() {
             if values.len() >= 4 {
@@ -4362,12 +4509,15 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
             state.single_color = true;
             state.colors = [value as u32; 4];
         }
-    } else if (state.blend_mode & 0xF0) == 0 {
+    } else if native_white_color_fallback(content, state.blend_mode) {
         // sub_1033D0E0: legacy non-MODULATE2X frames without an explicit
-        // color use white instead of the normal neutral gray.
+        // color use white instead of the normal neutral gray. The native
+        // fallback lives inside its `mask & 0x20600` block, so a frame whose
+        // mask carries neither the color bit nor the bm bit keeps the gray,
+        // and a masked frame's stray `color` key is ignored entirely.
         state.colors = [0xFFFF_FFFF; 4];
     }
-    if let Some(motion) = content.field("motion") {
+    if let Some(motion) = masked_field(content, 0x80000, "motion", &[]) {
         // sub_1033D0E0 initializes every motion payload to
         // flags=0, dt=1, dofst=0, docmpl=false, dtgt="", then reads the
         // fields selected by the serialized mask. Preserve those exact
@@ -4384,7 +4534,7 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
     } else if let Some(time_offset) = content.field_f32("timeOffset") {
         state.time_offset_ticks = time_offset;
     }
-    if let Some(prt) = content.field("prt") {
+    if let Some(prt) = masked_field(content, 0x100000, "prt", &[]) {
         let mut value = ParticleFrameState::default();
         value.trigger = prt.field_i64("trigger").unwrap_or(0) as i32;
         value.fmin = prt.field_f32("fmin").unwrap_or(10.0);
@@ -4398,13 +4548,13 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
         value.range = prt.field_f32("range").unwrap_or(0.0);
         state.particle = Some(value);
     }
-    if let Some(camera) = content.field("camera") {
+    if let Some(camera) = masked_field(content, 0x200000, "camera", &[]) {
         state.camera = Some(CameraFrameState {
             fov: camera.field_f32("fov").unwrap_or(0.0),
             target: camera.field_str("target").unwrap_or("").to_owned(),
         });
     }
-    if let Some(model) = content.field("model") {
+    if let Some(model) = masked_field(content, 0x1000000, "model", &[]) {
         state.model = Some(ModelFrameState {
             looped: content_bool_like(model, "loop").unwrap_or(false),
             direction_type: model.field_i64("dt").unwrap_or(0) as i32,
@@ -4412,7 +4562,7 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
             time_offset_ticks: model.field_f32("timeOffset").unwrap_or(0.0),
         });
     }
-    if let Some(feedback) = content.field("feedback") {
+    if let Some(feedback) = masked_field(content, 0x8000000, "feedback", &[]) {
         state.feedback_timespan = Some(feedback.field_f32("timespan").unwrap_or(0.0));
     }
     if content.field("stc").is_some()
@@ -4428,14 +4578,23 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
             enabled, reverse, threshold, softness,
         ));
     }
-    if let Some(anchor) = content.field("anchor") {
+    if let Some(anchor) = masked_field(content, 0x800000, "anchor", &[]) {
         state.anchor_target = Some(anchor.field_str("target").unwrap_or("").to_owned());
     }
-    if let Some(mut mesh) = parse_content_mesh_patch(content, 1, 1) {
-        if mesh.domain.is_none() {
-            mesh.domain = content.field_str("icon").and_then(parse_mesh_domain_icon);
+    if frame_has_key(content, 0x2000000) {
+        if let Some(mut mesh) = parse_content_mesh_patch(content, 1, 1) {
+            if mesh.domain.is_none() {
+                mesh.domain = content.field_str("icon").and_then(parse_mesh_domain_icon);
+            }
+            state.mesh_patch = Some(mesh);
         }
-        state.mesh_patch = Some(mesh);
+    }
+}
+
+fn psb_value_bool(value: &PsbValue) -> Option<bool> {
+    match value {
+        PsbValue::Bool(value) => Some(*value),
+        value => value.as_i64().map(|value| value != 0),
     }
 }
 
@@ -7752,6 +7911,122 @@ mod tests {
         assert!((y - 0.75).abs() < 1.0e-6);
     }
 
+    fn bezier_curve(xs: &[f32], ys: &[f32]) -> PsbValue {
+        PsbValue::Object(vec![
+            (
+                "c".to_owned(),
+                PsbValue::List(vec![PsbValue::Int(1); xs.len() / 3 + 1]),
+            ),
+            (
+                "x".to_owned(),
+                PsbValue::List(xs.iter().map(|value| PsbValue::Float(*value)).collect()),
+            ),
+            (
+                "y".to_owned(),
+                PsbValue::List(ys.iter().map(|value| PsbValue::Float(*value)).collect()),
+            ),
+        ])
+    }
+
+    /// `m2logo.mtn`'s `back_black/main` zcc curve: one cubic segment. The
+    /// expected values are the native evaluation (`FUN_100087d0`: solve the
+    /// segment's x polynomial with `FUN_10008220`, evaluate the Bernstein
+    /// y polynomial), computed independently.
+    #[test]
+    fn native_bezier_easing_curve_matches_reference_values() {
+        let curve = bezier_curve(&[0.0, 0.21333334, 0.5833333, 1.0], &[0.0, 0.62, 0.9, 1.0]);
+        let ease = |t: f32| evaluate_native_easing_curve(&curve, t).unwrap();
+        assert!((ease(0.25) - 0.496931157).abs() < 1.0e-5, "{}", ease(0.25));
+        assert!((ease(0.5) - 0.760715887).abs() < 1.0e-5, "{}", ease(0.5));
+        assert!((ease(0.75) - 0.914160890).abs() < 1.0e-5, "{}", ease(0.75));
+        // Outside the authored x domain the evaluator clamps to the y range.
+        assert_eq!(ease(-0.5), 0.0);
+        assert_eq!(ease(1.5), 1.0);
+    }
+
+    /// `yuzusourlogo.mtn`'s `awa` graycircle zcc curve: three chained cubic
+    /// segments (`x.len() = 3N + 1`), so the segment walk itself matters.
+    #[test]
+    fn native_bezier_easing_curve_walks_chained_segments() {
+        let curve = bezier_curve(
+            &[
+                0.0, 0.07235151, 0.14061041, 0.31, 0.42611614, 0.48394063, 0.6166667, 0.74986356,
+                0.7033333, 1.0,
+            ],
+            &[
+                0.0,
+                0.020163536,
+                0.3959712,
+                0.5733333,
+                0.69491464,
+                0.31268233,
+                0.37666667,
+                0.44087797,
+                0.81333333,
+                1.0,
+            ],
+        );
+        let ease = |t: f32| evaluate_native_easing_curve(&curve, t).unwrap();
+        // 0.4 lies in segment 1 (x 0.31..0.6167), 0.75 and 0.9 in segment 2.
+        assert!((ease(0.4) - 0.574740862).abs() < 1.0e-5, "{}", ease(0.4));
+        assert!((ease(0.75) - 0.651111040).abs() < 1.0e-5, "{}", ease(0.75));
+        assert!((ease(0.9) - 0.918287427).abs() < 1.0e-5, "{}", ease(0.9));
+    }
+
+    /// A Bezier piece whose y control values mirror its x control values is
+    /// the identity function, in one piece and across a piece list.
+    #[test]
+    fn native_bezier_easing_identity_and_piece_list_selection() {
+        let identity = bezier_curve(&[0.0, 0.1, 0.3, 0.5], &[0.0, 0.1, 0.3, 0.5]);
+        for t in [0.0f32, 0.2, 0.5] {
+            assert!((evaluate_native_easing_curve(&identity, t).unwrap() - t).abs() < 1.0e-6);
+        }
+        let list = PsbValue::List(vec![
+            bezier_curve(&[0.0, 0.1, 0.3, 0.5], &[0.0, 0.1, 0.3, 0.5]),
+            bezier_curve(&[0.5, 0.6, 0.8, 1.0], &[0.5, 0.6, 0.8, 1.0]),
+        ]);
+        for t in [0.25f32, 0.75] {
+            assert!((evaluate_native_easing_curve(&list, t).unwrap() - t).abs() < 1.0e-6);
+        }
+    }
+
+    /// `content.mask` decides which keys a frame carries: a key that is
+    /// present but outside the mask is not read (`FUN_1001d000` gates every
+    /// read on the bitfield). Mask-less content keeps the permissive read
+    /// the FreeMote flavor relies on.
+    #[test]
+    fn native_frame_mask_gates_key_reads() {
+        let masked = test_frame(
+            0.0,
+            2,
+            test_content(vec![
+                ("mask", PsbValue::Int(0x1)),
+                ("ox", PsbValue::Float(3.0)),
+                ("zx", PsbValue::Float(5.0)),
+                ("opa", PsbValue::Int(10)),
+            ]),
+        );
+        let state = evaluate_frame_list(&[masked], 0.0, None, 0, None);
+        assert_eq!(state.ox, 3.0, "the mask's own bit is read");
+        assert_eq!(state.scale_x, 1.0, "zx sits outside the mask");
+        assert_eq!(state.scale_y, 1.0, "zy was never authored");
+        assert_eq!(state.opa, 255.0, "opa sits outside the mask");
+
+        let unmasked = test_frame(
+            0.0,
+            2,
+            test_content(vec![
+                ("ox", PsbValue::Float(3.0)),
+                ("zx", PsbValue::Float(5.0)),
+                ("opa", PsbValue::Int(10)),
+            ]),
+        );
+        let state = evaluate_frame_list(&[unmasked], 0.0, None, 0, None);
+        assert_eq!(state.ox, 3.0);
+        assert_eq!(state.scale_x, 5.0);
+        assert_eq!(state.opa, 10.0);
+    }
+
     fn test_frame(time: f32, frame_type: i64, content: PsbValue) -> PsbValue {
         PsbValue::Object(vec![
             ("time".to_owned(), PsbValue::Float(time)),
@@ -8042,6 +8317,112 @@ mod tests {
         let angle = state.motion_path_tangent_degrees.unwrap();
         let expected = 1.5f32.atan2(1.0).to_degrees();
         assert!((angle - expected).abs() < 0.05, "{angle} vs {expected}");
+    }
+
+    /// The direction-mode-3 tangent block samples the same gated `ccc`/`cp`
+    /// values the coordinate interpolation uses: a type-3 frame whose mask
+    /// omits those bits must not read a stray curve or path (M137 review
+    /// finding 1), or p0/p1 would come from two different paths.
+    #[test]
+    fn native_tangent_samples_respect_the_frame_mask() {
+        let motion = || {
+            PsbValue::Object(vec![
+                ("dt".to_owned(), PsbValue::Int(3)),
+                ("dofst".to_owned(), PsbValue::Float(0.0)),
+            ])
+        };
+        // A strongly ease-out coordinate curve: `frame_easing(0.25)` is ~0.68,
+        // not 0.25, so reading it by mistake moves the coord by ~4.
+        let stray_ccc = || {
+            PsbValue::Object(vec![
+                (
+                    "c".to_owned(),
+                    PsbValue::List(vec![PsbValue::Int(1), PsbValue::Int(1)]),
+                ),
+                (
+                    "x".to_owned(),
+                    PsbValue::List(
+                        [0.0f32, 0.1, 0.5, 1.0]
+                            .into_iter()
+                            .map(PsbValue::Float)
+                            .collect(),
+                    ),
+                ),
+                (
+                    "y".to_owned(),
+                    PsbValue::List(
+                        [0.0f32, 0.8, 0.95, 1.0]
+                            .into_iter()
+                            .map(PsbValue::Float)
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+        let masked = vec![
+            test_frame(
+                0.0,
+                3,
+                test_content(vec![
+                    // coord + motion only: the stray ccc/cp are not frame keys.
+                    ("mask", PsbValue::Int(0x2 | 0x80000)),
+                    ("coord", test_coord(0.0, 0.0, 0.0)),
+                    ("ccc", stray_ccc()),
+                    ("cp", test_inline_cp_path()),
+                    ("motion", motion()),
+                ]),
+            ),
+            test_frame(
+                10.0,
+                1,
+                test_content(vec![
+                    ("mask", PsbValue::Int(0x2)),
+                    ("coord", test_coord(10.0, 0.0, 0.0)),
+                ]),
+            ),
+        ];
+        let state = evaluate_frame_list(&masked, 2.5, None, 0, None);
+        assert_eq!(
+            state.coord,
+            Some([2.5, 0.0, 0.0]),
+            "the stray ccc must not ease the coordinate"
+        );
+        let angle = state.motion_path_tangent_degrees.unwrap();
+        assert!(
+            angle.abs() < 1.0e-4,
+            "the stray cp must not bend the tangent, got {angle}"
+        );
+
+        // Control: with the bits set the same payload eases and bends.
+        let gated = vec![
+            test_frame(
+                0.0,
+                3,
+                test_content(vec![
+                    ("mask", PsbValue::Int(0x2 | 0x800 | 0x10000 | 0x80000)),
+                    ("coord", test_coord(0.0, 0.0, 0.0)),
+                    ("ccc", stray_ccc()),
+                    ("cp", test_inline_cp_path()),
+                    ("motion", motion()),
+                ]),
+            ),
+            test_frame(
+                10.0,
+                1,
+                test_content(vec![("coord", test_coord(10.0, 0.0, 0.0))]),
+            ),
+        ];
+        let state = evaluate_frame_list(&gated, 2.5, None, 0, None);
+        let coord = state.coord.unwrap()[0];
+        assert!(
+            (coord - 2.5).abs() > 0.5,
+            "the gated ccc eases the coordinate, got {coord}"
+        );
+        let angle = state.motion_path_tangent_degrees.unwrap();
+        assert!(
+            angle.abs() > 5.0,
+            "the gated cp bends the tangent, got {angle}"
+        );
     }
 
     #[test]
