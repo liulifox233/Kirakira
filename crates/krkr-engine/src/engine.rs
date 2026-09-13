@@ -286,6 +286,14 @@ pub struct KrkrEngine {
     /// Session state the parked-VM marker replaced, restored once the parked
     /// work lands. `None` while no mark is active.
     parked_resource_state: Option<KagTaskState>,
+    /// The clock sample `update` was handed for the frame it is running,
+    /// when its caller supplied one. Continuous callbacks dispatched inside
+    /// the frame observe this exact timestamp; re-reading the host clock
+    /// would drift by however long the frame has been running, which is how
+    /// a callback that paces itself against its `tick` argument (the movie
+    /// plugin's frame timeline) became wall-clock dependent even under an
+    /// explicitly driven clock.
+    frame_now_millis: Option<i64>,
 }
 
 impl KrkrEngine {
@@ -316,6 +324,7 @@ impl KrkrEngine {
             input_result: EngineInputResult::default(),
             scheduler_turn_started: false,
             parked_resource_state: None,
+            frame_now_millis: None,
         })
     }
 
@@ -1075,6 +1084,7 @@ impl KrkrEngine {
 
     pub fn update(&mut self, input: EngineInput, delta: Duration) -> Result<EngineFrame> {
         self.input_result = EngineInputResult::default();
+        self.frame_now_millis = input.now_millis;
         if let Some(now_millis) = input.now_millis {
             self.tjs_runtime.host_mut().set_clock_millis(now_millis);
         } else {
@@ -1779,7 +1789,16 @@ impl KrkrEngine {
                     .post_current_async_event(handle);
             }
             IdleEvent::ContinuousHandlers(handlers) => {
-                let tick = self.tjs_runtime.host_mut().now_millis();
+                // One timestamp for the whole frame: the sample `update` was
+                // handed, when it had one. A fresh host-clock read here lands
+                // a millisecond or more away from that sample depending on
+                // load, which moves any cadence a handler derives from its
+                // `tick` argument (the movie plugin's frame timeline) off the
+                // driven clock.
+                let tick = match self.frame_now_millis {
+                    Some(tick) => tick,
+                    None => self.tjs_runtime.host_mut().now_millis(),
+                };
                 for handler in handlers {
                     if matches!(handler, Variant::Void) {
                         continue;
@@ -19768,6 +19787,48 @@ mod tests {
         );
     }
 
+    /// A frame's continuous callbacks observe exactly the clock sample the
+    /// caller handed `update`: re-reading the host clock would drift by the
+    /// wall time the frame has been running, which threads through any
+    /// handler that paces itself against its `tick` argument — the movie
+    /// plugin's frame timeline, whose layer tests were load-flaky because of
+    /// it (the M108 findings).
+    #[test]
+    fn continuous_handlers_observe_the_frames_explicit_timestamp() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "continuous_tick.tjs",
+                r#"
+                global.ticks = [];
+                function tickProbe(tick) {
+                    global.ticks.push(tick);
+                }
+                System.addContinuousHandler(tickProbe);
+                "#,
+            )
+            .expect("script");
+
+        let stamps = [0i64, 999, 1000];
+        for now in stamps {
+            engine
+                .update(
+                    EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new())
+                        .with_now_millis(now),
+                    Duration::ZERO,
+                )
+                .expect("update");
+        }
+        for (index, expected) in stamps.into_iter().enumerate() {
+            let tick = engine
+                .execute_expression("read.tjs", &format!("global.ticks[{index}]"))
+                .expect("tick")
+                .to_integer()
+                .expect("integer");
+            assert_eq!(tick, expected, "tick {index}");
+        }
+    }
+
     #[test]
     fn system_exit_sets_host_termination_request() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -20687,6 +20748,15 @@ mod tests {
     #[test]
     fn wave_pause_status_fade_delay_and_set_pos_match_krkr() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        // The fade's due time is the host clock plus 50 + 25 ms, sampled
+        // inside the script. Sandwiching the script between two clock reads
+        // makes the 74/75 ms boundary exact: the fade was armed at some `t`
+        // with `armed_before <= t <= armed_after`, so `armed_before + 74` is
+        // provably early and `armed_after + 75` provably due — instead of
+        // needing the check to run less than a millisecond of real time after
+        // the script, which is what made this test wall-clock flaky under
+        // load (the M108 finding).
+        let armed_before = engine.host_mut().now_millis();
         engine
             .execute_script(
                 "wave_compat.tjs",
@@ -20705,6 +20775,7 @@ mod tests {
                 "#,
             )
             .expect("script");
+        let armed_after = engine.host_mut().now_millis();
         assert_eq!(
             engine.tjs_runtime().global_member("statusChanges"),
             Variant::Integer(1)
@@ -20738,21 +20809,20 @@ mod tests {
             "expected a pause command, got {commands:?}"
         );
         assert!(engine.host().scheduler().has_audio_fade_completion(buffer));
-        engine.host_mut().advance_clock(Duration::from_millis(74));
-        let now = engine.tjs_runtime.host_mut().now_millis();
+        // 74 ms after the fade was armed at the latest bound (`armed_before`):
+        // still short of the 75 ms due time.
         engine
             .tjs_runtime
             .host_mut()
             .scheduler_mut()
-            .post_due_audio_fade_completions(now);
+            .post_due_audio_fade_completions(armed_before.saturating_add(74));
         assert!(engine.host().scheduler().has_audio_fade_completion(buffer));
-        engine.host_mut().advance_clock(Duration::from_millis(1));
-        let now = engine.tjs_runtime.host_mut().now_millis();
+        // 75 ms after the earliest bound (`armed_after`): due.
         engine
             .tjs_runtime
             .host_mut()
             .scheduler_mut()
-            .post_due_audio_fade_completions(now);
+            .post_due_audio_fade_completions(armed_after.saturating_add(75));
         assert!(!engine.host().scheduler().has_audio_fade_completion(buffer));
     }
 
