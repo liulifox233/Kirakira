@@ -33,7 +33,7 @@ use crate::resource_manager::decode_province_image;
 use crate::scheduler::AsyncTriggerMode;
 
 use super::{
-    native_void, register_stub_method,
+    native_void, register_stub_method_with_arg_count,
     video::{
         install_video_native_properties, install_video_overlay_methods,
         install_video_overlay_property_placeholders,
@@ -170,13 +170,13 @@ fn install_methods(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
     class_name: &'static str,
-    methods: &'static [&'static str],
+    methods: &'static [NativeMethodSpec],
 ) {
-    for method in methods {
+    for &(method, min_args) in methods {
         if member_visible_in_chain(runtime, handle, method) {
             continue;
         }
-        register_stub_method(runtime, handle, class_name, method);
+        register_stub_method_with_arg_count(runtime, handle, class_name, method, min_args);
     }
 }
 
@@ -986,13 +986,41 @@ fn install_menu_item_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHand
     // kirikiroid2/plugin copy); KAGEX's `KAGMenuItem` subclasses it and a
     // class-qualified or `super.*` finalize call must resolve to the no-op.
     register_native_method_preserving_script(runtime, handle, "finalize", native_void);
-    register_native_method_preserving_script(runtime, handle, "add", menu_item_add);
-    register_native_method_preserving_script(runtime, handle, "insert", menu_item_insert);
-    register_native_method_preserving_script(runtime, handle, "remove", menu_item_remove);
+    // krkr2's `tTJSNC_MenuItem` floors (`plugins/win32/menu/MenuItemIntf.cpp`):
+    // `add` :263, `insert` :273, `remove` :284 and `popup` :294, all plain
+    // `if(numparams < N) return TJS_E_BADPARAMCOUNT;` tests.  `popup` stays
+    // the no-op stub behind its floor: the engine has no window menu to track.
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "add",
+        NativeArgCount::AtLeast(1),
+        menu_item_add,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "insert",
+        NativeArgCount::AtLeast(2),
+        menu_item_insert,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "remove",
+        NativeArgCount::AtLeast(1),
+        menu_item_remove,
+    );
     register_native_method_preserving_script(runtime, handle, "clear", menu_item_clear);
     register_native_method_preserving_script(runtime, handle, "click", menu_item_noop);
     register_native_method_preserving_script(runtime, handle, "onClick", menu_item_noop);
-    register_native_method_preserving_script(runtime, handle, "popup", menu_item_noop);
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "popup",
+        NativeArgCount::AtLeast(3),
+        menu_item_noop,
+    );
 }
 
 fn menu_item_children(
@@ -1162,6 +1190,10 @@ fn menu_item_noop(
     Ok(Variant::Void)
 }
 
+/// `tTJSNC_Window`'s floors (`visual/WindowIntf.cpp`: `add` :832,
+/// `remove` :842, `setPos` :879, `setSize` :852, `setInnerSize` :899,
+/// `setZoom` :908) at the registration sites.  `onCloseQuery` (:1204) and the
+/// event methods are unguarded in the reference.
 fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     register_native_method_preserving_script(runtime, handle, "finalize", window_finalize);
     register_native_method_preserving_script(runtime, handle, "close", window_close);
@@ -1172,12 +1204,42 @@ fn install_window_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
         "onCloseQuery",
         window_on_close_query,
     );
-    runtime.register_object_native(handle, "add", window_add);
-    runtime.register_object_native(handle, "remove", window_remove);
-    runtime.register_object_native(handle, "setPos", window_set_pos);
-    runtime.register_object_native(handle, "setSize", window_set_size);
-    runtime.register_object_native(handle, "setInnerSize", window_set_inner_size);
-    runtime.register_object_native(handle, "setZoom", window_set_zoom);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "add",
+        NativeArgCount::AtLeast(1),
+        window_add,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "remove",
+        NativeArgCount::AtLeast(1),
+        window_remove,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setPos",
+        NativeArgCount::AtLeast(2),
+        window_set_pos,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setSize",
+        NativeArgCount::AtLeast(2),
+        window_set_size,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setInnerSize",
+        NativeArgCount::AtLeast(2),
+        window_set_inner_size,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setZoom",
+        NativeArgCount::AtLeast(2),
+        window_set_zoom,
+    );
 }
 
 fn window_finalize(
@@ -1433,27 +1495,99 @@ fn set_window_size_members(
     set_window_property_storage(runtime, window, "innerHeight", Variant::Integer(height));
 }
 
+/// The `numparams` floor every `tTJSNI_BaseLayer` method declares in
+/// `visual/LayerIntf.cpp` is registered as `NativeArgCount::AtLeast(N)`, so a
+/// short call reports `TJS_E_BADPARAMCOUNT` (-1004) before the handler runs --
+/// the order the reference validates in (`if(numparams < N) return
+/// TJS_E_BADPARAMCOUNT;`).  `setClip` and `update` are the exceptions: their
+/// accepted set is *0 arguments, or at least N* (`LayerIntf.cpp:7001/7010` and
+/// `:7645/7652`), which `AtLeast` cannot express, so their handlers keep the
+/// count checks.
 fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     register_native_method_preserving_script(runtime, handle, "finalize", layer_void);
     register_native_method_preserving_script(runtime, handle, "asLayer", layer_as_layer);
-    register_native_method_preserving_script(runtime, handle, "loadImages", layer_load_images);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "loadImages",
+        NativeArgCount::AtLeast(1),
+        layer_load_images,
+    );
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "saveLayerImage",
+        NativeArgCount::AtLeast(1),
         layer_save_layer_image,
     );
     register_native_method_preserving_script(runtime, handle, "freeImage", layer_free_image);
-    register_native_method_preserving_script(runtime, handle, "setPos", layer_set_pos);
-    register_native_method_preserving_script(runtime, handle, "setSize", layer_set_size);
-    register_native_method_preserving_script(runtime, handle, "setImagePos", layer_set_image_pos);
-    register_native_method_preserving_script(runtime, handle, "setImageSize", layer_set_image_size);
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "setPos",
+        NativeArgCount::AtLeast(2),
+        layer_set_pos,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "setSize",
+        NativeArgCount::AtLeast(2),
+        layer_set_size,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "setImagePos",
+        NativeArgCount::AtLeast(2),
+        layer_set_image_pos,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "setImageSize",
+        NativeArgCount::AtLeast(2),
+        layer_set_image_size,
+    );
+    // `if(numparams == 0)` resets the clip rect and only a count between 1 and
+    // 3 is an error (`LayerIntf.cpp:7001/7010`), so the handler keeps the
+    // count rule.
     register_native_method_preserving_script(runtime, handle, "setClip", layer_set_clip);
-    register_native_method_preserving_script(runtime, handle, "getMainPixel", layer_get_main_pixel);
-    register_native_method_preserving_script(runtime, handle, "setMainPixel", layer_set_main_pixel);
-    register_native_method_preserving_script(runtime, handle, "getMaskPixel", layer_get_mask_pixel);
-    register_native_method_preserving_script(runtime, handle, "setMaskPixel", layer_set_mask_pixel);
-    register_native_method_preserving_script(runtime, handle, "setCursorPos", layer_set_cursor_pos);
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "getMainPixel",
+        NativeArgCount::AtLeast(2),
+        layer_get_main_pixel,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "setMainPixel",
+        NativeArgCount::AtLeast(3),
+        layer_set_main_pixel,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "getMaskPixel",
+        NativeArgCount::AtLeast(2),
+        layer_get_mask_pixel,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "setMaskPixel",
+        NativeArgCount::AtLeast(3),
+        layer_set_mask_pixel,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "setCursorPos",
+        NativeArgCount::AtLeast(2),
+        layer_set_cursor_pos,
+    );
     register_native_method_preserving_script(
         runtime,
         handle,
@@ -1480,10 +1614,11 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
         layer_assign_images,
     );
     register_native_method_preserving_script(runtime, handle, "exchangeInfo", layer_exchange_info);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "beginTransition",
+        NativeArgCount::AtLeast(1),
         layer_begin_transition,
     );
     register_native_method_preserving_script(
@@ -1499,43 +1634,102 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     if runtime.object_super_class(handle).is_none() {
         runtime.register_object_native(handle, "onTransitionCompleted", native_void);
     }
-    register_native_method_preserving_script(runtime, handle, "fillRect", layer_fill_rect);
-    register_native_method_preserving_script(runtime, handle, "colorRect", layer_color_rect);
-    register_native_method_preserving_script(runtime, handle, "copyRect", layer_copy_rect);
-    register_native_method_preserving_script(runtime, handle, "operateRect", layer_operate_rect);
-    register_native_method_preserving_script(runtime, handle, "piledCopy", layer_piled_copy);
-    register_native_method_preserving_script(runtime, handle, "stretchCopy", layer_stretch_copy);
-    register_native_method_preserving_script(runtime, handle, "affineCopy", layer_affine_copy);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "fillRect",
+        NativeArgCount::AtLeast(5),
+        layer_fill_rect,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "colorRect",
+        NativeArgCount::AtLeast(5),
+        layer_color_rect,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "copyRect",
+        NativeArgCount::AtLeast(7),
+        layer_copy_rect,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "operateRect",
+        NativeArgCount::AtLeast(7),
+        layer_operate_rect,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "piledCopy",
+        NativeArgCount::AtLeast(7),
+        layer_piled_copy,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "stretchCopy",
+        NativeArgCount::AtLeast(9),
+        layer_stretch_copy,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "affineCopy",
+        NativeArgCount::AtLeast(12),
+        layer_affine_copy,
+    );
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "operateStretch",
+        NativeArgCount::AtLeast(9),
         layer_operate_stretch,
     );
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "operateAffine",
+        NativeArgCount::AtLeast(12),
         layer_operate_affine,
     );
-    register_native_method_preserving_script(runtime, handle, "drawText", layer_draw_text);
-    register_native_method_preserving_script(runtime, handle, "drawGlyph", layer_draw_glyph);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "drawText",
+        NativeArgCount::AtLeast(4),
+        layer_draw_text,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "drawGlyph",
+        NativeArgCount::AtLeast(4),
+        layer_draw_glyph,
+    );
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "loadProvinceImage",
+        NativeArgCount::AtLeast(1),
         layer_load_province_image,
     );
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "getProvincePixel",
+        NativeArgCount::AtLeast(2),
         layer_get_province_pixel,
     );
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "setProvincePixel",
+        NativeArgCount::AtLeast(3),
         layer_set_province_pixel,
     );
     register_native_method_preserving_script(
@@ -1544,9 +1738,24 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
         "independProvinceImage",
         layer_independ_province_image,
     );
-    register_native_method_preserving_script(runtime, handle, "getLayerAt", layer_get_layer_at);
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "getLayerAt",
+        NativeArgCount::AtLeast(2),
+        layer_get_layer_at,
+    );
+    // `if(numparams < 1)` selects the whole-layer update path and does not
+    // error; only a partial update below four arguments is rejected
+    // (`LayerIntf.cpp:7645/7652`), so the handler keeps the count rule.
     register_native_method_preserving_script(runtime, handle, "update", layer_update);
-    register_native_method_preserving_script(runtime, handle, "convertType", layer_convert_type);
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "convertType",
+        NativeArgCount::AtLeast(1),
+        layer_convert_type,
+    );
     register_native_method_preserving_script(runtime, handle, "focus", layer_focus);
     register_native_method_preserving_script(runtime, handle, "focusPrev", layer_focus_prev);
     register_native_method_preserving_script(runtime, handle, "focusNext", layer_focus_next);
@@ -1554,7 +1763,13 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     register_native_method_preserving_script(runtime, handle, "removeMode", layer_remove_mode);
     register_native_method_preserving_script(runtime, handle, "releaseCapture", layer_void);
     register_native_method_preserving_script(runtime, handle, "onClick", layer_on_click);
-    register_native_method_preserving_script(runtime, handle, "onHitTest", layer_on_hit_test);
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "onHitTest",
+        NativeArgCount::AtLeast(3),
+        layer_on_hit_test,
+    );
     register_native_method_preserving_script(runtime, handle, "onKeyDown", layer_on_key_down);
     register_native_method_preserving_script(runtime, handle, "onKeyUp", layer_on_key_up);
     register_native_method_preserving_script(
@@ -1577,6 +1792,10 @@ fn install_layer_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
     );
 }
 
+/// `tTJSNC_Font`'s methods floor at one argument in the reference
+/// (`LayerIntf.cpp:9919-10032`, one `if(numparams < 1) return
+/// TJS_E_BADPARAMCOUNT;` each); `unmapPrerenderedFont`'s `< 0` test
+/// (`:10043`) is dead, so it stays unguarded.
 fn install_font_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     // `tTJSNC_Font` declares an empty `finalize` with
     // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`LayerIntf.cpp:9903`); the font
@@ -1585,38 +1804,67 @@ fn install_font_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     // script subclass's `super.finalize(...)`; without it the member call
     // aborts the caller with `Member "finalize" does not exist`.
     register_native_method_preserving_script(runtime, handle, "finalize", native_void);
-    register_native_method_preserving_script(runtime, handle, "getTextWidth", font_get_text_width);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "getTextWidth",
+        NativeArgCount::AtLeast(1),
+        font_get_text_width,
+    );
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "getTextHeight",
+        NativeArgCount::AtLeast(1),
         font_get_text_height,
     );
-    register_native_method_preserving_script(runtime, handle, "getEscWidthX", font_get_esc_width_x);
-    register_native_method_preserving_script(runtime, handle, "getEscWidthY", font_get_esc_width_y);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "getEscWidthX",
+        NativeArgCount::AtLeast(1),
+        font_get_esc_width_x,
+    );
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "getEscWidthY",
+        NativeArgCount::AtLeast(1),
+        font_get_esc_width_y,
+    );
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "getEscHeightX",
+        NativeArgCount::AtLeast(1),
         font_get_esc_height_x,
     );
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "getEscHeightY",
+        NativeArgCount::AtLeast(1),
         font_get_esc_height_y,
     );
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "getGlyphDrawRect",
+        NativeArgCount::AtLeast(1),
         font_get_glyph_draw_rect,
     );
-    register_native_method_preserving_script(runtime, handle, "getList", font_get_list);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "getList",
+        NativeArgCount::AtLeast(1),
+        font_get_list,
+    );
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "mapPrerenderedFont",
+        NativeArgCount::AtLeast(1),
         font_map_prerendered_font,
     );
     register_native_method_preserving_script(
@@ -1627,6 +1875,8 @@ fn install_font_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     );
 }
 
+/// `tTJSNC_ImageFunction`'s two real methods floor at the reference counts
+/// (`ImageFunction.cpp:829` for `drawText`, `:915` for `drawGlyph`).
 fn install_image_function_methods(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     // `tTJSNC_ImageFunction` declares an empty `finalize` with
     // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`ImageFunction.cpp:114`); the bitmap
@@ -1635,11 +1885,18 @@ fn install_image_function_methods(runtime: &mut Runtime<KrkrHost>, handle: Objec
     // (`global.ImageFunction.finalize(...)`) and through a script subclass's
     // `super.finalize(...)`.
     register_native_method_preserving_script(runtime, handle, "finalize", native_void);
-    register_native_method_preserving_script(runtime, handle, "drawText", image_function_draw_text);
-    register_native_method_preserving_script(
+    register_native_method_preserving_script_with_arg_count(
+        runtime,
+        handle,
+        "drawText",
+        NativeArgCount::AtLeast(6),
+        image_function_draw_text,
+    );
+    register_native_method_preserving_script_with_arg_count(
         runtime,
         handle,
         "drawGlyph",
+        NativeArgCount::AtLeast(5),
         image_function_draw_glyph,
     );
 }
@@ -3344,12 +3601,31 @@ fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: Ob
     // destroyed (`voiceeffect.tjs`) -- so the member must resolve through the
     // script class's native parent, or the member call aborts the caller.
     runtime.register_object_native(handle, "finalize", native_void);
-    runtime.register_object_native(handle, "open", wave_sound_buffer_open);
+    // `tTJSNI_BaseWaveSoundBuffer`'s floors: `open` (`WaveIntf.cpp:1036`),
+    // `fade` (`:1069`), `setPos` (`:1101`) and `getVisBuffer`
+    // (`sound/win32/WaveImpl.cpp:3376`); `play`/`stop`/`stopFade`/
+    // `setDefaultCounts`/`setDefaultAheads` carry no arity test.
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "open",
+        NativeArgCount::AtLeast(1),
+        wave_sound_buffer_open,
+    );
     runtime.register_object_native(handle, "play", wave_sound_buffer_play);
     runtime.register_object_native(handle, "stop", wave_sound_buffer_stop);
-    runtime.register_object_native(handle, "fade", wave_sound_buffer_fade);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "fade",
+        NativeArgCount::AtLeast(2),
+        wave_sound_buffer_fade,
+    );
     runtime.register_object_native(handle, "stopFade", wave_sound_buffer_stop_fade);
-    runtime.register_object_native(handle, "setPos", wave_sound_buffer_set_pos);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setPos",
+        NativeArgCount::AtLeast(3),
+        wave_sound_buffer_set_pos,
+    );
     runtime.register_object_native(
         handle,
         "setDefaultCounts",
@@ -3361,7 +3637,12 @@ fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: Ob
         wave_sound_buffer_set_default_aheads,
     );
     runtime.register_object_native(handle, "freeDirectSound", native_wave_noop);
-    runtime.register_object_native(handle, "getVisBuffer", native_wave_noop);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "getVisBuffer",
+        NativeArgCount::AtLeast(3),
+        native_wave_noop,
+    );
 }
 
 fn wave_sound_buffer_open(
@@ -6756,14 +7037,13 @@ fn affine_copy_impl(
 /// `dfAlpha -> dfAddAlpha` (premultiply) and `dfAddAlpha -> dfAlpha`
 /// (unpremultiply, "this may loose additive stuff", `:1714`) exist; every other
 /// pairing throws `TVPCannotConvertLayerTypeUsingGivenDirection` (`:1721`).
+/// The missing-argument case is the declaration's floor
+/// (`if(numparams < 1)`, `:7628`), checked before this handler runs.
 fn layer_convert_type(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    if args.is_empty() {
-        return Err(TjsError::bad_param_count());
-    }
     let from_face = args[0].to_integer()?;
     let (this, target) = this_render_layer_target(runtime, this_obj)?;
     let convert: fn(u32) -> u32 = match (effective_draw_face(runtime, this), from_face) {
@@ -10510,11 +10790,19 @@ fn sync_layer_image_members(
     }
 }
 
+/// A member declared on a native class spec: its name and the `numparams`
+/// floor the reference declares (`if(numparams < N) return TJS_E_BADPARAMCOUNT;`),
+/// `0` when the member is unguarded.  The floor reaches the stub registration,
+/// so a short call fails with -1004 before the stub records it.  Members whose
+/// only registration is a hand-written handler carry their floor at that
+/// registration site instead.
+type NativeMethodSpec = (&'static str, usize);
+
 pub(crate) struct NativeClassSpec {
     name: &'static str,
-    methods: &'static [&'static str],
+    methods: &'static [NativeMethodSpec],
     properties: &'static [&'static str],
-    static_methods: &'static [&'static str],
+    static_methods: &'static [NativeMethodSpec],
     static_properties: &'static [&'static str],
 }
 
@@ -10528,27 +10816,30 @@ pub(crate) static TIMER_CLASS: NativeClassSpec = NativeClassSpec {
 
 pub(crate) static ASYNC_TRIGGER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "AsyncTrigger",
-    methods: &["trigger", "cancel"],
+    methods: &[("trigger", 0), ("cancel", 0)],
     properties: &["cached", "mode"],
     static_methods: &[],
     static_properties: &[],
 };
 
+/// `tTJSNI_BaseRect`'s floors (`visual/RectItf.cpp`): `setSize` :68,
+/// `setOffset` :77, `addOffset` :86, `set` :103, `clip` :112, `union` :129,
+/// `intersects` :146, `included` :163, `includedPos` :180, `equal` :190.
 pub(crate) static RECT_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Rect",
     methods: &[
-        "isEmpty",
-        "setSize",
-        "setOffset",
-        "addOffset",
-        "clear",
-        "set",
-        "clip",
-        "union",
-        "intersects",
-        "included",
-        "includedPos",
-        "equal",
+        ("isEmpty", 0),
+        ("setSize", 2),
+        ("setOffset", 2),
+        ("addOffset", 2),
+        ("clear", 0),
+        ("set", 4),
+        ("clip", 1),
+        ("union", 1),
+        ("intersects", 1),
+        ("included", 1),
+        ("includedPos", 2),
+        ("equal", 1),
     ],
     properties: &[
         "width",
@@ -10563,22 +10854,26 @@ pub(crate) static RECT_CLASS: NativeClassSpec = NativeClassSpec {
     static_properties: &[],
 };
 
+/// `tTJSNI_BaseBitmap`'s floors (`visual/BitmapIntf.cpp`): `getPixel` :211,
+/// `setPixel` :220, `getMaskPixel` :229, `setMaskPixel` :238, `setSize` :258,
+/// `copyFrom` :268, `save` :285, `load` :300, `loadAsync` :320, `loadHeader`
+/// :329, `getSaveOption` :352.
 pub(crate) static BITMAP_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Bitmap",
     methods: &[
-        "getPixel",
-        "setPixel",
-        "getMaskPixel",
-        "setMaskPixel",
-        "independ",
-        "setSize",
-        "copyFrom",
-        "save",
-        "load",
-        "loadAsync",
-        "loadHeader",
-        "getSaveOption",
-        "onLoaded",
+        ("getPixel", 2),
+        ("setPixel", 3),
+        ("getMaskPixel", 2),
+        ("setMaskPixel", 3),
+        ("independ", 0),
+        ("setSize", 2),
+        ("copyFrom", 1),
+        ("save", 1),
+        ("load", 1),
+        ("loadAsync", 1),
+        ("loadHeader", 1),
+        ("getSaveOption", 1),
+        ("onLoaded", 0),
     ],
     properties: &[
         "width",
@@ -10592,60 +10887,72 @@ pub(crate) static BITMAP_CLASS: NativeClassSpec = NativeClassSpec {
     static_properties: &[],
 };
 
+/// `tTJSNI_ImageFunction`'s floors (`visual/ImageFunction.cpp`):
+/// `operateAffine` :132, `operateRect` :240, `operateStretch` :331, `flipLR`
+/// :438, `flipUD` :474, `adjustGamma` :511, `doBoxBlur` :578, `doGrayScale`
+/// :634, `fillRect` :670, `colorRect` :738.  `drawText`/`drawGlyph` are real
+/// handlers here and carry their floors (`:829`/`:915`) at the registration
+/// site.
 pub(crate) static IMAGE_FUNCTION_CLASS: NativeClassSpec = NativeClassSpec {
     name: "ImageFunction",
     methods: &[
-        "operateAffine",
-        "operateRect",
-        "operateStretch",
-        "flipLR",
-        "flipUD",
-        "adjustGamma",
-        "doBoxBlur",
-        "doGrayScale",
-        "fillRect",
-        "colorRect",
-        "drawText",
-        "drawGlyph",
+        ("operateAffine", 11),
+        ("operateRect", 6),
+        ("operateStretch", 2),
+        ("flipLR", 1),
+        ("flipUD", 1),
+        ("adjustGamma", 1),
+        ("doBoxBlur", 1),
+        ("doGrayScale", 1),
+        ("fillRect", 2),
+        ("colorRect", 2),
+        ("drawText", 0),
+        ("drawGlyph", 0),
     ],
     properties: &[],
     static_methods: &[],
     static_properties: &[],
 };
 
+/// `tTJSNI_BitmapLayerTreeOwner`'s floors (`visual/BitmapLayerTreeOwner.cpp`):
+/// `fireClick` :216, `fireDoubleClick` :225, `fireMouseDown` :234,
+/// `fireMouseUp` :243, `fireMouseMove` :252, `fireMouseWheel` :261,
+/// `fireTouchDown` :286, `fireTouchUp` :295, `fireTouchMove` :304,
+/// `fireTouchScaling` :313, `fireTouchRotate` :322, `fireKeyDown` :339,
+/// `fireKeyUp` :348, `fireKeyPress` :357, `fireDisplayRotate` :366.
 pub(crate) static BITMAP_LAYER_TREE_OWNER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "BitmapLayerTreeOwner",
     methods: &[
-        "fireClick",
-        "fireDoubleClick",
-        "fireMouseDown",
-        "fireMouseUp",
-        "fireMouseMove",
-        "fireMouseWheel",
-        "fireReleaseCapture",
-        "fireMouseOutOfWindow",
-        "fireTouchDown",
-        "fireTouchUp",
-        "fireTouchMove",
-        "fireTouchScaling",
-        "fireTouchRotate",
-        "fireMultiTouch",
-        "fireKeyDown",
-        "fireKeyUp",
-        "fireKeyPress",
-        "fireDisplayRotate",
-        "fireRecheckInputState",
-        "onSetMouseCursor",
-        "onGetCursorPos",
-        "onSetCursorPos",
-        "onReleaseMouseCapture",
-        "onSetHintText",
-        "onResizeLayer",
-        "onChangeLayerImage",
-        "onSetAttentionPoint",
-        "onDisableAttentionPoint",
-        "onSetImeMode",
-        "onResetImeMode",
+        ("fireClick", 2),
+        ("fireDoubleClick", 2),
+        ("fireMouseDown", 4),
+        ("fireMouseUp", 4),
+        ("fireMouseMove", 3),
+        ("fireMouseWheel", 4),
+        ("fireReleaseCapture", 0),
+        ("fireMouseOutOfWindow", 0),
+        ("fireTouchDown", 5),
+        ("fireTouchUp", 5),
+        ("fireTouchMove", 5),
+        ("fireTouchScaling", 5),
+        ("fireTouchRotate", 6),
+        ("fireMultiTouch", 0),
+        ("fireKeyDown", 2),
+        ("fireKeyUp", 2),
+        ("fireKeyPress", 1),
+        ("fireDisplayRotate", 5),
+        ("fireRecheckInputState", 0),
+        ("onSetMouseCursor", 0),
+        ("onGetCursorPos", 0),
+        ("onSetCursorPos", 0),
+        ("onReleaseMouseCapture", 0),
+        ("onSetHintText", 0),
+        ("onResizeLayer", 0),
+        ("onChangeLayerImage", 0),
+        ("onSetAttentionPoint", 0),
+        ("onDisableAttentionPoint", 0),
+        ("onSetImeMode", 0),
+        ("onResetImeMode", 0),
     ],
     properties: &[
         "width",
@@ -10662,7 +10969,13 @@ pub(crate) static BITMAP_LAYER_TREE_OWNER_CLASS: NativeClassSpec = NativeClassSp
 pub(crate) static MENU_ITEM_CLASS: NativeClassSpec = NativeClassSpec {
     name: "MenuItem",
     methods: &[
-        "add", "insert", "remove", "clear", "click", "onClick", "popup",
+        ("add", 0),
+        ("insert", 0),
+        ("remove", 0),
+        ("clear", 0),
+        ("click", 0),
+        ("onClick", 0),
+        ("popup", 0),
     ],
     properties: &[
         "owner", "caption", "shortcut", "checked", "enabled", "visible", "radio", "group",
@@ -10672,57 +10985,64 @@ pub(crate) static MENU_ITEM_CLASS: NativeClassSpec = NativeClassSpec {
     static_properties: &[],
 };
 
+/// `tTJSNC_Window`'s floor-free members and the ones only a stub serves; the
+/// stub floors are `visual/WindowIntf.cpp`: `setMinSize` :861, `setMaxSize`
+/// :870, `setLayerPos` :889, `postInputEvent` :926, plus
+/// `visual/win32/WindowImpl.cpp`: `findFullScreenCandidates` :2082,
+/// `registerMessageReceiver` :2104, `getTouchPoint` :2117, `getTouchVelocity`
+/// :2168, `getMouseVelocity` :2193.  `add`/`remove`/`setSize`/`setPos`/
+/// `setInnerSize`/`setZoom` are real handlers and carry their floors there.
 pub(crate) static WINDOW_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Window",
     methods: &[
-        "close",
-        "beginMove",
-        "bringToFront",
-        "update",
-        "showModal",
-        "setMaskRegion",
-        "removeMaskRegion",
-        "add",
-        "remove",
-        "setSize",
-        "setMinSize",
-        "setMaxSize",
-        "setPos",
-        "setLayerPos",
-        "setInnerSize",
-        "setZoom",
-        "hideMouseCursor",
-        "postInputEvent",
-        "onResize",
-        "onMouseEnter",
-        "onMouseLeave",
-        "onClick",
-        "onDoubleClick",
-        "onMouseDown",
-        "onMouseUp",
-        "onMouseMove",
-        "onMouseWheel",
-        "onTouchDown",
-        "onTouchUp",
-        "onTouchMove",
-        "onTouchScaling",
-        "onTouchRotate",
-        "onMultiTouch",
-        "onKeyDown",
-        "onKeyUp",
-        "onKeyPress",
-        "onFileDrop",
-        "onCloseQuery",
-        "onPopupHide",
-        "onActivate",
-        "onDeactivate",
-        "onDisplayRotate",
-        "findFullScreenCandidates",
-        "registerMessageReceiver",
-        "getTouchPoint",
-        "getTouchVelocity",
-        "getMouseVelocity",
-        "resetMouseVelocity",
+        ("close", 0),
+        ("beginMove", 0),
+        ("bringToFront", 0),
+        ("update", 0),
+        ("showModal", 0),
+        ("setMaskRegion", 0),
+        ("removeMaskRegion", 0),
+        ("add", 0),
+        ("remove", 0),
+        ("setSize", 0),
+        ("setMinSize", 2),
+        ("setMaxSize", 2),
+        ("setPos", 0),
+        ("setLayerPos", 2),
+        ("setInnerSize", 0),
+        ("setZoom", 0),
+        ("hideMouseCursor", 0),
+        ("postInputEvent", 1),
+        ("onResize", 0),
+        ("onMouseEnter", 0),
+        ("onMouseLeave", 0),
+        ("onClick", 0),
+        ("onDoubleClick", 0),
+        ("onMouseDown", 0),
+        ("onMouseUp", 0),
+        ("onMouseMove", 0),
+        ("onMouseWheel", 0),
+        ("onTouchDown", 0),
+        ("onTouchUp", 0),
+        ("onTouchMove", 0),
+        ("onTouchScaling", 0),
+        ("onTouchRotate", 0),
+        ("onMultiTouch", 0),
+        ("onKeyDown", 0),
+        ("onKeyUp", 0),
+        ("onKeyPress", 0),
+        ("onFileDrop", 0),
+        ("onCloseQuery", 0),
+        ("onPopupHide", 0),
+        ("onActivate", 0),
+        ("onDeactivate", 0),
+        ("onDisplayRotate", 0),
+        ("findFullScreenCandidates", 5),
+        ("registerMessageReceiver", 3),
+        ("getTouchPoint", 1),
+        ("getTouchVelocity", 4),
+        ("getMouseVelocity", 3),
+        ("resetMouseVelocity", 0),
     ],
     properties: &[
         "visible",
@@ -10771,96 +11091,103 @@ pub(crate) static WINDOW_CLASS: NativeClassSpec = NativeClassSpec {
     static_properties: &["mainWindow"],
 };
 
+/// `tTJSNC_Layer`'s surface.  Only the members whose sole registration is the
+/// stub carry a floor here: `moveBefore` (`LayerIntf.cpp:6731`), `moveBehind`
+/// (:6752), `copy9Patch` (:7165), `setAttentionPos` (:7780),
+/// `copyToBitmapFromMainImage` (:7865) and `copyFromBitmapToMainImage`
+/// (:7884).  The rest are real handlers (floor at the registration site) or
+/// have no reference arity test, and `onKeyDown`/`onKeyUp`/`onKeyPress`'s
+/// `< N || <flag>` tests only pick the default handler -- they never reject.
 pub(crate) static LAYER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Layer",
     methods: &[
-        "asLayer",
-        "moveBefore",
-        "moveBehind",
-        "bringToBack",
-        "bringToFront",
-        "saveLayerImage",
-        "loadImages",
-        "freeImage",
-        "loadProvinceImage",
-        "getMainPixel",
-        "setMainPixel",
-        "getMaskPixel",
-        "setMaskPixel",
-        "getProvincePixel",
-        "setProvincePixel",
-        "getLayerAt",
-        "setPos",
-        "setSize",
-        "setSizeToImageSize",
-        "setImagePos",
-        "setImageSize",
-        "setDefaultCursor",
-        "independMainImage",
-        "independProvinceImage",
-        "setClip",
-        "fillRect",
-        "colorRect",
-        "drawText",
-        "drawGlyph",
-        "piledCopy",
-        "copyRect",
-        "copy9Patch",
-        "operateRect",
-        "stretchCopy",
-        "operateStretch",
-        "affineCopy",
-        "operateAffine",
-        "doBoxBlur",
-        "adjustGamma",
-        "doGrayScale",
-        "flipLR",
-        "flipUD",
-        "convertType",
-        "update",
-        "setCursorPos",
-        "releaseCapture",
-        "releaseTouchCapture",
-        "focus",
-        "focusPrev",
-        "focusNext",
-        "setMode",
-        "removeMode",
-        "setAttentionPos",
-        "beginTransition",
-        "stopTransition",
-        "assignImages",
-        "exchangeInfo",
-        "dump",
-        "copyToBitmapFromMainImage",
-        "copyFromBitmapToMainImage",
-        "onHitTest",
-        "onClick",
-        "onDoubleClick",
-        "onMouseDown",
-        "onMouseUp",
-        "onMouseMove",
-        "onMouseEnter",
-        "onMouseLeave",
-        "onTouchDown",
-        "onTouchUp",
-        "onTouchMove",
-        "onTouchScaling",
-        "onTouchRotate",
-        "onMultiTouch",
-        "onBlur",
-        "onFocus",
-        "onNodeEnabled",
-        "onNodeDisabled",
-        "onKeyDown",
-        "onKeyUp",
-        "onKeyPress",
-        "onMouseWheel",
-        "onSearchPrevFocusable",
-        "onSearchNextFocusable",
-        "onBeforeFocus",
-        "onPaint",
-        "onTransitionCompleted",
+        ("asLayer", 0),
+        ("moveBefore", 1),
+        ("moveBehind", 1),
+        ("bringToBack", 0),
+        ("bringToFront", 0),
+        ("saveLayerImage", 0),
+        ("loadImages", 0),
+        ("freeImage", 0),
+        ("loadProvinceImage", 0),
+        ("getMainPixel", 0),
+        ("setMainPixel", 0),
+        ("getMaskPixel", 0),
+        ("setMaskPixel", 0),
+        ("getProvincePixel", 0),
+        ("setProvincePixel", 0),
+        ("getLayerAt", 0),
+        ("setPos", 0),
+        ("setSize", 0),
+        ("setSizeToImageSize", 0),
+        ("setImagePos", 0),
+        ("setImageSize", 0),
+        ("setDefaultCursor", 0),
+        ("independMainImage", 0),
+        ("independProvinceImage", 0),
+        ("setClip", 0),
+        ("fillRect", 0),
+        ("colorRect", 0),
+        ("drawText", 0),
+        ("drawGlyph", 0),
+        ("piledCopy", 0),
+        ("copyRect", 0),
+        ("copy9Patch", 1),
+        ("operateRect", 0),
+        ("stretchCopy", 0),
+        ("operateStretch", 0),
+        ("affineCopy", 0),
+        ("operateAffine", 0),
+        ("doBoxBlur", 0),
+        ("adjustGamma", 0),
+        ("doGrayScale", 0),
+        ("flipLR", 0),
+        ("flipUD", 0),
+        ("convertType", 0),
+        ("update", 0),
+        ("setCursorPos", 0),
+        ("releaseCapture", 0),
+        ("releaseTouchCapture", 0),
+        ("focus", 0),
+        ("focusPrev", 0),
+        ("focusNext", 0),
+        ("setMode", 0),
+        ("removeMode", 0),
+        ("setAttentionPos", 2),
+        ("beginTransition", 0),
+        ("stopTransition", 0),
+        ("assignImages", 0),
+        ("exchangeInfo", 0),
+        ("dump", 0),
+        ("copyToBitmapFromMainImage", 1),
+        ("copyFromBitmapToMainImage", 1),
+        ("onHitTest", 0),
+        ("onClick", 0),
+        ("onDoubleClick", 0),
+        ("onMouseDown", 0),
+        ("onMouseUp", 0),
+        ("onMouseMove", 0),
+        ("onMouseEnter", 0),
+        ("onMouseLeave", 0),
+        ("onTouchDown", 0),
+        ("onTouchUp", 0),
+        ("onTouchMove", 0),
+        ("onTouchScaling", 0),
+        ("onTouchRotate", 0),
+        ("onMultiTouch", 0),
+        ("onBlur", 0),
+        ("onFocus", 0),
+        ("onNodeEnabled", 0),
+        ("onNodeDisabled", 0),
+        ("onKeyDown", 0),
+        ("onKeyUp", 0),
+        ("onKeyPress", 0),
+        ("onMouseWheel", 0),
+        ("onSearchPrevFocusable", 0),
+        ("onSearchNextFocusable", 0),
+        ("onBeforeFocus", 0),
+        ("onPaint", 0),
+        ("onTransitionCompleted", 0),
     ],
     properties: &[
         "parent",
@@ -10926,19 +11253,21 @@ pub(crate) static LAYER_CLASS: NativeClassSpec = NativeClassSpec {
     static_properties: &[],
 };
 
+/// The Font method floors are the registration sites' (`LayerIntf.cpp`); the
+/// stub list only has to declare the members, so every entry stays unguarded.
 pub(crate) static FONT_CLASS: NativeClassSpec = NativeClassSpec {
     name: "Font",
     methods: &[
-        "getTextWidth",
-        "getTextHeight",
-        "getEscWidthX",
-        "getEscWidthY",
-        "getEscHeightX",
-        "getEscHeightY",
-        "getGlyphDrawRect",
-        "getList",
-        "mapPrerenderedFont",
-        "unmapPrerenderedFont",
+        ("getTextWidth", 0),
+        ("getTextHeight", 0),
+        ("getEscWidthX", 0),
+        ("getEscWidthY", 0),
+        ("getEscHeightX", 0),
+        ("getEscHeightY", 0),
+        ("getGlyphDrawRect", 0),
+        ("getList", 0),
+        ("mapPrerenderedFont", 0),
+        ("unmapPrerenderedFont", 0),
     ],
     properties: &[
         "face",
@@ -10955,20 +11284,20 @@ pub(crate) static FONT_CLASS: NativeClassSpec = NativeClassSpec {
     static_properties: &[],
 };
 
-const WAVE_SOUND_BUFFER_METHODS: &[&str] = &[
-    "open",
-    "play",
-    "stop",
-    "fade",
-    "stopFade",
-    "setPos",
-    "onStatusChanged",
-    "onFadeCompleted",
-    "onLabel",
-    "freeDirectSound",
-    "getVisBuffer",
-    "setDefaultCounts",
-    "setDefaultAheads",
+const WAVE_SOUND_BUFFER_METHODS: &[NativeMethodSpec] = &[
+    ("open", 0),
+    ("play", 0),
+    ("stop", 0),
+    ("fade", 0),
+    ("stopFade", 0),
+    ("setPos", 0),
+    ("onStatusChanged", 0),
+    ("onFadeCompleted", 0),
+    ("onLabel", 0),
+    ("freeDirectSound", 0),
+    ("getVisBuffer", 0),
+    ("setDefaultCounts", 0),
+    ("setDefaultAheads", 0),
 ];
 
 pub(crate) static WAVE_SOUND_BUFFER_CLASS: NativeClassSpec = NativeClassSpec {
@@ -11018,30 +11347,33 @@ pub(crate) fn video_overlay_property_names() -> &'static [&'static str] {
     VIDEO_OVERLAY_CLASS.properties
 }
 
+/// VideoOverlay's method floors belong to `native/video.rs` (the module that
+/// registers the real handlers and the class surface); the spec only declares
+/// the names, so every entry stays unguarded here.
 pub(crate) static VIDEO_OVERLAY_CLASS: NativeClassSpec = NativeClassSpec {
     name: "VideoOverlay",
     methods: &[
-        "open",
-        "play",
-        "stop",
-        "close",
-        "setPos",
-        "setSize",
-        "setBounds",
-        "pause",
-        "rewind",
-        "prepare",
-        "setSegmentLoop",
-        "cancelSegmentLoop",
-        "setPeriodEvent",
-        "cancelPeriodEvent",
-        "selectAudioStream",
-        "setMixingLayer",
-        "resetMixingLayer",
-        "onStatusChanged",
-        "onCallbackCommand",
-        "onPeriod",
-        "onFrameUpdate",
+        ("open", 0),
+        ("play", 0),
+        ("stop", 0),
+        ("close", 0),
+        ("setPos", 0),
+        ("setSize", 0),
+        ("setBounds", 0),
+        ("pause", 0),
+        ("rewind", 0),
+        ("prepare", 0),
+        ("setSegmentLoop", 0),
+        ("cancelSegmentLoop", 0),
+        ("setPeriodEvent", 0),
+        ("cancelPeriodEvent", 0),
+        ("selectAudioStream", 0),
+        ("setMixingLayer", 0),
+        ("resetMixingLayer", 0),
+        ("onStatusChanged", 0),
+        ("onCallbackCommand", 0),
+        ("onPeriod", 0),
+        ("onFrameUpdate", 0),
     ],
     properties: &[
         "position",
@@ -11099,7 +11431,7 @@ pub(crate) static VIDEO_OVERLAY_CLASS: NativeClassSpec = NativeClassSpec {
 
 pub(crate) static BASIC_DRAW_DEVICE_CLASS: NativeClassSpec = NativeClassSpec {
     name: "BasicDrawDevice",
-    methods: &["recreate"],
+    methods: &[("recreate", 0)],
     properties: &["interface", "enableD3D", "preferredDrawer"],
     static_methods: &[],
     static_properties: &["dtNone", "dtDrawDib", "dtDBGDI", "dtDBDD", "dtDBD3D"],
@@ -11549,5 +11881,594 @@ mod tests {
             ),
             "the destination moved to a fresh plane"
         );
+    }
+
+    /// M169.  Every `tTJSNI_BaseLayer` method whose reference declares
+    /// `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carries that floor at its
+    /// registration site (`visual/LayerIntf.cpp`, the per-row anchors are in
+    /// the mission notes), so a short call reports `TJS_E_BADPARAMCOUNT`
+    /// (-1004) before the handler runs -- while the arities the shipped games
+    /// call (`setSize(10, 10)`, `fillRect(0, 0, 10, 10, color)`) still go
+    /// through.  `setClip`/`update` accept 0 arguments and are pinned by
+    /// `layer_clip_and_update_keep_the_zero_argument_forms`.
+    #[test]
+    fn layer_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "layer_floors.tjs",
+                r#"
+                var layer = new Layer();
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var full = "";
+                try {
+                    layer.setSize(10, 10);
+                    layer.setImageSize(10, 10);
+                    layer.fillRect(0, 0, 10, 10, 0xffffffff);
+                    layer.getLayerAt(0, 0);
+                } catch (e) { full = e.message; }
+                return full + "|" + [
+                    message(function() { layer.setPos(1); }),
+                    message(function() { layer.setSize(1); }),
+                    message(function() { layer.setImagePos(1); }),
+                    message(function() { layer.setImageSize(1); }),
+                    message(function() { layer.getMainPixel(1); }),
+                    message(function() { layer.setMainPixel(1, 0); }),
+                    message(function() { layer.getMaskPixel(1); }),
+                    message(function() { layer.setMaskPixel(1, 0); }),
+                    message(function() { layer.getProvincePixel(1); }),
+                    message(function() { layer.setProvincePixel(1, 0); }),
+                    message(function() { layer.getLayerAt(1); }),
+                    message(function() { layer.setCursorPos(1); }),
+                    message(function() { layer.loadImages(); }),
+                    message(function() { layer.saveLayerImage(); }),
+                    message(function() { layer.loadProvinceImage(); }),
+                    message(function() { layer.beginTransition(); }),
+                    message(function() { layer.convertType(); }),
+                    message(function() { layer.fillRect(0, 0, 1, 1); }),
+                    message(function() { layer.colorRect(0, 0, 1, 1); }),
+                    message(function() { layer.drawText(0, 0, "x"); }),
+                    message(function() { layer.drawGlyph(0, 0, 1); }),
+                    message(function() { layer.copyRect(0, 0, 1, 1, 1, 1); }),
+                    message(function() { layer.operateRect(0, 0, 1, 1, 1, 1); }),
+                    message(function() { layer.piledCopy(0, 0, 1, 1, 1, 1); }),
+                    message(function() { layer.stretchCopy(0, 0, 1, 1, 1, 1, 1, 1); }),
+                    message(function() { layer.operateStretch(0, 0, 1, 1, 1, 1, 1, 1); }),
+                    message(function() { layer.affineCopy(0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1); }),
+                    message(function() { layer.operateAffine(0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1); }),
+                    message(function() { layer.onHitTest(1, 2); }),
+                    message(function() { layer.moveBefore(); }),
+                    message(function() { layer.moveBehind(); }),
+                    message(function() { layer.copy9Patch(); }),
+                    message(function() { layer.setAttentionPos(1); }),
+                    message(function() { layer.copyToBitmapFromMainImage(); }),
+                    message(function() { layer.copyFromBitmapToMainImage(); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("|{}", ["Invalid argument count"; 35].join("|")))
+        );
+        // The identity from Rust: the dispatch check answers
+        // `TJS_E_BADPARAMCOUNT` (-1004) before the handler.
+        let error = engine
+            .execute_expression("layer_floors.tjs", "layer.setPos(1)")
+            .expect_err("a short setPos call must fail");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+    }
+
+    /// The `tTJSNC_Window` floors (`visual/WindowIntf.cpp` :832/:842/:852/:879/
+    /// :899/:908 for the real handlers and :861/:870/:889/:926 plus
+    /// `visual/win32/WindowImpl.cpp` :2082/:2104/:2117/:2168/:2193 for the
+    /// members only a stub serves), with the window call shapes a game uses.
+    #[test]
+    fn window_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "window_floors.tjs",
+                r#"
+                var window = new Window();
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var full = "";
+                try {
+                    window.setSize(100, 100);
+                    window.setPos(20, 30);
+                    window.setInnerSize(80, 60);
+                    window.setZoom(200, 100);
+                    window.add(new Layer(window, null));
+                } catch (e) { full = e.message; }
+                return full + "|" + [
+                    message(function() { window.add(); }),
+                    message(function() { window.remove(); }),
+                    message(function() { window.setPos(1); }),
+                    message(function() { window.setSize(1); }),
+                    message(function() { window.setInnerSize(1); }),
+                    message(function() { window.setZoom(1); }),
+                    message(function() { window.setMinSize(1); }),
+                    message(function() { window.setMaxSize(1); }),
+                    message(function() { window.setLayerPos(1); }),
+                    message(function() { window.postInputEvent(); }),
+                    message(function() { window.getTouchPoint(); }),
+                    message(function() { window.getTouchVelocity(1, 2, 3); }),
+                    message(function() { window.getMouseVelocity(1, 2); }),
+                    message(function() { window.registerMessageReceiver(1, 2); }),
+                    message(function() { window.findFullScreenCandidates(1, 2, 3, 4); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("|{}", ["Invalid argument count"; 15].join("|")))
+        );
+    }
+
+    /// The `tTJSNC_Font` floors: every method below `unmapPrerenderedFont` needs
+    /// one argument (`LayerIntf.cpp:9919-10032`); the `unmapPrerenderedFont`
+    /// test is `numparams < 0` (`:10043`) and therefore never rejects.
+    #[test]
+    fn font_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "font_floors.tjs",
+                r#"
+                var font = new Font();
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var full = "";
+                try {
+                    font.getTextWidth("A");
+                    font.getTextHeight("A");
+                    font.unmapPrerenderedFont();
+                } catch (e) { full = e.message; }
+                return full + "|" + [
+                    message(function() { font.getTextWidth(); }),
+                    message(function() { font.getTextHeight(); }),
+                    message(function() { font.getEscWidthX(); }),
+                    message(function() { font.getEscWidthY(); }),
+                    message(function() { font.getEscHeightX(); }),
+                    message(function() { font.getEscHeightY(); }),
+                    message(function() { font.getGlyphDrawRect(); }),
+                    message(function() { font.getList(); }),
+                    message(function() { font.mapPrerenderedFont(); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("|{}", ["Invalid argument count"; 9].join("|")))
+        );
+    }
+
+    /// The `WaveSoundBuffer` floors (`WaveIntf.cpp:1036` `open`, `:1069`
+    /// `fade`, `:1101` `setPos`; `win32/WaveImpl.cpp:3376` `getVisBuffer`); the
+    /// engine plays a movie soundtrack through this surface and PARQUET's KAG
+    /// wrappers forward the reference arity.
+    #[test]
+    fn wave_sound_buffer_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_floors.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var full = "";
+                try {
+                    WaveSoundBuffer.setDefaultCounts(256);
+                    buffer.stop();
+                } catch (e) { full = e.message; }
+                return full + "|" + [
+                    message(function() { buffer.open(); }),
+                    message(function() { buffer.fade(1); }),
+                    message(function() { buffer.setPos(1, 2); }),
+                    message(function() { buffer.getVisBuffer(1, 2); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("|{}", ["Invalid argument count"; 4].join("|")))
+        );
+    }
+
+    /// The engine `MenuItem` floors M162 measured against krkr2's
+    /// `tTJSNC_MenuItem` (`plugins/win32/menu/MenuItemIntf.cpp`): `add` :263,
+    /// `insert` :273, `remove` :284 and `popup` :294.  `popup` answers void
+    /// behind its floor -- the engine has no window menu to track, which is
+    /// M114/M162's finding, not this floor.
+    #[test]
+    fn menu_item_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "menu_item_floors.tjs",
+                r#"
+                var root = new MenuItem(null, "root");
+                var child = new MenuItem(null, "child");
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var full = "";
+                try {
+                    root.add(child);
+                } catch (e) { full = e.message; }
+                var popup = root.popup(1, 2, 3);
+                return full + "|" + (popup === void ? "true" : "false") + "|" + [
+                    message(function() { root.add(); }),
+                    message(function() { root.insert(child); }),
+                    message(function() { root.remove(); }),
+                    message(function() { root.popup(1, 2); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("|true|{}", ["Invalid argument count"; 4].join("|")))
+        );
+    }
+
+    /// The spec-level floors of the classes that are stubs on this engine --
+    /// `Rect` (11 rows), `Bitmap` (15) and `BitmapLayerTreeOwner` (29), all
+    /// registered through `NativeClassSpec` (`visual/RectItf.cpp`,
+    /// `visual/BitmapIntf.cpp`, `visual/BitmapLayerTreeOwner.cpp`).  A short
+    /// call fails before the stub records it; a full-arity call still answers
+    /// `void`.
+    #[test]
+    fn stub_class_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "stub_floors.tjs",
+                r#"
+                var rect = new Rect(0, 0, 10, 10);
+                var bitmap = new Bitmap();
+                var owner = new BitmapLayerTreeOwner();
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var full = "";
+                try {
+                    rect.setSize(10, 10);
+                    bitmap.getPixel(1, 1);
+                    owner.fireClick(0, 0);
+                } catch (e) { full = e.message; }
+                return full + "|" + [
+                    message(function() { rect.setSize(1); }),
+                    message(function() { rect.setOffset(1); }),
+                    message(function() { rect.addOffset(1); }),
+                    message(function() { rect.set(1, 2, 3); }),
+                    message(function() { rect.clip(); }),
+                    message(function() { rect.union(); }),
+                    message(function() { rect.intersects(); }),
+                    message(function() { rect.included(); }),
+                    message(function() { rect.includedPos(1); }),
+                    message(function() { rect.equal(); }),
+                    message(function() { bitmap.getPixel(1); }),
+                    message(function() { bitmap.setPixel(1, 2); }),
+                    message(function() { bitmap.getMaskPixel(1); }),
+                    message(function() { bitmap.setMaskPixel(1, 2); }),
+                    message(function() { bitmap.setSize(1); }),
+                    message(function() { bitmap.copyFrom(); }),
+                    message(function() { bitmap.save(); }),
+                    message(function() { bitmap.load(); }),
+                    message(function() { bitmap.loadAsync(); }),
+                    message(function() { bitmap.loadHeader(); }),
+                    message(function() { bitmap.getSaveOption(); }),
+                    message(function() { owner.fireClick(1); }),
+                    message(function() { owner.fireDoubleClick(1); }),
+                    message(function() { owner.fireMouseDown(1, 2, 3); }),
+                    message(function() { owner.fireMouseUp(1, 2, 3); }),
+                    message(function() { owner.fireMouseMove(1, 2); }),
+                    message(function() { owner.fireMouseWheel(1, 2, 3); }),
+                    message(function() { owner.fireTouchDown(1, 2, 3, 4); }),
+                    message(function() { owner.fireTouchUp(1, 2, 3, 4); }),
+                    message(function() { owner.fireTouchMove(1, 2, 3, 4); }),
+                    message(function() { owner.fireTouchScaling(1, 2, 3, 4); }),
+                    message(function() { owner.fireTouchRotate(1, 2, 3, 4, 5); }),
+                    message(function() { owner.fireKeyDown(1); }),
+                    message(function() { owner.fireKeyUp(1); }),
+                    message(function() { owner.fireKeyPress(); }),
+                    message(function() { owner.fireDisplayRotate(1, 2, 3, 4); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("|{}", ["Invalid argument count"; 36].join("|")))
+        );
+    }
+
+    /// `ImageFunction`'s two real handlers floor at six (`drawText`,
+    /// `ImageFunction.cpp:829`) and five (`drawGlyph`, `:915`) arguments, and
+    /// the stub members carry their own rows from the same file.  The
+    /// layer-target form the engine forwards (`ImageFunction.drawText(layer,
+    /// ...)`, six arguments) still reaches the layer handler.
+    #[test]
+    fn image_function_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "image_function_floors.tjs",
+                r#"
+                var image = new ImageFunction();
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var full = "";
+                try {
+                    image.drawText(null, 0, 0, "x", 0, 0);
+                    image.drawGlyph(null, 0, 0, 0, 0);
+                } catch (e) { full = e.message; }
+                return full + "|" + [
+                    message(function() { image.drawText(null, 0, 0, "x", 0); }),
+                    message(function() { image.drawGlyph(null, 0, 0, 0); }),
+                    message(function() { image.operateAffine(0, 0, 1, 1, 0, 0, 1, 1, 0, 0); }),
+                    message(function() { image.operateRect(0, 0, 1, 1, 1); }),
+                    message(function() { image.operateStretch(0); }),
+                    message(function() { image.flipLR(); }),
+                    message(function() { image.flipUD(); }),
+                    message(function() { image.adjustGamma(); }),
+                    message(function() { image.doBoxBlur(); }),
+                    message(function() { image.doGrayScale(); }),
+                    message(function() { image.fillRect(0); }),
+                    message(function() { image.colorRect(0); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("|{}", ["Invalid argument count"; 12].join("|")))
+        );
+    }
+
+    /// The two members whose reference shape is *0 arguments, or at least N*:
+    /// `Layer.setClip` (0 resets the clip rect, >= 4 sets it,
+    /// `LayerIntf.cpp:7001/7010`) and `Layer.update` (0 updates the whole
+    /// layer, `:7645/7652`).  They keep their handler checks instead of a
+    /// registration floor, so the zero-argument calls the engine's own
+    /// transition tests drive (`dest.update()`) and the clip reset stay valid
+    /// while 1..3 arguments are still rejected.
+    #[test]
+    fn layer_clip_and_update_keep_the_zero_argument_forms() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "layer_exceptions.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(4, 4);
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var zero = message(function() { layer.setClip(); layer.update(); });
+                var four = message(function() { layer.setClip(0, 0, 4, 4); });
+                return zero + "|" + four + "|" + [
+                    message(function() { layer.setClip(1); }),
+                    message(function() { layer.setClip(1, 2, 3); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("||Invalid argument count|Invalid argument count".to_string())
+        );
+    }
+
+    /// The other half of the floor contract: a call at exactly the reference's
+    /// argument count must not be rejected as a short call.  A floor that is
+    /// too high (a mistyped N) is the failure mode that would break working
+    /// game scripts, so every floored member is called once here at the count
+    /// its reference row declares and any `Invalid argument count` answer is
+    /// reported with the member's name.  A handler that fails for any *other*
+    /// reason (a detached layer, a missing storage, a stub's own limits)
+    /// counts as accepted -- this test is about the declaration, not the
+    /// implementation behind it.
+    #[test]
+    fn reference_arity_calls_are_not_rejected() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "floor_exactness.tjs",
+                r#"
+                var layer = new Layer();
+                layer.setImageSize(10, 10);
+                var source = new Layer();
+                source.setImageSize(4, 4);
+                var window = new Window();
+                var added = new Layer(window, null);
+                var font = new Font();
+                var wave = new WaveSoundBuffer();
+                var image = new ImageFunction();
+                var rect = new Rect(0, 0, 10, 10);
+                var bitmap = new Bitmap();
+                var owner = new BitmapLayerTreeOwner();
+                var root = new MenuItem(null, "root");
+                var child = new MenuItem(null, "child");
+                var problems = "";
+                function check(name, body) {
+                    try {
+                        body();
+                    } catch (e) {
+                        if (e.message === "Invalid argument count") {
+                            problems += name + "; ";
+                        }
+                    }
+                }
+                check("Layer.setPos", function() { layer.setPos(0, 0); });
+                check("Layer.setSize", function() { layer.setSize(10, 10); });
+                check("Layer.setImagePos", function() { layer.setImagePos(0, 0); });
+                check("Layer.setImageSize", function() { layer.setImageSize(10, 10); });
+                check("Layer.getMainPixel", function() { layer.getMainPixel(0, 0); });
+                check("Layer.setMainPixel", function() { layer.setMainPixel(0, 0, 0xffffffff); });
+                check("Layer.getMaskPixel", function() { layer.getMaskPixel(0, 0); });
+                check("Layer.setMaskPixel", function() { layer.setMaskPixel(0, 0, 128); });
+                check("Layer.getProvincePixel", function() { layer.getProvincePixel(0, 0); });
+                check("Layer.setProvincePixel", function() { layer.setProvincePixel(0, 0, 0); });
+                check("Layer.getLayerAt", function() { layer.getLayerAt(0, 0); });
+                check("Layer.setCursorPos", function() { layer.setCursorPos(0, 0); });
+                check("Layer.loadImages", function() { layer.loadImages("none"); });
+                check("Layer.saveLayerImage", function() { layer.saveLayerImage("none"); });
+                check("Layer.loadProvinceImage", function() { layer.loadProvinceImage("none"); });
+                check("Layer.beginTransition", function() { layer.beginTransition("none"); });
+                check("Layer.convertType", function() { layer.convertType(dfAlpha); });
+                check("Layer.fillRect", function() { layer.fillRect(0, 0, 10, 10, 0xffffffff); });
+                check("Layer.colorRect", function() { layer.colorRect(0, 0, 10, 10, 0xffffffff); });
+                check("Layer.drawText", function() { layer.drawText(0, 0, "x", 0xffffff); });
+                check("Layer.drawGlyph", function() { layer.drawGlyph(0, 0, "x", 0xffffff); });
+                check("Layer.copyRect", function() { layer.copyRect(0, 0, source, 0, 0, 4, 4); });
+                check("Layer.operateRect", function() { layer.operateRect(0, 0, source, 0, 0, 4, 4); });
+                check("Layer.piledCopy", function() { layer.piledCopy(0, 0, source, 0, 0, 4, 4); });
+                check("Layer.stretchCopy", function() { layer.stretchCopy(0, 0, 4, 4, source, 0, 0, 2, 2); });
+                check("Layer.operateStretch", function() { layer.operateStretch(0, 0, 4, 4, source, 0, 0, 2, 2); });
+                check("Layer.affineCopy", function() { layer.affineCopy(source, 1, 0, 1, 1, false, 0, 0, 1, 0, 0, 1); });
+                check("Layer.operateAffine", function() { layer.operateAffine(source, 1, 0, 1, 1, false, 0, 0, 1, 0, 0, 1); });
+                check("Layer.onHitTest", function() { layer.onHitTest(0, 0, 1); });
+                check("Layer.moveBefore", function() { layer.moveBefore(0); });
+                check("Layer.moveBehind", function() { layer.moveBehind(0); });
+                check("Layer.copy9Patch", function() { layer.copy9Patch(0); });
+                check("Layer.setAttentionPos", function() { layer.setAttentionPos(0, 0); });
+                check("Layer.copyToBitmapFromMainImage", function() { layer.copyToBitmapFromMainImage(0); });
+                check("Layer.copyFromBitmapToMainImage", function() { layer.copyFromBitmapToMainImage(0); });
+                check("Layer.setClip", function() { layer.setClip(); });
+                check("Layer.setClip4", function() { layer.setClip(0, 0, 4, 4); });
+                check("Layer.update", function() { layer.update(); });
+                check("Window.add", function() { window.add(added); });
+                check("Window.remove", function() { window.remove(added); });
+                check("Window.setPos", function() { window.setPos(0, 0); });
+                check("Window.setSize", function() { window.setSize(100, 100); });
+                check("Window.setInnerSize", function() { window.setInnerSize(80, 60); });
+                check("Window.setZoom", function() { window.setZoom(100, 100); });
+                check("Window.setMinSize", function() { window.setMinSize(10, 10); });
+                check("Window.setMaxSize", function() { window.setMaxSize(100, 100); });
+                check("Window.setLayerPos", function() { window.setLayerPos(0, 0); });
+                check("Window.postInputEvent", function() { window.postInputEvent(0); });
+                check("Window.getTouchPoint", function() { window.getTouchPoint(0); });
+                check("Window.getTouchVelocity", function() { window.getTouchVelocity(0, 0, 0, 0); });
+                check("Window.getMouseVelocity", function() { window.getMouseVelocity(0, 0, 0); });
+                check("Window.registerMessageReceiver", function() { window.registerMessageReceiver(0, 0, 0); });
+                check("Window.findFullScreenCandidates", function() { window.findFullScreenCandidates(0, 0, 0, 0, 0); });
+                check("Font.getTextWidth", function() { font.getTextWidth("A"); });
+                check("Font.getTextHeight", function() { font.getTextHeight("A"); });
+                check("Font.getEscWidthX", function() { font.getEscWidthX("A"); });
+                check("Font.getEscWidthY", function() { font.getEscWidthY("A"); });
+                check("Font.getEscHeightX", function() { font.getEscHeightX("A"); });
+                check("Font.getEscHeightY", function() { font.getEscHeightY("A"); });
+                check("Font.getGlyphDrawRect", function() { font.getGlyphDrawRect("A"); });
+                check("Font.getList", function() { font.getList("A"); });
+                check("Font.mapPrerenderedFont", function() { font.mapPrerenderedFont(font); });
+                check("WaveSoundBuffer.open", function() { wave.open("none"); });
+                check("WaveSoundBuffer.fade", function() { wave.fade(0, 1); });
+                check("WaveSoundBuffer.setPos", function() { wave.setPos(0, 0, 0); });
+                check("WaveSoundBuffer.getVisBuffer", function() { wave.getVisBuffer(0, 0, 0); });
+                check("ImageFunction.drawText", function() { image.drawText(null, 0, 0, "x", 0, 0); });
+                check("ImageFunction.drawGlyph", function() { image.drawGlyph(null, 0, 0, 0, 0); });
+                check("ImageFunction.operateAffine", function() { image.operateAffine(0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0); });
+                check("ImageFunction.operateRect", function() { image.operateRect(0, 0, 1, 1, 1, 1); });
+                check("ImageFunction.operateStretch", function() { image.operateStretch(0, 0); });
+                check("ImageFunction.flipLR", function() { image.flipLR(0); });
+                check("ImageFunction.flipUD", function() { image.flipUD(0); });
+                check("ImageFunction.adjustGamma", function() { image.adjustGamma(0); });
+                check("ImageFunction.doBoxBlur", function() { image.doBoxBlur(0); });
+                check("ImageFunction.doGrayScale", function() { image.doGrayScale(0); });
+                check("ImageFunction.fillRect", function() { image.fillRect(0, 0); });
+                check("ImageFunction.colorRect", function() { image.colorRect(0, 0); });
+                check("Rect.setSize", function() { rect.setSize(10, 10); });
+                check("Rect.setOffset", function() { rect.setOffset(0, 0); });
+                check("Rect.addOffset", function() { rect.addOffset(0, 0); });
+                check("Rect.set", function() { rect.set(0, 0, 10, 10); });
+                check("Rect.clip", function() { rect.clip(rect); });
+                check("Rect.union", function() { rect.union(rect); });
+                check("Rect.intersects", function() { rect.intersects(rect); });
+                check("Rect.included", function() { rect.included(rect); });
+                check("Rect.includedPos", function() { rect.includedPos(0, 0); });
+                check("Rect.equal", function() { rect.equal(rect); });
+                check("Bitmap.getPixel", function() { bitmap.getPixel(0, 0); });
+                check("Bitmap.setPixel", function() { bitmap.setPixel(0, 0, 0xffffffff); });
+                check("Bitmap.getMaskPixel", function() { bitmap.getMaskPixel(0, 0); });
+                check("Bitmap.setMaskPixel", function() { bitmap.setMaskPixel(0, 0, 128); });
+                check("Bitmap.setSize", function() { bitmap.setSize(10, 10); });
+                check("Bitmap.copyFrom", function() { bitmap.copyFrom(bitmap); });
+                check("Bitmap.save", function() { bitmap.save("none"); });
+                check("Bitmap.load", function() { bitmap.load("none"); });
+                check("Bitmap.loadAsync", function() { bitmap.loadAsync("none"); });
+                check("Bitmap.loadHeader", function() { bitmap.loadHeader("none"); });
+                check("Bitmap.getSaveOption", function() { bitmap.getSaveOption("none"); });
+                check("BitmapLayerTreeOwner.fireClick", function() { owner.fireClick(0, 0); });
+                check("BitmapLayerTreeOwner.fireDoubleClick", function() { owner.fireDoubleClick(0, 0); });
+                check("BitmapLayerTreeOwner.fireMouseDown", function() { owner.fireMouseDown(0, 0, 1, 0); });
+                check("BitmapLayerTreeOwner.fireMouseUp", function() { owner.fireMouseUp(0, 0, 1, 0); });
+                check("BitmapLayerTreeOwner.fireMouseMove", function() { owner.fireMouseMove(0, 0, 0); });
+                check("BitmapLayerTreeOwner.fireMouseWheel", function() { owner.fireMouseWheel(0, 0, 1, 0); });
+                check("BitmapLayerTreeOwner.fireTouchDown", function() { owner.fireTouchDown(0, 0, 1, 1, 0); });
+                check("BitmapLayerTreeOwner.fireTouchUp", function() { owner.fireTouchUp(0, 0, 1, 1, 0); });
+                check("BitmapLayerTreeOwner.fireTouchMove", function() { owner.fireTouchMove(0, 0, 1, 1, 0); });
+                check("BitmapLayerTreeOwner.fireTouchScaling", function() { owner.fireTouchScaling(0, 0, 1, 1, 0); });
+                check("BitmapLayerTreeOwner.fireTouchRotate", function() { owner.fireTouchRotate(0, 0, 1, 1, 0, 0); });
+                check("BitmapLayerTreeOwner.fireKeyDown", function() { owner.fireKeyDown(0, 1); });
+                check("BitmapLayerTreeOwner.fireKeyUp", function() { owner.fireKeyUp(0, 1); });
+                check("BitmapLayerTreeOwner.fireKeyPress", function() { owner.fireKeyPress(0); });
+                check("BitmapLayerTreeOwner.fireDisplayRotate", function() { owner.fireDisplayRotate(0, 1, 1, 0, 0); });
+                check("MenuItem.add", function() { root.add(child); });
+                check("MenuItem.insert", function() { root.insert(child, 0); });
+                check("MenuItem.remove", function() { root.remove(child); });
+                check("MenuItem.popup", function() { root.popup(0, 0, 0); });
+                return problems === "" ? "ok" : problems;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("ok".to_string()));
     }
 }

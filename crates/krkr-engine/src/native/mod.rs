@@ -1,5 +1,5 @@
-pub(crate) mod classes;
 mod blend;
+pub(crate) mod classes;
 mod clipboard;
 mod debug;
 mod kag;
@@ -28,7 +28,7 @@ pub(crate) use video::{tick_video_overlays, video_overlay_frame_quads};
 
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 
 use crate::host::KrkrHost;
@@ -46,9 +46,29 @@ fn register_stub_method(
     class_name: &'static str,
     method: &'static str,
 ) {
-    runtime.register_object_native(
+    register_stub_method_with_arg_count(runtime, handle, class_name, method, 0);
+}
+
+/// [`register_stub_method`] with the member's reference `numparams` floor
+/// (`0` when the reference declares none): the declaration-level check answers
+/// `TJS_E_BADPARAMCOUNT` before the stub body runs, the order the official
+/// natives validate in.
+fn register_stub_method_with_arg_count(
+    runtime: &mut Runtime<KrkrHost>,
+    handle: ObjectHandle,
+    class_name: &'static str,
+    method: &'static str,
+    min_args: usize,
+) {
+    let arg_count = if min_args == 0 {
+        NativeArgCount::Any
+    } else {
+        NativeArgCount::AtLeast(min_args)
+    };
+    runtime.register_object_native_with_arg_count(
         handle,
         method,
+        arg_count,
         move |runtime: &mut Runtime<KrkrHost>,
               _this_obj: Option<ObjectHandle>,
               args: Vec<Variant>| {
