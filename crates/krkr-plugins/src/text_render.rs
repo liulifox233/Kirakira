@@ -3,9 +3,9 @@
 //!
 //! Games normally subclass this object in TJS
 //! (`class TextRender extends TextRenderBase`), supply the layout callbacks and
-//! paint the glyph records `getCharacters()` hands back into Layers. Returning
-//! an empty list here is therefore not a harmless stub: it advances the
-//! scenario while drawing no dialogue at all.
+//! paint the glyph records `getCharacters(from, count)` hands back into Layers.
+//! Returning an empty list here is therefore not a harmless stub: it advances
+//! the scenario while drawing no dialogue at all.
 //!
 //! # Surface
 //!
@@ -245,7 +245,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "TextRenderBase",
-    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. render takes the DLL's six arguments, consumes argument 2 as the per-character base delay (the games' kag.actualChSpeed, with the reference's 0.001 fallback when it is 0 and argument 3 is positive), seeds every record's display time from it and scales the %d/%w codes by it while %a/%t stay absolute, and parses the message text format the games' TagTextConverter emits and the DLL's layout walker FUN_1000b8c0 interprets: \\n/raw newline/%n breaks, \\k key waits for getKeyWait(), \\w/\\x/\\i/\\r, $expr; through onEval, &name; through onGetGraphSize, %f/%r/%<n>;/%;/%B/%S/%b/%i/%s/%e/%p/%a/%d/%t/%w/%D/%l/#…; style and timing codes (%a/%d/%t/%w/%D honour ignore_delay; the last group's line-shift, indent and named-wait details are documented gaps), [ruby,count], and \\X as the literal X. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and the auto-indent/kinsoku rules still need engine work.",
+    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. render takes the DLL's six arguments, consumes argument 2 as the per-character base delay (the games' kag.actualChSpeed, with the reference's 0.001 fallback when it is 0 and argument 3 is positive), seeds every record's display time from it and scales the %d/%w codes by it while %a/%t stay absolute, and parses the message text format the games' TagTextConverter emits and the DLL's layout walker FUN_1000b8c0 interprets: \\n/raw newline/%n breaks, \\k key waits for getKeyWait(), \\w/\\x/\\i/\\r, $expr; through onEval, &name; through onGetGraphSize, %f/%r/%<n>;/%;/%B/%S/%b/%i/%s/%e/%p/%a/%d/%t/%w/%D/%l/#…; style and timing codes (%a/%d/%t/%w/%D honour ignore_delay; the last group's line-shift, indent and named-wait details are documented gaps), [ruby,count], and \\X as the literal X. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and the auto-indent/kinsoku rules still need engine work. Every method's argument floor is its command's declared parameter count (ncbind's ArgsCount: fewer is TJS_E_BADPARAMCOUNT, extras are ignored), so setRenderSize needs 2, getCharacters 2, getLinkRects/getLinkCharacters 1 and isLinkContains 3, while the games' own call shapes (setRenderSize(w, h), getCharacters(0, 0)) pass the full lists.",
     install: |engine| engine.register_plugin(TextRenderPlugin),
 };
 
@@ -340,7 +340,7 @@ struct Member {
 const SURFACE: &[Member] = &[
     member("setOption", "void (tTJSVariant)", set_option, 1),
     member("setDefault", "void (tTJSVariant)", set_default, 1),
-    member("setRenderSize", "void (float, float)", set_render_size, 1),
+    member("setRenderSize", "void (float, float)", set_render_size, 2),
     prop("vertical", "bool", ValueKind::Bool, Default::Bool(false)),
     prop(
         "timeScale",
@@ -461,7 +461,9 @@ const SURFACE: &[Member] = &[
         "getCharacters",
         "tTJSVariant (int, int) const",
         get_characters,
-        0,
+        // `tTJSVariant(TextRenderBase::*)(int,int) const`
+        // (`P81@BE?AVtTJSVariant@@HH@Z`), the class's only two-int getter.
+        2,
     ),
     member(
         "getLinkNames",
@@ -473,19 +475,19 @@ const SURFACE: &[Member] = &[
         "getLinkRects",
         "tTJSVariant (int) const",
         get_link_rects,
-        0,
+        1,
     ),
     member(
         "getLinkCharacters",
         "tTJSVariant (int) const",
         get_link_characters,
-        0,
+        1,
     ),
     member(
         "isLinkContains",
         "bool (int, float, float) const",
         is_link_contains,
-        0,
+        3,
     ),
     member(
         "getLinkOfPosition",
@@ -1871,8 +1873,9 @@ fn calc_show_count(
 /// `if (arg2 == 0) arg2 = renderCount - arg1`. The game calls
 /// `getCharacters(0, 0)` in its message renderer and its redraw path, so
 /// treating the second argument as an end index would return nothing and draw
-/// no dialogue at all. One argument means "from here to the end"; no arguments
-/// returns every character.
+/// no dialogue at all. Both arguments are mandatory: the command's `ArgsCount`
+/// is two (`P81@BE?AVtTJSVariant@@HH@Z`), so ncbind rejects a shorter call
+/// before the handler runs.
 fn get_characters(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1882,15 +1885,9 @@ fn get_characters(
         return Ok(Variant::Object(runtime.alloc_array_object(Vec::new())));
     };
     let records = character_records(runtime, this);
-    if args.is_empty() {
-        return Ok(Variant::Object(runtime.alloc_array_object(records)));
-    }
     let from = usize::try_from(arguments(&args, 0).to_integer().unwrap_or(0).max(0))
         .unwrap_or(usize::MAX);
-    let count = match args.get(1) {
-        Some(value) => value.to_integer().unwrap_or(0),
-        None => 0,
-    };
+    let count = arguments(&args, 1).to_integer().unwrap_or(0);
     let take = if count <= 0 {
         records.len().saturating_sub(from)
     } else {
@@ -3046,22 +3043,36 @@ fn native_void(
 #[cfg(test)]
 mod tests {
     use krkr_engine::{EngineConfig, KrkrEngine};
-    use krkr_tjs2::runtime::{NativePropertyAccess, ObjectHandle, Variant};
+    use krkr_tjs2::{
+        TjsError, TjsErrorKind,
+        runtime::{NativePropertyAccess, ObjectHandle, Variant},
+    };
 
     use super::{MemberKind, SURFACE, TextRenderPlugin};
 
-    /// Run a script against an engine with this plugin registered and return the
-    /// string form of its result.
-    fn run(script: &str) -> String {
+    fn engine() -> KrkrEngine {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .register_plugin(TextRenderPlugin)
             .expect("register plugin");
         engine
+    }
+
+    /// Run a script against an engine with this plugin registered and return the
+    /// string form of its result.
+    fn run(script: &str) -> String {
+        engine()
             .execute_script("probe.tjs", script)
             .expect("script")
             .to_tjs_string()
             .expect("string result")
+    }
+
+    /// The error a failing script raises, for the reference-identity checks.
+    fn script_error(script: &str) -> TjsError {
+        engine()
+            .execute_script("probe.tjs", script)
+            .expect_err("script must fail")
     }
 
     /// The checklist from the M27 dossier and the DLL's command vftables,
@@ -3368,34 +3379,73 @@ mod tests {
     /// ignored. `render`'s two shipped builds declare five (PARQUET,
     /// `P8TextRender@@AE_NPB_WHHH_N@Z`) and six (GINKA/少女世界,
     /// `P8TextRender@@AE_NPB_WHHH_N1@Z`) parameters, so the registration
-    /// accepts both flavours and rejects four arguments or fewer.
+    /// accepts both flavours and rejects four arguments or fewer. The rest of
+    /// the surface takes its own command's count: `setRenderSize` and
+    /// `getCharacters` two (`P8TextRender@@AEXMM@Z`,
+    /// `P81@BE?AVtTJSVariant@@HH@Z`), `getLinkRects`/`getLinkCharacters` one
+    /// (`tTJSVariant(int) const`) and `isLinkContains` three
+    /// (`bool(int,float,float) const`). No shipped call site passes a shorter
+    /// list — the games write `setRenderSize(w, h)` and `getCharacters(0, 0)`
+    /// — so the floors only turn a silent short call into the reference's
+    /// error.
     #[test]
     fn methods_enforce_their_reference_argument_contracts() {
+        for (member, call) in [
+            ("setOption", "render.setOption()"),
+            ("setDefault", "render.setDefault()"),
+            ("setRenderSize", "render.setRenderSize()"),
+            ("setRenderSize", "render.setRenderSize(100)"),
+            ("render", "render.render()"),
+            ("render", "render.render(\"a\", 1, 25)"),
+            ("render", "render.render(\"a\", 1, 25, 0)"),
+            ("contains", "render.contains(1)"),
+            ("getLinkOfPosition", "render.getLinkOfPosition(1)"),
+            ("onEval", "render.onEval()"),
+            ("getCharacters", "render.getCharacters()"),
+            ("getCharacters", "render.getCharacters(1)"),
+            ("getLinkRects", "render.getLinkRects()"),
+            ("getLinkCharacters", "render.getLinkCharacters()"),
+            ("isLinkContains", "render.isLinkContains(0, 1)"),
+        ] {
+            let error = script_error(&format!("var render = new TextRenderBase();\n{call};"));
+            assert_eq!(
+                error.kind,
+                TjsErrorKind::BadParamCount,
+                "{member} {call}: {}",
+                error.message
+            );
+            assert_eq!(
+                error.kind.tjs_error_code(),
+                Some(-1004),
+                "{member} {call} must be the reference's TJS_E_BADPARAMCOUNT"
+            );
+            assert_eq!(error.message, "Invalid argument count", "{member} {call}");
+        }
+
+        // The exact and longer shapes the reference accepts — including the
+        // calls the games make — still run; extras are ignored, so a
+        // six-argument `render` works against PARQUET's five-parameter
+        // declaration too.
         let value = run(
             r#"
             var render = new TextRenderBase();
-            function rejects(block) { try { block(); } catch (e) { return "rejected"; } return "accepted"; }
-            render.setOption(%["vertical" => 0]);
-            render.setDefault(%["face" => "normal"]);
-            render.setRenderSize(100, 50);
-            return rejects(function() { render.setOption(); }) + "/"
-                + rejects(function() { render.setDefault(); }) + "/"
-                + rejects(function() { render.setRenderSize(); }) + "/"
-                + rejects(function() { render.render(); }) + "/"
-                + rejects(function() { render.render("a", 1, 25); }) + "/"
-                + rejects(function() { render.render("a", 1, 25, 0); }) + "/"
-                + rejects(function() { render.contains(1); }) + "/"
-                + rejects(function() { render.getLinkOfPosition(1); }) + "/"
-                + rejects(function() { render.onEval(); }) + "/"
-                + rejects(function() { render.render("a", 1, 25, 0, void); }) + "/"
-                + rejects(function() { render.render("a", 1, 25, 0, void, 0); });
+            var font = new Font();
+            font.height = 20;
+            render.setFont(font);
+            render.setRenderSize(400, 0);
+            render.setRenderSize(400, 0, 1);
+            render.render("abc", 1, 0, 0, void, 0);
+            var chars = render.getCharacters(0, 0);
+            var extra = render.getCharacters(1, 1, "ignored");
+            var links = render.getLinkRects(0).count + render.getLinkCharacters(0).count
+                + render.isLinkContains(0, 1, 1) + render.isLinkContains(0, 1, 1, 2);
+            // Each render replaces the record list, so the five-argument call
+            // comes after the reads; that it runs at all is the assertion.
+            render.render("a", 1, 25, 0, void);
+            return chars.count + "/" + extra.count + "/" + links;
             "#,
         );
-        assert_eq!(
-            value,
-            "rejected/rejected/rejected/rejected/rejected/rejected/rejected/rejected/\
-             rejected/accepted/accepted"
-        );
+        assert_eq!(value, "3/1/0");
     }
 
     /// The layout end-to-end through the engine's font path: glyph advances come
@@ -3412,7 +3462,7 @@ mod tests {
             render.setRenderSize(400, 0);
             var started = render.render("あいうえお", 1, 0, 0, void, 0);
             var glyph = font.getEscWidthX("あ");
-            var chars = render.getCharacters();
+            var chars = render.getCharacters(0, 0);
             var first = chars[0];
             var last = chars[4];
             var waits = render.getKeyWait();
@@ -3689,12 +3739,12 @@ mod tests {
             var tail = render.getCharacters(2, 0);
             var slice = render.getCharacters(1, 2);
             var none = render.getCharacters(4, 1);
-            var from_one = render.getCharacters(3);
+            var from_three = render.getCharacters(3, 0);
             var texts = "";
             var i = 0;
             while (i < slice.count) { texts += slice[i].text, i = i + 1; }
             return all.count + "/" + all[4].text + "/" + tail.count + "/" + slice.count + "/"
-                + texts + "/" + none.count + "/" + from_one.count;
+                + texts + "/" + none.count + "/" + from_three.count;
             "#,
         );
         assert_eq!(value, "5/e/3/2/bc/1/2");
@@ -3851,7 +3901,7 @@ mod tests {
             render.newline();
             render.render("b", 1, 0, 0, void, 0);
             var after_break = render.renderLines;
-            var chars = render.getCharacters();
+            var chars = render.getCharacters(0, 0);
             // `newline` breaks the layout before the next text, so the second
             // render holds the one glyph that follows the break.
             var break_y = chars[0].y;
@@ -3863,7 +3913,7 @@ mod tests {
             render.resetFont();
             render.resetStyle();
             render.render("a\nb", 1, 0, 0, void, 0);
-            var styled = render.getCharacters();
+            var styled = render.getCharacters(0, 0);
             var active = styled[0].face + "/" + styled[1].y;
             var defaults = render.defaultFace + "/" + render.defaultFontSize + "/"
                 + render.defaultLineSpacing;
@@ -3873,7 +3923,7 @@ mod tests {
             // `TextRenderBase.setFont(%["face" => defaultFace])`).
             render.setFont(%["face" => "Pressed"]);
             render.render("c", 1, 0, 0, void, 0);
-            var pressed = render.getCharacters()[0].face + "/" + render.defaultFace + "/"
+            var pressed = render.getCharacters(0, 0)[0].face + "/" + render.defaultFace + "/"
                 + (render.font !== void);
             var sliced = render.getCharacters(0, 1).count;
             return before + "/" + cleared + "/" + chars.count + "/" + after_break + "/"

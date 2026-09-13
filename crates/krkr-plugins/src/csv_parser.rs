@@ -39,7 +39,7 @@
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, TjsHost, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, TjsHost, Variant},
 };
 
 use crate::catalog::{PluginMeta, PluginStatus};
@@ -132,8 +132,22 @@ fn install_csv_parser(runtime: &mut Runtime<KrkrHost>) {
 fn install_csv_parser_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.set_object_member(handle, "target", Variant::Void);
     runtime.register_object_native(handle, "finalize", csv_finalize);
-    runtime.register_object_native(handle, "init", csv_init);
-    runtime.register_object_native(handle, "initStorage", csv_init_storage);
+    // `init(text)` and `initStorage(storage [, mode])` both open with
+    // `if (numparams < 1) return TJS_E_BADPARAMCOUNT` (`csvParser/Main.cpp:594`
+    // and `:603`), so the registration floor is the reference's one mandatory
+    // argument; the handlers keep the same guard as the reference body has.
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "init",
+        NativeArgCount::AtLeast(1),
+        csv_init,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "initStorage",
+        NativeArgCount::AtLeast(1),
+        csv_init_storage,
+    );
     runtime.register_object_native(handle, "getNextLine", csv_get_next_line);
     runtime.register_object_native(handle, "parse", csv_parse);
     runtime.register_object_native(handle, "parseStorage", csv_parse_storage);
@@ -745,25 +759,40 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// `init`/`initStorage` declare one mandatory argument
+    /// (`csvParser/Main.cpp:594`/`:603`: `if (numparams < 1) return
+    /// TJS_E_BADPARAMCOUNT`) and the module registers that count as the
+    /// member's floor, so the short call is ncbind's parameter-count error —
+    /// `TJS_E_BADPARAMCOUNT`, code -1004 — not just any failure. The games'
+    /// shapes (`init(text)`, `initStorage("table.csv")`) pass their argument
+    /// list and are covered by the tests above.
     #[test]
     fn argument_count_and_read_only_property_errors_match_the_reference() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine.register_plugin(CsvParserPlugin).expect("plugin");
-        let error = engine
-            .execute_expression(
-                "inline.tjs",
-                "(function() { var parser = new CSVParser(); return parser.init(); })()",
-            )
-            .expect_err("init() without text must fail");
-        assert_eq!(error.message, "Invalid argument count");
-
-        let error = engine
-            .execute_expression(
-                "inline.tjs",
-                "(function() { var parser = new CSVParser(); return parser.initStorage(); })()",
-            )
-            .expect_err("initStorage() without a name must fail");
-        assert_eq!(error.message, "Invalid argument count");
+        for (member, call) in [
+            ("init", "parser.init()"),
+            ("initStorage", "parser.initStorage()"),
+        ] {
+            let error = engine
+                .execute_expression(
+                    "inline.tjs",
+                    &format!("(function() {{ var parser = new CSVParser(); return {call}; }})()"),
+                )
+                .expect_err(&format!("{member} without its argument must fail"));
+            assert_eq!(
+                error.kind,
+                krkr_tjs2::TjsErrorKind::BadParamCount,
+                "{member}: {}",
+                error.message
+            );
+            assert_eq!(
+                error.kind.tjs_error_code(),
+                Some(-1004),
+                "{member} must be the reference's TJS_E_BADPARAMCOUNT"
+            );
+            assert_eq!(error.message, "Invalid argument count", "{member}");
+        }
 
         let error = engine
             .execute_expression(

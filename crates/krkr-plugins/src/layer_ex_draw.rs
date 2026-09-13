@@ -658,7 +658,15 @@ fn install_point_f_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle
             runtime.set_object_member(handle, name, Variant::Real(0.0));
         }
     }
-    runtime.register_object_native(handle, "Equals", point_f_equals);
+    // `NCB_METHOD(Equals)` (`layerExDraw/main.cpp:129`) is
+    // `BOOL PointF::Equals(const PointF&) const`: one parameter, so a call
+    // with none is ncbind's `TJS_E_BADPARAMCOUNT` (`ncbind.hpp:1186`).
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "Equals",
+        NativeArgCount::AtLeast(1),
+        point_f_equals,
+    );
 }
 
 fn new_point_f(runtime: &mut Runtime<KrkrHost>, x: f64, y: f64) -> ObjectHandle {
@@ -5007,7 +5015,9 @@ mod tests {
     }
 
     /// The reference's ncbind check is `numparams < declared` (`ncbind.hpp:1186`),
-    /// so a short call is `TJS_E_BADPARAMCOUNT`.
+    /// so a short call is `TJS_E_BADPARAMCOUNT`. The counts are the members'
+    /// PMFs — `PointF::Equals` is `BOOL PointF::Equals(const PointF&) const`
+    /// (`layerExDraw/main.cpp:129`, `NCB_METHOD(Equals)`), so one argument.
     #[test]
     fn short_calls_are_bad_parameter_counts() {
         let mut engine = engine();
@@ -5029,6 +5039,10 @@ mod tests {
                 "Path.drawArc",
                 "var p = new GdiPlus.Path(); p.drawArc(0, 0, 1, 1, 0);",
             ),
+            (
+                "PointF.Equals",
+                "var p = new GdiPlus.PointF(0, 0); p.Equals();",
+            ),
         ] {
             let error = engine.execute_script("short.tjs", script).expect_err(name);
             assert_eq!(
@@ -5037,7 +5051,28 @@ mod tests {
                 "{name}: {}",
                 error.message
             );
+            assert_eq!(
+                error.kind.tjs_error_code(),
+                Some(-1004),
+                "{name} must be the reference's TJS_E_BADPARAMCOUNT"
+            );
         }
+
+        // The reference's own call shape (`manual.tjs:354`) still works: one
+        // PointF compares both coordinates, and extra arguments are ignored.
+        assert_eq!(
+            integer(
+                &mut engine,
+                "(function() {\n\
+                     var p = new GdiPlus.PointF(1, 2);\n\
+                     var same = p.Equals(new GdiPlus.PointF(1, 2));\n\
+                     var other = p.Equals(new GdiPlus.PointF(1, 3));\n\
+                     var extra = p.Equals(new GdiPlus.PointF(1, 2), 1);\n\
+                     return same * 10 + other + extra;\n\
+                 })()"
+            ),
+            11
+        );
     }
 
     /// A straight one-pixel line with integer ends: GDI+'s flat cap ends the
