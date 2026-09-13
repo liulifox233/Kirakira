@@ -15,7 +15,8 @@
 //!   reads.
 //! - `SqliteThread(window, sqlite)` — background `select`/`update` with
 //!   `onStateChange`/`onProgress` events and `state`/`errorCode`/
-//!   `selectResult`/`progressUpdateCount`.
+//!   `selectResult`/`progressUpdateCount`; `selectResult` is one array per
+//!   row, each holding one entry per column (`Main.cpp:884-895`).
 //!
 //! # SQLite binding
 //!
@@ -37,8 +38,11 @@
 //!   reference's `xp3` VFS: a name that resolves to a real file is opened
 //!   read-only in place; an archive/memory member is read whole and opened
 //!   read-only from a temporary copy that is deleted with the connection.
-//!   The reference reads the member through `TVPCreateIStream` directly; both
-//!   refuse writes with `SQLITE_READONLY` and see the same bytes.
+//!   The copy is created exclusively (`create_new`) under a per-open random
+//!   name with owner-only permissions, so a pre-existing path is never
+//!   written through. The reference reads the member through
+//!   `TVPCreateIStream` directly; both refuse writes with `SQLITE_READONLY`
+//!   and see the same bytes.
 //! - `readonly = false` needs a locally accessible file, like the reference:
 //!   an existing local name resolves through the storage layer, a new plain
 //!   name resolves under the engine's executable path (the reference's
@@ -52,12 +56,15 @@
 //!   in order on the script thread, calling `onStateChange`/`onProgress`
 //!   exactly like the reference's window messages would.
 //! - The reference's `SqliteStatement` direct-column reads go through the
-//!   class's `missing` handler. This engine's missing handler cannot write
-//!   the value property it receives, so the plugin instead registers one
-//!   native read-only property per result column when a statement is opened
-//!   (plus a lowercase alias when the column has upper-case letters — the
-//!   reference resolves column names case-insensitively). The values are live
-//!   reads of the current row, so `stmt.columnName` behaves the same.
+//!   class's `missing` handler, which only answers names the class chain
+//!   misses. This engine's missing handler cannot write the value property it
+//!   receives, so the plugin instead registers one native read-only property
+//!   per result column when a statement is opened (plus a lowercase alias
+//!   when the column has upper-case letters — the reference resolves column
+//!   names case-insensitively), skipping any name that already resolves on
+//!   the statement so a column called `count`/`step`/`sql` cannot shadow the
+//!   class member. The values are live reads of the current row, so
+//!   `stmt.columnName` behaves the same.
 //! - `progressUpdateCount` is sampled when an operation starts; the reference
 //!   re-reads the member at each progress milestone.
 //! - `errorCode`/`errorMessage` report the connection's last error through
@@ -72,6 +79,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
+use std::io::Write;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::ptr;
@@ -851,11 +859,13 @@ fn open_connection(
                 return Ok(Rc::new(open_path(&missing, true)));
             }
         };
-        let temp = temp_copy_path();
-        if std::fs::write(&temp, &bytes).is_err() {
+        // The copy is created exclusively (no pre-existing path, symlink or
+        // otherwise, is ever written through) and carries a per-open random
+        // name; it is deleted with the connection.
+        let Some(temp) = write_temp_copy(&bytes) else {
             let missing = virtual_path(runtime, database);
             return Ok(Rc::new(open_path(&missing, true)));
-        }
+        };
         let mut connection = open_path(&temp, true);
         connection.temp_path = Some(temp);
         return Ok(Rc::new(connection));
@@ -933,11 +943,46 @@ fn virtual_path(runtime: &Runtime<KrkrHost>, database: &str) -> PathBuf {
     }
 }
 
-fn temp_copy_path() -> PathBuf {
+/// Materializes a read-only archive/memory database into a private temp file.
+///
+/// The name carries per-open entropy (clock nanos plus a counter) and the file
+/// is created with `create_new` (`O_CREAT|O_EXCL`), so a pre-created path — a
+/// symlink included — is never written through; the caller records the path on
+/// the connection and removes it when the connection drops.
+fn write_temp_copy(bytes: &[u8]) -> Option<PathBuf> {
+    for attempt in 0..16u32 {
+        let path = temp_copy_path(attempt);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                if file.write_all(bytes).is_err() {
+                    let _ = std::fs::remove_file(&path);
+                    return None;
+                }
+                return Some(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn temp_copy_path(attempt: u32) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
     std::env::temp_dir().join(format!(
-        "kirakira-sqlite3-{}-{unique}.db",
+        "kirakira-sqlite3-{}-{unique}-{nanos}-{attempt}.db",
         std::process::id()
     ))
 }
@@ -1267,7 +1312,7 @@ fn statement_open(
     params: Option<&Variant>,
 ) -> Result<c_int> {
     let sql = sql.to_tjs_string()?;
-    let (connection, rc, column_names) = STATEMENTS.with(|map| {
+    let (rc, column_names) = STATEMENTS.with(|map| {
         let mut map = map.borrow_mut();
         let state = map
             .get_mut(&instance)
@@ -1307,9 +1352,8 @@ fn statement_open(
                 .map(|index| column_name(state.stmt, index))
                 .collect::<Vec<_>>()
         };
-        Ok::<_, TjsError>((state.connection.clone(), rc, names))
+        Ok::<_, TjsError>((rc, names))
     })?;
-    let _ = connection;
     register_column_members(runtime, instance, &column_names)?;
     Ok(rc)
 }
@@ -1317,6 +1361,11 @@ fn statement_open(
 /// Registers one read-only native property per result column so
 /// `stmt.columnName` reads the current row's value, the engine-side
 /// equivalent of the reference's `missing` handler (`Main.cpp:532-548`).
+/// A name that already resolves on the statement — its methods, `count`,
+/// `sql`, `columnCount` — is skipped: the reference's handler only answers
+/// members the class chain misses, so `SELECT count(*) AS count` must leave
+/// `stmt.count` alone (`manual.tjs`: only columns that do not collide with
+/// class member names are directly readable).
 fn register_column_members(
     runtime: &mut Runtime<KrkrHost>,
     instance: ObjectHandle,
@@ -1333,6 +1382,9 @@ fn register_column_members(
             members.push(lower);
         }
         for member in members {
+            if statement_member_resolves(runtime, instance, &member) {
+                continue;
+            }
             let row = index;
             runtime.register_object_native_property_with_access(
                 instance,
@@ -1362,6 +1414,23 @@ fn register_column_members(
         }
     });
     Ok(())
+}
+
+/// Whether `name` already resolves on the instance or anywhere up its class
+/// chain (the shape the reference's `PropGet` consults before `missing`).
+fn statement_member_resolves(
+    runtime: &Runtime<KrkrHost>,
+    instance: ObjectHandle,
+    name: &str,
+) -> bool {
+    let mut current = Some(instance);
+    while let Some(handle) = current {
+        if !matches!(runtime.object_member(handle, name), Variant::Void) {
+            return true;
+        }
+        current = runtime.object_super_class(handle);
+    }
+    false
 }
 
 fn statement_state_mut<R>(
@@ -1557,8 +1626,11 @@ fn statement_get(
     let default = args.get(1).cloned();
     statement_state_mut(runtime, this_obj, |state| {
         let index = statement_column_no(state, &column);
+        // `sqlite3_column_type(stmt, -1)` is `SQLITE_NULL`, so the reference
+        // answers the default value for a name that is not a column
+        // (`Main.cpp:519-530`).
         if index < 0 {
-            return Ok(Variant::Void);
+            return Ok(default.unwrap_or(Variant::Void));
         }
         let value = column_value(state.stmt, index);
         Ok(match value {
@@ -1789,6 +1861,34 @@ fn set_timer_enabled(runtime: &mut Runtime<KrkrHost>, timer: Option<ObjectHandle
     }
 }
 
+/// The reference's `open()` refuses while a worker runs (`Main.cpp:782-783`),
+/// before it closes the old statement and prepares a new one. Preparing first
+/// would leak the statement on the error path — and with it the connection,
+/// because `sqlite3_close` answers `SQLITE_BUSY` for unfinalized statements.
+/// The check also has to precede the per-operation state reset, or a refused
+/// call would throw away the running operation's queued events (and with them
+/// its DONE delivery).
+fn check_thread_idle(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Result<()> {
+    let running = with_thread_state(runtime, this_obj, |state| state.worker.is_some())?;
+    if running {
+        return Err(TjsError::runtime("already running"));
+    }
+    Ok(())
+}
+
+/// `onStateChange` sets the visible state synchronously, before the event it
+/// posts is delivered (`Main.cpp:804-813`); a refused `select` still leaves
+/// the state at INIT in the reference. The event itself is only queued once
+/// the operation starts, because the queue still belongs to the previous
+/// operation until `check_thread_idle` passes.
+fn set_thread_state(
+    runtime: &Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    value: i64,
+) -> Result<()> {
+    with_thread_state_mut(runtime, this_obj, |state| state.state = value)
+}
+
 fn thread_select(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1811,10 +1911,13 @@ fn thread_select(
         };
         (connection, spec)
     };
-    // `select` posts INIT before it opens (`Main.cpp:700`), and the open
-    // failure still leaves the state at INIT. The per-operation worker state
-    // is reset first so the INIT record lands in the fresh queue
-    // (`startSelectThread`, `Main.cpp:920-927`).
+    // `select` publishes INIT before `open` can refuse it (`Main.cpp:700`),
+    // and the refusal must not disturb the running operation: state first,
+    // then the running check, then the per-operation reset (`startSelectThread`
+    // replaces the result array only once the open has succeeded,
+    // `Main.cpp:920-927`).
+    set_thread_state(runtime, this_obj, THREAD_INIT)?;
+    check_thread_idle(runtime, this_obj)?;
     let results = runtime.alloc_array_object(Vec::new());
     let (shared, canceled, progress) = reset_operation(runtime, this_obj, Some(results))?;
     begin_operation(runtime, instance, THREAD_INIT)?;
@@ -1871,8 +1974,11 @@ fn thread_update(
     let Some(connection) = connection else {
         return Ok(Variant::Integer(0));
     };
-    // The per-operation worker state resets before INIT is queued
+    // `update` publishes INIT before `open` can refuse it (`Main.cpp:716`);
+    // state first, then the running check, then the per-operation reset
     // (`startUpdateThread`, `Main.cpp:979-984`).
+    set_thread_state(runtime, this_obj, THREAD_INIT)?;
+    check_thread_idle(runtime, this_obj)?;
     let (shared, canceled, progress) = reset_operation(runtime, this_obj, None)?;
     begin_operation(runtime, instance, THREAD_INIT)?;
     let (stmt, rc) = prepare(connection.ptr(), &sql);
@@ -2252,14 +2358,16 @@ fn thread_tick(
                 )?;
             }
             Delivery::Row(row) => {
+                // `selectThreadMain` builds a fresh array per row and adds
+                // *that* to `selectResult` (`Main.cpp:884-895`), so scripts
+                // read `selectResult[row][column]`.
                 let values = row.iter().map(ColumnValue::to_variant).collect::<Vec<_>>();
                 THREADS.with(|map| {
                     if let Some(state) = map.borrow_mut().get_mut(&instance)
                         && let Variant::Object(results) = &state.select_result
                     {
-                        for value in values {
-                            runtime.array_push(*results, value);
-                        }
+                        let line = runtime.alloc_array_object(values);
+                        runtime.array_push(*results, Variant::Object(line));
                     }
                 });
             }
@@ -2486,7 +2594,7 @@ mod tests {
     use krkr_engine::{EngineConfig, EngineInput, KrkrEngine, SystemPaths};
     use krkr_tjs2::runtime::Variant;
 
-    use super::Sqlite3Plugin;
+    use super::{Connection, Db, SQLITES, Sqlite3Plugin, ffi, write_temp_copy};
 
     fn test_root(name: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
@@ -2799,6 +2907,40 @@ mod tests {
     }
 
     #[test]
+    fn the_readonly_temp_copy_is_private_and_dies_with_the_connection() {
+        let first = write_temp_copy(b"copy one").expect("first copy");
+        let second = write_temp_copy(b"copy two").expect("second copy");
+        assert_ne!(
+            first, second,
+            "every archive-backed open gets its own copy name"
+        );
+        assert_eq!(fs::read(&first).expect("read first"), b"copy one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&second)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the copy must not be world readable");
+        }
+
+        // The copy belongs to the connection: dropping it removes the file.
+        // (The null handle keeps the sqlite3_close path out of this test.)
+        let connection = Connection {
+            db: Db(std::ptr::null_mut()),
+            temp_path: Some(first.clone()),
+        };
+        drop(connection);
+        assert!(
+            !first.exists(),
+            "the temp copy was removed with the connection"
+        );
+        fs::remove_file(&second).expect("cleanup");
+    }
+
+    #[test]
     fn statements_step_read_and_reset() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine.register_plugin(Sqlite3Plugin).expect("plugin");
@@ -2835,6 +2977,62 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn a_column_named_like_a_statement_member_does_not_shadow_it() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(Sqlite3Plugin).expect("plugin");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var db = new Sqlite(":memory:");
+                db.exec("CREATE TABLE t (v TEXT)");
+                db.exec("INSERT INTO t VALUES ('x')");
+                // Columns named after statement members: the reference's
+                // `missing` handler only answers names the class chain misses,
+                // so `st.count` stays `sqlite3_data_count` and `st.step()`
+                // stays a method.
+                var st = new SqliteStatement(db,
+                    "SELECT 'zzz' AS step, 'yyy' AS plain, count(*) AS count, v AS sql FROM t");
+                var has_row = st.step();
+                var countValue = st.count;
+                var plain = st.plain;
+                var sqlProperty = st.sql;
+                var more = st.step();
+                return has_row + ":" + countValue + ":" + plain + ":" + sqlProperty + ":" + more;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(
+                "1:4:yyy:SELECT 'zzz' AS step, 'yyy' AS plain, count(*) AS count, v AS sql FROM t:0"
+                    .to_string()
+            ),
+            "a colliding column keeps the class member; a free name reads the column"
+        );
+    }
+
+    #[test]
+    fn get_answers_the_default_for_a_name_that_is_not_a_column() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(Sqlite3Plugin).expect("plugin");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var db = new Sqlite(":memory:");
+                var st = new SqliteStatement(db, "SELECT 1 AS one");
+                st.step();
+                // `sqlite3_column_type(stmt, -1)` is SQLITE_NULL, so the
+                // reference answers the default (`Main.cpp:519-530`).
+                return (st.get("absent") === void) + ":" + st.get("absent", "fallback");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("1:fallback".to_string()));
     }
 
     #[test]
@@ -2963,7 +3161,7 @@ mod tests {
                 global.th = new SqliteThread(win, db);
                 th.onStateChange = function(s) { global.events += "S" + s; };
                 th.onProgress = function(n) { global.progress.add(n); };
-                global.started = th.select("SELECT v FROM t ORDER BY v");
+                global.started = th.select("SELECT v, upper(v) FROM t ORDER BY v");
                 "#,
             )
             .expect("script");
@@ -2982,19 +3180,21 @@ mod tests {
                 "inline.tjs",
                 r#"
                 var result = th.selectResult;
-                var flat = [];
-                for (var i = 0; i < result.count; i++) { flat.add(result[i][0]); }
-                return global.events + "|" + flat.join(",") + "|" + th.errorCode + "|" +
+                // One array per row, each holding one entry per column
+                // (`sqlite3/Main.cpp:884-895`).
+                var shape = result.count + ":" + result[0].count + ":" + result[0][0] + ":" +
+                    result[0][1] + ":" + result[1][0] + ":" + result[1][1];
+                return global.events + "|" + shape + "|" + th.errorCode + "|" +
                     global.progress.join(",");
                 "#,
             )
             .expect("script");
         assert_eq!(
             value,
-            Variant::String("S0S1S2|a,b|101|2".to_string()),
+            Variant::String("S0S1S2|2:2:a:A:b:B|101|2".to_string()),
             "INIT, WORKING and DONE in order (progress arrives through its own \
-             handler); a successful select leaves the last step's SQLITE_DONE in \
-             errorCode like the reference"
+             handler); selectResult is an array of row arrays; a successful select \
+             leaves the last step's SQLITE_DONE in errorCode like the reference"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -3082,30 +3282,103 @@ mod tests {
     fn a_finished_thread_locks_out_a_second_start_until_done_arrives() {
         let root = test_root("thread-running");
         let mut engine = test_engine(&root);
-        let value = engine
+        engine
             .execute_script(
                 "inline.tjs",
                 r#"
-                var win = new Window();
-                var db = new Sqlite(":memory:");
+                global.win = new Window();
+                global.db = new Sqlite(":memory:");
                 db.exec("CREATE TABLE t (v TEXT)");
-                var th = new SqliteThread(win, db);
-                var first = th.select("SELECT v FROM t");
-                var second = "";
+                db.exec("INSERT INTO t VALUES ('a')");
+                global.th = new SqliteThread(win, db);
+                global.first = th.select("SELECT v FROM t");
+                global.second = "";
                 try {
                     th.select("SELECT v FROM t");
                 } catch (e) {
-                    second = e.message;
+                    global.second = e.message;
                 }
-                return first + ":" + second;
+                global.state_after_refusal = th.state;
                 "#,
             )
             .expect("script");
         // The worker for the first select has finished by the time the second
         // call runs in the same script, but DONE has not been delivered, so
-        // the reference's `already running` check still fires.
-        assert_eq!(value, Variant::String("1:already running".to_string()));
+        // the reference's `already running` check still fires — after the
+        // state has moved to INIT (`Main.cpp:700`, `:782-783`).
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "global.first + ':' + global.second")
+                .expect("first/second"),
+            Variant::String("1:already running".to_string())
+        );
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "global.state_after_refusal")
+                .expect("state"),
+            Variant::Integer(0),
+            "a refused select still leaves the state at INIT"
+        );
+        let db = engine
+            .execute_expression("inline.tjs", "global.db")
+            .expect("db handle")
+            .object_handle()
+            .expect("object handle");
+        assert!(
+            open_statement_count(db) <= 1,
+            "the refused select leaked its prepared statement"
+        );
+        // The first operation still completes: its queued events survived the
+        // refused call.
+        assert!(
+            tick_until(&mut engine, "global.th.state", 2),
+            "the first select never reached DONE after the refusal"
+        );
+        assert_eq!(
+            open_statement_count(db),
+            0,
+            "the statement of the finished select was not finalized"
+        );
+        // And the thread is usable again, which also proves the connection was
+        // not left busy by a leaked statement.
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var started = th.select("SELECT v FROM t");
+                return started + ":" + th.state;
+                "#,
+            )
+            .expect("third select");
+        assert_eq!(value, Variant::String("1:0".to_string()));
+        assert!(tick_until(&mut engine, "global.th.state", 2));
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "th.selectResult[0][0]")
+                .expect("row"),
+            Variant::String("a".to_string()),
+            "the third select still reads the table through the same connection"
+        );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Open `sqlite3_stmt`s on a connection, so a test can see a leaked
+    /// prepared statement (and the `SQLITE_BUSY` close it would cause).
+    fn open_statement_count(instance: krkr_tjs2::runtime::ObjectHandle) -> usize {
+        SQLITES.with(|map| {
+            let map = map.borrow();
+            let state = map.get(&instance).expect("sqlite state");
+            let db = state.connection.ptr();
+            let mut count = 0;
+            let mut stmt = std::ptr::null_mut();
+            while {
+                stmt = unsafe { ffi::sqlite3_next_stmt(db, stmt) };
+                !stmt.is_null()
+            } {
+                count += 1;
+            }
+            count
+        })
     }
 
     #[test]

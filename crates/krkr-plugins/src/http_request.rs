@@ -46,9 +46,15 @@
 //! - Response header names are stored as the client canonicalizes them
 //!   (lower-case), and `getResponseHeader` looks names up
 //!   case-insensitively; the reference keeps the server's spelling and
-//!   compares exactly.
+//!   compares exactly. The value is returned without the single space the
+//!   reference's raw-header parse keeps after the colon.
 //! - `saveStorage` is written when the response finishes rather than
 //!   streamed, because the engine's storage write API takes whole buffers.
+//!
+//! One reference behaviour worth stating because scripts depend on it: a
+//! request is finished when its response is done (`HttpConnection::response`
+//! closes the handles, `HttpConnection.cpp:489`), so a second `send` without a
+//! new `open` throws `not open`.
 
 // `result_large_err` is the crate-wide `TjsError` size lint every native
 // callback carries, silenced here the same way `wf_basic_effect.rs` and
@@ -385,7 +391,14 @@ fn parse_content_type(value: &str) -> (String, String) {
     let content_type = head[..end].to_string();
     let tail = rest[semicolon + 1..].trim_start();
     let mut encoding = String::new();
-    if tail.len() >= 7 && tail[..7].eq_ignore_ascii_case("charset") {
+    // `get(..7)` keeps a multibyte tail from splitting a character: a
+    // server's `<meta … content="text/html; あああ">` and a script's
+    // `setRequestHeader("Content-Type", …)` both reach this parser, and a
+    // byte-indexed slice would panic the process.
+    if tail
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("charset"))
+    {
         let after = tail[7..].trim_start();
         if let Some(value) = after.strip_prefix('=') {
             let value = value.trim_start();
@@ -398,33 +411,48 @@ fn parse_content_type(value: &str) -> (String, String) {
     (content_type, encoding)
 }
 
+/// ASCII case-insensitive search for `needle` in `haystack`, starting at
+/// byte offset `from`.
+fn find_ascii_ci(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let last = haystack.len() - needle.len();
+    (from..=last).find(|start| haystack[*start..*start + needle.len()].eq_ignore_ascii_case(needle))
+}
+
 /// `matchContentType` (`match.cpp:16-36`): the `content=` value of a
 /// `<meta http-equiv="content-type" ...>` tag, case-insensitive, quotes
-/// stripped. The reference uses a regex; this is the same match by hand.
+/// stripped. The reference uses a regex; this is the same match by hand. All
+/// scanning is done on byte offsets located at ASCII delimiters and every
+/// slice goes through `str::get`, so a multibyte body can never split a
+/// character (matching the reference, which reads UTF-16 code units).
 fn sniff_meta_content_type(text: &str) -> Option<String> {
-    let lower = text.to_lowercase();
+    let bytes = text.as_bytes();
     let mut offset = 0;
-    while let Some(found) = lower[offset..].find("<meta") {
-        let start = offset + found + "<meta".len();
+    while let Some(found) = find_ascii_ci(bytes, offset, b"<meta") {
+        let start = found + "<meta".len();
         // The tag ends at the next '>'.
-        let end = text[start..].find('>').map(|end| start + end)?;
-        let tag = &text[start..end];
-        let tag_lower = &lower[start..end];
-        if meta_tag_matches(tag_lower)
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .map(|end| start + end)?;
+        let tag = text.get(start..end)?;
+        if meta_tag_matches(tag)
             && let Some(value) = meta_content_value(tag)
         {
             return Some(value);
         }
         offset = end + 1;
-        if offset >= text.len() {
+        if offset >= bytes.len() {
             break;
         }
     }
     None
 }
 
-fn meta_tag_matches(tag_lower: &str) -> bool {
-    let bytes = tag_lower.as_bytes();
+fn meta_tag_matches(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
     let mut index = 0;
     let mut has_http_equiv = false;
     let mut has_content = false;
@@ -440,7 +468,9 @@ fn meta_tag_matches(tag_lower: &str) -> bool {
         {
             index += 1;
         }
-        let name = &tag_lower[name_start..index];
+        let Some(name) = tag.get(name_start..index) else {
+            return false;
+        };
         while index < bytes.len() && (bytes[index] == b' ' || bytes[index] == b'\t') {
             index += 1;
         }
@@ -451,9 +481,9 @@ fn meta_tag_matches(tag_lower: &str) -> bool {
         while index < bytes.len() && (bytes[index] == b' ' || bytes[index] == b'\t') {
             index += 1;
         }
-        if name == "http-equiv" {
+        if name.eq_ignore_ascii_case("http-equiv") {
             has_http_equiv = true;
-        } else if name == "content" {
+        } else if name.eq_ignore_ascii_case("content") {
             has_content = true;
         }
         // Skip the value.
@@ -488,7 +518,7 @@ fn meta_content_value(tag: &str) -> Option<String> {
         {
             index += 1;
         }
-        let name = &tag[name_start..index];
+        let name = tag.get(name_start..index)?;
         while index < bytes.len() && (bytes[index] == b' ' || bytes[index] == b'\t') {
             index += 1;
         }
@@ -506,7 +536,7 @@ fn meta_content_value(tag: &str) -> Option<String> {
             while index < bytes.len() && bytes[index] != quote {
                 index += 1;
             }
-            let value = tag[start..index].to_string();
+            let value = tag.get(start..index)?.to_string();
             index += 1;
             value
         } else {
@@ -514,7 +544,7 @@ fn meta_content_value(tag: &str) -> Option<String> {
             while index < bytes.len() && bytes[index] != b' ' && bytes[index] != b'\t' {
                 index += 1;
             }
-            tag[start..index].to_string()
+            tag.get(start..index)?.to_string()
         };
         if name.eq_ignore_ascii_case("content") {
             return Some(value);
@@ -784,8 +814,12 @@ fn install_http_request_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectH
         NativePropertyAccess::ReadOnly,
         |runtime, this_obj| {
             request_property(runtime, this_obj, |state| {
-                if state.content_type.len() >= 5
-                    && state.content_type[..5].eq_ignore_ascii_case("text/")
+                // `get(..5)` keeps a multibyte content type (a meta-sniffed
+                // `<meta … content="ああ">`) from splitting a character.
+                if state
+                    .content_type
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
                 {
                     return Variant::String(decode_text(&state.output, &state.encoding));
                 }
@@ -1333,6 +1367,11 @@ fn apply_outcome(
             state.status_code = status;
             state.status_text = status_text;
             state.save_storage = None;
+            // `HttpConnection::response` closes its handles when the response
+            // is done (`HttpConnection.cpp:489`), so `isValid()` is false
+            // afterwards and a second `send()` without `open()` throws
+            // "not open" (`Main.cpp:114-116`, `:396-400`).
+            state.opened = false;
             if outcome.error.is_none() && !outcome.canceled {
                 state.content_type = outcome.content_type.clone();
                 state.encoding = outcome.encoding.clone();
@@ -2242,5 +2281,124 @@ mod tests {
             )
             .expect("second send");
         assert_eq!(value, Variant::String("already running".to_string()));
+    }
+
+    #[test]
+    fn a_completed_request_is_closed_until_the_next_open() {
+        let server = TestServer::start(|_| ok_response("once"));
+        let mut engine = test_engine();
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                &format!(
+                    r#"
+                    var r = new HttpRequest(new Window());
+                    r.open("GET", "{}");
+                    var first = r.sendSync();
+                    // `HttpConnection::response` closes its handles when the
+                    // response is done (`HttpConnection.cpp:489`), so the
+                    // reference refuses a second send (`Main.cpp:114-116`).
+                    var syncAgain = "";
+                    try {{ r.sendSync(); }} catch (e) {{ syncAgain = e.message; }}
+                    var asyncAgain = "";
+                    try {{ r.send(); }} catch (e) {{ asyncAgain = e.message; }}
+                    r.open("GET", "{}");
+                    var third = r.sendSync();
+                    return first + ":" + syncAgain + ":" + asyncAgain + ":" + third;
+                    "#,
+                    server.url("/once"),
+                    server.url("/twice")
+                ),
+            )
+            .expect("completed request");
+        assert_eq!(
+            value,
+            Variant::String("200:not open:not open:200".to_string()),
+            "a finished request has to be opened again, like the reference's closed handles"
+        );
+        assert_eq!(server.requests().len(), 2, "no request was re-issued");
+    }
+
+    #[test]
+    fn multibyte_content_types_never_panic() {
+        // The meta-sniff path (server-controlled): the 7-byte `charset` probe
+        // used to slice inside a UTF-8 character of the parameter tail.
+        let server = TestServer::start(|_| {
+            let body = "<html><head><meta http-equiv=\"content-type\" \
+                        content=\"text/html; あああ\"></head></html>";
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let mut engine = test_engine();
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                &format!(
+                    r#"
+                    var r = new HttpRequest(new Window());
+                    r.open("GET", "{}");
+                    r.sendSync();
+                    return r.status + ":" + r.contentType + ":" + (r.contentTypeEncoding === "");
+                    "#,
+                    server.url("/multibyte-tail")
+                ),
+            )
+            .expect("multibyte charset tail");
+        assert_eq!(value, Variant::String("200:text/html:1".to_string()));
+
+        // A multibyte content type, which the `response` property's 5-byte
+        // `text/` probe then has to survive.
+        let server = TestServer::start(|_| {
+            let body = "<meta http-equiv=\"content-type\" content=\"ああ\">";
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                &format!(
+                    r#"
+                    var r = new HttpRequest(new Window());
+                    r.open("GET", "{}");
+                    r.sendSync();
+                    var read = typeof r.response;
+                    return r.status + ":" + r.contentType + ":" + (read != "undefined");
+                    "#,
+                    server.url("/multibyte-content-type")
+                ),
+            )
+            .expect("multibyte content type");
+        assert_eq!(value, Variant::String("200:ああ:1".to_string()));
+
+        // A script's multibyte Content-Type: the parse must not panic, and the
+        // header is passed through like the reference hands it to WinINet.
+        let server = TestServer::start(|_| ok_response("x"));
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                &format!(
+                    r#"
+                    var r = new HttpRequest(new Window());
+                    r.open("GET", "{}");
+                    r.setRequestHeader("Content-Type", "text/x; あああ");
+                    var status = r.sendSync();
+                    return status + ":" + (r.statusText.length > 0);
+                    "#,
+                    server.url("/multibyte-header")
+                ),
+            )
+            .expect("multibyte header");
+        assert_eq!(value, Variant::String("200:1".to_string()));
+        assert!(
+            server.requests()[0].contains("text/x; あああ"),
+            "the multibyte header reached the server intact: {}",
+            server.requests()[0]
+        );
     }
 }
