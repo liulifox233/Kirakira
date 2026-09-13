@@ -7,7 +7,8 @@
 # against the reference implementation, and the games' Windows plugins
 # (PackinOne.dll, layerExImage.dll, ...) are otherwise only understood through
 # decompilation.  This script runs the *official* krkrz build (the only one
-# published upstream) on a virtual display, on a scratch copy of a game tree,
+# published upstream) on the session's display (or on an Xvfb it starts when
+# there is none, as in CI), on a scratch copy of a game tree,
 # and can reproduce a reference bookmark container written by the real
 # Plug-in.  M142's report is the long-form write-up; this header is the
 # operator-facing summary.
@@ -28,7 +29,11 @@
 #
 # Environment:
 #   KIRA_WINE_ROOT      scratch root (prefix, engine, game trees, artifacts)
-#   KIRA_WINE_DISPLAY   X display used for the runs (default :97)
+#   KIRA_WINE_DISPLAY   X display used for the runs.  Defaults to $DISPLAY
+#                       when the session has one (this machine is not a
+#                       headless VM: drive the real display and the window is
+#                       visible/clickable), to :97 (an Xvfb this script
+#                       starts) otherwise, which is the CI case.
 #   KIRA_WINE_ENGINE    engine release name to require (default krkrz_20171225)
 #   KRKRZ_RELEASE_URL   engine release URL override
 #   KRKRZ_RELEASE_SHA256 engine release .7z sha-256 (verified on download)
@@ -76,7 +81,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 
 KIRA_WINE_ROOT=${KIRA_WINE_ROOT:-${TMPDIR:-/tmp}/kirakira-wine}
-KIRA_WINE_DISPLAY=${KIRA_WINE_DISPLAY:-:97}
+KIRA_WINE_DISPLAY=${KIRA_WINE_DISPLAY:-${DISPLAY:-:97}}
 KIRA_WINE_ENGINE=${KIRA_WINE_ENGINE:-krkrz_20171225}
 KRKRZ_RELEASE_URL=${KRKRZ_RELEASE_URL:-https://github.com/krkrz/krkrz/releases/download/1.4.0r2/krkrz_20171225r2.7z}
 KRKRZ_RELEASE_SHA256=${KRKRZ_RELEASE_SHA256:-a58da24a2e14eac102f0fd8bf66106b22ad238d17a317b8d44b65d68efb574df}
