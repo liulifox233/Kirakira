@@ -967,7 +967,7 @@ impl KrkrEngine {
                     self.tjs_runtime.host_mut().log(&format!(
                         "external resource resume failed for `{path}`: {error}"
                     ));
-                    return Err(error);
+                    self.handle_resumed_callback_error("external resource resume", error)?;
                 }
             }
         }
@@ -1238,7 +1238,9 @@ impl KrkrEngine {
             }
 
             self.tjs_runtime.host_mut().pop_modal_window(window);
-            self.tjs_runtime.resume_suspended()?;
+            if let Err(error) = self.tjs_runtime.resume_suspended() {
+                self.handle_resumed_callback_error("resumed modal callback", error)?;
+            }
             if self.kag_session.state == KagTaskState::WaitingModal
                 && !self.tjs_runtime.is_suspended()
             {
@@ -1316,7 +1318,12 @@ impl KrkrEngine {
                     elapsed: Duration::ZERO,
                 });
             }
-            return Err(error);
+            // A script image decode that failed leaves its `Layer.loadImages`
+            // retry to throw when this frame resumes the parked callback; that
+            // callback is the game's own code (KAG's Conductor timer), so the
+            // exception goes to `System.exceptionHandler` before it can reach
+            // `update`'s caller.
+            self.handle_resumed_callback_error("resumed script callback", error)?;
         }
         if let Err(error) = self.refresh_transition_ticks() {
             self.handle_callback_error("transition tick callback", error)?;
@@ -2367,6 +2374,38 @@ impl KrkrEngine {
             error.message
         ));
         Ok(())
+    }
+
+    /// Reports an exception escaping a script callback the engine *resumed*
+    /// after a park (a modal window closing, an async image decode landing)
+    /// the way KRKR reports every other script callback.
+    ///
+    /// A parked VM has not returned from the game's call yet, so the
+    /// continuation is still that callback: the reference runs it inside
+    /// `TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION` (`base/ScriptMgnIntf.h:94`) like
+    /// every posted event, and a project whose `System.exceptionHandler`
+    /// claims the exception keeps its frame loop. KAG's Conductor is exactly
+    /// such a callback -- `timer = new Timer(timerCallback, '')`
+    /// (Conductor.tjs:30) -- and the exception it raises after a broken image
+    /// decode (`throw new ConductorException(msg)`, Conductor.tjs:186) is the
+    /// one the game's own handler is written for (Initialize.tjs:18-36
+    /// returns true for `ConductorException`).
+    ///
+    /// An unclaimed exception is returned unchanged, so callers keep today's
+    /// fatal path and error text -- `TVPShowScriptException` shows the
+    /// reference's error dialog and terminates there too.
+    fn handle_resumed_callback_error(&mut self, context: &str, error: TjsError) -> Result<()> {
+        if is_resource_pending_error(&error) || error.is_debug_quit() {
+            return Err(error);
+        }
+        if self.tjs_runtime.process_unhandled_exception(&error)? {
+            self.tjs_runtime
+                .host_mut()
+                .log(&format!("handled {context}: {}", error.message));
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 
     fn dispatch_window_mouse_wheel(&mut self, delta: i32) -> Result<()> {
@@ -20163,6 +20202,284 @@ mod tests {
             panic!("exception handler did not receive a string message");
         };
         assert_eq!(error_message, "boom");
+    }
+
+    /// The `Timer` half of `event_exception_handler_receives_escaped_tjs_exception`:
+    /// KAG's Conductor is a `Timer` callback (`new Timer(timerCallback, '')`,
+    /// Conductor.tjs:30) whose `throw new ConductorException(msg)`
+    /// (Conductor.tjs:186) is what the project's `System.exceptionHandler`
+    /// exists for (`Initialize.tjs:18-36` returns true for it), so the
+    /// exception must not take the frame down.
+    #[test]
+    fn timer_exception_handler_receives_escaped_tjs_exception() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer-exception-handler.tjs",
+                r#"
+                    class ConductorException extends Exception {
+                        function ConductorException(message) { super.Exception(message); }
+                    }
+                    global.handled = 0;
+                    global.classSeen = false;
+                    global.errorMessage = "";
+                    System.exceptionHandler = function(e) {
+                        global.handled++;
+                        global.classSeen = e instanceof "ConductorException";
+                        global.errorMessage = e.message;
+                        return true;
+                    };
+                    global.ran = 0;
+                    global.timerProbe = new Timer(function() {
+                        global.ran++;
+                        throw new ConductorException("boom");
+                    }, "");
+                    timerProbe.interval = 1000;
+                    timerProbe.enabled = true;
+                "#,
+            )
+            .expect("install timer exception handler");
+        let timer = object_handle(&engine, "timerProbe");
+        force_timer_due(&mut engine, timer);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("handled timer error");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("ran"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(1)
+        );
+        let Variant::String(error_message) = engine.tjs_runtime().global_member("errorMessage")
+        else {
+            panic!("exception handler did not receive a string message");
+        };
+        assert_eq!(error_message, "boom");
+    }
+
+    /// A `Timer` callback left without a claiming handler stays fatal, and the
+    /// error text stays exactly what `fire_script_event` produced before this
+    /// behaviour was pinned: the event site prefix plus the raw throw.
+    #[test]
+    fn unclaimed_timer_callback_exception_stays_fatal() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "timer-unclaimed.tjs",
+                r#"
+                    class ConductorException extends Exception {
+                        function ConductorException(message) { super.Exception(message); }
+                    }
+                    global.timerProbe = new Timer(function() {
+                        throw new ConductorException("boom");
+                    }, "");
+                    timerProbe.interval = 1000;
+                    timerProbe.enabled = true;
+                "#,
+            )
+            .expect("install timer");
+        let timer = object_handle(&engine, "timerProbe");
+        force_timer_due(&mut engine, timer);
+
+        let error = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect_err("unclaimed timer error");
+        assert!(
+            error.message.starts_with(&format!(
+                "Timer event `onTimer` on object#{} failed: ",
+                timer.0
+            )),
+            "unexpected error text: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("uncaught exception"),
+            "unexpected error text: {}",
+            error.message
+        );
+    }
+
+    /// Closes the fixture's modal window so the next `update` resumes the
+    /// parked Timer callback.
+    fn close_fixture_modal(engine: &mut KrkrEngine) {
+        let modal = object_handle(engine, "modal");
+        engine
+            .tjs_runtime_mut()
+            .call_object_method(modal, "close", Vec::new())
+            .expect("close modal");
+    }
+
+    /// Builds a `Timer` callback that parks the VM on a modal window and
+    /// throws a `ConductorException` once it is resumed -- the shape KAG's
+    /// Conductor has when its `Layer.loadImages` decode fails: the callback
+    /// catches the load error, throws `ConductorException`
+    /// (Conductor.tjs:186) and the engine resumes the very same callback at a
+    /// later frame boundary. `handler_script` installs the project's
+    /// `System.exceptionHandler` (or nothing).
+    fn parked_timer_fixture(handler_script: &str) -> KrkrEngine {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let script = [
+            r#"
+                class ConductorException extends Exception {
+                    function ConductorException(message) { super.Exception(message); }
+                }
+                global.handled = 0;
+            "#,
+            handler_script,
+            r#"
+                global.modal = new Window();
+                global.timerProbe = new Timer(function() {
+                    global.modal.showModal();
+                    global.resumed = 1;
+                    throw new ConductorException("boom");
+                }, "");
+                timerProbe.interval = 1000;
+                timerProbe.enabled = true;
+            "#,
+        ]
+        .concat();
+        engine
+            .execute_script("parked-timer.tjs", &script)
+            .expect("install parked timer");
+        let timer = object_handle(&engine, "timerProbe");
+        force_timer_due(&mut engine, timer);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("modal frame");
+        assert!(engine.tjs_runtime().is_suspended());
+        engine
+    }
+
+    /// The exception a *resumed* callback throws is the same callback's
+    /// exception: the project's handler must see it and the frame loop must
+    /// keep running. This is the live 纸上的魔法使 shape -- the conductor's
+    /// timer callback parks on a failing `PageBreak` image decode and its
+    /// `ConductorException` used to escape `update` as
+    /// `Runtime error: uncaught exception ... at Conductor.tjs:timerCallback`
+    /// even though `System.exceptionHandler` returns true for it.
+    #[test]
+    fn resumed_timer_callback_exception_reaches_the_games_exception_handler() {
+        let mut engine = parked_timer_fixture(
+            r#"
+                System.exceptionHandler = function(e) {
+                    global.handled++;
+                    global.classSeen = e instanceof "ConductorException";
+                    global.errorMessage = e.message;
+                    return true;
+                };
+            "#,
+        );
+        close_fixture_modal(&mut engine);
+
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("handled resumed callback error");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("resumed"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("handled"),
+            Variant::Integer(1)
+        );
+        assert_eq!(
+            engine.tjs_runtime().global_member("classSeen"),
+            Variant::Integer(1)
+        );
+        let Variant::String(error_message) = engine.tjs_runtime().global_member("errorMessage")
+        else {
+            panic!("exception handler did not receive a string message");
+        };
+        assert_eq!(error_message, "boom");
+
+        // The loop survived: a later timer still runs and a later frame still
+        // reports normally.
+        engine
+            .execute_script(
+                "after-error.tjs",
+                r#"
+                    global.afterError = 0;
+                    global.afterTimer = new Timer(function() {
+                        global.afterError++;
+                        global.afterTimer.enabled = false;
+                    }, "");
+                    global.afterProbe = afterTimer;
+                    afterTimer.interval = 1000;
+                    afterTimer.enabled = true;
+                "#,
+            )
+            .expect("install follow-up timer");
+        let after_timer = object_handle(&engine, "afterProbe");
+        force_timer_due(&mut engine, after_timer);
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("later frame");
+        assert_eq!(
+            engine.tjs_runtime().global_member("afterError"),
+            Variant::Integer(1)
+        );
+    }
+
+    /// No handler (and a handler that answers `false`) leave the resumed
+    /// callback's exception fatal, with the raw error text the escape produced
+    /// before -- the reference terminates on an unclaimed exception too.
+    #[test]
+    fn unclaimed_resumed_timer_callback_exception_stays_fatal() {
+        for handler_script in [
+            "",
+            "System.exceptionHandler = function(e) { global.handled++; return false; };",
+        ] {
+            let mut engine = parked_timer_fixture(handler_script);
+            close_fixture_modal(&mut engine);
+
+            let error = engine
+                .update(
+                    EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                    Duration::ZERO,
+                )
+                .expect_err("unclaimed resumed error");
+            assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::Runtime);
+            assert!(
+                error.message.starts_with("uncaught exception "),
+                "unexpected error text: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("class=ConductorException|Exception"),
+                "unexpected error text: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("boom"),
+                "unexpected error text: {}",
+                error.message
+            );
+        }
     }
 
     #[test]
