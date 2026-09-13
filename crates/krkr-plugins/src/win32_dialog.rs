@@ -6,11 +6,20 @@
 //! (0) immediately, `messageBox` pretends the default button was pressed and
 //! `chooseColor` reports cancellation, so scripts that merely probe the API
 //! keep running. Real dialog interaction is out of scope for the stub.
+//!
+//! The members whose reference declarations carry parameters keep their
+//! argument counts: the plugin registers them with `Method(...)`, i.e.
+//! ncbind's `ncbNativeClassMethod`, whose `ArgsCount` is the member's PMF
+//! parameter count and whose `doInvoke` rejects a shorter call with
+//! `TJS_E_BADPARAMCOUNT` before the body runs (`ncbind.hpp:1186`). The games
+//! always pass the full list (`close(id)`, `setItemLong(id, index, value)`,
+//! `mapRect(rect)`, `messageBox(win, msg, caption, type)`), so the floors only
+//! turn a silent short call into the reference's error.
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 
 use crate::catalog::{PluginMeta, PluginStatus};
@@ -75,10 +84,23 @@ fn bound_instance(
 
 fn install_dialog_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.register_object_native(handle, "finalize", native_void);
+    // `void close(DWORD id)` (`main.cpp:610`, registered with `Method(...)` at
+    // `:1692`) and `void SetPos(int x, int y)` (`:492`, `:1724`).
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "close",
+        NativeArgCount::AtLeast(1),
+        native_void,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setPos",
+        NativeArgCount::AtLeast(2),
+        native_void,
+    );
     for name in [
         "loadResource",
         "makeTemplate",
-        "close",
         "show",
         "setItemInt",
         "setItemText",
@@ -86,7 +108,6 @@ fn install_dialog_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
         "setItemFocus",
         "setItemPos",
         "setItemSize",
-        "setPos",
         "setSize",
         "setActive",
         "bringToFront",
@@ -103,12 +124,24 @@ fn install_dialog_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     ] {
         runtime.register_object_native(handle, name, native_void);
     }
+    // `tjs_int64 GetItem(int id) const` (`:415`, registered `:1694`) and
+    // `long SetItemLong(int id, int index, long newlong)` (`:419`, `:1697`).
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "getItem",
+        NativeArgCount::AtLeast(1),
+        zero,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setItemLong",
+        NativeArgCount::AtLeast(3),
+        zero,
+    );
     for name in [
         "open",
-        "getItem",
         "getItemID",
         "getItemLong",
-        "setItemLong",
         "getItemInt",
         "getItemEnabled",
         "getItemLeft",
@@ -136,7 +169,15 @@ fn install_dialog_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     runtime.register_object_native(handle, "getItemClassName", empty_string);
     runtime.register_object_native(handle, "getItemText", empty_string);
     runtime.register_object_native(handle, "getBaseUnits", base_units);
-    for name in ["mapRect", "getWindowRect", "getClientRect"] {
+    // `VarT MapRect(VarT in) const` (`:576`, registered `:1720`); the
+    // `getWindowRect`/`getClientRect` pair takes no argument.
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "mapRect",
+        NativeArgCount::AtLeast(1),
+        empty_rect,
+    );
+    for name in ["getWindowRect", "getClientRect"] {
         runtime.register_object_native(handle, name, empty_rect);
     }
     runtime.register_object_native(handle, "getScrollInfo", scroll_info);
@@ -201,7 +242,16 @@ fn register_shadowed_zero_property(
 // WIN32Dialog static methods
 
 fn install_dialog_statics(runtime: &mut Runtime<KrkrHost>, class: ObjectHandle) {
-    runtime.register_object_native(class, "messageBox", message_box);
+    // `static int MessageBox(iTJSDispatch2* window, NameT text, NameT caption,
+    // UINT type)` (`:1127`, registered `Method(TJS_W("messageBox"), ...)` at
+    // `:2398`): four parameters, and `manual.tjs:274` documents the same
+    // script shape, `messageBox(window, text, caption, type)`.
+    runtime.register_object_native_with_arg_count(
+        class,
+        "messageBox",
+        NativeArgCount::AtLeast(4),
+        message_box,
+    );
     runtime.register_object_native(class, "chooseColor", native_void);
     runtime.register_object_native(class, "initCommonControls", native_void);
     runtime.register_object_native(class, "initCommonControlsEx", one);
@@ -1651,3 +1701,82 @@ const STR_CONSTANTS: &[(&str, &str)] = &[
     ("PROGRESS", "msctls_progress32"),
     ("HOTKEY", "msctls_hotkey32"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use krkr_engine::{EngineConfig, KrkrEngine};
+    use krkr_tjs2::runtime::Variant;
+
+    use super::Win32DialogPlugin;
+
+    fn engine() -> KrkrEngine {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(Win32DialogPlugin).expect("plugin");
+        engine
+    }
+
+    /// Every member the reference registers with `Method(...)` carries its
+    /// PMF's parameter count as ncbind's `ArgsCount`, so a shorter call is
+    /// `TJS_E_BADPARAMCOUNT` (`ncbind.hpp:1186`), code -1004 — the members are
+    /// `close(id)` (`main.cpp:610`), `getItem(id)` (`:415`),
+    /// `setItemLong(id, index, value)` (`:419`), `setPos(x, y)` (`:492`),
+    /// `mapRect(rect)` (`:576`) and `messageBox(window, text, caption, type)`
+    /// (`:1127`).
+    #[test]
+    fn short_calls_are_bad_parameter_counts() {
+        let mut engine = engine();
+        for (member, call) in [
+            ("close", "var d = new WIN32Dialog(); d.close();"),
+            ("getItem", "var d = new WIN32Dialog(); d.getItem();"),
+            (
+                "setItemLong",
+                "var d = new WIN32Dialog(); d.setItemLong(1, 0);",
+            ),
+            ("setPos", "var d = new WIN32Dialog(); d.setPos(1);"),
+            ("mapRect", "var d = new WIN32Dialog(); d.mapRect();"),
+            (
+                "messageBox",
+                "WIN32Dialog.messageBox(0, \"text\", \"caption\");",
+            ),
+        ] {
+            let error = engine.execute_script("short.tjs", call).expect_err(member);
+            assert_eq!(
+                error.kind,
+                krkr_tjs2::TjsErrorKind::BadParamCount,
+                "{member}: {}",
+                error.message
+            );
+            assert_eq!(
+                error.kind.tjs_error_code(),
+                Some(-1004),
+                "{member} must be the reference's TJS_E_BADPARAMCOUNT"
+            );
+            assert_eq!(error.message, "Invalid argument count", "{member}");
+        }
+    }
+
+    /// The shapes the games call still run against the stub:
+    /// `k2compat_modeless.tjs`'s `setPos`/`setSize`/`mapRect`,
+    /// `WIN32DialogEX`'s item plumbing, and `world.tjs`'s
+    /// `messageBox(win, msg, title, type)`.
+    #[test]
+    fn the_games_call_shapes_still_run() {
+        let mut engine = engine();
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var dialog = new WIN32Dialog(null);\n\
+                     dialog.close(0);\n\
+                     dialog.getItem(1);\n\
+                     dialog.setItemLong(1, 0, 5);\n\
+                     dialog.setPos(10, 20);\n\
+                     dialog.mapRect(%[left => 0, top => 0, right => 1, bottom => 1]);\n\
+                     return WIN32Dialog.messageBox(dialog, \"msg\", \"title\", 4);\n\
+                 })()",
+            )
+            .expect("the games' call shapes must run");
+        // MB_YESNO: the stub reports the default button, IDYES.
+        assert_eq!(value, Variant::Integer(6));
+    }
+}

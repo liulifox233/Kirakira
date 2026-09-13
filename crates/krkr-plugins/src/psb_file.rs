@@ -50,7 +50,7 @@ use std::{collections::BTreeMap, str};
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
     Result,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 
 use crate::catalog::{PluginMeta, PluginStatus};
@@ -141,7 +141,15 @@ fn install_psb_file_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandl
     if matches!(runtime.object_member(handle, "root"), Variant::Void) {
         runtime.set_object_member(handle, "root", Variant::Void);
     }
-    runtime.register_object_native(handle, "load", psb_file_load);
+    // `load` is `bool (PSBFile::*)(ttstr)` in the DLL (the ncbind command's
+    // RTTI, `docs/plugins/psbfile.md`), so the storage name is mandatory;
+    // `clearStorageCache` takes none.
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "load",
+        NativeArgCount::AtLeast(1),
+        psb_file_load,
+    );
     runtime.register_object_native(handle, "clearStorageCache", native_void);
     runtime.register_object_native(handle, "finalize", native_void);
 }
@@ -1361,5 +1369,41 @@ mod tests {
             load_psb_document(&unflagged, &store),
             Err(PsbError::Malformed(_))
         ));
+    }
+
+    /// The DLL registers `load` as `bool (PSBFile::*)(ttstr)` — one mandatory
+    /// argument (the command's RTTI carries the signature, and the arity is
+    /// what ncbind enforces as `_numparams < ArgsCount`) — so `load()` with no
+    /// storage is the reference's `TJS_E_BADPARAMCOUNT` (code -1004). The form
+    /// the games use, `load(storage)`, still runs: an unreadable storage
+    /// reports 0 as before.
+    #[test]
+    fn load_requires_its_storage_argument() {
+        use krkr_engine::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PsbFilePlugin).expect("plugin");
+
+        // `(new PSBFile()).load()` rather than `new PSBFile().load()`: TJS's
+        // `new` takes the whole following primary expression, so the latter
+        // parses as `new (PSBFile().load())` and fails on the class object
+        // before the member is reached.
+        let error = engine
+            .execute_script("short.tjs", "(new PSBFile()).load();")
+            .expect_err("load() without a storage must fail");
+        assert_eq!(
+            error.kind,
+            krkr_tjs2::TjsErrorKind::BadParamCount,
+            "{}",
+            error.message
+        );
+        assert_eq!(error.kind.tjs_error_code(), Some(-1004));
+        assert_eq!(error.message, "Invalid argument count");
+
+        let value = engine
+            .execute_expression("inline.tjs", "(new PSBFile()).load(\"absent.psb\")")
+            .expect("the games' load(storage) shape must still run");
+        assert_eq!(value, Variant::Integer(0));
     }
 }
