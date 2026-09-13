@@ -15,6 +15,8 @@ pub(crate) mod tjs_ns0;
 pub mod value;
 
 #[cfg(test)]
+mod array_tests;
+#[cfg(test)]
 mod dictionary_tests;
 
 pub use self::object::{NativeArgCount, NativePropertyAccess, Object, ObjectKind};
@@ -69,6 +71,37 @@ pub(crate) fn split_string_by_regex(
         parts.push(Variant::String(tail.to_string()));
     }
     parts
+}
+
+/// `Array.load`'s line split (`tjsArray.cpp:276-327`): a `\n`, a `\r` or a
+/// `\r\n` pair ends a line, and the file's lines become the elements in order.
+/// A separator at the end of the file adds nothing -- the reference only
+/// counts the trailing segment when it is non-empty (`:319-327`) -- but a
+/// separator with an empty segment before it *does* contribute an element, so
+/// `"\n"` is one empty line while `"a\nb"` is two.
+pub(crate) fn split_loaded_lines(text: &str) -> Vec<Variant> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte != b'\r' && byte != b'\n' {
+            index += 1;
+            continue;
+        }
+        lines.push(Variant::String(text[start..index].to_string()));
+        index += if byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+        start = index;
+    }
+    if start < bytes.len() {
+        lines.push(Variant::String(text[start..].to_string()));
+    }
+    lines
 }
 
 pub trait TjsHost {

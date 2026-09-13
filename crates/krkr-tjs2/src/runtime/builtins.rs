@@ -9,7 +9,9 @@ use crate::compile_source_to_bytecode;
 use crate::error::{Result, TjsError};
 use crate::runtime::object::Object;
 use crate::runtime::value::{ObjectHandle, Variant};
-use crate::runtime::{Runtime, TjsHost, split_delimited_string, split_string_by_regex};
+use crate::runtime::{
+    Runtime, TjsHost, split_delimited_string, split_loaded_lines, split_string_by_regex,
+};
 
 pub(crate) fn install<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
     let array = runtime.register_global_native("Array", native_array::<H>);
@@ -604,13 +606,25 @@ fn array_load<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
+    // The reference creates the read stream *before* it touches the receiver
+    // (`tjsArray.cpp:270-273`), so a path that cannot be read leaves the items
+    // exactly as they were.
     let text = runtime.host_mut().read_text(&path, &mode)?;
-    runtime.heap[handle.0] = Object::array(
-        text.lines()
-            .map(|line| Variant::String(line.to_string()))
-            .collect(),
-    );
-    install_array_methods(runtime, handle);
+    // `ni->Items.clear()` and the refill work on the native instance behind
+    // `this` (`tjsArray.cpp:270-332`), so the receiver object and every member
+    // on it survive the call.  That is what `saveStruct.dll` needs: `save2`
+    // and its siblings are copied onto each Array *instance*
+    // (`tjsNative.cpp:340-364`, `Main.cpp:281-291`), and the games' settings
+    // writer loads the file it is about to save back through.
+    if !runtime.heap[handle.0].array_clear() {
+        // Anything without an Array native instance is
+        // `TJS_E_NATIVECLASSCRASH` (`TJS_GET_NATIVE_INSTANCE`,
+        // `tjsNative.h:312-319`).
+        return Err(TjsError::native_class_crash());
+    }
+    runtime.heap[handle.0].array_extend(split_loaded_lines(&text));
+    // Official: `if(result) *result = tTJSVariant(objthis, objthis);`
+    // (`tjsArray.cpp:358`).
     Ok(Variant::Object(handle))
 }
 
