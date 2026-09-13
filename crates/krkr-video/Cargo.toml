@@ -13,8 +13,25 @@ objc2-core-video = { version = "0.3", optional = true }
 objc2-core-audio-types = { version = "0.3", optional = true }
 objc2-av-foundation = { version = "0.3", optional = true, features = ["objc2-core-media"] }
 
+# System FFmpeg (libavformat/libavcodec/libswscale/libswresample) through
+# pkg-config: never a bundled decoder, just the host's own libav* shared
+# libraries. Enabling `ffmpeg` therefore needs an FFmpeg development
+# installation plus libclang (its build script generates the bindings from the
+# installed headers) on the build host, which is why the fallback is opt-in.
+# Excluded on wasm32, where no system libraries exist at all.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ffmpeg-next = { version = "9.0", optional = true, default-features = false, features = [
+    "codec",
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
+
 [features]
 default = []
+# FFmpeg fallback decoder. The platform's own system decoder stays primary
+# wherever one is compiled in; see `platform_capabilities`.
+ffmpeg = ["dep:ffmpeg-next"]
 macos-avfoundation = [
     "objc2",
     "objc2-foundation",

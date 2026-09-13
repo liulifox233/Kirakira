@@ -1,15 +1,36 @@
 //! Video decoding backends for the KRKR VideoOverlay object.
 //!
 //! Like krkr2/krkrz (DirectShow / Media Foundation), this crate does not
-//! bundle a codec; it decodes through the host platform's own media
-//! framework. Backends are pluggable per platform behind the
-//! [`VideoPort`] protocol and its [`VideoDecoder`] decode stream:
+//! bundle a codec; it decodes through the host's own media stack. Backends are
+//! pluggable behind the [`VideoPort`] protocol and its [`VideoDecoder`] decode
+//! stream, and the host platform's own decoder is always primary where one is
+//! compiled in. Where no system decoder exists, the opt-in `ffmpeg` feature
+//! provides a fallback on the host's system FFmpeg libraries (no bundled
+//! decoder, no shelling out to the `ffmpeg` CLI).
 //!
-//! - `macos-avfoundation` (macOS): AVFoundation `AVAssetReader`, zero-copy
-//!   BGRA frames out of `CVPixelBuffer`.
+//! Selection order (see [`platform_capabilities`] and [`create_decoder`]):
+//!
+//! 1. `macos-avfoundation` (macOS): AVFoundation `AVAssetReader`, zero-copy
+//!    BGRA frames out of `CVPixelBuffer`. System decoder, always wins on
+//!    macOS when compiled in — FFmpeg is only used there when that feature is
+//!    off.
+//! 2. `ffmpeg` (Linux/Windows/Android/iOS and any other host with system
+//!    libav* libraries): libavformat/libavcodec demux + decode, swscale to
+//!    RGBA, swresample to the interleaved f32 soundtrack. Sources are read
+//!    through a custom AVIO, so in-memory bytes never touch the filesystem.
+//! 3. Per-platform declared profiles (Android MediaCodec, iOS AVFoundation,
+//!    Web media element): protocol declarations the corresponding shell
+//!    provides; selected when no decoder is linked in above them.
+//! 4. [`VideoBackendKind::Unavailable`]: no backend at all.
+//!
+//! The rule is compile-time, because linking a system framework is a build
+//! decision; [`PlatformVideoFactory::capabilities`] reports exactly what
+//! [`create_decoder`] on the same build will return.
 
 use std::{error::Error, fmt, path::PathBuf, sync::Arc};
 
+#[cfg(all(feature = "ffmpeg", not(target_arch = "wasm32")))]
+mod ffmpeg;
 #[cfg(all(target_os = "macos", feature = "macos-avfoundation"))]
 mod macos;
 
@@ -56,6 +77,9 @@ pub struct AudioChunk {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoBackendKind {
     MacosAvFoundation,
+    /// System FFmpeg libraries, the fallback where no platform decoder is
+    /// compiled in.
+    Ffmpeg,
     AndroidMediaCodec,
     IosAvFoundation,
     WebMediaElement,
@@ -90,13 +114,16 @@ impl VideoCapabilities {
     }
 }
 
-/// Returns the capability profile for the current target. Android/iOS and
-/// Web profiles are protocol declarations today; their shells can provide a
-/// native/media-element `VideoPort` without linking the macOS decoder.
+/// Returns the capability profile for the current build and target.
+///
+/// The order encodes the selection rule: the platform's own decoder wins where
+/// it is compiled in (AVFoundation on macOS), system FFmpeg is the fallback
+/// everywhere else, and the Android/iOS/Web profiles are protocol declarations
+/// whose shells provide a native/media-element `VideoPort` when the crate has
+/// no decoder of its own.
 pub const fn platform_capabilities() -> VideoCapabilities {
-    #[cfg(all(target_os = "macos", feature = "macos-avfoundation"))]
-    {
-        return VideoCapabilities {
+    if cfg!(all(target_os = "macos", feature = "macos-avfoundation")) {
+        VideoCapabilities {
             backend: VideoBackendKind::MacosAvFoundation,
             mp4: true,
             webm: true,
@@ -105,11 +132,20 @@ pub const fn platform_capabilities() -> VideoCapabilities {
             avi: true,
             in_memory: true,
             soundtrack_pcm: true,
-        };
-    }
-    #[cfg(target_os = "android")]
-    {
-        return VideoCapabilities {
+        }
+    } else if cfg!(all(feature = "ffmpeg", not(target_arch = "wasm32"))) {
+        VideoCapabilities {
+            backend: VideoBackendKind::Ffmpeg,
+            mp4: true,
+            webm: true,
+            mpeg: true,
+            wmv: true,
+            avi: true,
+            in_memory: true,
+            soundtrack_pcm: true,
+        }
+    } else if cfg!(target_os = "android") {
+        VideoCapabilities {
             backend: VideoBackendKind::AndroidMediaCodec,
             mp4: true,
             webm: true,
@@ -118,11 +154,9 @@ pub const fn platform_capabilities() -> VideoCapabilities {
             avi: false,
             in_memory: true,
             soundtrack_pcm: true,
-        };
-    }
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    {
-        return VideoCapabilities {
+        }
+    } else if cfg!(any(target_os = "ios", target_os = "tvos")) {
+        VideoCapabilities {
             backend: VideoBackendKind::IosAvFoundation,
             mp4: true,
             webm: false,
@@ -131,11 +165,9 @@ pub const fn platform_capabilities() -> VideoCapabilities {
             avi: false,
             in_memory: true,
             soundtrack_pcm: true,
-        };
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        return VideoCapabilities {
+        }
+    } else if cfg!(target_arch = "wasm32") {
+        VideoCapabilities {
             backend: VideoBackendKind::WebMediaElement,
             mp4: true,
             webm: true,
@@ -144,15 +176,8 @@ pub const fn platform_capabilities() -> VideoCapabilities {
             avi: false,
             in_memory: false,
             soundtrack_pcm: false,
-        };
-    }
-    #[cfg(not(any(
-        all(target_os = "macos", feature = "macos-avfoundation"),
-        target_os = "android",
-        any(target_os = "ios", target_os = "tvos"),
-        target_arch = "wasm32"
-    )))]
-    {
+        }
+    } else {
         VideoCapabilities::unavailable()
     }
 }
@@ -284,19 +309,35 @@ impl fmt::Display for VideoError {
 
 impl Error for VideoError {}
 
-/// Opens a host-owned source with the best backend for the current platform.
+/// Opens a host-owned source with the best backend for the current build.
+///
+/// Selection is compile-time and follows [`platform_capabilities`]: the
+/// platform's own system decoder first, system FFmpeg as the fallback when it
+/// is compiled in (and no system decoder is), otherwise `Unsupported`.
 pub fn create_decoder(source: VideoSource) -> Result<Box<dyn VideoPort>, VideoError> {
+    // System decoder primary: AVFoundation on macOS.
     #[cfg(all(target_os = "macos", feature = "macos-avfoundation"))]
+    return macos::AvfDecoder::open(source).map(|decoder| Box::new(decoder) as _);
+
+    // FFmpeg fallback wherever no system decoder is compiled in.
+    #[cfg(all(
+        feature = "ffmpeg",
+        not(target_arch = "wasm32"),
+        not(all(target_os = "macos", feature = "macos-avfoundation"))
+    ))]
+    return ffmpeg::FfmpegDecoder::open(source).map(|decoder| Box::new(decoder) as _);
+
+    #[cfg(not(any(
+        all(target_os = "macos", feature = "macos-avfoundation"),
+        all(feature = "ffmpeg", not(target_arch = "wasm32"))
+    )))]
     {
-        return macos::AvfDecoder::open(source).map(|decoder| Box::new(decoder) as _);
+        let _ = source;
+        Err(VideoError::Unsupported(format!(
+            "no video backend for this platform ({})",
+            std::env::consts::OS
+        )))
     }
-    #[cfg(not(all(target_os = "macos", feature = "macos-avfoundation")))]
-    let _ = source;
-    #[allow(unreachable_code)]
-    Err(VideoError::Unsupported(format!(
-        "no video backend for this platform ({})",
-        std::env::consts::OS
-    )))
 }
 
 #[cfg(test)]
@@ -319,5 +360,40 @@ mod tests {
         assert_eq!(capabilities.backend, VideoBackendKind::Unavailable);
         assert!(!capabilities.mp4);
         assert!(!capabilities.in_memory);
+    }
+
+    /// The selection rule: a platform's own decoder wins where it is compiled
+    /// in (even with the FFmpeg fallback present), FFmpeg covers everything
+    /// else, and the remaining profiles are declared by their shells.
+    #[test]
+    fn backend_selection_follows_the_documented_priority() {
+        let backend = platform_capabilities().backend;
+        if cfg!(all(target_os = "macos", feature = "macos-avfoundation")) {
+            assert_eq!(backend, VideoBackendKind::MacosAvFoundation);
+        } else if cfg!(all(feature = "ffmpeg", not(target_arch = "wasm32"))) {
+            assert_eq!(backend, VideoBackendKind::Ffmpeg);
+        } else if cfg!(target_os = "android") {
+            assert_eq!(backend, VideoBackendKind::AndroidMediaCodec);
+        } else if cfg!(any(target_os = "ios", target_os = "tvos")) {
+            assert_eq!(backend, VideoBackendKind::IosAvFoundation);
+        } else if cfg!(target_arch = "wasm32") {
+            assert_eq!(backend, VideoBackendKind::WebMediaElement);
+        } else {
+            assert_eq!(backend, VideoBackendKind::Unavailable);
+        }
+    }
+
+    /// `PlatformVideoFactory` must report exactly what `create_decoder` on the
+    /// same build returns.
+    #[test]
+    fn platform_factory_reports_the_selected_backend() {
+        assert_eq!(
+            PlatformVideoFactory.capabilities().backend,
+            platform_capabilities().backend
+        );
+        assert_eq!(
+            UnavailableVideoFactory.capabilities().backend,
+            VideoBackendKind::Unavailable
+        );
     }
 }
