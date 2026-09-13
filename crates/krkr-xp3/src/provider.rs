@@ -86,12 +86,14 @@ impl Xp3ResourceProvider {
     }
 
     pub fn get_entry(&self, path: &str) -> Option<&Xp3Entry> {
-        let normalized = normalize_entry_name(path).ok()?;
+        let probe = NormalizedProbe::new(path).ok()?;
         for archive in self.archives.iter().rev() {
-            if let Some(entry) = archive.get_entry(&normalized) {
+            if let Some(entry) = archive.get_entry_normalized(&probe.name) {
                 return Some(entry);
             }
-            if let Some(entry) = archive.get_entry_ascii_case_insensitive(&normalized) {
+            if let Some(entry) =
+                archive.get_entry_normalized_ascii_case_insensitive(&probe.ascii_lowercase)
+            {
                 return Some(entry);
             }
         }
@@ -103,11 +105,11 @@ impl Xp3ResourceProvider {
     /// `System.arcPath`), so only the file name is compared.
     pub fn get_entry_in(&self, archive: &str, path: &str) -> Option<&Xp3Entry> {
         let index = self.archive_index(archive)?;
-        let normalized = normalize_entry_name(path).ok()?;
+        let probe = NormalizedProbe::new(path).ok()?;
         let archive = &self.archives[index];
         archive
-            .get_entry(&normalized)
-            .or_else(|| archive.get_entry_ascii_case_insensitive(&normalized))
+            .get_entry_normalized(&probe.name)
+            .or_else(|| archive.get_entry_normalized_ascii_case_insensitive(&probe.ascii_lowercase))
     }
 
     pub fn open_in(&self, archive: &str, path: &str) -> io::Result<Box<dyn ResourceStream>> {
@@ -146,11 +148,13 @@ impl Xp3ResourceProvider {
 
 impl StoragePort for Xp3ResourceProvider {
     fn open(&self, path: &str) -> io::Result<Box<dyn ResourceStream>> {
-        let normalized = normalize_entry_name(path).map_err(xp3_error_to_io)?;
+        let probe = NormalizedProbe::new(path).map_err(xp3_error_to_io)?;
         for archive in self.archives.iter().rev() {
-            let entry_name = if archive.get_entry(&normalized).is_some() {
-                normalized.clone()
-            } else if let Some(entry) = archive.get_entry_ascii_case_insensitive(&normalized) {
+            let entry_name = if archive.get_entry_normalized(&probe.name).is_some() {
+                probe.name.clone()
+            } else if let Some(entry) =
+                archive.get_entry_normalized_ascii_case_insensitive(&probe.ascii_lowercase)
+            {
                 entry.name.clone()
             } else {
                 continue;
@@ -162,7 +166,7 @@ impl StoragePort for Xp3ResourceProvider {
             return Ok(Box::new(stream));
         }
 
-        Err(io::Error::new(io::ErrorKind::NotFound, normalized))
+        Err(io::Error::new(io::ErrorKind::NotFound, probe.name))
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -171,6 +175,33 @@ impl StoragePort for Xp3ResourceProvider {
 
     fn byte_len(&self, path: &str) -> io::Result<Option<u64>> {
         Ok(self.get_entry(path).map(|entry| entry.original_size))
+    }
+}
+
+/// One lookup path, normalized once for the whole provider call.
+///
+/// A probe needs two spellings: the normalized name, which is what each
+/// archive's exact map keys on, and its ASCII-lowercased form, which is what
+/// the case-insensitive map keys on. Building them per archive made an
+/// existence probe over seven mounts pay a fresh normalization for every
+/// exact and case-insensitive attempt (fifteen normalizations and seven
+/// lowercase allocations for a name that is usually absent), so the provider
+/// builds both once and hands the archives the normalized-input lookups.
+struct NormalizedProbe {
+    /// The path after [`normalize_entry_name`].
+    name: String,
+    /// `name.to_ascii_lowercase()`, the case-insensitive maps' key.
+    ascii_lowercase: String,
+}
+
+impl NormalizedProbe {
+    fn new(path: &str) -> Result<Self> {
+        let name = normalize_entry_name(path)?;
+        let ascii_lowercase = name.to_ascii_lowercase();
+        Ok(Self {
+            name,
+            ascii_lowercase,
+        })
     }
 }
 
