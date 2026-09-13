@@ -30,7 +30,7 @@ use krkr_core::{
 };
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{Closure, ObjectHandle, Runtime, Variant},
+    runtime::{Closure, NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 #[cfg(not(target_arch = "wasm32"))]
 use krkr_video::VideoSource;
@@ -1011,17 +1011,47 @@ pub(crate) fn install_video_overlay_methods(runtime: &mut Runtime<KrkrHost>, han
     // does `global.VideoOverlay.finalize(...)` (`Movie.tjs`) after stopping
     // playback -- so the member must exist on the class surface.
     runtime.register_object_native(handle, "finalize", native_void);
-    runtime.register_object_native(handle, "open", video_overlay_open);
+    // `tTJSNC_VideoOverlay` members that declare
+    // `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carry the floor at the
+    // registration site (`visual/VideoOvlIntf.cpp:224-406`). `setPeriodEvent`
+    // stays unfloored: its `numparams` tests dispatch behaviour (`0` disables,
+    // `1` sets, `2+` are ignored, `:368-370`) instead of rejecting.
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "open",
+        NativeArgCount::AtLeast(1),
+        video_overlay_open,
+    );
     runtime.register_object_native(handle, "play", video_overlay_play);
     runtime.register_object_native(handle, "stop", video_overlay_stop);
     runtime.register_object_native(handle, "close", video_overlay_close);
-    runtime.register_object_native(handle, "setPos", video_overlay_set_pos);
-    runtime.register_object_native(handle, "setSize", video_overlay_set_size);
-    runtime.register_object_native(handle, "setBounds", video_overlay_set_bounds);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setPos",
+        NativeArgCount::AtLeast(2),
+        video_overlay_set_pos,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setSize",
+        NativeArgCount::AtLeast(2),
+        video_overlay_set_size,
+    );
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setBounds",
+        NativeArgCount::AtLeast(4),
+        video_overlay_set_bounds,
+    );
     runtime.register_object_native(handle, "pause", video_overlay_pause);
     runtime.register_object_native(handle, "rewind", video_overlay_rewind);
     runtime.register_object_native(handle, "prepare", video_overlay_prepare);
-    runtime.register_object_native(handle, "setSegmentLoop", video_overlay_set_segment_loop);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setSegmentLoop",
+        NativeArgCount::AtLeast(2),
+        video_overlay_set_segment_loop,
+    );
     runtime.register_object_native(
         handle,
         "cancelSegmentLoop",
@@ -1033,12 +1063,18 @@ pub(crate) fn install_video_overlay_methods(runtime: &mut Runtime<KrkrHost>, han
         "cancelPeriodEvent",
         video_overlay_cancel_period_event,
     );
-    runtime.register_object_native(
+    runtime.register_object_native_with_arg_count(
         handle,
         "selectAudioStream",
+        NativeArgCount::AtLeast(1),
         video_overlay_select_audio_stream,
     );
-    runtime.register_object_native(handle, "setMixingLayer", video_overlay_set_mixing_layer);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setMixingLayer",
+        NativeArgCount::AtLeast(1),
+        video_overlay_set_mixing_layer,
+    );
     runtime.register_object_native(handle, "resetMixingLayer", video_overlay_reset_mixing_layer);
 }
 
@@ -1732,5 +1768,91 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("M:0".to_string()));
+    }
+
+    /// M175.  Every `tTJSNC_VideoOverlay` method whose reference declares
+    /// `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carries that floor at
+    /// its registration site (`visual/VideoOvlIntf.cpp:224-406`), so a short
+    /// call reports `TJS_E_BADPARAMCOUNT` (-1004) before the handler runs.
+    /// `setPeriodEvent` stays unfloored: 0 arguments disable the event and 1
+    /// sets it (`:368-370`) -- a behaviour dispatch, not a rejection.
+    #[test]
+    fn video_overlay_method_floors_reject_short_calls() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "video_overlay_floors.tjs",
+                r#"
+                var overlay = new VideoOverlay();
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                var rejected = [
+                    message(function() { overlay.open(); }),
+                    message(function() { overlay.setPos(1); }),
+                    message(function() { overlay.setSize(1); }),
+                    message(function() { overlay.setBounds(1, 2, 3); }),
+                    message(function() { overlay.setSegmentLoop(1); }),
+                    message(function() { overlay.selectAudioStream(); }),
+                    message(function() { overlay.setMixingLayer(); })
+                ].join("|");
+                var tolerant = message(function() { overlay.setPeriodEvent(); });
+                return rejected + "@" + tolerant;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(format!("{}@", ["Invalid argument count"; 7].join("|")))
+        );
+        // The identity from Rust: the dispatch check answers
+        // `TJS_E_BADPARAMCOUNT` (-1004) before the handler.
+        let error = engine
+            .execute_expression("video_overlay_floors.tjs", "overlay.setBounds(1, 2, 3)")
+            .expect_err("a short setBounds call must fail");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+        assert_eq!(error.tjs_error_code(), Some(-1004));
+        assert_eq!(error.message, "Invalid argument count");
+    }
+
+    /// The other half of the contract: every floor accepts the reference
+    /// arity (the shapes PARQUET's `Movie` forwards), so a floor that is too
+    /// high cannot slip in.  A call may fail for other reasons (a missing
+    /// movie storage), so only `TJS_E_BADPARAMCOUNT` counts as a problem.
+    #[test]
+    fn video_overlay_reference_arity_calls_are_not_rejected() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "video_overlay_floors_exact.tjs",
+                r#"
+                var overlay = new VideoOverlay();
+                var problems = "";
+                function check(body) {
+                    try { body(); } catch (e) {
+                        if (e.message === "Invalid argument count") { problems += "bad; "; }
+                    }
+                }
+                check(function() { overlay.open("missing.mpg"); });
+                check(function() { overlay.setPos(0, 0); });
+                check(function() { overlay.setSize(16, 16); });
+                check(function() { overlay.setBounds(0, 0, 16, 16); });
+                check(function() { overlay.setSegmentLoop(0, 1); });
+                check(function() { overlay.selectAudioStream(0); });
+                check(function() { overlay.setMixingLayer(0); });
+                check(function() { overlay.setPeriodEvent(); });
+                check(function() { overlay.setPeriodEvent(30); });
+                return problems;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String(String::new()));
     }
 }

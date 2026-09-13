@@ -1,6 +1,6 @@
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, TjsHost, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, TjsHost, Variant},
 };
 use std::collections::BTreeSet;
 
@@ -21,17 +21,56 @@ pub(crate) fn install_scripts(runtime: &mut Runtime<KrkrHost>) {
     // `TJS_DECL_EMPTY_FINALIZE_METHOD` (`ScriptMgnIntf.cpp:1218`); scripts
     // reach it as `Scripts.finalize(...)` while tearing a session down.
     runtime.register_object_native(scripts, "finalize", native_void);
-    runtime.register_object_native(scripts, "execStorage", scripts_exec_storage);
-    runtime.register_object_native(scripts, "evalStorage", scripts_eval_storage);
+    // The `tTJSNC_Scripts` members that declare
+    // `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carry the floor at the
+    // registration site, so a short call reports `TJS_E_BADPARAMCOUNT` (-1004)
+    // before the handler runs (`base/ScriptMgnIntf.cpp:1233-1400`).
+    runtime.register_object_native_with_arg_count(
+        scripts,
+        "execStorage",
+        NativeArgCount::AtLeast(1),
+        scripts_exec_storage,
+    );
+    runtime.register_object_native_with_arg_count(
+        scripts,
+        "evalStorage",
+        NativeArgCount::AtLeast(1),
+        scripts_eval_storage,
+    );
     runtime.register_object_native(scripts, "loadDataPack", scripts_load_data_pack);
-    runtime.register_object_native(scripts, "compileStorage", scripts_compile_storage);
-    runtime.register_object_native(scripts, "exec", scripts_exec);
-    runtime.register_object_native(scripts, "eval", scripts_eval);
+    runtime.register_object_native_with_arg_count(
+        scripts,
+        "compileStorage",
+        NativeArgCount::AtLeast(2),
+        scripts_compile_storage,
+    );
+    runtime.register_object_native_with_arg_count(
+        scripts,
+        "exec",
+        NativeArgCount::AtLeast(1),
+        scripts_exec,
+    );
+    runtime.register_object_native_with_arg_count(
+        scripts,
+        "eval",
+        NativeArgCount::AtLeast(1),
+        scripts_eval,
+    );
     runtime.register_object_native(scripts, "dump", native_void);
     runtime.register_object_native(scripts, "getTraceString", scripts_get_trace_string);
     runtime.register_object_native(scripts, "dumpStringHeap", native_void);
-    runtime.register_object_native(scripts, "setCallMissing", scripts_set_call_missing);
-    runtime.register_object_native(scripts, "getClassNames", scripts_get_class_names);
+    runtime.register_object_native_with_arg_count(
+        scripts,
+        "setCallMissing",
+        NativeArgCount::AtLeast(1),
+        scripts_set_call_missing,
+    );
+    runtime.register_object_native_with_arg_count(
+        scripts,
+        "getClassNames",
+        NativeArgCount::AtLeast(1),
+        scripts_get_class_names,
+    );
     runtime.register_object_native(scripts, "getObjectKeys", scripts_get_object_keys);
     runtime.register_object_native(scripts, "getObjectCount", scripts_get_object_count);
     runtime.register_object_native(scripts, "foreach", scripts_foreach);
@@ -564,5 +603,80 @@ mod tests {
             )
             .expect("object keys");
         assert_eq!(value, Variant::String("e,c,a,b".to_string()));
+    }
+
+    /// M175.  Every `tTJSNC_Scripts` method whose reference declares
+    /// `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carries that floor at
+    /// its registration site (`base/ScriptMgnIntf.cpp:1233-1400`), so a short
+    /// call reports `TJS_E_BADPARAMCOUNT` (-1004) before the handler runs.
+    #[test]
+    fn scripts_method_floors_reject_short_calls() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "scripts_floors.tjs",
+                r#"
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                return [
+                    message(function() { Scripts.execStorage(); }),
+                    message(function() { Scripts.evalStorage(); }),
+                    message(function() { Scripts.compileStorage("missing.tjs"); }),
+                    message(function() { Scripts.exec(); }),
+                    message(function() { Scripts.eval(); }),
+                    message(function() { Scripts.setCallMissing(); }),
+                    message(function() { Scripts.getClassNames(); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(["Invalid argument count"; 7].join("|"))
+        );
+        // The identity from Rust: the dispatch check answers
+        // `TJS_E_BADPARAMCOUNT` (-1004) before the handler.
+        let error = engine
+            .execute_expression(
+                "scripts_floors.tjs",
+                "Scripts.compileStorage(\"missing.tjs\")",
+            )
+            .expect_err("a short compileStorage call must fail");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+        assert_eq!(error.tjs_error_code(), Some(-1004));
+        assert_eq!(error.message, "Invalid argument count");
+    }
+
+    /// The other half of the contract: every floor accepts the reference
+    /// arity.  A call may fail for other reasons (a missing storage, the
+    /// unimplemented bytecode writer), so only `TJS_E_BADPARAMCOUNT` counts
+    /// as a problem.
+    #[test]
+    fn scripts_reference_arity_calls_are_not_rejected() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "scripts_floors_exact.tjs",
+                r#"
+                var problems = "";
+                function check(body) {
+                    try { body(); } catch (e) {
+                        if (e.message === "Invalid argument count") { problems += "bad; "; }
+                    }
+                }
+                check(function() { Scripts.execStorage("missing.tjs"); });
+                check(function() { Scripts.evalStorage("missing.tjs"); });
+                check(function() { Scripts.compileStorage("missing.tjs", "missing.out"); });
+                check(function() { Scripts.exec("1 + 1;"); });
+                check(function() { Scripts.eval("1 + 1"); });
+                check(function() { Scripts.setCallMissing(%[]); });
+                check(function() { Scripts.getClassNames(%[]); });
+                return problems;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String(String::new()));
     }
 }

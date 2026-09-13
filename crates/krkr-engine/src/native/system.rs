@@ -1,6 +1,6 @@
 use krkr_tjs2::{
     Result, TjsError,
-    runtime::{ObjectHandle, Runtime, Variant},
+    runtime::{NativeArgCount, ObjectHandle, Runtime, Variant},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,28 +33,80 @@ pub(crate) fn install_system(runtime: &mut Runtime<KrkrHost>) {
     runtime.register_object_native(system, "terminate", system_exit);
     runtime.register_object_native(system, "exit", system_exit);
     runtime.register_object_native(system, "clearGraphicCache", system_clear_graphic_cache);
-    runtime.register_object_native(system, "touchImages", system_touch_images);
-    runtime.register_object_native(
+    // The `tTJSNC_System` / `TVPCreateNativeClass_System` members that declare
+    // `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carry the floor at the
+    // registration site, so a short call reports `TJS_E_BADPARAMCOUNT` (-1004)
+    // before the handler runs (`base/SystemIntf.cpp:128-243`,
+    // `base/win32/SystemImpl.cpp:751-880`).
+    runtime.register_object_native_with_arg_count(
+        system,
+        "touchImages",
+        NativeArgCount::AtLeast(1),
+        system_touch_images,
+    );
+    runtime.register_object_native_with_arg_count(
         system,
         "addContinuousHandler",
+        NativeArgCount::AtLeast(1),
         system_add_continuous_handler,
     );
-    runtime.register_object_native(
+    runtime.register_object_native_with_arg_count(
         system,
         "removeContinuousHandler",
+        NativeArgCount::AtLeast(1),
         system_remove_continuous_handler,
     );
-    runtime.register_object_native(system, "inform", system_inform);
-    runtime.register_object_native(system, "getKeyState", system_get_key_state);
-    runtime.register_object_native(system, "shellExecute", system_shell_execute);
-    runtime.register_object_native(system, "createAppLock", system_create_app_lock);
+    runtime.register_object_native_with_arg_count(
+        system,
+        "inform",
+        NativeArgCount::AtLeast(1),
+        system_inform,
+    );
+    runtime.register_object_native_with_arg_count(
+        system,
+        "getKeyState",
+        NativeArgCount::AtLeast(1),
+        system_get_key_state,
+    );
+    runtime.register_object_native_with_arg_count(
+        system,
+        "shellExecute",
+        NativeArgCount::AtLeast(1),
+        system_shell_execute,
+    );
+    runtime.register_object_native_with_arg_count(
+        system,
+        "createAppLock",
+        NativeArgCount::AtLeast(1),
+        system_create_app_lock,
+    );
     runtime.register_object_native(system, "getTickCount", system_get_tick_count);
-    runtime.register_object_native(system, "toActualColor", system_to_actual_color);
-    runtime.register_object_native(system, "assignMessage", system_assign_message);
+    runtime.register_object_native_with_arg_count(
+        system,
+        "toActualColor",
+        NativeArgCount::AtLeast(1),
+        system_to_actual_color,
+    );
+    runtime.register_object_native_with_arg_count(
+        system,
+        "assignMessage",
+        NativeArgCount::AtLeast(2),
+        system_assign_message,
+    );
     runtime.register_object_native(system, "doCompact", system_do_compact);
-    runtime.register_object_native(system, "setArgument", system_set_argument);
+    runtime.register_object_native_with_arg_count(
+        system,
+        "setArgument",
+        NativeArgCount::AtLeast(2),
+        system_set_argument,
+    );
     runtime.register_object_native(system, "createUUID", system_create_uuid);
-    runtime.register_object_native(system, "getArgument", system_get_argument);
+    runtime.register_object_native_with_arg_count(
+        system,
+        "getArgument",
+        NativeArgCount::AtLeast(1),
+        system_get_argument,
+    );
     runtime.register_object_native(system, "addFont", system_add_font);
 
     for (name, value) in [
@@ -451,4 +503,90 @@ fn system_add_font(
         .load_font_data(name, bytes)
         .map(|_| Variant::Integer(1))
         .map_err(TjsError::runtime)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{EngineConfig, KrkrEngine};
+    use krkr_tjs2::runtime::Variant;
+
+    /// M175.  Every `tTJSNC_System` method whose reference declares
+    /// `if(numparams < N) return TJS_E_BADPARAMCOUNT;` carries that floor at
+    /// its registration site (`base/SystemIntf.cpp:128-243`,
+    /// `base/win32/SystemImpl.cpp:751-880`), so a short call reports
+    /// `TJS_E_BADPARAMCOUNT` (-1004) before the handler runs.
+    #[test]
+    fn system_method_floors_reject_short_calls() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "system_floors.tjs",
+                r#"
+                function message(body) {
+                    try { body(); } catch (e) { return e.message; }
+                    return "";
+                }
+                return [
+                    message(function() { System.addContinuousHandler(); }),
+                    message(function() { System.removeContinuousHandler(); }),
+                    message(function() { System.toActualColor(); }),
+                    message(function() { System.touchImages(); }),
+                    message(function() { System.assignMessage(1); }),
+                    message(function() { System.inform(); }),
+                    message(function() { System.getKeyState(); }),
+                    message(function() { System.shellExecute(); }),
+                    message(function() { System.getArgument(); }),
+                    message(function() { System.setArgument("name"); }),
+                    message(function() { System.createAppLock(); })
+                ].join("|");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String(["Invalid argument count"; 11].join("|"))
+        );
+        // The identity from Rust: the dispatch check answers
+        // `TJS_E_BADPARAMCOUNT` (-1004) before the handler.
+        let error = engine
+            .execute_expression("system_floors.tjs", "System.assignMessage(1)")
+            .expect_err("a short assignMessage call must fail");
+        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+        assert_eq!(error.tjs_error_code(), Some(-1004));
+        assert_eq!(error.message, "Invalid argument count");
+    }
+
+    /// The other half of the contract: every floor accepts the reference
+    /// arity, so a floor that is too high (the failure mode that breaks
+    /// working game scripts) cannot slip in.
+    #[test]
+    fn system_reference_arity_calls_are_not_rejected() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "system_floors_exact.tjs",
+                r#"
+                var problems = "";
+                function check(body) {
+                    try { body(); } catch (e) {
+                        if (e.message === "Invalid argument count") { problems += "bad; "; }
+                    }
+                }
+                check(function() { System.addContinuousHandler(function() {}); });
+                check(function() { System.removeContinuousHandler(function() {}); });
+                check(function() { System.toActualColor(0x112233); });
+                check(function() { System.touchImages("sprite.png"); });
+                check(function() { System.assignMessage(1, "one"); });
+                check(function() { System.inform("hello"); });
+                check(function() { System.getKeyState(0); });
+                check(function() { System.shellExecute("echo"); });
+                check(function() { System.getArgument("-foo"); });
+                check(function() { System.setArgument("-foo", "bar"); });
+                check(function() { System.createAppLock("test"); });
+                return problems;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String(String::new()));
+    }
 }
