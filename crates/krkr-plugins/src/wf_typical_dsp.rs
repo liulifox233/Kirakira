@@ -57,9 +57,136 @@
 //! `cutoff`, …) for the labels the DLL's strings carry. The parameter *names*
 //! are this port's choice; the labels and the design/response vocabularies are
 //! recovered. `getParamInfo` accepts an index or a name and answers the record
-//! dictionary, `setParams` accepts a dictionary or name/value pairs, and an
-//! unknown name or a malformed argument raises the recovered
-//! `invalid usage of ParamInfo` message.
+//! dictionary; `setParams` accepts the reference's positional form plus a
+//! dictionary or name/value pairs (the port's own extension, checked first,
+//! see below), and an unknown name or a malformed argument raises the
+//! recovered `invalid usage of ParamInfo` message.
+//!
+//! # `setParams`: the reference's positional/void-slot contract
+//!
+//! The reference's `setParams` is **positional**, not name-based. The member
+//! wrapper (VA `0x10001e60`, registered at `0x10001d32` with
+//! `TJSNativeClassRegisterNCM`) resolves the native instance and calls
+//! `0x10002a30`, which writes the arguments into eight doubles at
+//! `instance+0x80` (`fstp QWORD PTR [edi+esi*8+0x80]`, `0x10002b15`). That
+//! array is DSPFilters' `Params` (`double value[8]`, `maxParameters = 8`,
+//! `shared/DSPFilters/include/DspFilters/Params.h`), the parameter vector of
+//! the live filter object:
+//!
+//! * Slot `i` is the `i`-th parameter of the live filter object; the slot
+//!   count is that object's `getNumParams()` (virtual call through
+//!   `[vtable+0xc]`, `0x10002a86`). Slots at or past the count are zeroed and
+//!   their arguments ignored (`fldz` at `0x10002aae`).
+//! * A **missing or `void` argument restores the slot's default**: before the
+//!   loop the function fills a local eight-double buffer from the filter's
+//!   `getParamInfo(i)` through helper `0x100a5f30`, which loads the
+//!   `ParamInfo` field at `+0x20`. In DSPFilters' `ParamInfo` that field is
+//!   `m_defaultNativeValue` (layout `{m_id, m_szLabel, m_szName, m_arg1,
+//!   m_arg2, m_defaultNativeValue, m_toControlValue, m_toNativeValue,
+//!   m_toString}` — the same layout the DLL's own inlined `ParamInfo`
+//!   constructors write: `0x100015f0` sample rate 11025/192000/44100,
+//!   `0x10001640` cutoff and `0x10001690` center 10/22040/2000, `0x100016e0`
+//!   ripple 0.001/12/0.01, `0x10001730` bandwidth Hz 10/22040/1720,
+//!   `0x10001780` stopband 3/60/48, `0x10001870` gain −24/24/−6, `0x100017d0`
+//!   pole real −1/1/0.25, `0x100018c0` pole distance 0/1/0.5, `0x10001910`
+//!   pole angle 0/π/π⁄2, `0x10001a50` resonance −4/4/1, `0x10001aa0` slope
+//!   −2/2/1, `0x10001af0` octave bandwidth −4/4/1 — the parameter table's
+//!   defaults carry these recovered values). So a `void` slot is not "keep the
+//!   previous value": it is "back to the design's default".
+//! * Any other argument is stored through `AsReal()` (`0x10002b15`), whatever
+//!   its type; arguments past the eighth slot are ignored (the loop runs
+//!   `i < 8`, `0x10002aa0`).
+//! * The callback stores the parameter count into the call's result
+//!   (`0x10001ec8`, `tTJSVariant::operator=(tjs_int32)`, resolved from
+//!   `im::tjsVariant.h`), i.e. `setParams` returns the slot count.
+//!
+//! Slot 0 is the **sample rate** for every design: DSPFilters' design classes
+//! hand `params[0]` to their `setup` as the sample rate (`RBJ::TypeI::setParams`
+//! and `Butterworth::Design::TypeI::setParams` in the library headers). That is
+//! why PARQUET's `setParams(void, v0..v4)` leaves slot 0 `void`: it keeps the
+//! default 44100 Hz. The orders of the other slots come from the design classes
+//! of the DSPFilters library the DLL embeds; this port maps them onto its own
+//! parameter names in [`positional_slots`] (slot 1 and up, sample rate aside):
+//!
+//! * `RBJ` — `[cutoff, Q]` for Low/High Pass, `[center, bandwidth]` for
+//!   Band Pass/Stop, `[cutoff, gain, slope]` for Low/High Shelf and
+//!   `[center, gain, bandwidth]` for Band Shelf.
+//! * `Butterworth`/`Bessel`/`Legendre`/`Chebyshev I`/`Chebyshev II`/
+//!   `Elliptic` — the library's `OrderBase` puts the `Order` at slot 1, then
+//!   the response's frequencies (`cutoff`, or `center` + `bandwidthHz`), then
+//!   `gain` for the shelves, then the design's extras (`ripple` for
+//!   Chebyshev I/Elliptic, `stopAttenuation` for Chebyshev II/Elliptic).
+//! * `Custom One-Pole`/`Two-Pole` — the port's placement: frequency, then
+//!   `poleAngle`, `poleDistance`, `poleReal` (the DLL's Custom layouts are not
+//!   recovered).
+//!
+//! **Unit conversions.** The library feeds the value after the frequency into
+//! `sin/(2·x)` for two of the RBJ responses — TypeI's `x` is the `Resonance`
+//! (Q), TypeII's the octave bandwidth — while this port's `quality()` computes
+//! `sin/(2·Q)` from its `bandwidthOctaves` (`Q = 1/(2·sinh(ln2/2·BW))`). Those
+//! two slots are therefore stored as the octave bandwidth that reproduces the
+//! library's `x` exactly (the conversion is the exact inverse of `quality()`,
+//! so the chain matches), and two consequences are visible and deliberate: a
+//! `void` Q or bandwidth slot stores the converted default (`Q = 1` → ≈1.3886
+//! octaves), and `currentValue("bandwidthOctaves")` reports the stored octave
+//! value, not the script's `x`. TypeIII's slot is the library's shelf `Slope`,
+//! stored verbatim: the port's shelf branch reads it with the gain exactly as
+//! the library's `AL = sn/2·sqrt((A + 1/A)(1/S − 1) + 2)` does, so a later gain
+//! change re-derives the shelf the way the reference would. TypeIV's bandwidth
+//! goes through the library's `sinh(ln2/2·BW·w0/sn)` octave form — the port's
+//! band shelf is the library's (`RBJ.cpp` `BandShelf::setup`), wedge included —
+//! and stays a raw octave value. A value whose conversion has no positive
+//! radicand — a non-positive `x`, or a shelf slope whose
+//! `(A + 1/A)(1/S − 1) + 2` is not positive, e.g. slope `2` at `−24 dB` —
+//! answers an error rather than the reference's nonsense filter: the
+//! conversion refuses with the port's `invalid usage of ParamInfo`, and the
+//! designer refuses a slope or bandwidth it cannot use with its own message
+//! (the parameter is rolled back, so the filter keeps a working chain).
+//!
+//! **Which bandwidth field carries the Q.** The library's parameter lists
+//! decide: the RBJ designs declare the octave bandwidth, so `quality()` reads
+//! the octave field for them (with the Hz form as this port's fallback), while
+//! the prototype designs declare only `Bandwidth (Hz)`
+//! (`Butterworth.h`/`ChebyshevI.h`… `TypeIIBase` → `defaultBandwidthHzParam`),
+//! so `quality()` reads the Hz field for them. Before this, the octave field's
+//! default (1.0) shadowed the Hz slot value, and a `setParams(void, order,
+//! center, bandwidthHz)` on a prototype band designed the wrong width.
+//!
+//! The dictionary/name-value pair forms are this port's extension (the
+//! reference would read a dictionary as slot 0's value). They are checked
+//! first — an object first argument is the dictionary form, a string first
+//! argument is the pairs form, everything else (including no arguments and the
+//! game's leading `void`) is the reference's positional form.
+//!
+//! # Construction
+//!
+//! The class is created through `TJSCreateNativeClassForPlugin(name,
+//! factory)` (`0x100012e1`; the factory `0x10003bc0` news the 0xd8-byte
+//! instance), and TJS2's `CreateNew` then calls the member named after the
+//! class with the constructor arguments (`tjsNative.cpp:389`,
+//! `FuncCall(0, ClassName, …, numparams, param, dsp)`). The DLL registers that
+//! member (`0x10001ce7`, callback `0x10001e00`) and forwards the arguments to
+//! the instance's first virtual method (`0x100020f0`), which consumes up to
+//! four of them: slot 0 the response name, slot 1 the design name, slot 2 the
+//! direct-form name and slot 3 an integer stored at `instance+0xd0`. Names are
+//! mapped through the DLL's tables (`0x100cbd38` responses, `0x100cbda0`
+//! designs, `0x100cbdf8` forms, each `{value, name}` with a negative
+//! terminator; a miss leaves the field unchanged). PARQUET builds every filter
+//! as `new WaveSoundBuffer.WaveDSPFilter(args[0], args[1])`
+//! (`voiceeffect.tjs` object 2), so the port's constructor applies the first
+//! two arguments as its `type` and `design`; the form and the trailing integer
+//! are accepted and have no effect here (the port's chain is one direct form,
+//! and the integer's role in the DLL was not recovered). The three response
+//! names the reference's table carries but this port cannot model (`AllPass`,
+//! `BandPass1`, `BandPass2`) are named in the port's `does not model` error —
+//! the game's factory list includes an `AllPass_RBJ` wrapper — and a `new`
+//! that names an unbuildable design fails before the filter is registered.
+//!
+//! A no-argument `new` is the one place the port's defaults are its own: the
+//! reference's instance starts at response 8 (`0x10001fb0`'s `+0xc4`, its
+//! table's last response), design 0 (`RBJ`), form `DirectFormII` and
+//! `instance+0xd0 = 0x400`, while this port starts at `Low Pass`/`Butterworth`.
+//! The game always passes both names, so the divergence is latent.
 //!
 //! # What this module implements
 //!
@@ -68,8 +195,9 @@
 //! built from the selected design and response:
 //!
 //! * `RBJ` — the cookbook coefficients for every response the class names;
-//!   `Band Shelf` maps to the cookbook's **peaking** section (RBJ has no
-//!   band-shelf formula), which the arm comment in `rbj_sections` records.
+//!   `Band Shelf` uses the library's own band-shelf form (`AL =
+//!   sn·sinh(ln2/2·BW·w0/sn)`, `RBJ.cpp` `BandShelf::setup`), and the shelves
+//!   their `sqrt((A + 1/A)(1/S − 1) + 2)` form.
 //! * `Butterworth`, `Chebyshev I`, `Chebyshev II`, `Bessel`, `Legendre` —
 //!   an analog prototype (computed here: closed forms for Butterworth and the
 //!   two Chebyshev families, the roots of the reverse Bessel polynomial and of
@@ -82,11 +210,10 @@
 //! **Not implemented** (documented, not silently substituted): the
 //! `Elliptic` design and the shelf responses for the non-RBJ designs need the
 //! elliptic function machinery / polynomial shelf algebra of the reference
-//! matrix; the DLL's `AllPass`, `BandPass1` and `BandPass2` response
+//! matrix, and the DLL's `AllPass`, `BandPass1` and `BandPass2` response
 //! identifiers are recognised but unmodelled (this port names them in its
-//! refusal instead of treating them as typos); and the RBJ `Band Shelf` is the
-//! peaking approximation above. All of them answer a clear error rather than a
-//! wrong filter. The DLL's own Bessel/Legendre pole tables were not extracted
+//! refusal instead of treating them as typos). All of them answer a clear error
+//! rather than a wrong filter. The DLL's own Bessel/Legendre pole tables were not extracted
 //! (that is a second RE pass on the 1.1 MB image), so those two prototypes are
 //! computed numerically here.
 //!
@@ -118,7 +245,7 @@ pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "WaveDSPFilter (tTJSNC_WaveDSPFilter / tTJSNI_WaveDSPFilter) on WaveSoundBuffer",
     notes: "Real IIR designer and processor behind the recovered member surface: RBJ cookbook \
-            (with Band Shelf mapped to the peaking section), Butterworth / Chebyshev I / \
+            (the band shelf in the library's own sinh-octave form), Butterworth / Chebyshev I / \
             Chebyshev II / Bessel / Legendre analog prototypes through the bilinear transform, \
             and custom pole placement; the parameter table carries the recovered labels and both \
             the DLL's own identifiers and the readable spellings for design/response values. The \
@@ -153,6 +280,17 @@ const PLUGIN_NAME: &str = "wfTypicalDSP.dll";
 /// Rust engine resolves the filter by object identity instead of publishing a
 /// raw `iTVPBasicWaveFilter*`).
 const INTERFACE_SENTINEL: i64 = 0x5746_0101;
+
+/// The sample rate behind slot 0 of the positional `setParams` form. The
+/// reference's default is `ParamInfo::defaultSampleRateParam()`'s
+/// `m_defaultNativeValue` (the DLL loads `44100.0` for the `Sample Rate`
+/// descriptor, VA `0x100015f0`'s `ds:0x100d7d20`); a `void` slot 0 restores it.
+const SAMPLE_RATE_DEFAULT: f64 = 44100.0;
+
+/// The reference's slot vector has eight entries (`DSPFilters`'
+/// `maxParameters`); its `setParams` loop runs `i < 8` and ignores arguments
+/// past the eighth (`0x10002aa0`).
+const MAX_POSITIONAL_SLOTS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // The recovered vocabularies
@@ -447,11 +585,19 @@ impl FilterSpec {
         }
     }
 
-    /// The resonant `Q` the RBJ designs and the band transforms use. A
-    /// bandwidth in octaves wins over the Hz form when both are set (octaves
-    /// are the musical unit and the DLL ships labels for both).
+    /// The resonant `Q` the RBJ designs and the band transforms use. Which
+    /// field carries it follows the library's parameter lists: the RBJ designs
+    /// declare an octave bandwidth (`RBJ.h` `TypeIIBase` → `Bandwidth
+    /// (Octaves)`), so their octave field wins when it is set, with the Hz form
+    /// as the port's fallback; the prototype designs declare only `Bandwidth
+    /// (Hz)` (`Butterworth.h` `TypeIIBase` → `defaultBandwidthHzParam`), so
+    /// they always read the Hz field — otherwise the octave field's default
+    /// (1.0) would shadow the reference's Hz slot value.
     fn quality(&self) -> f64 {
         let frequency = f64::from(self.design_frequency().max(1.0));
+        if self.design != DesignKind::Rbj {
+            return (frequency / f64::from(self.bandwidth_hz.max(1.0))).max(0.001);
+        }
         if self.bandwidth_octaves > 0.0 {
             let bandwidth = f64::from(self.bandwidth_octaves);
             let sinh = ((std::f64::consts::LN_2 / 2.0) * bandwidth).sinh();
@@ -459,8 +605,7 @@ impl FilterSpec {
                 return 1.0 / (2.0 * sinh);
             }
         }
-        let hz = f64::from(self.bandwidth_hz.max(1.0));
-        (frequency / hz).max(0.001)
+        (frequency / f64::from(self.bandwidth_hz.max(1.0))).max(0.001)
     }
 
     /// The band edge in radians, clamped below Nyquist so the bilinear
@@ -964,7 +1109,6 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
     let q = spec.quality().max(0.001);
     let alpha = sin / (2.0 * q);
     let a = 10.0_f64.powf(f64::from(spec.gain_db) / 40.0);
-    let sqrt_a = a.sqrt();
     let section = |b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64| Biquad {
         b0: (b0 / a0) as f32,
         b1: (b1 / a0) as f32,
@@ -996,7 +1140,7 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
             section(1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha)
         }
         ResponseType::LowShelf => {
-            let beta = 2.0 * sqrt_a * alpha;
+            let beta = shelf_sq(spec, a, sin)?;
             section(
                 a * ((a + 1.0) - (a - 1.0) * cos + beta),
                 2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
@@ -1007,7 +1151,7 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
             )
         }
         ResponseType::HighShelf => {
-            let beta = 2.0 * sqrt_a * alpha;
+            let beta = shelf_sq(spec, a, sin)?;
             section(
                 a * ((a + 1.0) + (a - 1.0) * cos + beta),
                 -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
@@ -1017,18 +1161,47 @@ fn rbj_sections(spec: &FilterSpec) -> std::result::Result<Vec<Biquad>, DesignErr
                 (a + 1.0) - (a - 1.0) * cos - beta,
             )
         }
-        // RBJ's cookbook has no band-shelf section; the peaking response is
-        // the closest member of the family, and the port documents the mapping.
-        ResponseType::BandShelf => section(
-            1.0 + alpha * a,
-            -2.0 * cos,
-            1.0 - alpha * a,
-            1.0 + alpha / a,
-            -2.0 * cos,
-            1.0 - alpha / a,
-        ),
+        // The library's band shelf (`RBJ.cpp` `BandShelf::setup`), not the
+        // cookbook's peaking section: `AL = sn·sinh(ln2/2·BW·w0/sn)` — the
+        // `w0/sn` wedge is what makes the octave bandwidth mean an octave away
+        // from DC — with `b0 = 1 + AL·A`, `b2 = 1 − AL·A`, `a0 = 1 + AL/A`,
+        // `a2 = 1 − AL/A`.
+        ResponseType::BandShelf => {
+            let bandwidth = f64::from(spec.bandwidth_octaves);
+            let al = sin * ((std::f64::consts::LN_2 / 2.0) * bandwidth * omega / sin).sinh();
+            if !al.is_finite() || al <= 0.0 {
+                return Err(DesignError::BadParameter(format!(
+                    "Band Shelf bandwidth {bandwidth} has no finite form at {} Hz",
+                    spec.center
+                )));
+            }
+            section(
+                1.0 + al * a,
+                -2.0 * cos,
+                1.0 - al * a,
+                1.0 + al / a,
+                -2.0 * cos,
+                1.0 - al / a,
+            )
+        }
     };
     Ok(vec![coefficients])
+}
+
+/// The shelf's `sq` term: the library's `2·sqrt(A)·AL` with `AL =
+/// sn/2·sqrt((A + 1/A)(1/S − 1) + 2)` (`RBJ.cpp` `LowShelf::setup` /
+/// `HighShelf::setup`), where `S` is the stored `Slope` value. `S` doubles as
+/// the port's octave field, and must leave the radicand positive.
+fn shelf_sq(spec: &FilterSpec, a: f64, sin: f64) -> std::result::Result<f64, DesignError> {
+    let slope = f64::from(spec.bandwidth_octaves);
+    let radicand = (a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0;
+    if !radicand.is_finite() || radicand <= 0.0 {
+        return Err(DesignError::BadParameter(format!(
+            "the RBJ shelf slope {slope} has no finite form at {} dB",
+            spec.gain_db
+        )));
+    }
+    Ok(a.sqrt() * sin * radicand.sqrt())
 }
 
 fn custom_one_pole(spec: &FilterSpec) -> Biquad {
@@ -1312,9 +1485,11 @@ pub struct ParamInfo {
 }
 
 /// The parameter table. The labels and the design/response vocabularies are
-/// recovered from the DLL's strings; the parameter names are this port's
-/// (documented in the module docs), and the five labels marked `(port)` were
-/// not in the recovered string list — they name parameters the designs need.
+/// recovered from the DLL's strings; the numeric defaults are the DLL's own
+/// `ParamInfo` defaults (its inlined constructors — see the module docs for the
+/// builder addresses), and the parameter names are this port's (documented in
+/// the module docs). The five labels marked `(port)` were not in the recovered
+/// string list — they name parameters the designs need.
 pub const PARAMETER_TABLE: [ParamInfo; 13] = [
     ParamInfo {
         name: "type",
@@ -1329,17 +1504,17 @@ pub const PARAMETER_TABLE: [ParamInfo; 13] = [
     ParamInfo {
         name: "cutoff",
         label: "Cutoff Frequency",
-        default: ParamValue::Real(1000.0),
+        default: ParamValue::Real(2000.0),
     },
     ParamInfo {
         name: "center",
         label: "Center Frequency",
-        default: ParamValue::Real(1000.0),
+        default: ParamValue::Real(2000.0),
     },
     ParamInfo {
         name: "bandwidthHz",
         label: "Bandwidth (Hz)",
-        default: ParamValue::Real(200.0),
+        default: ParamValue::Real(1720.0),
     },
     ParamInfo {
         name: "bandwidthOctaves",
@@ -1354,22 +1529,22 @@ pub const PARAMETER_TABLE: [ParamInfo; 13] = [
     ParamInfo {
         name: "gain",
         label: "Gain (dB) (port)",
-        default: ParamValue::Real(0.0),
+        default: ParamValue::Real(-6.0),
     },
     ParamInfo {
         name: "ripple",
         label: "Passband Ripple (dB) (port)",
-        default: ParamValue::Real(1.0),
+        default: ParamValue::Real(0.01),
     },
     ParamInfo {
         name: "stopAttenuation",
         label: "Stopband Attenuation (dB) (port)",
-        default: ParamValue::Real(40.0),
+        default: ParamValue::Real(48.0),
     },
     ParamInfo {
         name: "poleAngle",
         label: "Pole Angle",
-        default: ParamValue::Real(0.0),
+        default: ParamValue::Real(std::f64::consts::FRAC_PI_2),
     },
     ParamInfo {
         name: "poleDistance",
@@ -1379,7 +1554,7 @@ pub const PARAMETER_TABLE: [ParamInfo; 13] = [
     ParamInfo {
         name: "poleReal",
         label: "Pole Real",
-        default: ParamValue::Real(-0.5),
+        default: ParamValue::Real(0.25),
     },
 ];
 
@@ -1391,6 +1566,125 @@ fn parameter_at(index: i64) -> Option<&'static ParamInfo> {
     usize::try_from(index)
         .ok()
         .and_then(|index| PARAMETER_TABLE.get(index))
+}
+
+/// A slot's default in the port's units: the table value, which carries the
+/// reference's recovered default.
+fn slot_default(name: &str) -> f64 {
+    parameter(name)
+        .and_then(|entry| entry.default.as_real())
+        .unwrap_or(0.0)
+}
+
+/// The default of the reference's `Resonance` (Q, builder `0x10001a50`) and of
+/// its octave bandwidth (builder `0x10001af0`): both are `1` (the DLL loads
+/// `fld1` for each).
+const QUALITY_DEFAULT: f64 = 1.0;
+
+/// The default of the reference's shelf `Slope` (builder `0x10001aa0`, `fld1`).
+const SLOPE_DEFAULT: f64 = 1.0;
+
+/// The octave bandwidth this port's `quality()` turns back into `q`
+/// (`q = 1/(2·sinh(ln2/2·BW))`, inverted). Exact round trip, so a filter chain
+/// built from the result reproduces `q`.
+fn octaves_for_quality(q: f64) -> std::result::Result<f64, String> {
+    if !(q.is_finite() && q > 0.0) {
+        return Err(format!(
+            "invalid usage of ParamInfo: the reference's `{q}` has no positive bandwidth equivalent"
+        ));
+    }
+    Ok((2.0 / std::f64::consts::LN_2) * (1.0 / (2.0 * q)).asinh())
+}
+
+/// What one slot of the reference's positional `setParams` vector addresses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Slot {
+    /// Slot 0 of every design: the filter's sample rate (`Params[0]`, which the
+    /// DSPFilters design classes hand to their `setup` as the rate).
+    SampleRate,
+    /// One of this port's parameters, whose units are the reference's already;
+    /// its default is the table's recovered value.
+    Parameter(&'static str),
+    /// The reference's `Resonance` (Q) — RBJ TypeI. Stored as the octave
+    /// bandwidth that reproduces `Q`.
+    Resonance,
+    /// The reference's octave bandwidth for the band responses — RBJ TypeII,
+    /// which the library feeds into the same `sn/(2·x)` position as the Q.
+    /// Stored the same way, so the chain matches the library's `AL`.
+    BandwidthAsQuality,
+    /// The reference's shelf slope — RBJ TypeIII, whose `AL` is the library's
+    /// `sqrt((A + 1/A)(1/S − 1) + 2)` form. Stored verbatim; the port's shelf
+    /// designer reads it together with the gain.
+    ShelfSlope,
+}
+
+/// The port's names for the reference's slot vector, slot 0 — the sample rate —
+/// first, then the current response/design's parameters in the order the
+/// DSPFilters design classes declare them (see the module docs for the DLL
+/// addresses and the library headers behind each order).
+pub fn positional_slots(response: ResponseType, design: DesignKind) -> Vec<Slot> {
+    let mut slots = vec![Slot::SampleRate];
+    let band = response.is_band();
+    let mut push = |slot: Slot| slots.push(slot);
+    match design {
+        // The RBJ responses carry no order. The library feeds the value after
+        // the frequency (and the shelf gain) into `sin/(2·x)`: the Q for
+        // TypeI, the octave bandwidth for TypeII and the shelf slope for
+        // TypeIII. TypeIV's bandwidth goes through the library's octave
+        // `sinh` form and stays a raw octave value.
+        DesignKind::Rbj => {
+            if band {
+                push(Slot::Parameter("center"));
+            } else {
+                push(Slot::Parameter("cutoff"));
+            }
+            if response.is_shelf() {
+                push(Slot::Parameter("gain"));
+            }
+            match response {
+                ResponseType::BandShelf => push(Slot::Parameter("bandwidthOctaves")),
+                ResponseType::LowShelf | ResponseType::HighShelf => push(Slot::ShelfSlope),
+                ResponseType::BandPass | ResponseType::BandStop => push(Slot::BandwidthAsQuality),
+                ResponseType::LowPass | ResponseType::HighPass => push(Slot::Resonance),
+            }
+        }
+        // The DLL's Custom layouts were not recovered; this is the port's
+        // placement.
+        DesignKind::CustomOnePole | DesignKind::CustomTwoPole => {
+            if band {
+                push(Slot::Parameter("center"));
+            } else {
+                push(Slot::Parameter("cutoff"));
+            }
+            push(Slot::Parameter("poleAngle"));
+            push(Slot::Parameter("poleDistance"));
+            push(Slot::Parameter("poleReal"));
+        }
+        // The prototype designs share the library's `OrderBase`: `Order` first,
+        // then the response's frequencies, then `gain` for the shelves, then
+        // the design's extras.
+        _ => {
+            push(Slot::Parameter("order"));
+            if band {
+                push(Slot::Parameter("center"));
+                push(Slot::Parameter("bandwidthHz"));
+            } else {
+                push(Slot::Parameter("cutoff"));
+            }
+            if response.is_shelf() {
+                push(Slot::Parameter("gain"));
+            }
+            match design {
+                DesignKind::ChebyshevI | DesignKind::Elliptic => push(Slot::Parameter("ripple")),
+                DesignKind::ChebyshevII => push(Slot::Parameter("stopAttenuation")),
+                _ => {}
+            }
+            if matches!(design, DesignKind::Elliptic) {
+                push(Slot::Parameter("stopAttenuation"));
+            }
+        }
+    }
+    slots
 }
 
 /// The live parameter set of one filter: the table defaults with the script's
@@ -1430,10 +1724,20 @@ impl WaveDspState {
         self.value(name).and_then(ParamValue::as_text).unwrap_or("")
     }
 
+    /// The response the live chain was designed for.
+    fn response(&self) -> ResponseType {
+        ResponseType::from_name(self.text("type")).unwrap_or(ResponseType::LowPass)
+    }
+
+    /// The design the live chain was designed for.
+    fn design(&self) -> DesignKind {
+        DesignKind::from_name(self.text("design")).unwrap_or(DesignKind::Butterworth)
+    }
+
     fn spec(&self) -> FilterSpec {
         FilterSpec {
-            response: ResponseType::from_name(self.text("type")).unwrap_or(ResponseType::LowPass),
-            design: DesignKind::from_name(self.text("design")).unwrap_or(DesignKind::Butterworth),
+            response: self.response(),
+            design: self.design(),
             sample_rate: self.sample_rate,
             cutoff: self.real("cutoff") as f32,
             center: self.real("center") as f32,
@@ -1446,6 +1750,42 @@ impl WaveDspState {
             pole_angle: self.real("poleAngle") as f32,
             pole_distance: self.real("poleDistance") as f32,
             pole_real: self.real("poleReal") as f32,
+        }
+    }
+
+    /// Rebuilds the chain from the current values, used when several
+    /// parameters change at once — the constructor's response/design pair
+    /// cannot be applied one at a time, because the intermediate combination
+    /// may be one the designer refuses.
+    fn redesign(&mut self) -> std::result::Result<(), String> {
+        match DesignedFilter::design(&self.spec()) {
+            Ok(chain) => {
+                self.chain = chain;
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Slot 0 of the positional form: the rate the chain is designed against.
+    /// A refused rate leaves the previous one (and the working chain) alone.
+    fn set_sample_rate(&mut self, rate: f64) -> std::result::Result<(), String> {
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(format!(
+                "invalid usage of ParamInfo: `{rate}` is not a sample rate"
+            ));
+        }
+        let previous = self.sample_rate;
+        self.sample_rate = rate as f32;
+        match DesignedFilter::design(&self.spec()) {
+            Ok(chain) => {
+                self.chain = chain;
+                Ok(())
+            }
+            Err(error) => {
+                self.sample_rate = previous;
+                Err(error.to_string())
+            }
         }
     }
 
@@ -1509,7 +1849,7 @@ thread_local! {
 fn install_wf_typical_dsp(runtime: &mut Runtime<KrkrHost>) {
     FILTERS.with(|filters| filters.borrow_mut().clear());
     let class = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
+        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, args: Vec<Variant>| {
             let instance = runtime.alloc_ordinary_object();
             runtime.add_object_class_info(instance, "WaveDSPFilter");
             runtime.set_object_member(
@@ -1520,8 +1860,12 @@ fn install_wf_typical_dsp(runtime: &mut Runtime<KrkrHost>) {
             if let Some(class) = filter_class(runtime) {
                 runtime.set_object_super_class(instance, class);
             }
-            match WaveDspState::new(44100.0) {
-                Ok(state) => {
+            match WaveDspState::new(SAMPLE_RATE_DEFAULT as f32) {
+                Ok(mut state) => {
+                    // The reference reads the constructor arguments before the
+                    // instance is usable; a refused `new` must not leave a live
+                    // filter behind.
+                    apply_constructor_arguments(&mut state, &args)?;
                     FILTERS.with(|filters| filters.borrow_mut().insert(instance, state));
                 }
                 Err(error) => {
@@ -1536,6 +1880,59 @@ fn install_wf_typical_dsp(runtime: &mut Runtime<KrkrHost>) {
     runtime.add_object_class_info(class, "WaveDSPFilter");
     install_members(runtime, class);
     publish_filter_class(runtime, class);
+}
+
+/// The reference's constructor arguments: the class-name NCM (`0x10001e00`)
+/// forwards them to the instance's first virtual method (`0x100020f0`), which
+/// reads up to four — response name, design name, direct-form name and an
+/// integer it stores at `instance+0xd0`. Names go through the DLL's lookup
+/// tables (`0x100cbd38` responses, `0x100cbda0` designs, `0x100cbdf8` forms),
+/// whose miss path leaves the field unchanged. This port applies the first two
+/// as its `type` and `design`; the form and the integer are accepted without
+/// effect — the port's chain is a single direct form, and the integer's role in
+/// the DLL was not recovered. PARQUET builds every filter as
+/// `new WaveSoundBuffer.WaveDSPFilter(args[0], args[1])`, so the two names are
+/// what a real game passes.
+///
+/// The reference's table carries three response names this port cannot model
+/// (`AllPass`, `BandPass1`, `BandPass2`); naming one is the port's
+/// `does not model` error, like the dictionary/pairs path, not a silent keep.
+fn apply_constructor_arguments(state: &mut WaveDspState, args: &[Variant]) -> Result<()> {
+    let mut named = false;
+    for (index, name) in [(0usize, "type"), (1, "design")] {
+        let Some(argument) = args.get(index) else {
+            continue;
+        };
+        if matches!(argument, Variant::Void) {
+            continue;
+        }
+        let text = argument.to_tjs_string()?;
+        if name == "type" && UNMODELLED_RESPONSE_IDENTIFIERS.contains(&text.as_str()) {
+            return Err(TjsError::runtime(format!(
+                "invalid usage of ParamInfo: `{text}` is a WaveDSPFilter identifier this port does not model"
+            )));
+        }
+        let canonical = if name == "type" {
+            canonical_response(&text)
+        } else {
+            canonical_design(&text)
+        };
+        // A name the table does not carry leaves the field unchanged; a name
+        // that resolves is applied, and a design this port cannot build
+        // reports itself instead of silently keeping the previous one.
+        let Some(canonical) = canonical else {
+            continue;
+        };
+        state.values.insert(name, ParamValue::Text(canonical));
+        named = true;
+    }
+    // Both names land before the chain is rebuilt: an intermediate pair (a
+    // shelf response with the previous design, say) may be one the designer
+    // refuses even though the final pair is fine.
+    if named {
+        state.redesign().map_err(TjsError::runtime)?;
+    }
+    Ok(())
 }
 
 /// Publishes the class where the reference's binder puts it: as a member of the
@@ -1721,9 +2118,11 @@ fn filter_default_value(
     Ok(param_value_variant(&entry.default))
 }
 
-/// `setParams(...)`: either a dictionary of name/value pairs or a flat list of
-/// them. A rejected value leaves the parameter (and the chain) untouched and
-/// reports the recovered error message.
+/// `setParams(...)`: the reference's positional form, or this port's dictionary
+/// / name-value pair extension. A rejected value leaves the parameter (and the
+/// chain) untouched and reports the recovered error message. The call answers
+/// the slot count either way, which is the reference's return value: its
+/// callback stores `getNumParams()` into the result variant (`0x10001ec8`).
 fn filter_set_params(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1732,31 +2131,110 @@ fn filter_set_params(
     let this = plugin_this(runtime, this_obj).ok_or_else(|| {
         TjsError::runtime("invalid usage of ParamInfo: setParams requires this".to_string())
     })?;
-    let mut assignments: Vec<(String, ParamValue)> = Vec::new();
     if let Some(Variant::Object(dictionary)) = args.first() {
+        let mut assignments: Vec<(String, ParamValue)> = Vec::new();
         for (name, value) in runtime.object_members(*dictionary) {
             assignments.push((name, param_value_from_variant(&value)?));
         }
-    } else {
+        apply_assignments(this, assignments)?;
+        return Ok(Variant::Integer(slot_count(this)?));
+    }
+    if matches!(args.first(), Some(Variant::String(_))) {
         if !args.len().is_multiple_of(2) {
             return Err(TjsError::runtime(
                 "invalid usage of ParamInfo: setParams needs name/value pairs or a dictionary"
                     .to_string(),
             ));
         }
+        let mut assignments: Vec<(String, ParamValue)> = Vec::new();
         let mut index = 0;
         while index + 1 < args.len() {
             let name = args[index].to_tjs_string()?;
             assignments.push((name, param_value_from_variant(&args[index + 1])?));
             index += 2;
         }
+        apply_assignments(this, assignments)?;
+        return Ok(Variant::Integer(slot_count(this)?));
     }
+    set_positional_params(this, &args)
+}
+
+fn apply_assignments(this: ObjectHandle, assignments: Vec<(String, ParamValue)>) -> Result<()> {
     for (name, value) in assignments {
         if let Err(message) = with_state(this, |state| state.set(&name, value)).unwrap_or(Ok(())) {
             return Err(TjsError::runtime(message));
         }
     }
-    Ok(Variant::Void)
+    Ok(())
+}
+
+/// The count the reference's `setParams` answers with: the live filter object's
+/// parameter count, which is this port's slot count for the current
+/// response/design.
+fn slot_count(this: ObjectHandle) -> Result<i64> {
+    let count = with_state(this, |state| {
+        positional_slots(state.response(), state.design()).len()
+    })
+    .ok_or_else(|| {
+        TjsError::runtime("ClassID mismatched: WaveDSPFilter state is gone".to_string())
+    })?;
+    Ok(count as i64)
+}
+
+/// The reference's positional form
+/// (`0x10002a30` — see the module docs): slot 0 is the sample rate, then the
+/// current response/design's parameters. A `void` or missing argument restores
+/// the slot's default, arguments past the eighth slot are ignored, and the
+/// answer is the slot count.
+fn set_positional_params(this: ObjectHandle, args: &[Variant]) -> Result<Variant> {
+    let (response, design) = with_state(this, |state| (state.response(), state.design()))
+        .ok_or_else(|| {
+            TjsError::runtime("ClassID mismatched: WaveDSPFilter state is gone".to_string())
+        })?;
+    let slots = positional_slots(response, design);
+    for (index, slot) in slots.iter().enumerate().take(MAX_POSITIONAL_SLOTS) {
+        let supplied = match args.get(index) {
+            None | Some(Variant::Void) => None,
+            Some(argument) => Some(argument.to_real()?),
+        };
+        let result = match slot {
+            Slot::SampleRate => {
+                let rate = supplied.unwrap_or(SAMPLE_RATE_DEFAULT);
+                with_state(this, |state| state.set_sample_rate(rate)).unwrap_or(Ok(()))
+            }
+            // The reference's units here are this port's already; its default
+            // is the table's recovered value.
+            Slot::Parameter(name) => {
+                let value = supplied.unwrap_or_else(|| slot_default(name));
+                with_state(this, |state| state.set(name, ParamValue::Real(value))).unwrap_or(Ok(()))
+            }
+            // The library feeds the value into `sn/(2·x)`, where this port's
+            // `quality()` goes: store the octave bandwidth that reproduces it.
+            Slot::Resonance | Slot::BandwidthAsQuality => {
+                match octaves_for_quality(supplied.unwrap_or(QUALITY_DEFAULT)) {
+                    Ok(octaves) => with_state(this, |state| {
+                        state.set("bandwidthOctaves", ParamValue::Real(octaves))
+                    })
+                    .unwrap_or(Ok(())),
+                    Err(message) => Err(message),
+                }
+            }
+            // The shelf slope is stored verbatim: the port's shelf branch reads
+            // it with the gain the way the library's `AL` does, so a later gain
+            // change re-derives the shelf as the reference would.
+            Slot::ShelfSlope => {
+                let slope = supplied.unwrap_or(SLOPE_DEFAULT);
+                with_state(this, |state| {
+                    state.set("bandwidthOctaves", ParamValue::Real(slope))
+                })
+                .unwrap_or(Ok(()))
+            }
+        };
+        if let Err(message) = result {
+            return Err(TjsError::runtime(message));
+        }
+    }
+    Ok(Variant::Integer(slots.len() as i64))
 }
 
 fn param_value_from_variant(value: &Variant) -> Result<ParamValue> {
@@ -1958,7 +2436,7 @@ mod tests {
         );
         assert_eq!(
             value,
-            "type/Filter Type (port)/Low Pass/Low Pass|cutoff:Cutoff Frequency/1000|order:2/2"
+            "type/Filter Type (port)/Low Pass/Low Pass|cutoff:Cutoff Frequency/2000|order:2/2"
         );
         assert_eq!(
             string(
@@ -2006,6 +2484,271 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    /// The reference's positional contract, and PARQUET's own call shape:
+    /// `new WaveSoundBuffer.WaveDSPFilter(type, design)` followed by
+    /// `setParams(void, v0..v4)`. Slot 0 is the sample rate (why the game's
+    /// first argument is `void`), a `void` or missing argument restores the
+    /// slot's default, arguments past the eighth slot are ignored, and the
+    /// answer is the slot count.
+    #[test]
+    fn the_positional_form_takes_the_reference_slot_contract() {
+        let mut engine = engine();
+        // `DSP("LowPass", "RBJ")` then `setParams(void, cutoff, q)`.
+        assert_eq!(
+            string(
+                &mut engine,
+                "(function() {\n\
+                     var f = new WaveSoundBuffer.WaveDSPFilter(\"LowPass\", \"RBJ\");\n\
+                     var count = f.setParams(void, 2000, 0.7);\n\
+                     return count + \"/\" + f.name + \"/\" + f.label;\n\
+                 })()",
+            ),
+            "3/Low Pass/RBJ"
+        );
+        // The Q slot is stored as the octave bandwidth that reproduces 0.7, so
+        // the chain's Q comes back as the script's value.
+        let (cutoff, quality) = positional_probe(&mut engine, "f.setParams(void, 2000, 0.7);");
+        assert_eq!(cutoff, 2000.0);
+        assert!((quality - 0.7).abs() < 1e-6, "Q came back as {quality}");
+
+        // A `void` slot restores the reference's default, not the previous
+        // value, and missing trailing arguments behave the same way: the cutoff
+        // returns to the recovered 2000 Hz and the Q to the library's
+        // `Resonance` default of 1.
+        let (cutoff, quality) = positional_probe(
+            &mut engine,
+            "f.setParams(void, 2000, 0.7); f.setParams(void, void, void);",
+        );
+        assert_eq!(cutoff, 2000.0);
+        assert!(
+            (quality - 1.0).abs() < 1e-6,
+            "the void Q slot gave {quality}"
+        );
+
+        // Arguments past the slot count (and past the eighth slot) are ignored;
+        // the game's own six-argument call — `setParams(void, v0..v4)` with the
+        // trailing ones void registers — is the same case.
+        for call in [
+            "f.setParams(void, 2000, 0.7, void, void, void)",
+            "f.setParams(void, 2000, 0.7, 5, 6, 7, 8, 9, 10, 11)",
+        ] {
+            assert_eq!(
+                string(
+                    &mut engine,
+                    &format!(
+                        "(function() {{\n\
+                             var f = new WaveSoundBuffer.WaveDSPFilter(\"LowPass\", \"RBJ\");\n\
+                             var count = {call};\n\
+                             return count + \"/\" + f.currentValue(\"cutoff\");\n\
+                         }})()"
+                    ),
+                ),
+                "3/2000",
+                "{call}"
+            );
+            let (_, quality) = positional_probe(&mut engine, &format!("{call};"));
+            assert!((quality - 0.7).abs() < 1e-6, "{call} gave Q {quality}");
+        }
+    }
+
+    /// Runs `statements` against a fresh script-built `Low Pass`/`RBJ` filter
+    /// and answers its cutoff and the Q its chain was designed with.
+    fn positional_probe(engine: &mut KrkrEngine, statements: &str) -> (f64, f64) {
+        let handle = match try_run(
+            engine,
+            &format!(
+                "(function() {{\n\
+                     var f = new WaveSoundBuffer.WaveDSPFilter(\"LowPass\", \"RBJ\");\n\
+                     {statements}\n\
+                     return f;\n\
+                 }})()"
+            ),
+        )
+        .expect("the positional call must be accepted")
+        {
+            Variant::Object(handle) => handle,
+            Variant::Closure(closure) => closure.object,
+            other => panic!("the script returned {other:?}"),
+        };
+        with_state(handle, |state| {
+            (state.real("cutoff"), state.spec().quality())
+        })
+        .expect("the filter is live")
+    }
+
+    /// Slot 0 is the sample rate the chain is designed against, and slot 1 of a
+    /// Butterworth low pass is the order (`Butterworth.h`: `OrderBase` puts
+    /// `Order` at `getParamInfo_1`, `TypeI` the cutoff at `getParamInfo_2`).
+    #[test]
+    fn the_positional_sample_rate_and_order_slots_land() {
+        let mut engine = engine();
+        let handle = match try_run(
+            &mut engine,
+            "(function() {\n\
+                 var f = new WaveSoundBuffer.WaveDSPFilter(\"LowPass\", \"Butterworth\");\n\
+                 f.setParams(22050, 4, 800);\n\
+                 return f;\n\
+             })()",
+        )
+        .expect("the positional call must be accepted")
+        {
+            Variant::Object(handle) => handle,
+            Variant::Closure(closure) => closure.object,
+            other => panic!("the script returned {other:?}"),
+        };
+        let (rate, order, cutoff) = with_state(handle, |state| {
+            (state.sample_rate, state.real("order"), state.real("cutoff"))
+        })
+        .expect("the filter is live");
+        assert_eq!(rate, 22050.0);
+        assert_eq!(order, 4.0);
+        assert_eq!(cutoff, 800.0);
+    }
+
+    /// The port's mapping of the slot vector: slot 0 is the sample rate, then
+    /// the parameters in the order the DSPFilters design classes declare them,
+    /// with the three `sin/(2·x)` slots marked for conversion.
+    #[test]
+    fn the_positional_slot_order_follows_the_design_classes() {
+        // RBJ's `TypeI`: sample rate, cutoff, Q.
+        assert_eq!(
+            positional_slots(ResponseType::LowPass, DesignKind::Rbj),
+            vec![Slot::SampleRate, Slot::Parameter("cutoff"), Slot::Resonance,]
+        );
+        // RBJ's `TypeII`: the octave bandwidth goes through the same
+        // `sin/(2·x)` position as the Q.
+        assert_eq!(
+            positional_slots(ResponseType::BandPass, DesignKind::Rbj),
+            vec![
+                Slot::SampleRate,
+                Slot::Parameter("center"),
+                Slot::BandwidthAsQuality,
+            ]
+        );
+        // RBJ's `TypeIII` (Low/High Shelf): cutoff, gain, slope.
+        assert_eq!(
+            positional_slots(ResponseType::HighShelf, DesignKind::Rbj),
+            vec![
+                Slot::SampleRate,
+                Slot::Parameter("cutoff"),
+                Slot::Parameter("gain"),
+                Slot::ShelfSlope,
+            ]
+        );
+        // RBJ's `TypeIV` (Band Shelf): center, gain, bandwidth — the library
+        // uses this one in its `sinh` octave form, so it stays raw.
+        assert_eq!(
+            positional_slots(ResponseType::BandShelf, DesignKind::Rbj),
+            vec![
+                Slot::SampleRate,
+                Slot::Parameter("center"),
+                Slot::Parameter("gain"),
+                Slot::Parameter("bandwidthOctaves"),
+            ]
+        );
+        // The prototypes share `OrderBase` (Order first) and take the library's
+        // Hz bandwidth for the band responses.
+        assert_eq!(
+            positional_slots(ResponseType::BandPass, DesignKind::Butterworth),
+            vec![
+                Slot::SampleRate,
+                Slot::Parameter("order"),
+                Slot::Parameter("center"),
+                Slot::Parameter("bandwidthHz"),
+            ]
+        );
+        assert_eq!(
+            positional_slots(ResponseType::LowShelf, DesignKind::Butterworth),
+            vec![
+                Slot::SampleRate,
+                Slot::Parameter("order"),
+                Slot::Parameter("cutoff"),
+                Slot::Parameter("gain"),
+            ]
+        );
+        // Chebyshev I's design carries its ripple as the trailing parameter —
+        // after `gain` on the shelves, as the library's TypeIII/TypeIV declare
+        // it.
+        assert_eq!(
+            positional_slots(ResponseType::LowPass, DesignKind::ChebyshevI),
+            vec![
+                Slot::SampleRate,
+                Slot::Parameter("order"),
+                Slot::Parameter("cutoff"),
+                Slot::Parameter("ripple"),
+            ]
+        );
+        assert_eq!(
+            positional_slots(ResponseType::LowShelf, DesignKind::ChebyshevI),
+            vec![
+                Slot::SampleRate,
+                Slot::Parameter("order"),
+                Slot::Parameter("cutoff"),
+                Slot::Parameter("gain"),
+                Slot::Parameter("ripple"),
+            ]
+        );
+    }
+
+    /// The constructor consumes its arguments: the DLL's class-name NCM
+    /// (`0x100020f0`) reads a response name and a design name, which the game's
+    /// factories pass. A name the tables do not carry leaves the field alone,
+    /// and the form/integer arguments are accepted.
+    #[test]
+    fn the_constructor_consumes_the_response_and_design_arguments() {
+        let mut engine = engine();
+        assert_eq!(
+            string(
+                &mut engine,
+                "(function() {\n\
+                     var f = new WaveSoundBuffer.WaveDSPFilter(\"HighPass\", \"ChebyshevII\");\n\
+                     return f.name + \"/\" + f.label;\n\
+                 })()",
+            ),
+            "High Pass/Chebyshev II"
+        );
+        assert_eq!(
+            string(
+                &mut engine,
+                "(function() {\n\
+                     var f = new WaveSoundBuffer.WaveDSPFilter(\"Nonsense\", \"Butterworth\", \"DirectFormI\", 4);\n\
+                     return f.name + \"/\" + f.label;\n\
+                 })()",
+            ),
+            "Low Pass/Butterworth"
+        );
+
+        // The reference's table carries three response names this port cannot
+        // model; naming one is the port's `does not model` error, not a silent
+        // keep (the game's factory list has an `AllPass_RBJ` wrapper).
+        let error = try_run(
+            &mut engine,
+            "(function() { return new WaveSoundBuffer.WaveDSPFilter(\"AllPass\", \"RBJ\"); })()",
+        )
+        .expect_err("AllPass is not modelled");
+        assert!(
+            error.message.contains("AllPass") && error.message.contains("does not model"),
+            "unexpected message: {}",
+            error.message
+        );
+
+        // A `new` naming an unbuildable design fails before the filter is
+        // registered, and the class keeps working afterwards.
+        let error = try_run(
+            &mut engine,
+            "(function() { return new WaveSoundBuffer.WaveDSPFilter(\"LowPass\", \"Elliptic\"); })()",
+        )
+        .expect_err("Elliptic must be refused at construction");
+        assert!(error.message.contains("Elliptic"), "{}", error.message);
+        assert_eq!(
+            string(
+                &mut engine,
+                "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(\"LowPass\", \"RBJ\"); return f.label; })()",
+            ),
+            "RBJ"
+        );
     }
 
     /// The unimplemented combinations answer a clear error instead of a wrong
@@ -2210,6 +2953,8 @@ mod tests {
         let gain = 10.0_f64.powf(6.0 / 20.0);
         let mut low = spec(DesignKind::Rbj, ResponseType::LowShelf);
         low.gain_db = 6.0;
+        // The shelf slope: the library's `Slope` parameter, default 1.
+        low.bandwidth_octaves = 1.0;
         assert!((response_of(&low, 0.0) - gain).abs() < 1e-3, "low shelf DC");
         assert!(
             (response_of(&low, 24000.0) - 1.0).abs() < 0.02,
@@ -2218,6 +2963,7 @@ mod tests {
 
         let mut high = spec(DesignKind::Rbj, ResponseType::HighShelf);
         high.gain_db = 6.0;
+        high.bandwidth_octaves = 1.0;
         assert!(
             (response_of(&high, 24000.0) - gain).abs() < 0.02,
             "high shelf Nyquist"
@@ -2226,6 +2972,181 @@ mod tests {
             (response_of(&high, 0.0) - 1.0).abs() < 1e-3,
             "high shelf DC"
         );
+    }
+
+    /// `|H(e^{jω})|` of a biquad at `frequency`, so a test can compare a
+    /// designed chain against coefficients written out from the reference's
+    /// source (the denominator's `a0` normalises both rows).
+    fn biquad_magnitude(
+        frequency: f64,
+        sample_rate: f32,
+        [b0, b1, b2]: [f64; 3],
+        [a0, a1, a2]: [f64; 3],
+    ) -> f64 {
+        let omega = 2.0 * std::f64::consts::PI * frequency / f64::from(sample_rate);
+        let (b0, b1, b2) = (b0 / a0, b1 / a0, b2 / a0);
+        let (a1, a2) = (a1 / a0, a2 / a0);
+        let re_b = b0 + b1 * (-omega).cos() + b2 * (-2.0 * omega).cos();
+        let im_b = b1 * (-omega).sin() + b2 * (-2.0 * omega).sin();
+        let re_a = 1.0 + a1 * (-omega).cos() + a2 * (-2.0 * omega).cos();
+        let im_a = a1 * (-omega).sin() + a2 * (-2.0 * omega).sin();
+        re_b.hypot(im_b) / re_a.hypot(im_a)
+    }
+
+    /// The shelf slot is the library's `Slope`, stored verbatim; the port's
+    /// shelf branch computes the library's `AL` — the `sn/2·sqrt((A + 1/A)(1/S
+    /// − 1) + 2)` form — and `sq = 2·sqrt(A)·AL` from it and the gain, so the
+    /// chain reproduces `RBJ.cpp` `HighShelf::setup`. Unlike a stored
+    /// conversion, a later gain change re-derives it.
+    #[test]
+    fn the_rbj_slope_slot_reproduces_the_library() {
+        let mut engine = engine();
+        let handle = match try_run(
+            &mut engine,
+            "(function() {\n\
+                 var f = new WaveSoundBuffer.WaveDSPFilter(\"HighShelf\", \"RBJ\");\n\
+                 f.setParams(void, 2000, 6, 0.5);\n\
+                 return f;\n\
+             })()",
+        )
+        .expect("the shelf's positional call must be accepted")
+        {
+            Variant::Object(handle) => handle,
+            Variant::Closure(closure) => closure.object,
+            other => panic!("the script returned {other:?}"),
+        };
+        let (gain, slope, rate, designed) = with_state(handle, |state| {
+            let rate = state.sample_rate;
+            (
+                state.real("gain"),
+                state.real("bandwidthOctaves"),
+                rate,
+                [500.0, 2000.0, 8000.0]
+                    .map(|frequency| state.chain.magnitude_at_hz(frequency, rate)),
+            )
+        })
+        .expect("the filter is live");
+        assert_eq!(gain, 6.0);
+        assert_eq!(slope, 0.5, "the slope is stored verbatim");
+
+        // `RBJ.cpp` `HighShelf::setup` at the live cutoff and sample rate.
+        let a = 10.0_f64.powf(6.0 / 40.0);
+        let omega = 2.0 * std::f64::consts::PI * 2000.0 / f64::from(rate);
+        let (sin, cos) = (omega.sin(), omega.cos());
+        let al = sin / 2.0 * ((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0).sqrt();
+        let sq = 2.0 * a.sqrt() * al;
+        let b = [
+            a * ((a + 1.0) + (a - 1.0) * cos + sq),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
+            a * ((a + 1.0) + (a - 1.0) * cos - sq),
+        ];
+        let denominator = [
+            (a + 1.0) - (a - 1.0) * cos + sq,
+            2.0 * ((a - 1.0) - (a + 1.0) * cos),
+            (a + 1.0) - (a - 1.0) * cos - sq,
+        ];
+        for (index, frequency) in [500.0, 2000.0, 8000.0].into_iter().enumerate() {
+            let expected = biquad_magnitude(frequency, rate, b, denominator);
+            assert!(
+                (designed[index] - expected).abs() < 1e-5,
+                "at {frequency} Hz: {} vs {}",
+                designed[index],
+                expected
+            );
+        }
+    }
+
+    /// The port's band shelf is the library's `BandShelf::setup`, including the
+    /// `w0/sn` wedge in `AL = sn·sinh(ln2/2·BW·w0/sn)`: at 10 kHz/44.1 kHz the
+    /// wedge moves the sinh argument by about 47 %, so its absence is visible
+    /// away from the center (at the center this coefficient family's gain is
+    /// `A²` whatever `AL` is).
+    #[test]
+    fn the_rbj_band_shelf_uses_the_librarys_octave_wedge() {
+        let mut spec = spec(DesignKind::Rbj, ResponseType::BandShelf);
+        spec.center = 10_000.0;
+        spec.bandwidth_octaves = 1.0;
+        spec.gain_db = 6.0;
+
+        // The library's arithmetic, written out from `RBJ.cpp`: the coefficients
+        // come from the design center, the response is sampled at `frequency`.
+        let a = 10.0_f64.powf(6.0 / 40.0);
+        let omega0 = 2.0 * std::f64::consts::PI * 10_000.0 / f64::from(spec.sample_rate);
+        let magnitude = |frequency: f64, al: f64| {
+            let omega = 2.0 * std::f64::consts::PI * frequency / f64::from(spec.sample_rate);
+            let cos0 = omega0.cos();
+            let (b0, b1, b2) = (1.0 + al * a, -2.0 * cos0, 1.0 - al * a);
+            let (a0, a1, a2) = (1.0 + al / a, -2.0 * cos0, 1.0 - al / a);
+            let (b0, b1, b2) = (b0 / a0, b1 / a0, b2 / a0);
+            let (a1, a2) = (a1 / a0, a2 / a0);
+            let re_b = b0 + b1 * (-omega).cos() + b2 * (-2.0 * omega).cos();
+            let im_b = b1 * (-omega).sin() + b2 * (-2.0 * omega).sin();
+            let re_a = 1.0 + a1 * (-omega).cos() + a2 * (-2.0 * omega).cos();
+            let im_a = a1 * (-omega).sin() + a2 * (-2.0 * omega).sin();
+            re_b.hypot(im_b) / re_a.hypot(im_a)
+        };
+        let arg = std::f64::consts::LN_2 / 2.0;
+        let wedged = |frequency: f64| {
+            magnitude(
+                frequency,
+                omega0.sin() * (arg * omega0 / omega0.sin()).sinh(),
+            )
+        };
+        let unwarped = |frequency: f64| magnitude(frequency, omega0.sin() * arg.sinh());
+
+        assert!(
+            (response_of(&spec, 10_000.0) - wedged(10_000.0)).abs() < 1e-5,
+            "the port's band shelf is {}, the library's {}",
+            response_of(&spec, 10_000.0),
+            wedged(10_000.0)
+        );
+        assert!(
+            (response_of(&spec, 7_000.0) - wedged(7_000.0)).abs() < 1e-5,
+            "the port's band shelf at 7 kHz is {}, the library's {}",
+            response_of(&spec, 7_000.0),
+            wedged(7_000.0)
+        );
+        assert!(
+            (wedged(7_000.0) - unwarped(7_000.0)).abs() > 0.05,
+            "the wedge must matter at 10 kHz: {} vs {} unwarped",
+            wedged(7_000.0),
+            unwarped(7_000.0)
+        );
+    }
+
+    /// The prototype designs' band slots take their width from `bandwidthHz`
+    /// (their `TypeIIBase` declares `defaultBandwidthHzParam` and no octave
+    /// parameter), so the octave field's default must not shadow it: a
+    /// `setParams(void, order, center, bandwidthHz)` designs `center /
+    /// bandwidthHz` as the Q.
+    #[test]
+    fn the_prototype_band_slot_uses_its_hz_bandwidth() {
+        let mut engine = engine();
+        let handle = match try_run(
+            &mut engine,
+            "(function() {\n\
+                 var f = new WaveSoundBuffer.WaveDSPFilter(\"BandPass\", \"Butterworth\");\n\
+                 f.setParams(void, 4, 1000, 500);\n\
+                 return f;\n\
+             })()",
+        )
+        .expect("the positional call must be accepted")
+        {
+            Variant::Object(handle) => handle,
+            Variant::Closure(closure) => closure.object,
+            other => panic!("the script returned {other:?}"),
+        };
+        let (center, bandwidth, quality) = with_state(handle, |state| {
+            (
+                state.real("center"),
+                state.real("bandwidthHz"),
+                state.spec().quality(),
+            )
+        })
+        .expect("the filter is live");
+        assert_eq!(center, 1000.0);
+        assert_eq!(bandwidth, 500.0);
+        assert!((quality - 2.0).abs() < 1e-6, "Q came out as {quality}");
     }
 
     // ------------------------------------------- analog prototype designs
