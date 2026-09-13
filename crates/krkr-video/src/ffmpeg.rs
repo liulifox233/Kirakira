@@ -6,15 +6,22 @@
 //! decoder and needs no system FFmpeg at build or run time (no pkg-config
 //! probe, no shared libav*). FFmpeg itself is never shelled out to.
 //!
-//! The vendored build's configure line is fixed by the bindings crate and is
-//! on the record in `AGENTS.md`: FFmpeg's LGPL defaults
-//! (`--disable-gpl --disable-version3 --disable-nonfree`) with
-//! `--disable-autodetect` (no external codec libraries) and only
-//! libavcodec/libavformat/libswscale/libswresample enabled. A direct
-//! `ffmpeg-sys-next` dependency pins `build-portable` so the artifact does not
-//! inherit `-march=native`. The build wants network (a shallow git clone), a C
-//! toolchain (gcc/clang, make, nasm) and libclang for bindgen; it takes about
-//! 3.5 minutes on a 32-core host and is cached afterwards per profile.
+//! The vendored build's configure line is fixed by the bindings crate:
+//! `--enable-static --disable-shared --enable-pthreads --enable-pic
+//! --disable-autodetect --disable-programs --disable-doc --disable-gpl
+//! --disable-version3 --disable-nonfree --enable-avcodec --disable-avdevice
+//! --disable-avfilter --enable-avformat --enable-swresample --enable-swscale`
+//! plus `--enable-debug --disable-stripping` (the crate passes those whenever
+//! cargo runs the build script, which is every profile — the static archives
+//! therefore carry debug symbols and artifacts are larger than a stripped
+//! build would be, while `-O3` still applies). The `--disable-*` license
+//! switches keep this FFmpeg LGPL v2.1+: no GPL, (L)GPLv3 or nonfree
+//! components, and `--disable-autodetect` keeps external codec libraries
+//! (x264/x265/...) out. A direct `ffmpeg-sys-next` dependency pins
+//! `build-portable` so the artifact does not inherit `-march=native`. The
+//! build wants network (a shallow git clone), a C toolchain (gcc/clang, make,
+//! nasm) and libclang for bindgen; it takes about 3.5 minutes on a 32-core
+//! host and is cached afterwards per profile.
 //!
 //! One-command reproduction from a clean worktree (Linux host):
 //!
@@ -142,9 +149,13 @@ impl FfmpegDecoder {
                 });
             }
         }
+        // Only the streams a decoder actually pulls get queued; a soundtrack
+        // that could not be opened must not make the demuxer buffer its
+        // packets for a consumer that will never ask for them.
+        let audio_index = audio.as_ref().map(|audio| audio.index);
 
         Ok(Self {
-            demuxer: Demuxer::new(input, video.index),
+            demuxer: Demuxer::new(input, video.index, audio_index),
             video: VideoStream {
                 index: video.index,
                 time_base: video.time_base,
@@ -182,36 +193,51 @@ struct StreamSelection {
     rate: Rational,
 }
 
-/// Demuxer with one packet queue per stream.
+/// Demuxer with one packet queue per *selected* stream.
 ///
 /// The engine pulls video and audio from the same decode thread, one item at a
-/// time; a pull for one stream must not discard the other stream's packets, so
-/// every demuxed packet is routed to its queue and consumed in stream order.
+/// time; a pull for one stream must not discard the other selected stream's
+/// packets, so those are routed to their queues and consumed in stream order.
+/// Packets of any *other* stream — subtitles, a second audio track,
+/// attachments — belong to no decoder here and are dropped: queueing them for
+/// the audio pull would feed them to the audio decoder (a `mov_text` packet is
+/// not AAC), and a second audio track would be decoded through the first
+/// track's decoder. Both cases are regression-tested.
 struct Demuxer {
     input: format::context::Input,
     /// Set once `av_read_frame` reports end of stream; cleared by a seek.
     eof: bool,
     /// Stream index of the video stream, used to route packets to their queue.
     video_index: usize,
+    /// Index of the audio stream `next_audio_chunk` decodes; `None` when the
+    /// movie has no decodable soundtrack. A caller that pulls video but never
+    /// audio will buffer that stream's packets (bounded by the file); the
+    /// engine always pulls both in lockstep.
+    audio_index: Option<usize>,
     video_packets: VecDeque<Packet>,
     audio_packets: VecDeque<Packet>,
 }
 
 impl Demuxer {
-    fn new(input: format::context::Input, video_index: usize) -> Self {
+    fn new(input: format::context::Input, video_index: usize, audio_index: Option<usize>) -> Self {
         Self {
             input,
             eof: false,
             video_index,
+            audio_index,
             video_packets: VecDeque::new(),
             audio_packets: VecDeque::new(),
         }
     }
 
     /// Next packet of `stream_index`, buffering the packets of the other
-    /// stream for its own pull. `Ok(None)` means this stream has no packet
-    /// left in the demuxer or in its queue.
+    /// selected stream for its own pull. `Ok(None)` means this stream has no
+    /// packet left in the demuxer or in its queue.
     fn take_packet(&mut self, stream_index: usize) -> Result<Option<Packet>, VideoError> {
+        if stream_index != self.video_index && Some(stream_index) != self.audio_index {
+            // Only the two selected streams are ever pulled.
+            return Ok(None);
+        }
         let buffered = if stream_index == self.video_index {
             self.video_packets.pop_front()
         } else {
@@ -234,7 +260,7 @@ impl Demuxer {
                     }
                     if packet.stream() == self.video_index {
                         self.video_packets.push_back(packet);
-                    } else {
+                    } else if Some(packet.stream()) == self.audio_index {
                         self.audio_packets.push_back(packet);
                     }
                 }

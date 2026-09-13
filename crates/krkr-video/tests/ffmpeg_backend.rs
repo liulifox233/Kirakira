@@ -1,15 +1,42 @@
 //! Round-trips the FFmpeg fallback backend through the [`krkr_video::VideoPort`]
 //! contract on the committed sample clip.
 //!
-//! The clip is generated once with an `ffmpeg` CLI (only to produce the
-//! fixture; the backend itself never shells out):
+//! The clips are generated once with an `ffmpeg` CLI (only to produce the
+//! fixtures; the backend itself never shells out). `sample_clip.mp4` lives in
+//! `tests/fixtures/movie_project` because it doubles as the `krkr-debug`
+//! harness project; the regression clips live in `tests/fixtures/clips`:
 //!
 //! ```text
 //! ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=10:duration=2 \
 //!   -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 \
 //!   -c:v libx264 -preset veryfast -crf 30 -pix_fmt yuv420p -g 10 \
 //!   -c:a aac -ac 2 -b:a 64k -shortest sample_clip.mp4
+//!
+//! # video + AAC + mov_text subtitle track (subtitle packets must not reach
+//! # the audio decoder)
+//! ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=10:duration=2 \
+//!   -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 \
+//!   -f srt -i subs.srt -map 0:v -map 1:a -map 2:s \
+//!   -c:v libx264 -preset veryfast -crf 30 -pix_fmt yuv420p -g 10 \
+//!   -c:a aac -ac 2 -b:a 64k -c:s mov_text -t 2 subtitle_track_clip.mp4
+//!
+//! # video + two AAC tracks, 440 Hz then 880 Hz (only the first is decoded)
+//! ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=10:duration=2 \
+//!   -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 \
+//!   -f lavfi -i sine=frequency=880:sample_rate=44100:duration=2 \
+//!   -map 0:v -map 1:a -map 2:a \
+//!   -c:v libx264 -preset veryfast -crf 30 -pix_fmt yuv420p -g 10 \
+//!   -c:a aac -ac 2 -b:a 64k -t 2 two_audio_track_clip.mp4
+//!
+//! # video + mov_text subtitle and no audio stream at all
+//! ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=10:duration=2 \
+//!   -f srt -i subs.srt -map 0:v -map 1:s \
+//!   -c:v libx264 -preset veryfast -crf 30 -pix_fmt yuv420p -g 10 \
+//!   -c:s mov_text -t 2 subtitle_only_clip.mp4
 //! ```
+//!
+//! (`-shortest` is deliberately avoided: a subtitle stream shorter than the
+//! video truncates the mux, which would leave the clips with 18 frames.)
 //!
 //! The suite needs the `ffmpeg` feature, which builds the embedded FFmpeg from
 //! source (see the `krkr_video::ffmpeg` module docs for the one-command
@@ -39,6 +66,18 @@ fn sample_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/movie_project/sample_clip.mp4")
 }
 
+/// Regression clips (`tests/fixtures/clips`) that carry streams the backend
+/// must not confuse with the movie's own audio and video.
+fn open_clip(name: &str) -> Box<dyn VideoPort> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/clips")
+        .join(name);
+    let data =
+        std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    create_decoder(VideoSource::bytes(data, Some(name)))
+        .unwrap_or_else(|error| panic!("the FFmpeg backend opens {name}: {error}"))
+}
+
 /// Opens the clip the way the engine does: host-owned bytes with a name hint.
 fn open_from_bytes() -> Box<dyn VideoPort> {
     let data = std::fs::read(sample_path()).expect("the sample clip is committed");
@@ -56,6 +95,61 @@ fn drain_frames(decoder: &mut (impl VideoDecoder + ?Sized)) -> Vec<VideoFrame> {
         }
     }
     frames
+}
+
+/// Pulls one frame and one audio chunk per iteration, the way the engine's
+/// decode thread does, and returns `(frames, audio frames per channel)`.
+fn drain_interleaved(decoder: &mut (impl VideoDecoder + ?Sized), channels: u32) -> (usize, u64) {
+    let mut video_frames = 0usize;
+    let mut audio_frames = 0u64;
+    loop {
+        let frame = decoder.next_frame().expect("video");
+        let chunk = decoder.next_audio_chunk().expect("audio");
+        if frame.is_none() && chunk.is_none() {
+            break;
+        }
+        if frame.is_some() {
+            video_frames += 1;
+        }
+        if let Some(chunk) = chunk {
+            audio_frames += chunk.samples.len() as u64 / u64::from(channels.max(1));
+        }
+    }
+    (video_frames, audio_frames)
+}
+
+/// Rough dominant frequency of the first channel of interleaved f32 samples,
+/// estimated from zero crossings: robust enough to tell the fixture's 440 Hz
+/// track from its 880 Hz track.
+fn dominant_frequency_hz(samples: &[f32], channels: u32, sample_rate: u32) -> f64 {
+    let stride = channels.max(1) as usize;
+    let mut crossings = 0usize;
+    let mut count = 0usize;
+    let mut previous = 0.0f32;
+    for frame in samples.chunks_exact(stride) {
+        let value = frame[0];
+        if (previous < 0.0 && value >= 0.0) || (previous > 0.0 && value <= 0.0) {
+            crossings += 1;
+        }
+        previous = value;
+        count += 1;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    crossings as f64 * f64::from(sample_rate) / (2.0 * count as f64)
+}
+
+fn drain_audio(decoder: &mut (impl VideoDecoder + ?Sized)) -> Vec<f32> {
+    let mut samples = Vec::new();
+    loop {
+        match decoder.next_audio_chunk() {
+            Ok(Some(chunk)) => samples.extend_from_slice(&chunk.samples),
+            Ok(None) => break,
+            Err(error) => panic!("decoding the soundtrack failed: {error}"),
+        }
+    }
+    samples
 }
 
 fn audio_spec(decoder: &(impl VideoDecoder + ?Sized)) -> AudioSpec {
@@ -201,27 +295,79 @@ fn soundtrack_matches_the_advertised_spec_until_eof() {
 fn interleaved_video_and_audio_pulls_keep_every_stream() {
     let mut decoder = open_from_bytes();
     let spec = audio_spec(decoder.as_ref());
-    let mut video_frames = 0usize;
-    let mut audio_frames = 0u64;
-    loop {
-        let frame = decoder.next_frame().expect("video");
-        let chunk = decoder.next_audio_chunk().expect("audio");
-        if frame.is_none() && chunk.is_none() {
-            break;
-        }
-        if frame.is_some() {
-            video_frames += 1;
-        }
-        if let Some(chunk) = chunk {
-            audio_frames += chunk.samples.len() as u64 / u64::from(spec.channels);
-        }
-    }
+    let (video_frames, audio_frames) = drain_interleaved(decoder.as_mut(), spec.channels);
     assert_eq!(video_frames, SAMPLE_FRAMES);
     let expected = SAMPLE_DURATION_MS as u64 * u64::from(spec.sample_rate) / 1000;
     assert!(
         audio_frames.abs_diff(expected) <= u64::from(spec.sample_rate) / 10,
         "{audio_frames} frames per channel, expected about {expected}"
     );
+}
+
+/// Regression (M143 review P1): subtitle packets must never be queued for the
+/// audio decoder. With the old routing the `mov_text` packets travelled
+/// through `audio_packets` and reached the AAC decoder, which failed the whole
+/// movie with a "Reserved bit set" decode error.
+#[test]
+fn subtitle_track_does_not_leak_into_the_soundtrack() {
+    let mut decoder = open_clip("subtitle_track_clip.mp4");
+    assert!(decoder.metadata().has_audio);
+    let spec = audio_spec(decoder.as_ref());
+    assert_eq!((spec.sample_rate, spec.channels), (44_100, 2));
+
+    let (video_frames, audio_frames) = drain_interleaved(decoder.as_mut(), spec.channels);
+    assert_eq!(video_frames, SAMPLE_FRAMES);
+    let expected = SAMPLE_DURATION_MS as u64 * u64::from(spec.sample_rate) / 1000;
+    assert!(
+        audio_frames.abs_diff(expected) <= u64::from(spec.sample_rate) / 10,
+        "{audio_frames} frames per channel, expected about {expected}"
+    );
+}
+
+/// Regression (M143 review P1): a second audio track must not be decoded
+/// through the first track's decoder. With the old routing every packet that
+/// was not the video or the requested stream landed in `audio_packets`, so the
+/// two tracks were decoded as one (repeat PTS, doubled sample count, garbled
+/// audio reported as success).
+#[test]
+fn a_second_audio_track_is_not_decoded_through_the_first() {
+    let mut decoder = open_clip("two_audio_track_clip.mp4");
+    let spec = audio_spec(decoder.as_ref());
+    assert_eq!((spec.sample_rate, spec.channels), (44_100, 2));
+
+    let (video_frames, audio_frames) = drain_interleaved(decoder.as_mut(), spec.channels);
+    assert_eq!(video_frames, SAMPLE_FRAMES);
+    let expected = SAMPLE_DURATION_MS as u64 * u64::from(spec.sample_rate) / 1000;
+    // One track, not two: the old routing produced about twice this.
+    assert!(
+        audio_frames.abs_diff(expected) <= u64::from(spec.sample_rate) / 10,
+        "{audio_frames} frames per channel, expected about {expected}"
+    );
+
+    // The selected soundtrack is the first audio stream (440 Hz), not the
+    // second (880 Hz).
+    let mut decoder = open_clip("two_audio_track_clip.mp4");
+    let samples = drain_audio(decoder.as_mut());
+    let frequency = dominant_frequency_hz(&samples, spec.channels, spec.sample_rate);
+    assert!(
+        (frequency - 440.0).abs() < 60.0,
+        "decoded a {frequency:.1} Hz tone; the first track is 440 Hz"
+    );
+}
+
+/// A movie with subtitles but no audio at all: the video still plays, the
+/// backend reports no soundtrack, and (with the fix) the subtitle packets are
+/// dropped instead of accumulating for an audio pull that never comes.
+#[test]
+fn video_with_subtitles_and_no_audio_plays_cleanly() {
+    let mut decoder = open_clip("subtitle_only_clip.mp4");
+    assert!(!decoder.metadata().has_audio);
+    assert!(decoder.audio_spec().is_none());
+    assert!(matches!(decoder.next_audio_chunk(), Ok(None)));
+
+    let frames = drain_frames(decoder.as_mut());
+    assert_eq!(frames.len(), SAMPLE_FRAMES);
+    assert!(matches!(decoder.next_frame(), Ok(None)));
 }
 
 #[test]
