@@ -11,30 +11,31 @@
 //! * `XMLParser(target = void)` — the constructor stores `param[0]->AsObject()`
 //!   as the handler target (`:339-355`); a non-object argument (or none) leaves
 //!   it NULL.
-//! * `parse(text)` / `parseStorage(filename)` (`:485-511`): both call the
-//!   instance's `init` (`:352-372`), which resets the parser with the
+//! * `parse(text)` / `parseStorage(filename)` (`:515-540`): both call the
+//!   instance's `init` (`:359-372`), which resets the parser with the
 //!   **UTF-8** protocol encoding and registers a handler for every member
 //!   the target answers for; the second argument of either method (or `this`
-//!   when absent) is the target `init` receives (`:503-505`, `:511-518`,
-//!   `:415`). `parse` converts the TJS text to UTF-8 and feeds the whole
+//!   when absent) is the target `init` receives (`:518-519`, `:531-532`,
+//!   `:360`). `parse` converts the TJS text to UTF-8 and feeds the whole
 //!   document as one buffer (`:413-421`); `parseStorage` streams the
 //!   storage's raw bytes in 8 KiB chunks, the last one flagged final
-//!   (`:427-455`). A missing storage throws `cannot open : <filename>`
-//!   (`:438-440`) — the only exception either method raises itself.
+//!   (`:435-455`). A missing storage throws `cannot open : <filename>`
+//!   (`:442-445`) — the only exception either method raises itself.
 //! * Parse errors **never throw**: `parse` returns the `XML_Parse` status
-//!   (`:420`, `:444`) and the caller inspects the properties.
+//!   (`:424`, `:453`) and the caller inspects the properties.
 //! * Read-only properties (getters only, `TJS_DENY_NATIVE_PROP_SETTER`
-//!   `:555-589`): `errorCode` (`XML_GetErrorCode`), `errorString`
+//!   `:541-618`): `errorCode` (`XML_GetErrorCode`), `errorString`
 //!   (`XML_ErrorString`), `currentByteIndex`, `currentLineNumber`,
-//!   `currentColumnNumber`, `currentByteCount` (`:472-491`).
-//! * Handler members (`:152-292`, registered only when the target has such a
+//!   `currentColumnNumber`, `currentByteCount` (`:472-491`). A non-object
+//!   handler target throws the reference's variant-conversion error.
+//! * Handler members (`:147-292`, registered only when the target has such a
 //!   member, `:359-371`): `startElement(name, attrs)` (attrs is a TJS
 //!   `Dictionary` built in document order, `:158-163`), `endElement(name)`,
 //!   `characterData(data)`, `processingInstruction(target, data)`,
 //!   `comment(data)`, `startCdataSection()`, `endCdataSection()`,
 //!   `defaultHandler(data)`, `defaultHandlerExpand(data)`. The two default
 //!   handlers are registered through `XML_SetDefaultHandler` /
-//!   `XML_SetDefaultHandlerExpand` (`:365-366`); every dispatch fetches the
+//!   `XML_SetDefaultHandlerExpand` (`:370-371`); every dispatch fetches the
 //!   member by name and a vanished member raises `can't get member:<name>`
 //!   (`:89-127`).
 //!
@@ -73,8 +74,10 @@
 //!   position is the end of the input, exactly like expat's end-of-buffer
 //!   event pointer.
 //! * `errorString` for code 0 (and for codes outside expat 2.0.0's table) is
-//!   `void`: `XML_ErrorString(0)` returns NULL (`xmlparse.c:1842-1886`), and
-//!   the reference assigns that NULL straight into the variant.
+//!   the **empty string**: `XML_ErrorString(0)` returns NULL
+//!   (`xmlparse.c:1842-1886`) and the reference's
+//!   `tTJSVariant(const tjs_char *)` turns a NULL string into a String-typed
+//!   NULL, which reads as `""` (`tjsVariant.h:559-571`) — not `void`.
 //!
 //! # Documented divergences
 //!
@@ -101,8 +104,12 @@
 //!   character that broke the reference); everything else in the error table
 //!   matches the reference's own reported `lineno`/`offset`/code for the
 //!   cases the tests pin.
-//! * A `void` argument to `parse` is an empty document here; the reference
-//!   dereferences the NULL string variant and crashes.
+//! * A `void` argument to `parse` is an empty document here, and an explicit
+//!   `null` target falls back to `this`; the reference dereferences the NULL
+//!   string variant / passes the NULL target into `isValidMember` and
+//!   crashes. A non-object target is *not* softened: it throws the
+//!   reference's `Cannot convert the variable type (%1 to Object)`
+//!   (`tjsVariant.h:668-679`).
 //! * Namespace processing is off on both sides (`XML_ParserCreate(NULL)`, no
 //!   `XML_SetNamespaceDeclHandler`), so `a:b` is a literal name in both.
 
@@ -152,7 +159,7 @@ impl KrkrPlugin for ExpatPlugin {
         install_members(runtime, class);
         // `tTJSNativeClass` carries a member named after the class, so the
         // shipped `XML.tjs` `DOMDocument` constructor's
-        // `global.XMLParser.XMLParser()` (`:63`) resolves, bound to the class
+        // `global.XMLParser.XMLParser()` (`XML.tjs:542`) resolves, bound to the class
         // object itself.
         runtime.set_object_member(
             class,
@@ -192,12 +199,15 @@ fn parser_constructor(
     let instance = instance_for(runtime, this_obj);
     runtime.add_object_class_info(instance, "XMLParser");
     install_members(runtime, instance);
-    // `Construct` keeps `param[0]->AsObject()`; only an object counts.
-    let target = args
-        .first()
-        .and_then(Variant::object_handle)
-        .map(Variant::Object)
-        .unwrap_or(Variant::Void);
+    // `Construct` stores `param[0]->AsObject()` (`:344-352`), and that
+    // conversion throws for every non-object variant but `null`
+    // (`tjsVariant.h:668-679`).
+    let target = match args.first() {
+        Some(value) => target_argument(value)?
+            .map(Variant::Object)
+            .unwrap_or(Variant::Void),
+        None => Variant::Void,
+    };
     state_set(runtime, instance, TARGET, target);
     Ok(Variant::Object(instance))
 }
@@ -236,19 +246,14 @@ fn install_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
                     return Ok(Variant::Void);
                 };
                 if key == ERROR_STRING {
-                    let code = state_int(runtime, object, ERROR_CODE);
-                    return Ok(if code == 0 {
-                        Variant::Void
-                    } else {
-                        error_string(code)
-                    });
+                    return Ok(error_string(state_int(runtime, object, ERROR_CODE)));
                 }
                 Ok(Variant::Integer(state_int(runtime, object, key)))
             },
             |_runtime: &mut Runtime<KrkrHost>, _this_obj, _value| Err(TjsError::access_denied()),
         );
     }
-    // `numparams < 1` is `TJS_E_BADPARAMCOUNT` (`:503`, `:515`), declared at
+    // `numparams < 1` is `TJS_E_BADPARAMCOUNT` (`:518`, `:531`), declared at
     // the registration site.
     runtime.register_object_native_with_arg_count(
         handle,
@@ -264,7 +269,7 @@ fn install_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     );
 }
 
-/// `parse(text [, target])` (`:485-499`).
+/// `parse(text [, target])` (`:515-527`).
 fn parse(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -273,13 +278,14 @@ fn parse(
     let Some(this) = plugin_this(runtime, this_obj) else {
         return Err(TjsError::native_class_crash());
     };
+    // The reference resolves the target argument first (`:518-519`), then the
+    // text, which reaches the parser as UTF-8 bytes (`AsStringNoAddRef` +
+    // `WideCharToMultiByte(CP_UTF8, ...)`, `:420-424`).
+    let target = object_argument(&args, 1)?;
     let text = match args.first() {
         Some(value) => value.to_tjs_string()?,
         None => return Err(TjsError::bad_param_count()),
     };
-    // `AsStringNoAddRef` then `WideCharToMultiByte(CP_UTF8, ...)`: the
-    // document reaches the parser as UTF-8 bytes (`:171-175`).
-    let target = object_argument(&args, 1);
     Ok(Variant::Integer(i64::from(run_parse(
         runtime,
         this,
@@ -288,7 +294,7 @@ fn parse(
     )?)))
 }
 
-/// `parseStorage(filename [, target])` (`:501-518`).
+/// `parseStorage(filename [, target])` (`:528-540`).
 fn parse_storage(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -297,6 +303,8 @@ fn parse_storage(
     let Some(this) = plugin_this(runtime, this_obj) else {
         return Err(TjsError::native_class_crash());
     };
+    // The target argument is resolved before the storage open (`:531-532`).
+    let target = object_argument(&args, 1)?;
     let filename = match args.first() {
         Some(value) => value.to_tjs_string()?,
         None => return Err(TjsError::bad_param_count()),
@@ -304,10 +312,9 @@ fn parse_storage(
     let bytes = runtime
         .host()
         .read_binary_storage(&filename)
-        // `TVPCreateIStream` failing throws (`:438-440`); nothing else in
+        // `TVPCreateIStream` failing throws (`:442-445`); nothing else in
         // either method raises.
         .map_err(|_| TjsError::runtime(format!("cannot open : {filename}")))?;
-    let target = object_argument(&args, 1);
     Ok(Variant::Integer(i64::from(run_parse(
         runtime, this, bytes, target,
     )?)))
@@ -322,8 +329,25 @@ fn plugin_this(
         .filter(|handle| *handle != runtime.global_handle())
 }
 
-fn object_argument(args: &[Variant], index: usize) -> Option<ObjectHandle> {
-    args.get(index).and_then(Variant::object_handle)
+fn object_argument(args: &[Variant], index: usize) -> Result<Option<ObjectHandle>> {
+    match args.get(index) {
+        Some(value) => target_argument(value),
+        None => Ok(None),
+    }
+}
+
+/// One optional target argument: an object is the target, `null` is the
+/// reference's NULL target, and every other variant throws the same
+/// `Cannot convert the variable type (%1 to Object)` the reference's
+/// `operator iTJSDispatch2*` raises (`tjsVariant.h:668-679`, `:755-758`).
+fn target_argument(value: &Variant) -> Result<Option<ObjectHandle>> {
+    if matches!(value, Variant::Null) {
+        return Ok(None);
+    }
+    match value.object_handle() {
+        Some(handle) => Ok(Some(handle)),
+        None => Err(TjsError::variant_convert_to_object(value)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +412,7 @@ fn state_set(runtime: &mut Runtime<KrkrHost>, object: ObjectHandle, key: &str, v
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// `init()` (`:352-372`): fresh error state, then a parse run over `input`.
+/// `init()` (`:359-372`): fresh error state, then a parse run over `input`.
 fn run_parse(
     runtime: &mut Runtime<KrkrHost>,
     this: ObjectHandle,
@@ -406,7 +430,7 @@ fn run_parse(
         runtime.set_object_member(state, key, initial);
     }
     // `init` uses the constructor's target when one was given, then the
-    // method's own target argument, then `objthis` (`:110-111`, `:415-416`).
+    // method's own target argument, then `objthis` (`:360-361`, `:519`).
     let target = match state_get(runtime, this, TARGET).object_handle() {
         Some(target) => target,
         None => argument_target.unwrap_or(this),
@@ -1033,7 +1057,7 @@ fn split_character_data(
 // Handler set and dispatch
 // ---------------------------------------------------------------------------
 
-/// Which of the nine handlers `init` registered for a target (`:359-371`).
+/// Which of the nine handlers `init` registered for a target (`:360-371`).
 #[derive(Default, Clone, Copy)]
 struct Handlers {
     start_element: bool,
@@ -1044,7 +1068,7 @@ struct Handlers {
     start_cdata_section: bool,
     end_cdata_section: bool,
     /// `Some` when `defaultHandler` or `defaultHandlerExpand` was registered
-    /// (`:365-366`); the two differ only in internal-entity expansion, which
+    /// (`:370-371`); the two differ only in internal-entity expansion, which
     /// this port does not implement (see the module docs). The name is the
     /// member every raw token is dispatched to.
     default_name: Option<&'static str>,
@@ -1123,6 +1147,11 @@ const XML_ERROR_UNCLOSED_CDATA_SECTION: i64 = 20;
 const XML_ERROR_XML_DECL: i64 = 30;
 
 /// expat 2.0.0's `XML_ErrorString` table (`xmlparse.c`, `errorStrings`).
+///
+/// `XML_ErrorString` answers NULL for code 0 and for codes outside the
+/// table; the reference assigns that NULL into a variant, which TJS types
+/// as a **String** holding NULL and reads as the empty string
+/// (`tjsVariant.h:559-571`) — not `void`.
 fn error_string(code: i64) -> Variant {
     let text = match code {
         1 => "out of memory",
@@ -1165,7 +1194,7 @@ fn error_string(code: i64) -> Variant {
         38 => "reserved prefix (xml) must not be undeclared or bound to another namespace name",
         39 => "reserved prefix (xmlns) must not be declared or undeclared",
         40 => "prefix must not be bound to one of the reserved namespace names",
-        _ => return Variant::Void,
+        _ => "",
     };
     Variant::String(text.to_string())
 }
@@ -1242,7 +1271,7 @@ fn attribute_dictionary(
         let name = decode_slice(attribute.key.as_ref(), frame, frame.start)?;
         if seen.iter().any(|previous| previous == &name) {
             // expat reports the duplicate at the second attribute's name
-            // (`xmlparse.c:2361`); quick-xml's own duplicate check reports no
+            // (`xmlparse.c:2664`); quick-xml's own duplicate check reports no
             // position, so the offset is found in the raw tag bytes.
             let haystack = &frame.input[frame.start..frame.end];
             let offset = second_occurrence(haystack, name.as_bytes())
@@ -1357,7 +1386,8 @@ fn normalize_eols(raw: &str) -> String {
 // Positions and errors
 // ---------------------------------------------------------------------------
 
-/// expat's position tracking (`XmlUpdatePosition`, `xmlparse.c:1784-1801`):
+/// expat's position tracking (the getters at `xmlparse.c:1784-1801` calling
+/// `XmlUpdatePosition`):
 /// 1-based lines, 0-based columns counted in characters, `\r\n` as one
 /// break.
 struct Cursor {
@@ -1724,12 +1754,17 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() { var parser = new XMLParser();\n\
-                 var fresh = typeof parser.errorString;\n\
+                 // `XML_ErrorString(0)` is NULL, and the reference's variant\n\
+                 // types a NULL string as an empty String (not void).\n\
+                 var fresh = typeof parser.errorString + \":\" + (parser.errorString == \"\");\n\
                  parser.parse(\"<a></b>\");\n\
                  return fresh + \"|\" + parser.errorString + \"|\" + parser.errorCode; })()",
             )
             .expect("errors");
-        assert_eq!(value, Variant::String("void|mismatched tag|7".to_string()));
+        assert_eq!(
+            value,
+            Variant::String("String:1|mismatched tag|7".to_string())
+        );
     }
 
     /// A successful parse leaves the position at the end of the input.
@@ -1957,6 +1992,37 @@ mod tests {
                  \":\" + p.currentColumnNumber + \":\" + p.currentByteCount; })()",
             )
             .expect("fresh");
-        assert_eq!(value, Variant::String("0:void:-1:1:0:0".to_string()));
+        assert_eq!(value, Variant::String("0:String:-1:1:0:0".to_string()));
+    }
+
+    /// A non-object target throws the reference's conversion error
+    /// (`AsObject()`, `tjsVariant.h:668-679`), while `null` is the
+    /// reference's NULL target and is accepted.
+    #[test]
+    fn non_object_targets_throw_like_the_reference() {
+        let mut engine = engine();
+        let script = r#"(function() {
+            var texts = [];
+            try { new XMLParser(5); texts.add("ok"); } catch (e) { texts.add(e.message); }
+            try { new XMLParser("target"); texts.add("ok"); } catch (e) { texts.add(e.message); }
+            var parser = new XMLParser();
+            try { parser.parse("<a/>", 5); texts.add("ok"); } catch (e) { texts.add(e.message); }
+            try { parser.parseStorage("doc.xml", 5); texts.add("ok"); } catch (e) { texts.add(e.message); }
+            var nullTarget = new XMLParser(null);
+            var accepted = nullTarget.parse("<a/>");
+            texts.add(accepted + ":" + (nullTarget.errorCode == 0));
+            var joined = "";
+            for (var i = 0; i < texts.count; i++) { joined += texts[i] + ";"; }
+            return joined; })()"#;
+        assert_eq!(
+            expression_string(&mut engine, script),
+            concat!(
+                "Cannot convert the variable type ((int)5 to Object);",
+                "Cannot convert the variable type ((string)\"target\" to Object);",
+                "Cannot convert the variable type ((int)5 to Object);",
+                "Cannot convert the variable type ((int)5 to Object);",
+                "1:1;"
+            )
+        );
     }
 }

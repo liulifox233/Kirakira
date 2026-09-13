@@ -14,8 +14,12 @@
 //!
 //! Surface, verified line by line against the source:
 //!
-//! * Constants: `color_mode_*` 0-9 (`:829-836`), `blend_mode_*` -1..27
-//!   (`:838-867`), `layer_type_*` 0-5 (`:870-875`).
+//! * Constants (`:829-875`): the eight `color_mode_*` names (values 0-4 and
+//!   7-9), the twenty-eight `blend_mode_*` names (0-27 — the reference
+//!   registers no invalid constant; an unknown key reads back through
+//!   `getLayerInfo`'s `blend_mode` as the internal -1) and the five
+//!   `layer_type_*` names (0-4; the enum's never-assigned `TEXT` is not
+//!   registered).
 //! * `load(filename) → bool` (`:131-157`): loads through the storage stack
 //!   (`TVPGetPlacedPath`), registering the object as the media's weak
 //!   reference for the file's basename when it succeeds.
@@ -47,16 +51,18 @@
 //!   load. `clearStorageCache()` drops the media's cached document
 //!   (`main.cpp:248-254`).
 //! * Storage: `CheckExistentStorage` (present in the layer maps, or the `id/`
-//!   form), `Open` (BMP, read-only — anything else throws
-//!   `%1:cannot open psdfile`, `main.cpp:124`), `GetListAt` (`.bmp` names per
-//!   directory), and `invalid path:%1` when the name has no `/`
+//!   form), `Open` (a 32-bit bottom-up **BGRA** BMP, read-only — anything
+//!   else throws `%1:cannot open psdfile`, `main.cpp:124`; the byte order is
+//!   the reference's `BGRA_LE`, `psdclass.cpp:809-810` + `psdbase.h:53`),
+//!   `GetListAt` (`.bmp` names per directory), and `invalid path:%1` when the
+//!   name has no `/`
 //!   (`main.cpp:173`). Paths are lowercased; `/` inside a layer name became
 //!   `_` (`psdclass.cpp:596-619`); a name collision keeps the
 //!   bottom-most layer, the reference's reverse registration order.
 //!
 //! # How the port parses
 //!
-//! The container grammar (`psdparse.h:206-229`, `:236-275`, `:596-627`) is
+//! The container grammar (`psdparse.h:214-226`, `:244-253`, `:596-627`) is
 //! re-implemented over a byte cursor:
 //!
 //! * signature `8BPS`, u16 version (**parsed and ignored** — the reference
@@ -426,7 +432,7 @@ fn install_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle, media:
     runtime.register_object_native(handle, "getLayerComp", get_layer_comp);
     let media = Arc::clone(media);
     // `static void clearStorageCache()` (`main.cpp:248-254`), registered as a
-    // static method (`psdclass.cpp:899`).
+    // static method (`psdclass.cpp:900`).
     runtime.register_object_native(
         handle,
         "clearStorageCache",
@@ -784,8 +790,8 @@ fn get_layer_image_call(
     } else {
         match compose_layer_image(&document, layer, mode, width as usize, height as usize) {
             Some(pixels) => pixels,
-            // `getLayerImage` failing leaves the buffer as it was
-            // (`psdimage.cpp:795-940`): nothing is written.
+            // `getLayerImage` failing (`psdimage.cpp:808-810`) leaves the
+            // buffer as it was: nothing is written.
             None => return Ok(Variant::Void),
         }
     };
@@ -1290,7 +1296,7 @@ fn parse_document(data: &[u8]) -> std::result::Result<PsdDocument, ParseError> {
         parse_layer_and_mask(layer_and_mask, &mut document)?;
     }
 
-    // The merged image is the rest of the file (`psdparse.h:623-626`).
+    // The merged image is the rest of the file (`psdparse.h:625`).
     if cursor.remaining() > 0 {
         document.merged = Some(cursor.bytes(cursor.remaining())?.to_vec());
     }
@@ -1307,7 +1313,7 @@ struct Resource {
     data: Vec<u8>,
 }
 
-/// The `8BIM`-tagged resource list (`psdparse.h:241-260`).
+/// The `8BIM`-tagged resource list (`psdparse.h:244-253`).
 fn parse_image_resources(data: &[u8]) -> std::result::Result<Vec<Resource>, ParseError> {
     let mut cursor = Cursor::new(data);
     let mut resources = Vec::new();
@@ -1316,7 +1322,7 @@ fn parse_image_resources(data: &[u8]) -> std::result::Result<Vec<Resource>, Pars
         let id = cursor.u16()?;
         let name_length = cursor.u8()? as usize;
         cursor.skip(name_length)?;
-        // The name is padded to an even length (`psdparse.h:246`).
+        // The name is padded to an even length (`psdparse.h:249`).
         if !(name_length + 1).is_multiple_of(2) {
             cursor.skip(1)?;
         }
@@ -1460,7 +1466,7 @@ fn parse_slices(data: &[u8]) -> std::result::Result<Option<SliceResource>, Parse
     Ok(Some(resource))
 }
 
-/// The layer-and-mask block (`psdparse.h:530-590`).
+/// The layer-and-mask block (`psdparse.h:538-580`).
 fn parse_layer_and_mask(
     data: &[u8],
     document: &mut PsdDocument,
@@ -1475,7 +1481,7 @@ fn parse_layer_and_mask(
     }
     // The 16/32-bit layer info repeat: the reference re-parses the same
     // grammar against the same document, appending a second copy of every
-    // layer and replacing the channel blob (`psdparse.h:552-557`).
+    // layer and replacing the channel blob (`psdparse.h:554-557`).
     if cursor.remaining() >= 12 {
         let rest = &cursor.data[cursor.position..];
         if &rest[..4] == b"8BIM" && (&rest[4..8] == b"Lr16" || &rest[4..8] == b"Lr32") {
@@ -1488,7 +1494,7 @@ fn parse_layer_and_mask(
     Ok(())
 }
 
-/// The layer info block (`psdparse.h:411-475`).
+/// The layer info block (`psdparse.h:409-475`).
 fn parse_layer_info(
     data: &[u8],
     document: &mut PsdDocument,
@@ -1586,7 +1592,7 @@ fn parse_extra_data(data: &[u8], layer: &mut Layer) {
         };
         if !signature_ok {
             // `8B64` blocks are refused with a note on stderr
-            // (`psdparse.cpp:168-173`).
+            // (`psdparse.cpp:169-172`).
             continue;
         }
         apply_additional(key, payload, layer);
@@ -1869,7 +1875,7 @@ fn decode_packbits(
             x += 1;
             let count = if opcode > 128 {
                 // A run of `257 - opcode` copies of the next byte
-                // (`psdimage.cpp:514-517`).
+                // (`psdimage.cpp:530-535`).
                 let count = 257 - usize::from(opcode);
                 let Some(&value) = source.get(line_data) else {
                     return read_bytes;
@@ -1884,7 +1890,7 @@ fn decode_packbits(
                 }
                 count
             } else if opcode < 128 {
-                // A literal run of `opcode + 1` bytes (`psdimage.cpp:518-523`).
+                // A literal run of `opcode + 1` bytes (`psdimage.cpp:536-540`).
                 let count = usize::from(opcode) + 1;
                 for index in 0..count {
                     let Some(&value) = source.get(line_data) else {
@@ -1926,7 +1932,7 @@ fn decode_zip_without_prediction(out: &mut [u8], source: &[u8]) -> bool {
     if filled != out.len() {
         return false;
     }
-    // The reference requires `Z_STREAM_END` (`psdimage.cpp:578`): one more
+    // The reference requires `Z_STREAM_END` (`psdimage.cpp:580`): one more
     // read must hit the end of the stream.
     let mut extra = [0u8; 1];
     matches!(decoder.read(&mut extra), Ok(0))
@@ -2013,7 +2019,7 @@ fn sample_high_byte(data: &[u8], index: usize, depth: i32) -> u8 {
         }
         32 => {
             // A big-endian float in [0, 1] scaled to 0..255
-            // (`rgbaCompoToRgba32<uint32_t>`, `psdimage.cpp:39-60`).
+            // (`rgbaCompoToRgba32<uint32_t>`, `psdimage.cpp:53-60`).
             let offset = index * 4;
             let bytes = [
                 data.get(offset + 3).copied().unwrap_or(0),
@@ -2091,7 +2097,7 @@ fn compose_layer_image(
     let mut planes = decode_layer_channels(document, layer, mode)?;
     if mode == ImageMode::Mask {
         // The mask plane is composed as a grayscale image
-        // (`psdimage.cpp:171-177`).
+        // (`psdimage.cpp:845-852`).
         planes.first_mut()?.id = 0;
     }
     if mode == ImageMode::MaskedImage {
@@ -2372,7 +2378,7 @@ fn split_name(name: &str) -> Option<(String, String)> {
     Some((domain.to_string(), path.to_string()))
 }
 
-/// The layer lookup maps `startStorage` builds (`psdclass.cpp:684-698`):
+/// The layer lookup maps `startStorage` builds (`psdclass.cpp:623-637`):
 /// layer id and `path/name` to a layer index.
 type LayerMaps = (
     BTreeMap<i32, usize>,
@@ -2521,10 +2527,16 @@ impl plugin_api::StorageMediaProvider for PsdMedia {
         bmp.extend_from_slice(&0u32.to_le_bytes());
         bmp.extend_from_slice(&0u32.to_le_bytes());
         // The reference writes the rows bottom-up through a negative pitch
-        // (`psdclass.cpp:809-810`); BMP files are bottom-up, and converting
-        // the engine's top-down RGBA plane is a row reversal.
+        // (`psdclass.cpp:809-810`) in `BGRA_LE` byte order (`psdbase.h:53`):
+        // a BI_RGB 32bpp BMP's bytes are B, G, R, A and its rows run
+        // bottom-up, which is what the engine's own BMP reader reverses
+        // (`resource_manager.rs`, `classes.rs`'s BMP writer emits the same
+        // order). The engine's plane is top-down RGBA, so each row is
+        // reversed and each pixel's R and B are swapped.
         for y in (0..height).rev() {
-            bmp.extend_from_slice(&pixels[y * pitch..(y + 1) * pitch]);
+            for pixel in pixels[y * pitch..(y + 1) * pitch].chunks_exact(4) {
+                bmp.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
         }
         Ok(Box::new(io::Cursor::new(bmp)))
     }
@@ -2632,7 +2644,7 @@ mod tests {
     }
 
     /// One image resource: `8BIM`, u16 id, empty name, u32 size, padded data
-    /// (`psdparse.h:241-260`).
+    /// (`psdparse.h:244-253`).
     fn image_resource(out: &mut Vec<u8>, id: u16, payload: &[u8]) {
         out.extend_from_slice(b"8BIM");
         be16(out, id);
@@ -3110,7 +3122,7 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    /// The `psd://` media (`main.cpp:98-135`, `psdclass.cpp:688-754`): the
+    /// The `psd://` media (`main.cpp:98-135`, `psdclass.cpp:657-754`): the
     /// root path walks the folder parents, the `id/` form addresses a layer
     /// by its `lyid`, and a missing layer is not found.
     #[test]
@@ -3147,8 +3159,9 @@ mod tests {
             "7.bmp,42.bmp,"
         );
 
-        // The bitmap is a 32-bit bottom-up BMP of the masked image; its first
-        // pixel is the *bottom* row of layer 0 (`psdclass.cpp:761-822`).
+        // The bitmap is a 32-bit bottom-up BMP in the reference's `BGRA_LE`
+        // order (`psdclass.cpp:809-810`, `psdbase.h:53`): the first pixel is
+        // the *bottom* row of layer 0, with its R and B bytes swapped.
         let storage = engine.host().project_storage().expect("storage");
         let bytes = storage
             .data("psd://fixture.psd/root/folder/背景.bmp")
@@ -3164,8 +3177,32 @@ mod tests {
             2
         );
         assert_eq!(u16::from_le_bytes([bytes[28], bytes[29]]), 32);
-        assert_eq!(&bytes[54..58], &[48, 112, 176, 255]);
-        assert_eq!(&bytes[58..62], &[64, 128, 192, 255]);
+        // Layer 0's bottom row is (R,G,B,A) (48,112,176,255) then
+        // (64,128,192,255); as B,G,R,A that is (176,112,48,255) then
+        // (192,128,64,255).
+        assert_eq!(&bytes[54..58], &[176, 112, 48, 255]);
+        assert_eq!(&bytes[58..62], &[192, 128, 64, 255]);
+
+        // End to end: the engine's own image loader reads that bitmap and the
+        // layer comes back with the original colours — layer 0's top row is
+        // (16,80,144) then (32,96,160) in the engine's RGBA plane. An RGBA
+        // bitmap here (the pre-fix byte order) would come back R/B swapped.
+        probe(
+            &mut engine,
+            "global.window = new Window();\n\
+             global.layer = new Layer(window, null);\n\
+             global.loaded = layer.loadImages(\"psd://fixture.psd/root/folder/背景.bmp\");\n\
+             return \"\" + loaded;",
+        );
+        let layer = engine
+            .tjs_runtime()
+            .global_member("layer")
+            .object_handle()
+            .expect("layer");
+        let (width, height, pixels) = read_layer(&mut engine, layer);
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(&pixels[0..4], &[16, 80, 144, 255]);
+        assert_eq!(&pixels[4..8], &[32, 96, 160, 255]);
 
         // A missing layer takes the media's own failure, whose message is the
         // reference's `%1:cannot open psdfile` (`main.cpp:124`). The media is
