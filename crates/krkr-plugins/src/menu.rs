@@ -116,15 +116,22 @@
 //!   synchronously and routes an escaping exception through the engine's event
 //!   boundary (`Runtime::process_unhandled_exception`), because a plugin
 //!   cannot reach the engine's event queue.
-//! * `root` / `window` — the parent-chain walks of `0x10006af0` / `0x10009990`
-//!   / `0x10009a50` over the engine's `parent` member. The engine has no
-//!   native `Window` field on an item, so an item counts as attached exactly
-//!   when the root is its owner-window's `menu` object — the shape
-//!   `TVPCreateMenuItemObject(window)` produces in the reference. Both getters
-//!   return self-bound objects, the reference's `tTJSVariant(dsp, dsp)` and
-//!   the shape `new MenuItem(…)`/`new Window()` values carry; the engine's own
-//!   `parent`/`owner`/`children` members are stored *unbound* (see the gap
-//!   list), so `item.root === item.parent` is false in this engine.
+//! * `root` — the parent-chain walk of `GetRootMenuItem` (`0x10006af0` /
+//!   `0x10009990`) over the engine's `parent` member; the item itself for a
+//!   root. Self-bound, the reference's `tTJSVariant(dsp, dsp)` and the shape
+//!   `new MenuItem(…)` values carry; the engine's own `parent`/`owner`/
+//!   `children` members are stored *unbound* (see the gap list), so
+//!   `item.root === item.parent` is false in this engine.
+//! * `window` (`0x10009a50`) — the item's **own** `Window` field (`+0x2c`,
+//!   `0x10009aa6 mov 0x2c(%eax),%eax`), no walk, and `AddChild`
+//!   (`0x10006f90`) writes only `Parent` (`+0x40`): a descendant's `window`
+//!   is void, exactly like the reference. The field is set only by the object
+//!   `TVPCreateMenuItemObject(window)` built; in this engine that object is
+//!   the window's `menu` member (owner = the window), which is the one shape
+//!   [`attached_window`] recognises. The engine materializes `window.menu`
+//!   without a class link (gap below), so in practice only that object would
+//!   ever answer — and it cannot be read from script until the engine links
+//!   it; `fireClick` still reaches it through its parent-chain gate.
 //! * `HMENU` — the reference type of an item with no native menu object
 //!   (`GetMenuItemHandleForPlugin` returns `NULL`, also the platform-less
 //!   port's constant result, `Kirikiroid2 …/MenuItemImpl.cpp:199-203`): 0.
@@ -352,9 +359,13 @@ fn menu_item_root(
     Ok(Variant::self_bound(root_of(runtime, item)))
 }
 
-/// `window` (`0x10009a50`): the `Window` an item was created for, read from
-/// the root the reference's `TVPCreateMenuItemObject(window)` produced —
-/// here, the window whose `menu` member is the root.
+/// `window` (`0x10009a50`): the item's **own** `Window` field (`+0x2c`,
+/// `0x10009aa6 mov 0x2c(%eax),%eax`) — no parent-chain walk, and
+/// `AddChild` (`0x10006f90`) writes only `Parent` (`+0x40`). The field is set
+/// only by the object `TVPCreateMenuItemObject(window)` built, so a
+/// descendant's `window` is void in the reference. The engine equivalent of
+/// that object is the window's `menu` member; `attached_window` recognises
+/// it per item.
 fn menu_item_window(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -634,14 +645,14 @@ fn root_of(runtime: &Runtime<KrkrHost>, item: ObjectHandle) -> ObjectHandle {
     root
 }
 
-/// The `Window` field of the reference's instance (`+0x2c`), which only the
-/// object `TVPCreateMenuItemObject(window)` built carries. The engine's
-/// `Window.menu` is that object: it is the window's `menu` member and its
-/// owner is the window, so the root of a tree counts as attached exactly
-/// then; every `new MenuItem(…)` stays detached like the reference's.
+/// The item's **own** `Window` field (reference `+0x2c`), which only the
+/// object `TVPCreateMenuItemObject(window)` built carries: no walk, exactly
+/// like the getter (`0x10009a50`). The engine's `Window.menu` object is that
+/// item — its owner is the window and the window's `menu` member is it — so
+/// it is the one object that answers the window; every `new MenuItem(…)`,
+/// descendants included, stays detached like the reference's.
 fn attached_window(runtime: &Runtime<KrkrHost>, item: ObjectHandle) -> Option<ObjectHandle> {
-    let root = root_of(runtime, item);
-    let owner = runtime.object_member(root, "owner").object_handle()?;
+    let owner = runtime.object_member(item, "owner").object_handle()?;
     if !runtime
         .object_class_infos(owner)
         .iter()
@@ -650,12 +661,15 @@ fn attached_window(runtime: &Runtime<KrkrHost>, item: ObjectHandle) -> Option<Ob
         return None;
     }
     let menu = runtime.object_member(owner, "menu").object_handle()?;
-    (menu == root).then_some(owner)
+    (menu == item).then_some(owner)
 }
 
 /// `CanDeliverEvents` (`0x10006f60`) and `OnClick`'s window walk
 /// (`0x10006dd8`): every ancestor including the item itself must be enabled,
-/// and the root must be attached to a window.
+/// and *some* item on the way to the root must carry its own `Window` field
+/// (`0x10006db0`: `while (!item->Window) item = item->Parent`). With the
+/// per-item [`attached_window`] that is the root's window for a descendant,
+/// which is why `fireClick` works on children while `child.window` is void.
 fn can_deliver_events(runtime: &Runtime<KrkrHost>, item: ObjectHandle) -> bool {
     let mut current = item;
     for _ in 0..64 {
@@ -667,7 +681,18 @@ fn can_deliver_events(runtime: &Runtime<KrkrHost>, item: ObjectHandle) -> bool {
             _ => break,
         }
     }
-    attached_window(runtime, item).is_some()
+
+    let mut current = item;
+    for _ in 0..64 {
+        if attached_window(runtime, current).is_some() {
+            return true;
+        }
+        match parent_of(runtime, current) {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -939,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn root_and_window_walk_the_engine_tree() {
+    fn root_walks_the_engine_tree_and_window_is_per_item() {
         let mut engine = engine();
         let source = "\
             var w = new Window(); \
@@ -949,25 +974,40 @@ mod tests {
             var leaf = new MenuItem(null, \"leaf\"); \
             mid.add(leaf); \
             var rooted = \"\" + (leaf.root === mid.root) + (mid.root === mid.root); \
-            var windowed = \"\" + (leaf.window === w) + (mid.window === w); \
+            var windowed = \"\" + (leaf.window === void) + (mid.window === void); \
             var loose = new MenuItem(null, \"loose\"); \
             var detached = \"\" + (loose.root === loose) + (loose.window === void); \
             var lonely = new MenuItem(null, \"lonely\"); \
             var childless = lonely.window === void; \
             return rooted + \"/\" + windowed + \"/\" + detached + \"/\" + childless;";
-        // `root` walks to the same object from every depth and `window` is the
-        // window of the attached root (self-bound, so it compares equal to the
-        // `new Window()` value); the reference's children carry no window of
-        // their own but reach it through the root walk, and a standalone item
-        // has none.
+        // `root` walks `parent` to the same object from every depth; `window`
+        // is the item's *own* field (`+0x2c`, `0x10009aa6`, no walk), so a
+        // descendant and a standalone item both answer void — exactly the
+        // reference, whose `AddChild` (`0x10006f90`) only writes `Parent`
+        // (`+0x40`).
         assert_eq!(script_text(&mut engine, source), "11/11/11/1");
+
+        // Only the object `TVPCreateMenuItemObject(window)` built carries the
+        // field; here that is the engine's `Window.menu` member. Exercise the
+        // per-item rule on it directly — its class-level members are not
+        // readable from script while the engine leaves it unlinked (see the
+        // module docs and the gap assertion below).
+        probe_tree(&mut engine);
+        let window = global_object(&mut engine, "__menuWindow");
+        let menu = global_object(&mut engine, "__menuRoot");
+        let item = global_object(&mut engine, "__menuItem");
+        {
+            let runtime = engine.tjs_runtime();
+            assert_eq!(super::attached_window(runtime, menu), Some(window));
+            assert_eq!(super::attached_window(runtime, item), None);
+            assert!(super::can_deliver_events(runtime, item));
+        }
 
         // The engine materializes `window.menu` without a class link (see the
         // module docs), so the class-level members this module adds are not
         // readable on the root object itself — only on `new MenuItem(…)`
         // instances. This pins that engine gap; fixing it means updating the
         // docs here.
-        probe_tree(&mut engine);
         assert_eq!(
             script_error(&mut engine, "return global.__menuRoot.root;").kind,
             TjsErrorKind::MemberNotFound
