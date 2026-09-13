@@ -4265,6 +4265,10 @@ impl KagSession {
     }
 }
 
+/// One `name=value` attribute of a `custom.ks` hook declaration. Values follow
+/// the reference tag parser (`KAGParser.cpp:2126-2152`): a quoted value runs to
+/// its matching quote, an unquoted one ends at the first whitespace or `]`.
+/// The native twin (`native::kag::kag_decl_attr`) reads the same spellings.
 fn hook_attr(command: &str, name: &str) -> Option<String> {
     let marker = format!("{name}=");
     let start = command.find(&marker)? + marker.len();
@@ -4274,7 +4278,11 @@ fn hook_attr(command: &str, name: &str) -> Option<String> {
         let end = body.find(quote).unwrap_or(body.len());
         return Some(body[..end].to_string());
     }
-    non_empty_string(rest.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ']' || ch == ';'))
+    non_empty_string(
+        rest.split(|ch: char| ch.is_whitespace() || ch == ']')
+            .next()
+            .unwrap_or_default(),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20880,6 +20888,61 @@ mod tests {
         close_park_modal(&mut engine);
         let tick = engine.tick().expect("retried system hook");
         assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["HOOK".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `hook_attr` reads one `name=value` attribute out of a `custom.ks`
+    /// declaration with the reference tag parser's value rules
+    /// (`KAGParser.cpp:2126-2152`): a quoted value runs to its matching quote,
+    /// an unquoted one ends at the first whitespace or `]`. The unquoted value
+    /// used to run to the end of the line minus the trailing bracket, so
+    /// `[addSysHook name=probe storage=hook.ks target=*probe]` keyed the hook
+    /// under `probe storage=hook.ks target=*probe` and `[syshook name=probe]`
+    /// never found it.
+    #[test]
+    fn hook_attr_reads_unquoted_values_to_the_first_delimiter() {
+        let quoted = "[addSysHook name=\"probe\" storage=\"hook.ks\" target=\"*probe\"]";
+        let unquoted = "[addSysHook name=probe storage=hook.ks target=*probe]";
+        for command in [quoted, unquoted] {
+            assert_eq!(hook_attr(command, "name"), Some("probe".to_string()));
+            assert_eq!(hook_attr(command, "storage"), Some("hook.ks".to_string()));
+            assert_eq!(hook_attr(command, "target"), Some("*probe".to_string()));
+        }
+
+        // The shipped games' spelling (`custom.ks:46` of PARQUET): the bare
+        // `call` flag sits between the name and the storage, and `target` is
+        // the last attribute, so only the name exposes the whole-remainder
+        // fallback.
+        let game = "[addSysHook   name=first.logo  call storage=custom.ks target=*logo]";
+        assert_eq!(hook_attr(game, "name"), Some("first.logo".to_string()));
+        assert_eq!(hook_attr(game, "storage"), Some("custom.ks".to_string()));
+        assert_eq!(hook_attr(game, "target"), Some("*logo".to_string()));
+        assert_eq!(hook_attr(game, "missing"), None);
+        assert_eq!(hook_attr("[addSysHook name=]", "name"), None);
+    }
+
+    /// A hook declared with the reference's unquoted spelling registers under
+    /// its own name, so the engine-driven `[syshook]` finds it and enters the
+    /// hook scenario. Before the tokenisation fix the tag silently continued
+    /// (the message layer stayed empty and the session finished).
+    #[test]
+    fn kag_syshook_fires_for_an_unquoted_declaration() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[syshook name=probe][s]").expect("write scenario");
+        fs::write(
+            root.join("custom.ks"),
+            "[addSysHook name=probe storage=hook.ks target=*probe]",
+        )
+        .expect("write hook declarations");
+        fs::write(root.join("hook.ks"), "*probe\nHOOK[s]").expect("write hook scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .tick()
+            .expect("an unquoted hook declaration must register");
         assert_eq!(engine.message_layer().lines, vec!["HOOK".to_string()]);
         fs::remove_dir_all(root).expect("cleanup");
     }
