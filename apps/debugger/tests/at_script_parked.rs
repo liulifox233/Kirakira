@@ -63,10 +63,45 @@ fn a_parked_vm_waits_for_the_script_and_fails_if_it_never_runs() {
     );
 
     assert!(out.contains("at-frame script frame=40 deferred"), "{out}");
-    assert!(out.contains("script for frame=40 never ran"), "{out}");
+    assert!(
+        out.contains("script for frame=40 never ran: vm-suspended"),
+        "{out}"
+    );
     assert!(out.contains("expression_error=vm-suspended"), "{out}");
     assert!(out.contains("injection=error"), "{out}");
     assert!(!out.contains("expression=\"RAN\""), "{out}");
+    assert_eq!(code, Some(1), "{out}");
+}
+
+/// A request the run never reaches is a miss too, but its cause is the frame
+/// budget, not a parked VM: `--at-frame 100` under `--max-frames 60` on a root
+/// whose VM never parks must say so (the reviewed P2 -- the message used to
+/// claim `vm-suspended` without checking the VM).
+#[test]
+fn a_request_the_run_never_reaches_names_the_frame_budget() {
+    let root = scratch_root("at-script-budget", RUNNING_STARTUP);
+    let (out, code) = run_probe(
+        &root,
+        &[
+            "--at-frame",
+            "100",
+            "--at-script",
+            r#"global.__m181mark = "RAN";"#,
+            "--expr",
+            "global.__m181mark",
+        ],
+    );
+
+    assert!(out.contains("script for frame=100 never ran"), "{out}");
+    assert!(
+        out.contains("the frame budget (--max-frames 60) ended first"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("vm-suspended"),
+        "the budget miss must not blame the VM: {out}"
+    );
+    assert!(out.contains("injection=error"), "{out}");
     assert_eq!(code, Some(1), "{out}");
 }
 

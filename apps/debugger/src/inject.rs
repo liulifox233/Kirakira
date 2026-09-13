@@ -10,11 +10,12 @@
 //! So injection never enters a parked VM. An `--at-frame N --at-script`
 //! request whose frame arrives while the VM is parked stays queued and runs
 //! on the first frame where the VM runs again, in request order, printing the
-//! frame it actually ran at. A request that never gets such a frame inside
-//! the frame budget is reported by [`AtFrameScripts::unfinished`] and fails
-//! the run. The interactive console handles the same situation by handing its
-//! operator the diagnosis and letting them advance frames and retry; this is
-//! the batch-tool form of that retry.
+//! frame it actually ran at. A request that never runs before the run ends is
+//! reported by [`AtFrameScripts::unfinished`] with the cause that applies --
+//! the park outlived the run, or the frame budget ended before the frame
+//! arrived -- and fails the run. The interactive console handles the same
+//! situation by handing its operator the diagnosis and letting them advance
+//! frames and retry; this is the batch-tool form of that retry.
 
 use krkr_engine::KrkrEngine;
 
@@ -54,6 +55,18 @@ struct AtScriptRequest {
     script: String,
     done: bool,
     deferral_reported: bool,
+}
+
+/// An `--at-frame`/`--at-script` request the run ended without running, and
+/// the cause the message must name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtScriptUnfinished {
+    /// The requested frame arrived while the VM was parked, and the VM never
+    /// gave the script a running frame again -- the park outlived the run.
+    VmStayedParked { requested_frame: usize },
+    /// The run ended before the requested frame was reached; no park was ever
+    /// involved. The frame budget is the cause to name, not the VM.
+    BudgetEnded { requested_frame: usize },
 }
 
 /// The `--at-frame`/`--at-script` queue with its parked-VM deferral.
@@ -113,13 +126,23 @@ impl AtFrameScripts {
         outcomes
     }
 
-    /// The frames of requests still waiting for a running VM (the frame
-    /// budget ended first). The caller reports them and fails the run.
-    pub fn unfinished(&self) -> impl Iterator<Item = usize> + '_ {
+    /// The requests still waiting when the run ends, each with the cause that
+    /// actually applies. The caller reports them and fails the run.
+    pub fn unfinished(&self) -> impl Iterator<Item = AtScriptUnfinished> + '_ {
         self.requests
             .iter()
             .filter(|request| !request.done)
-            .map(|request| request.frame)
+            .map(|request| {
+                if request.deferral_reported {
+                    AtScriptUnfinished::VmStayedParked {
+                        requested_frame: request.frame,
+                    }
+                } else {
+                    AtScriptUnfinished::BudgetEnded {
+                        requested_frame: request.frame,
+                    }
+                }
+            })
     }
 }
 
@@ -189,11 +212,17 @@ mod tests {
             vec![AtScriptOutcome::Deferred { requested_frame: 5 }]
         );
         assert_eq!(trace(&engine), Variant::String(String::new()));
-        assert_eq!(scripts.unfinished().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(
+            scripts.unfinished().collect::<Vec<_>>(),
+            vec![AtScriptUnfinished::VmStayedParked { requested_frame: 5 }]
+        );
 
         // A second parked frame repeats nothing (one notice per request).
         assert!(scripts.inject(&mut engine, 6).is_empty());
-        assert_eq!(scripts.unfinished().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(
+            scripts.unfinished().collect::<Vec<_>>(),
+            vec![AtScriptUnfinished::VmStayedParked { requested_frame: 5 }]
+        );
 
         resume(&mut engine);
         let outcomes = scripts.inject(&mut engine, 7);
@@ -207,6 +236,35 @@ mod tests {
         );
         assert_eq!(trace(&engine), Variant::String("A".to_string()));
         assert_eq!(scripts.unfinished().count(), 0);
+    }
+
+    /// The unfinished reason must be the cause that actually applies: a miss
+    /// whose frame arrived while parked is the park; a miss whose frame the
+    /// run never reached is the frame budget (the reviewed P2: the budget case
+    /// was reported as `vm-suspended` without checking the VM at all).
+    #[test]
+    fn the_unfinished_reason_names_the_park_or_the_frame_budget() {
+        let mut engine = parked_engine();
+        let mut scripts = AtFrameScripts::new(vec![
+            (5, r#"global.__m181trace += "A";"#.to_string()),
+            (50, r#"global.__m181trace += "B";"#.to_string()),
+        ]);
+
+        // Frame 5 arrives while the VM is parked: that miss is the park.
+        assert_eq!(
+            scripts.inject(&mut engine, 5),
+            vec![AtScriptOutcome::Deferred { requested_frame: 5 }]
+        );
+        // The run then ends at frame 20, before frame 50 ever arrives.
+        assert_eq!(
+            scripts.unfinished().collect::<Vec<_>>(),
+            vec![
+                AtScriptUnfinished::VmStayedParked { requested_frame: 5 },
+                AtScriptUnfinished::BudgetEnded {
+                    requested_frame: 50
+                },
+            ]
+        );
     }
 
     /// A deferred request keeps its place in the queue: once the VM resumes,

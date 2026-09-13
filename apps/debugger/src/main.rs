@@ -126,7 +126,7 @@
 
 use krkr_debug::{
     console::*,
-    inject::{AtFrameScripts, AtScriptOutcome, VM_SUSPENDED},
+    inject::{AtFrameScripts, AtScriptOutcome, AtScriptUnfinished, VM_SUSPENDED},
     snapshot,
 };
 
@@ -469,6 +469,28 @@ fn global_member_path(runtime: &Runtime<KrkrHost>, name: &str) -> Variant {
     current
 }
 
+/// Names every `--at-frame`/`--at-script` request the run ended without
+/// running, with the cause the queue recorded: the VM stayed parked at the
+/// request's frame, or the frame budget ended before that frame arrived.
+/// Returns true when something was reported, so the normal end of the run can
+/// exit non-zero; the deliberate terminations (an interactive `q`, a debugger
+/// quit) only report -- their exit code stays what it was.
+fn report_unfinished_at_scripts(scripts: &AtFrameScripts, max_frames: usize) -> bool {
+    let mut any = false;
+    for unfinished in scripts.unfinished() {
+        match unfinished {
+            AtScriptUnfinished::VmStayedParked { requested_frame } => println!(
+                "at-frame error: script for frame={requested_frame} never ran: {VM_SUSPENDED}"
+            ),
+            AtScriptUnfinished::BudgetEnded { requested_frame } => println!(
+                "at-frame error: script for frame={requested_frame} never ran: the frame budget (--max-frames {max_frames}) ended first"
+            ),
+        }
+        any = true;
+    }
+    any
+}
+
 fn main() {
     let config = parse_args();
     let root = config
@@ -701,6 +723,7 @@ fn main() {
                         &mut interactive_auto_click,
                         &mut interactive_auto_point,
                     ) {
+                        report_unfinished_at_scripts(&at_scripts, config.max_frames);
                         dump_stub_calls(runtime.engine());
                         return;
                     }
@@ -738,6 +761,7 @@ fn main() {
                             &mut interactive_auto_click,
                             &mut interactive_auto_point,
                         ) {
+                            report_unfinished_at_scripts(&at_scripts, config.max_frames);
                             dump_stub_calls(runtime.engine());
                             return;
                         }
@@ -1044,6 +1068,7 @@ fn main() {
             }
             Err(error) if error.is_debug_quit() => {
                 println!("debug session terminated at frame={frame_index}");
+                report_unfinished_at_scripts(&at_scripts, config.max_frames);
                 dump_stub_calls(runtime.engine());
                 return;
             }
@@ -1059,11 +1084,10 @@ fn main() {
         }
     }
 
-    // An injection that never found a running VM inside the frame budget is a
-    // failed probe: name every one of them (the run ends non-zero below)
+    // An injection the run never got to is a failed probe: name every one of
+    // them with the cause the queue recorded (the run ends non-zero below)
     // instead of leaving a silent gap where the script should have run.
-    for requested_frame in at_scripts.unfinished() {
-        println!("at-frame error: script for frame={requested_frame} never ran: {VM_SUSPENDED}");
+    if report_unfinished_at_scripts(&at_scripts, config.max_frames) {
         injection_failed = true;
     }
 
