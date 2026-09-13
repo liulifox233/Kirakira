@@ -2985,6 +2985,25 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
+    /// The `this` a getter/setter runs with, i.e. the reference's
+    /// `TJS_SELECT_OBJTHIS(tvclosure, objthis)` (`tjsObject.h:81-82`, used by
+    /// `TJSDefaultPropGet` and `TJSDefaultPropSet`, `tjsObject.cpp:1364`,
+    /// `:1452`): the receiver value's own ObjThis wins, and the reading
+    /// frame's `this` is the fallback for a value that carries none.  The
+    /// class-chain case below keeps this tree's handling of a member a class
+    /// object handed to an instance: such a value runs on the instance.
+    ///
+    /// A global *property* carries the global as its ObjThis: a top-level
+    /// declaration installs it with the reference's prologue
+    /// `const %1, #prop; chgthis %1, %-1; spds %-1.#name, %1`
+    /// (`tjsInterCodeGen.cpp:747-781`, `changethis` set for
+    /// `ctProperty` at `:946`), so `global.prop` read from a frame whose
+    /// `this` is something else must still run the getter on the global.
+    /// Answering the reading frame's `this` instead makes the getter's
+    /// this-proxy start at that object, where a `Dictionary` (for example
+    /// KAG's UI part tables) answers every unqualified global name it does not
+    /// hold with `void` (`tjsDictionary.cpp:734-745`), so the getter reads
+    /// void where the global holds the value.
     fn effective_member_this(
         &mut self,
         closure_this: Option<ObjectHandle>,
@@ -2997,9 +3016,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Ok(closure_this.or(Some(caller_this)));
         }
         if let Some(closure_this) = closure_this {
-            if closure_this == self.runtime.global
-                || self.is_class_in_instance_chain(caller_this, closure_this)?
-            {
+            if self.is_class_in_instance_chain(caller_this, closure_this)? {
                 return Ok(Some(caller_this));
             }
             return Ok(Some(closure_this));
