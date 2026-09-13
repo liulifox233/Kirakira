@@ -6680,11 +6680,15 @@ fn layer_piled_copy(
             height,
         );
     }
-    mutate_layer_pixels_min(
+    // The pile lands in the layer's *existing* `MainImage`; a copy whose
+    // rectangle reaches past it is clipped by `tTVPBaseBitmap::CopyRect`'s
+    // bound check and the pixels outside the rectangle keep their content
+    // (`LayerBitmapIntf.cpp:689-745`). The bitmap never grows here: it only
+    // changes size through `setImageSize`, `setSize` (`ImageLayerSizeChanged`,
+    // `LayerIntf.cpp:2388`) and image loads.
+    mutate_layer_pixels(
         runtime,
         &dest_target,
-        dest_min_extent(copy_x, width),
-        dest_min_extent(copy_y, height),
         |pixels, image_width, image_height| {
             let dest_stride = image_width as usize * 4;
             let pile_stride = width as usize * 4;
@@ -6858,23 +6862,19 @@ fn stretch_copy_impl(
     let hold_alpha = layer_holds_alpha(runtime, this);
     let clip = layer_clip_bounds(runtime, &dest_target);
     let stretch_type = blend::stretch_type_from_i64(raw_stretch_type);
-    // A mirrored request covers `[dx + dw, dx)`, so the image has to reach
-    // `dx` rather than `dx + dw`.
-    let min_x = if dest_width < 0 {
-        dx
-    } else {
-        dx.saturating_add(dest_width)
-    };
-    let min_y = if dest_height < 0 {
-        dy
-    } else {
-        dy.saturating_add(dest_height)
-    };
-    mutate_layer_pixels_min(
+    // `MainImage->StretchBlt(ClipRect, destrect, src, srcrect, ...)`
+    // (`LayerIntf.cpp:4248`/`:4256`) resamples into the layer's *existing*
+    // bitmap: `tTVPBaseBitmap::StretchBlt` folds the clip rectangle onto the
+    // bitmap and hands it to the resampler (`LayerBitmapIntf.cpp:1849-1875`),
+    // and the bitmap only changes size through `setImageSize`, `setSize`
+    // (`ImageLayerSizeChanged`, `LayerIntf.cpp:2388`) and image loads. A
+    // stretch that reaches past the bitmap is clipped; nothing outside the
+    // destination rectangle is touched. A mirrored request (`dw < 0`) is
+    // clipped the same way (`TVPIntersectRect` with the swapped rectangle,
+    // `:4236-4239`).
+    mutate_layer_pixels(
         runtime,
         &dest_target,
-        dest_min_extent(min_x, 0),
-        dest_min_extent(min_y, 0),
         |pixels, image_width, image_height| {
             stretch_copy_pixels(
                 pixels,
@@ -10762,14 +10762,6 @@ fn stretch_copy_pixels(
     }
 }
 
-fn dest_min_extent(offset: i64, length: i64) -> u32 {
-    offset
-        .saturating_add(length)
-        .clamp(1, u32::MAX as i64)
-        .try_into()
-        .unwrap_or(u32::MAX)
-}
-
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn clipped_copy_rect(
@@ -12677,6 +12669,143 @@ mod tests {
             (0..8).any(|x| (0..60).any(|y| pixel(x, y) != [0xff, 0xff, 0xff, 0xff])),
             "the clipped draw painted nothing"
         );
+    }
+
+    /// No blit changes the destination's image size: `PiledCopy` copies into
+    /// the layer's *existing* `MainImage`
+    /// (`MainImage->CopyRect(dx, dy, bmp, rect, TVP_BB_COPY_MAIN|TVP_BB_COPY_MASK)`,
+    /// `LayerIntf.cpp:4120-4122`), whose size only moves through
+    /// `setImageSize`/`setSize`/`LoadImages` (`ImageLayerSizeChanged`
+    /// `LayerIntf.cpp:2388`, called from `InternalSetSize` `:1981`). A copy
+    /// whose rectangle reaches past the bitmap is clipped by
+    /// `tTVPBaseBitmap::CopyRect`'s bound check (`LayerBitmapIntf.cpp:689-745`),
+    /// and everything outside it keeps its pixels. Our old `piledCopy` grew the
+    /// 10x10 destination to 15x15 for the first copy and to 25x25 for the
+    /// second, dropping every pixel the copies did not touch (the grown plane
+    /// was zero-filled).
+    #[test]
+    fn layer_piled_copy_clips_into_the_existing_image() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.visible = true;
+                source.setImageSize(20, 20);
+                source.fillRect(0, 0, 20, 20, 0xff336699);
+
+                var dest = new Layer();
+                dest.setImageSize(10, 10);
+                dest.fillRect(0, 0, 10, 10, 0xffff0000);
+
+                var before = dest.imageWidth + "x" + dest.imageHeight + ":" +
+                    dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0);
+                // (5, 5) + 10x10 reaches 15x15 on a 10x10 bitmap.
+                dest.piledCopy(5, 5, source, 0, 0, 10, 10);
+                var after = dest.imageWidth + "x" + dest.imageHeight + ":" +
+                    dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
+                    dest.getMainPixel(9, 9) + ":" + dest.getMaskPixel(9, 9);
+                // (15, 15) + 10x10 reaches 25x25: entirely outside the bitmap.
+                dest.piledCopy(15, 15, source, 0, 0, 10, 10);
+                var outside = dest.imageWidth + "x" + dest.imageHeight + ":" +
+                    dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
+                    dest.getMainPixel(9, 9) + ":" + dest.getMaskPixel(9, 9);
+                return before + "|" + after + "|" + outside;
+                "#,
+            )
+            .expect("script");
+        // 0x336699 = 3368601: the pixels the first copy reaches took the
+        // source, the ones outside its rectangle keep the fill the layer
+        // started with, and the far copy changes nothing at all.
+        assert_eq!(
+            value,
+            Variant::String(
+                "10x10:16711680:255|10x10:16711680:255:3368601:255|10x10:16711680:255:3368601:255"
+                    .to_string()
+            )
+        );
+    }
+
+    /// The `stretchCopy` half of the same rule: `StretchCopy` intersects the
+    /// destination rectangle with the layer's `ClipRect` and then resamples
+    /// into `MainImage` with `MainImage->StretchBlt(ClipRect, destrect, src,
+    /// srcrect, bmCopy, 255, HoldAlpha, type, typeopt)`
+    /// (`LayerIntf.cpp:4232-4273`); `tTVPBaseBitmap::StretchBlt` folds the clip
+    /// rectangle onto the bitmap and never resizes it
+    /// (`LayerBitmapIntf.cpp:1849-1875`), so a stretch that reaches past a
+    /// 10x10 image stays 10x10 and loses nothing outside its rectangle.
+    #[test]
+    fn layer_stretch_copy_clips_into_the_existing_image() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                var source = new Layer();
+                source.visible = true;
+                source.setImageSize(20, 20);
+                source.fillRect(0, 0, 20, 20, 0xff336699);
+
+                var dest = new Layer();
+                dest.setImageSize(10, 10);
+                dest.fillRect(0, 0, 10, 10, 0xffff0000);
+
+                var before = dest.imageWidth + "x" + dest.imageHeight + ":" +
+                    dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0);
+                dest.stretchCopy(5, 5, 10, 10, source, 0, 0, 20, 20, stNearest);
+                var after = dest.imageWidth + "x" + dest.imageHeight + ":" +
+                    dest.getMainPixel(0, 0) + ":" + dest.getMaskPixel(0, 0) + ":" +
+                    dest.getMainPixel(9, 9) + ":" + dest.getMaskPixel(9, 9);
+                return before + "|" + after;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("10x10:16711680:255|10x10:16711680:255:3368601:255".to_string())
+        );
+    }
+
+    /// The one case these two blits *do* refuse: a destination whose
+    /// `MainImage` is gone. `PiledCopy` (`LayerIntf.cpp:4111`), `StretchCopy`
+    /// (`:4245`/`:4253`) and `OperateStretch` (`:4417`/`:4423`) all throw
+    /// `TVPNotDrawableLayerType` before they look at any rectangle, so a freed
+    /// bitmap is not resurrected by a blit that would have fit it.
+    /// `OperateStretch` (`:4417`) takes the same check for the operation-mode
+    /// entry points of the same resampler.
+    #[test]
+    fn layer_blits_without_a_destination_image_throw_not_drawable_layer_type() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                global.dest = new Layer();
+                dest.setImageSize(2, 2);
+                dest.freeImage();
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "dest.piledCopy(0, 0, source, 0, 0, 8, 8);",
+            "dest.stretchCopy(0, 0, 8, 8, source, 0, 0, 2, 2, stNearest);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("a freed destination image is not drawable");
+            assert_eq!(error.message, "Not drawable layer type", "{call}");
+        }
     }
 
     fn global_object(engine: &crate::KrkrEngine, name: &str) -> krkr_tjs2::runtime::ObjectHandle {
