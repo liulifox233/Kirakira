@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 use fontdb::{Database, Family, Query, Source, Stretch, Style as FontStyle, Weight};
 pub use krkr_core::{FontSpec, ShadowStyle, TextStyle};
 use swash::{
-    FontRef,
+    FontRef, StringId,
     scale::{Render, ScaleContext, Source as GlyphSource, StrikeWith, image::Content},
     shape::ShapeContext,
     zeno::{Format, Vector},
@@ -219,14 +219,209 @@ fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// One entry of a game's `embfontlist.tjs`: the name scenarios ask for, the
+/// storage the font file lives in, and the face name the table declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedFontEntry {
+    pub name: String,
+    pub file: String,
+    pub face: String,
+}
+
+/// Parses the `(const)%[ "name"=>..., "file"=>..., "face"=>... ]` dictionaries
+/// that KAG games ship as `embfontlist.tjs`. The table is TJS source rather
+/// than data, so the parser only collects quoted `key => "value"` pairs out of
+/// every `%[ ... ]` dictionary and keeps the ones that name a font file.
+pub fn parse_embedded_font_list(text: &str) -> Vec<EmbeddedFontEntry> {
+    let mut entries = Vec::new();
+    for block in tjs_dictionary_blocks(text) {
+        let fields = tjs_string_pairs(block);
+        let Some(file) = string_pair(&fields, "file") else {
+            continue;
+        };
+        let Some(name) = string_pair(&fields, "name") else {
+            continue;
+        };
+        entries.push(EmbeddedFontEntry {
+            name,
+            file,
+            face: string_pair(&fields, "face").unwrap_or_default(),
+        });
+    }
+    entries
+}
+
+/// Parses the plain `"alias" => "name"` pairs of `deffontmap.tjs`; nested
+/// dictionaries (the language tables) contribute their own string pairs, which
+/// is exactly the alias set the table defines.
+pub fn parse_font_alias_pairs(text: &str) -> Vec<(String, String)> {
+    tjs_string_pairs(text)
+        .into_iter()
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .collect()
+}
+
+fn string_pair(pairs: &[(String, String)], key: &str) -> Option<String> {
+    pairs
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+}
+
+fn tjs_dictionary_blocks(text: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find("%[") {
+        let start = cursor + offset + 1;
+        let mut depth = 0usize;
+        let mut index = start;
+        for (position, ch) in text[start..].char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        index = start + position;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            break;
+        }
+        blocks.push(&text[start..index]);
+        cursor = index + 1;
+    }
+    blocks
+}
+
+fn tjs_string_pairs(text: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(offset) = text[cursor..].find('"') else {
+            break;
+        };
+        let key_start = cursor + offset;
+        let Some((key, after_key)) = tjs_quoted_string(text, key_start) else {
+            cursor = key_start + 1;
+            continue;
+        };
+        let rest = &text[after_key..];
+        let mut arrow = rest.trim_start();
+        if let Some(stripped) = arrow.strip_prefix('=') {
+            arrow = stripped.trim_start();
+            if let Some(stripped) = arrow.strip_prefix('>') {
+                let value_offset = after_key + (rest.len() - stripped.len());
+                let value_start = text[value_offset..]
+                    .find('"')
+                    .map(|offset| value_offset + offset);
+                let Some(value_start) = value_start else {
+                    break;
+                };
+                if let Some((value, after_value)) = tjs_quoted_string(text, value_start) {
+                    pairs.push((key, value));
+                    cursor = after_value;
+                    continue;
+                }
+            }
+        }
+        cursor = after_key;
+    }
+    pairs
+}
+
+fn tjs_quoted_string(text: &str, start: usize) -> Option<(String, usize)> {
+    let mut chars = text[start..].char_indices();
+    if chars.next().map(|(_, ch)| ch) != Some('"') {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    for (position, ch) in chars {
+        if escaped {
+            value.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some((value, start + position + ch.len_utf8())),
+            _ => value.push(ch),
+        }
+    }
+    None
+}
+
+/// Lowercased lookup key for a font name; the reference resolves names through
+/// the platform font table, which is case-insensitive.
+fn face_name_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+const REGION_TOKENS: [&str; 6] = ["jp", "sc", "tc", "kr", "cn", "hk"];
+const REGION_LETTERS: [&str; 2] = ["j", "k"];
+
+/// A name with its regional-variant token removed (`Source Han Sans SC Bold`
+/// and `Source Han Sans JP Bold` both reduce to their region-free form), so a
+/// game table can name a face the shipped font does not carry under that
+/// regional spelling. `None` when the name carries no region token.
+fn region_free_key(name: &str) -> Option<String> {
+    let key = face_name_key(name).replace(['-', '_'], " ");
+    let mut tokens = Vec::new();
+    let mut removed = false;
+    for token in key.split_whitespace() {
+        if REGION_TOKENS.contains(&token) || REGION_LETTERS.contains(&token) {
+            removed = true;
+            continue;
+        }
+        // File stems glue the region onto the family ("sourcehansansjp"), so a
+        // multi-letter token may also end with one.
+        let mut token = token.to_string();
+        for region in REGION_TOKENS {
+            if token.len() > region.len() && token.ends_with(region) {
+                token.truncate(token.len() - region.len());
+                removed = true;
+                break;
+            }
+        }
+        tokens.push(token);
+    }
+    if removed && !tokens.is_empty() {
+        Some(tokens.join(" "))
+    } else {
+        None
+    }
+}
+
+/// Basename of a file with its extension dropped and lowercased. No region
+/// handling, so two regional variants of one family stay distinct.
+fn stem_key(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = base.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(base);
+    stem.trim().to_lowercase()
+}
+
+/// Key for matching a file cited by a game table against a loaded storage when
+/// the named file is not shipped: the directory and extension are dropped and
+/// the region token ignored, so the shipped regional variant of the same family
+/// answers for it.
+fn file_key(name: &str) -> String {
+    let stem = stem_key(name);
+    region_free_key(&stem).unwrap_or(stem)
+}
+
 #[derive(Debug)]
 pub struct FontSystem {
     db: Database,
     named_file_faces: BTreeMap<String, Vec<fontdb::ID>>,
+    embedded_fonts: Vec<EmbeddedFontEntry>,
+    font_aliases: Vec<(String, String)>,
+    loaded_face_names: BTreeMap<String, fontdb::ID>,
     prerendered_fonts: BTreeMap<PrerenderedFontKey, PrerenderedFont>,
     primary_faces: RefCell<BTreeMap<FaceSelectionKey, Option<fontdb::ID>>>,
-    char_faces: RefCell<BTreeMap<CharFaceSelectionKey, Option<fontdb::ID>>>,
-    recent_fallback_faces: RefCell<BTreeMap<FaceSelectionKey, fontdb::ID>>,
     glyph_ids: RefCell<BTreeMap<(FontFaceKey, char), Option<u16>>>,
     face_metrics: RefCell<BTreeMap<FaceMetricsKey, swash::Metrics>>,
     glyph_images: RefCell<BTreeMap<RenderedGlyphKey, Arc<GlyphImage>>>,
@@ -244,10 +439,11 @@ impl Clone for FontSystem {
         Self {
             db: self.db.clone(),
             named_file_faces: self.named_file_faces.clone(),
+            embedded_fonts: self.embedded_fonts.clone(),
+            font_aliases: self.font_aliases.clone(),
+            loaded_face_names: self.loaded_face_names.clone(),
             prerendered_fonts: self.prerendered_fonts.clone(),
             primary_faces: RefCell::new(BTreeMap::new()),
-            char_faces: RefCell::new(BTreeMap::new()),
-            recent_fallback_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
@@ -271,10 +467,11 @@ impl FontSystem {
         Self {
             db,
             named_file_faces: BTreeMap::new(),
+            embedded_fonts: Vec::new(),
+            font_aliases: Vec::new(),
+            loaded_face_names: BTreeMap::new(),
             prerendered_fonts: BTreeMap::new(),
             primary_faces: RefCell::new(BTreeMap::new()),
-            char_faces: RefCell::new(BTreeMap::new()),
-            recent_fallback_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
@@ -283,14 +480,62 @@ impl FontSystem {
     }
 
     pub fn families(&self) -> Vec<String> {
-        let mut names = self
-            .db
-            .faces()
-            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
-            .collect::<Vec<_>>();
+        let mut names = Vec::new();
+        for face in self.db.faces() {
+            names.extend(face.families.iter().map(|(name, _)| name.clone()));
+            let mut table_names = Vec::new();
+            self.with_font(face.id, |font| {
+                collect_face_names(font, &mut table_names, false);
+                Some(())
+            });
+            names.extend(table_names);
+        }
         names.sort();
         names.dedup();
         names
+    }
+
+    /// Registers the embedded-font table a game ships (`embfontlist.tjs`), so
+    /// the names scenarios ask for resolve to the fonts `System.addFont`
+    /// actually loaded.
+    pub fn register_embedded_font_list(&mut self, entries: Vec<EmbeddedFontEntry>) {
+        // A build can carry the list twice (patch and data archives) with the
+        // same names but a different face spelling for an entry — GINKA's JP
+        // font is `Source Han Sans JP Bold` in one and `源ノ角ゴシック JP Bold`
+        // in the other — so keep both spellings and drop only exact duplicates.
+        // The first table read still wins, like the archive priority the game
+        // loader sees.
+        for entry in entries {
+            let known = self.embedded_fonts.iter().any(|existing| {
+                existing.name == entry.name
+                    && existing.file == entry.file
+                    && existing.face == entry.face
+            });
+            if !known {
+                self.embedded_fonts.push(entry);
+            }
+        }
+        self.clear_caches();
+    }
+
+    /// Registers the `"alias" => "name"` pairs of a game's `deffontmap.tjs`.
+    pub fn register_font_aliases(&mut self, aliases: Vec<(String, String)>) {
+        for (alias, target) in aliases {
+            if !self.font_aliases.iter().any(|(name, _)| *name == alias) {
+                self.font_aliases.push((alias, target));
+            }
+        }
+        self.clear_caches();
+    }
+
+    /// `register_embedded_font_list` on the table's source text.
+    pub fn register_embedded_font_list_text(&mut self, text: &str) {
+        self.register_embedded_font_list(parse_embedded_font_list(text));
+    }
+
+    /// `register_font_aliases` on the table's source text.
+    pub fn register_font_alias_text(&mut self, text: &str) {
+        self.register_font_aliases(parse_font_alias_pairs(text));
     }
 
     pub fn load_font_data(&mut self, name: impl Into<String>, data: Vec<u8>) -> Result<(), String> {
@@ -302,10 +547,33 @@ impl FontSystem {
         if ids.is_empty() {
             return Err(format!("font `{name}` did not contain a supported face"));
         }
-        self.named_file_faces
-            .insert(name, ids.into_iter().collect());
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        for id in &ids {
+            self.index_face_names(*id);
+        }
+        self.named_file_faces.insert(name, ids);
         self.clear_caches();
         Ok(())
+    }
+
+    /// Records every name the face's name table carries, so a request for a
+    /// legacy family name (`Source Han Sans SC Bold`), a localized name
+    /// (`思源黑体`) or a PostScript name can find the face even though
+    /// `fontdb` only indexes one family per face.
+    fn index_face_names(&mut self, face: fontdb::ID) {
+        let mut names = Vec::new();
+        self.with_font(face, |font| {
+            collect_face_names(font, &mut names, true);
+            Some(())
+        });
+        for name in names {
+            self.loaded_face_names
+                .entry(face_name_key(&name))
+                .or_insert(face);
+            if let Some(key) = region_free_key(&name) {
+                self.loaded_face_names.entry(key).or_insert(face);
+            }
+        }
     }
 
     pub fn map_prerendered_font(
@@ -382,14 +650,9 @@ impl FontSystem {
             });
         }
         let primary_face = self.select_primary_face(spec)?;
-        let face = if self.face_supports(primary_face, ch) {
-            primary_face
-        } else {
-            self.select_face_for_char(spec, ch, primary_face)
-                .unwrap_or(primary_face)
-        };
+        let face = primary_face;
         let glyph_id = self
-            .glyph_id(face, ch)
+            .glyph_id(face, self.char_for_face(face, ch))
             .or_else(|| self.tofu_glyph_id(face))?;
         let image = self.render_glyph(face, spec, glyph_id, 0.0, 0.0)?;
         Some(GlyphDrawRect {
@@ -490,48 +753,38 @@ impl FontSystem {
         let mut max_width = 0.0_f32;
         let mut lines = 1_u32;
         let mut run = String::new();
-        let mut run_face = primary_face;
 
-        let flush_run = |run: &mut String,
-                         run_face: fontdb::ID,
-                         pen_x: &mut f32,
-                         pen_y: f32,
-                         glyphs: &mut Vec<PositionedGlyph>| {
-            if run.is_empty() {
-                return;
-            }
-            self.shape_run(spec, run_face, run, *pen_x, pen_y, glyphs);
-            *pen_x = glyphs
-                .last()
-                .map(|glyph| glyph.pen_x + glyph.advance)
-                .unwrap_or(*pen_x);
-            run.clear();
-        };
+        // One face serves the whole spec, the way `FreeTypeFontRasterizer`
+        // resolves `GetBeingFont` once per font spec and never per character
+        // (`FreeTypeFontRasterizer.cpp:43-90`). A character the face has no
+        // glyph for draws the face's own default character (:107-129) instead
+        // of a glyph borrowed from another face.
+        let flush_run =
+            |run: &mut String, pen_x: &mut f32, pen_y: f32, glyphs: &mut Vec<PositionedGlyph>| {
+                if run.is_empty() {
+                    return;
+                }
+                self.shape_run(spec, primary_face, run, *pen_x, pen_y, glyphs);
+                *pen_x = glyphs
+                    .last()
+                    .map(|glyph| glyph.pen_x + glyph.advance)
+                    .unwrap_or(*pen_x);
+                run.clear();
+            };
 
         for ch in text.chars() {
             if ch == '\n' {
-                flush_run(&mut run, run_face, &mut pen_x, pen_y, &mut glyphs);
+                flush_run(&mut run, &mut pen_x, pen_y, &mut glyphs);
                 max_width = max_width.max(pen_x);
                 pen_x = 0.0;
                 pen_y += line_height;
                 lines = lines.saturating_add(1);
                 continue;
             }
-            let ch_face = if self.face_supports(run_face, ch) {
-                run_face
-            } else if run_face != primary_face && self.face_supports(primary_face, ch) {
-                primary_face
-            } else {
-                self.select_face_for_char(spec, ch, primary_face)
-                    .unwrap_or(primary_face)
-            };
-            if !run.is_empty() && ch_face != run_face {
-                flush_run(&mut run, run_face, &mut pen_x, pen_y, &mut glyphs);
-            }
-            run_face = ch_face;
+            let ch = self.char_for_face(primary_face, ch);
             run.push(ch);
         }
-        flush_run(&mut run, run_face, &mut pen_x, pen_y, &mut glyphs);
+        flush_run(&mut run, &mut pen_x, pen_y, &mut glyphs);
         max_width = max_width.max(pen_x);
 
         TextLayout {
@@ -595,14 +848,10 @@ impl FontSystem {
                 continue;
             }
 
-            let face = if self.face_supports(primary_face, ch) {
-                primary_face
-            } else {
-                self.select_face_for_char(spec, ch, primary_face)
-                    .unwrap_or(primary_face)
-            };
+            let face = primary_face;
             let start = glyphs.len();
-            self.shape_run(spec, face, &ch.to_string(), pen_x, pen_y, &mut glyphs);
+            let fallback = self.char_for_face(face, ch);
+            self.shape_run(spec, face, &fallback.to_string(), pen_x, pen_y, &mut glyphs);
             if let Some(last) = glyphs.get(start..).and_then(|run| run.last()) {
                 pen_x = last.pen_x + last.advance;
             }
@@ -974,7 +1223,7 @@ impl FontSystem {
 
     fn select_primary_face(&self, spec: &FontSpec) -> Option<fontdb::ID> {
         if spec.face_is_file_name {
-            return self.select_named_file_face(spec, None);
+            return self.select_named_file_face(spec);
         }
 
         let key = FaceSelectionKey::new(spec);
@@ -983,69 +1232,20 @@ impl FontSystem {
         }
 
         let selected = self
-            .query_requested_faces(spec, None)
-            .or_else(|| self.query_fallback_faces(spec, None))
+            .query_requested_faces(spec)
+            .or_else(|| self.query_fallback_faces(spec))
             .or_else(|| self.db.faces().next().map(|face| face.id));
         self.primary_faces.borrow_mut().insert(key, selected);
         selected
     }
 
-    fn select_face_for_char(
-        &self,
-        spec: &FontSpec,
-        ch: char,
-        primary_face: fontdb::ID,
-    ) -> Option<fontdb::ID> {
-        if spec.face_is_file_name {
-            return self.select_named_file_face(spec, Some(ch));
-        }
-
-        let key = FaceSelectionKey::new(spec);
-        let char_key = CharFaceSelectionKey {
-            key: key.clone(),
-            ch,
-        };
-        if let Some(cached) = self.char_faces.borrow().get(&char_key).copied() {
-            return cached;
-        }
-
-        let selected = self
-            .query_requested_faces(spec, Some(ch))
-            .or_else(|| {
-                self.recent_fallback_faces
-                    .borrow()
-                    .get(&key)
-                    .copied()
-                    .filter(|id| self.face_supports(*id, ch))
-            })
-            .or_else(|| self.query_fallback_faces(spec, Some(ch)))
-            .or_else(|| {
-                self.db
-                    .faces()
-                    .map(|face| face.id)
-                    .find(|id| self.face_supports(*id, ch))
-            });
-        if let Some(id) = selected
-            && id != primary_face
-        {
-            self.recent_fallback_faces
-                .borrow_mut()
-                .insert(key.clone(), id);
-        }
-        self.char_faces.borrow_mut().insert(char_key, selected);
-        selected
+    fn select_named_file_face(&self, spec: &FontSpec) -> Option<fontdb::ID> {
+        self.named_file_faces
+            .get(&spec.face)
+            .and_then(|ids| ids.first().copied())
     }
 
-    fn select_named_file_face(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
-        self.named_file_faces.get(&spec.face).and_then(|ids| {
-            ids.iter()
-                .copied()
-                .find(|id| ch.is_none_or(|ch| self.face_supports(*id, ch)))
-                .or_else(|| ids.first().copied())
-        })
-    }
-
-    fn query_requested_faces(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
+    fn query_requested_faces(&self, spec: &FontSpec) -> Option<fontdb::ID> {
         let weight = if spec.bold {
             Weight::BOLD
         } else {
@@ -1063,15 +1263,81 @@ impl FontSystem {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            let families = [Family::Name(face_name)];
-            let query = Query {
-                families: &families,
-                weight,
-                stretch: Stretch::Normal,
-                style,
+            if let Some(id) = self.resolve_face_name(face_name, weight, style, 0) {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
+    /// Resolves one candidate name of a font spec the way `GetBeingFont`
+    /// (`FontSystem.cpp:53-97`) picks the being face — a family query against
+    /// the loaded face set — extended with the names a game's own font tables
+    /// use for the files `System.addFont` registered.
+    fn resolve_face_name(
+        &self,
+        name: &str,
+        weight: Weight,
+        style: FontStyle,
+        depth: usize,
+    ) -> Option<fontdb::ID> {
+        if depth > MAX_FONT_ALIAS_DEPTH {
+            return None;
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+
+        let families = [Family::Name(name)];
+        let query = Query {
+            families: &families,
+            weight,
+            stretch: Stretch::Normal,
+            style,
+        };
+        if let Some(id) = self.db.query(&query) {
+            return Some(id);
+        }
+
+        // `fontdb` indexes one family per face; these come from the font's own
+        // name table (family, typographic family, full and PostScript names in
+        // every language), which is what the game tables quote.
+        if let Some(id) = self.loaded_face_names.get(&face_name_key(name)).copied() {
+            return Some(id);
+        }
+        if let Some(key) = region_free_key(name)
+            && let Some(id) = self.loaded_face_names.get(&key).copied()
+        {
+            return Some(id);
+        }
+
+        let key = face_name_key(name);
+        for entry in &self.embedded_fonts {
+            // An entry answers for the name the scenarios ask for and for the
+            // face spelling its table declares. A build's two archives can
+            // disagree on that spelling (GINKA: `源ノ角ゴシック JP Bold` in
+            // data.xp3, `Source Han Sans JP Bold` in patch.xp3), and the
+            // region-free comparison lets either spelling reach the entry.
+            let region_match = match (region_free_key(&entry.face), region_free_key(name)) {
+                (Some(entry_key), Some(name_key)) => entry_key == name_key,
+                _ => false,
             };
-            if let Some(id) = self.db.query(&query)
-                && ch.is_none_or(|ch| self.face_supports(id, ch))
+            if face_name_key(&entry.name) != key
+                && face_name_key(&entry.face) != key
+                && !region_match
+            {
+                continue;
+            }
+            if let Some(id) = self.resolve_embedded_entry(entry) {
+                return Some(id);
+            }
+        }
+
+        for (alias, target) in &self.font_aliases {
+            if alias == name
+                && let Some(id) = self.resolve_face_name(target, weight, style, depth + 1)
             {
                 return Some(id);
             }
@@ -1080,7 +1346,61 @@ impl FontSystem {
         None
     }
 
-    fn query_fallback_faces(&self, spec: &FontSpec, ch: Option<char>) -> Option<fontdb::ID> {
+    /// The face an embedded-font entry names. The entry's file is the storage
+    /// `System.addFont` receives, and when the build ships that file it wins;
+    /// the region-free key only takes over when it does not ship it, because
+    /// then the same typeface in the region the build does ship is the table's
+    /// counterpart (GINKA's `源ノ角ゴシックB` → `SourceHanSansJP-Bold.otf` →
+    /// the shipped `SourceHanSansSC-Bold.otf`).
+    fn resolve_embedded_entry(&self, entry: &EmbeddedFontEntry) -> Option<fontdb::ID> {
+        if let Some(id) = self.face_for_entry_file(&entry.file, true) {
+            return Some(id);
+        }
+        if let Some(id) = self.face_for_entry_file(&entry.file, false) {
+            return Some(id);
+        }
+
+        if !entry.face.is_empty() {
+            if let Some(id) = self
+                .loaded_face_names
+                .get(&face_name_key(&entry.face))
+                .copied()
+            {
+                return Some(id);
+            }
+            if let Some(key) = region_free_key(&entry.face)
+                && let Some(id) = self.loaded_face_names.get(&key).copied()
+            {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
+    /// The loaded face whose storage file an entry names: `exact_stem` matches
+    /// the file name itself, otherwise the regional-variant token is ignored.
+    fn face_for_entry_file(&self, file: &str, exact_stem: bool) -> Option<fontdb::ID> {
+        let key_for = |name: &str| {
+            if exact_stem {
+                stem_key(name)
+            } else {
+                file_key(name)
+            }
+        };
+        let wanted = key_for(file);
+        for (storage, ids) in &self.named_file_faces {
+            if key_for(storage) != wanted {
+                continue;
+            }
+            if let Some(id) = ids.first().copied() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn query_fallback_faces(&self, spec: &FontSpec) -> Option<fontdb::ID> {
         let weight = if spec.bold {
             Weight::BOLD
         } else {
@@ -1101,9 +1421,7 @@ impl FontSystem {
                 stretch: Stretch::Normal,
                 style,
             };
-            if let Some(id) = self.db.query(&query)
-                && ch.is_none_or(|ch| self.face_supports(id, ch))
-            {
+            if let Some(id) = self.db.query(&query) {
                 return Some(id);
             }
         }
@@ -1113,6 +1431,27 @@ impl FontSystem {
 
     fn face_supports(&self, face: fontdb::ID, ch: char) -> bool {
         self.glyph_id(face, ch).is_some()
+    }
+
+    /// The character a run draws for `ch` in its face. `FreeTypeFontRasterizer`
+    /// never borrows a glyph from another face: a character the being face
+    /// lacks draws that face's default character and advances by it
+    /// (`FreeTypeFontRasterizer.cpp:107-129`). Named faces resolve through the
+    /// platform face class there, whose default character is the font's
+    /// `tmDefaultChar`/`tmBreakChar` (`NativeFreeTypeFace.cpp:250-257`), so a
+    /// visible replacement glyph comes first and the generic face's space
+    /// (`FreeType.cpp:76`) is the last resort.
+    fn char_for_face(&self, face: fontdb::ID, ch: char) -> char {
+        if self.face_supports(face, ch) {
+            return ch;
+        }
+        self.default_char(face).unwrap_or(ch)
+    }
+
+    fn default_char(&self, face: fontdb::ID) -> Option<char> {
+        ['\u{25a1}', '\u{fffd}', '?', ' ']
+            .into_iter()
+            .find(|ch| self.face_supports(face, *ch))
     }
 
     fn glyph_id(&self, face: fontdb::ID, ch: char) -> Option<u16> {
@@ -1150,14 +1489,14 @@ impl FontSystem {
 
     fn clear_caches(&self) {
         self.primary_faces.borrow_mut().clear();
-        self.char_faces.borrow_mut().clear();
-        self.recent_fallback_faces.borrow_mut().clear();
         self.glyph_ids.borrow_mut().clear();
         self.face_metrics.borrow_mut().clear();
         self.glyph_images.borrow_mut().clear();
         self.prerendered_glyph_images.borrow_mut().clear();
     }
 }
+
+const MAX_FONT_ALIAS_DEPTH: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PrerenderedFontKey {
@@ -1203,12 +1542,6 @@ impl FaceSelectionKey {
             face_is_file_name: spec.face_is_file_name,
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct CharFaceSelectionKey {
-    key: FaceSelectionKey,
-    ch: char,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1266,6 +1599,23 @@ struct PositionedGlyph {
     x: f32,
     y: f32,
     advance: f32,
+}
+
+fn collect_face_names(font: FontRef<'_>, names: &mut Vec<String>, include_full: bool) {
+    for entry in font.localized_strings() {
+        let wanted = match entry.id() {
+            StringId::Family | StringId::TypographicFamily => true,
+            StringId::Full | StringId::PostScript => include_full,
+            _ => false,
+        };
+        if !wanted || !entry.is_decodable() {
+            continue;
+        }
+        let name = entry.chars().collect::<String>();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
 }
 
 fn fallback_layout(spec: &FontSpec, text: &str) -> TextLayout {
@@ -1518,5 +1868,666 @@ mod tests {
         assert_eq!(metrics.width, 6.0);
         let image = system.rasterize_text(&spec, TextStyle::default(), "A");
         assert!(image.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+    }
+
+    /// GINKA's own `data.xp3 > font/embfontlist.tjs`, verbatim apart from the
+    /// trimming of the groups the tests do not use. This is the table the
+    /// reviewer's scratch probe and the live runs see, so the JP entries carry
+    /// the Japanese face spelling (`源ノ角ゴシック JP Bold`).
+    const GINKA_EMBEDDED_FONT_LIST: &str = r#"
+(const)[
+	// 小杉ゴシックフォント（＝旧モトヤフォント）
+	(const)%[ "license" => "Kosugi-NOTICE.txt", "detail" => "Kosugi-LICENSE.txt", "ignorelang"=>"cn,tw" ], (const)[
+		(const)%[ "name"=>"小杉ゴシック",   "file"=>"Kosugi-Regular.ttf",     "face"=>"MotoyaLCedar", "capname"=>"Kosugi"   ],
+		(const)%[ "name"=>"小杉丸ゴシック", "file"=>"KosugiMaru-Regular.ttf", "face"=>"MotoyaLMaru",  "capname"=>"Kosugi Maru" ]
+		],
+
+	// 源ノ｛角ゴシック／明朝｝
+	(const)%[ "license" => "SourceHanSansAndSerif-NOTICE.txt", "detail" => "SourceHanSansAndSerif-LICENSE.txt", "ignorelang"=>"cn,tw" ], (const)[
+		(const)%[ "name"=>"源ノ角ゴシックR", "file"=>"SourceHanSansJP-Regular.otf", "face"=>"源ノ角ゴシック JP Regular" ],
+		(const)%[ "name"=>"源ノ角ゴシックB", "file"=>"SourceHanSansJP-Bold.otf",    "face"=>"源ノ角ゴシック JP Bold"    ],
+		(const)%[ "name"=>"源ノ角ゴシックH", "file"=>"SourceHanSansJP-Heavy.otf",   "face"=>"源ノ角ゴシック JP Heavy"   ]
+		],
+
+	// SourceHanSans/Serif (Simplified_Chinese)
+	(const)%[ "license" => "SourceHanSansAndSerif-NOTICE.txt", "detail" => "SourceHanSansAndSerif-LICENSE.txt", "ignorelang"=>"jp,en,tw" ], (const)[
+		(const)%[ "name"=>"思源黑体R", "file"=>"SourceHanSansSC-Regular.otf", "face"=>"Source Han Sans SC Regular" ],
+		(const)%[ "name"=>"思源黑体B", "file"=>"SourceHanSansSC-Bold.otf",    "face"=>"Source Han Sans SC Bold"    ],
+		(const)%[ "name"=>"思源黑体H", "file"=>"SourceHanSansSC-Heavy.otf",   "face"=>"Source Han Sans SC Heavy"   ]
+		],
+
+	// Nunito Sans (For English only)
+	(const)%[ "license" => "NunitoSans-NOTICE.txt", "detail" => "NunitoSans-LICENSE.txt", "uselang"=>"en" ], (const)[
+		(const)%[ "name"=>"NunitoSans-SB",  "file"=>"NunitoSans_10pt-SemiBold.ttf",        "face"=>"Nunito Sans 10pt SemiBold", "substyle" => (const)[ "NunitoSans-EB", "NunitoSans-SBI", "NunitoSans-EBI" ] ],
+		(const)%[ "name"=>"NunitoSans-BK",  "file"=>"NunitoSans_10pt-Black.ttf",           "face"=>"Nunito Sans 10pt Black", "bold"=>true,                 "noentry"=>true ]
+		]
+	]
+"#;
+
+    /// The same build's `patch.xp3 > embfontlist.tjs` for the JP/SC groups: it
+    /// spells the JP faces in English, so one build registers both spellings of
+    /// the same entry (`Source Han Sans JP Bold` and `源ノ角ゴシック JP Bold`).
+    const GINKA_PATCH_EMBEDDED_FONT_LIST: &str = r#"
+(const)[
+	// 源ノ｛角ゴシック／明朝｝
+	(const)%[ "license" => "SourceHanSansAndSerif-NOTICE.txt", "detail" => "SourceHanSansAndSerif-LICENSE.txt", "ignorelang"=>"cn,tw" ], (const)[
+		(const)%[ "name"=>"源ノ角ゴシックR", "file"=>"SourceHanSansJP-Regular.otf", "face"=>"Source Han Sans JP Regular" ],
+		(const)%[ "name"=>"源ノ角ゴシックB", "file"=>"SourceHanSansJP-Bold.otf",    "face"=>"Source Han Sans JP Bold"    ],
+		(const)%[ "name"=>"源ノ角ゴシックH", "file"=>"SourceHanSansJP-Heavy.otf",   "face"=>"Source Han Sans JP Heavy"   ]
+		],
+
+	// SourceHanSans/Serif (Simplified_Chinese)
+	(const)%[ "license" => "SourceHanSansAndSerif-NOTICE.txt", "detail" => "SourceHanSansAndSerif-LICENSE.txt", "ignorelang"=>"jp,en,tw" ], (const)[
+		(const)%[ "name"=>"思源黑体R", "file"=>"SourceHanSansSC-Regular.otf", "face"=>"Source Han Sans SC Regular" ],
+		(const)%[ "name"=>"思源黑体B", "file"=>"SourceHanSansSC-Bold.otf",    "face"=>"Source Han Sans SC Bold"    ],
+		(const)%[ "name"=>"思源黑体H", "file"=>"SourceHanSansSC-Heavy.otf",   "face"=>"Source Han Sans SC Heavy"   ]
+		]
+	]
+"#;
+
+    /// GINKA's `patch.xp3 > deffontmap.tjs`, verbatim: the `"*"` language
+    /// table, the legacy alias names and the `$記号$` macro alias.
+    const GINKA_DEFAULT_FONT_MAP: &str = r#"
+%[
+	// 共通定義
+	"*" => %[
+		"lang_*"  => "源ノ角ゴシックB", // failsafe用
+		"lang_jp" => "源ノ角ゴシックB",
+		"lang_en" => "源ノ角ゴシックB",
+		"lang_cn" => "思源黑体B",
+		"lang_tw" => "思源黑體B",
+		],
+
+	// 旧フォント名のエイリアス
+	"シーダ"   => "小杉ゴシック",
+	"マルベリ" => "小杉丸ゴシック",
+
+	// 日本語固定フォント[▼]マクロ用
+	"$記号$" => "源ノ角ゴシックB",
+
+	"SystemDefault"  => %[
+	lang:"ui",alias:"SystemFont", // システム用
+		"lang_jp" => "源ノ角ゴシックB",
+		"lang_en" => "NunitoSans-SB", //"源ノ角ゴシックB",
+		"lang_cn" => "思源黑体B",
+		"lang_tw" => "思源黑體B",
+		"lang_*" => "MS Shell Dlg 2",
+		]
+	]
+"#;
+
+    /// The second game's table maps everything onto `思源黑体中等`, whose entry
+    /// points at the renamed `sourcehansansjp-bold.otf` file.
+    const SHOUJO_EMBEDDED_FONT_LIST: &str = r#"
+(const)[		//思源黑体中等
+	(const)%[ "license" => "SourceHanSansAndSerif-NOTICE.txt", "detail" => "SourceHanSansAndSerifJP-LICENSE.txt" ], (const)[
+		(const)%[ "name"=>"Noto Sans SC Medium", "file"=>"SourceHanSansJP-Regular.otf", "face"=>"Noto Sans SC Medium" ],
+		(const)%[ "name"=>"思源黑体中等", "file"=>"sourcehansansjp-bold.otf",    "face"=>"思源黑体 CN Medium"    ],
+		(const)%[ "name"=>"霞鹜文楷", "file"=>"SourceHanSansJP-Heavy.otf",    "face"=>"霞鹜文楷"    ]
+		]
+	]
+"#;
+
+    /// Builds a minimal SFNT face: the tables `fontdb`/`swash` need to index
+    /// names and advances (head, hhea, maxp, hmtx, cmap, name) plus a `glyf`
+    /// rectangle so that `glyph_draw_rect` has ink to measure. `outline` gives
+    /// every mapped glyph the same box, which keeps the fixtures tiny while the
+    /// drawn rects still differ between faces.
+    fn build_test_font(
+        names: &[(u16, u16, &str)],
+        glyphs: &[(char, u16)],
+        outline: Option<(i16, i16)>,
+    ) -> Vec<u8> {
+        let num_glyphs = glyphs.len() as u16 + 1;
+
+        let mut head = Vec::new();
+        head.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        head.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        head.extend_from_slice(&0u32.to_be_bytes());
+        head.extend_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
+        head.extend_from_slice(&0u16.to_be_bytes());
+        head.extend_from_slice(&1000u16.to_be_bytes());
+        head.extend_from_slice(&0i64.to_be_bytes());
+        head.extend_from_slice(&0i64.to_be_bytes());
+        for value in [0i16, 0, 1000, 1000] {
+            head.extend_from_slice(&value.to_be_bytes());
+        }
+        head.extend_from_slice(&0u16.to_be_bytes());
+        head.extend_from_slice(&8u16.to_be_bytes());
+        head.extend_from_slice(&2i16.to_be_bytes());
+        head.extend_from_slice(&0i16.to_be_bytes());
+        head.extend_from_slice(&0i16.to_be_bytes());
+        assert_eq!(head.len(), 54);
+
+        let mut hhea = Vec::new();
+        hhea.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        hhea.extend_from_slice(&880i16.to_be_bytes());
+        hhea.extend_from_slice(&(-120i16).to_be_bytes());
+        hhea.extend_from_slice(&0i16.to_be_bytes());
+        hhea.extend_from_slice(
+            &glyphs
+                .iter()
+                .map(|(_, advance)| *advance)
+                .max()
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+        for _ in 0..11 {
+            hhea.extend_from_slice(&0i16.to_be_bytes());
+        }
+        hhea.extend_from_slice(&num_glyphs.to_be_bytes());
+        assert_eq!(hhea.len(), 36);
+
+        let mut maxp = Vec::new();
+        maxp.extend_from_slice(&0x0000_5000u32.to_be_bytes());
+        maxp.extend_from_slice(&num_glyphs.to_be_bytes());
+
+        let mut hmtx = Vec::new();
+        hmtx.extend_from_slice(&0u16.to_be_bytes());
+        hmtx.extend_from_slice(&0i16.to_be_bytes());
+        for (_, advance) in glyphs {
+            hmtx.extend_from_slice(&advance.to_be_bytes());
+            hmtx.extend_from_slice(&0i16.to_be_bytes());
+        }
+
+        let mut ordered = glyphs
+            .iter()
+            .enumerate()
+            .map(|(index, (ch, _))| (*ch, index as u16 + 1))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(ch, _)| *ch);
+        let seg_count = ordered.len() as u16 + 1;
+        let seg_count_x2 = seg_count * 2;
+        let entry_selector = (seg_count as f32).log2().floor() as u16;
+        let search_range = 2 * (1u16 << entry_selector);
+        let range_shift = seg_count_x2 - search_range;
+        let mut subtable = Vec::new();
+        subtable.extend_from_slice(&4u16.to_be_bytes());
+        subtable.extend_from_slice(&(14 + 8 * seg_count).to_be_bytes());
+        subtable.extend_from_slice(&0u16.to_be_bytes());
+        subtable.extend_from_slice(&seg_count_x2.to_be_bytes());
+        subtable.extend_from_slice(&search_range.to_be_bytes());
+        subtable.extend_from_slice(&entry_selector.to_be_bytes());
+        subtable.extend_from_slice(&range_shift.to_be_bytes());
+        for (ch, _) in &ordered {
+            subtable.extend_from_slice(&(*ch as u16).to_be_bytes());
+        }
+        subtable.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        subtable.extend_from_slice(&0u16.to_be_bytes());
+        for (ch, _) in &ordered {
+            subtable.extend_from_slice(&(*ch as u16).to_be_bytes());
+        }
+        subtable.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        for (ch, glyph) in &ordered {
+            let delta = (*glyph as i32 - *ch as i32) as u16;
+            subtable.extend_from_slice(&delta.to_be_bytes());
+        }
+        subtable.extend_from_slice(&1u16.to_be_bytes());
+        for _ in &ordered {
+            subtable.extend_from_slice(&0u16.to_be_bytes());
+        }
+        subtable.extend_from_slice(&0u16.to_be_bytes());
+        let mut cmap = Vec::new();
+        cmap.extend_from_slice(&0u16.to_be_bytes());
+        cmap.extend_from_slice(&1u16.to_be_bytes());
+        cmap.extend_from_slice(&3u16.to_be_bytes());
+        cmap.extend_from_slice(&1u16.to_be_bytes());
+        cmap.extend_from_slice(&12u32.to_be_bytes());
+        cmap.extend_from_slice(&subtable);
+
+        let records = names
+            .iter()
+            .map(|(id, language, value)| {
+                let bytes = value
+                    .encode_utf16()
+                    .flat_map(u16::to_be_bytes)
+                    .collect::<Vec<_>>();
+                (*id, *language, bytes)
+            })
+            .collect::<Vec<_>>();
+        let mut name = Vec::new();
+        name.extend_from_slice(&0u16.to_be_bytes());
+        name.extend_from_slice(&(records.len() as u16).to_be_bytes());
+        name.extend_from_slice(&(6 + 12 * records.len() as u16).to_be_bytes());
+        let mut string_offset = 0u16;
+        for (id, language, bytes) in &records {
+            name.extend_from_slice(&3u16.to_be_bytes());
+            name.extend_from_slice(&1u16.to_be_bytes());
+            name.extend_from_slice(&language.to_be_bytes());
+            name.extend_from_slice(&id.to_be_bytes());
+            name.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            name.extend_from_slice(&string_offset.to_be_bytes());
+            string_offset += bytes.len() as u16;
+        }
+        for (_, _, bytes) in &records {
+            name.extend_from_slice(bytes);
+        }
+
+        // One square outline per mapped glyph; `.notdef` stays empty. All the
+        // faces of a fixture share the box, which is all the rect assertions
+        // need (the advance still comes from `hmtx`).
+        fn push_glyph(glyf: &mut Vec<u8>, loca: &mut Vec<u16>, outline: Option<(i16, i16)>) {
+            loca.push((glyf.len() / 2) as u16);
+            let Some((width, height)) = outline else {
+                return;
+            };
+            glyf.extend_from_slice(&1i16.to_be_bytes());
+            glyf.extend_from_slice(&0i16.to_be_bytes());
+            glyf.extend_from_slice(&0i16.to_be_bytes());
+            glyf.extend_from_slice(&width.to_be_bytes());
+            glyf.extend_from_slice(&height.to_be_bytes());
+            glyf.extend_from_slice(&3u16.to_be_bytes());
+            glyf.extend_from_slice(&0u16.to_be_bytes());
+            glyf.extend_from_slice(&[0x01, 0x01, 0x01, 0x01]);
+            for delta in [0i16, width, 0, -width] {
+                glyf.extend_from_slice(&delta.to_be_bytes());
+            }
+            for delta in [0i16, 0, height, -height] {
+                glyf.extend_from_slice(&delta.to_be_bytes());
+            }
+            while !glyf.len().is_multiple_of(4) {
+                glyf.push(0);
+            }
+        }
+        let (mut glyf, mut loca) = (Vec::new(), Vec::new());
+        push_glyph(&mut glyf, &mut loca, None);
+        for _ in glyphs {
+            push_glyph(&mut glyf, &mut loca, outline);
+        }
+        loca.push((glyf.len() / 2) as u16);
+
+        let mut tables = vec![
+            (*b"cmap", cmap),
+            (*b"glyf", glyf),
+            (*b"head", head),
+            (*b"hhea", hhea),
+            (*b"hmtx", hmtx),
+            (
+                *b"loca",
+                loca.iter()
+                    .flat_map(|offset| offset.to_be_bytes())
+                    .collect(),
+            ),
+            (*b"maxp", maxp),
+            (*b"name", name),
+        ];
+        tables.sort_by_key(|(tag, _)| *tag);
+        let num_tables = tables.len() as u16;
+        let entry_selector = (num_tables as f32).log2().floor() as u16;
+        let search_range = 16 * (1u32 << entry_selector);
+        let mut font = Vec::new();
+        font.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        font.extend_from_slice(&num_tables.to_be_bytes());
+        font.extend_from_slice(&(search_range as u16).to_be_bytes());
+        font.extend_from_slice(&entry_selector.to_be_bytes());
+        font.extend_from_slice(&((u32::from(num_tables) * 16 - search_range) as u16).to_be_bytes());
+        let mut offset = 12 + 16 * tables.len();
+        for (tag, data) in &tables {
+            font.extend_from_slice(tag);
+            font.extend_from_slice(&0u32.to_be_bytes());
+            font.extend_from_slice(&(offset as u32).to_be_bytes());
+            font.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            offset += (data.len() + 3) & !3;
+        }
+        for (_, data) in &tables {
+            font.extend_from_slice(data);
+            while !font.len().is_multiple_of(4) {
+                font.push(0);
+            }
+        }
+        font
+    }
+
+    /// `font/sourcehansanssc-bold.otf`: the face GINKA's repack ships for the
+    /// `Source Han Sans SC Bold` entry. Its boxes are full width squares.
+    fn sc_bold_test_font() -> Vec<u8> {
+        build_test_font(
+            &[
+                (1, 0x0409, "Source Han Sans SC Bold"),
+                (1, 0x0804, "思源黑体 Bold"),
+                (16, 0x0409, "Source Han Sans SC"),
+                (16, 0x0804, "思源黑体"),
+                (4, 0x0409, "Source Han Sans SC Bold"),
+                (6, 0x0409, "SourceHanSansSC-Bold"),
+            ],
+            &[
+                ('あ', 1000),
+                ('い', 1000),
+                ('♪', 1000),
+                ('□', 1000),
+                ('?', 1000),
+                (' ', 300),
+            ],
+            Some((800, 800)),
+        )
+    }
+
+    /// The JP variant the tables name but GINKA's build does not ship: a
+    /// narrower face (あ advances 800 units, i.e. 38.4 px at height 48, the
+    /// reviewer's reproduction) with a different box shape.
+    fn jp_bold_test_font() -> Vec<u8> {
+        build_test_font(
+            &[
+                (1, 0x0409, "Source Han Sans JP Bold"),
+                (1, 0x0411, "源ノ角ゴシック JP Bold"),
+                (16, 0x0409, "Source Han Sans JP"),
+                (16, 0x0411, "源ノ角ゴシック JP"),
+                (4, 0x0409, "Source Han Sans JP Bold"),
+                (6, 0x0409, "SourceHanSansJP-Bold"),
+            ],
+            &[
+                ('あ', 800),
+                ('い', 800),
+                ('♪', 800),
+                ('□', 800),
+                ('?', 800),
+                (' ', 300),
+            ],
+            Some((800, 400)),
+        )
+    }
+
+    /// `sourcehansansjp-bold.otf` as the second game ships it: a renamed
+    /// `Source Han Sans CN Medium` carrying the localized family name the
+    /// table declares.
+    fn cn_medium_test_font() -> Vec<u8> {
+        build_test_font(
+            &[
+                (1, 0x0409, "Source Han Sans CN Medium"),
+                (1, 0x0804, "思源黑体 CN Medium"),
+                (16, 0x0409, "Source Han Sans CN"),
+                (16, 0x0804, "思源黑体 CN"),
+                (4, 0x0409, "Source Han Sans CN Medium"),
+                (6, 0x0409, "SourceHanSansCN-Medium"),
+            ],
+            &[
+                ('あ', 1000),
+                ('い', 1000),
+                ('♪', 1000),
+                ('□', 1000),
+                ('?', 1000),
+                (' ', 300),
+            ],
+            Some((800, 800)),
+        )
+    }
+
+    /// The Latin face the games only use for English: `♪` and `&` are half
+    /// width there, and `&` exists in no CJK fixture.
+    fn nunito_test_font() -> Vec<u8> {
+        build_test_font(
+            &[
+                (1, 0x0409, "Nunito Sans 10pt SemiBold"),
+                (16, 0x0409, "Nunito Sans 10pt"),
+                (4, 0x0409, "Nunito Sans 10pt SemiBold"),
+                (6, 0x0409, "NunitoSans10pt-SemiBold"),
+            ],
+            &[
+                ('A', 600),
+                ('♪', 500),
+                ('&', 500),
+                ('□', 500),
+                ('?', 500),
+                (' ', 300),
+            ],
+            Some((300, 300)),
+        )
+    }
+
+    fn spec(face: &str, height: f32) -> FontSpec {
+        FontSpec {
+            face: face.to_owned(),
+            height,
+            ..FontSpec::default()
+        }
+    }
+
+    #[test]
+    fn parses_the_embedded_font_lists_the_games_ship() {
+        let entries = parse_embedded_font_list(GINKA_EMBEDDED_FONT_LIST);
+        assert_eq!(entries.len(), 10);
+        assert_eq!(
+            entries[3],
+            EmbeddedFontEntry {
+                name: "源ノ角ゴシックB".to_owned(),
+                file: "SourceHanSansJP-Bold.otf".to_owned(),
+                face: "源ノ角ゴシック JP Bold".to_owned(),
+            }
+        );
+        assert_eq!(
+            entries[6],
+            EmbeddedFontEntry {
+                name: "思源黑体B".to_owned(),
+                file: "SourceHanSansSC-Bold.otf".to_owned(),
+                face: "Source Han Sans SC Bold".to_owned(),
+            }
+        );
+
+        // The patch archive carries the same entries with English face names.
+        let patch = parse_embedded_font_list(GINKA_PATCH_EMBEDDED_FONT_LIST);
+        assert_eq!(patch.len(), 6);
+        assert_eq!(patch[1].name, "源ノ角ゴシックB");
+        assert_eq!(patch[1].face, "Source Han Sans JP Bold");
+
+        let shoujo = parse_embedded_font_list(SHOUJO_EMBEDDED_FONT_LIST);
+        assert_eq!(shoujo.len(), 3);
+        assert_eq!(shoujo[1].name, "思源黑体中等");
+        assert_eq!(shoujo[1].file, "sourcehansansjp-bold.otf");
+        assert_eq!(shoujo[1].face, "思源黑体 CN Medium");
+    }
+
+    #[test]
+    fn parses_the_default_font_map_aliases() {
+        let aliases = parse_font_alias_pairs(GINKA_DEFAULT_FONT_MAP);
+        assert!(aliases.contains(&("シーダ".to_owned(), "小杉ゴシック".to_owned())));
+        assert!(aliases.contains(&("$記号$".to_owned(), "源ノ角ゴシックB".to_owned())));
+        assert!(aliases.contains(&("lang_jp".to_owned(), "源ノ角ゴシックB".to_owned())));
+        // The dict keys `lang:"ui"`/`alias:"SystemFont"` are not string pairs.
+        assert!(!aliases.iter().any(|(key, _)| key == "ui"));
+    }
+
+    #[test]
+    fn resolves_the_faces_ginka_requests() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/NunitoSans_10pt-SemiBold.ttf", nunito_test_font())
+            .unwrap();
+        system.register_embedded_font_list(parse_embedded_font_list(GINKA_EMBEDDED_FONT_LIST));
+        system.register_font_alias_text(GINKA_DEFAULT_FONT_MAP);
+
+        for face in [
+            "源ノ角ゴシックB",                        // kag.chDefaultFace
+            "思源黑体B",                              // kag.getLanguageFont(2)
+            "Source Han Sans SC Bold",                // the embfontlist face name
+            "思源黑体",                               // a localized name from the name table
+            "$記号$",                                 // a deffontmap alias
+            ",Source Han Sans SC Bold,ＭＳ ゴシック", // the realFace string the loader builds
+        ] {
+            let cjk = system.text_metrics(&spec(face, 48.0), "あ").width;
+            let symbol = system.text_metrics(&spec(face, 48.0), "♪").width;
+            assert_eq!(
+                cjk, 48.0,
+                "{face}: the CJK advance must come from the shipped face"
+            );
+            assert_eq!(symbol, 48.0, "{face}: the symbol must keep the CJK advance");
+        }
+
+        // The English-only face still resolves to the Latin font.
+        assert_eq!(
+            system.text_metrics(&spec("NunitoSans-SB", 48.0), "♪").width,
+            24.0
+        );
+    }
+
+    #[test]
+    fn a_face_spelling_of_either_table_resolves_to_the_shipped_variant() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+        // Both archives are registered in the order the plugin reads them
+        // (`embfontlist.tjs` first, then `font/embfontlist.tjs`), and one entry
+        // differing only in its face spelling must survive the second read.
+        system
+            .register_embedded_font_list(parse_embedded_font_list(GINKA_PATCH_EMBEDDED_FONT_LIST));
+        system.register_embedded_font_list(parse_embedded_font_list(GINKA_EMBEDDED_FONT_LIST));
+
+        // The JP files are not shipped, so every spelling the two tables give
+        // that entry has to land on the shipped SC face; the Japanese spelling
+        // is the one the live build's table declares.
+        for face in [
+            "源ノ角ゴシック JP Bold",
+            "Source Han Sans JP Bold",
+            "源ノ角ゴシックB",
+        ] {
+            assert_eq!(
+                system.text_metrics(&spec(face, 48.0), "あ").width,
+                48.0,
+                "{face}: must resolve to the shipped SC face"
+            );
+            assert_eq!(
+                system.text_metrics(&spec(face, 48.0), "♪").width,
+                48.0,
+                "{face}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entries_own_file_wins_over_the_region_free_match() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansansjp-bold.otf", jp_bold_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+        system
+            .register_embedded_font_list(parse_embedded_font_list(GINKA_PATCH_EMBEDDED_FONT_LIST));
+        system.register_embedded_font_list(parse_embedded_font_list(GINKA_EMBEDDED_FONT_LIST));
+
+        // Both regional variants are loaded, so each entry must get its own
+        // file. Matching only through the region-free key would hand the SC
+        // entry the JP file, whose あ advances 800/1000 em (38.4 px at 48).
+        let sc = system.text_metrics(&spec("思源黑体B", 48.0), "あ").width;
+        assert_eq!(sc, 48.0, "思源黑体B must resolve to its own SC file");
+        let jp = system
+            .text_metrics(&spec("源ノ角ゴシックB", 48.0), "あ")
+            .width;
+        assert!(
+            (jp - 38.4).abs() < 0.05,
+            "源ノ角ゴシックB must resolve to its own JP file, got {jp}"
+        );
+        // The same mix-up shows up in the drawn rect: the fixtures' boxes
+        // differ between the two variants.
+        let sc_rect = system.glyph_draw_rect(&spec("思源黑体B", 48.0), 'あ');
+        let jp_rect = system.glyph_draw_rect(&spec("源ノ角ゴシックB", 48.0), 'あ');
+        assert!(sc_rect.is_some(), "the SC face must draw");
+        assert!(jp_rect.is_some(), "the JP face must draw");
+        assert_ne!(sc_rect, jp_rect);
+    }
+
+    #[test]
+    fn resolves_the_face_the_second_game_requests() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansansjp-bold.otf", cn_medium_test_font())
+            .unwrap();
+        system.register_embedded_font_list(parse_embedded_font_list(SHOUJO_EMBEDDED_FONT_LIST));
+
+        for face in [
+            "思源黑体中等",
+            "思源黑体 CN Medium",
+            "Source Han Sans CN Medium",
+        ] {
+            let cjk = system.text_metrics(&spec(face, 48.0), "あ").width;
+            let symbol = system.text_metrics(&spec(face, 48.0), "♪").width;
+            assert_eq!(
+                cjk, 48.0,
+                "{face}: the CJK advance must come from the shipped face"
+            );
+            assert_eq!(symbol, 48.0, "{face}: the symbol must keep the CJK advance");
+        }
+    }
+
+    #[test]
+    fn a_symbol_inside_a_cjk_run_never_switches_faces_or_halves_the_advance() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/NunitoSans_10pt-SemiBold.ttf", nunito_test_font())
+            .unwrap();
+        system.register_embedded_font_list(parse_embedded_font_list(GINKA_EMBEDDED_FONT_LIST));
+
+        let face = "源ノ角ゴシックB";
+        // ♪ is in the shipped face, so it keeps that face's full advance.
+        assert_eq!(system.text_metrics(&spec(face, 48.0), "あ♪").width, 96.0);
+
+        // `&` exists only in the loaded Latin face (half width there). The run
+        // must not borrow it: the CJK face draws its own default character
+        // (□) instead, so the advance stays 48 and not the Latin 24.
+        let ampersand = system.text_metrics(&spec(face, 48.0), "&").width;
+        let default_char = system.text_metrics(&spec(face, 48.0), "□").width;
+        assert_eq!(ampersand, default_char);
+        assert_eq!(ampersand, 48.0);
+        assert_eq!(system.text_metrics(&spec(face, 48.0), "あ&あ").width, 144.0);
+        assert_eq!(
+            system.glyph_draw_rect(&spec(face, 48.0), '&'),
+            system.glyph_draw_rect(&spec(face, 48.0), '□')
+        );
+    }
+
+    #[test]
+    fn a_missing_glyph_draws_the_faces_own_default_character() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/NunitoSans_10pt-SemiBold.ttf", nunito_test_font())
+            .unwrap();
+        system.register_embedded_font_list(parse_embedded_font_list(GINKA_EMBEDDED_FONT_LIST));
+
+        // U+1F600 is absent from every loaded face, so it draws the resolved
+        // face's own default character (□) — glyph and advance both.
+        let missing = system
+            .text_metrics(&spec("思源黑体B", 48.0), "\u{1f600}")
+            .width;
+        let default_char = system.text_metrics(&spec("思源黑体B", 48.0), "□").width;
+        assert_eq!(missing, default_char);
+        assert_eq!(missing, 48.0);
+
+        let missing_rect = system.glyph_draw_rect(&spec("思源黑体B", 48.0), '\u{1f600}');
+        assert_eq!(
+            missing_rect,
+            system.glyph_draw_rect(&spec("思源黑体B", 48.0), '□')
+        );
+        // It is the CJK face's box, not the Latin face's glyph.
+        assert_ne!(
+            missing_rect,
+            system.glyph_draw_rect(&spec("NunitoSans-SB", 48.0), '♪')
+        );
+    }
+
+    #[test]
+    fn a_face_without_the_glyphs_keeps_its_own_advances() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/NunitoSans_10pt-SemiBold.ttf", nunito_test_font())
+            .unwrap();
+        system.register_embedded_font_list(parse_embedded_font_list(GINKA_EMBEDDED_FONT_LIST));
+
+        // The Latin face has no CJK glyphs; the CJK advance must not leak in
+        // from the other loaded face.
+        let latin = system.text_metrics(&spec("NunitoSans-SB", 48.0), "あ");
+        assert_eq!(latin.width, 24.0);
     }
 }
