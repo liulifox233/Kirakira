@@ -159,6 +159,22 @@ these entry points (paths under `crates/eluna/src`):
   the native mask constants in `api::transform_order_mask` (`api.rs:55-70`),
   `EmoteRuntime::set_transform_order_mask` (`sdk.rs:860`) and
   `EmoteTransformMode` (`sdk.rs:32`).
+- **Mesh deformation** — `EmoteMeshPatch` (`emote.rs:93-202`) with the native
+  patch ops `sample`/`combined_with`/`interpolate`/`control_bounds`, the
+  per-frame `mesh_transform`/`mesh_combine`/`mesh_sync_child_*` flags
+  (`emote.rs:377-383`), the retained per-layer `mesh_chain`
+  (`EmoteStepFrameLayerState`, `emote.rs:460`) and the meshCombinator split
+  (`evaluate_mesh_combinator_split`, `emote.rs:4585`); `EmoteStepFrameMeshState`/
+  `EmoteMeshChainNode` (`emote.rs:693`, `:702`) expose the recovered chain.
+- **Feedback / previous framebuffer** — type-10 sprites carry
+  `EmoteStaticSprite.feedback_history` (`emote.rs:333`) and are materialised by
+  `build_feedback_history_sprite` (`emote.rs:3021`) from
+  `EmoteFeedbackRuntimeState` (`emote.rs:518`); the decay math and sampling are
+  in the parity report's confirmed list (`sdk.rs:253`).
+- **Model pass (type 6)** — `EmoteModelRuntimeState` (`emote.rs:497`) carries
+  the recovered local-time/direction state; loading and drawing
+  `referenceModelFileList` resources stays a host 3-D-backend responsibility
+  (`sdk.rs:264`).
 - **Timeline lifecycle** — `EmoteTimeline`/`EmoteTimelineFrame`/
   `EmoteTimelineVariable` (`runtime.rs:56-74`), `collect_emote_timelines`
   (`runtime.rs:5371`), and on the runtime `play_timeline`/`fade_in_timeline`/
@@ -185,6 +201,15 @@ these entry points (paths under `crates/eluna/src`):
   "missing" list still includes running these paths under `cargo test`, which
   this vendored tree now does (95/95) and `crates/krkr-emote`'s PARQUET suite
   exercises over the game's 23 `.mtn` files.
+- **Metadata readers** — `collect_emote_runtime_pipeline` (`runtime.rs:3265`),
+  `collect_emote_timelines` (`runtime.rs:5371`), `collect_emote_variables`
+  (`runtime.rs:5484`) and `load_emote_static_scene` (`emote.rs:1546`) build the
+  pipeline/timeline/variable tables straight from a `PsbFile`;
+  `EmoteModelSchema::motion_infos`/`default_motion_name` (`emote.rs:858`, `:884`)
+  list a model's motions. `crates/krkr-emote` re-exports the types its own
+  signatures use (`EmoteModelSchema`, `EmoteStaticScene`, `EmoteStaticSprite`,
+  `EmoteDrawFrameInfo`, `EmoteDrawPass`, `EmoteMeshPatch`, …) so the plugin side
+  can reach them without naming the vendored path dependency.
 
 ## Updating the vendored copy
 
