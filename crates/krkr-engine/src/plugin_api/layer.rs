@@ -18,11 +18,12 @@
 //!   plane (`layerExBTOA`'s `copyAlphaToProvince`/`fillByProvince`).
 //! * [`layer_update`] — `Layer.update()`, the explicit repaint step the family
 //!   contract calls after a mutation.
-//! * [`create_canvas_layer`] / [`fit_canvas_layer`] — a detached, invisible
-//!   native `Layer` for a plugin that needs a private draw target and a
+//! * [`create_canvas_layer`] / [`fit_canvas_layer`] / [`attach_canvas_layer`] —
+//!   a native `Layer` for a plugin that needs a private draw target and a
 //!   publishable image, as `motionplayer.dll`'s `Motion.SeparateLayerAdaptor`
-//!   is (the KAG motion layer draws into it and copies it onto the visible
-//!   layer with `Layer.assignImages`).
+//!   is (the KAG motion layer draws into it and the reference's adaptor reaches
+//!   the screen as a visible child of its owner, which `attach_canvas_layer`
+//!   reproduces).
 //!
 //! **Byte order**: the views expose the engine's own store — R, G, B, A per
 //! pixel, top-down, tightly packed.  The reference's buffer is B, G, R, A
@@ -63,8 +64,8 @@ use krkr_tjs2::{
 use crate::host::{KrkrHost, LayerRenderTarget};
 use crate::native::classes::{
     LAYER_CLASS, allocate_layer_province_plane, construct_native_instance,
-    internal_set_layer_image_size, layer_update_by_script, mark_image_modified,
-    mutate_render_layer, not_drawable_layer_type, render_layer_snapshot,
+    internal_set_layer_image_size, join_layer_under_parent, layer_update_by_script,
+    mark_image_modified, mutate_render_layer, not_drawable_layer_type, render_layer_snapshot,
     set_layer_geographical_size, this_render_layer_target,
 };
 
@@ -216,8 +217,9 @@ pub fn layer_update(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Res
     layer_update_by_script(runtime, layer)
 }
 
-/// Creates a detached canvas layer: a real native `Layer` a plugin can draw
-/// into and publish from, without it ever reaching the screen on its own.
+/// Creates a canvas layer: a real native `Layer` a plugin can draw into and
+/// publish from, invisible and detached until [`attach_canvas_layer`] hangs it
+/// under the layer it stands in for.
 ///
 /// `motionplayer.dll`'s `Motion.SeparateLayerAdaptor` is exactly such a
 /// canvas.  The KAG motion layer constructs one per owner
@@ -225,13 +227,14 @@ pub fn layer_update(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Res
 /// `Motion.Player.clear`/`draw` as the draw target, and then publishes it with
 /// `Layer.assignImages` on the visible layer — so the object the plugin works
 /// with must be a real layer (`instanceof "Layer"`, a `__nativeLayerId`, a
-/// `LayerBitmap` to write) while never appearing in a draw list itself.
+/// `LayerBitmap` to write).
 ///
 /// The object is built the way `new Layer()` with no arguments is: the full
-/// native method surface, class info `Layer`, no window and no parent (an
-/// invisible render root the draw lists skip), and the constructor's 32×32
-/// holder bitmap, so [`layer_bitmap_write`] has pixels to lend immediately.
-/// [`fit_canvas_layer`] sizes it to the layer whose content it stands in for.
+/// native method surface, class info `Layer`, no window and no parent, and the
+/// constructor's 32×32 holder bitmap, so [`layer_bitmap_write`] has pixels to
+/// lend immediately.  [`fit_canvas_layer`] sizes it to the layer whose content
+/// it stands in for; [`attach_canvas_layer`] gives it the tree placement the
+/// reference's adaptor has.
 pub fn create_canvas_layer(runtime: &mut Runtime<KrkrHost>) -> Result<ObjectHandle> {
     let layer = construct_native_instance(runtime, &LAYER_CLASS, None, Vec::new())?;
     layer
@@ -262,6 +265,40 @@ pub fn fit_canvas_layer(
     set_layer_geographical_size(runtime, canvas, i64::from(width), i64::from(height))?;
     internal_set_layer_image_size(runtime, canvas, i64::from(width), i64::from(height))?;
     Ok(())
+}
+
+/// Hangs a canvas layer under `parent` as a visible child — the placement the
+/// reference's `Motion.SeparateLayerAdaptor` has: the DLL builds one host
+/// `Layer` per motion layer, parented to the adaptor's `targetLayer` at
+/// creation and visible as soon as it has pixels, with `hitThreshold = 0x100`
+/// so it never swallows a mouse hit (`motionplayer_nod3d.dll` `FUN_1000d280`).
+/// A canvas whose owner is a `ltBinder` layer is drawn *through* the binder,
+/// which itself never carries an image (`LayerIntf.cpp:5280-5281`, `:5912`,
+/// `:5931`).
+///
+/// The game's own `entryOwner` is the evidence for the shape: right after
+/// `new Motion.SeparateLayerAdaptor(owner incontextof global.Layer)` it rewrites
+/// an `ltAlpha` owner to `ltBinder` (`system/AffineSourceMotion.tjs`) — the
+/// owner stops drawing, so the adaptor must reach the screen on its own, which
+/// only a visible child of that owner can do (the game's per-frame
+/// `Layer.assignImages(owner, adaptor)` publish is undone by the type restore
+/// at the end of `drawAffine`, which frees the owner's image again).
+///
+/// A `parent` that is not a layer attached to a render node is ignored: the
+/// canvas stays detached, exactly as `create_canvas_layer` built it.
+pub fn attach_canvas_layer(
+    runtime: &mut Runtime<KrkrHost>,
+    canvas: ObjectHandle,
+    parent: ObjectHandle,
+) -> Result<()> {
+    let parent_is_layer = this_render_layer_target(runtime, Some(parent))
+        .ok()
+        .and_then(|(_, target)| target)
+        .is_some();
+    if !parent_is_layer {
+        return Ok(());
+    }
+    join_layer_under_parent(runtime, canvas, parent)
 }
 
 /// The drawable size of a layer: its rect when non-empty, else its bitmap.
