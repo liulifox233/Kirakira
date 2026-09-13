@@ -78,6 +78,17 @@
             pkg-config
             cmake
             python3
+            # The embedded-FFmpeg feature (`cargo build -p krkr-video
+            # --features ffmpeg`) compiles FFmpeg from source through
+            # ffmpeg-sys-next: nasm assembles FFmpeg's x86 SIMD kernels,
+            # the build script's `git clone` fetches the FFmpeg sources,
+            # and its bindgen run needs libclang — LIBCLANG_PATH below
+            # points it at this same store path.  (perl is deliberately
+            # absent: FFmpeg's configure wants it only for docs and the
+            # Solaris version script, and this build disables docs.)
+            nasm
+            git
+            llvmPackages.libclang
           ];
 
           # Native audio and image crates use these libraries through
@@ -90,6 +101,20 @@
             ++ (with pkgs; lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ]);
 
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
+          # ffmpeg-sys-next's bindgen run finds libclang through this; the
+          # libclang package above only supplies it in the store, not on
+          # PATH.
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+          # libclang never reads the compiler wrappers' NIX_CFLAGS_COMPILE,
+          # so bindgen gets the C library headers explicitly on Linux; without
+          # this the libavutil `#include <errno.h>` makes the bindgen step
+          # panic.
+          BINDGEN_EXTRA_CLANG_ARGS =
+            pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux
+              "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+
           shellHook = ''
             export CARGO_NET_GIT_FETCH_WITH_CLI=true
             ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
