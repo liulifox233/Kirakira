@@ -2255,6 +2255,21 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 // must still run on the caller's instance when invoked from
                 // within a construction chain (krkrz superclass-constructor
                 // semantics), otherwise state would land on the prototype.
+                //
+                // `clo.ObjThis ? clo.ObjThis : ra[-1]` (`tjsInterCodeExec.cpp:2438`,
+                // `:2372`) is the `objthis` *argument* of the closure call, and
+                // `tTJSVariantClosure::FuncCall` substitutes the closure's own
+                // `Object` when both it and that argument are NULL
+                // (`ObjThis?ObjThis:(objthis?objthis:Object)`,
+                // `tjsVariant.h:226-232`): a callee that carries no ObjThis and
+                // is called from a frame that has none runs on the callee
+                // object itself, self-bound by `ra[-1].SetObject(objthis, objthis)`
+                // (`:839`) -- which is the shape every host callback has
+                // (`clo.FuncCall(0, NULL, NULL, ...)`: `System.exceptionHandler`
+                // at `base/ScriptMgnIntf.cpp:950`, a transition's tick callback
+                // at `visual/LayerIntf.cpp:6694`).  The null object at `:839`
+                // belongs to *direct* dispatch with a NULL objthis
+                // (`:3063`, `:3135`, `:3172`), which never passes through here.
                 let effective_this = match (closure.this_obj, this_obj) {
                     (Some(bound), Some(caller))
                         if bound != caller
@@ -2274,7 +2289,18 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 self.call_handle(closure.object, effective_this, args, is_new, continuation)
             }
             Variant::Object(handle) => {
-                self.call_handle(handle, this_obj, args, is_new, continuation)
+                // A bare object value is the same `tTJSVariant(dsp)` shape as
+                // an unbound closure (`tjsVariant.cpp:530-548`), so the same
+                // `tTJSVariantClosure::FuncCall` fallback applies: called with
+                // no receiver at all it runs on itself
+                // (`tjsVariant.h:226-232`).
+                self.call_handle(
+                    handle,
+                    this_obj.or(Some(handle)),
+                    args,
+                    is_new,
+                    continuation,
+                )
             }
             // `VM_CALL` converts the callee with `AsObjectClosure()`
             // (`tjsInterCodeExec.cpp:2365`), so a value that is not an object
