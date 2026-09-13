@@ -417,6 +417,11 @@ fn file_key(name: &str) -> String {
 pub struct FontSystem {
     db: Database,
     named_file_faces: BTreeMap<String, Vec<fontdb::ID>>,
+    /// Every face the game registered through `System.addFont`
+    /// (`load_font_data`), in registration order — the default being font a
+    /// spec with no resolvable face measures through (see
+    /// `query_default_faces`).
+    registered_faces: Vec<fontdb::ID>,
     embedded_fonts: Vec<EmbeddedFontEntry>,
     font_aliases: Vec<(String, String)>,
     loaded_face_names: BTreeMap<String, fontdb::ID>,
@@ -439,6 +444,7 @@ impl Clone for FontSystem {
         Self {
             db: self.db.clone(),
             named_file_faces: self.named_file_faces.clone(),
+            registered_faces: self.registered_faces.clone(),
             embedded_fonts: self.embedded_fonts.clone(),
             font_aliases: self.font_aliases.clone(),
             loaded_face_names: self.loaded_face_names.clone(),
@@ -467,6 +473,7 @@ impl FontSystem {
         Self {
             db,
             named_file_faces: BTreeMap::new(),
+            registered_faces: Vec::new(),
             embedded_fonts: Vec::new(),
             font_aliases: Vec::new(),
             loaded_face_names: BTreeMap::new(),
@@ -551,6 +558,7 @@ impl FontSystem {
         for id in &ids {
             self.index_face_names(*id);
         }
+        self.registered_faces.extend(ids.iter().copied());
         self.named_file_faces.insert(name, ids);
         self.clear_caches();
         Ok(())
@@ -1233,10 +1241,45 @@ impl FontSystem {
 
         let selected = self
             .query_requested_faces(spec)
+            .or_else(|| self.query_default_faces(spec))
             .or_else(|| self.query_fallback_faces(spec))
             .or_else(|| self.db.faces().next().map(|face| face.id));
         self.primary_faces.borrow_mut().insert(key, selected);
         selected
+    }
+
+    /// The default being font: what `GetBeingFont` answers when no requested
+    /// candidate resolves (`FontSystem.cpp:92-96` returns
+    /// `TVPGetDefaultFontName()`), and the reference's default is a system
+    /// font that can draw the game's text. A `fontdb` generic family is not
+    /// that font here: it usually carries no CJK coverage, so a spec with an
+    /// empty or unknown face would measure CJK through the fallback face's
+    /// missing-glyph advance (0.8 em) while the game draws real glyphs 1 em
+    /// wide — the 少女世界 message font does exactly that, and the record
+    /// pitch comes out a fifth shorter than the glyphs. The faces the game
+    /// itself registered through `System.addFont` are the closest available
+    /// default; a game that registered none still falls through to the
+    /// generic families.
+    fn query_default_faces(&self, spec: &FontSpec) -> Option<fontdb::ID> {
+        let weight = if spec.bold {
+            Weight::BOLD
+        } else {
+            Weight::NORMAL
+        };
+        let style = if spec.italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        };
+        self.registered_faces
+            .iter()
+            .copied()
+            .find(|id| {
+                self.db
+                    .face(*id)
+                    .is_some_and(|face| face.weight == weight && face.style == style)
+            })
+            .or_else(|| self.registered_faces.first().copied())
     }
 
     fn select_named_file_face(&self, spec: &FontSpec) -> Option<fontdb::ID> {
@@ -2358,6 +2401,44 @@ mod tests {
         // The English-only face still resolves to the Latin font.
         assert_eq!(
             system.text_metrics(&spec("NunitoSans-SB", 48.0), "♪").width,
+            24.0
+        );
+    }
+
+    #[test]
+    fn an_unresolved_face_measures_through_the_games_default_font() {
+        let mut system = FontSystem::new();
+        // The live 少女世界 message font measures with an *empty* face: the
+        // game's `onGetTextWidth` sets only `font.height` and calls
+        // `Font.getEscWidthX`, whose face is whatever the layer font last
+        // carried. `GetBeingFont` (`FontSystem.cpp:92-96`) answers a default
+        // font there, and the reference's default can draw the game's text;
+        // a generic `fontdb` family cannot (the live box comes from FreeSans,
+        // whose missing-glyph advance lays CJK out at 0.8 em — 32 px at the
+        // game's size 40 — while the drawn glyphs are 1 em wide and overlap).
+        system.db.set_sans_serif_family("Nunito Sans 10pt");
+        system
+            .load_font_data("font/sourcehansanssc-medium.otf", cn_medium_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/NunitoSans_10pt-SemiBold.ttf", nunito_test_font())
+            .unwrap();
+
+        assert_eq!(
+            system.text_metrics(&spec("", 40.0), "あ").width,
+            40.0,
+            "the empty face must measure through the game's own font"
+        );
+        assert_eq!(
+            system.text_metrics(&spec("No Such Face", 40.0), "あ").width,
+            40.0,
+            "an unknown face gets the same default"
+        );
+        // A requested face still wins over the default.
+        assert_eq!(
+            system
+                .text_metrics(&spec("Nunito Sans 10pt", 40.0), "A")
+                .width,
             24.0
         );
     }
