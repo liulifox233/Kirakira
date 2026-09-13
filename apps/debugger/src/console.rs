@@ -496,7 +496,9 @@ pub fn apply_interactive_control(
 /// from any new evaluation instead of running it, so during a load screen even
 /// `expr 1+1` answers `void`. Reporting that as a value makes every inspection
 /// look like the object is missing; naming the suspension says to advance a few
-/// frames and retry.
+/// frames and retry. The batch probe's `--at-frame` handles the same situation
+/// by deferring instead (`crate::inject`), sharing [`crate::inject::VM_SUSPENDED`]
+/// so both surfaces name the cause in the same words.
 pub fn evaluate_interactive_expression(
     runtime: &mut RuntimeSession,
     expression: &str,
@@ -505,11 +507,8 @@ pub fn evaluate_interactive_expression(
         .engine_mut()
         .execute_expression("krkr_debug_interactive.tjs", expression)
         .map_err(|error| error.to_string())?;
-    if matches!(value, Variant::Void) && runtime.engine().tjs_runtime().is_suspended() {
-        return Err(
-            "vm-suspended (a call stack is parked on a pending resource; advance frames and retry)"
-                .to_string(),
-        );
+    if matches!(value, Variant::Void) && crate::inject::parked(runtime.engine()) {
+        return Err(crate::inject::VM_SUSPENDED.to_string());
     }
     Ok(value)
 }
