@@ -426,7 +426,13 @@ pub struct FontSystem {
     font_aliases: Vec<(String, String)>,
     loaded_face_names: BTreeMap<String, fontdb::ID>,
     prerendered_fonts: BTreeMap<PrerenderedFontKey, PrerenderedFont>,
+    /// The face a spec's requested candidates resolve to. A resolved candidate
+    /// is text independent, so one entry per spec serves every text of it.
     primary_faces: RefCell<BTreeMap<FaceSelectionKey, Option<fontdb::ID>>>,
+    /// The default being font an unresolvable spec measures through, per text:
+    /// the default has to be able to draw the text (`query_default_faces`), so
+    /// unlike `primary_faces` its answer depends on the text.
+    default_faces: RefCell<BTreeMap<FaceSelectionKey, BTreeMap<String, Option<fontdb::ID>>>>,
     glyph_ids: RefCell<BTreeMap<(FontFaceKey, char), Option<u16>>>,
     face_metrics: RefCell<BTreeMap<FaceMetricsKey, swash::Metrics>>,
     glyph_images: RefCell<BTreeMap<RenderedGlyphKey, Arc<GlyphImage>>>,
@@ -450,6 +456,7 @@ impl Clone for FontSystem {
             loaded_face_names: self.loaded_face_names.clone(),
             prerendered_fonts: self.prerendered_fonts.clone(),
             primary_faces: RefCell::new(BTreeMap::new()),
+            default_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
@@ -479,6 +486,7 @@ impl FontSystem {
             loaded_face_names: BTreeMap::new(),
             prerendered_fonts: BTreeMap::new(),
             primary_faces: RefCell::new(BTreeMap::new()),
+            default_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
             glyph_images: RefCell::new(BTreeMap::new()),
@@ -657,7 +665,9 @@ impl FontSystem {
                 height: u32::from(glyph.height),
             });
         }
-        let primary_face = self.select_primary_face(spec)?;
+        let mut utf8 = [0_u8; 4];
+        let text = ch.encode_utf8(&mut utf8);
+        let primary_face = self.select_primary_face(spec, text)?;
         let face = primary_face;
         let glyph_id = self
             .glyph_id(face, self.char_for_face(face, ch))
@@ -739,7 +749,7 @@ impl FontSystem {
     }
 
     pub fn layout_text(&self, spec: &FontSpec, text: &str) -> TextLayout {
-        let face = self.select_primary_face(spec);
+        let face = self.select_primary_face(spec, text);
         let Some(primary_face) = face else {
             return fallback_layout(spec, text);
         };
@@ -762,11 +772,13 @@ impl FontSystem {
         let mut lines = 1_u32;
         let mut run = String::new();
 
-        // One face serves the whole spec, the way `FreeTypeFontRasterizer`
-        // resolves `GetBeingFont` once per font spec and never per character
-        // (`FreeTypeFontRasterizer.cpp:43-90`). A character the face has no
-        // glyph for draws the face's own default character (:107-129) instead
-        // of a glyph borrowed from another face.
+        // One face serves the whole run, the way `FreeTypeFontRasterizer`
+        // resolves a being font once per font spec and never per character
+        // (`FreeTypeFontRasterizer.cpp:43-90`); when no requested candidate
+        // resolves, `select_primary_face` picked a default that can draw this
+        // text. A character the face has no glyph for draws the face's own
+        // default character (:107-129) instead of a glyph borrowed from
+        // another face.
         let flush_run =
             |run: &mut String, pen_x: &mut f32, pen_y: f32, glyphs: &mut Vec<PositionedGlyph>| {
                 if run.is_empty() {
@@ -1229,38 +1241,73 @@ impl FontSystem {
         metrics
     }
 
-    fn select_primary_face(&self, spec: &FontSpec) -> Option<fontdb::ID> {
+    /// The face a text is measured and drawn through. A candidate the spec
+    /// requests that resolves serves the whole spec — every text of it — the
+    /// way `FreeTypeFontRasterizer` resolves a being font once per font spec
+    /// and never per character (`FreeTypeFontRasterizer.cpp:43-90`). When no
+    /// candidate resolves, the being font is the default being font
+    /// (`FontSystem.cpp:92-96`); that one has to be able to draw the text, so
+    /// its answer is cached per text instead of per spec.
+    fn select_primary_face(&self, spec: &FontSpec, text: &str) -> Option<fontdb::ID> {
         if spec.face_is_file_name {
             return self.select_named_file_face(spec);
         }
 
         let key = FaceSelectionKey::new(spec);
-        if let Some(cached) = self.primary_faces.borrow().get(&key).copied() {
-            return cached;
+        let cached = self.primary_faces.borrow().get(&key).copied();
+        let requested = match cached {
+            Some(requested) => requested,
+            None => {
+                let requested = self.query_requested_faces(spec);
+                self.primary_faces
+                    .borrow_mut()
+                    .insert(key.clone(), requested);
+                requested
+            }
+        };
+        if requested.is_some() {
+            return requested;
         }
 
+        if let Some(cached) = self
+            .default_faces
+            .borrow()
+            .get(&key)
+            .and_then(|by_text| by_text.get(text))
+            .copied()
+        {
+            return cached;
+        }
         let selected = self
-            .query_requested_faces(spec)
-            .or_else(|| self.query_default_faces(spec))
+            .query_default_faces(spec, text)
             .or_else(|| self.query_fallback_faces(spec))
             .or_else(|| self.db.faces().next().map(|face| face.id));
-        self.primary_faces.borrow_mut().insert(key, selected);
+        self.default_faces
+            .borrow_mut()
+            .entry(key)
+            .or_default()
+            .insert(text.to_owned(), selected);
         selected
     }
 
     /// The default being font: what `GetBeingFont` answers when no requested
     /// candidate resolves (`FontSystem.cpp:92-96` returns
-    /// `TVPGetDefaultFontName()`), and the reference's default is a system
-    /// font that can draw the game's text. A `fontdb` generic family is not
-    /// that font here: it usually carries no CJK coverage, so a spec with an
-    /// empty or unknown face would measure CJK through the fallback face's
-    /// missing-glyph advance (0.8 em) while the game draws real glyphs 1 em
-    /// wide — the 少女世界 message font does exactly that, and the record
-    /// pitch comes out a fifth shorter than the glyphs. The faces the game
-    /// itself registered through `System.addFont` are the closest available
-    /// default; a game that registered none still falls through to the
-    /// generic families.
-    fn query_default_faces(&self, spec: &FontSpec) -> Option<fontdb::ID> {
+    /// `TVPGetDefaultFontName()`). The reference's default is a system font
+    /// that can draw the game's text (`TVPSysFont.cpp:16-54`; the platform's
+    /// font mapper substitutes even a name no font carries,
+    /// `NativeFreeTypeFace.cpp:47-85`), and a bare `fontdb` generic family is
+    /// not that font: it usually carries no CJK coverage, so a spec with an
+    /// empty or unknown face measured CJK through the fallback face's
+    /// missing-glyph advance (0.8 em) while the game drew real glyphs 1 em
+    /// wide — the 少女世界 message font did exactly that, and 纸上的魔法使's
+    /// `华文细黑` message font resolves to nothing at all. The default is
+    /// therefore the first face that can draw the text: the game's own
+    /// `System.addFont` faces first, then the platform's. Only when no loaded
+    /// face can draw the text does the choice fall back to the game's default
+    /// face and the generic families, which then draw their own missing-glyph
+    /// character — the reference does the same when even its default font
+    /// lacks the glyph (`FreeTypeFontRasterizer.cpp:113-129`).
+    fn query_default_faces(&self, spec: &FontSpec, text: &str) -> Option<fontdb::ID> {
         let weight = if spec.bold {
             Weight::BOLD
         } else {
@@ -1271,13 +1318,34 @@ impl FontSystem {
         } else {
             FontStyle::Normal
         };
+        let matches_style = |id: fontdb::ID| {
+            self.db
+                .face(id)
+                .is_some_and(|face| face.weight == weight && face.style == style)
+        };
+
         self.registered_faces
             .iter()
             .copied()
-            .find(|id| {
+            .find(|id| matches_style(*id) && self.face_covers_text(*id, text))
+            .or_else(|| {
+                self.registered_faces
+                    .iter()
+                    .copied()
+                    .find(|id| self.face_covers_text(*id, text))
+            })
+            .or_else(|| self.query_generic_faces(spec, Some(text)))
+            .or_else(|| {
                 self.db
-                    .face(*id)
-                    .is_some_and(|face| face.weight == weight && face.style == style)
+                    .faces()
+                    .map(|face| face.id)
+                    .find(|id| self.face_covers_text(*id, text))
+            })
+            .or_else(|| {
+                self.registered_faces
+                    .iter()
+                    .copied()
+                    .find(|id| matches_style(*id))
             })
             .or_else(|| self.registered_faces.first().copied())
     }
@@ -1444,6 +1512,13 @@ impl FontSystem {
     }
 
     fn query_fallback_faces(&self, spec: &FontSpec) -> Option<fontdb::ID> {
+        self.query_generic_faces(spec, None)
+    }
+
+    /// The first `fontdb` generic-family face that answers the spec — with a
+    /// text given, the first that can draw it, so the default being font never
+    /// hands CJK to a family that has none.
+    fn query_generic_faces(&self, spec: &FontSpec, text: Option<&str>) -> Option<fontdb::ID> {
         let weight = if spec.bold {
             Weight::BOLD
         } else {
@@ -1464,7 +1539,9 @@ impl FontSystem {
                 stretch: Stretch::Normal,
                 style,
             };
-            if let Some(id) = self.db.query(&query) {
+            if let Some(id) = self.db.query(&query)
+                && text.is_none_or(|text| self.face_covers_text(id, text))
+            {
                 return Some(id);
             }
         }
@@ -1474,6 +1551,14 @@ impl FontSystem {
 
     fn face_supports(&self, face: fontdb::ID, ch: char) -> bool {
         self.glyph_id(face, ch).is_some()
+    }
+
+    /// Whether a face carries every character of a text, so that none of them
+    /// needs the face's own missing-glyph character. Line breaks are layout,
+    /// not glyphs.
+    fn face_covers_text(&self, face: fontdb::ID, text: &str) -> bool {
+        text.chars()
+            .all(|ch| ch == '\n' || ch == '\r' || self.face_supports(face, ch))
     }
 
     /// The character a run draws for `ch` in its face. `FreeTypeFontRasterizer`
@@ -1532,6 +1617,7 @@ impl FontSystem {
 
     fn clear_caches(&self) {
         self.primary_faces.borrow_mut().clear();
+        self.default_faces.borrow_mut().clear();
         self.glyph_ids.borrow_mut().clear();
         self.face_metrics.borrow_mut().clear();
         self.glyph_images.borrow_mut().clear();
@@ -2234,6 +2320,7 @@ mod tests {
                 (6, 0x0409, "SourceHanSansSC-Bold"),
             ],
             &[
+                ('忆', 1000),
                 ('あ', 1000),
                 ('い', 1000),
                 ('♪', 1000),
@@ -2441,6 +2528,88 @@ mod tests {
                 .width,
             24.0
         );
+    }
+
+    /// 纸上的魔法使 asks for `华文细黑`, which resolves to nothing: no
+    /// `System.addFont` face, no table, no alias. The spec must still draw CJK
+    /// through the default being font (`FontSystem.cpp:92-96`), and that
+    /// default has to be a face that can draw the text — the game's own faces
+    /// first. Registering a Latin-only face before a CJK face must not send a
+    /// CJK character through the Latin face's missing-glyph character.
+    #[test]
+    fn an_unresolved_face_measures_cjk_through_a_registered_face_that_can_draw_it() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/NunitoSans_10pt-SemiBold.ttf", nunito_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+
+        let unresolved = spec("华文细黑", 48.0);
+        // 忆 is the first character of the game's first message; the CJK face
+        // draws it a full em wide, the Latin face only has its own □ (half
+        // width, 0.5 em).
+        assert_eq!(system.text_metrics(&unresolved, "忆").width, 48.0);
+        assert_eq!(system.text_metrics(&unresolved, "忆あ").width, 96.0);
+        // The drawn rect is the CJK face's glyph, not the Latin face's □.
+        let resolved = spec("Source Han Sans SC Bold", 48.0);
+        assert_eq!(
+            system.glyph_draw_rect(&unresolved, '忆'),
+            system.glyph_draw_rect(&resolved, '忆')
+        );
+        assert_ne!(
+            system.glyph_draw_rect(&unresolved, '忆'),
+            system.glyph_draw_rect(&spec("Nunito Sans 10pt SemiBold", 48.0), '□')
+        );
+    }
+
+    /// The live 纸上的魔法使 registers no fonts at all, so the default being
+    /// font is the platform's own — which in the reference is a system font
+    /// that can draw the game's text (`TVPSysFont.cpp:16-54`), never a bare
+    /// `fontdb` generic family. On a machine with no CJK face there is nothing
+    /// to measure through, and the test says so instead of failing.
+    #[test]
+    fn an_unresolved_face_measures_cjk_through_a_capable_system_face() {
+        let system = FontSystem::new();
+        if !system
+            .db
+            .faces()
+            .any(|face| system.face_supports(face.id, '忆'))
+        {
+            eprintln!("no CJK-capable system face installed; nothing to measure through");
+            return;
+        }
+
+        // At height 24 a CJK ideograph is a full em wide; the generic fallback
+        // face's missing-glyph advance was the live bug's 0.8 em (20 px).
+        let width = system.text_metrics(&spec("华文细黑", 24.0), "忆").width;
+        assert!(
+            width > 22.0,
+            "an unknown face must draw 忆 through a face that has it, got {width}"
+        );
+    }
+
+    /// A face a candidate resolves to is never replaced by the covering
+    /// default: one face serves the spec (`FreeTypeFontRasterizer.cpp:43-90`),
+    /// and only an unresolvable request reaches the default being font.
+    #[test]
+    fn a_resolved_face_is_still_preferred_over_a_covering_default() {
+        let mut system = FontSystem::new();
+        system
+            .load_font_data("font/NunitoSans_10pt-SemiBold.ttf", nunito_test_font())
+            .unwrap();
+        system
+            .load_font_data("font/sourcehansanssc-bold.otf", sc_bold_test_font())
+            .unwrap();
+
+        // `Nunito Sans 10pt SemiBold` resolves to the Latin face, which has no
+        // あ: it draws its own □ (0.5 em), not the CJK face's あ (1 em).
+        let latin = system.text_metrics(&spec("Nunito Sans 10pt SemiBold", 48.0), "あ");
+        assert_eq!(latin.width, 24.0);
+        // The same character through an unresolvable face gets the default.
+        let unresolved = system.text_metrics(&spec("华文细黑", 48.0), "あ");
+        assert_eq!(unresolved.width, 48.0);
     }
 
     #[test]
