@@ -115,13 +115,19 @@
 //!   characters) — plus the `%e#…;` / `%s#…;` colour forms.
 //! - `%p<n>;` / `%p;` — pitch or the default pitch (`case 0x70`, members
 //!   0x32/0x31) — `parseStyle` :479-489.
-//! - `%a<n>;` / `%d<n>;` / `%d;` — the per-character delay (member 0x5d):
-//!   absolute, percent of the base delay, or the base delay (`case 0x25`,
-//!   the `a`/`d` arms) — `parseDelay` :528-562.
+//! - `%a<n>;` / `%d<n>;` / `%d;` — the per-character delay (member 0x5d,
+//!   which `render`'s argument 2 seeds): absolute n, n/100 of the base
+//!   delay, or the base delay (`case 0x25`, the `a`/`d` arms) —
+//!   `parseDelay` :528-562.
 //! - `%t<n>;` / `%w<n>;` / `%D<n>;` and their `$name;` forms — wait time
-//!   added to the display clock (member 0x76); the `$` forms evaluate the
-//!   name through `onEval` first (`case 0x25`, the `t`/`w`/`D` arms) —
-//!   `parseWait` :502 / `parseWC` :514 / `parseTalkWait` :568.
+//!   added to the display clock (member 0x76); `%w` counts n/100 of the base
+//!   delay and the others add their value directly; the `$` forms evaluate
+//!   the name through `onEval` first (`case 0x25`, the `t`/`w`/`D` arms) —
+//!   `parseWait` :502 / `parseWC` :514 / `parseTalkWait` :568. `%D` is the
+//!   approximation: the DLL's arm (`0x1000c9a9`) calls the commit routine
+//!   `FUN_100097c0` to retime the records of the current run instead of
+//!   touching the clock, and that retiming is not modelled yet (see the wait
+//!   handler's comment).
 //! - `%n<n>;` — that many line breaks (`case 0x25`, the `n` arm calls the
 //!   line-break routine `FUN_10007440` per unit) — `parseXR` :493.
 //! - `%l<name>;` / `%l;` — link span start/end (`case 0x6c`) — `parseLink`
@@ -130,6 +136,19 @@
 //! - `%k0`/`%k1`/`%kd` — a flag the DLL stores at member +0x49; no converter
 //!   in the in-repo games emits it, so this module consumes it and does not
 //!   guess what the flag does.
+//!
+//! The clock the timing codes move, and the base delay they scale against, are
+//! the reference's timing members: `render`'s argument 2 arrives as the base
+//! per-character delay (or 0.001 when it is 0 and argument 3 is positive;
+//! `0x1000b8f4-0x1000b912` computes it, `0x1000ba47` stores it at member
+//! `+0x174`), every character advances the display clock by the current
+//! per-character delay (member `+0x1d8`, `FUN_1000a1f0`), and each character
+//! object carries the clock value reached *before* that step as its `delay`
+//! (the walker zeroes the clock at `0x1000ba31` and the record paths store it
+//! before adding the step — `0x1000b097`/`0x1000a758`/`0x1000905c` — so the
+//! first character shows at 0 ms and `renderDelay` is the time after the
+//! last). All five timing codes are gated by the `ignore_delay` option
+//! (member `+0x16a`), which suppresses them without touching the base.
 //!
 //! Every other `%X` is consumed up to its `;` and draws nothing — that is the
 //! DLL's own `default` arm, and it is why the converters escape a literal `%`
@@ -175,12 +194,20 @@
 //!   module's line records (the line's origin).
 //! - line-breaking options: `vertical`, `width_time_scale` and the booleans are
 //!   stored and the layout acts on those it can (axis, per-glyph delay), but
-//!   `following`/`leading`/`begin`/`end`/`kinsoku_max`/`word_break` and the
-//!   `ignore_*` gates need the DLL's kazari line-breaking rules — text is broken
-//!   at the render box width only, and nothing applies the auto-indent the game
-//!   passes as `render`'s argument 1 (`system/TextRender.tjs` calls
-//!   `TextRenderBase.render(a3, a4, a7, a8, 0)` with `a4` = 1 by default, and
-//!   `system/LangRender.tjs` passes `kag.autoIndent`).
+//!   `following`/`leading`/`begin`/`end`/`kinsoku_max`/`word_break` need the
+//!   DLL's kazari line-breaking rules — text is broken at the render box width
+//!   only, and nothing applies the auto-indent the game passes as `render`'s
+//!   argument 1 (`system/TextRender.tjs` calls
+//!   `TextRenderBase.render(a3, a4, a7, a8, 0, 0)` with `a4` = 1 by default,
+//!   and `system/LangRender.tjs` passes `kag.autoIndent`). Of the `ignore_*`
+//!   gates `ignore_delay` is applied: the option lands at member `+0x16a`
+//!   (`0x10018e5f`, key string 0x100274d4) and gates the five timing codes
+//!   (`%d` `0x1000c54b`, `%a` `0x1000c5fb`, `%w` `0x1000c6fe`, `%t` `0x1000c83c`,
+//!   `%D` `0x1000c977`), which then parse and consume their payload but leave
+//!   the char delay and the clock alone. The style gates (`ignore_color`
+//!   `+0x168`, `ignore_size` `+0x169`, `ignore_ruby` `+0x16d`, `ignore_type`
+//!   `+0x16e`, `ignore_face` `+0x16f`, `ignore_style` `+0x170`, `ignore_xr`
+//!   `+0x171`) are stored but not applied yet.
 //! - `done()` returns 1 where the DLL returns void: this renderer finishes
 //!   synchronously, and the in-repo game conductors treat the truthy answer as
 //!   "the characters are materialized".
@@ -218,7 +245,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "TextRenderBase",
-    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. render parses the message text format the games' TagTextConverter emits and the DLL's layout walker FUN_1000b8c0 interprets: \\n/raw newline/%n breaks, \\k key waits for getKeyWait(), \\w/\\x/\\i/\\r, $expr; through onEval, &name; through onGetGraphSize, %f/%r/%<n>;/%;/%B/%S/%b/%i/%s/%e/%p/%a/%d/%t/%w/%D/%l/#…; style and timing codes (the last group's line-shift, indent and named-wait details are documented gaps), [ruby,count], and \\X as the literal X. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and the auto-indent/kinsoku rules still need engine work.",
+    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. render takes the DLL's six arguments, consumes argument 2 as the per-character base delay (the games' kag.actualChSpeed, with the reference's 0.001 fallback when it is 0 and argument 3 is positive), seeds every record's display time from it and scales the %d/%w codes by it while %a/%t stay absolute, and parses the message text format the games' TagTextConverter emits and the DLL's layout walker FUN_1000b8c0 interprets: \\n/raw newline/%n breaks, \\k key waits for getKeyWait(), \\w/\\x/\\i/\\r, $expr; through onEval, &name; through onGetGraphSize, %f/%r/%<n>;/%;/%B/%S/%b/%i/%s/%e/%p/%a/%d/%t/%w/%D/%l/#…; style and timing codes (%a/%d/%t/%w/%D honour ignore_delay; the last group's line-shift, indent and named-wait details are documented gaps), [ruby,count], and \\X as the literal X. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and the auto-indent/kinsoku rules still need engine work.",
     install: |engine| engine.register_plugin(TextRenderPlugin),
 };
 
@@ -277,10 +304,13 @@ enum MemberKind {
     /// `ncbNativeClassMethod<InvokeCommand<...>>` — invocable.
     Method {
         handler: NativeMethod,
-        /// Arguments the reference command needs to do anything; ncbind pads
-        /// arguments a caller leaves out, so this is a lower bound, not an
-        /// exact count (the reference `render` command declares five, and both
-        /// in-repo games pass five).
+        /// The minimum parameter count across the reference builds whose
+        /// command declares the member (`InvokeCommand`'s `ArgsCount`,
+        /// `ncbind.hpp:1231`). ncbind rejects a call that passes fewer —
+        /// `if (_numparams < SelectorT::ArgsCount) return TJS_E_BADPARAMCOUNT`
+        /// (`ncbind.hpp:1186`) — and ignores extra arguments, so a value below
+        /// one build's count is the compatibility floor for that build's
+        /// callers rather than an exact match (see `render`).
         required_args: usize,
     },
     /// `ncbNativeClassProperty<PropertyCommand<...>>` — an accessor pair.
@@ -331,9 +361,20 @@ const SURFACE: &[Member] = &[
     member("setStyle", "void (tTJSVariant)", set_style, 1),
     member(
         "render",
-        "bool (const tjs_char *, int, int, int, bool)",
+        "bool (const tjs_char *, int, int, int, bool, bool)",
         render,
-        1,
+        // The two shipped builds of the DLL declare different arities: the
+        // GINKA/少女世界 build (md5 5aa3b6c88c0c50c59dc218d895036712) takes six
+        // parameters (`P8TextRender@@AE_NPB_WHHH_N1@Z`, its mangler `1` a
+        // back-reference to the preceding `bool`) and the PARQUET build
+        // (md5 2213af667928ddb8733e92b19f8421d2) five
+        // (`P8TextRender@@AE_NPB_WHHH_N@Z`). ncbind rejects a call shorter
+        // than the declared count (`ncbind.hpp:1186`), so the module requires
+        // the smaller of the two: PARQUET's five-argument dialogue calls work
+        // and the six-argument calls the other build's scripts make are
+        // accepted too (ncbind ignores extra arguments). Requiring six broke
+        // PARQUET's `system/TextRender.tjs`/`LangRender.tjs` calls.
+        5,
     ),
     member("newline", "void ()", newline, 0),
     member("done", "void ()", done, 0),
@@ -1902,6 +1943,40 @@ fn get_link_of_position(
     Ok(Variant::Integer(-1))
 }
 
+/// The base per-character delay `render`'s argument index 2 carries — the value
+/// the reference walker scales the `%a`/`%d`/`%w` codes against and seeds every
+/// character with.
+///
+/// `0x1000b8f4-0x1000b912`: when argument 3 is positive and argument 2 is 0 the
+/// walker substitutes the `.rdata` single at 0x100277b8, which is `0.001f`;
+/// otherwise the delay is `(float)arg2`. `0x1000ba47` stores it at member
+/// `+0x174` and `FUN_1000a1f0` starts every character's delay from it.
+fn base_char_delay(arg2: i64, arg3: i64) -> f64 {
+    if arg2 != 0 || arg3 <= 0 {
+        // `cvtdq2ps` at 0x1000b90f and the `movss` store at 0x1000ba47 keep
+        // the value in an f32.
+        f64::from(arg2 as f32)
+    } else {
+        f64::from(0.001_f32)
+    }
+}
+
+/// One character's step of the display clock: the current per-character delay,
+/// scaled by the glyph's own extent when `width_time_scale` is on.
+///
+/// `FUN_1000a1f0` (`0x1000a76a-0x1000a791`) computes the option-on step as the
+/// char delay times `extent / (fontScale * size)` — the glyph's own advance
+/// over its pixel size — so a glyph as wide as its em advances the clock by
+/// the base delay itself. (The `%w` handler applies a related but different
+/// factor; see the wait codes' comment.)
+fn character_step(width_time_scale: bool, char_delay: f64, size: i64, extent: i64) -> f64 {
+    if width_time_scale {
+        char_delay * (extent as f64) / (size.max(1) as f64)
+    } else {
+        char_delay
+    }
+}
+
 /// Materialize the character records the subclass consumes. That script owns
 /// effect selection and delegates glyph painting to `Layer.drawText`; the
 /// native side owns line layout and character geometry.
@@ -1909,13 +1984,24 @@ fn get_link_of_position(
 /// The text is the first argument: a string, or an object carrying a `text`
 /// member (the KAGEX message element; it may contain `[ruby,count]` inline
 /// annotations, where the ruby covers the following `count + 1` characters).
-/// The reference command takes four more arguments and both in-repo games pass
-/// five (`system/TextRender.tjs` → `TextRenderBase.render(a3, a4, a7, a8, 0)`,
-/// `system/LangRender.tjs` → `_TextRenderBase.render(text, indent, …)`); their
-/// meaning was not recovered from the DLL, so they are accepted and unused —
-/// in particular argument 1 is *not* a font size (PARQUET puts the auto-indent
-/// there, 1 by default, which would lay every glyph out one pixel wide). The
-/// size comes from the instance font, else `defaultFontSize`.
+/// The shipped builds declare different arities — GINKA/少女世界's
+/// (md5 `5aa3b6c8…`) `bool (TextRender::*)(const tjs_char *, int, int, int,
+/// bool, bool)` (`P8TextRender@@AE_NPB_WHHH_N1@`, the mangler's `1`
+/// back-referencing the preceding `bool`) and PARQUET's (md5 `2213af66…`)
+/// the same with five parameters — and ncbind rejects a call that passes
+/// fewer than the declared count (`ncbind.hpp:1186`), so the registration
+/// requires five (see the surface entry). GINKA and 少女世界 pass six
+/// (`system/TextRender.tjs` → `TextRenderBase.render(a3, a4, a7, a8, 0, 0)`,
+/// `system/LangRender.tjs` → `_TextRenderBase.render(text, indent, speed, …)`),
+/// PARQUET five, with argument 2 the per-character speed in both.
+///
+/// Argument index 2 is the base delay and index 3 the gate for the `0.001`
+/// fallback ([`base_char_delay`]). Argument 1 is *not* a font size: KAGEX puts
+/// the auto-indent there (1 by default, which would lay every glyph out one
+/// pixel wide), the size comes from the instance font, else `defaultFontSize`,
+/// and the auto-indent itself is not applied yet (see the module docs). The
+/// last two arguments drive the DLL's incremental redraw paths, which this
+/// single-pass renderer has no equivalent for; they are accepted and unused.
 ///
 /// The DLL's command returns bool; so does this one, with `renderCount`/the
 /// character array carrying the numbers.
@@ -1946,13 +2032,16 @@ fn render(
     // Font.getTextWidth). `font` belongs to the TextRender instance, not the
     // render arguments.
     let font = runtime.object_member(this, "font").object_handle();
-    // The remaining arguments stay unused: the DLL's own use of them was not
-    // recovered, and the games put different things in argument 1 — PARQUET
-    // passes the auto-indent the KAGEX layer supplies (1 by default,
-    // `system/TextRender.tjs` → `TextRenderBase.render(a3, a4, a7, a8, 0)`),
-    // so reading it as a font size would lay every glyph out one pixel wide.
-    // The size comes from the instance font, else the active/default font size.
+    // Argument 1 is not a font size — KAGEX passes the auto-indent the layer
+    // supplies (1 by default) and the layout does not apply it yet, so the size
+    // comes from the instance font, else the active/default font size.
     let font_scale = value_real(runtime, this, "fontScale");
+    // Argument 2 is the base per-character delay (`kag.actualChSpeed` on the
+    // message path) and argument 3 the gate for the reference's 0.001 fallback.
+    let base_delay = base_char_delay(
+        arguments(&args, 2).to_integer().unwrap_or(0),
+        arguments(&args, 3).to_integer().unwrap_or(0),
+    );
     // The default glyph size the `%<n>;` code takes its percentage of (the
     // DLL's member 0x2a) and the size the first glyph starts out with: the
     // font a game handed to `setFont`, else the default.
@@ -1985,7 +2074,7 @@ fn render(
         edge: effective_bool(runtime, this, "defaultEdge"),
         pitch: effective_real(runtime, this, "defaultPitch"),
         align: effective_int(runtime, this, "defaultAlign"),
-        char_delay: 1.0,
+        char_delay: base_delay,
         link: String::new(),
     };
     let width = state_int(runtime, this, RENDER_WIDTH).unwrap_or(0).max(0);
@@ -1998,6 +2087,9 @@ fn render(
     let ruby_offset = effective_real(runtime, this, "defaultRubyOffset");
     let width_time_scale = state_bool(runtime, this, LAYOUT_WIDTH_TIME_SCALE);
     let vertical = value_bool(runtime, this, "vertical");
+    // `ignore_delay` (member `+0x16a`) suppresses the five timing codes without
+    // touching the base delay; the DLL reads it at each of their handlers.
+    let ignore_delay = state_bool(runtime, this, "ignore_delay");
 
     let mut x = 0_i64;
     let mut y = 0_i64;
@@ -2081,12 +2173,11 @@ fn render(
             }
             TextToken::Graph { name } => {
                 let (graph_width, graph_height) = graph_size(runtime, this, &name);
-                let char_delay = if width_time_scale {
-                    graph_width as f64
-                } else {
-                    style.char_delay
-                };
-                delay += char_delay;
+                // Like a character, the graph's record carries the clock value
+                // reached before its step (`0x1000905c`).
+                let display_time = delay;
+                delay +=
+                    character_step(width_time_scale, style.char_delay, style.size, graph_width);
                 let record = build_character_record(
                     runtime,
                     &style,
@@ -2096,7 +2187,7 @@ fn render(
                         line,
                         width: graph_width,
                         height: graph_height,
-                        delay,
+                        delay: display_time,
                     },
                     vertical,
                     &name,
@@ -2183,24 +2274,55 @@ fn render(
                 continue;
             }
             TextToken::Delay { absolute, value } => {
-                style.char_delay = match (absolute, value) {
-                    (true, Some(value)) => value,
-                    (false, Some(percent)) => percent / 100.0,
-                    (_, None) => 1.0,
-                };
+                if !ignore_delay {
+                    style.char_delay = match (absolute, value) {
+                        // `%a<n>;` is absolute; `%a;` and `%d;` fall back to the
+                        // base delay, and `%d<n>;` is n/100 of it (`0x1000c5b8`
+                        // and `0x1000c545`: an empty run seeds the 1.0f at
+                        // 0x100277c0 and the store multiplies by the base at
+                        // `[ebp-0x134]`).
+                        (true, Some(value)) => value,
+                        (false, Some(percent)) => percent / 100.0 * base_delay,
+                        (_, None) => base_delay,
+                    };
+                }
                 continue;
             }
             TextToken::Wait { value, percent } => {
-                let value = match value {
-                    WaitValue::Time(value) => value,
-                    WaitValue::Named(name) => {
-                        let evaluated = evaluate_expression(runtime, this, &name);
-                        evaluated.trim().parse::<f64>().unwrap_or(0.0)
-                    }
-                };
-                // A `%w` value counts hundredths of a character delay, the
-                // other wait codes count display time directly.
-                delay += if percent { value / 100.0 } else { value };
+                if !ignore_delay {
+                    let number = match value {
+                        WaitValue::Time(number) => number,
+                        WaitValue::Named(name) => {
+                            let evaluated = evaluate_expression(runtime, this, &name);
+                            let evaluated = evaluated.trim();
+                            if evaluated.is_empty() {
+                                None
+                            } else {
+                                Some(evaluated.parse::<f64>().unwrap_or(0.0))
+                            }
+                        }
+                    };
+                    // `%w` counts hundredths of the base delay — an empty run
+                    // means 100, the 1.0f at 0x100277c0 (`0x1000c658-0x1000c777`
+                    // multiplies it by the base and adds it to the clock) —
+                    // while `%t` adds its value directly. Two documented
+                    // divergences from the reference stay here:
+                    // * `%D<n>;` (`0x1000c9a9`, gated at `0x1000c977`) calls the
+                    //   commit/retiming routine `FUN_100097c0` on the records
+                    //   laid out since the run's start (`+0x1e0`) instead of
+                    //   adding to the clock; a faithful model needs that
+                    //   retiming traced, so `%D` keeps `%t`'s absolute add.
+                    // * with `width_time_scale` on, `%w` scales by the stored
+                    //   member `[+0x11c]` over `fontScale x size`
+                    //   (`0x1000c754-0x1000c764`) rather than by a glyph extent;
+                    //   this layout has no `+0x11c` equivalent and adds the
+                    //   unscaled value.
+                    delay += if percent {
+                        number.unwrap_or(100.0) / 100.0 * base_delay
+                    } else {
+                        number.unwrap_or(0.0)
+                    };
+                }
                 continue;
             }
             TextToken::Link { name } => {
@@ -2232,23 +2354,25 @@ fn render(
             line_origins.push(y as f64);
         }
         let in_ruby_group = ruby_remaining > 0;
-        // Character timing: `delay` is this glyph's *display time* — the wait
-        // accumulated through it — which is the field the DLL's layout writes
-        // (`record[+0x64] = accumulator + char_delay`, 0x10013ac3), registers
-        // as the character property `delay` (FUN_100035d0 at 0x100039a0) and
-        // compares with the elapsed time in `FUN_10011080`; the game paces on it
+        // Character timing: the record's `delay` is the display clock value
+        // reached when the character is committed — the field the character
+        // object's `delay` property binds (`record+0x5c`) and `FUN_10008590`
+        // (calcShowCount) compares with the elapsed time; the game paces on it
         // (`rendermsgwin.tjs`: `updateTimerInterval(l1.delay - elapsed)`).
-        // Nothing is visible at elapsed 0. `width_time_scale` charges the wait
-        // by advance width instead of one tick per glyph; `renderDelay` reports
-        // the total wait times `timeScale` (the DLL's `[+0x220] x timeScale`).
-        // The `%d`/`%a` codes move the per-character delay (the DLL's member
-        // 0x5d).
-        let char_delay = if width_time_scale {
-            char_width as f64
-        } else {
-            style.char_delay
-        };
-        delay += char_delay;
+        // Every record-producing path in the reference writes that field
+        // *before* adding this character's step — the batch loop stores
+        // `[+0x1d8]` at `[esi+0x38]` and only then adds the step
+        // (`0x1000b097`/`0x1000b0f5`), the single-character path stores it at
+        // `[ebp-0x3c]` at `0x1000a758` before `0x1000a7b2` adds it, and the
+        // graph path does the same at `0x1000905c` — so the first character
+        // shows at 0 and the last record sits one step below `renderDelay`.
+        // The step is the current per-character delay — `render`'s argument 2
+        // until a `%d`/`%a` code moves it — times the `width_time_scale`
+        // factor (see [`character_step`]); `renderDelay` reports the total
+        // wait times `timeScale` (its getter `FUN_10009e60` returns
+        // `[+0x1e8] x [+0x4c]`).
+        let display_time = delay;
+        delay += character_step(width_time_scale, style.char_delay, style.size, char_width);
         let record = build_character_record(
             runtime,
             &style,
@@ -2258,7 +2382,7 @@ fn render(
                 line,
                 width: char_width,
                 height: style.size,
-                delay,
+                delay: display_time,
             },
             vertical,
             &character,
@@ -2416,11 +2540,11 @@ fn line_origins(runtime: &Runtime<KrkrHost>, instance: ObjectHandle) -> Vec<f64>
 }
 
 /// `renderDelay` — the total wait the layout accumulated, times the *current*
-/// `timeScale`: the DLL's getter multiplies its accumulator by `[+0x54]` on
-/// every read (`FUN_10010e90`), so a `timeScale` write after the render still
-/// changes the answer. The game only tests it against 0, which is how it
-/// decides between drawing the text at once and running the reveal timer
-/// (`sysscn/rendermsgwin.tjs`).
+/// `timeScale`: the DLL's getter multiplies its accumulator by `[+0x4c]` on
+/// every read (`FUN_10009e60` returns `[+0x1e8] x [+0x4c]`), so a `timeScale`
+/// write after the render still changes the answer. The game only tests it
+/// against 0, which is how it decides between drawing the text at once and
+/// running the reveal timer (`sysscn/rendermsgwin.tjs`).
 fn render_delay(runtime: &mut Runtime<KrkrHost>, instance: ObjectHandle) -> Result<Variant> {
     let delay = state_real(runtime, instance, LAYOUT_DELAY).unwrap_or(0.0);
     Ok(Variant::Real(delay * value_real(runtime, instance, "timeScale")))
@@ -2519,7 +2643,7 @@ enum TextToken {
     /// (the base delay).
     Delay { absolute: bool, value: Option<f64> },
     /// `%t…;` / `%w…;` / `%D…;`: wait time, literal or named; `percent` marks
-    /// the `%w` spelling, whose value counts hundredths of a character delay
+    /// the `%w` spelling, whose value counts hundredths of the *base* delay
     /// rather than display time.
     Wait { value: WaitValue, percent: bool },
     /// `%l<name>;` / `%l;` (empty = end the link span).
@@ -2554,7 +2678,9 @@ enum ColorTarget {
 /// The payload of a wait code: a literal count, or the name of an expression
 /// the DLL evaluates through `onEval` before reading the number.
 enum WaitValue {
-    Time(f64),
+    /// The digits of the payload. `None` is a run without digits, which the
+    /// walker treats as 1.0f for `%w` (100 hundredths) and as 0 for `%t`/`%D`.
+    Time(Option<f64>),
     Named(String),
 }
 
@@ -2741,13 +2867,14 @@ fn parse_percent_code(
     }
 }
 
-/// The `%t`/`%w`/`%D` payload: digits, or `$name;` to be evaluated.
+/// The `%t`/`%w`/`%D` payload: digits, or `$name;` to be evaluated. A payload
+/// without digits stays `None` so the `%w` default (1.0f, 100 hundredths) survives.
 fn parse_wait_value(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> WaitValue {
     if chars.peek() == Some(&'$') {
         chars.next();
         WaitValue::Named(take_to_semicolon(chars))
     } else {
-        WaitValue::Time(take_digits(chars, false).unwrap_or(0.0))
+        WaitValue::Time(take_digits(chars, false))
     }
 }
 
@@ -2954,7 +3081,7 @@ mod tests {
         ("resetStyle", true, "void ()"),
         ("setFont", true, "void (tTJSVariant)"),
         ("setStyle", true, "void (tTJSVariant)"),
-        ("render", true, "bool (const tjs_char *, int, int, int, bool)"),
+        ("render", true, "bool (const tjs_char *, int, int, int, bool, bool)"),
         ("newline", true, "void ()"),
         ("done", true, "void ()"),
         ("onEval", true, "tTJSString (const tjs_char *)"),
@@ -3233,8 +3360,15 @@ mod tests {
         assert_eq!(value, "0/denied/denied/denied/denied/denied/1/30/1");
     }
 
-    /// Calling a method with fewer arguments than the reference command needs
-    /// fails with the engine's parameter-count error, like ncbind's check.
+    /// Calling a method with fewer arguments than the reference command
+    /// declares fails with the engine's parameter-count error — ncbind's
+    /// `doInvoke` (`ncbind.hpp:1186`: `if (_numparams < SelectorT::ArgsCount)
+    /// return TJS_E_BADPARAMCOUNT`, its `ArgsCount` the parameter count of the
+    /// member-function signature, `ncbind.hpp:1231`) — and extra arguments are
+    /// ignored. `render`'s two shipped builds declare five (PARQUET,
+    /// `P8TextRender@@AE_NPB_WHHH_N@Z`) and six (GINKA/少女世界,
+    /// `P8TextRender@@AE_NPB_WHHH_N1@Z`) parameters, so the registration
+    /// accepts both flavours and rejects four arguments or fewer.
     #[test]
     fn methods_enforce_their_reference_argument_contracts() {
         let value = run(
@@ -3248,12 +3382,20 @@ mod tests {
                 + rejects(function() { render.setDefault(); }) + "/"
                 + rejects(function() { render.setRenderSize(); }) + "/"
                 + rejects(function() { render.render(); }) + "/"
+                + rejects(function() { render.render("a", 1, 25); }) + "/"
+                + rejects(function() { render.render("a", 1, 25, 0); }) + "/"
                 + rejects(function() { render.contains(1); }) + "/"
                 + rejects(function() { render.getLinkOfPosition(1); }) + "/"
-                + rejects(function() { render.onEval(); });
+                + rejects(function() { render.onEval(); }) + "/"
+                + rejects(function() { render.render("a", 1, 25, 0, void); }) + "/"
+                + rejects(function() { render.render("a", 1, 25, 0, void, 0); });
             "#,
         );
-        assert_eq!(value, "rejected/rejected/rejected/rejected/rejected/rejected/rejected");
+        assert_eq!(
+            value,
+            "rejected/rejected/rejected/rejected/rejected/rejected/rejected/rejected/\
+             rejected/accepted/accepted"
+        );
     }
 
     /// The layout end-to-end through the engine's font path: glyph advances come
@@ -3268,7 +3410,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            var started = render.render("あいうえお");
+            var started = render.render("あいうえお", 1, 0, 0, void, 0);
             var glyph = font.getEscWidthX("あ");
             var chars = render.getCharacters();
             var first = chars[0];
@@ -3279,11 +3421,11 @@ mod tests {
             var inside = render.contains(1, 1);
             var outside = render.contains(10000, 10000);
             render.setRenderSize(60, 0);
-            var wrapped = render.render("ああああああ");
+            var wrapped = render.render("ああああああ", 1, 0, 0, void, 0);
             var lines = render.renderLines;
             render.resetFont();
             render.setRenderSize(400, 0);
-            render.render("ab");
+            render.render("ab", 1, 1, 0, void, 0);
             var unwrappedLines = render.renderLines;
             return started + "/" + glyph + "/" + chars.count + "/" + first.text + "/" + first.size + "/"
                 + first.width + "/" + first.left + "/" + first.y + "/" + last.left + "/" + right + "/"
@@ -3330,9 +3472,12 @@ mod tests {
         assert_eq!(parts[16], "1", "without a font the default size lays out one line");
     }
 
-    /// The option keys the layout acts on: `width_time_scale` charges the delay
-    /// by glyph width, and `timeScale` multiplies the reported total — the
-    /// behaviour `renderDelay` exists for.
+    /// The option keys the layout acts on: `width_time_scale` scales each
+    /// character's step by the glyph's own extent over the glyph's pixel size
+    /// (the factor `FUN_1000a1f0`'s `0x1000a76a-0x1000a791` applies to the
+    /// current char delay, so a glyph as wide as its em charges the whole
+    /// delay), and `timeScale` multiplies the reported total — the behaviour
+    /// `renderDelay` exists for.
     #[test]
     fn render_delay_follows_width_time_scale_and_time_scale() {
         let value = run(
@@ -3342,18 +3487,187 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("ab");
+            render.render("ab", 1, 1, 0, void, 0);
             var per_char = render.renderDelay;
+            var widths = font.getEscWidthX("a") + font.getEscWidthX("b");
             render.setOption(%["width_time_scale" => 1]);
-            render.render("ab");
+            render.render("ab", 1, 1, 0, void, 0);
             var per_width = render.renderDelay;
             render.timeScale = 2;
-            render.render("ab");
+            render.render("ab", 1, 1, 0, void, 0);
             var scaled = render.renderDelay;
-            return per_char + "/" + (per_width > per_char) + "/" + (scaled > per_width);
+            return per_char + "/" + per_width + "/" + widths + "/" + scaled;
             "#,
         );
-        assert_eq!(value, "2/1/1");
+        let parts = value.split('/').collect::<Vec<_>>();
+        let per_char = parts[0].parse::<f64>().expect("per-character delay");
+        let per_width = parts[1].parse::<f64>().expect("per-width delay");
+        let widths = parts[2].parse::<f64>().expect("measured advances");
+        let scaled = parts[3].parse::<f64>().expect("scaled delay");
+        assert!(
+            (per_char - 2.0).abs() < 0.0001,
+            "one base tick per glyph with the option off: {value}"
+        );
+        let expected = widths / 20.0;
+        assert!(
+            (per_width - expected).abs() < 0.0001,
+            "the option charges delay x extent / size ({expected}): {value}"
+        );
+        assert!(
+            (scaled - per_width * 2.0).abs() < 0.0001,
+            "timeScale scales the same total: {value}"
+        );
+    }
+
+    /// The typewriter clock: `render`'s argument index 2 is the per-character
+    /// base delay the games pass as `kag.actualChSpeed`. `0x1000b8f4-0x1000b912`
+    /// computes it and `0x1000ba47` stores it at member `+0x174`; every
+    /// character advances the display clock by it and the record carries the
+    /// clock value reached *before* its own step — the walker zeroes `+0x1d8`
+    /// at `0x1000ba31` and the record paths store it before adding the step
+    /// (`0x1000b097`, `0x1000a758`, `0x1000905c`), so the first character is
+    /// due at 0 ms and `renderDelay` is the time after the last
+    /// (`0x1000bacc`'s commit hands `+0x1dc + base` to `+0x1e8`, the member
+    /// `renderDelay` reads). Before the fix the port ignored the argument and
+    /// charged one tick per glyph, so a whole message was revealed inside a
+    /// single frame.
+    #[test]
+    fn render_uses_its_second_argument_as_the_base_delay() {
+        let value = run(r#"
+            // TJS prints a real zero as "+0.0"; the delay table reads better
+            // with the reference's own "0".
+            function d(value) { return value == 0 ? "0" : "" + value; }
+            var render = new TextRenderBase();
+            render.setRenderSize(400, 100);
+            var started = render.render("abcd", 1, 25, 0, void, 0);
+            var chars = render.getCharacters(0, 0);
+            var delays = d(chars[0].delay) + "/" + d(chars[1].delay) + "/" + d(chars[2].delay) + "/"
+                + d(chars[3].delay);
+            return started + "/" + render.renderDelay + "/" + delays + "/"
+                + render.calcShowCount(0) + "/" + render.calcShowCount(24) + "/"
+                + render.calcShowCount(25) + "/" + render.calcShowCount(49) + "/"
+                + render.calcShowCount(50) + "/" + render.calcShowCount(99) + "/"
+                + render.calcShowCount(100);
+            "#);
+        // 25 ms per character: display times 0/25/50/75 and a total of 100. The
+        // first character is due at 0, and each further multiple of 25 reveals
+        // one more.
+        assert_eq!(value, "1/100/0/25/50/75/1/1/2/2/3/4/4");
+    }
+
+    /// The timing codes, against that base: the walker's `a` arm stores the
+    /// absolute value (`0x1000c5b8`), its `d` arm stores n/100 of the base with
+    /// an empty run storing the base itself (`0x1000c545`, `DAT_100277c0` the
+    /// 1.0f), its `w` arm *adds* n/100 of the base to the display clock
+    /// (`0x1000c658-0x1000c777`), and `t` adds its value (`0x1000c83c`). The
+    /// pre-fix port charged the raw numbers instead.
+    #[test]
+    fn render_scales_the_timing_codes_by_the_base_delay() {
+        let value = run(r#"
+            function d(value) { return value == 0 ? "0" : "" + value; }
+            function probe(text) {
+                var render = new TextRenderBase();
+                render.setRenderSize(400, 100);
+                render.render(text, 0, 25, 0, void, 0);
+                var chars = render.getCharacters(0, 0);
+                var delays = "";
+                var i = 0;
+                while (i < chars.count) { delays += (i > 0 ? "," : "") + d(chars[i].delay); i = i + 1; }
+                return render.renderDelay + ":" + delays;
+            }
+            return probe("ab%d50;cd") + "/" + probe("ab%d;cd") + "/" + probe("ab%a50;cd") + "/"
+                + probe("ab%w100;cd") + "/" + probe("ab%w;cd") + "/" + probe("ab%t50;cd");
+            "#);
+        // `%d50;`  -> 0,25,50,62.5   (half of the base from there on)
+        // `%d;`    -> 0,25,50,75     (the base itself)
+        // `%a50;`  -> 0,25,50,100    (absolute, 50 each)
+        // `%w100;` -> 0,25,75,100    (the clock takes one base tick first)
+        // `%w;`    -> 0,25,75,100    (an empty run counts 100 hundredths)
+        // `%t50;`  -> 0,25,100,125   (absolute display time)
+        assert_eq!(
+            value,
+            "75:0,25,50,62.5/100:0,25,50,75/150:0,25,50,100/125:0,25,75,100/\
+             125:0,25,75,100/150:0,25,100,125"
+        );
+    }
+
+    /// The `0.001` fallback (`0x1000b8f4-0x1000b912`): a zero argument 2
+    /// together with a positive argument 3 uses the `.rdata` single at
+    /// 0x100277b8, 0.001f, so a caller that asks for an already-running
+    /// animation still gets a non-zero clock; zero or negative argument 3
+    /// leaves the delay at 0 and the text appears at once (`renderDelay == 0`
+    /// is what the game tests).
+    #[test]
+    fn render_falls_back_to_the_reference_point_zero_zero_one_delay() {
+        let value = run(r#"
+            function probe(text, arg2, arg3) {
+                var render = new TextRenderBase();
+                render.setRenderSize(400, 100);
+                render.render(text, 0, arg2, arg3, void, 0);
+                var chars = render.getCharacters(0, 0);
+                return ((chars[0].delay * 1000 + 0.5) | 0) + "/"
+                    + ((chars[1].delay * 1000 + 0.5) | 0) + "/"
+                    + ((render.renderDelay * 1000 + 0.5) | 0);
+            }
+            return probe("ab", 0, 10) + "/" + probe("ab", 0, 0) + "/" + probe("ab", 0, -5) + "/"
+                + (function() {
+                    var render = new TextRenderBase();
+                    render.setRenderSize(400, 100);
+                    render.render("ab", 0, 0, 0, void, 0);
+                    return render.renderDelay == 0;
+                })();
+            "#);
+        // One and two milliseconds after rounding for the fallback pair (the
+        // first character sits at 0), then plain zeros where the fallback does
+        // not apply (two probes), and a 1 for the `renderDelay == 0` the game
+        // tests.
+        assert_eq!(value, "0/1/2/0/0/0/0/0/0/1");
+    }
+
+    /// `timeScale` still scales the reveal: `renderDelay` and `calcShowCount`
+    /// multiply the stored display times on every read (the DLL's getters read
+    /// `+0x4c` at each call), so a write after the render changes both.
+    #[test]
+    fn time_scale_still_scales_the_reveal() {
+        let value = run(r#"
+            var render = new TextRenderBase();
+            render.setRenderSize(400, 100);
+            render.render("abcd", 1, 25, 0, void, 0);
+            var before = render.calcShowCount(99) + "/" + render.renderDelay;
+            render.timeScale = 2;
+            var after = render.calcShowCount(99) + "/" + render.renderDelay;
+            return before + "/" + after;
+            "#);
+        // At 99 ms all four characters are due (display times 0/25/50/75); at
+        // half speed only two of them are, and the reported total doubles.
+        assert_eq!(value, "4/100/2/200");
+    }
+
+    /// `ignore_delay` (key string 0x100274d4, stored at member `+0x16a` by
+    /// `0x10018e5f`) suppresses the timing codes themselves — the walker gates
+    /// their five handlers on it (`%d` `0x1000c54b`, `%a` `0x1000c5fb`, `%w`
+    /// `0x1000c6fe`, `%t` `0x1000c83c`, `%D` `0x1000c977`) — while the base
+    /// delay from `render`'s argument 2 keeps its effect.
+    #[test]
+    fn ignore_delay_suppresses_the_timing_codes_but_not_the_base() {
+        let value = run(r#"
+            function d(value) { return value == 0 ? "0" : "" + value; }
+            var render = new TextRenderBase();
+            render.setRenderSize(400, 100);
+            render.render("ab%d50;c%t1000;d", 0, 25, 0, void, 0);
+            var active = render.getCharacters(0, 0);
+            var with_codes = d(active[0].delay) + "/" + d(active[1].delay) + "/" + d(active[2].delay)
+                + "/" + d(active[3].delay) + "/" + render.renderDelay;
+            render.setOption(%["ignore_delay" => 1]);
+            render.render("ab%d50;c%t1000;d", 0, 25, 0, void, 0);
+            var ignored = render.getCharacters(0, 0);
+            return with_codes + "/" + d(ignored[0].delay) + "/" + d(ignored[1].delay) + "/"
+                + d(ignored[2].delay) + "/" + d(ignored[3].delay) + "/" + render.renderDelay;
+            "#);
+        // Live: `%d50;` halves the per-character delay for `c` (12.5) and
+        // `%t1000;` adds a full second to the clock before `d`. Ignored: every
+        // character keeps the 25 ms base and the wait is dropped.
+        assert_eq!(value, "0/25/50/1062.5/1075/0/25/50/75/100");
     }
 
     /// `getCharacters`' second argument is a count, 0 meaning "to the end"
@@ -3370,7 +3684,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("abcde");
+            render.render("abcde", 1, 0, 0, void, 0);
             var all = render.getCharacters(0, 0);
             var tail = render.getCharacters(2, 0);
             var slice = render.getCharacters(1, 2);
@@ -3386,12 +3700,12 @@ mod tests {
         assert_eq!(value, "5/e/3/2/bc/1/2");
     }
 
-    /// `calcShowCount(elapsed)` (`FUN_10011080`) is the typewriter clock: the
-    /// number of characters whose display time — the record's `delay`, the wait
-    /// accumulated through the glyph — times `timeScale` has come at `elapsed`
-    /// milliseconds. `delay` is the character's absolute display time, as the
-    /// DLL's layout writes it (`record[+0x64]`, the field the character-object
-    /// builder registers as `delay`).
+    /// `calcShowCount(elapsed)` (`FUN_10008590`/`FUN_10011080`) is the
+    /// typewriter clock: the number of characters whose display time — the
+    /// record's `delay`, the clock value reached before the glyph — times
+    /// `timeScale` has come at `elapsed` milliseconds. `delay` is that value
+    /// as the DLL's layout writes it (`record+0x5c`, the field the character
+    /// object's `delay` property binds), so the first character is due at 0.
     #[test]
     fn calc_show_count_reveals_characters_over_elapsed_time() {
         let value = run(
@@ -3401,13 +3715,15 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("abcd");
+            render.render("abcd", 1, 1, 0, void, 0);
             var start = render.calcShowCount(0);
             var one = render.calcShowCount(1);
             var two = render.calcShowCount(2);
             var all = render.calcShowCount(100);
             var chars = render.getCharacters(0, 0);
-            var display_times = chars[0].delay + "/" + chars[1].delay + "/" + chars[3].delay;
+            // TJS prints a real zero as "+0.0"; report the reference's "0".
+            var display_times = (chars[0].delay == 0 ? "0" : chars[0].delay) + "/"
+                + chars[1].delay + "/" + chars[3].delay;
             // The DLL's character objects have no `time` (that name belongs to
             // the keyWait entries), and a Dictionary miss reads as void.
             var stray_time_key = chars[0].time === void ? 1 : 0;
@@ -3417,10 +3733,11 @@ mod tests {
                 + stray_time_key + "/" + scaled + "/" + render.renderDelay;
             "#,
         );
-        // Each glyph waits one unit, so at 2 the third is still pending and the
-        // records carry display times 1/2/4 with no extra `time` key; with
-        // `timeScale` 2 only one character has arrived at 2.
-        assert_eq!(value, "0/1/2/4/1/2/4/1/1/8");
+        // The first glyph is due at 0 and each further tick reveals one more, so
+        // at 2 three have arrived; the records carry display times 0/1/3 with no
+        // extra `time` key, and with `timeScale` 2 only two of them are due at
+        // 2 (0 and 2) while the total doubles.
+        assert_eq!(value, "1/2/3/4/0/1/3/1/2/8");
     }
 
     /// `render`'s remaining arguments are not a font size: PARQUET passes the
@@ -3435,7 +3752,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("a", 1, 0);
+            render.render("a", 1, 0, 0, void, 0);
             var char = render.getCharacters(0, 0)[0];
             return char.size + "/" + (char.width > 1);
             "#,
@@ -3464,21 +3781,21 @@ mod tests {
             var render = new TextRenderBase();
             render.setFont(new SizedFont());
             render.setRenderSize(400, 0);
-            render.render("a");
+            render.render("a", 1, 0, 0, void, 0);
             var sized = render.getCharacters(0, 0)[0];
             render.setFont(new ZeroFont());
-            render.render("b");
+            render.render("b", 1, 0, 0, void, 0);
             var zero = render.getCharacters(0, 0)[0];
             render.setFont(new BareFont());
-            render.render("c");
+            render.render("c", 1, 0, 0, void, 0);
             var bare = render.getCharacters(0, 0)[0];
             render.setFont(new Font());
-            render.render("d");
+            render.render("d", 1, 0, 0, void, 0);
             var native = render.getCharacters(0, 0)[0];
             // A negative height is a pixel size in the engine's own font
             // resolution, so `-20` must lay out at 20, not fall back.
             render.font.height = -20;
-            render.render("e");
+            render.render("e", 1, 0, 0, void, 0);
             var negative = render.getCharacters(0, 0)[0];
             return sized.size + "/" + sized.color + "/" + zero.size + "/" + bare.size + "/"
                 + native.size + "/" + negative.size + "/" + bare.color + "/" + render.defaultChColor;
@@ -3501,7 +3818,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("[あ,18446744073709551615]ab");
+            render.render("[あ,18446744073709551615]ab", 1, 0, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var ruby = "";
             if (chars[0].ruby !== void) {
@@ -3525,14 +3842,14 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("abc");
+            render.render("abc", 1, 0, 0, void, 0);
             var before = render.renderCount;
             render.clear();
             var cleared = render.renderCount;
             render.setFont(font);
-            render.render("a");
+            render.render("a", 1, 0, 0, void, 0);
             render.newline();
-            render.render("b");
+            render.render("b", 1, 0, 0, void, 0);
             var after_break = render.renderLines;
             var chars = render.getCharacters();
             // `newline` breaks the layout before the next text, so the second
@@ -3545,7 +3862,7 @@ mod tests {
             render.setDefault(%["face" => "Lang", "fontsize" => 30, "linespacing" => 20]);
             render.resetFont();
             render.resetStyle();
-            render.render("a\nb");
+            render.render("a\nb", 1, 0, 0, void, 0);
             var styled = render.getCharacters();
             var active = styled[0].face + "/" + styled[1].y;
             var defaults = render.defaultFace + "/" + render.defaultFontSize + "/"
@@ -3555,7 +3872,7 @@ mod tests {
             // measures through (`system/LangRender.tjs` calls
             // `TextRenderBase.setFont(%["face" => defaultFace])`).
             render.setFont(%["face" => "Pressed"]);
-            render.render("c");
+            render.render("c", 1, 0, 0, void, 0);
             var pressed = render.getCharacters()[0].face + "/" + render.defaultFace + "/"
                 + (render.font !== void);
             var sliced = render.getCharacters(0, 1).count;
@@ -3637,17 +3954,17 @@ mod tests {
             render.setFont(font);
             render.setRenderSize(400, 0);
             render.setStyle(%["pitch" => 5, "linespacing" => 12]);
-            render.render("ab");
+            render.render("ab", 1, 1, 0, void, 0);
             var line = render.getCharacters(0, 0);
             var pitch = line[1].left - line[0].left - line[0].width;
-            render.render("a\nb");
+            render.render("a\nb", 1, 0, 0, void, 0);
             var styled = render.getCharacters(0, 0);
             var line_step = styled[1].y;
             render.setDefault(%["linespacing" => 40]);
-            render.render("a\nb");
+            render.render("a\nb", 1, 0, 0, void, 0);
             var after_default = render.getCharacters(0, 0)[1].y;
             render.resetStyle();
-            render.render("a\nb");
+            render.render("a\nb", 1, 0, 0, void, 0);
             var after_reset = render.getCharacters(0, 0)[1].y;
             return pitch + "/" + line_step + "/" + after_default + "/" + after_reset + "/"
                 + render.defaultLineSpacing;
@@ -3707,7 +4024,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("A\\nB");
+            render.render("A\\nB", 1, 0, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var texts = "";
             var i = 0;
@@ -3732,7 +4049,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("あ\\kい");
+            render.render("あ\\kい", 1, 1, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var waits = render.getKeyWait();
             var first = waits[0];
@@ -3769,7 +4086,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("A%fuser;B$記号$;C");
+            render.render("A%fuser;B$記号$;C", 1, 0, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var texts = "";
             var i = 0;
@@ -3795,7 +4112,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("a%i1b%idc%120;d#ff0000;e");
+            render.render("a%i1b%idc%120;d#ff0000;e", 1, 0, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var texts = "";
             var i = 0;
@@ -3821,7 +4138,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("a\\w\\x%t1000;b%n2;c");
+            render.render("a\\w\\x%t1000;b%n2;c", 1, 1, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var texts = "";
             var i = 0;
@@ -3832,9 +4149,10 @@ mod tests {
                 + render.renderLines + "/" + render.renderDelay;
             "#);
         // `b` sits one blank cell — the current glyph size, 20 — after `a`
-        // (whose advance the Font measured), carries the 1000 the wait added
-        // plus its own tick, and `c` lands two lines below it.
-        assert_eq!(value, "3/abc/20/1002/0/2/3/1003");
+        // (whose advance the Font measured), carries the 1000 the wait added on
+        // top of `a`'s tick (its record's delay is the clock value reached
+        // before its own tick), and `c` lands two lines below it.
+        assert_eq!(value, "3/abc/20/1001/0/2/3/1003");
     }
 
     /// A `%…;` the walk cannot place is consumed up to its `;` and draws
@@ -3849,7 +4167,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(400, 0);
-            render.render("a%zz;b\\[c\\\\d");
+            render.render("a%zz;b\\[c\\\\d", 1, 0, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var texts = "";
             var i = 0;
@@ -3872,7 +4190,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(800, 0);
-            render.render("「それはない」\\n「ないない」");
+            render.render("「それはない」\\n「ないない」", 1, 0, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var texts = "";
             var i = 0;
@@ -3896,7 +4214,7 @@ mod tests {
             font.height = 20;
             render.setFont(font);
             render.setRenderSize(800, 0);
-            render.render("一连串的爆炸平息之后，\\n我将枪管架在沙袋的凹槽上，悄悄探出头观察外面的情况。");
+            render.render("一连串的爆炸平息之后，\\n我将枪管架在沙袋的凹槽上，悄悄探出头观察外面的情况。", 1, 0, 0, void, 0);
             var chars = render.getCharacters(0, 0);
             var texts = "";
             var i = 0;
