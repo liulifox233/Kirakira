@@ -11,7 +11,9 @@ use crate::vm::{SuspendedCallStack, Vm};
 pub(crate) mod builtins;
 pub mod object;
 pub(crate) mod symbol_table;
-pub(crate) mod tjs_ns0;
+/// The `TJS/` data-pack container: the 16-byte header and the seeded,
+/// check-byte-carrying value stream (`PackinOne.dll`'s `tjsDataPack`).
+pub mod tjs_ns0;
 pub mod value;
 
 #[cfg(test)]
@@ -995,6 +997,30 @@ impl<H: TjsHost + 'static> Runtime<H> {
 
     pub fn decode_tjs_ns0(&mut self, bytes: &[u8]) -> Result<Option<Variant>> {
         tjs_ns0::decode_tjs_ns0(self, bytes).map(Some)
+    }
+
+    /// Decodes a `TJS/ns0` body — the serialized values plus their trailing
+    /// 4-byte final check — with the container header's seed and byte order.
+    /// The caller handles the transform chain in front of the body (IV,
+    /// LZ4 framing, ChaCha), which `Scripts.loadDataPack` does.
+    pub fn decode_tjs_ns0_body(
+        &mut self,
+        payload: &[u8],
+        seed: u32,
+        big_endian: bool,
+    ) -> Result<Variant> {
+        tjs_ns0::decode_tjs_ns0_body(self, payload, seed, big_endian)
+    }
+
+    /// Serializes `value` as a `TJS/ns0` body with the header's seed and byte
+    /// order, appending the trailing final check.
+    pub fn encode_tjs_ns0_body(
+        &self,
+        value: &Variant,
+        seed: u32,
+        big_endian: bool,
+    ) -> Result<Vec<u8>> {
+        tjs_ns0::encode_tjs_ns0_body(self, value, seed, big_endian)
     }
 
     pub fn execute_file(&mut self, file: &BytecodeFile) -> Result<Variant> {

@@ -14,13 +14,14 @@
 //!   leaves `+` untouched (no form-style space mapping).
 //! - `Scripts.loadDataPack` / `Scripts.saveDataPack` / `Scripts.makeDataPackThumb`
 //!   / `Scripts.makeDataPackDigest`: the tjsDataPack surface. The loader reads
-//!   the binary dictionary/array formats used by packed UI definitions
-//!   (`KBAD100` and `TJS/ns0`) under the exact storage name it is handed (the
-//!   engine's `.pbd` alias stays as the fallback); the writer produces the
-//!   bookmark-file anatomy the game's own IO uses — the captured thumbnail
-//!   image leading, the engine-readable `KBAD100` pack appended, the digest
-//!   seed in a footer. See the `tjsDataPack` section for the reference anchors
-//!   and the deliberate divergences.
+//!   the reference container — an optional leading JPEG/PNG thumbnail, the
+//!   16-byte `TJS/` header (seed, crypt mode, IV), then the LZ4-framed and/or
+//!   ChaCha-encrypted `TJS/ns0` value stream — plus the plain `KBAD100` and
+//!   `TJS/ns0` packs used by packed UI definitions, under the exact storage
+//!   name it is handed (the engine's `.pbd` alias stays as the fallback); the
+//!   writer emits that same container back, thumbnail leading, with the digest
+//!   seed in the header. See the `tjsDataPack` section for the reference
+//!   anchors and the deliberate divergences.
 //! - `Scripts.clone`: recursively clones arrays and dictionaries and delegates
 //!   other objects to their own `clone` method, matching scriptsEx.
 //!
@@ -30,15 +31,12 @@
 //! use it to restore system variables before choosing their opening flow.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use krkr_engine::{KrkrHost, KrkrPlugin, plugin_api::layer::layer_bitmap_read};
 use krkr_tjs2::{
     Result, TjsError, TjsErrorKind,
-    runtime::{ObjectHandle, Runtime, TjsHost, Variant},
+    runtime::{ObjectHandle, Runtime, TjsHost, Variant, tjs_ns0 as ns0},
 };
 
 use crate::catalog::{PluginMeta, PluginStatus};
@@ -678,27 +676,22 @@ fn install_layer_effects(runtime: &mut Runtime<KrkrHost>) {
 // tjsDataPack: the DataPack container
 
 /// The binary struct pack header (`krkr-tjs2/src/runtime/builtins.rs`,
-/// `BINARY_STRUCT_HEADER`) the engine's struct reader and this writer share.
+/// `BINARY_STRUCT_HEADER`) the engine's struct reader and the pack decoder
+/// share. This port only *reads* it now: the reference container below is what
+/// the writer emits.
 const BINARY_STRUCT_HEADER: &[u8; 8] = b"KBAD100\0";
 
-/// The footer this port appends after the pack, laid out
-/// `[u32 pack_offset][u32 pack_len][u32 seed][u8 version]["KDPK"]`.
-///
-/// A file this port writes is `[thumbnail image][pack][footer]`, the anatomy
-/// the game's own bookmark writers use: `BookMarkIO_Standard.rewrite` saves
-/// the layer image and then runs `Dictionary.saveStruct(file, a0.size + "o")`
-/// — the struct lands *after* the image, at the offset the digest
-/// dictionary's `size` member records (system/MainWindow.tjs object 472,
-/// `/tmp/m129/mainwindow.dis`). The same split lets a save slot's thumbnail
-/// be the file itself, which is what the save screen loads
-/// (`drawNormalItem` → `kag.getBookMarkFileNameAtNum` → `loadImages`), and
-/// the pack inside is byte-for-byte the engine serializer's output. The
-/// reference's own container also carries the digest seed and validates the
-/// thumbnail octet ("saveDataPack: unknown thumboct format", PackinOne.dll
-/// tjsDataPack module); the footer is this port's slot for both.
+/// The footer this port's previous writer appended, laid out
+/// `[u32 pack_offset][u32 pack_len][u32 seed][u8 version]["KDPK"]`
+/// (M133). The reference container has no footer, so this is only parsed to
+/// keep saves written by that build loading.
 const DATA_PACK_FOOTER_MAGIC: &[u8; 4] = b"KDPK";
 const DATA_PACK_FOOTER_VERSION: u8 = 1;
 const DATA_PACK_FOOTER_LEN: usize = 17;
+
+/// The raw LZ4 block size the reference frames at (`FUN_10051220`'s 0x1000
+/// buffered stream is what feeds `LZ4CompressStream`).
+const DATAPACK_LZ4_BLOCK: usize = 4096;
 
 fn install_data_pack(runtime: &mut Runtime<KrkrHost>) {
     // tjsDataPack attaches these to the Scripts object (games call
@@ -760,49 +753,116 @@ fn load_data_pack(
     runtime.call_function(previous.clone(), args)
 }
 
+/// Decodes a `DataPack` storage: the reference container (optionally behind
+/// the leading JPEG/PNG thumbnail a bookmark file starts with), a plain
+/// `KBAD100` pack, or — for files this port wrote before the container switch
+/// — the pack behind a `KDPK` footer.
 fn decode_data_pack(
     runtime: &mut Runtime<KrkrHost>,
     bytes: &[u8],
     storage_name: &str,
 ) -> Result<Variant> {
-    let Some(payload) = data_pack_payload(bytes) else {
-        return Err(TjsError::runtime(format!(
-            "Scripts.loadDataPack expected a binary data pack in `{storage_name}`"
-        )));
-    };
-    if payload.starts_with(BINARY_STRUCT_HEADER) {
-        return runtime.decode_binary_struct(payload)?.ok_or_else(|| {
+    if let Some(pack) = reference_data_pack(bytes) {
+        return decode_reference_data_pack(runtime, pack, storage_name);
+    }
+    if is_plain_data_pack(bytes) {
+        return decode_plain_data_pack(runtime, bytes, storage_name);
+    }
+    if let Some(footer) = parse_data_pack_footer(bytes) {
+        let start = footer.pack_offset as usize;
+        let end = start.checked_add(footer.pack_len as usize);
+        if let Some(payload) = end.and_then(|end| bytes.get(start..end))
+            && is_plain_data_pack(payload)
+        {
+            return decode_plain_data_pack(runtime, payload, storage_name);
+        }
+    }
+    Err(TjsError::runtime(format!(
+        "Scripts.loadDataPack expected a binary data pack in `{storage_name}`"
+    )))
+}
+
+/// The reference container behind its optional leading image: `TJS/` or
+/// `TJS\` at offset 0, or right after the JPEG/PNG a bookmark file leads
+/// with (`FUN_10050020` sniffs exactly these four magics).
+fn reference_data_pack(bytes: &[u8]) -> Option<&[u8]> {
+    if starts_with_ns0_magic(bytes) {
+        return Some(bytes);
+    }
+    let end = image_end(bytes)?;
+    let pack = bytes.get(end..)?;
+    starts_with_ns0_magic(pack).then_some(pack)
+}
+
+fn starts_with_ns0_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(ns0::NS0_MAGIC_LE) || bytes.starts_with(ns0::NS0_MAGIC_BE)
+}
+
+/// Decodes the reference container: 16-byte header, IV, then the transform
+/// chain — ChaCha over the whole stream, LZ4 raw-block framing — ahead of the
+/// seeded value stream. The writer encrypts *after* compressing, so reading
+/// undoes them in that order.
+fn decode_reference_data_pack(
+    runtime: &mut Runtime<KrkrHost>,
+    pack: &[u8],
+    storage_name: &str,
+) -> Result<Variant> {
+    let header = ns0::parse_ns0_header(pack).map_err(|error| {
+        TjsError::runtime(format!(
+            "Scripts.loadDataPack could not decode `{storage_name}`: {error}"
+        ))
+    })?;
+    let iv_end = ns0::NS0_HEADER_SIZE + header.iv_length as usize;
+    let iv = pack.get(ns0::NS0_HEADER_SIZE..iv_end).ok_or_else(|| {
+        TjsError::runtime(format!(
+            "Scripts.loadDataPack found a truncated data pack in `{storage_name}`"
+        ))
+    })?;
+    let mut body = pack[iv_end..].to_vec();
+    if header.cryptmode != 0 {
+        datapack_chacha_apply(header.cryptmode, header.seed, iv, &mut body).map_err(|error| {
+            TjsError::runtime(format!(
+                "Scripts.loadDataPack could not decode `{storage_name}`: {error}"
+            ))
+        })?;
+    }
+    if header.compress == ns0::NS0_COMPRESS_LZ4 {
+        body = datapack_lz4_deframe(&body).map_err(|error| {
+            TjsError::runtime(format!(
+                "Scripts.loadDataPack could not decode `{storage_name}`: {error}"
+            ))
+        })?;
+    }
+    runtime
+        .decode_tjs_ns0_body(&body, header.seed, header.big_endian)
+        .map_err(|error| {
+            TjsError::runtime(format!(
+                "Scripts.loadDataPack could not decode `{storage_name}`: {error}"
+            ))
+        })
+}
+
+fn decode_plain_data_pack(
+    runtime: &mut Runtime<KrkrHost>,
+    bytes: &[u8],
+    storage_name: &str,
+) -> Result<Variant> {
+    if bytes.starts_with(BINARY_STRUCT_HEADER) {
+        return runtime.decode_binary_struct(bytes)?.ok_or_else(|| {
             TjsError::runtime(format!(
                 "Scripts.loadDataPack could not decode `{storage_name}`"
             ))
         });
     }
-    runtime.decode_tjs_ns0(payload)?.ok_or_else(|| {
+    runtime.decode_tjs_ns0(bytes)?.ok_or_else(|| {
         TjsError::runtime(format!(
             "Scripts.loadDataPack could not decode `{storage_name}`"
         ))
     })
 }
 
-/// The pack a `DataPack` storage holds: a plain container (`KBAD100`, or
-/// `TJS/ns0` for the packed UI definitions) *or* the pack inside a bookmark
-/// file this port wrote — `[thumbnail image][pack][footer]`, with the
-/// footer recording where the pack starts and how long it is.
-fn data_pack_payload(bytes: &[u8]) -> Option<&[u8]> {
-    if is_data_pack_container(bytes) {
-        return Some(bytes);
-    }
-    let footer = parse_data_pack_footer(bytes)?;
-    let start = footer.pack_offset as usize;
-    let end = start.checked_add(footer.pack_len as usize)?;
-    let payload = bytes.get(start..end)?;
-    is_data_pack_container(payload).then_some(payload)
-}
-
-fn is_data_pack_container(bytes: &[u8]) -> bool {
-    bytes.starts_with(BINARY_STRUCT_HEADER)
-        || bytes.starts_with(b"TJS/ns0\0")
-        || bytes.starts_with(b"TJS/4s0\0")
+fn is_plain_data_pack(bytes: &[u8]) -> bool {
+    bytes.starts_with(BINARY_STRUCT_HEADER) || starts_with_ns0_magic(bytes)
 }
 
 /// `Scripts.saveDataPack(name, data[, digest[, thumb]])`.
@@ -810,15 +870,15 @@ fn is_data_pack_container(bytes: &[u8]) -> bool {
 /// KAGEX's `BookMarkIO_DataPack.save` calls it with four arguments
 /// (system/MainWindow.tjs object 474): `data` is the bookmark dictionary
 /// (`id`/`core`/`user`/`history`), `digest` is `calcThumbnailSize()`'s
-/// dictionary after `makeDataPackDigest` filled its `seed`, and `thumb` is
-/// `makeDataPackThumb`'s encoded image (or void). The data is the pack's root
-/// — the game's reader checks `id`/`core` on the value `loadDataPack` returns
-/// — the pack is appended after the thumbnail image (so the save file is also
-/// the slot's picture, the anatomy `BookMarkIO_Standard` writes), and the
-/// digest seed rides in the footer. The reference's own container compresses
-/// (LZ4) and/or encrypts the payload according to the digest dictionary's
-/// `cryptmode`/`compress`/`iv` (set from `saveDataMode`, `main/Config.tjs:18`);
-/// this port writes the plain form its own reader decodes.
+/// dictionary after `makeDataPackDigest` filled its `seed` (and carries
+/// `compress`/`cryptmode`/`iv`, set from `saveDataMode`), and `thumb` is
+/// `makeDataPackThumb`'s encoded image (or void). The file is the reference
+/// container — `[thumbnail image][16-byte header][iv][LZ4-framed and/or
+/// ChaCha-encrypted body]`, no offset footer: the image's own chunk structure
+/// ends the thumbnail and the body follows the header. The writer runs the
+/// same chain the reference does (`FUN_10052090`): the body is serialized
+/// with the seeded checker, framed in raw LZ4 blocks when `compress` is set,
+/// then ChaCha-encrypted when `cryptmode` is set.
 fn save_data_pack(
     runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -832,19 +892,91 @@ fn save_data_pack(
             "saveDataPack: datapack type check failed: {name}"
         )));
     };
-    let pack = encode_struct_pack(runtime, data)?;
-    let seed = digest_seed(runtime, args.get(2));
+    let options = data_pack_options(runtime, args.get(2));
     let thumb = pack_thumbnail(runtime, args.get(3));
-    let mut bytes =
-        Vec::with_capacity(thumb.as_ref().map_or(0, Vec::len) + pack.len() + DATA_PACK_FOOTER_LEN);
+    let mut body = runtime.encode_tjs_ns0_body(&Variant::Object(data), options.seed, false)?;
+    if options.compress == ns0::NS0_COMPRESS_LZ4 {
+        body = datapack_lz4_frame(&body);
+    }
+    if options.cryptmode != 0 {
+        datapack_chacha_apply(options.cryptmode, options.seed, &options.iv, &mut body)?;
+    }
+    let mut bytes = Vec::with_capacity(
+        thumb.as_ref().map_or(0, Vec::len) + ns0::NS0_HEADER_SIZE + options.iv.len() + body.len(),
+    );
     if let Some(thumb) = &thumb {
         bytes.extend_from_slice(thumb);
     }
-    let pack_offset = bytes.len();
-    bytes.extend_from_slice(&pack);
-    append_data_pack_footer(&mut bytes, pack_offset, pack.len(), seed);
+    append_data_pack_header(&mut bytes, &options);
+    bytes.extend_from_slice(&body);
     runtime.host_mut().write_binary(&name, "b", &bytes)?;
     Ok(Variant::Void)
+}
+
+/// The header's digest-driven knobs (`BookMarkIO_DataPack`):
+/// `compress` picks the `4s0` LZ4 framing, `cryptmode` the ChaCha parameter
+/// set, `iv` the salt string (stored UTF-16LE plus its NUL terminator, the
+/// byte form the real `m144-*.ksd` artifacts carry) and `seed` — when the
+/// game leaves it zero — the writer's `"TJS"` default.
+struct DataPackOptions {
+    seed: u32,
+    compress: u8,
+    cryptmode: u16,
+    iv: Vec<u8>,
+}
+
+fn data_pack_options(runtime: &Runtime<KrkrHost>, digest: Option<&Variant>) -> DataPackOptions {
+    let handle = digest.and_then(|value| value.object_handle());
+    let member = |name: &str| {
+        handle
+            .map(|handle| runtime.object_member(handle, name))
+            .unwrap_or(Variant::Void)
+    };
+    let seed = digest_seed(runtime, digest)
+        .filter(|seed| *seed != 0)
+        .unwrap_or(ns0::NS0_DEFAULT_SEED);
+    let compress = match member("compress") {
+        Variant::Integer(value) if value != 0 => ns0::NS0_COMPRESS_LZ4,
+        Variant::Real(value) if value != 0.0 => ns0::NS0_COMPRESS_LZ4,
+        _ => ns0::NS0_COMPRESS_STORE,
+    };
+    let cryptmode = match member("cryptmode") {
+        Variant::Integer(value) if (1..=6).contains(&value) => value as u16,
+        _ => 0,
+    };
+    let iv = match member("iv") {
+        // The reference stores the salt string as UTF-16LE *including its
+        // NUL terminator* (`m144-*.ksd`: iv "kiri" → ivlen 10 = 2*(4+1); the
+        // 20-character title artifact → 42 = 2*(20+1)).
+        Variant::String(text) => {
+            let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.extend_from_slice(&[0, 0]);
+            bytes
+        }
+        _ => Vec::new(),
+    };
+    DataPackOptions {
+        seed,
+        compress,
+        cryptmode,
+        iv,
+    }
+}
+
+/// Writes the 16-byte header and the IV bytes (`FUN_1004e0d0`).
+fn append_data_pack_header(out: &mut Vec<u8>, options: &DataPackOptions) {
+    let mut header = [0u8; ns0::NS0_HEADER_SIZE];
+    header[0..4].copy_from_slice(ns0::NS0_MAGIC_LE);
+    header[4] = options.compress;
+    header[5..8].copy_from_slice(b"s0\0");
+    header[8..12].copy_from_slice(&options.seed.to_le_bytes());
+    header[12..14].copy_from_slice(&options.cryptmode.to_le_bytes());
+    header[14..16].copy_from_slice(&(options.iv.len() as u16).to_le_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&options.iv);
 }
 
 /// `Scripts.makeDataPackThumb(layer, ext, quality, component)`.
@@ -852,10 +984,10 @@ fn save_data_pack(
 /// `BookMarkIO_DataPack` picks the thumbnail format from `saveThumbnail` —
 /// `jpg` for 3, `png` otherwise, `kdt` when thumbnails are off — and the save
 /// path passes the captured layer to this function (object 474) before handing
-/// its result to `saveDataPack`. This port has no JPEG/PNG encoder reachable
-/// from the plugin, so the captured image is a 24-bit BMP of the layer's main
-/// bitmap: the bytes are stored in the pack's footer, never re-encoded. `kdt`
-/// means "no thumbnail", so it produces none.
+/// its result to `saveDataPack`. `kdt` means "no thumbnail", so it produces
+/// none; the other extensions get a baseline JPEG or a PNG of the layer's main
+/// bitmap (the reference's own encoder is IJG, so the *bytes* differ, the
+/// decodable image does not).
 fn make_data_pack_thumb(
     runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -869,10 +1001,16 @@ fn make_data_pack_thumb(
     if extension.eq_ignore_ascii_case("kdt") {
         return Ok(Variant::Void);
     }
+    let quality = args
+        .get(2)
+        .and_then(|value| value.to_integer().ok())
+        .filter(|quality| (1..=100).contains(quality))
+        .unwrap_or(75) as u8;
+    let jpeg = !extension.eq_ignore_ascii_case("png");
     let Some(layer) = args.first().and_then(|value| value.object_handle()) else {
         return Ok(Variant::Void);
     };
-    match encode_layer_thumbnail(runtime, layer) {
+    match encode_layer_thumbnail(runtime, layer, jpeg, quality) {
         Ok(bytes) => Ok(Variant::Octet(bytes)),
         Err(error) => {
             runtime.host_mut().log(&format!(
@@ -889,48 +1027,51 @@ fn make_data_pack_thumb(
 /// `makeDataPackDigest(data, System.getTickCount() & 0xffffffff, saveDataID)`
 /// and stores the result as the digest dictionary's `seed` member (object
 /// 474); `Initialize.tjs`'s `MakeLockKey` and `gridchain.calchash` use the
-/// four-argument form, hashing *storage names* there. The reference DLL
-/// bundles xxHash (and LZ4 for its container); this port keeps a plain FNV-1a
-/// over the serialized subject — or the storage's bytes for a name — mixed
-/// with the seed, key and flag, so the value is deterministic across runs.
+/// four-argument form. The reference feeds the *big-endian* value
+/// serialization of subject then key — including the per-value checker bytes,
+/// zero for the zero seed the digest state starts with (`FUN_10053500`,
+/// `FUN_10053450` over `VariantDigestState`/`XXH32Hasher`) — through
+/// `XXH32(data, seed)` — the value a real-engine probe pinned
+/// (`makeDataPackDigest(data, 7, "probe") = 882327524` for the `%["id" => ...]`
+/// dictionary the M142 harness used). `flag = 1` selects the DLL's Blake2s
+/// hasher (`FUN_10048910`, parameter block `[8, 4, 1, 1, 0, ...]`); this port
+/// answers the XXH32 value either way and logs the substitution once.
 fn make_data_pack_digest(
     runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
-    let mut hash = 0x811c_9dc5u32;
+    static BLAKE2S_WARNED: AtomicBool = AtomicBool::new(false);
+    let mut preimage = Vec::new();
     if let Some(subject) = args.first() {
-        match subject.object_handle() {
-            Some(handle) => fnv1a(&mut hash, &encode_struct_pack(runtime, handle)?),
-            None => {
-                let text = subject.to_tjs_string()?;
-                match runtime.host_mut().read_binary(&text, "") {
-                    Ok(bytes) => fnv1a(&mut hash, &bytes),
-                    Err(_) => fnv1a(&mut hash, text.as_bytes()),
-                }
-            }
-        }
+        preimage.extend_from_slice(&digest_serialization(runtime, subject)?);
     }
     let seed = args
         .get(1)
         .and_then(|value| value.to_integer().ok())
-        .unwrap_or(0);
-    let key = args.get(2).cloned().unwrap_or_default().to_tjs_string()?;
+        .unwrap_or(0) as u32;
+    let key = args.get(2).cloned().unwrap_or_default();
+    preimage.extend_from_slice(&digest_serialization(runtime, &key)?);
     let flag = args
         .get(3)
         .and_then(|value| value.to_integer().ok())
         .unwrap_or(0);
-    fnv1a(&mut hash, &(seed as u32).to_le_bytes());
-    fnv1a(&mut hash, key.as_bytes());
-    fnv1a(&mut hash, &(flag as u32).to_le_bytes());
-    Ok(Variant::Integer(i64::from(hash)))
+    if flag != 0 && !BLAKE2S_WARNED.swap(true, Ordering::Relaxed) {
+        runtime.host_mut().log(
+            "PackinOne.dll: makeDataPackDigest(flag=1) asks for Blake2s upstream; \
+             this port answers XXH32 instead",
+        );
+    }
+    Ok(Variant::Integer(i64::from(xxh32(&preimage, seed))))
 }
 
-fn fnv1a(hash: &mut u32, bytes: &[u8]) {
-    for &byte in bytes {
-        *hash ^= u32::from(byte);
-        *hash = hash.wrapping_mul(0x0100_0193);
-    }
+/// One digest operand: the `TJS/ns0` big-endian serialization with the zero
+/// seed's checker bytes and *without* the trailing final check (`FUN_10053450`
+/// writes a single value into the digest state).
+fn digest_serialization(runtime: &Runtime<KrkrHost>, value: &Variant) -> Result<Vec<u8>> {
+    let mut body = runtime.encode_tjs_ns0_body(value, 0, true)?;
+    body.truncate(body.len() - 4);
+    Ok(body)
 }
 
 /// The digest dictionary's `seed`, the value `makeDataPackDigest` produced.
@@ -948,14 +1089,14 @@ fn digest_seed(runtime: &Runtime<KrkrHost>, digest: Option<&Variant>) -> Option<
 /// path passes the *file name* it is rewriting (object 476 →
 /// `saveDataPack(a0, a1, l0, a0)` in `rewriteBookMarkToFile`), which reuses
 /// the pack's existing thumbnail; a raw layer is accepted the same way
-/// `makeDataPackThumb` takes one.
+/// `makeDataPackThumb` takes one (as a JPEG, the `saveThumbnail = 3` default).
 fn pack_thumbnail(runtime: &mut Runtime<KrkrHost>, thumb: Option<&Variant>) -> Option<Vec<u8>> {
     match thumb {
         Some(Variant::Octet(bytes)) if !bytes.is_empty() => Some(bytes.clone()),
         Some(Variant::String(name)) => read_pack_thumbnail(runtime, name),
         Some(value) => value
             .object_handle()
-            .and_then(|layer| encode_layer_thumbnail(runtime, layer).ok()),
+            .and_then(|layer| encode_layer_thumbnail(runtime, layer, true, 75).ok()),
         None => None,
     }
 }
@@ -963,7 +1104,10 @@ fn pack_thumbnail(runtime: &mut Runtime<KrkrHost>, thumb: Option<&Variant>) -> O
 /// The image a previous save leads with, so a rewrite that passes its own
 /// file name keeps the slot's picture (`BookMarkIO_Standard.rewrite` loads the
 /// old image and re-saves the layer; the DataPack path's rewrite simply hands
-/// the file back to `saveDataPack`).
+/// the file back to `saveDataPack`). The image ends where its own chunk
+/// structure says — that is how the reference recovers the header that
+/// follows it — with the old `KDPK` footer's offset as the fallback for files
+/// this port wrote before the container switch.
 fn read_pack_thumbnail(runtime: &mut Runtime<KrkrHost>, name: &str) -> Option<Vec<u8>> {
     if name.is_empty() {
         return None;
@@ -975,61 +1119,39 @@ fn read_pack_thumbnail(runtime: &mut Runtime<KrkrHost>, name: &str) -> Option<Ve
             runtime.host_mut().read_binary(&storage_name, "").ok()?
         }
     };
-    let footer = parse_data_pack_footer(&bytes)?;
-    let offset = footer.pack_offset as usize;
+    let offset = image_end(&bytes).or_else(|| {
+        let footer = parse_data_pack_footer(&bytes)?;
+        Some(footer.pack_offset as usize)
+    })?;
     (offset > 0 && offset <= bytes.len()).then(|| bytes[..offset].to_vec())
 }
 
-/// A 24-bit BMP of the layer's main bitmap, top-down in the engine's RGBA
-/// store to bottom-up BGR rows.
-fn encode_layer_thumbnail(runtime: &mut Runtime<KrkrHost>, layer: ObjectHandle) -> Result<Vec<u8>> {
+/// Encodes the layer's main bitmap as the save's leading image: a baseline
+/// JPEG or a PNG, matching `makeDataPackThumb`'s extension choice.
+fn encode_layer_thumbnail(
+    runtime: &mut Runtime<KrkrHost>,
+    layer: ObjectHandle,
+    jpeg: bool,
+    quality: u8,
+) -> Result<Vec<u8>> {
     let layer = runtime.bound_this(layer).unwrap_or(layer);
     layer_bitmap_read(runtime, layer, |view| {
         let width = view.bitmap.width as usize;
         let height = view.bitmap.height as usize;
         let stride = view.bitmap.pitch as usize;
-        let row_bytes = (width * 3).div_ceil(4) * 4;
-        let image_size = row_bytes * height;
-        let mut out = Vec::with_capacity(54 + image_size);
-        out.extend_from_slice(b"BM");
-        out.extend_from_slice(&((54 + image_size) as u32).to_le_bytes());
-        out.extend_from_slice(&[0u8; 4]);
-        out.extend_from_slice(&54u32.to_le_bytes());
-        out.extend_from_slice(&40u32.to_le_bytes());
-        out.extend_from_slice(&(width as i32).to_le_bytes());
-        out.extend_from_slice(&(height as i32).to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&24u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(image_size as u32).to_le_bytes());
-        out.extend_from_slice(&2835u32.to_le_bytes());
-        out.extend_from_slice(&2835u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        for y in (0..height).rev() {
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
             let start = (y * stride).min(view.pixels.len());
             let end = (start + width * 4).min(view.pixels.len());
-            for pixel in view.pixels[start..end].chunks_exact(4) {
-                out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-            }
-            let row_end = 54 + (height - y) * row_bytes;
-            out.resize(row_end, 0);
+            rgba.extend_from_slice(&view.pixels[start..end]);
+            rgba.resize((y + 1) * width * 4, 0);
         }
-        out
+        if jpeg {
+            encode_jpeg(&rgba, width, height, quality)
+        } else {
+            encode_png(&rgba, width, height)
+        }
     })
-}
-
-fn append_data_pack_footer(
-    out: &mut Vec<u8>,
-    pack_offset: usize,
-    pack_len: usize,
-    seed: Option<u32>,
-) {
-    out.extend_from_slice(&(pack_offset as u32).to_le_bytes());
-    out.extend_from_slice(&(pack_len as u32).to_le_bytes());
-    out.extend_from_slice(&seed.unwrap_or(0).to_le_bytes());
-    out.push(DATA_PACK_FOOTER_VERSION);
-    out.extend_from_slice(DATA_PACK_FOOTER_MAGIC);
 }
 
 /// The footer's contents, when the storage has one: where the pack sits, how
@@ -1056,189 +1178,953 @@ fn parse_data_pack_footer(bytes: &[u8]) -> Option<DataPackFooter> {
     })
 }
 
-/// Encodes `root` as a `KBAD100` struct pack.
-///
-/// The engine exposes only the *decoder* to plugins
-/// (`Runtime::decode_binary_struct`), so the writer mirrors
-/// `krkr-tjs2/src/runtime/builtins.rs`'s `BinaryStructSerializer` tag for tag:
-/// same header, same scalar tags and widths, same string/octet/array/map
-/// headers, cycles degrade to `null`. A `Dictionary` (class info) becomes a
-/// map, an array becomes an array, any other object becomes `null` — exactly
-/// the engine's own binary `saveStruct`.
-fn encode_struct_pack(runtime: &Runtime<KrkrHost>, root: ObjectHandle) -> Result<Vec<u8>> {
-    let mut writer = StructPackWriter::new(runtime);
-    let mut bytes = Vec::from(BINARY_STRUCT_HEADER);
-    writer.value(&Variant::Object(root), &mut bytes)?;
-    Ok(bytes)
+// ---------------------------------------------------------------------------
+// Reference container primitives: XXH32, BLAKE2s, ChaCha and raw-block LZ4
+
+const XXH32_PRIME1: u32 = 0x9E37_79B1;
+const XXH32_PRIME2: u32 = 0x85EB_CA77;
+const XXH32_PRIME3: u32 = 0xC2B2_AE3D;
+const XXH32_PRIME4: u32 = 0x27D4_EB2F;
+const XXH32_PRIME5: u32 = 0x1656_67B1;
+
+fn xxh32_round(acc: u32, input: u32) -> u32 {
+    acc.wrapping_add(input.wrapping_mul(XXH32_PRIME2))
+        .rotate_left(13)
+        .wrapping_mul(XXH32_PRIME1)
 }
 
-struct StructPackWriter<'a> {
-    runtime: &'a Runtime<KrkrHost>,
-    active: BTreeSet<ObjectHandle>,
+/// XXH32, the hash behind `makeDataPackDigest` and the ChaCha nonce
+/// (`PackinOne.dll`'s `XXH32Hasher`; the primes sit in its `.text`).
+fn xxh32(data: &[u8], seed: u32) -> u32 {
+    let read = |offset: usize| {
+        u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ])
+    };
+    let mut index = 0;
+    let mut hash;
+    if data.len() >= 16 {
+        let mut v1 = seed.wrapping_add(XXH32_PRIME1).wrapping_add(XXH32_PRIME2);
+        let mut v2 = seed.wrapping_add(XXH32_PRIME2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(XXH32_PRIME1);
+        while index + 16 <= data.len() {
+            v1 = xxh32_round(v1, read(index));
+            v2 = xxh32_round(v2, read(index + 4));
+            v3 = xxh32_round(v3, read(index + 8));
+            v4 = xxh32_round(v4, read(index + 12));
+            index += 16;
+        }
+        hash = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+    } else {
+        hash = seed.wrapping_add(XXH32_PRIME5);
+    }
+    hash = hash.wrapping_add(data.len() as u32);
+    while index + 4 <= data.len() {
+        hash = hash
+            .wrapping_add(read(index).wrapping_mul(XXH32_PRIME3))
+            .rotate_left(17)
+            .wrapping_mul(XXH32_PRIME4);
+        index += 4;
+    }
+    while index < data.len() {
+        hash = hash
+            .wrapping_add(u32::from(data[index]).wrapping_mul(XXH32_PRIME5))
+            .rotate_left(11)
+            .wrapping_mul(XXH32_PRIME1);
+        index += 1;
+    }
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(XXH32_PRIME2);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(XXH32_PRIME3);
+    hash ^= hash >> 16;
+    hash
 }
 
-impl<'a> StructPackWriter<'a> {
-    fn new(runtime: &'a Runtime<KrkrHost>) -> Self {
+/// The BLAKE2s IV (SHA-256's constants) and message schedule.
+const BLAKE2S_IV: [u32; 8] = [
+    0x6A09_E667,
+    0xBB67_AE85,
+    0x3C6E_F372,
+    0xA54F_F53A,
+    0x510E_527F,
+    0x9B05_688C,
+    0x1F83_D9AB,
+    0x5BE0_CD19,
+];
+const BLAKE2S_SIGMA: [[usize; 16]; 10] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+];
+/// The parameter block the reference initialises its cipher hash with:
+/// 32-byte digest, then `4, 1, 1` and zeros (`FUN_10050bc0`; the digest
+/// hasher's own block starts `8` at `FUN_10048910`).
+const BLAKE2S_CIPHER_PARAM: [u8; 32] = [
+    0x20, 4, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,
+];
+
+fn blake2s_mixing(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(x);
+    state[d] = (state[d] ^ state[a]).rotate_right(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(12);
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(y);
+    state[d] = (state[d] ^ state[a]).rotate_right(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(7);
+}
+
+fn blake2s_compress(state: &mut [u32; 8], block: &[u8], counter: u64, last: bool) {
+    let mut message = [0u32; 16];
+    for (index, word) in message.iter_mut().enumerate() {
+        *word = u32::from_le_bytes([
+            block[index * 4],
+            block[index * 4 + 1],
+            block[index * 4 + 2],
+            block[index * 4 + 3],
+        ]);
+    }
+    let mut working = [0u32; 16];
+    working[..8].copy_from_slice(state);
+    working[8..].copy_from_slice(&BLAKE2S_IV);
+    working[12] ^= counter as u32;
+    working[13] ^= (counter >> 32) as u32;
+    if last {
+        working[14] = !working[14];
+    }
+    for round in BLAKE2S_SIGMA {
+        blake2s_mixing(
+            &mut working,
+            0,
+            4,
+            8,
+            12,
+            message[round[0]],
+            message[round[1]],
+        );
+        blake2s_mixing(
+            &mut working,
+            1,
+            5,
+            9,
+            13,
+            message[round[2]],
+            message[round[3]],
+        );
+        blake2s_mixing(
+            &mut working,
+            2,
+            6,
+            10,
+            14,
+            message[round[4]],
+            message[round[5]],
+        );
+        blake2s_mixing(
+            &mut working,
+            3,
+            7,
+            11,
+            15,
+            message[round[6]],
+            message[round[7]],
+        );
+        blake2s_mixing(
+            &mut working,
+            0,
+            5,
+            10,
+            15,
+            message[round[8]],
+            message[round[9]],
+        );
+        blake2s_mixing(
+            &mut working,
+            1,
+            6,
+            11,
+            12,
+            message[round[10]],
+            message[round[11]],
+        );
+        blake2s_mixing(
+            &mut working,
+            2,
+            7,
+            8,
+            13,
+            message[round[12]],
+            message[round[13]],
+        );
+        blake2s_mixing(
+            &mut working,
+            3,
+            4,
+            9,
+            14,
+            message[round[14]],
+            message[round[15]],
+        );
+    }
+    for (index, value) in state.iter_mut().enumerate() {
+        *value ^= working[index] ^ working[index + 8];
+    }
+}
+
+/// BLAKE2s with an explicit parameter block (`FUN_10042c00` XORs the block
+/// into the IV, which is the BLAKE2s initialisation).
+fn blake2s(parts: &[&[u8]], param: &[u8; 32]) -> [u8; 32] {
+    let mut state = BLAKE2S_IV;
+    for (word, bytes) in state.iter_mut().zip(param.chunks_exact(4)) {
+        *word ^= u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
+    let mut data = Vec::new();
+    for part in parts {
+        data.extend_from_slice(part);
+    }
+    let mut counter = 0u64;
+    let mut offset = 0usize;
+    // Every full block *except the last* is compressed as a non-final block;
+    // an input whose length is a multiple of 64 (including zero) ends with
+    // its final block already full — the reference's update/final pair never
+    // appends a synthetic empty block.
+    while offset + 64 < data.len() {
+        let block = &data[offset..offset + 64];
+        counter += 64;
+        blake2s_compress(&mut state, block, counter, false);
+        offset += 64;
+    }
+    let mut last = [0u8; 64];
+    let tail = &data[offset..];
+    last[..tail.len()].copy_from_slice(tail);
+    counter += tail.len() as u64;
+    blake2s_compress(&mut state, &last, counter, true);
+    let mut digest = [0u8; 32];
+    for (index, word) in state.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    digest
+}
+
+/// The ChaCha filter's key hash (`FUN_10050bc0`): BLAKE2s-256 with the
+/// cipher's parameter block over `[seed u32 LE][60 zero bytes][iv]`.
+fn blake2s256(parts: &[&[u8]]) -> [u8; 32] {
+    blake2s(parts, &BLAKE2S_CIPHER_PARAM)
+}
+
+/// The ChaCha parameter sets (`FUN_10051ec0`'s six cases): rounds (8/12/20,
+/// i.e. ChaCha8/12/20) and the keystream batch in 64-byte blocks, whose
+/// blocks 2..n are xorshift-stretched from the first instead of counter-stepped.
+fn chacha_parameters(cryptmode: u16) -> Option<(usize, usize)> {
+    match cryptmode {
+        1 => Some((8, 16)),
+        2 => Some((12, 8)),
+        3 => Some((20, 4)),
+        4 => Some((8, 1)),
+        5 => Some((12, 1)),
+        6 => Some((20, 1)),
+        _ => None,
+    }
+}
+
+fn chacha_quarter(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(7);
+}
+
+fn chacha_block(input: &[u32; 16], rounds: usize) -> [u32; 16] {
+    let mut working = *input;
+    for _ in 0..rounds / 2 {
+        chacha_quarter(&mut working, 0, 4, 8, 12);
+        chacha_quarter(&mut working, 1, 5, 9, 13);
+        chacha_quarter(&mut working, 2, 6, 10, 14);
+        chacha_quarter(&mut working, 3, 7, 11, 15);
+        chacha_quarter(&mut working, 0, 5, 10, 15);
+        chacha_quarter(&mut working, 1, 6, 11, 12);
+        chacha_quarter(&mut working, 2, 7, 8, 13);
+        chacha_quarter(&mut working, 3, 4, 9, 14);
+    }
+    for index in 0..16 {
+        working[index] = working[index].wrapping_add(input[index]);
+    }
+    working
+}
+
+/// The reference ChaCha stream (`BasicCryptFilter`): the state is
+/// `sigma || BLAKE2s key || 64-bit counter || XXH32(iv, seed) || seed`, the
+/// key is `BLAKE2s(seed LE || 60 zero bytes || iv)` with the cipher's
+/// parameter block, and a batch of `blocks` blocks takes its first block from
+/// the core (counter incremented once per batch) while the rest are per-word
+/// xorshift (`v ^= v << 13; v ^= v >> 17; v ^= v << 5`, zero replaced by the
+/// seed^nonce fallback) of the block before them (`FUN_10049240`,
+/// `FUN_10050dc0`, `FUN_100510d0`).
+struct ChaCha {
+    key: [u32; 8],
+    nonce: u32,
+    seed: u32,
+    rounds: usize,
+    blocks: usize,
+    fallback: u32,
+    counter: u64,
+    keystream: Vec<u8>,
+    offset: usize,
+}
+
+impl ChaCha {
+    fn new(cryptmode: u16, seed: u32, iv: &[u8]) -> Result<Self> {
+        let (rounds, blocks) = chacha_parameters(cryptmode).ok_or_else(|| {
+            TjsError::runtime(format!("unsupported ChaCha cryptmode {cryptmode}"))
+        })?;
+        let digest = blake2s256(&[&seed.to_le_bytes(), &[0u8; 60], iv]);
+        let mut key = [0u32; 8];
+        for (index, word) in key.iter_mut().enumerate() {
+            *word = u32::from_le_bytes([
+                digest[index * 4],
+                digest[index * 4 + 1],
+                digest[index * 4 + 2],
+                digest[index * 4 + 3],
+            ]);
+        }
+        let nonce = xxh32(iv, seed);
+        let mixed = seed ^ nonce;
+        let fallback = if mixed == 0 {
+            if seed != 0 { seed } else { u32::MAX }
+        } else {
+            mixed
+        };
+        Ok(Self {
+            key,
+            nonce,
+            seed,
+            rounds,
+            blocks,
+            fallback,
+            counter: 0,
+            keystream: Vec::new(),
+            offset: 0,
+        })
+    }
+
+    fn refill(&mut self) {
+        let counter = self.counter;
+        self.counter += 1;
+        let mut state = [0u32; 16];
+        state[..4].copy_from_slice(&[0x6170_7865, 0x3320_646E, 0x7962_2D32, 0x6B20_6574]);
+        state[4..12].copy_from_slice(&self.key);
+        state[12] = counter as u32;
+        state[13] = (counter >> 32) as u32;
+        state[14] = self.nonce;
+        state[15] = self.seed;
+        let mut block = chacha_block(&state, self.rounds);
+        self.keystream.clear();
+        self.keystream.reserve(self.blocks * 64);
+        for index in 0..self.blocks {
+            if index > 0 {
+                for word in block.iter_mut() {
+                    let mut value = *word ^ (*word << 13);
+                    value ^= value >> 17;
+                    value ^= value << 5;
+                    *word = if value == 0 { self.fallback } else { value };
+                }
+            }
+            for word in block {
+                self.keystream.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        self.offset = 0;
+    }
+
+    fn apply(&mut self, data: &mut [u8]) {
+        for byte in data.iter_mut() {
+            if self.offset == self.keystream.len() {
+                self.refill();
+            }
+            *byte ^= self.keystream[self.offset];
+            self.offset += 1;
+        }
+    }
+}
+
+/// Encrypts (or decrypts — the keystream is XOR) `data` in place with the
+/// parameter set of `cryptmode`.
+fn datapack_chacha_apply(cryptmode: u16, seed: u32, iv: &[u8], data: &mut [u8]) -> Result<()> {
+    ChaCha::new(cryptmode, seed, iv)?.apply(data);
+    Ok(())
+}
+
+/// `LZ4CompressStream` (`FUN_1004f800`): every 4096-byte chunk of the body
+/// becomes `[u16 LE compressed length][raw LZ4 block]`. The framing is what
+/// `4s0` names, and the reference decompresses each frame into one block
+/// buffer, so frames must not exceed that size.
+fn datapack_lz4_frame(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + body.len() / 255 + 16);
+    for chunk in body.chunks(DATAPACK_LZ4_BLOCK) {
+        let compressed = lz4_flex::block::compress(chunk);
+        out.extend_from_slice(&(compressed.len() as u16).to_le_bytes());
+        out.extend_from_slice(&compressed);
+    }
+    out
+}
+
+/// `LZ4DecompressStream` (`FUN_1004f700`): the inverse of the framing above.
+fn datapack_lz4_deframe(framed: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < framed.len() {
+        if index + 2 > framed.len() {
+            return Err(TjsError::runtime("LZ4 frame length is truncated"));
+        }
+        let length = usize::from(u16::from_le_bytes([framed[index], framed[index + 1]]));
+        index += 2;
+        let limit = DATAPACK_LZ4_BLOCK + DATAPACK_LZ4_BLOCK / 255 + 16;
+        if length == 0 || length > limit {
+            return Err(TjsError::runtime("LZ4 frame has an implausible length"));
+        }
+        let block = framed
+            .get(index..index + length)
+            .ok_or_else(|| TjsError::runtime("LZ4 frame is truncated"))?;
+        index += length;
+        let start = out.len();
+        out.resize(start + DATAPACK_LZ4_BLOCK, 0);
+        let written =
+            lz4_flex::block::decompress_into(block, &mut out[start..]).map_err(|error| {
+                TjsError::runtime(format!("LZ4 frame does not decompress: {error}"))
+            })?;
+        out.truncate(start + written);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// The leading image: chunk walkers (what the reference sniffer does) and the
+// thumbnail encoders
+
+/// Where the leading image ends and the container header starts. The
+/// reference reads the file back through `JPGChunkStreamReader` /
+/// `PNGChunkStreamReader`, which stop exactly at the image's own end marker
+/// (`FUN_10050020` sniffs `TJS/`, `TJS\`, `\x89PNG` and `\xFF\xD8\xFF\xE0`).
+fn image_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return jpeg_end(bytes);
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return png_end(bytes);
+    }
+    None
+}
+
+/// Walks JPEG markers to the EOI that ends the image. Entropy-coded data is
+/// skipped with its stuffing (`FF 00`) and restart markers respected.
+fn jpeg_end(bytes: &[u8]) -> Option<usize> {
+    let mut index = 2;
+    loop {
+        if index + 2 > bytes.len() || bytes[index] != 0xFF {
+            return None;
+        }
+        let mut marker = bytes[index + 1];
+        while marker == 0xFF {
+            index += 1;
+            if index + 1 >= bytes.len() {
+                return None;
+            }
+            marker = bytes[index + 1];
+        }
+        match marker {
+            0x00 => return None,
+            0xD8 => index += 2,
+            0x01 | 0xD0..=0xD7 => index += 2,
+            0xD9 => return Some(index + 2),
+            0xDA => {
+                index += 2;
+                if index + 2 > bytes.len() {
+                    return None;
+                }
+                let length = usize::from(u16::from_be_bytes([bytes[index], bytes[index + 1]]));
+                index += length;
+                loop {
+                    if index + 1 >= bytes.len() {
+                        return None;
+                    }
+                    if bytes[index] == 0xFF && bytes[index + 1] != 0x00 {
+                        if (0xD0..=0xD7).contains(&bytes[index + 1]) {
+                            index += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            _ => {
+                if index + 4 > bytes.len() {
+                    return None;
+                }
+                let length = usize::from(u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]));
+                if length < 2 {
+                    return None;
+                }
+                index += 2 + length;
+            }
+        }
+    }
+}
+
+/// Walks the PNG chunk list to IEND.
+fn png_end(bytes: &[u8]) -> Option<usize> {
+    let mut index = 8;
+    loop {
+        let length_bytes = bytes.get(index..index + 4)?;
+        let length = u32::from_be_bytes([
+            length_bytes[0],
+            length_bytes[1],
+            length_bytes[2],
+            length_bytes[3],
+        ]) as usize;
+        let kind = bytes.get(index + 4..index + 8)?;
+        index = index.checked_add(12)?.checked_add(length)?;
+        if index > bytes.len() {
+            return None;
+        }
+        if kind == b"IEND" {
+            return Some(index);
+        }
+    }
+}
+
+/// The standard Annex K quantisation tables, natural (row-major) order.
+const JPEG_LUMA_QUANT: [u8; 64] = [
+    16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113,
+    92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
+];
+const JPEG_CHROMA_QUANT: [u8; 64] = [
+    17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99,
+    47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+];
+/// Natural-order index of each zigzag position.
+const JPEG_ZIGZAG: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+const JPEG_DC_LUMA_BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const JPEG_DC_LUMA_VALUES: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const JPEG_DC_CHROMA_BITS: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+const JPEG_DC_CHROMA_VALUES: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const JPEG_AC_LUMA_BITS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
+const JPEG_AC_LUMA_VALUES: [u8; 162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+];
+const JPEG_AC_CHROMA_BITS: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+const JPEG_AC_CHROMA_VALUES: [u8; 162] = [
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
+    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
+    0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
+    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
+    0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
+    0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
+    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+];
+
+struct JpegHuffman {
+    codes: [u16; 256],
+    sizes: [u8; 256],
+}
+
+impl JpegHuffman {
+    fn new(bits: &[u8; 16], values: &[u8]) -> Self {
+        let mut table = Self {
+            codes: [0; 256],
+            sizes: [0; 256],
+        };
+        let mut code = 0u16;
+        let mut index = 0;
+        for (length, count) in bits.iter().enumerate() {
+            for _ in 0..*count {
+                let symbol = values[index] as usize;
+                table.codes[symbol] = code;
+                table.sizes[symbol] = length as u8 + 1;
+                code += 1;
+                index += 1;
+            }
+            code <<= 1;
+        }
+        table
+    }
+
+    fn emit(&self, symbol: u8, writer: &mut JpegBits) {
+        writer.write(self.codes[symbol as usize], self.sizes[symbol as usize]);
+    }
+}
+
+struct JpegBits {
+    out: Vec<u8>,
+    buffer: u32,
+    bits: u32,
+}
+
+impl JpegBits {
+    fn new() -> Self {
         Self {
-            runtime,
-            active: BTreeSet::new(),
+            out: Vec::new(),
+            buffer: 0,
+            bits: 0,
         }
     }
 
-    fn value(&mut self, value: &Variant, out: &mut Vec<u8>) -> Result<()> {
-        match value {
-            Variant::Void => out.push(0xc1),
-            Variant::Null => out.push(0xc0),
-            Variant::Integer(value) => put_pack_integer(out, *value),
-            Variant::Real(value) => {
-                out.push(0xcb);
-                out.extend_from_slice(&value.to_bits().to_le_bytes());
+    fn write(&mut self, value: u16, length: u8) {
+        self.buffer = (self.buffer << length) | u32::from(value);
+        self.bits += u32::from(length);
+        while self.bits >= 8 {
+            self.bits -= 8;
+            let byte = ((self.buffer >> self.bits) & 0xFF) as u8;
+            self.out.push(byte);
+            if byte == 0xFF {
+                self.out.push(0x00);
             }
-            Variant::String(value) => put_pack_string(out, value)?,
-            Variant::Octet(value) => put_pack_octet(out, value)?,
-            Variant::Object(handle) => self.object(*handle, out)?,
-            Variant::Closure(closure) => {
-                self.object(closure.this_obj.unwrap_or(closure.object), out)?
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.bits > 0 {
+            let pad = 8 - self.bits;
+            self.write(((1u32 << pad) - 1) as u16, pad as u8);
+        }
+    }
+}
+
+/// The 8x8 type-II DCT, normalised as `JPEG` expects: `1/4 C(u)C(v)`.
+fn jpeg_fdct(samples: &[f32; 64]) -> [f32; 64] {
+    let mut table = [[0f32; 8]; 8];
+    for (value, row) in table.iter_mut().enumerate() {
+        for (frequency, cell) in row.iter_mut().enumerate() {
+            *cell =
+                (((2 * value + 1) as f32) * (frequency as f32) * std::f32::consts::PI / 16.0).cos();
+        }
+    }
+    let mut rows = [0f32; 64];
+    for row in 0..8 {
+        for frequency in 0..8 {
+            let mut sum = 0.0;
+            for value in 0..8 {
+                sum += samples[row * 8 + value] * table[value][frequency];
             }
-            Variant::CodeObject(_) => out.push(0xc0),
+            rows[row * 8 + frequency] = sum;
         }
-        Ok(())
     }
-
-    fn object(&mut self, handle: ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
-        if !self.active.insert(handle) {
-            out.push(0xc0);
-            return Ok(());
-        }
-        let elements = self.runtime.array_elements(handle).map(Vec::from);
-        if let Some(elements) = elements {
-            put_pack_array_header(out, elements.len())?;
-            for value in elements {
-                self.value(&value, out)?;
+    let mut out = [0f32; 64];
+    for column in 0..8 {
+        for frequency in 0..8 {
+            let mut sum = 0.0;
+            for value in 0..8 {
+                sum += rows[value * 8 + column] * table[value][frequency];
             }
-        } else if self
-            .runtime
-            .object_class_infos(handle)
-            .iter()
-            .any(|info| info == "Dictionary")
-        {
-            let entries = self.runtime.object_members(handle);
-            put_pack_map_header(out, entries.len())?;
-            for (key, value) in entries {
-                put_pack_string(out, &key)?;
-                self.value(&value, out)?;
+            let component_u = if frequency == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            };
+            let component_v = if column == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            };
+            out[frequency * 8 + column] = 0.25 * component_u * component_v * sum;
+        }
+    }
+    out
+}
+
+fn jpeg_category(value: i32) -> u8 {
+    if value == 0 {
+        return 0;
+    }
+    (32 - value.unsigned_abs().leading_zeros()) as u8
+}
+
+fn jpeg_bits(value: i32, size: u8) -> u16 {
+    if value >= 0 {
+        value as u16
+    } else {
+        (value - 1 + (1i32 << size)) as u16
+    }
+}
+
+struct JpegComponent {
+    quant: [f32; 64],
+    dc: JpegHuffman,
+    ac: JpegHuffman,
+    previous_dc: i32,
+}
+
+impl JpegComponent {
+    fn encode(&mut self, samples: &[f32; 64], writer: &mut JpegBits) {
+        let mut shifted = [0f32; 64];
+        for (index, value) in samples.iter().enumerate() {
+            shifted[index] = value - 128.0;
+        }
+        let transformed = jpeg_fdct(&shifted);
+        let mut block = [0i32; 64];
+        for zigzag in 0..64 {
+            let natural = JPEG_ZIGZAG[zigzag];
+            block[zigzag] = (transformed[natural] / self.quant[natural]).round() as i32;
+        }
+        let difference = block[0] - self.previous_dc;
+        self.previous_dc = block[0];
+        let size = jpeg_category(difference);
+        self.dc.emit(size, writer);
+        writer.write(jpeg_bits(difference, size), size);
+
+        let mut run = 0;
+        for &value in &block[1..] {
+            if value == 0 {
+                run += 1;
+                continue;
             }
-        } else {
-            out.push(0xc0);
+            while run >= 16 {
+                self.ac.emit(0xF0, writer);
+                run -= 16;
+            }
+            let size = jpeg_category(value);
+            self.ac.emit(((run << 4) | i32::from(size)) as u8, writer);
+            writer.write(jpeg_bits(value, size), size);
+            run = 0;
         }
-        self.active.remove(&handle);
-        Ok(())
-    }
-}
-
-fn put_pack_integer(out: &mut Vec<u8>, value: i64) {
-    if value < 0 {
-        if value >= i8::MIN as i64 {
-            out.push(0xd0);
-            out.push(value as i8 as u8);
-        } else if value >= i16::MIN as i64 {
-            out.push(0xd1);
-            out.extend_from_slice(&(value as i16).to_le_bytes());
-        } else if value >= i32::MIN as i64 {
-            out.push(0xd2);
-            out.extend_from_slice(&(value as i32).to_le_bytes());
-        } else {
-            out.push(0xd3);
-            out.extend_from_slice(&value.to_le_bytes());
+        if run > 0 {
+            self.ac.emit(0x00, writer);
         }
-    } else if value <= 0x7f {
-        out.push(value as u8);
-    } else if value <= u8::MAX as i64 {
-        out.push(0xcc);
-        out.push(value as u8);
-    } else if value <= u16::MAX as i64 {
-        out.push(0xcd);
-        out.extend_from_slice(&(value as u16).to_le_bytes());
-    } else if value <= u32::MAX as i64 {
-        out.push(0xce);
-        out.extend_from_slice(&(value as u32).to_le_bytes());
-    } else {
-        out.push(0xcf);
-        out.extend_from_slice(&value.to_le_bytes());
     }
 }
 
-fn put_pack_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
-    let units = value.encode_utf16().collect::<Vec<_>>();
-    put_pack_string_header(out, units.len())?;
-    for unit in units {
-        out.extend_from_slice(&unit.to_le_bytes());
+/// A baseline JPEG of an RGBA buffer: SOI, APP0/JFIF, the standard Annex K
+/// tables, 4:4:4 sampling and one interleaved scan. The reference's own
+/// encoder is IJG (`makeDataPackThumb`), so the bytes differ while the image
+/// stays a decodable baseline JPEG.
+fn encode_jpeg(rgba: &[u8], width: usize, height: usize, quality: u8) -> Vec<u8> {
+    let quality = u32::from(quality.clamp(1, 100));
+    let scale = if quality < 50 {
+        5000 / quality
+    } else {
+        200 - quality * 2
+    };
+    let scaled = |base: &[u8; 64]| {
+        let mut table = [0u8; 64];
+        for (index, value) in base.iter().enumerate() {
+            table[index] = ((u32::from(*value) * scale + 50) / 100).clamp(1, 255) as u8;
+        }
+        table
+    };
+    let luma_table = scaled(&JPEG_LUMA_QUANT);
+    let chroma_table = scaled(&JPEG_CHROMA_QUANT);
+    let as_quantiser = |table: &[u8; 64]| {
+        let mut quantiser = [0f32; 64];
+        for (index, value) in table.iter().enumerate() {
+            quantiser[index] = f32::from(*value);
+        }
+        quantiser
+    };
+    let luma = as_quantiser(&luma_table);
+    let chroma = as_quantiser(&chroma_table);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    out.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
+    out.extend_from_slice(b"JFIF\0");
+    out.extend_from_slice(&[1, 1, 0, 0, 1, 0, 1, 0, 0]);
+    for (id, table) in [(0x00u8, &luma_table), (0x01, &chroma_table)] {
+        out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43]);
+        out.push(id);
+        for zigzag in 0..64 {
+            out.push(table[JPEG_ZIGZAG[zigzag]]);
+        }
     }
-    Ok(())
+    out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+    out.extend_from_slice(&(height as u16).to_be_bytes());
+    out.extend_from_slice(&(width as u16).to_be_bytes());
+    out.push(3);
+    for (id, quant) in [(1u8, 0u8), (2, 1), (3, 1)] {
+        out.extend_from_slice(&[id, 0x11, quant]);
+    }
+    let tables = [
+        (&JPEG_DC_LUMA_BITS[..], &JPEG_DC_LUMA_VALUES[..]),
+        (&JPEG_AC_LUMA_BITS[..], &JPEG_AC_LUMA_VALUES[..]),
+        (&JPEG_DC_CHROMA_BITS[..], &JPEG_DC_CHROMA_VALUES[..]),
+        (&JPEG_AC_CHROMA_BITS[..], &JPEG_AC_CHROMA_VALUES[..]),
+    ];
+    for (id, (bits, values)) in [0x00u8, 0x10, 0x01, 0x11].into_iter().zip(tables) {
+        out.extend_from_slice(&[0xFF, 0xC4]);
+        out.extend_from_slice(&((19 + values.len()) as u16).to_be_bytes());
+        out.push(id);
+        out.extend_from_slice(bits);
+        out.extend_from_slice(values);
+    }
+    out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x0C, 0x03]);
+    for id in 1u8..=3 {
+        out.extend_from_slice(&[id, if id == 1 { 0x00 } else { 0x11 }]);
+    }
+    out.extend_from_slice(&[0x00, 0x3F, 0x00]);
+
+    let mut luma_component = JpegComponent {
+        quant: luma,
+        dc: JpegHuffman::new(&JPEG_DC_LUMA_BITS, &JPEG_DC_LUMA_VALUES),
+        ac: JpegHuffman::new(&JPEG_AC_LUMA_BITS, &JPEG_AC_LUMA_VALUES),
+        previous_dc: 0,
+    };
+    // Cb and Cr are the same quantisation/Huffman configuration but each
+    // keeps its own DC predictor (they are separate components on the wire).
+    let mut cb_component = JpegComponent {
+        quant: chroma,
+        dc: JpegHuffman::new(&JPEG_DC_CHROMA_BITS, &JPEG_DC_CHROMA_VALUES),
+        ac: JpegHuffman::new(&JPEG_AC_CHROMA_BITS, &JPEG_AC_CHROMA_VALUES),
+        previous_dc: 0,
+    };
+    let mut cr_component = JpegComponent {
+        quant: chroma,
+        dc: JpegHuffman::new(&JPEG_DC_CHROMA_BITS, &JPEG_DC_CHROMA_VALUES),
+        ac: JpegHuffman::new(&JPEG_AC_CHROMA_BITS, &JPEG_AC_CHROMA_VALUES),
+        previous_dc: 0,
+    };
+
+    let mut writer = JpegBits::new();
+    for block_y in (0..height).step_by(8) {
+        for block_x in (0..width).step_by(8) {
+            let mut samples = [[0f32; 64]; 3];
+            for y in 0..8 {
+                for x in 0..8 {
+                    let px = (block_x + x).min(width.saturating_sub(1));
+                    let py = (block_y + y).min(height.saturating_sub(1));
+                    let offset = (py * width + px) * 4;
+                    let r = f32::from(rgba[offset]);
+                    let g = f32::from(rgba[offset + 1]);
+                    let b = f32::from(rgba[offset + 2]);
+                    samples[0][y * 8 + x] = 0.299 * r + 0.587 * g + 0.114 * b;
+                    samples[1][y * 8 + x] = -0.168_736 * r - 0.331_264 * g + 0.5 * b + 128.0;
+                    samples[2][y * 8 + x] = 0.5 * r - 0.418_688 * g - 0.081_312 * b + 128.0;
+                }
+            }
+            luma_component.encode(&samples[0], &mut writer);
+            cb_component.encode(&samples[1], &mut writer);
+            cr_component.encode(&samples[2], &mut writer);
+        }
+    }
+    writer.flush();
+    out.extend_from_slice(&writer.out);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
 }
 
-fn put_pack_string_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
-    if len <= 0x1f {
-        out.push(0xa0 + len as u8);
-    } else if len <= u8::MAX as usize {
-        out.push(0xc4);
-        out.push(len as u8);
-    } else if len <= u16::MAX as usize {
-        out.push(0xc5);
-        out.extend_from_slice(&(len as u16).to_le_bytes());
-    } else if len <= u32::MAX as usize {
-        out.push(0xc6);
-        out.extend_from_slice(&(len as u32).to_le_bytes());
-    } else {
-        return Err(TjsError::runtime("binary string is too large"));
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
     }
-    Ok(())
+    !crc
 }
 
-fn put_pack_octet(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
-    if value.len() <= 5 {
-        out.push(0xd4 + value.len() as u8);
-    } else if value.len() <= u16::MAX as usize {
-        out.push(0xda);
-        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    } else if value.len() <= u32::MAX as usize {
-        out.push(0xdb);
-        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    } else {
-        return Err(TjsError::runtime("binary octet is too large"));
+fn adler32(bytes: &[u8]) -> u32 {
+    let mut low = 1u32;
+    let mut high = 0u32;
+    for &byte in bytes {
+        low = (low + u32::from(byte)) % 65521;
+        high = (high + low) % 65521;
     }
-    out.extend_from_slice(value);
-    Ok(())
+    (high << 16) | low
 }
 
-fn put_pack_array_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
-    if len <= 0x0f {
-        out.push(0x90 + len as u8);
-    } else if len <= u16::MAX as usize {
-        out.push(0xdc);
-        out.extend_from_slice(&(len as u16).to_le_bytes());
-    } else if len <= u32::MAX as usize {
-        out.push(0xdd);
-        out.extend_from_slice(&(len as u32).to_le_bytes());
-    } else {
-        return Err(TjsError::runtime("binary array is too large"));
+/// A minimal PNG: 8-bit RGBA, one IDAT of stored deflate blocks (a thumbnail
+/// is a handful of kilobytes; compression is not the point) and the format's
+/// CRC-32/Adler-32.
+fn encode_png(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(height * (1 + width * 4));
+    for y in 0..height {
+        raw.push(0);
+        let start = (y * width * 4).min(rgba.len());
+        let end = (start + width * 4).min(rgba.len());
+        raw.extend_from_slice(&rgba[start..end]);
+        raw.resize(y * (1 + width * 4) + 1 + width * 4, 0);
     }
-    Ok(())
-}
+    let mut zlib = Vec::with_capacity(raw.len() + raw.len() / 65_535 * 5 + 6);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    let mut start = 0;
+    loop {
+        let take = (raw.len() - start).min(0xFFFF);
+        let last = start + take == raw.len();
+        zlib.push(if last { 1 } else { 0 });
+        zlib.extend_from_slice(&(take as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(take as u16)).to_le_bytes());
+        zlib.extend_from_slice(&raw[start..start + take]);
+        start += take;
+        if last {
+            break;
+        }
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
 
-fn put_pack_map_header(out: &mut Vec<u8>, len: usize) -> Result<()> {
-    if len <= 0x0f {
-        out.push(0x80 + len as u8);
-    } else if len <= u16::MAX as usize {
-        out.push(0xde);
-        out.extend_from_slice(&(len as u16).to_le_bytes());
-    } else if len <= u32::MAX as usize {
-        out.push(0xdf);
-        out.extend_from_slice(&(len as u32).to_le_bytes());
-    } else {
-        return Err(TjsError::runtime("binary dictionary is too large"));
-    }
-    Ok(())
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    };
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(height as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &zlib);
+    chunk(b"IEND", &[]);
+    out
 }
 
 fn data_pack_storage_name(name: &str) -> String {
@@ -1519,13 +2405,49 @@ mod tests {
 
     use super::*;
 
-    /// `Scripts.saveDataPack` writes the pack KAGEX's save path needs: the
-    /// data dictionary is the root (`id`/`core` are read back by
-    /// `readBookMarkFromFile`), the file leads with the thumbnail image the
-    /// save screen loads, and it is readable under the exact storage name the
-    /// game hands to `loadDataPack` — `data0.jpg`, not its `.pbd` alias.
+    /// A real-engine container without any transform (`m144-plain.ksd`),
+    /// written by krkrz 1.4.0.8 + PackinOne.dll under wine for the probe data
+    /// `%["id" => "probe", "core" => %["storeTime" => 1, "name" => "あ"],
+    /// "list" => [1, 2, <%01 02%>]]` with `seed = 882327524`, `iv = "kiri"`.
+    const REAL_ENGINE_PLAIN: &[u8] = &[
+        0x54, 0x4a, 0x53, 0x2f, 0x6e, 0x73, 0x30, 0x00, 0xe4, 0x3f, 0x97, 0x34, 0x00, 0x00, 0x0a,
+        0x00, 0x6b, 0x00, 0x69, 0x00, 0x72, 0x00, 0x69, 0x00, 0x00, 0x00, 0xc1, 0xf6, 0x03, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x63, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x65, 0x00, 0xc1,
+        0xab, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x6e, 0x00, 0x61, 0x00, 0x6d, 0x00,
+        0x65, 0x00, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x42, 0x30, 0x09, 0x00, 0x00, 0x00, 0x73,
+        0x00, 0x74, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x65, 0x00, 0x54, 0x00, 0x69, 0x00, 0x6d, 0x00,
+        0x65, 0x00, 0x04, 0x18, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+        0x00, 0x69, 0x00, 0x64, 0x00, 0x02, 0xe1, 0x05, 0x00, 0x00, 0x00, 0x70, 0x00, 0x72, 0x00,
+        0x6f, 0x00, 0x62, 0x00, 0x65, 0x00, 0x04, 0x00, 0x00, 0x00, 0x6c, 0x00, 0x69, 0x00, 0x73,
+        0x00, 0x74, 0x00, 0x81, 0xfb, 0x03, 0x00, 0x00, 0x00, 0x04, 0xcd, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0xf6, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0xe5, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02, 0x99, 0xa3, 0xac, 0x00,
+    ];
+
+    /// The same harness data with both transforms (`m144-4s0-chacha.ksd`):
+    /// `4s0` LZ4 framing under cryptmode 1's ChaCha keystream.
+    const REAL_ENGINE_4S0_CHACHA: &[u8] = &[
+        0x54, 0x4a, 0x53, 0x2f, 0x34, 0x73, 0x30, 0x00, 0xe4, 0x3f, 0x97, 0x34, 0x01, 0x00, 0x0a,
+        0x00, 0x6b, 0x00, 0x69, 0x00, 0x72, 0x00, 0x69, 0x00, 0x00, 0x00, 0x5f, 0x74, 0x5f, 0xdb,
+        0x37, 0xc6, 0xd9, 0xad, 0x2c, 0x47, 0x0c, 0x72, 0x0e, 0x49, 0xfe, 0xee, 0xa5, 0x7f, 0x0e,
+        0x23, 0xd0, 0xd6, 0x6a, 0x03, 0x16, 0xe0, 0x72, 0x4e, 0x5f, 0xfe, 0x5b, 0x29, 0xc7, 0x56,
+        0x4b, 0x25, 0x30, 0xcf, 0xbb, 0xc4, 0x21, 0xd6, 0x88, 0x3b, 0x72, 0x76, 0x72, 0x14, 0x2e,
+        0x55, 0x30, 0xbb, 0x0a, 0x7d, 0xd3, 0xcf, 0x8a, 0xcc, 0xa2, 0x5a, 0x33, 0x81, 0xa2, 0x70,
+        0xc4, 0x15, 0xc2, 0x35, 0x94, 0x1f, 0x54, 0x62, 0x1e, 0xd8, 0x52, 0x43, 0xd0, 0xf2, 0xc8,
+        0xb5, 0x88, 0x58, 0x28, 0x4c, 0xeb, 0x9c, 0xde, 0xf2, 0x0c, 0x10, 0x30, 0xe0, 0xc1, 0xc2,
+        0x4d, 0x1c, 0x9e, 0xaa, 0x76, 0xc1, 0xfe, 0x55, 0x12, 0x0f, 0x67, 0x23, 0x19, 0x3e, 0x6f,
+        0x63, 0xdc, 0xde, 0x62, 0xf9, 0x45, 0xb7, 0x21, 0x77, 0x8f, 0xb9, 0x0e, 0xd3, 0xbd, 0x0f,
+        0xfe, 0xbb, 0x9e, 0x5e, 0xd4, 0x41,
+    ];
+
+    /// `Scripts.saveDataPack` writes the reference container: the JPEG
+    /// thumbnail the save screen loads leads the file, then the 16-byte
+    /// `TJS/4s0` header with the digest's seed/cryptmode/iv, then the LZ4-
+    /// framed and ChaCha-encrypted body + check — and `loadDataPack` reads it
+    /// back under the exact storage name the game hands over (`data0.jpg`,
+    /// not its `.pbd` alias).
     #[test]
-    fn save_data_pack_round_trips_through_the_shared_reader() {
+    fn save_data_pack_writes_the_reference_container() {
         let root = test_root("packinone-datapack-save");
         let mut engine = test_engine(&root);
         engine.register_plugin(PackinOnePlugin).expect("plugin");
@@ -1535,7 +2457,8 @@ mod tests {
                 r#"(function() {
                     var data = %[id => "save-id", core => %[storeTime => 1234],
                                  user => %[], history => %[]];
-                    var digest = %[width => 4, height => 2, ext => "jpg"];
+                    var digest = %[width => 4, height => 2, ext => "jpg",
+                                  compress => 1, cryptmode => 1, iv => "title"];
                     digest.seed = Scripts.makeDataPackDigest(data, 7, "save-id");
                     global.thumbLayer = new Layer();
                     thumbLayer.setImageSize(4, 2);
@@ -1559,24 +2482,36 @@ mod tests {
         assert_eq!(fields[3], "1", "the pack is readable under its own name");
 
         let bytes = fs::read(root.join("savedata/data0.jpg")).expect("read the pack");
-        let footer = parse_data_pack_footer(&bytes).expect("pack footer");
-        assert_eq!(footer.seed, seed, "the digest seed travels in the footer");
-        // A 4x2 24-bit BMP leads the file: `0x80112233` is an opaque enough
-        // `112233` pixel, stored bottom-up as BGR with 4-byte row padding.
-        let thumb = &bytes[..footer.pack_offset as usize];
-        assert_eq!(thumb.len(), 54 + 12 * 2);
-        assert_eq!(&thumb[..2], b"BM");
-        assert_eq!(&thumb[54..57], [0x33, 0x22, 0x11]);
-        let pack = &bytes[footer.pack_offset as usize..];
-        assert!(
-            pack.starts_with(b"KBAD100\0"),
-            "the shared struct header follows the image"
+        // A JPEG leads the file (`saveThumbnail = 3` picks `jpg`).
+        assert_eq!(&bytes[..2], [0xFF, 0xD8]);
+        let image_end = image_end(&bytes).expect("jpeg thumbnail end");
+        let pack = &bytes[image_end..];
+        let header = ns0::parse_ns0_header(pack).expect("container header");
+        assert_eq!(
+            header.compress,
+            ns0::NS0_COMPRESS_LZ4,
+            "digest.compress selects the 4s0 framing"
         );
-        assert_eq!(footer.pack_len as usize, pack.len() - DATA_PACK_FOOTER_LEN);
+        assert_eq!(header.cryptmode, 1);
+        // The IV is the salt string as UTF-16LE plus its NUL: `2*(5+1)`.
+        assert_eq!(header.iv_length, 12);
+        assert_eq!(header.seed, seed, "the digest seed lands in the header");
+        let iv: Vec<u8> = "title"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect();
+        let iv_end = ns0::NS0_HEADER_SIZE + iv.len();
+        assert_eq!(&pack[ns0::NS0_HEADER_SIZE..iv_end], iv.as_slice());
+        // The body decrypts and deframes back into the seeded value stream.
+        let mut body = pack[iv_end..].to_vec();
+        datapack_chacha_apply(1, seed, &iv, &mut body).expect("decrypt");
+        let body = datapack_lz4_deframe(&body).expect("deframe");
+        assert!(body.len() > 4, "the body carries the trailing check");
 
         // The save screen loads the slot's picture from the file itself
         // (`drawNormalItem` → `DataStore.getFileName` → `loadImages`), so the
-        // leading image has to decode with the pack and footer trailing it.
+        // leading JPEG has to decode with the container trailing it.
         engine
             .execute_script(
                 "inline.tjs",
@@ -1593,22 +2528,21 @@ mod tests {
                 .expect("thumbnail size"),
             Variant::String("4x2".to_string())
         );
-        assert_eq!(
-            engine
-                .execute_expression("inline.tjs", "slotView.getMainPixel(0, 0)")
-                .expect("thumbnail pixel"),
-            Variant::Integer(0x112233)
+        let pixel = read_integer(&mut engine, "slotView.getMainPixel(0, 0)");
+        let (red, green, blue) = ((pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF, pixel & 0xFF);
+        assert!(
+            (red - 0x11).abs() <= 24 && (green - 0x22).abs() <= 24 && (blue - 0x33).abs() <= 24,
+            "the thumbnail's pixel stays near 0x112233 through JPEG: {pixel:#08x}"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    /// The writer has to agree with the engine's own `saveStruct(..., "b")`
-    /// byte for byte: the reader is shared, and a divergence would corrupt
-    /// every save. With no digest and no thumbnail the pack is exactly the
-    /// engine's output plus this port's fixed-size footer.
+    /// Without a digest the writer emits the plain `TJS/ns0` container whose
+    /// body is exactly the seeded value stream — the shape the 124 shipped
+    /// `.pbd` files already prove.
     #[test]
-    fn save_data_pack_matches_the_engine_binary_struct_writer() {
-        let root = test_root("packinone-datapack-bytes");
+    fn save_data_pack_without_a_digest_writes_a_plain_ns0_container() {
+        let root = test_root("packinone-datapack-plain");
         let mut engine = test_engine(&root);
         engine.register_plugin(PackinOnePlugin).expect("plugin");
         engine
@@ -1617,53 +2551,459 @@ mod tests {
                 r#"(function() {
                     var data = %[id => "x", core => %[storeTime => 5, name => "あ"],
                                  list => [1, 2, <% 01 02 %>], flag => null, neg => -2];
-                    (Dictionary.saveStruct incontextof data)("engine.pbd", "b");
                     Scripts.saveDataPack("mine.pbd", data);
                 })();"#,
             )
-            .expect("write both packs");
-        let engine_bytes = fs::read(root.join("engine.pbd")).expect("engine pack");
-        let mine = fs::read(root.join("mine.pbd")).expect("plugin pack");
+            .expect("write the pack");
+        let bytes = fs::read(root.join("mine.pbd")).expect("plugin pack");
+        let header = ns0::parse_ns0_header(&bytes).expect("header");
+        assert_eq!(header.compress, ns0::NS0_COMPRESS_STORE);
+        assert_eq!(header.cryptmode, 0);
+        assert_eq!(header.iv_length, 0);
         assert_eq!(
-            &mine[..mine.len() - DATA_PACK_FOOTER_LEN],
-            engine_bytes.as_slice(),
-            "the payload must be the engine serializer's output"
+            header.seed,
+            ns0::NS0_DEFAULT_SEED,
+            "the writer's default seed"
         );
-        let footer = parse_data_pack_footer(&mine).expect("footer");
-        assert_eq!(footer.pack_offset, 0, "no thumbnail leads this file");
-        assert_eq!(
-            footer.pack_len as usize,
-            engine_bytes.len(),
-            "the footer points at the whole engine payload"
+        assert!(
+            !bytes.ends_with(DATA_PACK_FOOTER_MAGIC),
+            "the reference container has no footer"
         );
+        // The bytes after the header are the seeded body: re-decoding them
+        // with the header's seed reproduces the data.
+        let value = engine
+            .execute_expression("inline.tjs", "Scripts.loadDataPack(\"mine.pbd\").core.name")
+            .expect("load the pack");
+        assert_eq!(value, Variant::String("あ".to_string()));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    /// The digest is deterministic and mixes its arguments; `makeDataPackThumb`
-    /// answers an `Octet` image for a drawable layer and nothing for `kdt`.
+    /// The digest is deterministic, mixes its arguments, and hashes the
+    /// big-endian value serialization: for the key `"abc"` the preimage is
+    /// the string tag, its u32 big-endian length and the UTF-16LE units, with
+    /// the zero seed's zero check bytes.
     #[test]
-    fn data_pack_digest_and_thumb_follow_their_contracts() {
+    fn data_pack_digest_hashes_the_big_endian_serialization() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine.register_plugin(PackinOnePlugin).expect("plugin");
         let value = engine
             .execute_expression(
                 "inline.tjs",
                 r#"(function() {
-                    var data = %[id => "d", core => %[storeTime => 1]];
-                    var first = Scripts.makeDataPackDigest(data, 1, "key");
-                    var second = Scripts.makeDataPackDigest(data, 1, "key");
-                    var other = Scripts.makeDataPackDigest(data, 2, "key");
+                    var first = Scripts.makeDataPackDigest(void, 0, "abc");
+                    var second = Scripts.makeDataPackDigest(void, 0, "abc");
+                    var other = Scripts.makeDataPackDigest(void, 2, "abc");
+                    return first + ":" + second + ":" + other;
+                })()"#,
+            )
+            .expect("digest probes");
+        let Variant::String(text) = &value else {
+            panic!("unexpected digest value {value:?}");
+        };
+        let numbers: Vec<u32> = text
+            .split(':')
+            .map(|part| part.parse().expect("digest number"))
+            .collect();
+        assert_eq!(numbers.len(), 3, "{text}");
+        assert_eq!(numbers[0], numbers[1]);
+        assert_ne!(numbers[0], numbers[2]);
+        let mut preimage = vec![0x00, 0x00]; // the void subject's tag + zero check
+        preimage.extend_from_slice(&[0x00, 0x02]); // zero check byte, string tag
+        preimage.extend_from_slice(&3_u32.to_be_bytes());
+        for unit in "abc".encode_utf16() {
+            preimage.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(numbers[0], xxh32(&preimage, 0));
+    }
+
+    /// `makeDataPackThumb` answers an `Octet` image for a drawable layer —
+    /// JPEG for the `jpg`/default spelling, PNG for `png` — and nothing for
+    /// `kdt`.
+    #[test]
+    fn data_pack_thumb_follows_its_contracts() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
                     global.layer = new Layer();
                     layer.setImageSize(2, 1);
                     layer.fillRect(0, 0, 2, 1, 0xff102030);
-                    var thumb = Scripts.makeDataPackThumb(layer, "png");
+                    var jpeg = Scripts.makeDataPackThumb(layer, "jpg");
+                    var png = Scripts.makeDataPackThumb(layer, "png");
                     var kdt = Scripts.makeDataPackThumb(layer, "kdt");
-                    return (first == second) + ":" + (first != other) + ":" +
-                        typeof thumb + ":" + typeof kdt;
+                    global.jpegHead = jpeg[0] + ":" + jpeg[1];
+                    global.pngHead = png[0] + ":" + png[1];
+                    return (jpeg != void) + ":" + (png != void) + ":" +
+                        typeof kdt + ":" + jpegHead + ":" + pngHead;
                 })()"#,
             )
-            .expect("digest and thumbnail probes");
-        assert_eq!(value, Variant::String("1:1:Octet:void".to_string()));
+            .expect("thumbnail probes");
+        assert_eq!(
+            value,
+            Variant::String("1:1:void:255:216:137:80".to_string()),
+            "JPEG starts FFD8, PNG starts 89 50"
+        );
+    }
+
+    /// XXH32 against the official `libxxhash` (0.8.3) for the classic sanity
+    /// strings and for two multi-block inputs, including a seeded one.
+    #[test]
+    fn xxh32_matches_the_published_vectors() {
+        let vectors: &[(&str, u32)] = &[
+            ("", 0x02CC_5D05),
+            ("a", 0x550D_7456),
+            ("abc", 0x32D1_53FF),
+            ("message digest", 0x7C94_8494),
+            ("abcdefghijklmnopqrstuvwxyz", 0x63A1_4D5F),
+            (
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                0x9C28_5E64,
+            ),
+        ];
+        for (input, expected) in vectors {
+            assert_eq!(xxh32(input.as_bytes(), 0), *expected, "{input:?}");
+        }
+        let long: Vec<u8> = (0..256u16)
+            .map(|byte| byte as u8)
+            .cycle()
+            .take(768)
+            .collect();
+        assert_eq!(xxh32(&long, 0), 0xCDB9_46B1);
+        assert_eq!(xxh32(&long, 42), 0x9E5B_105A);
+    }
+
+    /// BLAKE2s through the unkeyed parameter block (the published vectors) and
+    /// through the cipher's own block, whose key bytes a real-engine artifact
+    /// pins: the DLL's key hash is BLAKE2s, not SHA-256 (it carries no SHA-256
+    /// round constants, and `FUN_10042d70` is BLAKE2s's compression).
+    #[test]
+    fn blake2s_matches_the_published_and_real_engine_vectors() {
+        let hex = |digest: [u8; 32]| {
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mut unkeyed = [0u8; 32];
+        unkeyed[0..4].copy_from_slice(&[0x20, 0, 1, 1]);
+        assert_eq!(
+            hex(blake2s(&[b""], &unkeyed)),
+            "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9"
+        );
+        assert_eq!(
+            hex(blake2s(&[b"abc"], &unkeyed)),
+            "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982"
+        );
+        let mut iv = Vec::new();
+        for unit in "kiri".encode_utf16() {
+            iv.extend_from_slice(&unit.to_le_bytes());
+        }
+        iv.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            hex(blake2s256(&[
+                &0x3497_3FE4_u32.to_le_bytes(),
+                &[0u8; 60],
+                &iv
+            ])),
+            "67fd820ca5fc08d07885343b87e622cc553e9a2b27ace65d3579605dc5657ea9"
+        );
+
+        // Lengths around the block boundary: a 64-multiple input must end with
+        // its full final block, not a synthetic empty one. The key preimage is
+        // `64 + 2*(title_chars+1)` bytes, so a 31-mod-32-character title lands
+        // exactly on a multiple of 64.
+        let vectors: &[(usize, &str)] = &[
+            (
+                55,
+                "f4495470f226c8c214be08fdfad4bc4a2a9dbea9136a210df0d4b64929e6fc14",
+            ),
+            (
+                56,
+                "e290dd270b467f34ab1c002d340fa016257ff19e5833fdbbf2cb401c3b2817de",
+            ),
+            (
+                63,
+                "e57cb79487dd57902432b250733813bd96a84efce59f650fac26e6696aefafc3",
+            ),
+            (
+                64,
+                "56f34e8b96557e90c1f24b52d0c89d51086acf1b00f634cf1dde9233b8eaaa3e",
+            ),
+            (
+                65,
+                "1b53ee94aaf34e4b159d48de352c7f0661d0a40edff95a0b1639b4090e974472",
+            ),
+            (
+                127,
+                "f18417b39d617ab1c18fdf91ebd0fc6d5516bb34cf39364037bce81fa04cecb1",
+            ),
+            (
+                128,
+                "1fa877de67259d19863a2a34bcc6962a2b25fcbf5cbecd7ede8f1fa36688a796",
+            ),
+            (
+                129,
+                "5bd169e67c82c2c2e98ef7008bdf261f2ddf30b1c00f9e7f275bb3e8a28dc9a2",
+            ),
+        ];
+        let pattern: Vec<u8> = (0..200).map(|index| (index % 251) as u8).collect();
+        for (length, expected) in vectors {
+            assert_eq!(
+                hex(blake2s(&[&pattern[..*length]], &unkeyed)),
+                *expected,
+                "length {length}"
+            );
+        }
+    }
+
+    /// The four containers M142's real-engine session wrote (`m144-*.ksd`,
+    /// krkrz 1.4.0.8 + 少女世界/GINKA's PackinOne.dll) decode through
+    /// `Scripts.loadDataPack` to the probe dictionary the harness passed —
+    /// including the `4s0` + ChaCha variant, which pins the header, the IV
+    /// bytes, the LZ4 framing, the whole keystream and the checker against the
+    /// reference implementation.
+    #[test]
+    fn real_engine_containers_decode_through_load_data_pack() {
+        for (label, bytes) in [
+            ("plain", REAL_ENGINE_PLAIN),
+            ("4s0+chacha", REAL_ENGINE_4S0_CHACHA),
+        ] {
+            let root = test_root(&format!("packinone-real-{label}"));
+            fs::write(root.join("probe.ksd"), bytes).expect("write fixture");
+            let mut engine = test_engine(&root);
+            engine.register_plugin(PackinOnePlugin).expect("plugin");
+            let value = engine
+                .execute_expression(
+                    "inline.tjs",
+                    r#"(function() {
+                        var d = Scripts.loadDataPack("probe.ksd");
+                        return d.id + "|" + d.core.storeTime + "|" + d.core.name + "|" +
+                            d.list.count + "|" + d.list[0] + "|" + d.list[1];
+                    })()"#,
+                )
+                .expect("load the real-engine container");
+            assert_eq!(
+                value,
+                Variant::String("probe|1|あ|3|1|2".to_string()),
+                "{label}"
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    /// The digest is deterministic and travels in the header. **Known
+    /// divergence**: a real-engine probe printed `882327524` for this data
+    /// (`m144/probe-output.txt`), while this port's XXH32-over-the-big-endian-
+    /// serialization model gives `1715496921`. The reference feeds its digest
+    /// state (`VariantDigestState`) through a collection order and checker path
+    /// the decompilation does not fully pin (the value pointer is stored into
+    /// the state before each operand is written), and nothing re-verifies the
+    /// digest — `isValidBookMarkData` checks only `core`/`id`/`storeTime` — so
+    /// the value is recorded here rather than chased. The header seed, the
+    /// checker and the ChaCha key are driven by whatever value this function
+    /// returns, so the port stays self-consistent.
+    #[test]
+    fn data_pack_digest_is_deterministic() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var data = %["id" => "probe",
+                                 "core" => %["storeTime" => 1, "name" => "あ"],
+                                 "list" => [1, 2, <%01 02%>]];
+                    var first = Scripts.makeDataPackDigest(data, 7, "probe");
+                    var second = Scripts.makeDataPackDigest(data, 7, "probe");
+                    return first + ":" + second;
+                })()"#,
+            )
+            .expect("digest probe");
+        let Variant::String(text) = &value else {
+            panic!("unexpected digest value {value:?}");
+        };
+        assert_eq!(
+            text, "1715496921:1715496921",
+            "deterministic (reference: 882327524)"
+        );
+    }
+
+    /// The ChaCha core is the standard one: RFC 8439 §2.3.2's block, built
+    /// from the RFC's own key/nonce/counter through the same layout the
+    /// reference cipher uses (`sigma || key || counter || nonce`).
+    #[test]
+    fn chacha_block_matches_rfc_8439() {
+        let mut state = [0u32; 16];
+        state[..4].copy_from_slice(&[0x6170_7865, 0x3320_646E, 0x7962_2D32, 0x6B20_6574]);
+        for (index, word) in state[4..12].iter_mut().enumerate() {
+            let base = (index * 4) as u8;
+            *word = u32::from_le_bytes([base, base + 1, base + 2, base + 3]);
+        }
+        state[12] = 1;
+        state[13] = 0x0900_0000;
+        state[14] = 0x4A00_0000;
+        state[15] = 0;
+        let block = chacha_block(&state, 20);
+        let mut bytes = Vec::new();
+        for word in block {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let expected: [u8; 64] = [
+            0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15, 0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20,
+            0x71, 0xc4, 0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03, 0x04, 0x22, 0xaa, 0x9a,
+            0xc3, 0xd4, 0x6c, 0x4e, 0xd2, 0x82, 0x64, 0x46, 0x07, 0x9f, 0xaa, 0x09, 0x14, 0xc2,
+            0xd7, 0x05, 0xd9, 0x8b, 0x02, 0xa2, 0xb5, 0x12, 0x9c, 0xd1, 0xde, 0x16, 0x4e, 0xb9,
+            0xcb, 0xd0, 0x83, 0xe8, 0xa2, 0x50, 0x3c, 0x4e,
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    /// The `4s0` framing round-trips, keeps the raw-block boundaries and
+    /// leaves a body past one block intact.
+    #[test]
+    fn lz4_framing_round_trips() {
+        let body: Vec<u8> = (0..(DATAPACK_LZ4_BLOCK * 2 + 77))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let framed = datapack_lz4_frame(&body);
+        let unframed = datapack_lz4_deframe(&framed).expect("deframe");
+        assert_eq!(unframed, body);
+        // The first frame's u16 length covers a block that decompresses to at
+        // most the reference's 4096-byte capacity.
+        let first = usize::from(u16::from_le_bytes([framed[0], framed[1]]));
+        assert!(first > 0 && first < framed.len());
+        assert!(datapack_lz4_deframe(&framed[..framed.len() - 1]).is_err());
+    }
+
+    /// The ChaCha stream is symmetric, deterministic in the seed and differs
+    /// between parameter sets.
+    #[test]
+    fn chacha_stream_is_symmetric_and_seed_dependent() {
+        let plaintext: Vec<u8> = (0..3000u32).map(|index| index as u8).collect();
+        for cryptmode in 1..=6u16 {
+            let mut ciphertext = plaintext.clone();
+            datapack_chacha_apply(cryptmode, 0x1234_5678, b"iv", &mut ciphertext).expect("encrypt");
+            assert_ne!(ciphertext, plaintext, "cryptmode {cryptmode}");
+            datapack_chacha_apply(cryptmode, 0x1234_5678, b"iv", &mut ciphertext).expect("decrypt");
+            assert_eq!(ciphertext, plaintext, "cryptmode {cryptmode}");
+        }
+        let mut first = plaintext.clone();
+        let mut second = plaintext.clone();
+        let mut third = plaintext.clone();
+        datapack_chacha_apply(1, 1, b"iv", &mut first).expect("encrypt");
+        datapack_chacha_apply(2, 1, b"iv", &mut second).expect("encrypt");
+        datapack_chacha_apply(1, 2, b"iv", &mut third).expect("encrypt");
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+    }
+
+    /// The thumbnail walkers stop exactly at the image's own end marker.
+    #[test]
+    fn image_end_walks_jpeg_and_png_structures() {
+        let rgba = [0x11u8, 0x22, 0x33, 0xFF].repeat(16);
+        let jpeg = encode_jpeg(&rgba, 4, 4, 75);
+        assert_eq!(image_end(&jpeg), Some(jpeg.len()));
+        let png = encode_png(&rgba, 4, 4);
+        assert_eq!(image_end(&png), Some(png.len()));
+        // A container behind the image is found where the image ends.
+        let mut file = jpeg.clone();
+        file.extend_from_slice(b"TJS/ns0\0rest");
+        assert_eq!(image_end(&file), Some(jpeg.len()));
+        assert_eq!(
+            reference_data_pack(&file).map(|pack| &pack[..8]),
+            Some(&b"TJS/ns0\0"[..])
+        );
+        // Truncated images have no end.
+        assert_eq!(image_end(&jpeg[..jpeg.len() - 3]), None);
+        assert_eq!(image_end(&png[..png.len() - 3]), None);
+    }
+
+    /// The DQT values of a baseline JPEG, in file order.
+    fn jpeg_quantisation_tables(jpeg: &[u8]) -> Vec<[u8; 64]> {
+        let mut tables = Vec::new();
+        let mut index = 2;
+        while index + 4 <= jpeg.len() {
+            if jpeg[index] != 0xFF {
+                break;
+            }
+            let marker = jpeg[index + 1];
+            if marker == 0xDA {
+                break;
+            }
+            let length = usize::from(u16::from_be_bytes([jpeg[index + 2], jpeg[index + 3]]));
+            if marker == 0xDB {
+                let mut position = index + 4;
+                while position + 65 <= index + 2 + length {
+                    tables.push(jpeg[position + 1..position + 65].try_into().unwrap());
+                    position += 65;
+                }
+            }
+            index += 2 + length;
+        }
+        tables
+    }
+
+    /// The DQT segment must carry the *scaled* tables the encoder quantises
+    /// with: quantising by one table and advertising another made every
+    /// quality but 50 needlessly lossy.
+    #[test]
+    fn jpeg_encoder_writes_the_scaled_quantisation_tables() {
+        let rgba = [0x11u8, 0x22, 0x33, 0xFF].repeat(16 * 8);
+        let tables = jpeg_quantisation_tables(&encode_jpeg(&rgba, 16, 8, 100));
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0], [1u8; 64], "q100 scales every entry to 1");
+        assert_eq!(tables[1], [1u8; 64]);
+        let tables = jpeg_quantisation_tables(&encode_jpeg(&rgba, 16, 8, 75));
+        assert_eq!(tables[0][0], 8, "q75 scales the luma 16 to 8");
+        assert_eq!(tables[1][0], 9, "q75 scales the chroma 17 to 9");
+        assert_ne!(tables[0], tables[1]);
+    }
+
+    /// Flat colours survive the JPEG round trip through the engine's own
+    /// decoder: both chroma components need their own DC predictor and the
+    /// quantisation has to match the DQT. The tolerance is deliberately tight
+    /// (the pre-review encoder decoded the left block as (0, 47, 219) instead
+    /// of (0x11, 0x22, 0x33)).
+    #[test]
+    fn jpeg_thumbnail_keeps_flat_colours_through_the_engines_decoder() {
+        let root = test_root("packinone-jpeg");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.thumb = new Layer();
+                thumb.setImageSize(32, 8);
+                thumb.fillRect(0, 0, 16, 8, 0xff112233);
+                thumb.fillRect(16, 0, 16, 8, 0xffcc4411);
+                var jpeg = Scripts.makeDataPackThumb(thumb, "jpg", 75, void);
+                Storages.saveOctet("thumb.jpg", jpeg);
+                global.view = new Layer();
+                view.loadImages("thumb.jpg");
+                "#,
+            )
+            .expect("encode and reload the thumbnail");
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "view.imageWidth + \"x\" + view.imageHeight")
+                .expect("thumbnail size"),
+            Variant::String("32x8".to_string())
+        );
+        for (x, expected) in [(4i64, 0x112233i64), (28, 0xCC4411)] {
+            let pixel = read_integer(&mut engine, &format!("view.getMainPixel({x}, 4)"));
+            for shift in [16u32, 8, 0] {
+                let actual = (pixel >> shift) & 0xFF;
+                let want = (expected >> shift) & 0xFF;
+                assert!(
+                    (actual - want).abs() <= 6,
+                    "pixel {x}: {pixel:#08x} should be near {expected:#08x}"
+                );
+            }
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1690,6 +3030,36 @@ mod tests {
         let value = engine
             .execute_expression("inline.tjs", "Scripts.loadDataPack(\"probe.pbd\").answer")
             .expect("load data pack");
+
+        assert_eq!(value, Variant::Integer(42));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Files the port wrote before the container switch still load: a leading
+    /// image, the `KBAD100` pack and the old 17-byte `KDPK` footer.
+    #[test]
+    fn load_data_pack_reads_the_ports_old_footer_format() {
+        let root = test_root("packinone-datapack-legacy");
+        let mut pack = b"KBAD100\0\x81\xa6".to_vec();
+        for unit in "answer".encode_utf16() {
+            pack.extend_from_slice(&unit.to_le_bytes());
+        }
+        pack.push(42);
+        let mut bytes = b"BMthumbnail".to_vec();
+        let pack_offset = bytes.len();
+        bytes.extend_from_slice(&pack);
+        bytes.extend_from_slice(&(pack_offset as u32).to_le_bytes());
+        bytes.extend_from_slice(&(pack.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&7_u32.to_le_bytes());
+        bytes.push(DATA_PACK_FOOTER_VERSION);
+        bytes.extend_from_slice(DATA_PACK_FOOTER_MAGIC);
+        fs::write(root.join("old.pbd"), bytes).expect("write the legacy pack");
+
+        let mut engine = test_engine(&root);
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression("inline.tjs", "Scripts.loadDataPack(\"old.pbd\").answer")
+            .expect("load the legacy data pack");
 
         assert_eq!(value, Variant::Integer(42));
         fs::remove_dir_all(root).expect("cleanup");
