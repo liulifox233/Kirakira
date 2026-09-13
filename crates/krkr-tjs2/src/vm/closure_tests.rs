@@ -66,14 +66,24 @@ fn enclosing_local_is_not_visible_to_a_nested_function() {
 }
 
 /// The `%-2` proxy's first object is the callee's `this`, so a name that an
-/// enclosing local shadows still resolves to the instance member.
+/// enclosing local shadows still resolves to the instance member -- *when the
+/// call supplies that instance*.  A literal returned from a method carries no
+/// context of its own (see
+/// `method_created_literal_called_bare_runs_on_the_call_site_this`), so the
+/// reference reaches the instance the only way it can: an explicit
+/// `incontextof this`, which is what the game's own
+/// `system/MainWindow.tjs` `getHandlers()` does.  Verified against krkrz
+/// 1.4.0r2: `window3.make()()` returns `q=7`, `this` = the instance.
 #[test]
 fn nested_function_reads_the_this_member_before_the_global() {
     assert_eq!(
         ok(r#"
         class Window {
             var q = 7;
-            function make() { var q = 5; return function() { return q; }; }
+            function make() {
+                var q = 5;
+                return (function() { return q; } incontextof this);
+            }
         }
         global.window = new Window();
         return global.window.make()();
@@ -166,10 +176,17 @@ fn incontextof_binding_survives_a_member_read_and_call() {
     );
 }
 
-/// The KAGEX `getHandlers()` shape: handlers are built in a method, bound to
-/// the instance with `chgthis`, stored in a dictionary, and later read out of
-/// it. An unqualified global inside the handler must still resolve through
-/// the `%-2` proxy's global fallback.
+/// The KAGEX `getHandlers()` shape: handlers are built in a method, *bound to
+/// the instance with `incontextof this`*, stored in a dictionary, and later
+/// read out of it by the dispatcher. The game's own `system/MainWindow.tjs`
+/// documents the binding ("incontextof this は、関数を常に このクラスの
+/// オブジェクトのコンテキストで動くようにするために必要") because a function
+/// literal carries no context of its own -- see
+/// `dictionary_stored_literal_without_a_binding_stops_at_the_dictionary` for
+/// the unbound spelling the official engine cannot run. The bound handler's
+/// unqualified global resolves through the `%-2` proxy: its ObjThis (the
+/// instance) misses the name and the proxy walks on to the global object.
+/// Verified against krkrz 1.4.0r2: `back:KAGWINDOW3`.
 #[test]
 fn kagex_style_handler_dictionary_resolves_globals_through_the_proxy() {
     assert_eq!(
@@ -179,17 +196,154 @@ fn kagex_style_handler_dictionary_resolves_globals_through_the_proxy() {
             function pick(elm) { return elm.page; }
             function getHandlers() {
                 return %[
-                    syspage: function(elm) { return kag.pick(elm); },
-                    free: function(elm) { return this.pick(elm); }
+                    syspage: function(elm) { return kag.pick(elm); } incontextof this,
+                    free: function(elm) { return this.pick(elm); } incontextof this
                 ];
             }
         }
         global.kag = new KAGWindow();
         global.kag.tagHandlers = global.kag.getHandlers();
-        return global.kag.tagHandlers.syspage(%[free => 1, page => "back"])
-             + ":" + global.kag.tagHandlers.free(%[page => "back"]);
+        return global.kag.tagHandlers.syspage(%[free: 1, page: "back"])
+             + ":" + global.kag.tagHandlers.free(%[page: "back"]);
         "#),
         Variant::String("back:back".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A function literal, and the members it is stored in.
+//
+// `func_expr_def` compiles a function expression to a bare `T_CONSTVAL` of its
+// code object (`syntax/tjs.y:377-386`); an ObjThis reaches a closure only
+// through `incontextof` (`VM_CHGTHIS`, `tjsInterCodeGen.cpp:1195-1215`), a
+// declared function's registration (`:755-772`) or `regmember`
+// (`tjsInterCodeExec.cpp:3025-3040`).  An object *member* is a storage slot,
+// not a scope: an unqualified name reaches the frame's `%-2` proxy -- first
+// the callee's `this`, then the global object (`tjsInterCodeExec.cpp:789-806`,
+// `:284`) -- and the callee's `this` is `clo.ObjThis ? clo.ObjThis : ra[-1]`
+// (`:2434`, `tjsObject.cpp:1280-1312`), i.e. whatever the call site supplies,
+// never the object the value was created in.  Every expectation below was
+// measured on the official krkrz 1.4.0r2 engine with the wine harness in
+// `scripts/wine/run.sh`.
+
+/// A member-stored closure cannot read the creating frame's local: TJS2 has no
+/// lexical capture, and the proxy's primary (the dictionary receiver) answers
+/// the miss with void, so the read is void rather than an error
+/// (`tTJSDictionaryObject::PropGet`, `tjsDictionary.cpp:733-745`).
+#[test]
+fn member_stored_closure_cannot_read_the_enclosing_local() {
+    assert_eq!(
+        ok(r#"
+        function make() {
+            var local = 7;
+            var d = %[];
+            d.reader = function() { return local; };
+            return d;
+        }
+        var d = make();
+        return d.reader() === void;
+        "#),
+        Variant::Integer(1)
+    );
+}
+
+/// A literal returned from a method is called with no receiver, so
+/// `clo.ObjThis` is null and the call site's `this` -- the top level's global
+/// object -- becomes the callee's (`tjsInterCodeExec.cpp:2434`).  The
+/// enclosing instance is *not* captured; the official engine returns `100`
+/// here.
+#[test]
+fn method_created_literal_called_bare_runs_on_the_call_site_this() {
+    assert_eq!(
+        ok(r#"
+        class MethodHolder {
+            var marker = 42;
+            function makeClosure() {
+                return function() { return (this == global) + ":" + q; };
+            }
+        }
+        global.q = 100;
+        return (new MethodHolder()).makeClosure()();
+        "#),
+        Variant::String("1:100".to_string())
+    );
+}
+
+/// The same literal stored on a *dictionary* runs on the dictionary when it is
+/// called through it, and the top-level class name is void: the dictionary
+/// answers the miss itself, so the proxy never reaches the global object.
+#[test]
+fn method_created_literal_stored_on_a_dictionary_runs_on_the_dictionary() {
+    assert_eq!(
+        ok(r#"
+        class ScopeProbe {}
+        class Maker {
+            function make() {
+                var d = %[];
+                d.reader = function(expect) {
+                    return (this == expect) + ":" + typeof ScopeProbe;
+                };
+                return d;
+            }
+        }
+        var d = (new Maker()).make();
+        return d.reader(d);
+        "#),
+        Variant::String("1:void".to_string())
+    );
+}
+
+/// Stored on an *instance*, the same literal runs on the instance: an ordinary
+/// object answers a miss with `TJS_E_MEMBERNOTFOUND`, so the proxy walks on to
+/// the global object and the class name resolves.
+#[test]
+fn method_created_literal_stored_on_an_instance_runs_on_the_instance() {
+    assert_eq!(
+        ok(r#"
+        class ScopeProbe {}
+        class Owner {
+            var cb;
+            function make() {
+                this.cb = function(expect) {
+                    return (this == expect) + ":" + typeof ScopeProbe;
+                };
+            }
+        }
+        var owner = new Owner();
+        owner.make();
+        return owner.cb(owner);
+        "#),
+        Variant::String("1:Object".to_string())
+    );
+}
+
+/// The M176 shape, pinned as the reference has it: an *unbound* handler stored
+/// in a dictionary cannot read the global `kag`, because the dictionary stops
+/// the proxy's walk with its void answer -- `kag` is void and the member call
+/// on it raises the convert error.  The official engine reproduces both the
+/// void and the message; KAGEX avoids them by binding its handlers
+/// (`kagex_style_handler_dictionary_resolves_globals_through_the_proxy`).
+#[test]
+fn dictionary_stored_literal_without_a_binding_stops_at_the_dictionary() {
+    let error = failure(
+        r#"
+        class KAGWindow {
+            var tagHandlers = %[];
+            function pick(elm) { return elm.page; }
+            function getHandlers() {
+                return %[ syspage: function(elm) { return kag.pick(elm); } ];
+            }
+        }
+        global.kag = new KAGWindow();
+        global.kag.tagHandlers = global.kag.getHandlers();
+        return global.kag.tagHandlers.syspage(%[free: 1, page: "back"]);
+        "#,
+    );
+    assert_eq!(error.kind, TjsErrorKind::Runtime);
+    assert!(
+        error.message.contains("((void) to Object)"),
+        "unexpected error text: {}",
+        error.message
     );
 }
 

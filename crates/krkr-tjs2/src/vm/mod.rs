@@ -781,24 +781,27 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         match inst.opcode {
             0 | 127 => {}
             1 => {
-                let mut value = self.data_slot_value(object, inst.operands[1])?;
-                if let Variant::Closure(closure) = &mut value
-                    && closure.this_obj.is_none()
-                    && frame.this_obj != Some(self.runtime.global)
-                    && matches!(
-                        self.runtime.heap[closure.object.0].kind,
-                        ObjectKind::InterCode {
-                            context: BytecodeContextType::ExprFunction,
-                            ..
-                        }
-                    )
-                {
-                    // Expression functions created inside an object method
-                    // retain that context. Top-level expression functions
-                    // remain unbound so assigning one to an object member can
-                    // bind ObjThis to that destination, as krkr does.
-                    closure.this_obj = frame.this_obj;
-                }
+                // `VM_CONST` materializes a function literal as an *unbound*
+                // closure.  The reference has no JavaScript-style capture: a
+                // function expression is a bare `T_CONSTVAL` of its code
+                // object (`syntax/tjs.y:377-386`, `func_expr_def`), and an
+                // ObjThis reaches a value only through `incontextof`
+                // (`tjsInterCodeGen.cpp:1195-1215`), a declared function's
+                // registration (`:755-772`) or `regmember`
+                // (`tjsInterCodeExec.cpp:3025-3040`).  A literal created
+                // inside a method therefore carries no context of its own: a
+                // bare call runs it on the call site's `this`
+                // (`clo.ObjThis?clo.ObjThis:ra[-1]`,
+                // `tjsInterCodeExec.cpp:2434`) and a member store leaves it to
+                // the destination.  Binding it to the enclosing frame's `this`
+                // here made member-stored handlers resolve names the official
+                // engine answers with the storage object's own (void for a
+                // Dictionary) -- measured against krkrz 1.4.0r2.  KAGEX binds
+                // its handlers explicitly for that reason
+                // (`system/MainWindow.tjs` `getHandlers()`: "incontextof this
+                // は、関数を常に このクラスの オブジェクトのコンテキストで
+                // 動くようにするために必要").
+                let value = self.data_slot_value(object, inst.operands[1])?;
                 frame.set(inst.operands[0], value)?;
             }
             2 => {
