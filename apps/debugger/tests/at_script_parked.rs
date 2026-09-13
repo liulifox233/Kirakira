@@ -7,7 +7,12 @@
 //! fires on the virtual clock (500 ms of 16.7 ms frames = frame 30), so a
 //! probe injected at frame 40 always meets a parked VM.
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 /// A project root with only a startup script: the dispatcher runs it, and the
 /// probe needs no game assets.
@@ -27,9 +32,35 @@ fn run_probe(root: &PathBuf, extra: &[&str]) -> (String, Option<i32>) {
         .args(extra)
         .output()
         .expect("run krkr-debug");
+    (combined_output(&output), output.status.code())
+}
+
+/// Runs the built debugger with `stdin` piped in (the interactive console
+/// reads its commands there) and returns its output and exit code.
+fn run_probe_interactive(root: &PathBuf, extra: &[&str], stdin: &str) -> (String, Option<i32>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_krkr-debug"))
+        .arg(root)
+        .args(["--quiet"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn krkr-debug");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(stdin.as_bytes())
+        .expect("write commands");
+    let output = child.wait_with_output().expect("wait for krkr-debug");
+    (combined_output(&output), output.status.code())
+}
+
+fn combined_output(output: &std::process::Output) -> String {
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    (combined, output.status.code())
+    combined
 }
 
 const PARKING_STARTUP: &str = r#"
@@ -103,6 +134,39 @@ fn a_request_the_run_never_reaches_names_the_frame_budget() {
     );
     assert!(out.contains("injection=error"), "{out}");
     assert_eq!(code, Some(1), "{out}");
+}
+
+/// A run that ends on request did not run out of budget, and the pending
+/// request must say so: an interactive `q` at frame 0 leaves `--max-frames
+/// 100000` almost untouched, so reporting `the frame budget ... ended first`
+/// would be the round-2 reviewed lie. The request is still reported, and a
+/// requested termination stays a non-failure.
+#[test]
+fn a_request_pending_at_a_requested_quit_names_the_quit() {
+    let root = scratch_root("at-script-quit", RUNNING_STARTUP);
+    let (out, code) = run_probe_interactive(
+        &root,
+        &[
+            "--interactive",
+            "--max-frames",
+            "100000",
+            "--at-frame",
+            "5000",
+            "--at-script",
+            r#"global.__m181mark = "RAN";"#,
+        ],
+        "q\n",
+    );
+
+    assert!(
+        out.contains("script for frame=5000 never ran: the run ended before that frame"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("frame budget"),
+        "a requested quit must not blame the frame budget: {out}"
+    );
+    assert_eq!(code, Some(0), "{out}");
 }
 
 /// The ordinary path is unchanged: a VM that runs at the requested frame

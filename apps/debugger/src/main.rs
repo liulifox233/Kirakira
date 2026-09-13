@@ -469,22 +469,40 @@ fn global_member_path(runtime: &Runtime<KrkrHost>, name: &str) -> Variant {
     current
 }
 
+/// How the run ended when the unfinished injections are reported.
+///
+/// A requested termination is not the frame budget running out — the message
+/// must not claim it is: an operator's `q` at frame 5 has 99995 frames left.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunEnd {
+    /// The frame loop ran out its `--max-frames` budget.
+    FrameBudget,
+    /// The run stopped on request (an interactive `q`, a debugger quit).
+    Requested,
+}
+
 /// Names every `--at-frame`/`--at-script` request the run ended without
-/// running, with the cause the queue recorded: the VM stayed parked at the
-/// request's frame, or the frame budget ended before that frame arrived.
-/// Returns true when something was reported, so the normal end of the run can
-/// exit non-zero; the deliberate terminations (an interactive `q`, a debugger
-/// quit) only report -- their exit code stays what it was.
-fn report_unfinished_at_scripts(scripts: &AtFrameScripts, max_frames: usize) -> bool {
+/// running, with the cause the queue recorded — the VM stayed parked at the
+/// request's frame — or, for a request whose frame never arrived, the reason
+/// the run ended (`end`). Returns true when something was reported, so the
+/// normal end of the run can exit non-zero; the deliberate terminations (an
+/// interactive `q`, a debugger quit) only report -- their exit code stays what
+/// it was.
+fn report_unfinished_at_scripts(scripts: &AtFrameScripts, max_frames: usize, end: RunEnd) -> bool {
     let mut any = false;
     for unfinished in scripts.unfinished() {
         match unfinished {
             AtScriptUnfinished::VmStayedParked { requested_frame } => println!(
                 "at-frame error: script for frame={requested_frame} never ran: {VM_SUSPENDED}"
             ),
-            AtScriptUnfinished::BudgetEnded { requested_frame } => println!(
-                "at-frame error: script for frame={requested_frame} never ran: the frame budget (--max-frames {max_frames}) ended first"
-            ),
+            AtScriptUnfinished::BudgetEnded { requested_frame } => match end {
+                RunEnd::FrameBudget => println!(
+                    "at-frame error: script for frame={requested_frame} never ran: the frame budget (--max-frames {max_frames}) ended first"
+                ),
+                RunEnd::Requested => println!(
+                    "at-frame error: script for frame={requested_frame} never ran: the run ended before that frame"
+                ),
+            },
         }
         any = true;
     }
@@ -723,7 +741,11 @@ fn main() {
                         &mut interactive_auto_click,
                         &mut interactive_auto_point,
                     ) {
-                        report_unfinished_at_scripts(&at_scripts, config.max_frames);
+                        report_unfinished_at_scripts(
+                            &at_scripts,
+                            config.max_frames,
+                            RunEnd::Requested,
+                        );
                         dump_stub_calls(runtime.engine());
                         return;
                     }
@@ -761,7 +783,11 @@ fn main() {
                             &mut interactive_auto_click,
                             &mut interactive_auto_point,
                         ) {
-                            report_unfinished_at_scripts(&at_scripts, config.max_frames);
+                            report_unfinished_at_scripts(
+                                &at_scripts,
+                                config.max_frames,
+                                RunEnd::Requested,
+                            );
                             dump_stub_calls(runtime.engine());
                             return;
                         }
@@ -1068,7 +1094,7 @@ fn main() {
             }
             Err(error) if error.is_debug_quit() => {
                 println!("debug session terminated at frame={frame_index}");
-                report_unfinished_at_scripts(&at_scripts, config.max_frames);
+                report_unfinished_at_scripts(&at_scripts, config.max_frames, RunEnd::Requested);
                 dump_stub_calls(runtime.engine());
                 return;
             }
@@ -1087,7 +1113,7 @@ fn main() {
     // An injection the run never got to is a failed probe: name every one of
     // them with the cause the queue recorded (the run ends non-zero below)
     // instead of leaving a silent gap where the script should have run.
-    if report_unfinished_at_scripts(&at_scripts, config.max_frames) {
+    if report_unfinished_at_scripts(&at_scripts, config.max_frames, RunEnd::FrameBudget) {
         injection_failed = true;
     }
 
