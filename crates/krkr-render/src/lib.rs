@@ -9,7 +9,7 @@ use std::{
 use bytemuck::{Pod, Zeroable};
 use krkr_core::{
     Color, DrawCommand, FrameOutput, FrameTransition, ImageCommand, ImageUpload, Rect, Size,
-    TextureId, TransitionMethod,
+    TextCommand, TextureId, TransitionMethod,
 };
 use krkr_font::FontSystem;
 use wgpu::util::DeviceExt;
@@ -89,8 +89,7 @@ pub struct Renderer {
     transition_pipeline: TransitionPipelineResources,
     textures: BTreeMap<TextureId, CachedTexture>,
     text_font_system: FontSystem,
-    next_text_texture_id: TextureId,
-    frame_text_textures: BTreeSet<TextureId>,
+    text_cache: TextImageCache,
     physical_size: PhysicalSize<u32>,
     scale_factor: f64,
     content_size: Option<Size>,
@@ -238,8 +237,7 @@ impl Renderer {
             transition_pipeline,
             textures: BTreeMap::new(),
             text_font_system: FontSystem::new(),
-            next_text_texture_id: 1 << 60,
-            frame_text_textures: BTreeSet::new(),
+            text_cache: TextImageCache::new(),
             physical_size,
             scale_factor,
             content_size: None,
@@ -318,6 +316,12 @@ impl Renderer {
         let prepared = self.prepare_frame(frame);
         self.upload_frame_images(&prepared);
         self.retain_frame_textures(&prepared);
+        // An entry outlives its text's draw command only until the renderer
+        // drops the texture under it; purge it then, so the cache is bounded by
+        // the textures the prepared frame still references and never names one
+        // the renderer no longer holds.
+        self.text_cache
+            .retain_live_textures(|texture_id| self.textures.contains_key(&texture_id));
         if self.suspended || self.physical_size.width == 0 || self.physical_size.height == 0 {
             return Ok(());
         }
@@ -562,27 +566,32 @@ impl Renderer {
     }
 
     fn prepare_frame(&mut self, frame: &FrameOutput) -> FrameOutput {
-        for texture_id in std::mem::take(&mut self.frame_text_textures) {
-            self.textures.remove(&texture_id);
-        }
         for texture_id in &frame.image_releases {
             self.textures.remove(texture_id);
         }
 
-        let (draw_commands, mut image_uploads) = self.prepare_commands(&frame.draw_commands);
+        // Text textures prepared earlier in this frame are not in
+        // `self.textures` yet (uploading runs after preparation), so every
+        // preparation sees the ids the frame has already minted as live, and a
+        // text that appears twice in one frame — in one draw list, or in one
+        // and then the next — rasterizes and uploads once.  The set is filled
+        // by the preparation itself, as it mints each id.
+        let mut queued = BTreeSet::new();
+        let (draw_commands, mut image_uploads) =
+            self.prepare_commands(&frame.draw_commands, &mut queued);
         image_uploads.extend(frame.image_uploads.iter().cloned());
         let transitions = frame
             .transitions
             .iter()
             .map(|transition| {
                 let (frozen_draw_commands, mut frozen_image_uploads) =
-                    self.prepare_commands(&transition.frozen_draw_commands);
+                    self.prepare_commands(&transition.frozen_draw_commands, &mut queued);
                 frozen_image_uploads.extend(transition.frozen_image_uploads.iter().cloned());
                 let (under_draw_commands, mut under_image_uploads) =
-                    self.prepare_commands(&transition.under_draw_commands);
+                    self.prepare_commands(&transition.under_draw_commands, &mut queued);
                 under_image_uploads.extend(transition.under_image_uploads.iter().cloned());
                 let (source_draw_commands, mut source_image_uploads) =
-                    self.prepare_commands(&transition.source_draw_commands);
+                    self.prepare_commands(&transition.source_draw_commands, &mut queued);
                 source_image_uploads.extend(transition.source_image_uploads.iter().cloned());
                 FrameTransition {
                     method: transition.method.clone(),
@@ -614,45 +623,15 @@ impl Renderer {
     fn prepare_commands(
         &mut self,
         commands: &[DrawCommand],
+        queued: &mut BTreeSet<TextureId>,
     ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
-        let mut prepared = Vec::with_capacity(commands.len());
-        let mut uploads = Vec::new();
-        for command in commands {
-            match command {
-                DrawCommand::Text(text) => {
-                    let image = self
-                        .text_font_system
-                        .rasterize_text(&text.font, text.style, &text.text);
-                    if image.width == 0 || image.height == 0 {
-                        continue;
-                    }
-                    let texture_id = self.next_text_texture_id;
-                    self.next_text_texture_id = self.next_text_texture_id.saturating_add(1);
-                    self.frame_text_textures.insert(texture_id);
-                    uploads.push(ImageUpload::new(
-                        texture_id,
-                        image.width,
-                        image.height,
-                        Arc::from(image.rgba),
-                    ));
-                    prepared.push(DrawCommand::Image(ImageCommand {
-                        texture_id,
-                        rect: Rect::new(
-                            text.position.x,
-                            text.position.y,
-                            image.width as f32,
-                            image.height as f32,
-                        ),
-                        source_rect: Rect::new(0.0, 0.0, image.width as f32, image.height as f32),
-                        texture_size: Size::new(image.width as f32, image.height as f32),
-                        opacity: text.color.a,
-                        opaque: false,
-                    }));
-                }
-                _ => prepared.push(command.clone()),
-            }
-        }
-        (prepared, uploads)
+        prepare_commands(
+            commands,
+            &self.text_font_system,
+            &mut self.text_cache,
+            queued,
+            |texture_id| self.textures.contains_key(&texture_id),
+        )
     }
 
     fn upload_frame_images(&mut self, frame: &FrameOutput) {
@@ -668,72 +647,15 @@ impl Renderer {
     }
 
     fn upload_images(&mut self, uploads: &[ImageUpload]) {
-        for upload in uploads {
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Kirakira uploaded texture"),
-                size: wgpu::Extent3d {
-                    width: upload.width.max(1),
-                    height: upload.height.max(1),
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.image_texture_format,
-                usage: if self.capture_enabled {
-                    wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::COPY_SRC
-                } else {
-                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
-                },
-                view_formats: &[],
-            });
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &upload.rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(upload.width.saturating_mul(4)),
-                    rows_per_image: Some(upload.height),
-                },
-                wgpu::Extent3d {
-                    width: upload.width.max(1),
-                    height: upload.height.max(1),
-                    depth_or_array_layers: 1,
-                },
-            );
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Kirakira texture bind group"),
-                layout: &self.texture_pipeline.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.texture_pipeline.sampler),
-                    },
-                ],
-            });
-            self.textures.insert(
-                upload.texture_id,
-                CachedTexture {
-                    _texture: texture,
-                    _view: view,
-                    bind_group,
-                    width: upload.width,
-                    height: upload.height,
-                },
-            );
-        }
+        upload_images(
+            &self.device,
+            &self.queue,
+            &self.texture_pipeline,
+            self.image_texture_format,
+            self.capture_enabled,
+            &mut self.textures,
+            uploads,
+        );
     }
 
     fn retain_frame_textures(&mut self, frame: &FrameOutput) {
@@ -1048,28 +970,12 @@ impl Renderer {
     }
 
     fn image_vertices(&self, command: &ImageCommand) -> [TexturedVertex; 6] {
-        let transform = self.render_transform();
-        let x0 = transform.x_offset + command.rect.x * transform.x_scale;
-        let y0 = transform.y_offset + command.rect.y * transform.y_scale;
-        let x1 = transform.x_offset + (command.rect.x + command.rect.width) * transform.x_scale;
-        let y1 = transform.y_offset + (command.rect.y + command.rect.height) * transform.y_scale;
-        let tx0 = command.source_rect.x / command.texture_size.width.max(1.0);
-        let ty0 = command.source_rect.y / command.texture_size.height.max(1.0);
-        let tx1 = (command.source_rect.x + command.source_rect.width)
-            / command.texture_size.width.max(1.0);
-        let ty1 = (command.source_rect.y + command.source_rect.height)
-            / command.texture_size.height.max(1.0);
-        let tint = [1.0, 1.0, 1.0, command.opacity.clamp(0.0, 1.0)];
-        let force_opaque = if command.opaque { 1.0 } else { 0.0 };
-
-        [
-            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint, force_opaque),
-            TexturedVertex::new(self.ndc(x1, y0), [tx1, ty0], tint, force_opaque),
-            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint, force_opaque),
-            TexturedVertex::new(self.ndc(x0, y0), [tx0, ty0], tint, force_opaque),
-            TexturedVertex::new(self.ndc(x1, y1), [tx1, ty1], tint, force_opaque),
-            TexturedVertex::new(self.ndc(x0, y1), [tx0, ty1], tint, force_opaque),
-        ]
+        image_vertices(
+            self.render_transform(),
+            self.config.width,
+            self.config.height,
+            command,
+        )
     }
 
     fn rect_vertices(&self, rect: Rect, color: Color) -> [Vertex; 6] {
@@ -1091,9 +997,7 @@ impl Renderer {
     }
 
     fn ndc(&self, x: f32, y: f32) -> [f32; 2] {
-        let width = self.config.width as f32;
-        let height = self.config.height as f32;
-        [(x / width) * 2.0 - 1.0, 1.0 - (y / height) * 2.0]
+        ndc(x, y, self.config.width, self.config.height)
     }
 
     fn physical_rect(&self, rect: Rect) -> Option<PhysicalRect> {
@@ -1148,6 +1052,47 @@ struct RenderTransform {
     y_scale: f32,
     x_offset: f32,
     y_offset: f32,
+}
+
+/// The quad an image command draws, in the target's normalized device
+/// coordinates.  `transform` maps the command's logical rect into target
+/// pixels, which `target_width`/`target_height` then turn into NDC — the
+/// geometry the render pass samples the command's texture with, so a caller
+/// outside the renderer (the offscreen text tests) draws the same pixels.
+fn image_vertices(
+    transform: RenderTransform,
+    target_width: u32,
+    target_height: u32,
+    command: &ImageCommand,
+) -> [TexturedVertex; 6] {
+    let x0 = transform.x_offset + command.rect.x * transform.x_scale;
+    let y0 = transform.y_offset + command.rect.y * transform.y_scale;
+    let x1 = transform.x_offset + (command.rect.x + command.rect.width) * transform.x_scale;
+    let y1 = transform.y_offset + (command.rect.y + command.rect.height) * transform.y_scale;
+    let tx0 = command.source_rect.x / command.texture_size.width.max(1.0);
+    let ty0 = command.source_rect.y / command.texture_size.height.max(1.0);
+    let tx1 =
+        (command.source_rect.x + command.source_rect.width) / command.texture_size.width.max(1.0);
+    let ty1 =
+        (command.source_rect.y + command.source_rect.height) / command.texture_size.height.max(1.0);
+    let tint = [1.0, 1.0, 1.0, command.opacity.clamp(0.0, 1.0)];
+    let force_opaque = if command.opaque { 1.0 } else { 0.0 };
+    let ndc = |x: f32, y: f32| ndc(x, y, target_width, target_height);
+
+    [
+        TexturedVertex::new(ndc(x0, y0), [tx0, ty0], tint, force_opaque),
+        TexturedVertex::new(ndc(x1, y0), [tx1, ty0], tint, force_opaque),
+        TexturedVertex::new(ndc(x1, y1), [tx1, ty1], tint, force_opaque),
+        TexturedVertex::new(ndc(x0, y0), [tx0, ty0], tint, force_opaque),
+        TexturedVertex::new(ndc(x1, y1), [tx1, ty1], tint, force_opaque),
+        TexturedVertex::new(ndc(x0, y1), [tx0, ty1], tint, force_opaque),
+    ]
+}
+
+fn ndc(x: f32, y: f32, target_width: u32, target_height: u32) -> [f32; 2] {
+    let width = target_width as f32;
+    let height = target_height as f32;
+    [(x / width) * 2.0 - 1.0, 1.0 - (y / height) * 2.0]
 }
 
 #[cfg(all(feature = "winit-surface", target_os = "macos"))]
@@ -1418,6 +1363,293 @@ struct CachedTexture {
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+}
+
+/// Creates (or replaces) one cached texture per upload: the texture, its view
+/// and the bind group the draw path samples it through.  A free function so a
+/// caller that draws outside the renderer — the offscreen text tests and their
+/// cost probe — uploads through the exact path the renderer does.
+#[allow(clippy::too_many_arguments)]
+fn upload_images(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &TexturePipelineResources,
+    format: wgpu::TextureFormat,
+    capture_enabled: bool,
+    textures: &mut BTreeMap<TextureId, CachedTexture>,
+    uploads: &[ImageUpload],
+) {
+    for upload in uploads {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Kirakira uploaded texture"),
+            size: wgpu::Extent3d {
+                width: upload.width.max(1),
+                height: upload.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: if capture_enabled {
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+            },
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &upload.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(upload.width.saturating_mul(4)),
+                rows_per_image: Some(upload.height),
+            },
+            wgpu::Extent3d {
+                width: upload.width.max(1),
+                height: upload.height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Kirakira texture bind group"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                },
+            ],
+        });
+        textures.insert(
+            upload.texture_id,
+            CachedTexture {
+                _texture: texture,
+                _view: view,
+                bind_group,
+                width: upload.width,
+                height: upload.height,
+            },
+        );
+    }
+}
+
+/// Everything a rasterized `DrawCommand::Text` depends on, and the only inputs
+/// `FontSystem::rasterize_text` reads. Two text commands share a cached texture
+/// only when this key matches, so a change to the font spec, the style, the
+/// string or the font system's own state (`FontSystem::generation`) is a miss
+/// that rasterizes afresh.
+///
+/// `height` is keyed by its bit pattern: `f32` has no total equality, and two
+/// heights that differ in bits are two rasterizations even if they compare
+/// equal.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TextImageKey {
+    font_generation: u64,
+    face: String,
+    height_bits: u32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+    angle: i32,
+    face_is_file_name: bool,
+    rasterizer: String,
+    color: [u8; 4],
+    anti_alias: bool,
+    shadow: Option<(i32, i32, [u8; 4])>,
+    text: String,
+}
+
+impl TextImageKey {
+    fn new(font_generation: u64, text: &TextCommand) -> Self {
+        let font = &text.font;
+        Self {
+            font_generation,
+            face: font.face.clone(),
+            height_bits: font.height.to_bits(),
+            bold: font.bold,
+            italic: font.italic,
+            underline: font.underline,
+            strikeout: font.strikeout,
+            angle: font.angle,
+            face_is_file_name: font.face_is_file_name,
+            rasterizer: font.rasterizer.clone(),
+            color: text.style.color,
+            anti_alias: text.style.anti_alias,
+            shadow: text
+                .style
+                .shadow
+                .map(|shadow| (shadow.offset_x, shadow.offset_y, shadow.color)),
+            text: text.text.clone(),
+        }
+    }
+}
+
+/// The texture one text command's rasterization was uploaded to, and the image
+/// geometry its draw command uses.
+struct TextImageEntry {
+    texture_id: TextureId,
+    width: u32,
+    height: u32,
+}
+
+/// Rasterized text images kept across frames, so an unchanged
+/// `DrawCommand::Text` is neither re-rasterized nor re-uploaded every frame.
+///
+/// An entry names a texture the renderer holds — never one it dropped: the
+/// texture is what the next frame's unchanged command draws.  The renderer
+/// drops entries together with the textures `retain_frame_textures` dropped
+/// ([`TextImageCache::retain_live_textures`]), which bounds the cache by the
+/// last prepared frame's text — deliberately so: a text that leaves the draw
+/// list for a frame is rasterized again when it comes back, instead of keeping
+/// pixel buffers alive for an unbounded time.
+#[derive(Default)]
+struct TextImageCache {
+    entries: BTreeMap<TextImageKey, TextImageEntry>,
+    next_texture_id: TextureId,
+}
+
+impl TextImageCache {
+    /// Text textures are named far above every id the engine mints for layers,
+    /// so a `FrameOutput::image_releases` list can never name one.
+    const FIRST_TEXTURE_ID: TextureId = 1 << 60;
+
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            next_texture_id: Self::FIRST_TEXTURE_ID,
+        }
+    }
+
+    fn get(&self, key: &TextImageKey) -> Option<&TextImageEntry> {
+        self.entries.get(key)
+    }
+
+    /// Rasterizes `text` and records the image under `key`; `None` for a text
+    /// that rasterizes to no pixels (the command is dropped, as before).
+    fn rasterize(
+        &mut self,
+        fonts: &FontSystem,
+        key: TextImageKey,
+        text: &TextCommand,
+    ) -> Option<ImageUpload> {
+        let image = fonts.rasterize_text(&text.font, text.style, &text.text);
+        if image.width == 0 || image.height == 0 {
+            return None;
+        }
+        let texture_id = self.next_texture_id;
+        self.next_texture_id = self.next_texture_id.saturating_add(1);
+        let upload = ImageUpload::new(texture_id, image.width, image.height, Arc::from(image.rgba));
+        self.entries.insert(
+            key,
+            TextImageEntry {
+                texture_id,
+                width: image.width,
+                height: image.height,
+            },
+        );
+        Some(upload)
+    }
+
+    fn retain_live_textures(&mut self, texture_is_live: impl Fn(TextureId) -> bool) {
+        self.entries
+            .retain(|_, entry| texture_is_live(entry.texture_id));
+    }
+}
+
+/// The draw commands one frame draws, with every [`DrawCommand::Text`]
+/// replaced by the image command for its cached rasterization.  A command
+/// whose text has no cached image rasterizes now; one whose image is already
+/// cached contributes no upload at all — either way the draw list is the same
+/// pixels, at the same position, with the same alpha, as rasterizing it inline
+/// would produce.
+///
+/// `queued` carries the texture ids this frame has minted but not yet
+/// uploaded (`upload_frame_images` runs after preparation): the call adds each
+/// id it mints to the set, and treats an id in it as live, so a text that
+/// repeats within one draw list — or in a later face of the same frame — shares
+/// the one rasterization and upload instead of minting a second.
+fn prepare_commands(
+    commands: &[DrawCommand],
+    fonts: &FontSystem,
+    text_cache: &mut TextImageCache,
+    queued: &mut BTreeSet<TextureId>,
+    texture_is_live: impl Fn(TextureId) -> bool,
+) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+    let mut prepared = Vec::with_capacity(commands.len());
+    let mut uploads = Vec::new();
+    for command in commands {
+        match command {
+            DrawCommand::Text(text) => {
+                if let Some(command) = prepare_text_command(
+                    fonts,
+                    text_cache,
+                    queued,
+                    &texture_is_live,
+                    text,
+                    &mut uploads,
+                ) {
+                    prepared.push(command);
+                }
+            }
+            _ => prepared.push(command.clone()),
+        }
+    }
+    (prepared, uploads)
+}
+
+fn prepare_text_command(
+    fonts: &FontSystem,
+    text_cache: &mut TextImageCache,
+    queued: &mut BTreeSet<TextureId>,
+    texture_is_live: &dyn Fn(TextureId) -> bool,
+    text: &TextCommand,
+    uploads: &mut Vec<ImageUpload>,
+) -> Option<DrawCommand> {
+    let key = TextImageKey::new(fonts.generation(), text);
+    let (texture_id, width, height) = match text_cache.get(&key) {
+        Some(entry) if texture_is_live(entry.texture_id) || queued.contains(&entry.texture_id) => {
+            (entry.texture_id, entry.width, entry.height)
+        }
+        // A hit whose texture the renderer no longer holds (the frame that
+        // dropped the texture did not draw this text) is treated as a miss:
+        // rasterizing again keeps the drawn pixels right, where an image
+        // command naming a dropped texture would draw nothing at all.
+        _ => {
+            let upload = text_cache.rasterize(fonts, key, text)?;
+            let geometry = (upload.texture_id, upload.width, upload.height);
+            queued.insert(upload.texture_id);
+            uploads.push(upload);
+            geometry
+        }
+    };
+    Some(DrawCommand::Image(ImageCommand {
+        texture_id,
+        rect: Rect::new(
+            text.position.x,
+            text.position.y,
+            width as f32,
+            height as f32,
+        ),
+        source_rect: Rect::new(0.0, 0.0, width as f32, height as f32),
+        texture_size: Size::new(width as f32, height as f32),
+        opacity: text.color.a,
+        opaque: false,
+    }))
 }
 
 /// The face textures one composite reads: the frozen scene (binding 0), the
@@ -1811,7 +2043,7 @@ fn capture_adler32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use krkr_core::{Rect, TransitionParams};
+    use krkr_core::{FontSpec, Point, Rect, RectCommand, ShadowStyle, TextStyle, TransitionParams};
 
     fn transition(
         frozen: Vec<DrawCommand>,
@@ -2502,5 +2734,1131 @@ mod tests {
             0.75,
         );
         assert!((cleared[0] - faded[0]).abs() > 0.02);
+    }
+
+    // ---------------------------------------------------------------------
+    // The text image cache: an unchanged `DrawCommand::Text` must not be
+    // rasterized or uploaded again, and what it draws must be exactly what
+    // rasterizing it inline draws.
+    // ---------------------------------------------------------------------
+
+    fn probe_text(text: &str, style: TextStyle, font: FontSpec) -> TextCommand {
+        let size = font.height;
+        TextCommand {
+            position: Point::new(12.0, 34.0),
+            text: text.to_string(),
+            color: Color::new(1.0, 1.0, 1.0, 0.75),
+            size,
+            font,
+            style,
+        }
+    }
+
+    /// The renderer's own `prepare_commands` wiring, minus the device:
+    /// `textures` are the ids the renderer holds from earlier frames, `queued`
+    /// the ids this frame has minted but not yet uploaded — exactly the pair
+    /// `Renderer::prepare_commands` keys liveness on, so these tests drive the
+    /// live-set the production path uses (a constant predicate would hide a
+    /// within-frame miss).
+    fn prepare_text_commands(
+        commands: &[DrawCommand],
+        fonts: &FontSystem,
+        cache: &mut TextImageCache,
+        textures: &BTreeSet<TextureId>,
+        queued: &mut BTreeSet<TextureId>,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        prepare_commands(commands, fonts, cache, queued, |id| textures.contains(&id))
+    }
+
+    /// The ids a frame's uploads put into the renderer's texture map: what the
+    /// next frame's preparation sees as live.
+    fn uploaded_textures(uploads: &[ImageUpload]) -> BTreeSet<TextureId> {
+        uploads.iter().map(|upload| upload.texture_id).collect()
+    }
+
+    /// One frame's preparation that starts with nothing held from an earlier
+    /// frame.
+    fn prepare_fresh_frame(
+        commands: &[DrawCommand],
+        fonts: &FontSystem,
+        cache: &mut TextImageCache,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        prepare_text_commands(
+            commands,
+            fonts,
+            cache,
+            &BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )
+    }
+
+    /// One frame's preparation that still holds `textures` from earlier frames.
+    fn prepare_frame_holding(
+        commands: &[DrawCommand],
+        fonts: &FontSystem,
+        cache: &mut TextImageCache,
+        textures: &BTreeSet<TextureId>,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        prepare_text_commands(commands, fonts, cache, textures, &mut BTreeSet::new())
+    }
+
+    #[test]
+    fn unchanged_text_rasterizes_and_uploads_once() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let command = DrawCommand::Text(probe_text(
+            "a cached line of text",
+            TextStyle::default(),
+            FontSpec::default(),
+        ));
+
+        let (first_commands, first_uploads) =
+            prepare_fresh_frame(std::slice::from_ref(&command), &fonts, &mut cache);
+        assert_eq!(
+            first_uploads.len(),
+            1,
+            "the first frame rasterizes and uploads"
+        );
+        let [DrawCommand::Image(first_image)] = &first_commands[..] else {
+            panic!("expected one image command, got {first_commands:?}");
+        };
+        assert_eq!(first_image.texture_id, first_uploads[0].texture_id);
+
+        let (second_commands, second_uploads) = prepare_frame_holding(
+            std::slice::from_ref(&command),
+            &fonts,
+            &mut cache,
+            &uploaded_textures(&first_uploads),
+        );
+        assert!(
+            second_uploads.is_empty(),
+            "an unchanged text must not upload again"
+        );
+        assert_eq!(
+            second_commands, first_commands,
+            "same pixels, same texture, same geometry"
+        );
+    }
+
+    #[test]
+    fn cached_text_is_drawn_as_the_rasterizations_own_bytes() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let text = probe_text("pixel probe", TextStyle::default(), FontSpec::default());
+        let expected = fonts.rasterize_text(&text.font, text.style, &text.text);
+
+        let (commands, uploads) =
+            prepare_fresh_frame(&[DrawCommand::Text(text.clone())], &fonts, &mut cache);
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].width, expected.width);
+        assert_eq!(uploads[0].height, expected.height);
+        assert_eq!(uploads[0].rgba.as_ref(), expected.rgba.as_slice());
+
+        let [DrawCommand::Image(image)] = &commands[..] else {
+            panic!("expected one image command, got {commands:?}");
+        };
+        assert_eq!(
+            image.rect,
+            Rect::new(12.0, 34.0, expected.width as f32, expected.height as f32)
+        );
+        assert_eq!(image.opacity, text.color.a);
+    }
+
+    /// The text-heavy frame the cache is held to: a message box background, a
+    /// layer image the engine uploaded itself, three dialogue lines (one of
+    /// them repeated, the way a line can appear on more than one page), a
+    /// shadowed line at another height, and an empty text.  The empty string
+    /// rasterizes to a transparent image and draws nothing either way, so it
+    /// pins the "no pixels" case as much as the visible lines.
+    fn message_box_frame() -> Vec<DrawCommand> {
+        let style = TextStyle {
+            color: [255, 255, 255, 255],
+            anti_alias: true,
+            shadow: None,
+        };
+        let font = FontSpec {
+            height: 24.0,
+            ..FontSpec::default()
+        };
+        let mut commands = vec![
+            DrawCommand::Rect(RectCommand {
+                rect: Rect::new(0.0, 240.0, 640.0, 160.0),
+                color: Color::new(0.05, 0.05, 0.1, 0.85),
+            }),
+            // A texture the engine uploaded (a layer image), not one of the
+            // text cache's: the text preparation must leave it untouched.
+            DrawCommand::Image(ImageCommand {
+                texture_id: 7,
+                rect: Rect::new(8.0, 8.0, 96.0, 96.0),
+                source_rect: Rect::new(0.0, 0.0, 96.0, 96.0),
+                texture_size: Size::new(96.0, 96.0),
+                opacity: 1.0,
+                opaque: false,
+            }),
+        ];
+        for (index, line) in [
+            "こんにちは、世界。",
+            "きょうも いい てんき ですね。",
+            "こんにちは、世界。",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut text = probe_text(line, style, font.clone());
+            text.position = Point::new(24.0, 256.0 + index as f32 * 23.0);
+            text.color = Color::new(1.0, 1.0, 1.0, 0.75);
+            commands.push(DrawCommand::Text(text));
+        }
+        let mut shadowed = probe_text(
+            "影つきの一行",
+            TextStyle {
+                shadow: Some(ShadowStyle {
+                    offset_x: 2,
+                    offset_y: 2,
+                    color: [0, 0, 0, 160],
+                }),
+                ..style
+            },
+            FontSpec {
+                height: 32.0,
+                ..font.clone()
+            },
+        );
+        shadowed.position = Point::new(24.0, 344.0);
+        shadowed.color = Color::new(1.0, 0.9, 0.8, 1.0);
+        commands.push(DrawCommand::Text(shadowed));
+        let mut empty = probe_text("", style, font);
+        empty.position = Point::new(24.0, 384.0);
+        commands.push(DrawCommand::Text(empty));
+        commands
+    }
+
+    /// The pre-change text preparation, verbatim: every text rasterizes inline,
+    /// mints a fresh texture id and uploads under it, with no reuse across
+    /// commands or frames.  The cache has to draw exactly what this produces.
+    fn prepare_commands_inline_reference(
+        commands: &[DrawCommand],
+        fonts: &FontSystem,
+        next_texture_id: &mut TextureId,
+    ) -> (Vec<DrawCommand>, Vec<ImageUpload>) {
+        let mut prepared = Vec::with_capacity(commands.len());
+        let mut uploads = Vec::new();
+        for command in commands {
+            match command {
+                DrawCommand::Text(text) => {
+                    let image = fonts.rasterize_text(&text.font, text.style, &text.text);
+                    if image.width == 0 || image.height == 0 {
+                        continue;
+                    }
+                    let texture_id = *next_texture_id;
+                    *next_texture_id = next_texture_id.saturating_add(1);
+                    uploads.push(ImageUpload::new(
+                        texture_id,
+                        image.width,
+                        image.height,
+                        Arc::from(image.rgba),
+                    ));
+                    prepared.push(DrawCommand::Image(ImageCommand {
+                        texture_id,
+                        rect: Rect::new(
+                            text.position.x,
+                            text.position.y,
+                            image.width as f32,
+                            image.height as f32,
+                        ),
+                        source_rect: Rect::new(0.0, 0.0, image.width as f32, image.height as f32),
+                        texture_size: Size::new(image.width as f32, image.height as f32),
+                        opacity: text.color.a,
+                        opaque: false,
+                    }));
+                }
+                _ => prepared.push(command.clone()),
+            }
+        }
+        (prepared, uploads)
+    }
+
+    /// One prepared command reduced to what decides the pixels it draws: its
+    /// geometry, its blend inputs, and — for an image this frame uploaded —
+    /// the bytes behind its texture.  Texture ids are deliberately absent:
+    /// reusing an id across frames is the point of the cache, and the bytes a
+    /// live id holds are compared instead.
+    #[derive(Debug, PartialEq)]
+    enum PixelCommand {
+        Rect {
+            rect: Rect,
+            color: Color,
+        },
+        Image {
+            rect: Rect,
+            source_rect: Rect,
+            texture_size: Size,
+            opacity: f32,
+            opaque: bool,
+            /// `None` for a texture this preparation did not upload (an engine
+            /// layer image), whose pixels are the engine's business.
+            rgba: Option<Arc<[u8]>>,
+        },
+    }
+
+    fn pixel_commands(commands: &[DrawCommand], uploads: &[ImageUpload]) -> Vec<PixelCommand> {
+        let bytes: BTreeMap<TextureId, Arc<[u8]>> = uploads
+            .iter()
+            .map(|upload| (upload.texture_id, Arc::clone(&upload.rgba)))
+            .collect();
+        commands
+            .iter()
+            .map(|command| match command {
+                DrawCommand::Rect(rect) => PixelCommand::Rect {
+                    rect: rect.rect,
+                    color: rect.color,
+                },
+                DrawCommand::Image(image) => PixelCommand::Image {
+                    rect: image.rect,
+                    source_rect: image.source_rect,
+                    texture_size: image.texture_size,
+                    opacity: image.opacity,
+                    opaque: image.opaque,
+                    rgba: bytes.get(&image.texture_id).cloned(),
+                },
+                DrawCommand::Text(text) => {
+                    panic!("a prepared frame must not carry text, got {text:?}")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_whose_texture_the_renderer_dropped_is_rasterized_again() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let command = DrawCommand::Text(probe_text(
+            "reappearing line",
+            TextStyle::default(),
+            FontSpec::default(),
+        ));
+
+        let (first_commands, first_uploads) =
+            prepare_fresh_frame(std::slice::from_ref(&command), &fonts, &mut cache);
+        // The frame that dropped the texture did not draw this text, so the
+        // renderer dropped the entry with it: the text is rasterized again
+        // under a fresh id rather than drawn as a texture that is gone (which
+        // would draw nothing at all).  Nothing is held from that frame.
+        let (again_commands, again_uploads) = prepare_frame_holding(
+            std::slice::from_ref(&command),
+            &fonts,
+            &mut cache,
+            &BTreeSet::new(),
+        );
+        assert_eq!(again_uploads.len(), 1, "a dropped texture rasterizes again");
+        assert_ne!(
+            again_uploads[0].texture_id, first_uploads[0].texture_id,
+            "under a texture id of its own"
+        );
+        assert_eq!(
+            again_uploads[0].rgba.as_ref(),
+            first_uploads[0].rgba.as_ref(),
+            "with the bytes a fresh rasterization of the same text produces"
+        );
+        assert_eq!(
+            pixel_commands(&again_commands, &again_uploads),
+            pixel_commands(&first_commands, &first_uploads),
+            "and the same drawn pixels"
+        );
+    }
+
+    #[test]
+    fn a_message_box_frame_is_prepared_exactly_as_inline_rasterization_would() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let commands = message_box_frame();
+
+        let mut inline_next_id = TextImageCache::FIRST_TEXTURE_ID;
+        let (inline_commands, inline_uploads) =
+            prepare_commands_inline_reference(&commands, &fonts, &mut inline_next_id);
+
+        let (first_commands, first_uploads) = prepare_fresh_frame(&commands, &fonts, &mut cache);
+        assert_eq!(
+            pixel_commands(&inline_commands, &inline_uploads),
+            pixel_commands(&first_commands, &first_uploads),
+            "the first frame draws what inline rasterization draws"
+        );
+
+        // The second frame is the cache's own: nothing to upload, and exactly
+        // the same commands (same textures, same geometry, same alpha).
+        let (second_commands, second_uploads) = prepare_frame_holding(
+            &commands,
+            &fonts,
+            &mut cache,
+            &uploaded_textures(&first_uploads),
+        );
+        assert!(
+            second_uploads.is_empty(),
+            "an unchanged frame must not upload again"
+        );
+        assert_eq!(
+            first_commands, second_commands,
+            "the cached frame prepares the same commands as the frame that uploaded"
+        );
+    }
+
+    /// The within-frame live-set is the part a constant predicate cannot
+    /// exercise: two commands with the same text in one draw list, prepared
+    /// with the real `(*textures, *queued)` pair (`textures` empty — nothing is
+    /// uploaded until the frame is drawn), must rasterize once and upload once.
+    #[test]
+    fn a_text_that_appears_twice_in_one_draw_list_uploads_once() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let text = probe_text("twin", TextStyle::default(), FontSpec::default());
+        let commands = [
+            DrawCommand::Text(text.clone()),
+            DrawCommand::Text(text.clone()),
+        ];
+
+        let mut queued = BTreeSet::new();
+        let (prepared, uploads) =
+            prepare_text_commands(&commands, &fonts, &mut cache, &BTreeSet::new(), &mut queued);
+        assert_eq!(
+            uploads.len(),
+            1,
+            "the second command must reuse the id the first minted this frame"
+        );
+        assert!(queued.contains(&uploads[0].texture_id));
+        let [DrawCommand::Image(first), DrawCommand::Image(second)] = &prepared[..] else {
+            panic!("expected two image commands, got {prepared:?}");
+        };
+        assert_eq!(first, second);
+    }
+
+    /// The live-set spans the frame's draw lists: a text a transition face's
+    /// list rasterized first is a hit when the live list draws it again, with
+    /// no upload for the second — the ids minted earlier in the frame count as
+    /// live even though `upload_frame_images` has not run yet.
+    #[test]
+    fn a_text_shared_by_two_draw_lists_of_one_frame_uploads_once() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let text = probe_text("shared line", TextStyle::default(), FontSpec::default());
+        let live_list = [DrawCommand::Text(text.clone())];
+        let face_list = [DrawCommand::Text(text)];
+
+        let mut queued = BTreeSet::new();
+        let (_, live_uploads) = prepare_text_commands(
+            &live_list,
+            &fonts,
+            &mut cache,
+            &BTreeSet::new(),
+            &mut queued,
+        );
+        let (_, face_uploads) = prepare_text_commands(
+            &face_list,
+            &fonts,
+            &mut cache,
+            &BTreeSet::new(),
+            &mut queued,
+        );
+        assert_eq!(live_uploads.len(), 1);
+        assert!(
+            face_uploads.is_empty(),
+            "the second list must reuse the texture the first minted"
+        );
+    }
+
+    #[test]
+    fn a_changed_font_style_or_string_is_a_new_texture() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let base = probe_text("base", TextStyle::default(), FontSpec::default());
+        let (_, first_uploads) =
+            prepare_fresh_frame(&[DrawCommand::Text(base.clone())], &fonts, &mut cache);
+        let held = uploaded_textures(&first_uploads);
+
+        let variants = [
+            probe_text("base!", TextStyle::default(), FontSpec::default()),
+            probe_text(
+                "base",
+                TextStyle {
+                    color: [255, 0, 0, 255],
+                    ..TextStyle::default()
+                },
+                FontSpec::default(),
+            ),
+            probe_text(
+                "base",
+                TextStyle {
+                    color: [255, 255, 255, 128],
+                    ..TextStyle::default()
+                },
+                FontSpec::default(),
+            ),
+            probe_text(
+                "base",
+                TextStyle {
+                    anti_alias: false,
+                    ..TextStyle::default()
+                },
+                FontSpec::default(),
+            ),
+            probe_text(
+                "base",
+                TextStyle {
+                    shadow: Some(ShadowStyle {
+                        offset_x: 1,
+                        offset_y: 2,
+                        color: [0, 0, 0, 255],
+                    }),
+                    ..TextStyle::default()
+                },
+                FontSpec::default(),
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    height: 32.0,
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    bold: true,
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    italic: true,
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    underline: true,
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    strikeout: true,
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    angle: 90,
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    face: "another face".to_string(),
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    face: "font/probe.otf".to_string(),
+                    face_is_file_name: true,
+                    ..FontSpec::default()
+                },
+            ),
+            probe_text(
+                "base",
+                TextStyle::default(),
+                FontSpec {
+                    rasterizer: "prerendered".to_string(),
+                    ..FontSpec::default()
+                },
+            ),
+        ];
+        for variant in variants {
+            let (_, uploads) =
+                prepare_frame_holding(&[DrawCommand::Text(variant)], &fonts, &mut cache, &held);
+            assert_eq!(uploads.len(), 1, "a changed key must rasterize");
+            assert_ne!(uploads[0].texture_id, first_uploads[0].texture_id);
+        }
+
+        // A command's own position, opacity and size are not rasterization
+        // inputs: they stay per command, on a shared image.
+        let mut moved = base;
+        moved.position = Point::new(200.0, 90.0);
+        moved.color = Color::new(1.0, 1.0, 1.0, 0.25);
+        moved.size = 99.0;
+        let (prepared, uploads) =
+            prepare_frame_holding(&[DrawCommand::Text(moved)], &fonts, &mut cache, &held);
+        assert!(
+            uploads.is_empty(),
+            "position, opacity and size come from the command, not the cache"
+        );
+        let [DrawCommand::Image(image)] = &prepared[..] else {
+            panic!("expected one image command, got {prepared:?}");
+        };
+        assert_eq!(image.texture_id, first_uploads[0].texture_id);
+        assert_eq!(image.rect.x, 200.0);
+        assert_eq!(image.opacity, 0.25);
+    }
+
+    #[test]
+    fn a_font_system_change_is_a_new_texture() {
+        let mut fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let text = probe_text("generation", TextStyle::default(), FontSpec::default());
+        let (_, first_uploads) =
+            prepare_fresh_frame(&[DrawCommand::Text(text.clone())], &fonts, &mut cache);
+        let held = uploaded_textures(&first_uploads);
+
+        // An alias, an embedded-font table, a loaded face or the project
+        // language can change what the same spec resolves to; an entry filled
+        // before the change must not answer after it.
+        fonts.register_font_aliases(vec![("alias".to_string(), "target".to_string())]);
+        let (_, uploads) =
+            prepare_frame_holding(&[DrawCommand::Text(text)], &fonts, &mut cache, &held);
+        assert_eq!(uploads.len(), 1, "a font system change is a miss");
+        assert_ne!(uploads[0].texture_id, first_uploads[0].texture_id);
+    }
+
+    #[test]
+    fn a_font_generation_bump_invalidates_every_entry() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let text = probe_text("generation", TextStyle::default(), FontSpec::default());
+        prepare_fresh_frame(&[DrawCommand::Text(text.clone())], &fonts, &mut cache);
+
+        let stale = TextImageKey::new(fonts.generation().wrapping_add(1), &text);
+        assert!(
+            cache.get(&stale).is_none(),
+            "a cache entry from before the font system changed must not answer"
+        );
+        let current = TextImageKey::new(fonts.generation(), &text);
+        assert!(cache.get(&current).is_some());
+    }
+
+    #[test]
+    fn cache_entries_die_with_their_textures() {
+        let fonts = FontSystem::new();
+        let mut cache = TextImageCache::new();
+        let text = probe_text("bounded", TextStyle::default(), FontSpec::default());
+        prepare_fresh_frame(&[DrawCommand::Text(text.clone())], &fonts, &mut cache);
+
+        let key = TextImageKey::new(fonts.generation(), &text);
+        assert!(cache.get(&key).is_some());
+        cache.retain_live_textures(|_| true);
+        assert!(cache.get(&key).is_some(), "a live texture keeps its entry");
+        cache.retain_live_textures(|_| false);
+        assert!(
+            cache.get(&key).is_none(),
+            "an entry whose texture the renderer dropped is dropped too"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The same frames, rendered: the offscreen device draws the cached
+    // preparation and the inline one, and the two have to come out byte for
+    // byte the same picture.
+    // ---------------------------------------------------------------------
+
+    const TEXT_FRAME_WIDTH: u32 = 640;
+    const TEXT_FRAME_HEIGHT: u32 = 400;
+
+    /// The engine-uploaded layer image [`message_box_frame`] carries (texture
+    /// 7): the text preparation must leave it alone, so every stream is given
+    /// the same bytes under the same id.
+    fn engine_layer_upload() -> ImageUpload {
+        let (width, height) = (96u32, 96u32);
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    (x * 255 / width) as u8,
+                    (y * 255 / height) as u8,
+                    40,
+                    if (x / 8 + y / 8) % 2 == 0 { 255 } else { 128 },
+                ]);
+            }
+        }
+        ImageUpload::new(7, width, height, Arc::from(rgba))
+    }
+
+    /// Draws the image commands of a prepared frame into an offscreen target
+    /// with the renderer's own texture pipeline and vertex geometry (the
+    /// identity transform: a command's rect is already in target pixels) and
+    /// submits the pass, returning the target and its readback buffer so the
+    /// caller can map the pixels ([`read_back_pixels`]).
+    fn draw_image_frame_offscreen(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &TexturePipelineResources,
+        textures: &BTreeMap<TextureId, CachedTexture>,
+        clear: Color,
+        commands: &[DrawCommand],
+    ) -> (wgpu::Texture, wgpu::Buffer) {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Kirakira text frame target"),
+            size: wgpu::Extent3d {
+                width: TEXT_FRAME_WIDTH,
+                height: TEXT_FRAME_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let row_bytes = TEXT_FRAME_WIDTH * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Kirakira text frame readback"),
+            size: u64::from(row_bytes) * u64::from(TEXT_FRAME_HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Kirakira text frame encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Kirakira text frame pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(clear.r),
+                            g: f64::from(clear.g),
+                            b: f64::from(clear.b),
+                            a: f64::from(clear.a),
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let transform = RenderTransform {
+                x_scale: 1.0,
+                y_scale: 1.0,
+                x_offset: 0.0,
+                y_offset: 0.0,
+            };
+            for command in commands {
+                let DrawCommand::Image(image) = command else {
+                    continue;
+                };
+                let Some(texture) = textures.get(&image.texture_id) else {
+                    panic!(
+                        "prepared frame names texture {} with no upload",
+                        image.texture_id
+                    );
+                };
+                let vertices =
+                    image_vertices(transform, TEXT_FRAME_WIDTH, TEXT_FRAME_HEIGHT, image);
+                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Kirakira text frame vertices"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_bind_group(0, &texture.bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(TEXT_FRAME_HEIGHT),
+                },
+            },
+            wgpu::Extent3d {
+                width: TEXT_FRAME_WIDTH,
+                height: TEXT_FRAME_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        (target, readback)
+    }
+
+    /// Maps the readback buffer [`draw_image_frame_offscreen`] filled and
+    /// returns its RGBA bytes.
+    fn read_back_pixels(device: &wgpu::Device, readback: &wgpu::Buffer) -> Vec<u8> {
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        rx.recv().expect("map").expect("mapped");
+        let pixels = slice.get_mapped_range().to_vec();
+        readback.unmap();
+        pixels
+    }
+
+    /// The pixels one prepared frame draws offscreen, read back for comparison.
+    fn render_image_frame_offscreen(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &TexturePipelineResources,
+        textures: &BTreeMap<TextureId, CachedTexture>,
+        clear: Color,
+        commands: &[DrawCommand],
+    ) -> Vec<u8> {
+        let (_target, readback) =
+            draw_image_frame_offscreen(device, queue, pipeline, textures, clear, commands);
+        read_back_pixels(device, &readback)
+    }
+
+    /// The frames the cache produces have to be the frames inline rasterization
+    /// produces, on the device that draws them: this renders the message-box
+    /// frame three times — the pre-change preparation, the cache's first frame
+    /// and the cache's unchanged second frame — and compares the RGBA readback
+    /// byte for byte.  Then it changes the font system and checks the next
+    /// frame is the freshly rasterized picture again, not the stale one.  A
+    /// host without a wgpu adapter reports the skip instead of failing.
+    #[test]
+    fn cached_text_frames_render_byte_identically_to_inline_rasterization() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!(
+                "no wgpu adapter: the cached text frames' pixels were not compared on this host"
+            );
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let pipeline = TexturePipelineResources::new(&device, format);
+        let mut fonts = FontSystem::new();
+        let commands = message_box_frame();
+        let clear = Color::new(0.02, 0.02, 0.05, 1.0);
+
+        // "before the cache": every text rasterized inline, every frame.
+        let engine_layer = engine_layer_upload();
+        let upload_frame_textures = |textures: &mut BTreeMap<TextureId, CachedTexture>,
+                                     uploads: &[ImageUpload]| {
+            upload_images(&device, &queue, &pipeline, format, false, textures, uploads);
+            upload_images(
+                &device,
+                &queue,
+                &pipeline,
+                format,
+                false,
+                textures,
+                std::slice::from_ref(&engine_layer),
+            );
+        };
+        let mut inline_next_id = TextImageCache::FIRST_TEXTURE_ID;
+        let (inline_commands, inline_uploads) =
+            prepare_commands_inline_reference(&commands, &fonts, &mut inline_next_id);
+        let mut inline_textures = BTreeMap::new();
+        upload_frame_textures(&mut inline_textures, &inline_uploads);
+        let inline_pixels = render_image_frame_offscreen(
+            &device,
+            &queue,
+            &pipeline,
+            &inline_textures,
+            clear,
+            &inline_commands,
+        );
+        assert!(
+            inline_pixels.chunks_exact(4).any(|pixel| pixel[3] != 0),
+            "the probe frame must actually draw something"
+        );
+
+        // "after": the cache's first (cold) frame.
+        let mut cache = TextImageCache::new();
+        let (first_commands, first_uploads) = prepare_fresh_frame(&commands, &fonts, &mut cache);
+        // The frame repeats a line, and the preparation mints each id into the
+        // live-set as it goes: the repeated line draws from the texture its
+        // first occurrence minted, so this frame uploads one image fewer than
+        // the inline reference does for the same commands — and draws the same
+        // pixels (asserted below).
+        assert!(
+            first_uploads.len() < inline_uploads.len(),
+            "the repeated line must share its first occurrence's texture"
+        );
+        let held = uploaded_textures(&first_uploads);
+        let mut textures = BTreeMap::new();
+        upload_frame_textures(&mut textures, &first_uploads);
+        let first_pixels = render_image_frame_offscreen(
+            &device,
+            &queue,
+            &pipeline,
+            &textures,
+            clear,
+            &first_commands,
+        );
+        assert_eq!(
+            inline_pixels, first_pixels,
+            "the cache's first frame must render the inline frame's pixels"
+        );
+
+        // The unchanged second frame: the cache's hits, drawn again.
+        let (second_commands, second_uploads) =
+            prepare_frame_holding(&commands, &fonts, &mut cache, &held);
+        assert!(
+            second_uploads.is_empty(),
+            "the second frame has nothing to upload"
+        );
+        let second_pixels = render_image_frame_offscreen(
+            &device,
+            &queue,
+            &pipeline,
+            &textures,
+            clear,
+            &second_commands,
+        );
+        assert_eq!(
+            inline_pixels, second_pixels,
+            "an unchanged frame from the cache must render the inline frame's pixels"
+        );
+
+        // A font system change: the next frame is a fresh rasterization, and it
+        // is still the picture inline rasterization draws.
+        fonts.register_font_aliases(vec![("alias".to_string(), "target".to_string())]);
+        let (changed_commands, changed_uploads) =
+            prepare_frame_holding(&commands, &fonts, &mut cache, &held);
+        assert!(
+            !changed_uploads.is_empty(),
+            "a font system change must rasterize the frame again"
+        );
+        let mut changed_textures = BTreeMap::new();
+        upload_frame_textures(&mut changed_textures, &changed_uploads);
+        let changed_pixels = render_image_frame_offscreen(
+            &device,
+            &queue,
+            &pipeline,
+            &changed_textures,
+            clear,
+            &changed_commands,
+        );
+        let fresh_commands = {
+            let mut fresh_next_id = TextImageCache::FIRST_TEXTURE_ID;
+            let (fresh_commands, fresh_uploads) =
+                prepare_commands_inline_reference(&commands, &fonts, &mut fresh_next_id);
+            let mut fresh_textures = BTreeMap::new();
+            upload_frame_textures(&mut fresh_textures, &fresh_uploads);
+            let fresh_pixels = render_image_frame_offscreen(
+                &device,
+                &queue,
+                &pipeline,
+                &fresh_textures,
+                clear,
+                &fresh_commands,
+            );
+            assert_eq!(
+                fresh_pixels, changed_pixels,
+                "after a font change the cached frame is the freshly rasterized picture"
+            );
+            fresh_commands
+        };
+
+        // Evidence for the record: the exact pixels each preparation drew.
+        if let Ok(directory) = std::env::var("KRKR_TEXT_FRAME_DUMP") {
+            let directory = std::path::Path::new(&directory);
+            for (name, pixels) in [
+                ("inline", &inline_pixels),
+                ("cached-first", &first_pixels),
+                ("cached-second", &second_pixels),
+                ("cached-after-font-change", &changed_pixels),
+            ] {
+                let path = directory.join(format!("text-frame-{name}.png"));
+                write_capture_png(&path, TEXT_FRAME_WIDTH, TEXT_FRAME_HEIGHT, pixels)
+                    .expect("write frame dump");
+                eprintln!("wrote {}", path.display());
+            }
+            eprintln!(
+                "inline frame commands: {}, cached frame commands: {}",
+                inline_commands.len(),
+                fresh_commands.len()
+            );
+        }
+    }
+
+    /// The cost probe behind M203's numbers: what preparing a text-heavy frame
+    /// costs on this host with the cache and without it, how much of a frame
+    /// that is, and how much of it is the upload.  Prints to stdout; run it
+    /// with
+    ///
+    /// ```text
+    /// cargo test -p krkr-render --release -- --ignored text_frame_cost --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement probe: needs a wgpu adapter and prints timings"]
+    fn text_frame_cost_probe() {
+        use std::time::Instant;
+
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no wgpu adapter: the text frame cost was not measured on this host");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let pipeline = TexturePipelineResources::new(&device, format);
+        let fonts = FontSystem::new();
+        let commands = message_box_frame();
+        let clear = Color::new(0.02, 0.02, 0.05, 1.0);
+        let frame_count = 120u32;
+
+        let texts: Vec<&TextCommand> = commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+
+        // One rasterization per frame, per line.
+        let start = Instant::now();
+        for _ in 0..frame_count {
+            for text in &texts {
+                std::hint::black_box(fonts.rasterize_text(&text.font, text.style, &text.text));
+            }
+        }
+        let rasterize_frame = start.elapsed() / frame_count;
+
+        // One upload per frame, per line: create, write_texture, bind group.
+        let uploads: Vec<ImageUpload> = texts
+            .iter()
+            .map(|text| {
+                let image = fonts.rasterize_text(&text.font, text.style, &text.text);
+                ImageUpload::new(0, image.width, image.height, Arc::from(image.rgba))
+            })
+            .collect();
+        let start = Instant::now();
+        for _ in 0..frame_count {
+            let mut textures = BTreeMap::new();
+            upload_images(
+                &device,
+                &queue,
+                &pipeline,
+                format,
+                false,
+                &mut textures,
+                &uploads,
+            );
+        }
+        let upload_frame = start.elapsed() / frame_count;
+
+        // The pre-change preparation, per frame: rasterize + upload, nothing
+        // reused.
+        let start = Instant::now();
+        for _ in 0..frame_count {
+            let mut next_texture_id = TextImageCache::FIRST_TEXTURE_ID;
+            let (_, uploads) =
+                prepare_commands_inline_reference(&commands, &fonts, &mut next_texture_id);
+            let mut textures = BTreeMap::new();
+            upload_images(
+                &device,
+                &queue,
+                &pipeline,
+                format,
+                false,
+                &mut textures,
+                &uploads,
+            );
+        }
+        let inline_prepare_frame = start.elapsed() / frame_count;
+
+        // The cache, per frame: the first frame prepares and uploads, every
+        // later frame is the renderer's steady state — every text a hit drawn
+        // from the textures the first frame left behind, one `queued` set per
+        // frame, no device resource touched.
+        let mut cache = TextImageCache::new();
+        let (first_commands, first_uploads) = prepare_fresh_frame(&commands, &fonts, &mut cache);
+        let held = uploaded_textures(&first_uploads);
+        let mut textures = BTreeMap::new();
+        upload_images(
+            &device,
+            &queue,
+            &pipeline,
+            format,
+            false,
+            &mut textures,
+            &first_uploads,
+        );
+        // The engine-uploaded layer image the frame carries, so the draw below
+        // has every texture the prepared commands name.
+        upload_images(
+            &device,
+            &queue,
+            &pipeline,
+            format,
+            false,
+            &mut textures,
+            std::slice::from_ref(&engine_layer_upload()),
+        );
+        let start = Instant::now();
+        for _ in 0..frame_count {
+            let mut queued = BTreeSet::new();
+            let (hits, uploads) =
+                prepare_text_commands(&commands, &fonts, &mut cache, &held, &mut queued);
+            assert!(uploads.is_empty(), "the cached frame must not upload");
+            std::hint::black_box(hits);
+        }
+        let cached_prepare_frame = start.elapsed() / frame_count;
+
+        // Drawing the prepared frame: the render pass plus its submit, the
+        // part of a real frame's cost that is not the text preparation.
+        let start = Instant::now();
+        for _ in 0..frame_count {
+            let (target, readback) = draw_image_frame_offscreen(
+                &device,
+                &queue,
+                &pipeline,
+                &textures,
+                clear,
+                &first_commands,
+            );
+            std::hint::black_box((target, readback));
+        }
+        let draw_frame = start.elapsed() / frame_count;
+
+        let inline_total = inline_prepare_frame + draw_frame;
+        let cached_total = cached_prepare_frame + draw_frame;
+        println!(
+            "M203 text frame cost probe ({} frames per case)",
+            frame_count
+        );
+        println!("  texts in frame: {}", texts.len());
+        println!("  rasterize_text, per frame:      {rasterize_frame:?}");
+        println!("  upload_images, per frame:       {upload_frame:?}");
+        println!(
+            "  prepare+upload, inline (before): {inline_prepare_frame:?} ({:.1}% of {inline_total:?})",
+            inline_prepare_frame.as_secs_f64() / inline_total.as_secs_f64() * 100.0
+        );
+        println!(
+            "  prepare, cached (after):         {cached_prepare_frame:?} ({:.1}% of {cached_total:?})",
+            cached_prepare_frame.as_secs_f64() / cached_total.as_secs_f64() * 100.0
+        );
+        println!("  draw+submit one frame:           {draw_frame:?}");
+        println!("  frame total inline -> cached:    {inline_total:?} -> {cached_total:?}");
     }
 }
