@@ -473,6 +473,11 @@ pub struct FontSystem {
     /// encoding ([`FontSystem::set_language_affinity`]); it decides which
     /// region variant the default being font prefers.
     language_affinity: LanguageAffinity,
+    /// Bumped by every change to what a spec or text measures, resolves or
+    /// rasterizes to. Callers that cache rasterized pixels key on
+    /// [`FontSystem::generation`] alongside the spec, style and string, so a
+    /// cache entry from before the change cannot be served after it.
+    generation: u64,
     /// The being font each spec resolves to: a requested candidate when one
     /// answers, else the default being font (`query_default_faces`). One entry
     /// per spec — the reference resolves `GetBeingFont` once per font spec
@@ -502,6 +507,7 @@ impl Clone for FontSystem {
             loaded_face_names: self.loaded_face_names.clone(),
             prerendered_fonts: self.prerendered_fonts.clone(),
             language_affinity: self.language_affinity,
+            generation: self.generation,
             primary_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
@@ -532,6 +538,7 @@ impl FontSystem {
             loaded_face_names: BTreeMap::new(),
             prerendered_fonts: BTreeMap::new(),
             language_affinity: LanguageAffinity::Unspecified,
+            generation: 0,
             primary_faces: RefCell::new(BTreeMap::new()),
             glyph_ids: RefCell::new(BTreeMap::new()),
             face_metrics: RefCell::new(BTreeMap::new()),
@@ -611,11 +618,20 @@ impl FontSystem {
         if self.language_affinity != language {
             self.language_affinity = language;
             self.primary_faces.borrow_mut().clear();
+            self.bump_generation();
         }
     }
 
     pub fn language_affinity(&self) -> LanguageAffinity {
         self.language_affinity
+    }
+
+    /// The counter [`FontSystem`] bumps whenever its state changes what a spec
+    /// resolves to or a glyph rasterizes as. A rasterized-pixel cache keys on
+    /// it so a face registered, an alias or an embedded-font table added after
+    /// the cache was filled cannot be answered with the old pixels.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn load_font_data(&mut self, name: impl Into<String>, data: Vec<u8>) -> Result<(), String> {
@@ -1775,12 +1791,17 @@ impl FontSystem {
         })?
     }
 
-    fn clear_caches(&self) {
+    fn clear_caches(&mut self) {
         self.primary_faces.borrow_mut().clear();
         self.glyph_ids.borrow_mut().clear();
         self.face_metrics.borrow_mut().clear();
         self.glyph_images.borrow_mut().clear();
         self.prerendered_glyph_images.borrow_mut().clear();
+        self.bump_generation();
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -3245,5 +3266,52 @@ mod tests {
             chosen, unmarked,
             "a Japanese project must keep the default the unmarked order picks"
         );
+    }
+
+    /// The generation a rasterized-pixel cache keys on has to move for every
+    /// change that can change what a spec resolves to.  A caller that caches
+    /// `rasterize_text` output keyed on `(generation, spec, style, text)` must
+    /// see a miss after any of these — the pixels of the same spec and string
+    /// can differ once an alias, an embedded-font table, a loaded face or the
+    /// project language has changed since.
+    #[test]
+    fn the_generation_moves_for_every_font_system_change() {
+        let mut system = FontSystem::new();
+        let mut generation = system.generation();
+
+        system.register_font_aliases(vec![("alias".to_string(), "target".to_string())]);
+        let after_alias = system.generation();
+        assert_ne!(after_alias, generation, "a font alias changes resolution");
+        generation = after_alias;
+
+        system.register_embedded_font_list(Vec::new());
+        let after_embedded = system.generation();
+        assert_ne!(
+            after_embedded, generation,
+            "an embedded-font table changes resolution"
+        );
+        generation = after_embedded;
+
+        system
+            .load_font_data("font/probe.otf", jp_probe_test_font())
+            .unwrap();
+        let after_face = system.generation();
+        assert_ne!(after_face, generation, "a loaded face changes resolution");
+        generation = after_face;
+
+        system.set_language_affinity(LanguageAffinity::Japanese);
+        let after_language = system.generation();
+        assert_ne!(
+            after_language, generation,
+            "the project language changes the default being font"
+        );
+
+        // A value that does not change is not a change.
+        system.set_language_affinity(LanguageAffinity::Japanese);
+        assert_eq!(system.generation(), after_language);
+
+        // A clone carries the same state, and therefore the same generation.
+        let clone = system.clone();
+        assert_eq!(clone.generation(), system.generation());
     }
 }
