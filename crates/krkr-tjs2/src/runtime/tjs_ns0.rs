@@ -289,7 +289,15 @@ impl<'a, H: super::TjsHost + 'static> TjsNs0Decoder<'a, H> {
 
     fn dictionary(&mut self) -> Result<Variant> {
         let len = self.read_u32()? as usize;
-        let handle = self.runtime.alloc_ordinary_object();
+        // The tagged dictionary is a TJS Dictionary and has to carry the
+        // class, like the structs of the other pack format
+        // (`BinaryStructDecoder::dictionary`, `builtins.rs:1765`): a miss
+        // answers void only for a Dictionary *instance* (`tjsDictionary.cpp:
+        // 720-731`), and KAGEX's bookmark code reads the members a save does
+        // not hold with exactly that idiom (`MainConductor.restore`'s
+        // `dic.runLine`, `LineModeEx.onRestore`'s `dic.language`).  A plain
+        // object raises `Member "%1" does not exist` on the first such read.
+        let handle = self.runtime.alloc_dictionary_object_sized(len as i64);
         for _ in 0..len {
             let key = self.read_string()?;
             let value = self.value()?;
@@ -437,9 +445,9 @@ impl<'a, H: super::TjsHost + 'static> TjsNs0Encoder<'a, H> {
             // The reference writes every non-array closure as a dictionary
             // (`FUN_10052b10` checks only `Array`). A classed engine object (a
             // Layer, the KAG object, ...) has no portable representation, so
-            // it degrades to the writer's null-object tag; a class-less
-            // object is a plain dictionary — that is what the decoder builds
-            // for a nested dictionary — so it is serialized as one.
+            // it degrades to the writer's null-object tag; a Dictionary -- the
+            // shape the decoder builds for a tagged dictionary -- serializes
+            // as one, and a class-less object counts as a plain dictionary.
             let is_dictionary =
                 class_infos.is_empty() || class_infos.iter().any(|info| info == "Dictionary");
             if !is_dictionary {
@@ -522,10 +530,10 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn decoded_dictionary_contains_only_packed_members() {
-        // A seed of zero makes all byte-check and final-check values zero.
-        // The payload is `%[answer => 42]` encoded as a TJS/ns0 dictionary.
+    /// The hand-built `%[answer => 42]` pack: a zero seed makes every
+    /// byte-check and the final check zero, so the payload is one dictionary
+    /// tag, its key, one integer and that zero final check.
+    fn answer_pack() -> Vec<u8> {
         let mut bytes = b"TJS/ns0\0".to_vec();
         bytes.extend_from_slice(&0_u32.to_le_bytes()); // seed
         bytes.extend_from_slice(&0_u16.to_le_bytes()); // crypt
@@ -539,9 +547,14 @@ mod tests {
         bytes.extend_from_slice(&0x0004_u16.to_le_bytes()); // Integer
         bytes.extend_from_slice(&42_i64.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes()); // final check
+        bytes
+    }
 
+    #[test]
+    fn decoded_dictionary_contains_only_packed_members() {
         let mut runtime = Runtime::new();
-        let Variant::Object(dictionary) = decode_tjs_ns0(&mut runtime, &bytes).expect("decode")
+        let Variant::Object(dictionary) =
+            decode_tjs_ns0(&mut runtime, &answer_pack()).expect("decode")
         else {
             panic!("expected dictionary");
         };
@@ -550,6 +563,9 @@ mod tests {
             runtime.object_member(dictionary, "answer"),
             Variant::Integer(42)
         );
+        // The raw member map holds the packed keys only: the class a Dictionary
+        // instance carries registers no method members either
+        // (`alloc_dictionary_object`).
         assert!(matches!(
             runtime.object_member(dictionary, "assign"),
             Variant::Void
@@ -558,6 +574,34 @@ mod tests {
             runtime.object_member(dictionary, "clear"),
             Variant::Void
         ));
+    }
+
+    /// A decoded dictionary is a Dictionary *instance*, so the miss protocol
+    /// comes with it: a member the save does not hold reads as void through the
+    /// VM's own read path (`missing_member`'s Dictionary branch,
+    /// `tjsDictionary.cpp:720-731`) -- the `dic.runLine === void` idiom KAGEX's
+    /// bookmark code depends on (`MainConductor.restore`, `MainWindow.tjs`),
+    /// not `Member "runLine" does not exist`.
+    #[test]
+    fn decoded_dictionary_reads_an_unset_member_as_void() {
+        let mut runtime = Runtime::new();
+        let Variant::Object(dictionary) =
+            decode_tjs_ns0(&mut runtime, &answer_pack()).expect("decode")
+        else {
+            panic!("expected dictionary");
+        };
+        assert!(runtime.is_dictionary_instance(dictionary));
+
+        runtime.set_global_member("decoded", Variant::Object(dictionary));
+        let file =
+            crate::compile_source_to_bytecode("decoded-probe.tjs", "return decoded.runLine;")
+                .expect("compile");
+        assert_eq!(
+            runtime
+                .execute_file(&file)
+                .expect("an unset member of a decoded dictionary reads as void"),
+            Variant::Void
+        );
     }
 
     /// The exact bytes the writer emits for the shape the existing test
@@ -679,10 +723,9 @@ mod tests {
             assert_sample(&runtime, decoded);
         }
 
-        // A decoded *flat* dictionary re-encodes byte for byte once the
-        // Dictionary class info is restored: the decoder answers a plain
-        // object (the existing behaviour `assign`/`clear` absence pins), and
-        // only Dictionary-classed objects serialize as dictionaries.
+        // A decoded *flat* dictionary re-encodes byte for byte: the decoder
+        // restores the Dictionary class the writer keys off, so the decoded
+        // value is already the shape that serializes as a dictionary tag.
         let flat = flat_value(&mut runtime);
         let body = encode_tjs_ns0_body(&runtime, &Variant::Object(flat), 0x1234_5678, false)
             .expect("encode");
@@ -695,7 +738,6 @@ mod tests {
             runtime.object_member(decoded, "count"),
             Variant::Integer(-3)
         );
-        runtime.add_object_class_info(decoded, "Dictionary");
         let again = encode_tjs_ns0_body(&runtime, &Variant::Object(decoded), 0x1234_5678, false)
             .expect("re-encode");
         assert_eq!(body, again);
