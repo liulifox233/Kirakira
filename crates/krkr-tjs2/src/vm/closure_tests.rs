@@ -1609,6 +1609,134 @@ fn class_body_link_does_not_answer_for_other_receivers() {
     );
 }
 
+/// A plain call of a class object answers the class body's own value -- not
+/// the object the body ran on.
+///
+/// `tTJSInterCodeContext::FuncCall` with no member name answers a class
+/// context with `ExecuteAsFunction(objthis, param, numparams, result, 0)`
+/// (`tjsInterCodeExec.cpp:3096-3098`), so `*result` is whatever the body's own
+/// `srv` holds: void for `class Stub {}`.  PARQUET's `option.ks:20` tests
+/// exactly this value -- `SaveSnapshotLayer("get")` on patch.tjs's empty stub
+/// class must be falsy, so `getSnapshotSilent` takes the false branch and the
+/// settings page opens.  Answering the receiver instead made the guard true
+/// and the read of `.DefFile` on the option instance raised
+/// `Member "DefFile" does not exist` (`main_uioption.tjs` object 58 bytecode
+/// 25, the `gpd` right after the call at offset 3).
+#[test]
+fn plain_call_of_a_class_object_answers_the_class_bodys_value() {
+    assert_eq!(
+        ok(r#"
+        class Stub {}
+        var q = %[];
+        var r = (function() { return Stub("get"); } incontextof q)();
+        return (r ? 1 : 0) + "/" + ((r === q) ? 1 : 0);
+        "#),
+        Variant::String("0/0".to_string())
+    );
+}
+
+/// The same call from a frame whose `this` is the global object (a top-level
+/// or unbound frame): the body runs *there* and installs its members on it,
+/// and the call never constructs.
+///
+/// Only `CreateNew` builds an instance and runs the constructor
+/// (`tjsInterCodeExec.cpp:3211-3238`); a plain call reaches
+/// `ExecuteAsFunction(objthis, ...)` instead, so a class with a constructor
+/// called plainly leaves the constructor unrun.  Constructing a throwaway
+/// instance -- what `call_handle` did whenever the receiver was the global
+/// object or absent -- both ran that constructor and dropped the body's
+/// members where nobody could read them.
+#[test]
+fn plain_call_of_a_class_object_installs_on_the_global_receiver() {
+    assert_eq!(
+        ok(r#"
+        class Base7 {
+            var _map = 7;
+            function Base7() { global.constructed = 1; }
+            function read() { return _map; }
+        }
+        global.constructed = void;
+        var body = Base7;
+        var result = body();
+        return global._map + "/" + (typeof global.constructed) + "/"
+            + (typeof global.read) + "/" + (typeof result);
+        "#),
+        Variant::String("7/void/Object/void".to_string())
+    );
+}
+
+/// Parent-class initialization is a plain class-body call on the *derived*
+/// instance, and it stays one: the base body's member initializers run on the
+/// derived instance and its constructor does not.
+///
+/// The compiler emits the `extends` operand's initialization as a bound call
+/// of the base class object (`ChangeThis` + `call`, `mir.rs`; the official
+/// bytecode's `gpd %r, %-2.Base; chgthis %r, %-1; call %r()`), and the
+/// reference's `ctClass` arm runs only the body there -- the base constructor
+/// runs only through `new` or an explicit `super.Base()` member call, which
+/// is what `script_super_class_member_is_installed_by_its_body_not_the_link`
+/// pins.  This shape's result is discarded, so only the *body* half is
+/// observable: the derived instance carries the base body's field.
+#[test]
+fn parent_class_initialization_runs_the_base_body_on_the_instance() {
+    assert_eq!(
+        ok(r#"
+        class Base9 {
+            var marker = 11;
+            function Base9() { global.base_ctor_runs = 1; }
+            function read() { return marker; }
+        }
+        class Child9 extends Base9 { function Child9() {} }
+        global.base_ctor_runs = void;
+        var c = new Child9();
+        return c.read() + "/" + (typeof global.base_ctor_runs)
+            + "/" + (c instanceof "Base9");
+        "#),
+        // Nothing calls the base constructor here -- not `new Child9()`, which
+        // runs the base *body*, and not the body call itself.
+        Variant::String("11/void/1".to_string())
+    );
+}
+
+/// The mixinclass probe shape: KAGEX runs a class body against a temporary
+/// object whose `missing` hook swallows the member stores (`BuildMixinClass`
+/// `__work__`/`__missing`, `data.xp3>sysscn/mixinclass.tjs`), and the value
+/// the probe reports back is the class body's own -- `BuildMixinClass("")`
+/// returns exactly that value (`var t1 = l1(l1); return t1;`), never the
+/// probe object.
+#[test]
+fn class_body_probe_on_a_missing_hooked_object_answers_the_bodys_value() {
+    let mut runtime = Runtime::new();
+    runtime.register_global_native(
+        "setCallMissing",
+        |runtime: &mut Runtime, _this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
+            let handle = match args.first() {
+                Some(Variant::Object(handle)) => *handle,
+                Some(Variant::Closure(closure)) => closure.object,
+                _ => return Err(TjsError::runtime("setCallMissing requires object")),
+            };
+            runtime.set_object_call_missing(handle, "missing");
+            Ok(Variant::Void)
+        },
+    );
+    let file = compile_source_to_bytecode(
+        "mixin-probe-result.tjs",
+        r#"
+        class StubX { function tag() {} var a = 1; }
+        var w = %[];
+        w.missing = function(set, name, value) { if (!set) { *value = void; } return true; };
+        setCallMissing(w);
+        var r = (StubX incontextof w)();
+        return (r ? 1 : 0) + "/" + ((r === w) ? 1 : 0);
+        "#,
+    )
+    .expect("compile");
+    assert_eq!(
+        runtime.execute_file(&file).expect("execute"),
+        Variant::String("0/0".to_string())
+    );
+}
+
 /// A member read hands back the *stored* value, binding and all.
 ///
 /// `tTJSCustomObject::PropGet` (`tjsObject.cpp:1392`) copies the member

@@ -596,8 +596,19 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     self.runtime.heap[instance.0].super_class = Some(class_handle);
                 }
                 // `VM_CALLD` stores the instance `CreateNew` produced as
-                // `tTJSVariant(dsp, dsp)` (`tjsInterCodeExec.cpp:2384`).
-                let object_value = Variant::self_bound(instance);
+                // `tTJSVariant(dsp, dsp)` (`tjsInterCodeExec.cpp:2384`).  A
+                // plain call is `tTJSInterCodeContext::FuncCall` with no
+                // member name instead, whose `*result` is the body's own
+                // `srv` value (`:3096-3098`); answering the instance there
+                // would hand the caller the object the body happened to run
+                // on -- PARQUET's `option.ks:20` reads `SaveSnapshotLayer("get")`
+                // as a guard, and the reference's empty stub class leaves that
+                // value void.
+                let object_value = if run_constructor {
+                    Variant::self_bound(instance)
+                } else {
+                    value
+                };
                 if run_constructor
                     && !class_name.is_empty()
                     && let Some(constructor) = self.runtime.heap[instance.0].get_raw(&class_name)
