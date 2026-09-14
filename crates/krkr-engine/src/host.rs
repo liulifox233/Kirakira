@@ -2745,7 +2745,14 @@ impl KrkrHost {
                 Some(completion) => {
                     self.handle_resource_completion(completion);
                 }
-                None => return self.load_image_storage(name),
+                None => {
+                    // The worker is gone, so no completion can arrive for this
+                    // request; forget it before decoding here, or the engine
+                    // would report a resource wait that nothing will deliver.
+                    self.pending_script_image_loads
+                        .retain(|_, (storage, _)| !storage.eq_ignore_ascii_case(name));
+                    return self.load_image_storage(name);
+                }
             }
         }
     }
@@ -4824,42 +4831,42 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    /// `tTJSNI_BaseLayer::LoadImages` (`LayerIntf.cpp:2494`) loads through the
-    /// synchronous `TVPLoadGraphic` (`GraphicsLoaderIntf.cpp:1672`): when the
-    /// script call returns, the graphic is decoded, in the cache, and no
-    /// request is left for a later frame to finish.  A repeat load is the
-    /// reference's graphic-cache hit (`tTVPGraphicCache::FindAndTouchWithHash`,
-    /// `:1690-1700`).
+    /// A worker that cannot answer (it stopped, or the shell dropped it) must
+    /// not leave the load stranded or the engine reporting a resource wait:
+    /// the wait decodes in the calling thread -- the reference's own load --
+    /// and forgets the queued request no completion can satisfy.
     #[test]
-    fn a_script_image_load_finishes_inside_the_calling_call() {
-        let root = temp_root("script-image-wait");
+    fn a_dead_decode_worker_falls_back_to_an_in_thread_load_and_forgets_the_request() {
+        let root = temp_root("script-image-dead-worker");
         fs::create_dir_all(&root).expect("create root");
         write_test_png(&root.join("button.png"), 2, 3);
         let storage = ProjectStorage::for_root(&root).expect("storage");
         let mut host = KrkrHost::from_storage(storage, SystemPaths::default()).expect("host");
 
+        let revision = host.storage_revision();
+        let id = host
+            .resource_manager
+            .as_ref()
+            .expect("resource manager")
+            .request_image_decode("button.png".to_string(), revision)
+            .expect("worker accepts the decode");
+        host.pending_script_image_loads
+            .insert(id, ("button.png".to_string(), revision));
+        // No completion can arrive for that request any more.
+        host.resource_manager = None;
+
         let image = host
-            .load_image_storage_for_script("button.png")
-            .expect("the load completes inside the call");
+            .wait_for_script_image("button.png")
+            .expect("the fallback decodes in the calling thread");
         assert_eq!((image.upload.width, image.upload.height), (2, 3));
         assert!(
-            !host.has_pending_resource_loads(),
-            "no request outlives the call"
+            host.pending_script_image_loads.is_empty(),
+            "a request no completion will satisfy must not stay pending"
         );
-        assert!(host.script_image_errors.is_empty());
-
-        // The wait applies its own completion, so the frame start has nothing
-        // to hand to a parked call.
-        let (_, script_image_completions) = host.take_completed_image_loads();
-        assert_eq!(script_image_completions, 0);
-
-        // The second load is the reference's graphic-cache hit: the image is
-        // already in hand and no decode is queued for it.
-        let again = host
-            .load_image_storage_for_script("button.png")
-            .expect("cache hit");
-        assert_eq!((again.upload.width, again.upload.height), (2, 3));
-        assert!(!host.has_pending_resource_loads());
+        assert!(
+            !host.has_pending_resource_loads(),
+            "the engine must not keep waiting for a resource nobody delivers"
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -4899,6 +4906,13 @@ mod tests {
         // script-image wakeup to deliver.
         let (_, script_image_completions) = host.take_completed_image_loads();
         assert_eq!(script_image_completions, 0);
+
+        // A repeat load is the reference's graphic-cache hit
+        // (`tTVPGraphicCache::FindAndTouchWithHash`, `:1690-1700`): the image
+        // comes back without a decode request of its own.
+        let again = host.wait_for_script_image("button.png").expect("cache hit");
+        assert_eq!((again.upload.width, again.upload.height), (2, 3));
+        assert!(!host.has_pending_resource_loads());
 
         fs::remove_dir_all(root).expect("cleanup");
     }
