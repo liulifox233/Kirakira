@@ -2675,15 +2675,6 @@ pub(crate) fn complete_layer_before_draw(
     runtime: &mut Runtime<KrkrHost>,
     handle: ObjectHandle,
 ) -> Result<()> {
-    // TEMPORARY M202 DIAGNOSTIC -- removed before commit.
-    if !runtime.object_valid(handle) {
-        eprintln!(
-            "[m202-diag] engine paint dispatch on invalid object: handle={} classes={:?} native_layer={:?}",
-            handle.0,
-            runtime.object_class_infos(handle),
-            runtime.host().native_layer(handle)
-        );
-    }
     let handle = runtime.bound_this(handle).unwrap_or(handle);
     if runtime.host().native_layer(handle).is_none() {
         return Ok(());

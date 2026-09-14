@@ -82,13 +82,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// guards are how KAGEX-family scripts touch an object that may have been
     /// invalidated.
     fn invalid_object_error(&self, handle: ObjectHandle) -> Option<TjsError> {
-        if !self.runtime.heap[handle.0].valid {
-            // TEMPORARY M202 DIAGNOSTIC -- removed before commit.
-            eprintln!(
-                "[m202-diag] invalid object read: handle={} kind={:?} classes={:?}",
-                handle.0, self.runtime.heap[handle.0].kind, self.runtime.heap[handle.0].class_infos
-            );
-        }
         (!self.runtime.heap[handle.0].valid).then(TjsError::invalid_object)
     }
 
@@ -2215,14 +2208,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         if !self.runtime.heap[handle.0].valid {
             return Ok(false);
         }
-        // TEMPORARY M202 DIAGNOSTIC -- removed before commit.
-        eprintln!(
-            "[m202-diag] invalidate handle={} kind={:?} classes={:?} name={:?}",
-            handle.0,
-            self.runtime.heap[handle.0].kind,
-            self.runtime.heap[handle.0].class_infos,
-            self.runtime.heap[handle.0].get_raw("name")
-        );
         if self.runtime.heap[handle.0].invalidating {
             return Ok(false);
         }
@@ -2394,65 +2379,6 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         is_new: bool,
         continuation: Continuation,
     ) -> Result<CallOutcome> {
-        // TEMPORARY M202 DIAGNOSTIC -- removed before commit.
-        if let Some(this_obj) = this_obj
-            && !self.runtime.heap[this_obj.0].valid
-        {
-            let callee_name = match &self.runtime.heap[handle.0].kind {
-                ObjectKind::InterCode {
-                    file_id,
-                    object_index,
-                    ..
-                } => self
-                    .runtime
-                    .script_file(*file_id)
-                    .ok()
-                    .and_then(|file| {
-                        file.objects
-                            .get(*object_index)
-                            .and_then(|object| object.name(&file))
-                            .map(str::to_string)
-                    }),
-                _ => None,
-            };
-            // TEMPORARY M202 DIAGNOSTIC -- removed before commit.
-            // Find who still holds a closure to this code object bound to the
-            // corpse: that holder is the caller.
-            let mut holders = Vec::new();
-            for (index, object) in self.runtime.heap.iter().enumerate() {
-                if !object.valid || index == handle.0 {
-                    continue;
-                }
-                for (member, value) in object.member_entries() {
-                    if let Variant::Closure(closure) = value
-                        && closure.object == handle
-                        && closure.this_obj == Some(this_obj)
-                    {
-                        holders.push(format!(
-                            "#{} classes={:?} name={:?} member={}",
-                            index,
-                            object.class_infos,
-                            object.get_raw("name"),
-                            member
-                        ));
-                        if holders.len() >= 8 {
-                            break;
-                        }
-                    }
-                }
-                if holders.len() >= 8 {
-                    break;
-                }
-            }
-            eprintln!(
-                "[m202-diag] call with corpse this: callee={} name={:?} this={} depth={} holders={:?}",
-                handle.0,
-                callee_name,
-                this_obj.0,
-                self.runtime.call_depth,
-                holders
-            );
-        }
         if let Some(error) = self.invalid_object_error(handle) {
             // The call protocol checks validity in both implementations of
             // `FuncCall`: `tTJSCustomObject::FuncCall` (`tjsObject.cpp:1316`)
