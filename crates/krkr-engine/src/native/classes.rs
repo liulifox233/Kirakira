@@ -6615,13 +6615,29 @@ fn blit_source_object(
     allow_province: bool,
 ) -> Option<ObjectHandle> {
     let handle = source.and_then(variant_object)?;
-    // `render_layer_target` only wraps the host's infallible layer lookup
-    // (`register_kag_layer_slots_from_tjs` plus `Host::layer_render_target`),
-    // so an absent target means a non-Layer object. The reference falls back
-    // to `tTJSNC_Bitmap` there; Kirakira's `Bitmap` class is a spec-only
-    // placeholder with no bitmap behind it
-    // (`install_bitmap_native_properties`), so only a Layer resolves and a
-    // Bitmap object lands on the same error.
+    // The wrapper asks the *object* whether it is a Layer
+    // (`NativeInstanceSupport(TJS_NIS_GETINSTANCE, tTJSNC_Layer::ClassID)`,
+    // `LayerIntf.cpp:7218`), and in the reference that instance belongs to the
+    // TJS object for its whole life: `Invalidate` (`:482`) frees the *image*
+    // (`DeallocateImage`, `:2079`) and detaches it from the tree, but never
+    // takes the native instance away from the object. Kirakira models
+    // invalidation by dropping the instance from the host table and rebuilds
+    // it on use (`ensure_native_layer_attached`, the call
+    // `this_render_layer_target` already makes for the destination and
+    // `set_layer_has_image` for `hasImage = 1`), so a source that a script
+    // invalidated and still draws with has to be re-attached before this
+    // question is asked. Without it the object looked like "another native
+    // class" and the wrapper reported `TVPSpecifyLayerOrBitmap`: PARQUET's
+    // option page dies exactly there when a tab switch repaints a widget
+    // whose own `tabImage` layer was invalidated with the page it belonged to
+    // (compiled `SliderLayer.tjs`, `onPaint` code object, `operateRect` at
+    // word offset 1000 with `this.tabImage` as the source), and the exception
+    // aborts every later draw of that event.
+    // A freed layer (`freeImage` → `hasImage` 0) still resolves to no bitmap
+    // and keeps M184's error, and a non-Layer object stays unresolved because
+    // `ensure_native_layer_attached` only rebuilds an instance the Layer ctor
+    // registered (`__nativeLayerId`/layer property storage).
+    ensure_native_layer_attached(runtime, handle);
     let target = render_layer_target(runtime, handle).ok().flatten()?;
     let has_image = layer_main_image(runtime, handle).is_some();
     let has_province = allow_province
@@ -6639,6 +6655,12 @@ fn piled_copy_source_object(
     source: Option<&Variant>,
 ) -> Option<ObjectHandle> {
     let handle = source.and_then(variant_object)?;
+    // Same object-owned instance as the other wrappers (`LayerIntf.cpp:7104`):
+    // `piledCopy`'s wrapper asks for a Layer and `PiledCopy` itself is what
+    // reports a missing bitmap (`:4112` `TVPSourceLayerHasNoImage`), so a
+    // layer a script invalidated and still piles has to be re-attached here
+    // too, or the wrapper misreports it as a non-Layer object.
+    ensure_native_layer_attached(runtime, handle);
     render_layer_target(runtime, handle)
         .ok()
         .flatten()
@@ -12988,6 +13010,118 @@ mod tests {
             .execute_script("inline.tjs", "dest.piledCopy(0, 0, freed, 0, 0, 2, 2);")
             .expect_err("a freed source has no bitmap to pile");
         assert_eq!(error.message, "Source layer has no image");
+    }
+
+    /// The wrapper asks the *object* whether it is a Layer, and the reference's
+    /// instance belongs to that object for its whole life: `Invalidate`
+    /// (`LayerIntf.cpp:482`) stops transitions, parts the layer from the tree
+    /// and frees its image (`DeallocateImage`, `:2079`), but the class instance
+    /// stays hosted, so `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
+    /// tTJSNC_Layer::ClassID, ...)` (`:7218` `operateRect`) keeps answering and
+    /// the source resolves like any other layer. Kirakira models invalidation
+    /// by dropping the instance from the host table and rebuilds it on use
+    /// (`ensure_native_layer_attached`) everywhere a script draws *on* the
+    /// layer (`this_render_layer_target`) or revives it (`hasImage = 1`), so a
+    /// source has to re-attach too. PARQUET's option page is the live case: on
+    /// a tab switch the page's slider widget repaints its own `tabImage` layer,
+    /// which `invalidate` took away with the page it belonged to, and the
+    /// source guard threw `Specify Layer or Bitmap class object` at `onPaint`
+    /// bytecode 1000 (compiled `SliderLayer.tjs`), aborting every later draw of
+    /// that event.
+    #[test]
+    fn layer_blits_accept_a_source_the_engine_reattaches_after_invalidate() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.fresh = function() {
+                    var layer = new Layer();
+                    layer.setImageSize(2, 2);
+                    invalidate layer;
+                    return layer;
+                };
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                dest.fillRect(0, 0, 4, 4, 0xff000000);
+                "#,
+            )
+            .expect("script");
+        // Every wrapper resolves the source before its blit runs, so each call
+        // gets an invalidated-but-still-alive source of its own.
+        for call in [
+            "dest.copyRect(0, 0, detached, 0, 0, 2, 2);",
+            "dest.operateRect(0, 0, detached, 0, 0, 2, 2, omAlpha);",
+            "dest.stretchCopy(0, 0, 2, 2, detached, 0, 0, 2, 2, stNearest);",
+            "dest.operateStretch(0, 0, 2, 2, detached, 0, 0, 2, 2, omAlpha);",
+            "dest.affineCopy(detached, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(detached, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
+            "dest.piledCopy(0, 0, detached, 0, 0, 2, 2);",
+        ] {
+            engine
+                .execute_script("inline.tjs", "global.detached = fresh();")
+                .expect("fresh invalidated source");
+            if let Err(error) = engine.execute_script("inline.tjs", call) {
+                panic!("{call}: {error}");
+            }
+        }
+        // The re-attached layer carries the ctor bitmap `AllocateImage`
+        // rebuilds (`hasImage` is still 1: `invalidate` frees the image, not
+        // the object's intent), so `copyRect` writes its neutral white.
+        assert_eq!(
+            layer_main_pixel(&mut engine, "dest.getMainPixel(0, 0)"),
+            0xffffff,
+            "copyRect blitted the re-attached bitmap"
+        );
+
+        // A freed layer keeps M184's refusal: `freeImage` recorded
+        // `hasImage == 0` (`LayerIntf.cpp:2237` reads `MainImage != NULL`), so
+        // the rebuilt instance has no bitmap to hand the blit.
+        engine
+            .execute_script(
+                "inline.tjs",
+                "global.freed = new Layer(); freed.setImageSize(2, 2); freed.freeImage(); invalidate freed;",
+            )
+            .expect("script");
+        let error = engine
+            .execute_script(
+                "inline.tjs",
+                "dest.operateRect(0, 0, freed, 0, 0, 2, 2, omAlpha);",
+            )
+            .expect_err("a freed source still resolves to no bitmap");
+        assert_eq!(error.message, "Specify Layer or Bitmap class object");
+        let error = engine
+            .execute_script("inline.tjs", "dest.piledCopy(0, 0, freed, 0, 0, 2, 2);")
+            .expect_err("a freed source has no bitmap to pile");
+        assert_eq!(error.message, "Source layer has no image");
+
+        // `ensure_native_layer_attached` only rebuilds an instance the Layer
+        // ctor registered, so nothing that is not a Layer starts resolving.
+        for call in [
+            "dest.operateRect(0, 0, void, 0, 0, 2, 2, omAlpha);",
+            "dest.operateRect(0, 0, new Window(), 0, 0, 2, 2, omAlpha);",
+            "dest.operateRect(0, 0, new Bitmap(), 0, 0, 2, 2, omAlpha);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("a non-Layer source cannot resolve to a bitmap");
+            assert_eq!(
+                error.message, "Specify Layer or Bitmap class object",
+                "{call}"
+            );
+        }
+        for call in [
+            "dest.piledCopy(0, 0, void, 0, 0, 2, 2);",
+            "dest.piledCopy(0, 0, new Bitmap(), 0, 0, 2, 2);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("piledCopy requires a Layer source");
+            assert_eq!(error.message, "Specify Layer class object", "{call}");
+        }
     }
 
     /// The official TJS blit wrappers resolve their source argument before the
