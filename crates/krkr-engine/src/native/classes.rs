@@ -4514,11 +4514,13 @@ pub(crate) fn apply_completed_resource_loads(runtime: &mut Runtime<KrkrHost>) ->
     for completion in completions {
         apply_completed_image_load(runtime, completion)?;
     }
-    // `Layer.loadImages` carries an explicit target continuation, but image
-    // loads initiated by script helpers (for example the packed quick-menu
-    // loader) suspend the TJS VM while the decode worker runs.  Once the
-    // decoded bytes are in the cache, retry that native call so startup can
-    // continue and the following scenario can be loaded.
+    // `Layer.loadImages` carries an explicit target continuation, but a script
+    // helper (for example the packed quick-menu loader) used to suspend the TJS
+    // VM while the decode worker ran.  Script image loads now complete inside
+    // their own call, the way the reference's synchronous `TVPLoadGraphic`
+    // (`GraphicsLoaderIntf.cpp:1672`) does, so a script-image completion is not
+    // expected here; the resume stays as the safety net for a platform path
+    // that cannot wait inside the call and parks a frame on one.
     if script_image_completions > 0 && runtime.is_suspended() {
         runtime.resume_suspended()?;
     }

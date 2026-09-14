@@ -8,7 +8,6 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
 };
 
 use krkr_core::{AssetKind, ProjectStoragePort, ProvinceImage, ResourceData};
@@ -204,13 +203,14 @@ impl ResourceManager {
         completions
     }
 
-    /// Blocks up to `timeout` for the next decode completion. Script image
-    /// loads use this to finish a fast decode inside the calling tick, the way
-    /// official `TVPLoadGraphic` loads synchronously; `None` means the worker
-    /// is still busy and the caller must keep the asynchronous path.
-    pub fn wait_completion(&self, timeout: Duration) -> Option<ResourceCompletion> {
+    /// Blocks until the next decode completion arrives, the way a synchronous
+    /// `TVPLoadGraphic` load (`visual/GraphicsLoaderIntf.cpp:1672`) sees its
+    /// own result inside the calling script call. `None` means the worker is
+    /// gone, so the caller must decode on its own thread rather than wait for a
+    /// completion that cannot arrive.
+    pub fn wait_completion_blocking(&self) -> Option<ResourceCompletion> {
         let rx = self.completion_rx.lock().ok()?;
-        rx.recv_timeout(timeout).ok()
+        rx.recv().ok()
     }
 
     /// Marks an in-flight decode as no longer needed. The worker checks this
@@ -372,16 +372,14 @@ pub(crate) fn decode_province_image(
     let decoded = decode_image_bytes(bytes, name)?;
     let mut pixels = Vec::with_capacity(decoded.rgba.len() / 4);
     for rgba in decoded.rgba.chunks_exact(4) {
-        let luma = 0.299 * f32::from(rgba[0]) + 0.587 * f32::from(rgba[1]) + 0.114 * f32::from(rgba[2]);
+        let luma =
+            0.299 * f32::from(rgba[0]) + 0.587 * f32::from(rgba[1]) + 0.114 * f32::from(rgba[2]);
         pixels.push(luma.round().clamp(0.0, 255.0) as u8);
     }
     Ok(ProvinceImage::new(decoded.width, decoded.height, pixels))
 }
 
-fn decode_png_province(
-    bytes: &[u8],
-    name: &str,
-) -> std::result::Result<ProvinceImage, String> {
+fn decode_png_province(bytes: &[u8], name: &str) -> std::result::Result<ProvinceImage, String> {
     use png::{BitDepth, ColorType, Transformations};
 
     let probe = png::Decoder::new(Cursor::new(bytes))
