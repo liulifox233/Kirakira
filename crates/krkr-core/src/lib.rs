@@ -1004,6 +1004,34 @@ pub enum TransitionMethod {
     /// reads the rule as a scroll-and-repeat texture instead of the reference's
     /// `GetScanLine` sampling, and it samples the rule in frame space rather
     /// than at the destination rectangle's image coordinates.
+    ///
+    /// **Frame-space rule sampling repeats the effect once per
+    /// viewport/rule axis, so a window larger than the game's screen shows the
+    /// whole transition several times instead of once.**  The reference hands
+    /// the provider a rule bitmap *tiled to the destination layer's own size*
+    /// (`imagepro->LoadImage(rulename, 8, 0x02ffffff, src1w, src1h, &scpro)`,
+    /// `krkrz/visual/TransIntf.cpp:781`; the loader grows the buffer to the
+    /// desired size and repeats the source into it,
+    /// `krkrz/visual/GraphicsLoaderIntf.cpp:869`, `:877`, `:960`, `:969`) and
+    /// samples it at the *destination bitmap's* own pixel coordinates
+    /// (`data.Left`/`data.Top` are offsets inside that bitmap,
+    /// `krkrz/visual/LayerIntf.cpp:6575-6576`, read as the rule scan line and
+    /// `rule += data->Left`, `TransIntf.cpp:825-851`).  The kernel's
+    /// `transition_universal` instead derives `rule_uv` from the frame's
+    /// *physical* viewport and wraps it with `fract` whenever the rule is
+    /// smaller than that viewport (`transition.wgsl:137-151`, `viewport_size()`
+    /// is `config.width/height`), i.e. it tiles in window space rather than in
+    /// the destination bitmap's coordinates.  Every rule image the three
+    /// shipped titles use is exactly their screen size (measured: 1280x720 in
+    /// GINKA and PARQUET, 1920x1080 in 少女世界的生存之道), which the reference
+    /// therefore never repeats; a window rendered at 2x -- a 200% display
+    /// scale, or any window twice the game's screen -- makes the kernel repeat
+    /// it exactly 2x2, showing four quarter-screen copies of the transition
+    /// where the reference shows one full-screen one.  The reference geometry
+    /// is the destination's logical coordinates, which is the conversion
+    /// `transition_wave` already performs (`(uv * frame - origin) / scale`,
+    /// `transition.wgsl:268-278`); the fix is a `krkr-render` change, so this
+    /// note is the record until one lands.
     Universal = 1,
     /// `tTVPScrollTransHandler` (`TransIntf.cpp:925`): `from` picks the
     /// direction, `stay` keeps one face in place.
@@ -1055,6 +1083,13 @@ pub enum TransitionMethod {
     /// centre (`:89-90`), rotates in aspect-normalized uv (a shear on
     /// non-square frames) and cross-fades inside the quad where the reference
     /// copies pixels (`:117`, `rotatebase.cpp` has no blending).
+    ///
+    /// A caller-specified `centerx`/`centery` is also read in the destination
+    /// bitmap's logical pixels but divided by the frame's *physical* viewport
+    /// (`transition_center`, `transition.wgsl:390-396`), so on a window whose
+    /// physical size differs from the content size the pivot is off by the
+    /// render scale; `RotateVanish` shares that helper, while `RotateSwap`
+    /// pins its centre at `(0.5, 0.5)` and is unaffected.
     RotateZoom = 6,
     /// `rotatevanish` (`extrans/rotatetrans.cpp:222-316`): the same handler
     /// with `factor` 1 -> 0 and the source not fixed; `accel` (2), `twist` (2),
