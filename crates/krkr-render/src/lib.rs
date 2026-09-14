@@ -1843,8 +1843,10 @@ fn transition_uniforms(
     } else {
         params.bg_color1
     };
-    // `tTVPDivisibleData::Dest` (`LayerIntf.cpp:6513-6540`) in logical frame
-    // pixels.  A destination without measurable geometry makes the composite
+    // `tTVPDivisibleData` (`LayerIntf.cpp:6665-6676`: `Left`/`Top`/`Width`/
+    // `Height` filled in `tTransDrawable::DrawCompleted`, `Dest` at `:6735`)
+    // in logical frame pixels.  A destination without measurable geometry makes
+    // the composite
     // cover the whole frame, and the reference's handlers then work on the
     // whole layer bitmap, which is the frame's content size here.
     let image_rect = transition
@@ -2490,6 +2492,375 @@ mod tests {
             }
         }
         println!("wave shader vs CPU mirror: max per-channel deviation {max_deviation:.5}");
+    }
+
+    /// The rule-driven `universal` transition's real shader at two window
+    /// scales.  The rule is sampled in the destination bitmap's logical pixels
+    /// (`image_local`), so its black/white split stays at the middle of the
+    /// *game's* screen however much larger the physical window is -- the fix
+    /// for the reported "four small copies in a 2x2 grid".  A sample taken in
+    /// window space (the kernel before M206) tiles the rule 2x2 here, which
+    /// flips both assertions.
+    #[test]
+    fn universal_rule_ignores_the_window_scale_on_the_gpu() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!(
+                "no wgpu adapter: the universal kernel's GPU path was not verified on this host"
+            );
+            return;
+        };
+        const W: u32 = 64;
+        const H: u32 = 16;
+        // The repeat case's rule: a quarter of the destination's size, so the
+        // loader's tiling applies.
+        const SMALL_W: u32 = 4;
+        const SMALL_H: u32 = 2;
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let pipeline = TransitionPipelineResources::new(&device, format);
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Kirakira test universal sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let upload = |pixel: fn(u32, u32) -> [u8; 4], width: u32, height: u32, label: &str| {
+            let mut data = Vec::with_capacity((width * height * 4) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    data.extend_from_slice(&pixel(x, y));
+                }
+            }
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let old_view = upload(
+            |_, _| [220, 30, 20, 255],
+            W,
+            H,
+            "Kirakira test universal old face",
+        );
+        let new_view = upload(
+            |_, _| [20, 40, 230, 255],
+            W,
+            H,
+            "Kirakira test universal new face",
+        );
+        let rule_view = upload(
+            |x, _| {
+                if x < W / 2 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            },
+            W,
+            H,
+            "Kirakira test universal rule",
+        );
+        // The same split at a quarter of the destination's size: the rule the
+        // loader repeats (`fract(local / rule_dims)`).
+        let small_rule_view = upload(
+            |x, _| {
+                if x < SMALL_W / 2 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            },
+            SMALL_W,
+            SMALL_H,
+            "Kirakira test universal small rule",
+        );
+
+        let transition = FrameTransition {
+            method: "universal".to_string(),
+            progress: 0.5,
+            params: TransitionParams {
+                method: TransitionMethod::Universal,
+                vague: 64.0,
+                duration_millis: 1000.0,
+                ..TransitionParams::default()
+            },
+            dest_rect: Some(Rect::new(0.0, 0.0, W as f32, H as f32)),
+            rule_texture_id: Some(1),
+            rule_image_upload: None,
+            frozen_draw_commands: Vec::new(),
+            frozen_image_uploads: Vec::new(),
+            under_draw_commands: Vec::new(),
+            under_image_uploads: Vec::new(),
+            source_draw_commands: Vec::new(),
+            source_image_uploads: Vec::new(),
+        };
+
+        let render = |uniforms: &TransitionUniforms,
+                      width: u32,
+                      height: u32,
+                      rule: &wgpu::TextureView|
+         -> Vec<u8> {
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Kirakira test universal uniforms"),
+                contents: bytemuck::cast_slice(&[*uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Kirakira test universal bind group"),
+                layout: &pipeline.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&old_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&new_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(rule),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&new_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Kirakira test universal target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Kirakira test universal readback"),
+                size: u64::from(width * 4 * height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Kirakira test universal encoder"),
+                });
+                let tint = [1.0, 1.0, 1.0, 1.0];
+                let vertices = [
+                    TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint, 0.0),
+                    TexturedVertex::new([1.0, 1.0], [1.0, 0.0], tint, 0.0),
+                    TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint, 0.0),
+                    TexturedVertex::new([-1.0, 1.0], [0.0, 0.0], tint, 0.0),
+                    TexturedVertex::new([1.0, -1.0], [1.0, 1.0], tint, 0.0),
+                    TexturedVertex::new([-1.0, -1.0], [0.0, 1.0], tint, 0.0),
+                ];
+                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Kirakira test universal vertices"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Kirakira test universal pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+                drop(pass);
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &target,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(width * 4),
+                            rows_per_image: Some(height),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([encoder.finish()]);
+            }
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            rx.recv().expect("map").expect("mapped");
+            let mapped = slice.get_mapped_range().to_vec();
+            readback.unmap();
+            mapped
+        };
+
+        // `(physical viewport, render scale)`: the game's screen is 64x16
+        // logical pixels; a 2x window renders it into 128x32.
+        for (viewport, scale) in [((W, H), 1.0f32), ((W * 2, H * 2), 2.0)] {
+            let uniforms = transition_uniforms(
+                &transition,
+                viewport.0 as f32,
+                viewport.1 as f32,
+                RenderTransform {
+                    x_scale: scale,
+                    y_scale: scale,
+                    x_offset: 0.0,
+                    y_offset: 0.0,
+                },
+                Size::new(W as f32, H as f32),
+                false,
+            );
+            let mapped = render(&uniforms, viewport.0, viewport.1, &rule_view);
+            let pixel = |x: u32, y: u32| -> [f32; 4] {
+                let index = ((y * viewport.0 + x) * 4) as usize;
+                [
+                    mapped[index] as f32 / 255.0,
+                    mapped[index + 1] as f32 / 255.0,
+                    mapped[index + 2] as f32 / 255.0,
+                    mapped[index + 3] as f32 / 255.0,
+                ]
+            };
+            // Both samples sit eight logical pixels either side of the rule's
+            // split, at the vertical centre of the frame.
+            let center_y = viewport.1 / 2;
+            let left = pixel(viewport.0 / 2 - 8 * scale as u32, center_y);
+            assert!(
+                left[2] > 0.75 && left[0] < 0.25,
+                "at {scale}x the rule's black half must take the incoming (blue) \
+                 face, got {left:?}"
+            );
+            let right = pixel(viewport.0 / 2 + 8 * scale as u32, center_y);
+            assert!(
+                right[0] > 0.75 && right[2] < 0.25,
+                "at {scale}x the rule's white half must keep the outgoing (red) \
+                 face, got {right:?}"
+            );
+        }
+
+        // The repeat case: a rule a quarter of the destination's size, at the
+        // 2x window.  `fract(local / rule_dims)` lays the black/white split
+        // every four *logical* pixels from the destination's own origin, so
+        // physical pixel 3 (logical 1.5) is inside the first black copy and
+        // physical pixel 4 (logical 2) the first white one.  A sample tiled in
+        // window space repeats every two logical pixels here and flips both.
+        let uniforms = transition_uniforms(
+            &transition,
+            (W * 2) as f32,
+            (H * 2) as f32,
+            RenderTransform {
+                x_scale: 2.0,
+                y_scale: 2.0,
+                x_offset: 0.0,
+                y_offset: 0.0,
+            },
+            Size::new(W as f32, H as f32),
+            false,
+        );
+        let mapped = render(&uniforms, W * 2, H * 2, &small_rule_view);
+        let pixel = |x: u32, y: u32| -> [f32; 4] {
+            let index = ((y * W * 2 + x) * 4) as usize;
+            [
+                mapped[index] as f32 / 255.0,
+                mapped[index + 1] as f32 / 255.0,
+                mapped[index + 2] as f32 / 255.0,
+                mapped[index + 3] as f32 / 255.0,
+            ]
+        };
+        let black = pixel(3, H);
+        assert!(
+            black[2] > 0.75 && black[0] < 0.25,
+            "the small rule's first black copy must take the incoming (blue) face, \
+             got {black:?}"
+        );
+        let white = pixel(4, H);
+        assert!(
+            white[0] > 0.75 && white[2] < 0.25,
+            "the small rule's first white copy must keep the outgoing (red) face, \
+             got {white:?}"
+        );
     }
 
     /// The shader text and the CPU mirror must carry the same constants and the

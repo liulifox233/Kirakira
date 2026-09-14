@@ -1002,8 +1002,36 @@ pub enum TransitionMethod {
     /// Approximate: the reference advances a `tjs_int` phase and blends through
     /// the rule's threshold; the kernel walks `progress * (1 + vague)` and
     /// reads the rule as a scroll-and-repeat texture instead of the reference's
-    /// `GetScanLine` sampling, and it samples the rule in frame space rather
-    /// than at the destination rectangle's image coordinates.
+    /// `GetScanLine` sampling.
+    ///
+    /// The rule's geometry follows the reference and never the window, which is
+    /// worth recording because it was once wrong.  The provider loads the rule
+    /// **tiled to the destination layer's own size**
+    /// (`imagepro->LoadImage(rulename, 8, 0x02ffffff, src1w, src1h, &scpro)`,
+    /// `TransIntf.cpp:781`, handed the destination layer's `GetWidth()`/
+    /// `GetHeight()` at `LayerIntf.cpp:6336-6346`; the loader grows its buffer
+    /// to that size and repeats the source into it
+    /// (`TVPLoadGraphic_SizeCallback`, `GraphicsLoaderIntf.cpp:1795-1824`, the
+    /// clamp at `:1803`; `TVPLoadGraphic_ScanLineCallback`, `:1886`, `:1895`,
+    /// `:1915`; the contract is stated at `:2286`) and samples it at
+    /// `data.Left`/`data.Top` -- offsets *inside* that bitmap, in its own
+    /// logical pixels (`LayerIntf.cpp:6665-6676`, read at
+    /// `TransIntf.cpp:825-851`: the scan line at `:836`, `rule += data->Left`
+    /// at `:851`).
+    /// So the repeat period is the rule's natural size, a screen-sized rule is
+    /// never repeated at all, and neither the window's size nor the DPI scale
+    /// enters the geometry.  `transition_universal`
+    /// (`krkr-render/src/transition.wgsl`) samples through `image_local` and
+    /// repeats the rule only below the destination rectangle's own size.  Until
+    /// M206 it derived `rule_uv` from the frame's *physical* viewport
+    /// (`config.width/height`) and wrapped it with `fract` below that viewport,
+    /// so a window larger than the game's screen repeated the whole transition
+    /// once per (window / rule) axis -- four quarter-screen copies at a 2x
+    /// window, the reported symptom.  Every rule image the three shipped titles
+    /// load is exactly a screen size (measured from their archives: GINKA's
+    /// `rule/*` is 142 entries, all 1280x720; 少女世界的生存之道's `rule/map*`
+    /// is 72, all 1920x1080; PARQUET's is 91 -- 72 at 1280x720 and 19 at
+    /// 1920x1080).
     Universal = 1,
     /// `tTVPScrollTransHandler` (`TransIntf.cpp:925`): `from` picks the
     /// direction, `stay` keeps one face in place.
@@ -1030,9 +1058,9 @@ pub enum TransitionMethod {
     /// Approximate: the reference ramps the block size as the integer triangle
     /// `(maxsize-2) * t/HalfTime + 2` and re-anchors the block grid to the image
     /// centre every frame (`mosaic.cpp:123-143`), while the kernel uses a float
-    /// `1 + sin(pi*p) * maxsize` ramp with the grid anchored at the frame
-    /// origin; the reference samples the block's centre pixel exactly and
-    /// fills the block with `Blend`, the kernel samples through a bilinear
+    /// `1 + sin(pi*p) * maxsize` ramp with the grid anchored at the destination
+    /// bitmap's origin; the reference samples the block's centre pixel exactly
+    /// and fills the block with `Blend`, the kernel samples through a bilinear
     /// sampler.
     Mosaic = 4,
     /// `turn` (`extrans/turn.cpp:15`): `bgcolor` (0), 64x64 tiles folded by a
@@ -1042,7 +1070,9 @@ pub enum TransitionMethod {
     /// (`turntrans_table.cpp`, 63 x 64 entries of 16.16 source scans) nor the
     /// diagonal phase sweep (`phase = Phase - (x-y)*2`, `turn.cpp:141-144`)
     /// nor the gloss; it squeezes each tile horizontally and reveals the tiles
-    /// in a pseudo-random order (`transition.wgsl`, `hash_tile`).
+    /// in a pseudo-random order (`transition.wgsl`, `hash_tile`).  The 64x64
+    /// tile grid is the reference's: it is counted from the destination
+    /// bitmap's size (`xcount = (Width-1)/64 + 1`, `turn.cpp:141-142`).
     Turn = 5,
     /// `rotatezoom` (`extrans/rotatetrans.cpp:18-120`): `factor` (1),
     /// `accel` (0), `twist` (2), `twistaccel` (-2), `centerx`/`centery`
@@ -1055,6 +1085,17 @@ pub enum TransitionMethod {
     /// centre (`:89-90`), rotates in aspect-normalized uv (a shear on
     /// non-square frames) and cross-fades inside the quad where the reference
     /// copies pixels (`:117`, `rotatebase.cpp` has no blending).
+    ///
+    /// The pivot itself is the destination bitmap's, as in the reference:
+    /// `centerx`/`centery` are pixels of that bitmap and default to its centre
+    /// (`rotatetrans.cpp:185-186`, `:206-210`).  `transition.wgsl` converts
+    /// them through its `image_local`/`frame_uv` pair, so they are
+    /// destination-logical rather than window-physical; dividing them by the
+    /// physical viewport (which the kernel did until M206) put the pivot at
+    /// `centerx / (logical size * window scale)` of the frame -- off by exactly
+    /// the render scale on any scaled window.  `RotateVanish` shares the pivot
+    /// and the conversion; `RotateSwap` reads no `centerx`/`centery` and
+    /// pivots on the destination bitmap's centre.
     RotateZoom = 6,
     /// `rotatevanish` (`extrans/rotatetrans.cpp:222-316`): the same handler
     /// with `factor` 1 -> 0 and the source not fixed; `accel` (2), `twist` (2),
@@ -1085,7 +1126,10 @@ pub enum TransitionMethod {
     /// mirror-wrapped at the borders, while the kernel draws a travelling
     /// Gaussian band around a centre-out front, uses `rwidth` as a band width
     /// instead of the wave's wavelength mask and `speed` as a spatial frequency
-    /// instead of a phase advance.
+    /// instead of a phase advance.  The front, the band and the drift are
+    /// measured in the destination bitmap's pixels, as the reference's tables
+    /// are (`centerx`/`centery`, `rwidth` and `maxdrift` are pixels of that
+    /// bitmap, `ripple.cpp:1072`, `:1478-1525`).
     Ripple = 9,
 }
 
@@ -1322,7 +1366,7 @@ impl Default for TransitionParams {
 /// Official KRKR keeps a transition per layer (`tTJSNI_BaseLayer::InTransition`,
 /// `LayerIntf.cpp:6334`) and the handler composites the destination and source
 /// bitmaps inside the destination layer's own rectangle
-/// (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6513-6540`).  `dest_rect` is that
+/// (`tTVPDivisibleData`, `LayerIntf.cpp:6665-6676`).  `dest_rect` is that
 /// rectangle in frame coordinates, so unrelated layers can transition at the
 /// same time and each one only rewrites its own area.  `None` means the
 /// destination has no measurable geometry, and the composite then covers the
