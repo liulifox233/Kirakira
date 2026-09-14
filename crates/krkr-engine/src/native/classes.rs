@@ -6593,6 +6593,22 @@ fn source_layer_has_no_image() -> TjsError {
 /// which the wrapper turns into `TVPSpecifyLayerOrBitmap` (`:7150`); that
 /// happens before the blit method runs, so the error precedes every check the
 /// method itself makes.
+///
+/// What the wrapper resolves is a Layer's *bitmap object*, and the reference's
+/// is not a function of whether the image has been decoded yet: `MainImage`
+/// exists for the object's whole life (`AllocateDefaultImage`,
+/// `LayerIntf.cpp:404`/`:2111`), a load decodes *into* it
+/// (`tTJSNI_BaseLayer::LoadImages`, `:2509-2514`), and only `freeImage`
+/// (`DeallocateImage`, `:2079`) clears it. Kirakira instead materializes that
+/// bitmap in a render node, and the node can transiently be absent while the
+/// layer itself is fine -- `Invalidate`, KAG page retargeting, or an
+/// `assignImages` from an image-less source. Resolving through
+/// `layer_main_image` keeps the wrapper's question about the *object*: it is
+/// the same read `hasImage`/`imageWidth` use, it rebuilds a dropped node and
+/// restores the ctor bitmap, and it answers `None` only for a Layer whose
+/// bitmap really is gone (freed) or for a non-Layer -- so a still-loading
+/// source blits its (not yet filled) bitmap the way the reference does instead
+/// of reporting `TVPSpecifyLayerOrBitmap`.
 fn blit_source_object(
     runtime: &mut Runtime<KrkrHost>,
     source: Option<&Variant>,
@@ -6607,12 +6623,10 @@ fn blit_source_object(
     // (`install_bitmap_native_properties`), so only a Layer resolves and a
     // Bitmap object lands on the same error.
     let target = render_layer_target(runtime, handle).ok().flatten()?;
-    let snapshot = render_layer_snapshot(runtime, &target);
-    let has_image = snapshot.as_ref().is_some_and(|layer| layer.image.is_some());
-    let has_province = snapshot
-        .as_ref()
-        .is_some_and(|layer| layer.province.is_some());
-    (has_image || (allow_province && has_province)).then_some(handle)
+    let has_image = layer_main_image(runtime, handle).is_some();
+    let has_province = allow_province
+        && render_layer_snapshot(runtime, &target).is_some_and(|layer| layer.province.is_some());
+    (has_image || has_province).then_some(handle)
 }
 
 /// `piledCopy`'s wrapper takes a Layer and nothing else
@@ -6677,12 +6691,14 @@ fn layer_piled_copy(
     // (`LayerIntf.cpp:4111`).
     require_drawable_layer_image(runtime, &dest_target)?;
     complete_layer_subtree_before_draw(runtime, source_object, &mut BTreeSet::new())?;
-    let Some(source_target) = render_layer_target(runtime, source_object)? else {
+    let Some(_source_target) = render_layer_target(runtime, source_object)? else {
         return Err(TjsError::runtime("Specify Layer class object"));
     };
     // `if(!src->MainImage) TVPThrowExceptionMessage(TVPSourceLayerHasNoImage);`
-    // (`LayerIntf.cpp:4112`).
-    if !render_layer_snapshot(runtime, &source_target).is_some_and(|layer| layer.image.is_some()) {
+    // (`LayerIntf.cpp:4112`). Read through `layer_main_image` for the same
+    // reason the wrapper does: the reference's surrogate for "has no image" is
+    // `freeImage`, not a bitmap the engine has not materialized yet.
+    if layer_main_image(runtime, source_object).is_none() {
         return Err(source_layer_has_no_image());
     }
     if width <= 0 || height <= 0 {
@@ -12892,6 +12908,86 @@ mod tests {
                 .expect_err("a freed destination image is not drawable");
             assert_eq!(error.message, "Not drawable layer type", "{call}");
         }
+    }
+
+    /// A Layer that still owns its bitmap is not a missing source just because
+    /// the engine has not materialized that bitmap in the render node yet.
+    /// The reference's `MainImage` belongs to the object for its whole life
+    /// (`AllocateDefaultImage`, `LayerIntf.cpp:404`/`:2111`), a load decodes
+    /// *into* it (`tTJSNI_BaseLayer::LoadImages`, `:2509-2514`) and only
+    /// `freeImage` (`DeallocateImage`, `:2079`) clears it, so its wrapper's
+    /// `TVPSpecifyLayerOrBitmap` (`:7150`) never fires for a layer that is
+    /// merely still loading. Kirakira's bitmap lives in a render node, which
+    /// `Invalidate`/KAG retargeting or an `assignImages` from an image-less
+    /// source (`:2124-2140`; `copy_layer_images` clears the node) can take
+    /// away while the layer keeps its `hasImage` intent. The guard used to
+    /// read that node as the object and rejected the still-loading source --
+    /// the save-return frame died with `Specify Layer or Bitmap class object`
+    /// at `onPaint` while the decode completed a moment later. Resolving
+    /// through `layer_main_image` (the `hasImage`/`imageWidth` read) rebuilds
+    /// the ctor bitmap, so all seven members blit it, and a *freed* source
+    /// keeps M184's error.
+    #[test]
+    fn layer_blits_accept_a_source_whose_bitmap_the_engine_rebuilds() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "inline.tjs",
+                r#"
+                global.blank = new Layer();
+                blank.setImageSize(2, 2);
+                blank.freeImage();
+
+                global.source = new Layer();
+                source.setImageSize(2, 2);
+                source.assignImages(blank);
+
+                global.dest = new Layer();
+                dest.setImageSize(4, 4);
+                "#,
+            )
+            .expect("script");
+        for call in [
+            "dest.copyRect(0, 0, source, 0, 0, 2, 2);",
+            "dest.operateRect(0, 0, source, 0, 0, 2, 2, omAlpha);",
+            "dest.stretchCopy(0, 0, 2, 2, source, 0, 0, 2, 2, stNearest);",
+            "dest.operateStretch(0, 0, 2, 2, source, 0, 0, 2, 2, omAlpha);",
+            "dest.affineCopy(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
+            "dest.operateAffine(source, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
+            "dest.piledCopy(0, 0, source, 0, 0, 2, 2);",
+        ] {
+            if let Err(error) = engine.execute_script("inline.tjs", call) {
+                panic!("{call}: {error}");
+            }
+        }
+        // The rebuilt bitmap is the ctor's neutral fill (`AllocateDefaultImage`
+        // copies the transparent-white holder), so the copy writes bytes: the
+        // 4x4 destination starts black and its first pixel comes back white.
+        assert_eq!(
+            layer_main_pixel(&mut engine, "dest.getMainPixel(0, 0)"),
+            0xffffff,
+            "copyRect blitted the rebuilt bitmap"
+        );
+
+        engine
+            .execute_script(
+                "inline.tjs",
+                "global.freed = new Layer(); freed.setImageSize(2, 2); freed.freeImage();",
+            )
+            .expect("script");
+        let error = engine
+            .execute_script(
+                "inline.tjs",
+                "dest.operateRect(0, 0, freed, 0, 0, 2, 2, omAlpha);",
+            )
+            .expect_err("a freed source still resolves to no bitmap");
+        assert_eq!(error.message, "Specify Layer or Bitmap class object");
+        let error = engine
+            .execute_script("inline.tjs", "dest.piledCopy(0, 0, freed, 0, 0, 2, 2);")
+            .expect_err("a freed source has no bitmap to pile");
+        assert_eq!(error.message, "Source layer has no image");
     }
 
     /// The official TJS blit wrappers resolve their source argument before the
