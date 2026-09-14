@@ -2429,6 +2429,11 @@ impl KrkrHost {
         }
 
         self.layer_tree.remove_layer(layer_id);
+        // `Invalidate`'s `DeallocateImage`/`DeallocateCache`
+        // (`LayerIntf.cpp:2079-2088`) drops the layer's image state with the
+        // bitmap; the engine's record of the storage that filled it is part of
+        // that state, not a value a later re-attachment could reload from.
+        self.clear_layer_image_storage(layer_id);
         self.modal_layers
             .retain(|(_, entry_layer)| *entry_layer != layer_id);
         self.sync_modal_layer();
