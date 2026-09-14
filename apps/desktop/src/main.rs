@@ -1,4 +1,23 @@
+use krkr_assets::{NativeAssetStore, ProjectStorage};
+use krkr_audio::AudioSystem;
+use krkr_core::{
+    AudioEvent, AudioStatusLevel, ButtonState, Clock, Engine, EngineConfig, EngineEvent, EngineKey,
+    FrameInput, FrameOutput, Point, PointerButton, Size, StatusLevel,
+};
+use krkr_debug::{
+    console::{self, InteractiveCommand, InteractiveUntil},
+    snapshot::TextureCache,
+};
+use krkr_engine::{
+    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, RuntimeSession,
+    SystemMetrics, SystemPaths,
+};
+use krkr_plugins::register_reference_plugins;
+use krkr_render::{RenderError, Renderer};
+use krkr_video::PlatformVideoFactory;
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use std::{
+    collections::VecDeque,
     fmt,
     io::BufRead,
     path::PathBuf,
@@ -10,24 +29,6 @@ use std::{
     thread,
     time::Instant,
 };
-use krkr_assets::{NativeAssetStore, ProjectStorage};
-use krkr_audio::AudioSystem;
-use krkr_core::{
-    AudioEvent, AudioStatusLevel, ButtonState, Clock, DrawCommand, Engine, EngineConfig, EngineEvent,
-    EngineKey, FrameInput, Point, PointerButton, Size, StatusLevel,
-};
-use krkr_debug::{
-    console::{self, InteractiveCommand, InteractiveUntil},
-    snapshot::{self, TextureCache},
-};
-use krkr_engine::{
-    EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, RuntimeSession,
-    SystemMetrics, SystemPaths,
-};
-use krkr_plugins::register_reference_plugins;
-use krkr_render::{RenderError, Renderer};
-use krkr_video::PlatformVideoFactory;
-use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
@@ -165,10 +166,13 @@ impl DesktopStatus {
     }
 }
 
-#[derive(Clone, Copy)]
+/// What a console tick decided for the frame loop: whether the engine should
+/// run a frame, the pointer events the queued clicks turned into, and whether
+/// the console asked to quit.
 struct ConsoleTick {
     advance: bool,
     quit: bool,
+    events: Vec<EngineEvent>,
 }
 
 /// Interactive console attached to the windowed process (`--debug-console`).
@@ -176,40 +180,49 @@ struct ConsoleTick {
 /// (`krkr_debug::console`); only the frame source differs.
 struct ConsoleState {
     commands: Receiver<InteractiveCommand>,
+    /// Commands read while a frame budget was outstanding. They were written
+    /// for a later frame, so they wait for the frames they asked for; see
+    /// [`ConsoleState::tick`].
+    deferred: VecDeque<InteractiveCommand>,
     paused: bool,
     budget: Option<usize>,
     until: Option<InteractiveUntil>,
     pending_clicks: Vec<Point>,
     pending_releases: Vec<Point>,
-    pending_shots: Vec<String>,
+    /// `(path, raw)` shots waiting for a rendered frame.
+    pending_shots: Vec<(String, bool)>,
     auto_click: bool,
     auto_point: Option<Point>,
     textures: TextureCache,
-    last_commands: Option<Vec<DrawCommand>>,
+    /// The last presented frame, whole: `draw` reports its transitions and
+    /// `shot` composites them, the same frame the headless shell keeps.
+    last_frame: Option<FrameOutput>,
 }
 
 impl ConsoleState {
     fn start(path: PathBuf) -> Self {
         let (sender, commands) = mpsc::channel();
         let reader_path = path.clone();
-        thread::spawn(move || loop {
-            let Ok(file) = std::fs::File::open(&reader_path) else {
-                thread::sleep(std::time::Duration::from_millis(200));
-                continue;
-            };
-            for line in std::io::BufReader::new(file).lines() {
-                let Ok(line) = line else { break };
-                let line = line.trim();
-                if line.is_empty() {
+        thread::spawn(move || {
+            loop {
+                let Ok(file) = std::fs::File::open(&reader_path) else {
+                    thread::sleep(std::time::Duration::from_millis(200));
                     continue;
-                }
-                match console::parse_interactive_command(line) {
-                    Ok(command) => {
-                        if sender.send(command).is_err() {
-                            return;
-                        }
+                };
+                for line in std::io::BufReader::new(file).lines() {
+                    let Ok(line) = line else { break };
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
                     }
-                    Err(error) => println!("console_error {line:?}: {error}"),
+                    match console::parse_interactive_command(line) {
+                        Ok(command) => {
+                            if sender.send(command).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => println!("console_error {line:?}: {error}"),
+                    }
                 }
             }
         });
@@ -217,8 +230,15 @@ impl ConsoleState {
             "console=ready path={} (write commands to the fifo, dumps print here)",
             path.display()
         );
+        Self::with_commands(commands)
+    }
+
+    /// Console state over a command source. Split out of [`Self::start`] so the
+    /// frame scheduling can be driven without a FIFO or a window.
+    fn with_commands(commands: Receiver<InteractiveCommand>) -> Self {
         Self {
             commands,
+            deferred: VecDeque::new(),
             paused: false,
             budget: None,
             until: None,
@@ -228,7 +248,164 @@ impl ConsoleState {
             auto_click: false,
             auto_point: None,
             textures: TextureCache::new(),
-            last_commands: None,
+            last_frame: None,
+        }
+    }
+
+    /// Applies the commands that may run at this frame boundary and turns the
+    /// console's queued clicks into engine events.
+    ///
+    /// A command is only applied while the console is idle, because
+    /// `advance N` (and the two frames of a `click`) is a transaction over the
+    /// frames it requests: the commands written behind it in the same batch
+    /// wait until those frames have run, which is what makes `advance` mean
+    /// what its own contract says. The windowed shell used to apply the whole
+    /// batch on the frame it arrived on, so every batched click landed on one
+    /// frame; `krkr-debug` holds them back and this now matches it.
+    fn tick(&mut self, frame_index: u64, runtime: &mut RuntimeSession) -> ConsoleTick {
+        let mut quit = false;
+        let mut events = Vec::new();
+        // Idle: apply commands in the order they were written until one of
+        // them starts a run.
+        while self.paused || self.budget == Some(0) {
+            let Some(command) = self.next_command() else {
+                break;
+            };
+            quit |= self.apply(command, frame_index, runtime);
+            if quit || (!self.paused && self.budget != Some(0)) {
+                break;
+            }
+        }
+        // Running: a free-running console (`run`) takes commands as they
+        // arrive, but while a bounded budget is outstanding only `pause` and
+        // `quit` may jump the queue — everything else waits for its frames.
+        let mut held = 0usize;
+        while let Ok(command) = self.commands.try_recv() {
+            if self.budget.is_some()
+                && !matches!(
+                    command,
+                    InteractiveCommand::Pause | InteractiveCommand::Quit
+                )
+            {
+                self.deferred.push_back(command);
+                held += 1;
+                continue;
+            }
+            quit |= self.apply(command, frame_index, runtime);
+            if quit {
+                break;
+            }
+        }
+        if held > 0 {
+            println!(
+                "interactive=hold commands={held} frame={frame_index} (waiting for the frame budget)"
+            );
+        }
+        // A click's release follows on the next frame, exactly as in
+        // `krkr-debug`: press and release inside one frame's event batch is not
+        // the input the game would see from the mouse.
+        for position in std::mem::take(&mut self.pending_releases) {
+            events.push(EngineEvent::CursorMoved { position });
+            events.push(EngineEvent::PointerInput {
+                button: PointerButton::Primary,
+                state: ButtonState::Released,
+            });
+        }
+        for position in std::mem::take(&mut self.pending_clicks) {
+            println!("interactive click press frame={frame_index} position={position:?}");
+            events.push(EngineEvent::CursorMoved { position });
+            events.push(EngineEvent::PointerInput {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+            });
+            self.pending_releases.push(position);
+        }
+        for (path, raw) in std::mem::take(&mut self.pending_shots) {
+            let Some(frame) = self.last_frame.clone() else {
+                println!("interactive screenshot_error={path}: no rendered frame yet");
+                continue;
+            };
+            // The shared writer is the frame-aware one, so `shot` composites a
+            // running transition's faces exactly like the headless shell.
+            console::write_interactive_shot(
+                &path,
+                runtime.engine(),
+                &frame,
+                &mut self.textures,
+                raw,
+            );
+        }
+        ConsoleTick {
+            advance: !self.paused && self.budget != Some(0),
+            quit,
+            events,
+        }
+    }
+
+    /// The next command to apply: one held back for a finished budget first,
+    /// then whatever the FIFO reader has queued.
+    fn next_command(&mut self) -> Option<InteractiveCommand> {
+        if let Some(command) = self.deferred.pop_front() {
+            return Some(command);
+        }
+        self.commands.try_recv().ok()
+    }
+
+    fn apply(
+        &mut self,
+        command: InteractiveCommand,
+        frame_index: u64,
+        runtime: &mut RuntimeSession,
+    ) -> bool {
+        console::apply_interactive_control_with_frame(
+            command,
+            &mut self.paused,
+            &mut self.budget,
+            &mut self.until,
+            &mut self.pending_clicks,
+            &mut self.pending_shots,
+            frame_index as usize,
+            runtime,
+            &mut self.textures,
+            self.last_frame.as_ref(),
+            &mut self.auto_click,
+            &mut self.auto_point,
+        )
+    }
+
+    /// Records the presented frame for later `draw` / `shot` dumps and applies
+    /// the frame budget and `until` conditions. `frame_index` is the frame
+    /// about to run, so the pause it reports is the frame the run stopped at.
+    fn after_frame(
+        &mut self,
+        frame: &FrameOutput,
+        frame_index: u64,
+        runtime: Option<&RuntimeSession>,
+    ) {
+        self.last_frame = Some(frame.clone());
+        for upload in &frame.image_uploads {
+            self.textures.insert(
+                upload.texture_id,
+                (upload.width, upload.height, Arc::clone(&upload.rgba)),
+            );
+        }
+        if let Some(budget) = self.budget.as_mut() {
+            *budget = budget.saturating_sub(1);
+        }
+        if let Some(condition) = self.until.clone() {
+            let satisfied = runtime.is_some_and(|runtime| {
+                console::interactive_condition_satisfied(runtime.engine(), &condition)
+            });
+            if satisfied {
+                println!("interactive=until-hit condition={condition:?} frame={frame_index}");
+                self.until = None;
+                self.budget = Some(0);
+            }
+        }
+        if self.budget == Some(0) {
+            self.budget = None;
+            self.paused = true;
+            println!("interactive=paused frame={frame_index}");
         }
     }
 }
@@ -333,112 +510,34 @@ impl DesktopApp {
         }
     }
 
-    /// Applies every queued console command, then converts console-queued
-    /// clicks into engine events. Returns whether the engine should advance
-    /// this frame and whether the console asked to quit.
+    /// Runs the console's command intake for this frame boundary. See
+    /// [`ConsoleState::tick`] for the scheduling rule.
     fn console_tick(&mut self, frame_index: u64) -> ConsoleTick {
         let Some(console) = self.console.as_mut() else {
             return ConsoleTick {
                 advance: true,
                 quit: false,
+                events: Vec::new(),
             };
         };
         let Some(runtime) = self.runtime.as_mut() else {
             return ConsoleTick {
                 advance: true,
                 quit: false,
+                events: Vec::new(),
             };
         };
-        let mut quit = false;
-        while let Ok(command) = console.commands.try_recv() {
-            quit |= console::apply_interactive_control(
-                command,
-                &mut console.paused,
-                &mut console.budget,
-                &mut console.until,
-                &mut console.pending_clicks,
-                &mut console.pending_shots,
-                frame_index as usize,
-                runtime,
-                &mut console.textures,
-                console.last_commands.as_deref(),
-                &mut console.auto_click,
-                &mut console.auto_point,
-            );
-        }
-        for position in std::mem::take(&mut console.pending_clicks) {
-            println!("interactive click press frame={frame_index} position={position:?}");
-            self.pending_runtime_events
-                .push(EngineEvent::CursorMoved { position });
-            self.pending_runtime_events.push(EngineEvent::PointerInput {
-                button: PointerButton::Primary,
-                state: ButtonState::Pressed,
-            });
-            console.pending_releases.push(position);
-        }
-        for position in std::mem::take(&mut console.pending_releases) {
-            self.pending_runtime_events
-                .push(EngineEvent::CursorMoved { position });
-            self.pending_runtime_events.push(EngineEvent::PointerInput {
-                button: PointerButton::Primary,
-                state: ButtonState::Released,
-            });
-        }
-        for path in std::mem::take(&mut console.pending_shots) {
-            let viewport = runtime
-                .engine()
-                .content_viewport_size()
-                .unwrap_or(Size::new(1280.0, 720.0));
-            let commands = console.last_commands.clone().unwrap_or_default();
-            let (width, height, rgba) = snapshot::composite_frame(
-                viewport.width.max(1.0) as u32,
-                viewport.height.max(1.0) as u32,
-                &commands,
-                &console.textures,
-            );
-            match snapshot::write_png(&path, width, height, &rgba) {
-                Ok(()) => println!("interactive screenshot={path}"),
-                Err(error) => println!("interactive screenshot_error={path}: {error}"),
-            }
-        }
-        ConsoleTick {
-            advance: !console.paused && console.budget != Some(0),
-            quit,
-        }
+        console.tick(frame_index, runtime)
     }
 
     /// Records the presented frame for later `draw` / `shot` dumps and applies
     /// the console's frame budget and `until` conditions.
-    fn console_after_frame(&mut self, commands: &[DrawCommand], uploads: &[krkr_core::ImageUpload]) {
+    fn console_after_frame(&mut self, frame: &FrameOutput) {
         let Some(console) = self.console.as_mut() else {
             return;
         };
-        console.last_commands = Some(commands.to_vec());
-        for upload in uploads {
-            console.textures.insert(
-                upload.texture_id,
-                (upload.width, upload.height, Arc::clone(&upload.rgba)),
-            );
-        }
-        if let Some(budget) = console.budget.as_mut() {
-            *budget = budget.saturating_sub(1);
-        }
         let frame_index = self.rendered_frames;
-        if let Some(condition) = console.until.clone() {
-            let satisfied = self.runtime.as_ref().is_some_and(|runtime| {
-                console::interactive_condition_satisfied(runtime.engine(), &condition)
-            });
-            if satisfied {
-                println!("interactive=until-hit condition={condition:?} frame={frame_index}");
-                console.until = None;
-                console.budget = Some(0);
-            }
-        }
-        if console.budget == Some(0) {
-            console.budget = None;
-            console.paused = true;
-            println!("interactive=paused frame={frame_index}");
-        }
+        console.after_frame(frame, frame_index, self.runtime.as_ref());
     }
 
     fn handle_redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -459,6 +558,7 @@ impl DesktopApp {
         // Console commands run before the update so `pause` / `advance` /
         // `click` take effect on this frame, exactly like `krkr-debug`.
         let console_tick = self.console_tick(self.rendered_frames);
+        self.pending_runtime_events.extend(console_tick.events);
         if console_tick.quit {
             self.persist_running_project();
             event_loop.exit();
@@ -628,7 +728,7 @@ impl DesktopApp {
                 }
             }
         }
-        self.console_after_frame(&frame.draw_commands, &frame.image_uploads);
+        self.console_after_frame(&frame);
 
         if exit_after_render {
             self.persist_running_project();
@@ -1211,6 +1311,112 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// The desktop's frame loop without a window or a GPU: the console tick
+    /// runs first, then the frame it allowed, exactly as `handle_redraw` runs
+    /// them. Input events are recorded as `(frame, position, state)`.
+    struct ConsoleHarness {
+        console: ConsoleState,
+        runtime: RuntimeSession,
+        frame: u64,
+        cursor: Option<Point>,
+        buttons: Vec<(u64, Point, ButtonState)>,
+    }
+
+    impl ConsoleHarness {
+        fn new(commands: Receiver<InteractiveCommand>) -> Self {
+            let engine = KrkrEngine::new(KrkrEngineConfig::default()).expect("engine");
+            let runtime = RuntimeSession::new(
+                engine,
+                Box::new(krkr_core::MemoryAssetStore::default()),
+                Box::new(krkr_audio::VirtualAudioSink::default()),
+                Box::new(DesktopClock::new()),
+            );
+            Self {
+                console: ConsoleState::with_commands(commands),
+                runtime,
+                frame: 0,
+                cursor: None,
+                buttons: Vec::new(),
+            }
+        }
+
+        fn frame(&mut self) {
+            let tick = self.console.tick(self.frame, &mut self.runtime);
+            for event in tick.events {
+                match event {
+                    EngineEvent::CursorMoved { position } => self.cursor = Some(position),
+                    EngineEvent::PointerInput { state, .. } => self.buttons.push((
+                        self.frame,
+                        self.cursor.expect("cursor moved before the button"),
+                        state,
+                    )),
+                    _ => {}
+                }
+            }
+            if tick.advance {
+                self.frame += 1;
+                let recorded =
+                    FrameOutput::new(krkr_core::Color::new(0.0, 0.0, 0.0, 0.0), Vec::new());
+                self.console
+                    .after_frame(&recorded, self.frame, Some(&self.runtime));
+            }
+        }
+    }
+
+    /// `advance N` runs N frames before the next command is applied, so the
+    /// commands written behind it in one batch land on the frames they were
+    /// written for. Applying the whole batch on arrival put every batched click
+    /// on one frame, which made scripted windowed acceptance runs silently
+    /// test the wrong frame (M209).
+    #[test]
+    fn console_batch_lands_each_click_on_its_own_frame() {
+        let (sender, commands) = mpsc::channel();
+        for line in ["advance 4", "click 10 20", "advance 3", "click 30 40"] {
+            sender
+                .send(console::parse_interactive_command(line).expect("parse"))
+                .expect("queue command");
+        }
+        let mut harness = ConsoleHarness::new(commands);
+        for _ in 0..12 {
+            harness.frame();
+        }
+
+        assert_eq!(
+            harness.buttons,
+            vec![
+                (4, Point::new(10.0, 20.0), ButtonState::Pressed),
+                (5, Point::new(10.0, 20.0), ButtonState::Released),
+                (9, Point::new(30.0, 40.0), ButtonState::Pressed),
+                (10, Point::new(30.0, 40.0), ButtonState::Released),
+            ]
+        );
+        assert_eq!(harness.frame, 11);
+    }
+
+    /// `pause` is the one command that may skip ahead of an outstanding budget:
+    /// an agent that watches a long `advance` has to be able to stop it where it
+    /// is, without waiting for the frames it asked for.
+    #[test]
+    fn console_pause_written_mid_advance_stops_the_run() {
+        let (sender, commands) = mpsc::channel();
+        sender
+            .send(console::parse_interactive_command("advance 1000").expect("parse"))
+            .expect("queue advance");
+        let mut harness = ConsoleHarness::new(commands);
+        harness.frame();
+        harness.frame();
+        assert_eq!(harness.frame, 2);
+
+        sender
+            .send(console::parse_interactive_command("pause").expect("parse"))
+            .expect("queue pause");
+        for _ in 0..4 {
+            harness.frame();
+        }
+
+        assert_eq!(harness.frame, 2);
+    }
 
     #[test]
     fn maps_fullscreen_window_points_to_runtime_content_space() {
