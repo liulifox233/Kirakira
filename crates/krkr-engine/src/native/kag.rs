@@ -184,6 +184,12 @@ fn kag_load_scenario(
 
 fn register_system_hooks(host: &mut KrkrHost, text: &str) {
     for line in text.lines() {
+        // The reference's scenario reader skips a `;` line before it looks for
+        // tags, so a declaration that is commented out is not in its hook table
+        // either.
+        if is_hook_comment_line(line) {
+            continue;
+        }
         let Some(start) = line
             .find("[addSysHook")
             .or_else(|| line.find("[addSysScript"))
@@ -201,7 +207,7 @@ fn register_system_hooks(host: &mut KrkrHost, text: &str) {
             SystemHookRegistration {
                 storage: kag_decl_attr(command, "storage"),
                 target: kag_decl_attr(command, "target"),
-                call: !is_script && command.contains(" call"),
+                call: !is_script && kag_decl_is_call(command),
             },
         );
     }
@@ -211,22 +217,77 @@ fn register_system_hooks(host: &mut KrkrHost, text: &str) {
 /// the reference tag parser (`KAGParser.cpp:2126-2152`): a quoted value runs to
 /// its matching quote, an unquoted one ends at the first whitespace or `]`.
 /// The engine-side twin (`engine::hook_attr`) reads the same spellings for the
-/// engine-driven scan.
+/// engine-driven scan, and treats an empty value as absent where this table
+/// keeps it (`kag_decl_attr` returns `Some("")`).
 fn kag_decl_attr(command: &str, name: &str) -> Option<String> {
-    let marker = format!("{name}=");
-    let start = command.find(&marker)? + marker.len();
-    let rest = command[start..].trim_start();
-    if let Some(quote) = rest.chars().next().filter(|ch| *ch == '\"' || *ch == '\'') {
-        let body = &rest[quote.len_utf8()..];
-        let end = body.find(quote).unwrap_or(body.len());
-        return Some(body[..end].to_string());
+    decl_attr(command, name).map(str::to_string)
+}
+
+/// The boolean `call` attribute of a declaration, read the way the engine's
+/// twin does (`engine::hook_is_call`) and the way the tag path reads the same
+/// attribute (`kag_bool_attr`): the bare flag the reference's attribute reader
+/// turns into `true` is a call, and `call=false` is not.
+fn kag_decl_is_call(command: &str) -> bool {
+    matches!(decl_attr(command, "call"), Some("true" | "yes" | "1"))
+}
+
+/// `true` for a `custom.ks` line the reference's scenario reader skips as a
+/// comment: it strips leading tabs when it splits a scenario into lines
+/// (`KAGParser.cpp:147-148`) and then skips any line whose first character is
+/// `;` (`:1094-1095`), so the `;` and `;;` spellings are equally inert.
+fn is_hook_comment_line(line: &str) -> bool {
+    line.trim_start_matches('\t').starts_with(';')
+}
+
+/// The value of one `name=value` attribute of a declaration, borrowed from
+/// `command`, or `None` when the declaration does not carry the attribute.
+/// The name has to be a whole token (`filename=` is not `name`) and the scan
+/// stops at the tag's closing `]`.
+fn decl_attr<'a>(command: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = command;
+    while let Some((attribute, value, after)) = next_decl_attr(rest) {
+        if attribute.eq_ignore_ascii_case(name) {
+            return Some(value);
+        }
+        rest = after;
     }
-    Some(
-        rest.split(|ch: char| ch.is_whitespace() || ch == ']')
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-    )
+    None
+}
+
+/// The next `(name, value)` attribute of a declaration and the text after it,
+/// or `None` at the tag's closing `]`. The reference reads one attribute as a
+/// name up to whitespace, `=` or `]`, lowercased before it is compared
+/// (`KAGParser.cpp:2085-2093`), and a name that no `=` follows carries `true`
+/// (`:2096-2106`).
+fn next_decl_attr(text: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = text.trim_start_matches(char::is_whitespace);
+    if trimmed.is_empty() || trimmed.starts_with(']') {
+        return None;
+    }
+    let name_end = trimmed
+        .find(|ch: char| ch.is_whitespace() || ch == '=' || ch == ']')
+        .unwrap_or(trimmed.len());
+    let (name, after_name) = trimmed.split_at(name_end);
+    let after_name = after_name.trim_start_matches(char::is_whitespace);
+    let Some(after_eq) = after_name.strip_prefix('=') else {
+        return Some((name, "true", after_name));
+    };
+    let body = after_eq.trim_start_matches(char::is_whitespace);
+    match body.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let quoted = &body[quote.len_utf8()..];
+            match quoted.find(quote) {
+                Some(end) => Some((name, &quoted[..end], &quoted[end + quote.len_utf8()..])),
+                None => Some((name, quoted, "")),
+            }
+        }
+        _ => {
+            let end = body
+                .find(|ch: char| ch.is_whitespace() || ch == ']')
+                .unwrap_or(body.len());
+            Some((name, &body[..end], &body[end..]))
+        }
+    }
 }
 
 fn kag_go_to_label(
@@ -1398,5 +1459,67 @@ mod tests {
         assert_eq!(unquoted.storage.as_deref(), Some("hook.ks"));
         assert_eq!(unquoted.target.as_deref(), Some("*probe"));
         assert!(unquoted.call);
+    }
+
+    /// A declaration the reference's scenario reader skips as a comment must
+    /// not reach the host table either: the reader strips leading tabs when it
+    /// splits a scenario into lines (`KAGParser.cpp:147-148`) and then skips
+    /// any line whose first character is `;` (`:1094-1095`), which covers the
+    /// `;;` declarations PARQUET (`custom.ks:40,41,43`) and GINKA (`:48`)
+    /// comment out and 少女世界's single-`;` ones.
+    #[test]
+    fn register_system_hooks_skips_commented_out_declarations() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        register_system_hooks(
+            engine.host_mut(),
+            // The first line is the tab-indented comment shape of PARQUET's
+            // `custom.ks:21`; the rest are verbatim shipped declarations.
+            "\t;;\t[addSysHook name=\"tabbed.comment\" call storage=\"custom.ks\" target=*logo]\n\
+             \t[addSysHook   name=\"first.logo\"  call storage=\"custom.ks\" target=*logo]\n\
+             ;;	[addSysHook   name=\"scenemode.restore\"       call storage=\"custom.ks\" target=*endrecollection]\n\
+             ;	[addSysHook   name=\"exit.begin\"              call storage=\"custom.ks\" target=*exit_begin]\n\
+             ;;	[addSysScript name=\"title.from.soundmode\"    storage=\"custom.ks\" target=*title_extra_snd]\n",
+        );
+
+        let active = engine
+            .host()
+            .system_hook("first.logo")
+            .expect("active hook");
+        assert_eq!(active.storage.as_deref(), Some("custom.ks"));
+        assert_eq!(active.target.as_deref(), Some("*logo"));
+        assert!(active.call);
+
+        assert!(engine.host().system_hook("tabbed.comment").is_none());
+        assert!(engine.host().system_hook("scenemode.restore").is_none());
+        assert!(engine.host().system_hook("exit.begin").is_none());
+        assert!(engine.host().system_hook("title.from.soundmode").is_none());
+    }
+
+    /// The `call` flag is the attribute's value, not a `" call"` substring:
+    /// `call=false` registers a jump, and a `" call"` inside another value is
+    /// not the flag. The reference's own template reads the attribute value
+    /// (`_JumpOrCall` computes `iscall = +call`; PARQUET's compiled
+    /// `data/system/System.tjs`), and the engine's tag path reads the same
+    /// attribute with `kag_bool_attr`, which the scan now matches. The shipped
+    /// declarations write the bare flag, so they keep registering a call.
+    #[test]
+    fn register_system_hooks_reads_call_false_as_a_jump() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        register_system_hooks(
+            engine.host_mut(),
+            "\t[addSysHook name=\"probe.jump\" call=false storage=\"hook.ks\" target=\"*probe\"]\n\
+             \t[addSysHook name=\"probe.call\" call storage=\"hook.ks\" target=\"*probe\"]\n\
+             \t[addSysHook name=\"probe.decoy\" storage=\"a call.ks\" target=\"*probe\"]\n",
+        );
+
+        let jump = engine.host().system_hook("probe.jump").expect("jump hook");
+        let call = engine.host().system_hook("probe.call").expect("call hook");
+        let decoy = engine
+            .host()
+            .system_hook("probe.decoy")
+            .expect("decoy hook");
+        assert!(!jump.call);
+        assert!(call.call);
+        assert!(!decoy.call);
     }
 }
