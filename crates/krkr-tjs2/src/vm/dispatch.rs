@@ -2344,29 +2344,30 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                     // (`tjsInterCodeExec.cpp:3100-3101`).
                     Err(TjsError::invalid_type())
                 } else if context == BytecodeContextType::Class {
-                    if let Some(instance) = this_obj.filter(|handle| *handle != self.runtime.global)
-                    {
-                        // A plain call to a class object with an instance
-                        // `this` only runs the class body (member
-                        // initializers); krkrz performs superclass
-                        // initialization this way and never invokes the
-                        // constructor here. The constructor runs separately
-                        // through `new` or an explicit ctor call.
-                        self.initialize_inter_code_class_body(
-                            file_id,
-                            object_index,
-                            instance,
-                            continuation,
-                        )
-                    } else {
-                        self.create_new_inter_code(
-                            file_id,
-                            object_index,
-                            context,
-                            args,
-                            continuation,
-                        )
-                    }
+                    // A plain call to a class object only runs the class body
+                    // (member initializers) -- `tTJSInterCodeContext::FuncCall`
+                    // with no member name answers a class context with
+                    // `ExecuteAsFunction(objthis, param, numparams, result, 0)`
+                    // (`tjsInterCodeExec.cpp:3096-3098`) and never invokes the
+                    // constructor.  krkrz performs superclass initialization
+                    // this way (`VM_CHGTHIS` + `VM_CALL`
+                    // `CreateExtendsExprCode`, `tjsInterCodeGen.cpp:3474-3490`),
+                    // and KAGEX probes a class on its temporary `__missing`
+                    // object the same way.
+                    //
+                    // The body must therefore run on the receiver the call
+                    // supplied: constructing here would run it -- and the
+                    // constructor -- on a throwaway instance, so the caller's
+                    // object would keep missing every member the body installs.
+                    // A missing `this` falls back to the global object, the way
+                    // a top-level context does (`create_call_frame`).
+                    let instance = this_obj.unwrap_or(self.runtime.global);
+                    self.initialize_inter_code_class_body(
+                        file_id,
+                        object_index,
+                        instance,
+                        continuation,
+                    )
                 } else {
                     Ok(CallOutcome::Frame(Box::new(self.create_call_frame(
                         file_id,
