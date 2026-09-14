@@ -136,6 +136,55 @@ impl Uniforms {
         self.data[9][0].max(1.0e-6)
     }
 
+    fn transform_offset(&self) -> [f32; 2] {
+        [self.data[9][1], self.data[9][2]]
+    }
+
+    /// The destination-bitmap coordinates a frame uv samples -- the shader's
+    /// `image_local`: the reference's `data->Left`/`data->Top`
+    /// (`LayerIntf.cpp:6575-6576`), in the bitmap's own logical pixels.  The
+    /// frame's physical viewport -- the window's size and DPI scale -- never
+    /// enters the geometry.
+    fn image_local(&self, uv: [f32; 2]) -> [f32; 2] {
+        let image = self.image_rect();
+        let scale = self.transform_scale();
+        let origin = self.transform_offset();
+        let viewport = self.viewport_size();
+        [
+            (uv[0] * viewport[0] - origin[0]) / scale - image[0],
+            (uv[1] * viewport[1] - origin[1]) / scale - image[1],
+        ]
+    }
+
+    /// The frame uv of a destination-bitmap logical position; the inverse of
+    /// `image_local`.
+    fn frame_uv(&self, local: [f32; 2]) -> [f32; 2] {
+        let image = self.image_rect();
+        let scale = self.transform_scale();
+        let origin = self.transform_offset();
+        let viewport = self.viewport_size();
+        [
+            (origin[0] + (image[0] + local[0]) * scale) / viewport[0],
+            (origin[1] + (image[1] + local[1]) * scale) / viewport[1],
+        ]
+    }
+
+    /// The destination bitmap's centre, the reference's default pivot
+    /// (`rotatetrans.cpp:185-186`).
+    fn default_center(&self) -> [f32; 2] {
+        let image = self.image_rect();
+        self.frame_uv([image[2] * 0.5, image[3] * 0.5])
+    }
+
+    /// `centerx`/`centery` are destination-bitmap pixels
+    /// (`rotatetrans.cpp:185-210`), so the pivot never depends on the window.
+    fn transition_center(&self) -> [f32; 2] {
+        if self.data[6][1] >= 0.0 && self.data[6][2] >= 0.0 {
+            return self.frame_uv([self.data[6][1], self.data[6][2]]);
+        }
+        self.default_center()
+    }
+
     fn under_available(&self) -> bool {
         self.data[9][3] >= 0.5
     }
@@ -306,19 +355,22 @@ fn transition_universal(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) ->
     let new_color = faces.new.sample(uv);
     let mut rule_value = uv[0];
     if uniforms.data[0][2] > 0.5 {
-        let screen = uniforms.viewport_size();
+        // The rule is read at the destination bitmap's own coordinates and
+        // repeats only where the reference's loader repeats it -- below the
+        // destination bitmap's size (`TransIntf.cpp:781`, `:825-851`,
+        // `GraphicsLoaderIntf.cpp:869-877`).  The physical viewport never
+        // enters the repeat period (the shader's `image_local`).
+        let image = uniforms.image_rect();
+        let local = uniforms.image_local(uv);
         let rule_dims = [
             faces.rule.width.max(1) as f32,
             faces.rule.height.max(1) as f32,
         ];
-        let mut rule_uv = [
-            uv[0] * screen[0] / rule_dims[0],
-            uv[1] * screen[1] / rule_dims[1],
-        ];
-        if rule_dims[0] < screen[0] {
+        let mut rule_uv = [local[0] / rule_dims[0], local[1] / rule_dims[1]];
+        if rule_dims[0] < image[2] {
             rule_uv[0] = rule_uv[0].fract();
         }
-        if rule_dims[1] < screen[1] {
+        if rule_dims[1] < image[3] {
             rule_uv[1] = rule_uv[1].fract();
         }
         rule_uv = [rule_uv[0].clamp(0.0, 0.9999), rule_uv[1].clamp(0.0, 0.9999)];
@@ -435,12 +487,16 @@ fn transition_wave(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f32
 
 fn transition_mosaic(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f32; 4] {
     let p = uniforms.progress();
-    let screen = uniforms.viewport_size();
     let block = (1.0 + (p * std::f32::consts::PI).sin() * uniforms.data[5][0]).max(1.0);
-    let block_uv = [
-        ((uv[0] * screen[0] / block).floor() + 0.5) * block / screen[0],
-        ((uv[1] * screen[1] / block).floor() + 0.5) * block / screen[1],
+    // The block grid is measured in the destination bitmap's pixels
+    // (`mosaic.cpp:123-143` anchors it from `Width`/`Height`), so the window
+    // scale cannot change the blocks.
+    let local = uniforms.image_local(uv);
+    let snapped = [
+        ((local[0] / block).floor() + 0.5) * block,
+        ((local[1] / block).floor() + 0.5) * block,
     ];
+    let block_uv = uniforms.frame_uv(snapped);
     mix4(faces.old.sample(block_uv), faces.new.sample(block_uv), p)
 }
 
@@ -451,19 +507,24 @@ fn hash_tile(tile: [f32; 2]) -> f32 {
 
 fn transition_turn(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f32; 4] {
     let p = uniforms.progress();
-    let screen = uniforms.viewport_size();
     let bg = uniforms.data[3];
+    // `xcount = (Width-1)/64 + 1` (`turn.cpp:141-142`): the 64x64 tile grid is
+    // counted in the destination bitmap's pixels, never the window's.
+    let image = uniforms.image_rect();
+    let extent = [image[2].max(1.0), image[3].max(1.0)];
     let tile_count = [
-        (screen[0] / 64.0).floor().max(1.0),
-        (screen[1] / 64.0).floor().max(1.0),
+        (extent[0] / 64.0).floor().max(1.0),
+        (extent[1] / 64.0).floor().max(1.0),
     ];
+    let tile_size = [extent[0] / tile_count[0], extent[1] / tile_count[1]];
+    let local_px = uniforms.image_local(uv);
     let tile = [
-        (uv[0] * tile_count[0]).floor(),
-        (uv[1] * tile_count[1]).floor(),
+        (local_px[0] / tile_size[0]).floor(),
+        (local_px[1] / tile_size[1]).floor(),
     ];
     let local = [
-        uv[0] * tile_count[0] - tile[0],
-        uv[1] * tile_count[1] - tile[1],
+        local_px[0] / tile_size[0] - tile[0],
+        local_px[1] / tile_size[1] - tile[1],
     ];
     let delay = hash_tile(tile) * 0.25;
     let t = ((p - delay) / (1.0 - delay).max(0.001)).clamp(0.0, 1.0);
@@ -472,16 +533,20 @@ fn transition_turn(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f32
         return bg;
     }
     let corrected_local = [(local[0] - 0.5) / width + 0.5, local[1]];
-    let sample_uv = [
-        (tile[0] + corrected_local[0]) / tile_count[0],
-        (tile[1] + corrected_local[1]) / tile_count[1],
-    ];
+    let sample_uv = uniforms.frame_uv([
+        (tile[0] + corrected_local[0]) * tile_size[0],
+        (tile[1] + corrected_local[1]) * tile_size[1],
+    ]);
     if t < 0.5 {
         return faces.old.sample(sample_uv);
     }
     faces.new.sample(sample_uv)
 }
 
+/// Rotation happens in the destination bitmap's own pixels
+/// (`rotatetrans.cpp:66-115` builds its matrix from `Width`/`Height` and
+/// `CenterX`/`CenterY`), so both the pivot and the pixel aspect are the
+/// destination's -- the window's scale must not move or shear them.
 fn rotate_uv(
     uniforms: &Uniforms,
     uv: [f32; 2],
@@ -489,37 +554,22 @@ fn rotate_uv(
     scale: f32,
     angle: f32,
 ) -> [f32; 2] {
-    let screen = uniforms.viewport_size();
-    let aspect_vec = [screen[0] / screen[1], 1.0];
-    let mut p = [
-        (uv[0] - center[0]) * aspect_vec[0],
-        (uv[1] - center[1]) * aspect_vec[1],
-    ];
     let c = (-angle).cos();
     let s = (-angle).sin();
-    p = [p[0] * c - p[1] * s, p[0] * s + p[1] * c];
+    let pivot = uniforms.image_local(center);
+    let delta = uniforms.image_local(uv);
+    let delta = [delta[0] - pivot[0], delta[1] - pivot[1]];
     let scale = scale.max(0.001);
-    p = [p[0] / scale, p[1] / scale];
-    [
-        p[0] / aspect_vec[0] + center[0],
-        p[1] / aspect_vec[1] + center[1],
-    ]
-}
-
-fn transition_center(uniforms: &Uniforms, default_center: [f32; 2]) -> [f32; 2] {
-    let screen = uniforms.viewport_size();
-    if uniforms.data[6][1] >= 0.0 && uniforms.data[6][2] >= 0.0 {
-        return [
-            uniforms.data[6][1] / screen[0],
-            uniforms.data[6][2] / screen[1],
-        ];
-    }
-    default_center
+    let rotated = [
+        (delta[0] * c - delta[1] * s) / scale,
+        (delta[0] * s + delta[1] * c) / scale,
+    ];
+    uniforms.frame_uv([pivot[0] + rotated[0], pivot[1] + rotated[1]])
 }
 
 fn transition_rotatezoom(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f32; 4] {
     let p = uniforms.progress();
-    let center = transition_center(uniforms, [0.5, 0.5]);
+    let center = uniforms.transition_center();
     let scale_t = acceleration(p, uniforms.data[5][2]);
     let twist_t = acceleration(p, uniforms.data[6][0]);
     let scale = mix(uniforms.data[5][1].max(0.001), 1.0, scale_t);
@@ -535,7 +585,7 @@ fn transition_rotatezoom(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -
 
 fn transition_rotatevanish(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f32; 4] {
     let p = uniforms.progress();
-    let center = transition_center(uniforms, [0.5, 0.5]);
+    let center = uniforms.transition_center();
     let scale_t = acceleration(p, uniforms.data[5][2]);
     let twist_t = acceleration(p, uniforms.data[6][0]);
     let scale = (1.0 - scale_t).max(0.001);
@@ -553,14 +603,11 @@ fn transition_rotateswap(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -
     let p = uniforms.progress();
     let twist = uniforms.data[5][3] * std::f32::consts::PI * 2.0;
     let bg = uniforms.data[3];
-    let old_uv = rotate_uv(uniforms, uv, [0.5, 0.5], mix(1.0, 0.25, p), twist * p);
-    let new_uv = rotate_uv(
-        uniforms,
-        uv,
-        [0.5, 0.5],
-        mix(0.25, 1.0, p),
-        twist * (p - 1.0),
-    );
+    // `rotateswap` reads no `centerx`/`centery` (`rotatetrans.cpp:394-475`); its
+    // pivot is the destination bitmap's centre (`:339-340`).
+    let center = uniforms.default_center();
+    let old_uv = rotate_uv(uniforms, uv, center, mix(1.0, 0.25, p), twist * p);
+    let new_uv = rotate_uv(uniforms, uv, center, mix(0.25, 1.0, p), twist * (p - 1.0));
     let old_color = sample_old(faces, old_uv, bg);
     let new_color = sample_new(faces, new_uv, bg);
     mix4(old_color, new_color, p)
@@ -573,21 +620,31 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 
 fn transition_ripple(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f32; 4] {
     let p = uniforms.progress();
-    let screen = uniforms.viewport_size();
+    // `ripple.cpp` builds its displacement tables from `Width`/`Height` (the
+    // destination bitmap, `:1072`) and `rwidth`/`maxdrift` are pixels of that
+    // bitmap (`:1478-1525`): `local / extent` is the old frame uv with the
+    // window removed, so the front, the band and the drift are
+    // destination-locked.
+    let image = uniforms.image_rect();
+    let extent = [image[2].max(1.0), image[3].max(1.0)];
     let roundness = uniforms.data[7][0].max(0.01);
-    let aspect_vec = [screen[0] / screen[1] / roundness, roundness];
-    let center = transition_center(uniforms, [0.5, 0.5]);
+    let aspect_vec = [extent[0] / extent[1] / roundness, roundness];
+    let center = uniforms.transition_center();
+    let local = uniforms.image_local(uv);
+    let center_local = uniforms.image_local(center);
+    let local_uv = [local[0] / extent[0], local[1] / extent[1]];
+    let center_uv = [center_local[0] / extent[0], center_local[1] / extent[1]];
     let delta = [
-        (uv[0] - center[0]) * aspect_vec[0],
-        (uv[1] - center[1]) * aspect_vec[1],
+        (local_uv[0] - center_uv[0]) * aspect_vec[0],
+        (local_uv[1] - center_uv[1]) * aspect_vec[1],
     ];
     let dist = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
     let corner = [
-        center[0].max(1.0 - center[0]) * aspect_vec[0],
-        center[1].max(1.0 - center[1]) * aspect_vec[1],
+        center_uv[0].max(1.0 - center_uv[0]) * aspect_vec[0],
+        center_uv[1].max(1.0 - center_uv[1]) * aspect_vec[1],
     ];
     let max_dist = (corner[0] * corner[0] + corner[1] * corner[1]).sqrt();
-    let width = uniforms.data[6][3] / screen[0].min(screen[1]);
+    let width = uniforms.data[6][3] / extent[0].min(extent[1]);
     let front = p * (max_dist + width * uniforms.data[7][1]);
     let reveal = 1.0 - smoothstep(front - width, front + width, dist);
     let dir = {
@@ -599,7 +656,7 @@ fn transition_ripple(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f
     };
     let wave = ((dist - front) * uniforms.data[7][1] * 24.0).sin();
     let envelope = (-(dist - front).abs() / (width * 3.0).max(0.001)).exp() * (1.0 - p);
-    let drift = wave * envelope * uniforms.data[7][2] / screen[0].min(screen[1]);
+    let drift = wave * envelope * uniforms.data[7][2] / extent[0].min(extent[1]);
     let sample_uv = [uv[0] + dir[0] * drift, uv[1] + dir[1] * drift];
     let old_color = sample_old(faces, sample_uv, faces.old.sample(uv));
     let new_color = sample_new(faces, sample_uv, faces.new.sample(uv));
@@ -828,5 +885,169 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The uniform block a window `scale` times the game's screen produces:
+    /// the physical viewport is the content size times `scale` and the render
+    /// transform is that scale (`krkr-render`'s `transition_uniforms` with
+    /// `config.width/height` twice the content).  The destination rectangle
+    /// stays in the layer's own logical pixels.
+    fn window_scaled(uniforms: &Uniforms, scale: f32) -> Uniforms {
+        let mut scaled = *uniforms;
+        scaled.data[1][0] *= scale;
+        scaled.data[1][1] *= scale;
+        scaled.data[9][0] = scale;
+        scaled
+    }
+
+    fn pattern(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                data.extend_from_slice(&pixel(x, y));
+            }
+        }
+        data
+    }
+
+    /// The reported symptom, pinned: `universal` must sample its rule in the
+    /// destination bitmap's logical pixels, so a 2x window must not tile the
+    /// rule 2x2.  The rule's left half is black and its right half white; at
+    /// progress 0.5 with the default `vague` (64) the threshold `phase` is
+    /// 0.625, so black takes the incoming face and white keeps the outgoing
+    /// one, with a wide margin on both sides.
+    #[test]
+    fn universal_rule_does_not_repeat_across_a_larger_window() {
+        let (width, height) = (8u32, 4u32);
+        let old = solid(width, height, [220, 30, 20, 255]);
+        let new = solid(width, height, [20, 40, 230, 255]);
+        let rule = pattern(width, height, |x, _| {
+            if x < width / 2 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        });
+        let faces = Faces {
+            old: Face::new(&old, width, height),
+            new: Face::new(&new, width, height),
+            under: Face::EMPTY,
+            rule: Face::new(&rule, width, height),
+        };
+        let mut frame_transition = transition(TransitionMethod::Universal, 0.5, 1000.0);
+        frame_transition.rule_texture_id = Some(7);
+        for scale in [1.0f32, 2.0] {
+            let uniforms = window_scaled(
+                &Uniforms::for_transition(&frame_transition, width as f32, height as f32, false),
+                scale,
+            );
+            // 0.375 is left of the split (the rule's black half) and 0.625
+            // right of it.  A sample tiled in window space would have its
+            // split at 0.25 and 0.75 instead and flip both of these.
+            let left = kernel_pixel(&uniforms, [0.375, 0.5], &faces);
+            assert!(
+                left[2] > 0.75 && left[0] < 0.25,
+                "at {scale}x the rule's black half must take the incoming (blue) \
+                 face, got {left:?}"
+            );
+            let right = kernel_pixel(&uniforms, [0.625, 0.5], &faces);
+            assert!(
+                right[0] > 0.75 && right[2] < 0.25,
+                "at {scale}x the rule's white half must keep the outgoing (red) \
+                 face, got {right:?}"
+            );
+        }
+    }
+
+    /// The invariant the window-space bug violated: at a given *logical* pixel
+    /// every kernel's output is the same whether the window renders it 1:1 or
+    /// at 2x.  A logical pixel centre's uv is the same in both blocks (the
+    /// frame uv normalizes by the physical viewport, which doubles with the
+    /// window), so the two evaluations are the same screen position.
+    /// Patterned faces make any geometry difference visible.
+    #[test]
+    fn every_kernel_ignores_the_window_scale() {
+        let (width, height) = (8u32, 4u32);
+        let old = pattern(width, height, |x, y| {
+            [30 + x as u8 * 27, 20 + y as u8 * 61, 90, 255]
+        });
+        let new = pattern(width, height, |x, y| {
+            [50, 60 + x as u8 * 21, 30 + y as u8 * 53, 255]
+        });
+        let rule = pattern(width, height, |x, _| {
+            if x < width / 2 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        });
+        let under = solid(width, height, [10, 200, 90, 255]);
+        let faces = Faces {
+            old: Face::new(&old, width, height),
+            new: Face::new(&new, width, height),
+            under: Face::new(&under, width, height),
+            rule: Face::new(&rule, width, height),
+        };
+        for method in [
+            TransitionMethod::Crossfade,
+            TransitionMethod::Universal,
+            TransitionMethod::Scroll,
+            TransitionMethod::Wave,
+            TransitionMethod::Mosaic,
+            TransitionMethod::Turn,
+            TransitionMethod::RotateZoom,
+            TransitionMethod::RotateVanish,
+            TransitionMethod::RotateSwap,
+            TransitionMethod::Ripple,
+        ] {
+            for progress in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+                let mut frame_transition = transition(method, progress, 1000.0);
+                frame_transition.rule_texture_id = Some(7);
+                let base =
+                    Uniforms::for_transition(&frame_transition, width as f32, height as f32, true);
+                let doubled = window_scaled(&base, 2.0);
+                for y in 0..height {
+                    for x in 0..width {
+                        let uv = [
+                            (x as f32 + 0.5) / width as f32,
+                            (y as f32 + 0.5) / height as f32,
+                        ];
+                        assert_eq!(
+                            kernel_pixel(&base, uv, &faces),
+                            kernel_pixel(&doubled, uv, &faces),
+                            "{} at {uv:?} (progress {progress}) depends on the window scale",
+                            method.as_name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `centerx`/`centery` are destination-bitmap pixels, so the pivot's uv is
+    /// the destination's own logical position at any window scale, and the
+    /// default is the destination bitmap's centre (`rotatetrans.cpp:185-186`).
+    #[test]
+    fn rotate_pivot_is_destination_logical() {
+        let (width, height) = (8.0f32, 4.0f32);
+        let mut explicit = transition(TransitionMethod::RotateZoom, 0.5, 1000.0);
+        explicit.params.center_x = 2.0;
+        explicit.params.center_y = 1.0;
+        let base = Uniforms::for_transition(&explicit, width, height, false);
+        assert_eq!(base.transition_center(), [0.25, 0.25], "2/8, 1/4");
+        assert_eq!(
+            window_scaled(&base, 2.0).transition_center(),
+            base.transition_center(),
+            "the pivot must not move with the window"
+        );
+
+        let default = Uniforms::for_transition(
+            &transition(TransitionMethod::RotateZoom, 0.5, 1000.0),
+            width,
+            height,
+            false,
+        );
+        assert_eq!(default.transition_center(), [0.5, 0.5]);
+        assert_eq!(window_scaled(&default, 2.0).transition_center(), [0.5, 0.5]);
     }
 }

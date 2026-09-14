@@ -15,8 +15,9 @@
 //   scroll         approximate  direction from the numeric `from` code only, band
 //                               widths linear in `progress`
 //   mosaic         approximate  sine block ramp against the reference's integer
-//                               triangle, grid anchored at the frame origin
-//                               instead of re-centred on the image
+//                               triangle, grid anchored at the destination
+//                               bitmap's origin instead of re-centred on the
+//                               image
 //   turn           approximate  no fold table, no specular gloss, pseudo-random
 //                               tile order instead of the diagonal phase sweep
 //   rotatezoom     approximate  twist runs the other way, fixed pivot, in-quad
@@ -88,6 +89,58 @@ fn viewport_size() -> vec2<f32> {
     return max(uniforms.data[1].xy, vec2<f32>(1.0, 1.0));
 }
 
+// Screen transitions run over the whole frame surface; these accessors expose
+// the extra state the extrans kernels need on top of `data[0..8]`.
+//
+//   data[8]  = the destination layer's rectangle in logical frame pixels
+//              (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6513-6540`); zero
+//              width/height means the destination has no measurable geometry.
+//   data[9]  = logical -> physical transform of the frame (scale, offset x,
+//              offset y) and whether the under pass (binding 7) was rendered.
+//   data[10] = the transition's duration in milliseconds (`Time`), 0 when the
+//              caller did not supply the clock.
+fn image_rect() -> vec4<f32> {
+    return uniforms.data[8];
+}
+
+fn transform_scale() -> f32 {
+    return max(uniforms.data[9].x, 1.0e-6);
+}
+
+fn transform_offset() -> vec2<f32> {
+    return uniforms.data[9].yz;
+}
+
+fn under_available() -> bool {
+    return uniforms.data[9].w >= 0.5;
+}
+
+fn duration_millis() -> f32 {
+    return max(uniforms.data[10].x, 0.0);
+}
+
+// Every kernel's geometry is measured in the destination layer's own bitmap
+// pixels, which is where the reference's handlers work: `tTVPDivisibleData::
+// Left`/`Top` are offsets inside that bitmap (`LayerIntf.cpp:6575-6576`), and
+// the rule's sampling and repeat, the rotate pivots, the mosaic blocks, the
+// turn tiles and the ripple front are all taken in those pixels.  The frame's
+// physical viewport -- the window's size and its DPI scale -- must never enter
+// it: expressing this geometry in window pixels repeated a rule transition
+// once per (window / rule) axis, four quarter-screen copies at a 2x window.
+//
+// `image_local` maps a frame uv to destination-bitmap pixels and `frame_uv` is
+// its inverse; both read the same transform the wave kernel already converts
+// with (`(uv * frame - origin) / scale`).
+fn image_local(uv: vec2<f32>) -> vec2<f32> {
+    let image = image_rect();
+    return (uv * viewport_size() - transform_offset()) / transform_scale() - image.xy;
+}
+
+fn frame_uv(local: vec2<f32>) -> vec2<f32> {
+    let image = image_rect();
+    return (transform_offset() + (image.xy + local) * transform_scale()) / viewport_size();
+}
+
 fn in_bounds(uv: vec2<f32>) -> bool {
     return uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0;
 }
@@ -139,13 +192,25 @@ fn transition_universal(uv: vec2<f32>) -> vec4<f32> {
     let new_color = textureSample(new_image, new_sampler, uv);
     var rule_value = uv.x;
     if (uniforms.data[0].z > 0.5) {
-        let screen = viewport_size();
+        // The rule is read at the destination bitmap's own coordinates --
+        // `data.Left`/`data.Top`, the offsets the reference samples the rule
+        // scan line at (`TransIntf.cpp:825-851` with `LayerIntf.cpp:6575-6576`)
+        // -- and it repeats only where the reference's loader repeats it: the
+        // rule is loaded tiled to the destination layer's size
+        // (`imagepro->LoadImage(rulename, 8, 0x02ffffff, src1w, src1h, &scpro)`,
+        // `TransIntf.cpp:781`; `GraphicsLoaderIntf.cpp:869`, `:877`,
+        // `:950-975`), so the repeat period is the rule's size in *logical*
+        // destination pixels.  Taking it from the physical viewport instead
+        // tiled the whole transition once per (window / rule) axis -- four
+        // quarter-screen copies at a 2x window, the reported symptom.
+        let image = image_rect();
+        let local = image_local(uv);
         let rule_dims = vec2<f32>(textureDimensions(rule_image));
-        var rule_uv = uv * screen / max(rule_dims, vec2<f32>(1.0, 1.0));
-        if (rule_dims.x < screen.x) {
+        var rule_uv = local / max(rule_dims, vec2<f32>(1.0, 1.0));
+        if (rule_dims.x < image.z) {
             rule_uv.x = fract(rule_uv.x);
         }
-        if (rule_dims.y < screen.y) {
+        if (rule_dims.y < image.w) {
             rule_uv.y = fract(rule_uv.y);
         }
         rule_uv = clamp(rule_uv, vec2<f32>(0.0, 0.0), vec2<f32>(0.9999, 0.9999));
@@ -189,36 +254,6 @@ fn transition_scroll(uv: vec2<f32>) -> vec4<f32> {
         return sample_old(old_uv, transparent);
     }
     return transparent;
-}
-
-// Screen transitions run over the whole frame surface; these accessors expose
-// the extra state the extrans kernels need on top of `data[0..8]`.
-//
-//   data[8]  = the destination layer's rectangle in logical frame pixels
-//              (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6513-6540`); zero
-//              width/height means the destination has no measurable geometry.
-//   data[9]  = logical -> physical transform of the frame (scale, offset x,
-//              offset y) and whether the under pass (binding 7) was rendered.
-//   data[10] = the transition's duration in milliseconds (`Time`), 0 when the
-//              caller did not supply the clock.
-fn image_rect() -> vec4<f32> {
-    return uniforms.data[8];
-}
-
-fn transform_scale() -> f32 {
-    return max(uniforms.data[9].x, 1.0e-6);
-}
-
-fn transform_offset() -> vec2<f32> {
-    return uniforms.data[9].yz;
-}
-
-fn under_available() -> bool {
-    return uniforms.data[9].w >= 0.5;
-}
-
-fn duration_millis() -> f32 {
-    return max(uniforms.data[10].x, 0.0);
 }
 
 // The kernel's clock: `0` means the caller supplied no duration and the phase
@@ -270,12 +305,11 @@ fn transition_wave(uv: vec2<f32>) -> vec4<f32> {
     let frame = viewport_size();
     let image = image_rect();
     let scale = transform_scale();
-    let origin = transform_offset();
 
     // The reference's handlers work in the destination bitmap's own pixels
     // (`tTVPDivisibleData::Left/Top/Width/Height`, `LayerIntf.cpp:6513-6540`);
     // image pixels are the layer's logical pixels.
-    let local = (uv * frame - origin) / scale - image.xy;
+    let local = image_local(uv);
 
     // `StartProcess` (`wave.cpp:120-166`).
     let time = duration_millis();
@@ -345,10 +379,12 @@ fn transition_wave(uv: vec2<f32>) -> vec4<f32> {
 
 fn transition_mosaic(uv: vec2<f32>) -> vec4<f32> {
     let p = progress();
-    let screen = viewport_size();
     let pi = 3.14159265359;
     let block = max(1.0, 1.0 + sin(p * pi) * uniforms.data[5].x);
-    let block_uv = (floor(uv * screen / block) + vec2<f32>(0.5, 0.5)) * block / screen;
+    // The block grid is measured in the destination bitmap's pixels
+    // (`mosaic.cpp:123-143` anchors it from `Width`/`Height`), so the window
+    // scale cannot change the blocks.
+    let block_uv = frame_uv((floor(image_local(uv) / block) + vec2<f32>(0.5, 0.5)) * block);
     return mix(textureSample(old_image, old_sampler, block_uv), textureSample(new_image, new_sampler, block_uv), p);
 }
 
@@ -358,11 +394,15 @@ fn hash_tile(tile: vec2<f32>) -> f32 {
 
 fn transition_turn(uv: vec2<f32>) -> vec4<f32> {
     let p = progress();
-    let screen = viewport_size();
     let bg = uniforms.data[3];
-    let tile_count = max(floor(screen / 64.0), vec2<f32>(1.0, 1.0));
-    let tile = floor(uv * tile_count);
-    let local = fract(uv * tile_count);
+    // `xcount = (Width-1)/64 + 1` (`turn.cpp:141-142`): the 64x64 tile grid is
+    // counted in the destination bitmap's pixels, never the window's.
+    let extent = max(image_rect().zw, vec2<f32>(1.0, 1.0));
+    let tile_count = max(floor(extent / 64.0), vec2<f32>(1.0, 1.0));
+    let tile_size = extent / tile_count;
+    let local_px = image_local(uv);
+    let tile = floor(local_px / tile_size);
+    let local = local_px / tile_size - tile;
     let delay = hash_tile(tile) * 0.25;
     let t = clamp((p - delay) / max(1.0 - delay, 0.001), 0.0, 1.0);
     let width = max(abs(t - 0.5) * 2.0, 0.04);
@@ -370,35 +410,48 @@ fn transition_turn(uv: vec2<f32>) -> vec4<f32> {
         return bg;
     }
     let corrected_local = vec2<f32>((local.x - 0.5) / width + 0.5, local.y);
-    let sample_uv = (tile + corrected_local) / tile_count;
+    let sample_uv = frame_uv((tile + corrected_local) * tile_size);
     if (t < 0.5) {
         return textureSample(old_image, old_sampler, sample_uv);
     }
     return textureSample(new_image, new_sampler, sample_uv);
 }
 
+// Rotation happens in the destination bitmap's own pixels: `rotatetrans.cpp`
+// builds its matrix from `Width`/`Height` and `CenterX`/`CenterY` (`:66-115`),
+// so both the pivot and the pixel aspect are the destination's -- the window's
+// scale must not move or shear them.
 fn rotate_uv(uv: vec2<f32>, center: vec2<f32>, scale: f32, angle: f32) -> vec2<f32> {
-    let screen = viewport_size();
-    let aspect_vec = vec2<f32>(screen.x / screen.y, 1.0);
-    var p = (uv - center) * aspect_vec;
     let c = cos(-angle);
     let s = sin(-angle);
-    p = vec2<f32>(p.x * c - p.y * s, p.x * s + p.y * c) / max(scale, 0.001);
-    return p / aspect_vec + center;
+    let pivot = image_local(center);
+    let delta = image_local(uv) - pivot;
+    let rotated = vec2<f32>(delta.x * c - delta.y * s, delta.x * s + delta.y * c) / max(scale, 0.001);
+    return frame_uv(pivot + rotated);
 }
 
-fn transition_center(default_center: vec2<f32>) -> vec2<f32> {
-    let screen = viewport_size();
+// The destination bitmap's centre, the reference's default pivot
+// (`rotatetrans.cpp:185-186`: `centerx = src1w / 2`, `centery = src1h / 2`).
+fn default_center() -> vec2<f32> {
+    let image = image_rect();
+    return frame_uv(image.zw * 0.5);
+}
+
+// `centerx`/`centery` are destination-bitmap pixels (`rotatetrans.cpp:185-210`:
+// the default is `src1w / 2`, `src1h / 2` and the option is read as an integer
+// of that bitmap), so the pivot's uv is the destination's own logical position
+// and never depends on the window.
+fn transition_center() -> vec2<f32> {
     if (uniforms.data[6].y >= 0.0 && uniforms.data[6].z >= 0.0) {
-        return uniforms.data[6].yz / screen;
+        return frame_uv(uniforms.data[6].yz);
     }
-    return default_center;
+    return default_center();
 }
 
 fn transition_rotatezoom(uv: vec2<f32>) -> vec4<f32> {
     let p = progress();
     let pi = 3.14159265359;
-    let center = transition_center(vec2<f32>(0.5, 0.5));
+    let center = transition_center();
     let scale_t = acceleration(p, uniforms.data[5].z);
     let twist_t = acceleration(p, uniforms.data[6].x);
     let scale = mix(max(uniforms.data[5].y, 0.001), 1.0, scale_t);
@@ -415,7 +468,7 @@ fn transition_rotatezoom(uv: vec2<f32>) -> vec4<f32> {
 fn transition_rotatevanish(uv: vec2<f32>) -> vec4<f32> {
     let p = progress();
     let pi = 3.14159265359;
-    let center = transition_center(vec2<f32>(0.5, 0.5));
+    let center = transition_center();
     let scale_t = acceleration(p, uniforms.data[5].z);
     let twist_t = acceleration(p, uniforms.data[6].x);
     let scale = max(1.0 - scale_t, 0.001);
@@ -434,8 +487,11 @@ fn transition_rotateswap(uv: vec2<f32>) -> vec4<f32> {
     let pi = 3.14159265359;
     let twist = uniforms.data[5].w * pi * 2.0;
     let bg = uniforms.data[3];
-    let old_uv = rotate_uv(uv, vec2<f32>(0.5, 0.5), mix(1.0, 0.25, p), twist * p);
-    let new_uv = rotate_uv(uv, vec2<f32>(0.5, 0.5), mix(0.25, 1.0, p), twist * (p - 1.0));
+    // `rotateswap` reads no `centerx`/`centery` (`rotatetrans.cpp:394-475`); its
+    // pivot is the destination bitmap's centre (`:339-340`).
+    let center = default_center();
+    let old_uv = rotate_uv(uv, center, mix(1.0, 0.25, p), twist * p);
+    let new_uv = rotate_uv(uv, center, mix(0.25, 1.0, p), twist * (p - 1.0));
     let old_color = sample_old(old_uv, bg);
     let new_color = sample_new(new_uv, bg);
     return mix(old_color, new_color, p);
@@ -443,21 +499,27 @@ fn transition_rotateswap(uv: vec2<f32>) -> vec4<f32> {
 
 fn transition_ripple(uv: vec2<f32>) -> vec4<f32> {
     let p = progress();
-    let screen = viewport_size();
+    // `ripple.cpp` builds its displacement tables from `Width`/`Height` (the
+    // destination bitmap, `:1072`) and `rwidth`/`maxdrift` are pixels of that
+    // bitmap (`:1478-1525`): `local/extent` is the old frame uv with the window
+    // removed, so the front, the band and the drift are destination-locked.
+    let extent = max(image_rect().zw, vec2<f32>(1.0, 1.0));
     let roundness = max(uniforms.data[7].x, 0.01);
-    let aspect_vec = vec2<f32>(screen.x / screen.y / roundness, roundness);
-    let center = transition_center(vec2<f32>(0.5, 0.5));
-    let delta = (uv - center) * aspect_vec;
+    let aspect_vec = vec2<f32>(extent.x / extent.y / roundness, roundness);
+    let center = transition_center();
+    let local_uv = image_local(uv) / extent;
+    let center_uv = image_local(center) / extent;
+    let delta = (local_uv - center_uv) * aspect_vec;
     let dist = length(delta);
-    let corner = max(center, vec2<f32>(1.0, 1.0) - center) * aspect_vec;
+    let corner = max(center_uv, vec2<f32>(1.0, 1.0) - center_uv) * aspect_vec;
     let max_dist = length(corner);
-    let width = uniforms.data[6].w / min(screen.x, screen.y);
+    let width = uniforms.data[6].w / min(extent.x, extent.y);
     let front = p * (max_dist + width * uniforms.data[7].y);
     let reveal = 1.0 - smoothstep(front - width, front + width, dist);
     let dir = normalize(delta + vec2<f32>(0.0001, 0.0)) / aspect_vec;
     let wave = sin((dist - front) * uniforms.data[7].y * 24.0);
     let envelope = exp(-abs(dist - front) / max(width * 3.0, 0.001)) * (1.0 - p);
-    let drift = wave * envelope * uniforms.data[7].z / min(screen.x, screen.y);
+    let drift = wave * envelope * uniforms.data[7].z / min(extent.x, extent.y);
     let sample_uv = uv + dir * drift;
     let old_color = sample_old(sample_uv, textureSample(old_image, old_sampler, uv));
     let new_color = sample_new(sample_uv, textureSample(new_image, new_sampler, uv));
