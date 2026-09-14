@@ -8,9 +8,9 @@ use std::{
 use super::blend;
 
 use krkr_core::{
-    AudioBus, AudioCommand, AudioLoadPolicy, Color, ImageUpload, LayerId, LayerImage, LayerNode,
-    ProvinceImage, Size, TransitionMethod, TransitionParams, TransitionScrollFrom,
-    TransitionScrollStay, UnknownTransitionName,
+    AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, Color, ImageUpload, LayerId,
+    LayerImage, LayerNode, ProvinceImage, Size, TransitionMethod, TransitionParams,
+    TransitionScrollFrom, TransitionScrollStay, UnknownTransitionName,
 };
 use krkr_font::{FontSpec, FontSystem, TextLayout, TextStyle};
 use krkr_tjs2::{
@@ -3691,6 +3691,46 @@ fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: Ob
     );
 }
 
+/// The attributes the `audio` trace prints for a `WaveSoundBuffer` call: the
+/// instance id names the buffer the audio backend will play, the storage is
+/// what the script opened, and the bus is the one `play` would pick
+/// (`looping` picks [`AudioBus::Bgm`]).
+///
+/// A run can be *counted* from these lines alone (`KRKR_TRACE=audio` with
+/// `--virtual-audio` on a host with no audio device): a `play` opens a backend
+/// stream under its id, and only a `stop` with that id (or a `StopBus`) closes
+/// it, so two `play` lines whose ids never see a matching `stop` are two live
+/// streams.  `(paused)` marks an armed play whose stream stays inaudible (the
+/// reference's `Paused`, see `wave_sound_buffer_play`) and `(already playing)`
+/// a play the idempotent `Play` refused; neither adds an audible stream.
+struct WaveTraceBuffer {
+    id: AudioInstanceId,
+    storage: String,
+    bus: AudioBus,
+    playing: bool,
+    paused: bool,
+}
+
+fn wave_trace_buffer(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> Option<WaveTraceBuffer> {
+    runtime
+        .host()
+        .native_audio_buffer(handle)
+        .map(|buffer| WaveTraceBuffer {
+            id: buffer.id,
+            storage: buffer
+                .storage
+                .clone()
+                .unwrap_or_else(|| "<unopened>".to_string()),
+            bus: if buffer.looping {
+                AudioBus::Bgm
+            } else {
+                AudioBus::SoundEffect
+            },
+            playing: buffer.playing,
+            paused: buffer.paused,
+        })
+}
+
 fn wave_sound_buffer_open(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -3711,14 +3751,42 @@ fn wave_sound_buffer_open(
         .native_audio_buffer(this)
         .and_then(|buffer| buffer.storage.clone())
         .unwrap_or_default();
+    let opened_id = wave_trace_buffer(runtime, this)
+        .map(|buffer| buffer.id.0)
+        .unwrap_or_default();
     runtime.host_mut().trace(
         TraceCategory::Audio,
-        &format!("WaveSoundBuffer.open: {opened_storage}"),
+        &format!("WaveSoundBuffer.open: {opened_storage} id={opened_id}"),
     );
     set_wave_status(runtime, this, "stop");
+    // `tTJSNI_WaveSoundBuffer::Open` runs `Clear()` before it loads the
+    // decoder, and `Clear` resets the pause flag (`sound/win32/WaveImpl.cpp:
+    // 2328-2345`, `Paused = false` at `:2340`): a buffer re-opened after it
+    // was armed with `paused = true` starts unpaused.  `Play` (`:2857`) and
+    // `Stop` (`:2877`) leave the flag alone -- that is what makes an armed
+    // play silent, and `play` keeps it (see `wave_sound_buffer_play`).
+    reset_wave_pause_on_open(runtime, this);
     runtime.set_object_member(this, "position", Variant::Integer(0));
     runtime.set_object_member(this, "samplePosition", Variant::Integer(0));
     Ok(Variant::Void)
+}
+
+/// The pause state `open` leaves behind: the reference's `Clear()` resets it,
+/// but this engine's `open` does not stop an already-playing stream (that
+/// play-time teardown is a separate divergence, filed as a finding), so the
+/// flag is only rewritten where the reference's reset is observable for the
+/// `open` + `paused` + `play` flows the games use -- on a buffer that is not
+/// playing, where it is a pure flag write with no backend command.
+fn reset_wave_pause_on_open(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    let playing = runtime
+        .host()
+        .native_audio_buffer(handle)
+        .is_some_and(|buffer| buffer.playing);
+    if playing {
+        return;
+    }
+    runtime.host_mut().set_native_audio_paused(handle, false);
+    set_wave_paused(runtime, handle, false);
 }
 
 fn wave_sound_buffer_play(
@@ -3727,39 +3795,54 @@ fn wave_sound_buffer_play(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     let this = native_audio_this(runtime, this_obj, "WaveSoundBuffer.play")?;
-    if runtime
-        .host()
-        .native_audio_buffer(this)
-        .is_some_and(|buffer| buffer.playing)
+    if let Some(buffer) = wave_trace_buffer(runtime, this)
+        && buffer.playing
     {
         // BaseSoundBuffer::Play is idempotent while already playing; do not
         // enqueue a second backend voice or emit a duplicate status event.
+        runtime.host_mut().trace(
+            TraceCategory::Audio,
+            &format!(
+                "WaveSoundBuffer.play: {} bus={:?} id={} (already playing)",
+                buffer.storage, buffer.bus, buffer.id.0
+            ),
+        );
         return Ok(Variant::Void);
     }
     sync_wave_buffer_settings(runtime, this)?;
-    let bus = if runtime
-        .host()
-        .native_audio_buffer(this)
-        .is_some_and(|buffer| buffer.looping)
-    {
-        AudioBus::Bgm
-    } else {
-        AudioBus::SoundEffect
+    let Some(buffer) = wave_trace_buffer(runtime, this) else {
+        return Err(TjsError::runtime("WaveSoundBuffer is not initialized"));
     };
-    let play_storage = runtime
-        .host()
-        .native_audio_buffer(this)
-        .and_then(|buffer| buffer.storage.clone())
-        .unwrap_or_else(|| "<unopened>".to_string());
     runtime.host_mut().trace(
         TraceCategory::Audio,
-        &format!("WaveSoundBuffer.play: {play_storage} bus={bus:?}"),
+        &format!(
+            "WaveSoundBuffer.play: {} bus={:?} id={}{}",
+            buffer.storage,
+            buffer.bus,
+            buffer.id.0,
+            if buffer.paused { " (paused)" } else { "" }
+        ),
     );
+    // `tTJSNI_WaveSoundBuffer::Play` (`sound/win32/WaveImpl.cpp:2857-2875`)
+    // starts the playback *without touching `Paused`*: an armed buffer
+    // (`paused = 1` before the call) becomes `status == "play"` but silent --
+    // `StartPlay` skips `SoundBuffer->Play` while paused (`:2824-2828`) and
+    // the beat stops the DirectSound buffer (`:2539-2549`).  The engine's own
+    // play path clears the flag (`queue_native_audio_play`), so carry it
+    // across: the backend gets the play, then the pause that keeps the armed
+    // stream inaudible until the script resumes it.  PARQUET's option screen
+    // arms its movie-audio sample exactly this way
+    // (`MovieAudioSamplePlayer`: `paused = 1` + `play`), and without this the
+    // sample starts over the title BGM as a second audible track.
+    let was_paused = buffer.paused;
     runtime
         .host_mut()
-        .queue_native_audio_play(this, bus, AudioLoadPolicy::Auto)?;
+        .queue_native_audio_play(this, buffer.bus, AudioLoadPolicy::Auto)?;
+    if was_paused {
+        runtime.host_mut().set_native_audio_paused(this, true);
+    }
     let status_changed = set_wave_status(runtime, this, "play");
-    let paused_changed = set_wave_paused(runtime, this, false);
+    let paused_changed = set_wave_paused(runtime, this, was_paused);
     if status_changed || paused_changed {
         call_wave_status_changed(runtime, this)?;
     }
@@ -3787,9 +3870,12 @@ fn wave_sound_buffer_stop(
         .native_audio_buffer(this)
         .and_then(|buffer| buffer.storage.clone())
         .unwrap_or_else(|| "<unopened>".to_string());
+    let stop_id = wave_trace_buffer(runtime, this)
+        .map(|buffer| buffer.id.0)
+        .unwrap_or_default();
     runtime.host_mut().trace(
         TraceCategory::Audio,
-        &format!("WaveSoundBuffer.stop: {stop_storage}"),
+        &format!("WaveSoundBuffer.stop: {stop_storage} id={stop_id}"),
     );
     runtime.host_mut().cancel_audio_fade_completion(this);
     if let Some(id) = runtime
@@ -3890,9 +3976,14 @@ fn wave_sound_buffer_fade(
         .native_audio_buffer(this)
         .and_then(|buffer| buffer.storage.clone())
         .unwrap_or_else(|| "<unopened>".to_string());
+    let fade_id = wave_trace_buffer(runtime, this)
+        .map(|buffer| buffer.id.0)
+        .unwrap_or_default();
     runtime.host_mut().trace(
         TraceCategory::Audio,
-        &format!("WaveSoundBuffer.fade: {fade_storage} target={target} millis={millis}"),
+        &format!(
+            "WaveSoundBuffer.fade: {fade_storage} target={target} millis={millis} id={fade_id}"
+        ),
     );
     runtime
         .host_mut()
@@ -11883,6 +11974,139 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("F:0".to_string()));
+    }
+
+    /// `tTJSNI_WaveSoundBuffer::Play` starts the playback without touching
+    /// `Paused` (`sound/win32/WaveImpl.cpp:2857-2875`): a buffer armed with
+    /// `paused = true` before `play()` reports `status == "play"` and stays
+    /// silent, because `StartPlay` skips `SoundBuffer->Play` while paused
+    /// (`:2824-2828`) and the beat stops the DirectSound buffer (`:2539-2549`).
+    /// KRKR's own system scripts rely on that -- PARQUET's
+    /// `MovieAudioSamplePlayer` arms its movie-audio sample exactly this way
+    /// when the option screen opens (`paused = 1` + `play`) -- so the engine's
+    /// play path must carry the pause into the backend command; otherwise the
+    /// armed sample starts as a second audible track.
+    #[test]
+    fn wave_sound_buffer_play_keeps_an_armed_pause() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_armed_pause.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.looping = 1;
+                buffer.open("bgm91.opus");
+                buffer.paused = 1;
+                buffer.play();
+                return buffer.status + ":" + buffer.paused;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("play:1".to_string()));
+
+        let commands = engine.host_mut().take_audio_commands();
+        let [
+            AudioCommand::Preload { .. },
+            AudioCommand::Play { id: play_id, .. },
+            AudioCommand::Pause { id: pause_id, .. },
+        ] = &commands[..]
+        else {
+            panic!("an armed play must reach the backend as play + pause, got {commands:?}");
+        };
+        // The pause arms the play itself -- same stream, not another buffer.
+        assert_eq!(play_id, pause_id);
+    }
+
+    /// `Open` runs `Clear()` before it loads the decoder, and `Clear` resets
+    /// the pause flag (`sound/win32/WaveImpl.cpp:2328-2345`, `Paused = false`
+    /// at `:2340`): a buffer re-opened after an armed pause starts unpaused,
+    /// so the pause-preserving `play` cannot leak silence into an ordinary
+    /// `open` + `play` flow.
+    #[test]
+    fn wave_sound_buffer_open_resets_an_armed_pause() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_open_reset.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.open("first.ogg");
+                buffer.paused = 1;
+                buffer.open("second.ogg");
+                return buffer.status + ":" + buffer.paused;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("stop:0".to_string()));
+    }
+
+    /// The two-BGM shape of the report: a looping title BGM on one buffer,
+    /// then PARQUET's option screen arming a *second* BGM buffer paused (its
+    /// `MovieAudioSamplePlayer` constructor loads the sample's own `BGM`
+    /// manager and plays the sample with `paused = 1`).  Folding the engine's
+    /// commands the way the audio worker does (`handle_audio_command`), exactly
+    /// one Bgm stream may be left playing unpaused -- before the `play` fix
+    /// the armed sample started audible and the settings screen played the
+    /// title BGM a second time.
+    #[test]
+    fn armed_second_bgm_buffer_leaves_one_audible_stream() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "parquet_two_bgm.tjs",
+                r#"
+                var title = new WaveSoundBuffer();
+                title.looping = 1;
+                title.open("bgm91.opus");
+                title.play();
+
+                var sample = new WaveSoundBuffer();
+                sample.looping = 1;
+                sample.open("bgm91.opus");
+                sample.paused = 1;
+                sample.play();
+
+                return title.status + ":" + title.paused
+                    + ":" + sample.status + ":" + sample.paused;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("play:0:play:1".to_string()),
+            "the title BGM plays and the armed sample reports play while paused"
+        );
+
+        let mut audible = BTreeSet::new();
+        for command in engine.host_mut().take_audio_commands() {
+            match command {
+                AudioCommand::Play {
+                    id,
+                    bus: AudioBus::Bgm,
+                    ..
+                } => {
+                    audible.insert(id.0);
+                }
+                AudioCommand::Pause { id, .. } | AudioCommand::Stop { id, .. } => {
+                    audible.remove(&id.0);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            audible.len(),
+            1,
+            "two Bgm streams started, but only the un-armed one may be audible"
+        );
     }
 
     /// PARQUET's voice-filter wrapper reads the member first:
