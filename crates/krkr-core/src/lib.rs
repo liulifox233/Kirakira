@@ -1008,11 +1008,16 @@ pub enum TransitionMethod {
     /// worth recording because it was once wrong.  The provider loads the rule
     /// **tiled to the destination layer's own size**
     /// (`imagepro->LoadImage(rulename, 8, 0x02ffffff, src1w, src1h, &scpro)`,
-    /// `krkrz/visual/TransIntf.cpp:781`; the loader grows the buffer to that
-    /// size and repeats the source into it, `GraphicsLoaderIntf.cpp:869`,
-    /// `:877`, `:960`, `:969`) and samples it at `data.Left`/`data.Top` --
-    /// offsets *inside* that bitmap, in its own logical pixels
-    /// (`krkrz/visual/LayerIntf.cpp:6575-6576`, read at `TransIntf.cpp:825-851`).
+    /// `TransIntf.cpp:781`, handed the destination layer's `GetWidth()`/
+    /// `GetHeight()` at `LayerIntf.cpp:6336-6346`; the loader grows its buffer
+    /// to that size and repeats the source into it
+    /// (`TVPLoadGraphic_SizeCallback`, `GraphicsLoaderIntf.cpp:1795-1824`, the
+    /// clamp at `:1803`; `TVPLoadGraphic_ScanLineCallback`, `:1886`, `:1895`,
+    /// `:1915`; the contract is stated at `:2286`) and samples it at
+    /// `data.Left`/`data.Top` -- offsets *inside* that bitmap, in its own
+    /// logical pixels (`LayerIntf.cpp:6665-6676`, read at
+    /// `TransIntf.cpp:825-851`: the scan line at `:836`, `rule += data->Left`
+    /// at `:851`).
     /// So the repeat period is the rule's natural size, a screen-sized rule is
     /// never repeated at all, and neither the window's size nor the DPI scale
     /// enters the geometry.  `transition_universal`
@@ -1361,7 +1366,7 @@ impl Default for TransitionParams {
 /// Official KRKR keeps a transition per layer (`tTJSNI_BaseLayer::InTransition`,
 /// `LayerIntf.cpp:6334`) and the handler composites the destination and source
 /// bitmaps inside the destination layer's own rectangle
-/// (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6513-6540`).  `dest_rect` is that
+/// (`tTVPDivisibleData`, `LayerIntf.cpp:6665-6676`).  `dest_rect` is that
 /// rectangle in frame coordinates, so unrelated layers can transition at the
 /// same time and each one only rewrites its own area.  `None` means the
 /// destination has no measurable geometry, and the composite then covers the

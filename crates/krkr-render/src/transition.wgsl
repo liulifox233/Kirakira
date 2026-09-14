@@ -93,7 +93,8 @@ fn viewport_size() -> vec2<f32> {
 // the extra state the extrans kernels need on top of `data[0..8]`.
 //
 //   data[8]  = the destination layer's rectangle in logical frame pixels
-//              (`tTVPDivisibleData::Dest`, `LayerIntf.cpp:6513-6540`); zero
+//              (`tTVPDivisibleData` filled in `tTransDrawable::DrawCompleted`,
+//              `LayerIntf.cpp:6665-6676`; `Dest` at `:6735`); zero
 //              width/height means the destination has no measurable geometry.
 //   data[9]  = logical -> physical transform of the frame (scale, offset x,
 //              offset y) and whether the under pass (binding 7) was rendered.
@@ -121,7 +122,7 @@ fn duration_millis() -> f32 {
 
 // Every kernel's geometry is measured in the destination layer's own bitmap
 // pixels, which is where the reference's handlers work: `tTVPDivisibleData::
-// Left`/`Top` are offsets inside that bitmap (`LayerIntf.cpp:6575-6576`), and
+// Left`/`Top` are offsets inside that bitmap (`LayerIntf.cpp:6665-6676`), and
 // the rule's sampling and repeat, the rotate pivots, the mosaic blocks, the
 // turn tiles and the ripple front are all taken in those pixels.  The frame's
 // physical viewport -- the window's size and its DPI scale -- must never enter
@@ -194,15 +195,20 @@ fn transition_universal(uv: vec2<f32>) -> vec4<f32> {
     if (uniforms.data[0].z > 0.5) {
         // The rule is read at the destination bitmap's own coordinates --
         // `data.Left`/`data.Top`, the offsets the reference samples the rule
-        // scan line at (`TransIntf.cpp:825-851` with `LayerIntf.cpp:6575-6576`)
-        // -- and it repeats only where the reference's loader repeats it: the
-        // rule is loaded tiled to the destination layer's size
-        // (`imagepro->LoadImage(rulename, 8, 0x02ffffff, src1w, src1h, &scpro)`,
-        // `TransIntf.cpp:781`; `GraphicsLoaderIntf.cpp:869`, `:877`,
-        // `:950-975`), so the repeat period is the rule's size in *logical*
-        // destination pixels.  Taking it from the physical viewport instead
-        // tiled the whole transition once per (window / rule) axis -- four
-        // quarter-screen copies at a 2x window, the reported symptom.
+        // scan line at (`tTVPUniversalTransHandler::Blend`, `TransIntf.cpp:
+        // 825-851`: the scan line is fetched at `:836`, `:851` adds
+        // `data->Left`; the offsets come from `tTransDrawable::DrawCompleted`,
+        // `LayerIntf.cpp:6665-6676`) -- and it repeats only where the
+        // reference's loader repeats it: `TransIntf.cpp:781` hands `LoadImage`
+        // the *destination layer's* size (`LayerIntf.cpp:6336-6346`),
+        // `TVPLoadGraphic_SizeCallback` grows the rule buffer to it
+        // (`GraphicsLoaderIntf.cpp:1795-1824`, the clamp at `:1803`) and
+        // `TVPLoadGraphic_ScanLineCallback` repeats the source into it
+        // (`:1886`, `:1895`, `:1915`; the contract is stated at `:2286`).  So
+        // the repeat period is the rule's size in *logical* destination
+        // pixels.  Taking it from the physical viewport instead tiled the
+        // whole transition once per (window / rule) axis -- four quarter-screen
+        // copies at a 2x window, the reported symptom.
         let image = image_rect();
         let local = image_local(uv);
         let rule_dims = vec2<f32>(textureDimensions(rule_image));
@@ -307,7 +313,7 @@ fn transition_wave(uv: vec2<f32>) -> vec4<f32> {
     let scale = transform_scale();
 
     // The reference's handlers work in the destination bitmap's own pixels
-    // (`tTVPDivisibleData::Left/Top/Width/Height`, `LayerIntf.cpp:6513-6540`);
+    // (`tTVPDivisibleData::Left/Top/Width/Height`, `LayerIntf.cpp:6665-6676`);
     // image pixels are the layer's logical pixels.
     let local = image_local(uv);
 
@@ -520,7 +526,14 @@ fn transition_ripple(uv: vec2<f32>) -> vec4<f32> {
     let wave = sin((dist - front) * uniforms.data[7].y * 24.0);
     let envelope = exp(-abs(dist - front) / max(width * 3.0, 0.001)) * (1.0 - p);
     let drift = wave * envelope * uniforms.data[7].z / min(extent.x, extent.y);
-    let sample_uv = uv + dir * drift;
+    // The displacement is a radial step inside the destination bitmap's own
+    // pixels -- `dir * drift * extent` is that step, the same space the front
+    // and the band are measured in -- and the sampled position maps back
+    // through `frame_uv`.  Adding it to the frame uv instead would be off by
+    // the destination's placement in the frame (a sub-rect destination, a
+    // letterboxed window).
+    let sampled = image_local(uv) + dir * drift * extent;
+    let sample_uv = frame_uv(sampled);
     let old_color = sample_old(sample_uv, textureSample(old_image, old_sampler, uv));
     let new_color = sample_new(sample_uv, textureSample(new_image, new_sampler, uv));
     return mix(old_color, new_color, reveal);

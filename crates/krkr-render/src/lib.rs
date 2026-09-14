@@ -1843,8 +1843,10 @@ fn transition_uniforms(
     } else {
         params.bg_color1
     };
-    // `tTVPDivisibleData::Dest` (`LayerIntf.cpp:6513-6540`) in logical frame
-    // pixels.  A destination without measurable geometry makes the composite
+    // `tTVPDivisibleData` (`LayerIntf.cpp:6665-6676`: `Left`/`Top`/`Width`/
+    // `Height` filled in `tTransDrawable::DrawCompleted`, `Dest` at `:6735`)
+    // in logical frame pixels.  A destination without measurable geometry makes
+    // the composite
     // cover the whole frame, and the reference's handlers then work on the
     // whole layer bitmap, which is the frame's content size here.
     let image_rect = transition
@@ -2509,6 +2511,10 @@ mod tests {
         };
         const W: u32 = 64;
         const H: u32 = 16;
+        // The repeat case's rule: a quarter of the destination's size, so the
+        // loader's tiling applies.
+        const SMALL_W: u32 = 4;
+        const SMALL_H: u32 = 2;
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let pipeline = TransitionPipelineResources::new(&device, format);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2521,18 +2527,18 @@ mod tests {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        let upload = |pixel: fn(u32, u32) -> [u8; 4], label: &str| {
-            let mut data = Vec::with_capacity((W * H * 4) as usize);
-            for y in 0..H {
-                for x in 0..W {
+        let upload = |pixel: fn(u32, u32) -> [u8; 4], width: u32, height: u32, label: &str| {
+            let mut data = Vec::with_capacity((width * height * 4) as usize);
+            for y in 0..height {
+                for x in 0..width {
                     data.extend_from_slice(&pixel(x, y));
                 }
             }
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
-                    width: W,
-                    height: H,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -2552,12 +2558,12 @@ mod tests {
                 &data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(W * 4),
-                    rows_per_image: Some(H),
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
-                    width: W,
-                    height: H,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -2565,10 +2571,14 @@ mod tests {
         };
         let old_view = upload(
             |_, _| [220, 30, 20, 255],
+            W,
+            H,
             "Kirakira test universal old face",
         );
         let new_view = upload(
             |_, _| [20, 40, 230, 255],
+            W,
+            H,
             "Kirakira test universal new face",
         );
         let rule_view = upload(
@@ -2579,7 +2589,23 @@ mod tests {
                     [255, 255, 255, 255]
                 }
             },
+            W,
+            H,
             "Kirakira test universal rule",
+        );
+        // The same split at a quarter of the destination's size: the rule the
+        // loader repeats (`fract(local / rule_dims)`).
+        let small_rule_view = upload(
+            |x, _| {
+                if x < SMALL_W / 2 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            },
+            SMALL_W,
+            SMALL_H,
+            "Kirakira test universal small rule",
         );
 
         let transition = FrameTransition {
@@ -2602,7 +2628,11 @@ mod tests {
             source_image_uploads: Vec::new(),
         };
 
-        let render = |uniforms: &TransitionUniforms, width: u32, height: u32| -> Vec<u8> {
+        let render = |uniforms: &TransitionUniforms,
+                      width: u32,
+                      height: u32,
+                      rule: &wgpu::TextureView|
+         -> Vec<u8> {
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Kirakira test universal uniforms"),
                 contents: bytemuck::cast_slice(&[*uniforms]),
@@ -2634,7 +2664,7 @@ mod tests {
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: wgpu::BindingResource::TextureView(&rule_view),
+                        resource: wgpu::BindingResource::TextureView(rule),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
@@ -2763,7 +2793,7 @@ mod tests {
                 Size::new(W as f32, H as f32),
                 false,
             );
-            let mapped = render(&uniforms, viewport.0, viewport.1);
+            let mapped = render(&uniforms, viewport.0, viewport.1, &rule_view);
             let pixel = |x: u32, y: u32| -> [f32; 4] {
                 let index = ((y * viewport.0 + x) * 4) as usize;
                 [
@@ -2789,6 +2819,48 @@ mod tests {
                  face, got {right:?}"
             );
         }
+
+        // The repeat case: a rule a quarter of the destination's size, at the
+        // 2x window.  `fract(local / rule_dims)` lays the black/white split
+        // every four *logical* pixels from the destination's own origin, so
+        // physical pixel 3 (logical 1.5) is inside the first black copy and
+        // physical pixel 4 (logical 2) the first white one.  A sample tiled in
+        // window space repeats every two logical pixels here and flips both.
+        let uniforms = transition_uniforms(
+            &transition,
+            (W * 2) as f32,
+            (H * 2) as f32,
+            RenderTransform {
+                x_scale: 2.0,
+                y_scale: 2.0,
+                x_offset: 0.0,
+                y_offset: 0.0,
+            },
+            Size::new(W as f32, H as f32),
+            false,
+        );
+        let mapped = render(&uniforms, W * 2, H * 2, &small_rule_view);
+        let pixel = |x: u32, y: u32| -> [f32; 4] {
+            let index = ((y * W * 2 + x) * 4) as usize;
+            [
+                mapped[index] as f32 / 255.0,
+                mapped[index + 1] as f32 / 255.0,
+                mapped[index + 2] as f32 / 255.0,
+                mapped[index + 3] as f32 / 255.0,
+            ]
+        };
+        let black = pixel(3, H);
+        assert!(
+            black[2] > 0.75 && black[0] < 0.25,
+            "the small rule's first black copy must take the incoming (blue) face, \
+             got {black:?}"
+        );
+        let white = pixel(4, H);
+        assert!(
+            white[0] > 0.75 && white[2] < 0.25,
+            "the small rule's first white copy must keep the outgoing (red) face, \
+             got {white:?}"
+        );
     }
 
     /// The shader text and the CPU mirror must carry the same constants and the

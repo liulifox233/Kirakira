@@ -60,8 +60,9 @@ impl Uniforms {
         } else {
             params.bg_color1
         };
-        // `tTVPDivisibleData::Dest` (`LayerIntf.cpp:6513-6540`) in logical
-        // frame pixels; without measurable geometry the composite covers the
+        // `tTVPDivisibleData` (`LayerIntf.cpp:6665-6676`: `Left`/`Top`/
+        // `Width`/`Height` filled in `DrawCompleted`) in logical frame
+        // pixels; without measurable geometry the composite covers the
         // whole frame, which is the content size here.
         let image_rect = transition
             .dest_rect
@@ -142,7 +143,7 @@ impl Uniforms {
 
     /// The destination-bitmap coordinates a frame uv samples -- the shader's
     /// `image_local`: the reference's `data->Left`/`data->Top`
-    /// (`LayerIntf.cpp:6575-6576`), in the bitmap's own logical pixels.  The
+    /// (`LayerIntf.cpp:6665-6676`), in the bitmap's own logical pixels.  The
     /// frame's physical viewport -- the window's size and DPI scale -- never
     /// enters the geometry.
     fn image_local(&self, uv: [f32; 2]) -> [f32; 2] {
@@ -357,9 +358,10 @@ fn transition_universal(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) ->
     if uniforms.data[0][2] > 0.5 {
         // The rule is read at the destination bitmap's own coordinates and
         // repeats only where the reference's loader repeats it -- below the
-        // destination bitmap's size (`TransIntf.cpp:781`, `:825-851`,
-        // `GraphicsLoaderIntf.cpp:869-877`).  The physical viewport never
-        // enters the repeat period (the shader's `image_local`).
+        // destination bitmap's size (`TransIntf.cpp:781`, `:825-851`;
+        // `GraphicsLoaderIntf.cpp:1795-1824` grows the buffer, `:1886`,
+        // `:1895`, `:1915` tile it).  The physical viewport never enters the
+        // repeat period (the shader's `image_local`).
         let image = uniforms.image_rect();
         let local = uniforms.image_local(uv);
         let rule_dims = [
@@ -657,7 +659,17 @@ fn transition_ripple(uniforms: &Uniforms, uv: [f32; 2], faces: &Faces<'_>) -> [f
     let wave = ((dist - front) * uniforms.data[7][1] * 24.0).sin();
     let envelope = (-(dist - front).abs() / (width * 3.0).max(0.001)).exp() * (1.0 - p);
     let drift = wave * envelope * uniforms.data[7][2] / extent[0].min(extent[1]);
-    let sample_uv = [uv[0] + dir[0] * drift, uv[1] + dir[1] * drift];
+    // The displacement is a radial step inside the destination bitmap's own
+    // pixels -- `dir * drift * extent` is that step, the same space the front
+    // and the band are measured in -- and the sampled position maps back
+    // through `frame_uv`.  Adding it to the frame uv instead would be off by
+    // the destination's placement in the frame (a sub-rect destination, a
+    // letterboxed window).
+    let sampled = [
+        local[0] + dir[0] * drift * extent[0],
+        local[1] + dir[1] * drift * extent[1],
+    ];
+    let sample_uv = uniforms.frame_uv(sampled);
     let old_color = sample_old(faces, sample_uv, faces.old.sample(uv));
     let new_color = sample_new(faces, sample_uv, faces.new.sample(uv));
     mix4(old_color, new_color, reveal)
@@ -957,6 +969,53 @@ mod tests {
                  face, got {right:?}"
             );
         }
+    }
+
+    /// A rule *smaller* than the destination is the case where the loader's
+    /// repeat applies: `fract(local / rule_dims)` must count repeats in the
+    /// destination bitmap's own pixels.  An 8x4 destination with a 4x2 rule
+    /// repeats twice per axis, so the black/white split sits at logical x 2,
+    /// 4, 6; a sample tiled in window space would repeat four times at this
+    /// 2x window and flip both samples below.
+    #[test]
+    fn a_small_rule_repeats_in_destination_pixels() {
+        let (width, height) = (8u32, 4u32);
+        let (rule_width, rule_height) = (4u32, 2u32);
+        let old = solid(width, height, [220, 30, 20, 255]);
+        let new = solid(width, height, [20, 40, 230, 255]);
+        let rule = pattern(rule_width, rule_height, |x, _| {
+            if x < rule_width / 2 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        });
+        let faces = Faces {
+            old: Face::new(&old, width, height),
+            new: Face::new(&new, width, height),
+            under: Face::EMPTY,
+            rule: Face::new(&rule, rule_width, rule_height),
+        };
+        let mut frame_transition = transition(TransitionMethod::Universal, 0.5, 1000.0);
+        frame_transition.rule_texture_id = Some(7);
+        let uniforms = window_scaled(
+            &Uniforms::for_transition(&frame_transition, width as f32, height as f32, false),
+            2.0,
+        );
+        // Logical x 1 (uv 0.1875) is inside the rule's first black copy; a
+        // window-tiled sample would put it in a white copy.  Logical x 1.75
+        // (uv 0.28125) is in the first white copy, which a window-tiled sample
+        // would make black.
+        let black = kernel_pixel(&uniforms, [0.1875, 0.5], &faces);
+        assert!(
+            black[2] > 0.75 && black[0] < 0.25,
+            "the rule's first black copy must take the incoming (blue) face, got {black:?}"
+        );
+        let white = kernel_pixel(&uniforms, [0.28125, 0.5], &faces);
+        assert!(
+            white[0] > 0.75 && white[2] < 0.25,
+            "the rule's first white copy must keep the outgoing (red) face, got {white:?}"
+        );
     }
 
     /// The invariant the window-space bug violated: at a given *logical* pixel
