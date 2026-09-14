@@ -138,6 +138,18 @@ pub trait TjsHost {
     fn log(&mut self, _message: &str) {}
 
     fn invalidate_object(&mut self, _handle: ObjectHandle) {}
+
+    /// The objects a native entity registered for finalization with itself --
+    /// the reference's `tTJSNI_BaseWindow::ObjectVector`, filled by
+    /// `Window.Add` (`WindowIntf.cpp:705-711`) and locked once the window
+    /// starts invalidating (`:223`).  `Window::Invalidate` finalizes every one
+    /// of them in registration order when the window dies (`:222-243`), and
+    /// only the VM can run the TJS half of `_Finalize` (the object's
+    /// `finalize` member), so the list is taken from the host when `handle` is
+    /// invalidated and drained.
+    fn take_registered_objects(&mut self, _handle: ObjectHandle) -> Vec<ObjectHandle> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

@@ -343,12 +343,21 @@ impl LayerInstance {
 
 #[derive(Clone, Debug)]
 pub(crate) struct WindowInstance {
+    /// The objects the script registered through `Window.add`, in
+    /// registration order -- the reference's `ObjectVector`
+    /// (`WindowIntf.cpp:705-711`).  The engine's internal `children` array is
+    /// rebuilt from this list; there is no official `Window.children` member
+    /// (M2 §5a).
     pub children: Vec<ObjectHandle>,
     pub children_array: Option<ObjectHandle>,
     /// See [`LayerInstance::children_dirty`]. The array is engine-internal --
     /// official `Window` has no `children` member (M2 §5a) -- and is rebuilt in
     /// place for `Window.add`/`Window.remove` and layer invalidation.
     pub children_dirty: bool,
+    /// `ObjectVectorLocked` (`WindowIntf.cpp:150`, set at `:223`): once
+    /// `Window::Invalidate` starts finalizing the registered objects, further
+    /// `add`/`remove` calls are ignored.
+    pub registration_locked: bool,
     pub primary_layer: Option<ObjectHandle>,
     pub focused_layer: Option<ObjectHandle>,
     pub visible: bool,
@@ -363,6 +372,7 @@ impl WindowInstance {
             children: Vec::new(),
             children_array,
             children_dirty: true,
+            registration_locked: false,
             primary_layer: None,
             focused_layer: None,
             visible: false,
@@ -1745,14 +1755,22 @@ impl KrkrHost {
             .and_then(|window| window.focused_layer)
     }
 
+    /// Registers `child` with the window the way `tTJSNI_BaseWindow::Add`
+    /// (`WindowIntf.cpp:705-711`) registers a closure: the list is a set
+    /// (`std::find`), so an already-registered object keeps its position, and
+    /// a locked window (`:223`) registers nothing more.
     pub(crate) fn add_native_window_child(&mut self, window: ObjectHandle, child: ObjectHandle) {
         let window_instance = self
             .native_windows
             .entry(window)
             .or_insert_with(|| WindowInstance::new(None));
-        window_instance.children.retain(|entry| *entry != child);
-        window_instance.children.push(child);
-        window_instance.children_dirty = true;
+        if window_instance.registration_locked {
+            return;
+        }
+        if !window_instance.children.contains(&child) {
+            window_instance.children.push(child);
+            window_instance.children_dirty = true;
+        }
         if self.native_layers.contains_key(&child) {
             if window_instance.primary_layer.is_none() {
                 window_instance.primary_layer = Some(child);
@@ -1774,6 +1792,11 @@ impl KrkrHost {
         let Some(window_instance) = self.native_windows.get_mut(&window) else {
             return;
         };
+        // `Remove` is a no-op once the window started invalidating its
+        // registrations (`WindowIntf.cpp:717-718`).
+        if window_instance.registration_locked {
+            return;
+        }
         window_instance.children.retain(|entry| *entry != child);
         window_instance.children_dirty = true;
         if window_instance.primary_layer == Some(child) {
@@ -1788,6 +1811,26 @@ impl KrkrHost {
                 .properties
                 .insert("focusedLayer".to_string(), Variant::Null);
         }
+    }
+
+    /// Takes the objects a window registered through `Window.add` -- the
+    /// reference's `ObjectVector` (`WindowIntf.cpp:705-711`) -- leaving the
+    /// list empty and locked (`ObjectVectorLocked = true`, `:223`).
+    ///
+    /// `Window::Invalidate` finalizes every one of them when the window dies
+    /// (`:222-243`), and the TJS half of that finalization can only run in the
+    /// VM, so [`krkr_tjs2::runtime::TjsHost::take_registered_objects`] hands
+    /// the list over instead of letting the native cascade half-destroy it.
+    pub(crate) fn take_native_window_registrations(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Vec<ObjectHandle> {
+        let Some(window_instance) = self.native_windows.get_mut(&handle) else {
+            return Vec::new();
+        };
+        window_instance.registration_locked = true;
+        window_instance.children_dirty = true;
+        std::mem::take(&mut window_instance.children)
     }
 
     pub(crate) fn register_native_layer(
@@ -2394,10 +2437,18 @@ impl KrkrHost {
         self.cleanup_invalidated_handle(handle);
         self.modal_windows.retain(|window| *window != handle);
 
-        if let Some(window) = self.native_windows.remove(&handle) {
-            for child in window.children {
-                self.invalidate_native_object(child);
-            }
+        if self.native_windows.remove(&handle).is_some() {
+            // Official `tTJSNI_BaseWindow::Invalidate` (`WindowIntf.cpp:222-243`)
+            // finalizes the objects registered through `Window.add` -- each
+            // one's whole `_Finalize`, the script `finalize` member included --
+            // before the rest of its native teardown, and deliberately leaves
+            // the layer tree alone (registered layers are ordinary TJS objects
+            // whose own finalization does the parting).  The script half can
+            // only run in the VM, which drains the registration list via
+            // `TjsHost::take_registered_objects` and finalizes every item
+            // before it calls this teardown, so there is nothing left here to
+            // cascade into.  A list the VM never drained is dropped with the
+            // instance rather than half-destroyed natively.
             return;
         }
 
@@ -4672,6 +4723,10 @@ impl TjsHost for KrkrHost {
     fn invalidate_object(&mut self, handle: ObjectHandle) {
         self.invalidate_native_object(handle);
     }
+
+    fn take_registered_objects(&mut self, handle: ObjectHandle) -> Vec<ObjectHandle> {
+        self.take_native_window_registrations(handle)
+    }
 }
 
 impl krkr_core::Clock for KrkrHost {
@@ -5223,5 +5278,90 @@ mod tests {
         assert!(!media.storage_attached());
         assert!(host.storage_media_names().is_empty());
         assert!(!host.unregister_storage_media("wrap"));
+    }
+
+    /// The window's registration list is the reference's `ObjectVector`: a set
+    /// (`std::find`, `WindowIntf.cpp:708-711`) that stops accepting
+    /// `add`/`remove` once the window started invalidating it
+    /// (`ObjectVectorLocked`, `:223`, `:717-718`).
+    #[test]
+    fn window_registration_list_is_deduped_ordered_and_locked_while_draining() {
+        let mut host = KrkrHost::default();
+        let window = ObjectHandle(1);
+        let first = ObjectHandle(2);
+        let second = ObjectHandle(3);
+        host.add_native_window_child(window, first);
+        host.add_native_window_child(window, second);
+        // A repeated `add` of an already-registered object keeps its position.
+        host.add_native_window_child(window, first);
+        assert_eq!(host.native_window_children(window), vec![first, second]);
+
+        assert_eq!(
+            host.take_native_window_registrations(window),
+            vec![first, second]
+        );
+        assert!(host.native_window_children(window).is_empty());
+        // From the drain on, the window registers nothing more.
+        host.add_native_window_child(window, first);
+        host.remove_native_window_child(window, second);
+        assert!(host.native_window_children(window).is_empty());
+    }
+
+    /// `Window::Invalidate` finalizes every object the window registered
+    /// through `Window.add` the way the reference does
+    /// (`WindowIntf.cpp:222-243`): each registered object's own `finalize`
+    /// runs in registration order -- a repeated `add` does not move it
+    /// (`std::find`, `:708-711`) -- and from then on the script sees a corpse:
+    /// `isvalid` answers false and member access raises
+    /// `TJS_E_INVALIDOBJECT` ("The object is already invalidated"), the same
+    /// protocol `invalidate obj` gives a directly invalidated object.  A
+    /// registered *layer* is a registered object too, so its native instance
+    /// dies in the same loop.
+    #[test]
+    fn invalidating_a_window_finalizes_the_objects_window_add_registered() {
+        use crate::{EngineConfig, KrkrEngine};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "window_registration.tjs",
+                r#"
+                global.trace = "";
+                class RegisteredA { function finalize() { global.trace += "A"; } }
+                class RegisteredB { function finalize() { global.trace += "B"; } }
+                global.window = new Window();
+                global.layer = new Layer(window, null);
+                global.first = new RegisteredA();
+                global.second = new RegisteredB();
+                first.kept = 7;
+                window.add(layer);
+                window.add(first);
+                window.add(second);
+                window.add(first);
+                invalidate window;
+                var member = "";
+                try { first.kept; } catch (e) { member = e.message; }
+                return global.trace + ":" + (isvalid first) + ":" +
+                    (isvalid second) + ":" + (isvalid layer) + ":" + member;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("AB:0:0:0:The object is already invalidated".to_string())
+        );
+
+        let window = engine
+            .tjs_runtime()
+            .global_member("window")
+            .object_handle()
+            .unwrap_or_else(|| panic!("window global"));
+        assert!(engine.host().native_window_children(window).is_empty());
+        let layer = engine
+            .tjs_runtime()
+            .global_member("layer")
+            .object_handle()
+            .unwrap_or_else(|| panic!("layer global"));
+        assert!(engine.host().native_layer(layer).is_none());
     }
 }

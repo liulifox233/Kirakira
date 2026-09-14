@@ -2282,6 +2282,25 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return Err(error);
         }
 
+        // `Window::Invalidate` finalizes every object the window registered
+        // through `Window.add` inside its native invalidation
+        // (`WindowIntf.cpp:222-243`) -- after the window's own `finalize`
+        // member and before `DeleteAllMembers` (`tjsObject.cpp:451-469`).
+        // Only the VM can dispatch an item's `finalize` member, so the host
+        // hands the drained registration list over and the VM runs each
+        // item's `_Finalize`; an item that throws is logged and the loop goes
+        // on with the next one, exactly like the reference's catch arm
+        // (`:236-240`).  The window is still valid while the loop runs --
+        // `IsInvalidated` is set only after `Finalize` returns
+        // (`tjsObject.cpp:430-440`).
+        let registered = self.runtime.host_mut().take_registered_objects(handle);
+        for item in registered {
+            if let Err(error) = self.invalidate_object(item) {
+                let message = error.message.clone();
+                self.runtime.host_mut().log(&message);
+            }
+        }
+
         self.runtime.heap[handle.0].valid = false;
         self.runtime.heap[handle.0].invalidating = false;
         self.runtime.host_mut().invalidate_object(handle);
@@ -4153,6 +4172,65 @@ mod tests {
             .expect("second invalidate"),
             Variant::Integer(0)
         );
+    }
+
+    /// `Window::Invalidate` finalizes the objects the window registered
+    /// through `Window.add` (`WindowIntf.cpp:222-243`): each item's whole
+    /// `_Finalize` runs after the window's own `finalize` member and in
+    /// registration order, and an item whose finalize throws is logged rather
+    /// than stopping the loop (`:233-241`, `TVPAddLog`).
+    #[test]
+    fn invalidate_finalizes_the_hosts_registered_objects_in_order() {
+        #[derive(Default)]
+        struct RegistrationHost {
+            registered: std::collections::BTreeMap<usize, Vec<ObjectHandle>>,
+            logs: Vec<String>,
+        }
+
+        impl TjsHost for RegistrationHost {
+            fn take_registered_objects(&mut self, handle: ObjectHandle) -> Vec<ObjectHandle> {
+                self.registered.remove(&handle.0).unwrap_or_default()
+            }
+
+            fn log(&mut self, message: &str) {
+                self.logs.push(message.to_string());
+            }
+        }
+
+        let mut runtime = Runtime::with_host(RegistrationHost::default());
+        let window = runtime.alloc_ordinary_object();
+        let first = runtime.alloc_ordinary_object();
+        let second = runtime.alloc_ordinary_object();
+        runtime
+            .host_mut()
+            .registered
+            .insert(window.0, vec![first, second]);
+        runtime.set_global_member("window", Variant::Object(window));
+        runtime.set_global_member("first", Variant::Object(first));
+        runtime.set_global_member("second", Variant::Object(second));
+
+        let file = compile_source_to_bytecode(
+            "dispatch-test.tjs",
+            r#"
+            global.trace = "";
+            window.finalize = function() { global.trace += "W"; };
+            first.finalize = function() { global.trace += "1"; };
+            second.finalize = function() { global.trace += "2"; throw "boom"; };
+            invalidate window;
+            return global.trace + ":" + (isvalid window) + ":" +
+                (isvalid first) + ":" + (isvalid second);
+            "#,
+        )
+        .expect("compile");
+        assert_eq!(
+            runtime.execute_file(&file).expect("invalidate"),
+            Variant::String("W12:0:0:1".to_string())
+        );
+        // The item that refused to finalize stays alive -- `_Finalize` resets
+        // `IsInvalidating` and rethrows before `IsInvalidated` is set
+        // (`tjsObject.cpp:430-440`) -- and the window still invalidates.
+        assert_eq!(runtime.host().logs.len(), 1, "{:?}", runtime.host().logs);
+        assert!(runtime.host().logs[0].contains("boom"));
     }
 
     /// A *closure* read off the object before it was invalidated is dispatched
