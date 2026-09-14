@@ -68,6 +68,23 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         }
     }
 
+    /// `tTJSCustomObject::GetValidity()` (`tjsObject.cpp:493`) is
+    /// `!IsInvalidated`: once `invalidate obj` ran `_Finalize`
+    /// (`tjsObject.cpp:430-448`), every member protocol on that object fails
+    /// with `TJS_E_INVALIDOBJECT` (-1006, "The object is already invalidated",
+    /// `string_table_en.rc:40`) -- `PropGet` (`:1402`), `PropSet` (`:1476`),
+    /// `FuncCall` (`:1316`), `GetCount` (`:1557`), `EnumMembers` (`:1652`).
+    /// `Finalize` also ran `DeleteAllMembers` (`:467`), so there is nothing
+    /// left to answer with even if the protocol did not check first; the two
+    /// reference entry points that answer instead of raising are `isvalid`
+    /// (`IsValid`, `:1743`) and a second `invalidate` (`Invalidate`, `:1697`),
+    /// both false.  Games rely on exactly this: `if (a0 && a0 isvalid) ...`
+    /// guards are how KAGEX-family scripts touch an object that may have been
+    /// invalidated.
+    fn invalid_object_error(&self, handle: ObjectHandle) -> Option<TjsError> {
+        (!self.runtime.heap[handle.0].valid).then(TjsError::invalid_object)
+    }
+
     pub(super) fn prop_get(
         &mut self,
         target: Variant,
@@ -161,6 +178,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return self.prop_get_handle(fallback, name, flags, caller_this);
         }
 
+        if let Some(error) = self.invalid_object_error(handle) {
+            // An invalidated object answers no member protocol at all, exactly
+            // as `tTJSCustomObject::PropGet` checks before its `Find`
+            // (`tjsObject.cpp:1402`): the this-proxy's global fallback and the
+            // class-chain walks below are all `PropGet` on the object and stop
+            // here with it.  A read of a *declared* member of a corpse --
+            // `this.tabImage` in a widget whose page was invalidated --
+            // therefore raises "The object is already invalidated" rather than
+            // answering void.
+            return Err(error);
+        }
         let mut member = self.runtime.heap[handle.0].get_raw(name);
         if flags.must_exist && self.runtime.heap[handle.0].array_index_missing(name) {
             // `ARRAY_GET_VAL` (`tjsArray.cpp:1407`) reports an out-of-range
@@ -208,12 +236,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 // `tTJSInterCodeContext::PropGet` (`tjsInterCodeExec.cpp:3144`)
                 // walks on only for TJS_E_MEMBERNOTFOUND, so a super class
                 // member that exists with a void value is the answer.
-                match self.prop_get_handle(
-                    class_handle,
-                    name,
-                    flags.without_probe(),
-                    receiver,
-                ) {
+                match self.prop_get_handle(class_handle, name, flags.without_probe(), receiver) {
                     Ok(value) => return Ok(self.bind_proxy_value(value, receiver)),
                     Err(error) if error.is_member_not_found() => {}
                     Err(error) => return Err(error),
@@ -426,12 +449,12 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         caller_this: Option<ObjectHandle>,
     ) -> Result<()> {
         let member_set = match &target {
-            Variant::String(receiver) => Some(
-                member_kind(member).and_then(|kind| self.set_string_property(receiver, kind)),
-            ),
-            Variant::Octet(receiver) => Some(
-                member_kind(member).and_then(|kind| self.set_octet_property(receiver, kind)),
-            ),
+            Variant::String(receiver) => {
+                Some(member_kind(member).and_then(|kind| self.set_string_property(receiver, kind)))
+            }
+            Variant::Octet(receiver) => {
+                Some(member_kind(member).and_then(|kind| self.set_octet_property(receiver, kind)))
+            }
             _ => None,
         };
         if let Some(result) = member_set {
@@ -511,6 +534,14 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             return self.prop_set_handle(fallback, name, value, flags, caller_this);
         }
 
+        if let Some(error) = self.invalid_object_error(handle) {
+            // `tTJSCustomObject::PropSet` checks `GetValidity()` before it even
+            // looks for the member (`tjsObject.cpp:1476`), so a store through
+            // the this-proxy of an invalidated object raises too -- `prop` /
+            // `setter` members are gone with the rest of the symbol table.
+            return Err(error);
+        }
+
         // `tTJSNativeClass::FuncCall` copies every non-static member of the
         // native class onto the object it initializes (`tjsNative.cpp:293`),
         // and a class body registers its own members on the instance as well
@@ -586,11 +617,7 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
             self.set_bound_member(this_obj, name, value);
             return Ok(());
         }
-        if self
-            .runtime
-            .heap[handle.0]
-            .array_negative_index_after_wrap(name)
-        {
+        if self.runtime.heap[handle.0].array_negative_index_after_wrap(name) {
             // `tTJSArrayObject::PropSetByNum` (`tjsArray.cpp:1634`) fails such
             // a write instead of creating a member named `-n`, and it reports
             // `TJS_E_MEMBERNOTFOUND`: the failure is a miss, not a storage
@@ -1532,6 +1559,17 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 },
             )
         })?;
+        if let Some(error) = self.invalid_object_error(handle) {
+            // `iTJSDispatch2::FuncCall` is the member protocol too:
+            // `tTJSCustomObject::FuncCall` checks `GetValidity()`
+            // (`tjsObject.cpp:1316-1320`) before it resolves the name, so
+            // `corpse.method(...)` raises "The object is already invalidated"
+            // rather than reporting a missing member.  A *closure* taken off
+            // the object earlier still runs in the reference -- its dispatch
+            // is on the function object, and only `this` is the corpse -- so
+            // this gate belongs to the dispatch handle, not to `this`.
+            return Err(error);
+        }
         let mut member = if let Some(this_obj) = self.bound_super_this(handle, caller_this)?
             && self.handle_class_name_matches(handle, name)
         {
@@ -1645,7 +1683,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         let call_this = self
             .bound_super_this(handle, caller_this)?
             .or(closure_this)
-            .or_else(|| self.receiver_supplies_call_this(handle, name).then_some(handle))
+            .or_else(|| {
+                self.receiver_supplies_call_this(handle, name)
+                    .then_some(handle)
+            })
             .or(caller_this);
         // Deferred like the receiver's label: the callee is an object handle
         // either way, so the error path can still name it after `call_value`
@@ -2244,6 +2285,16 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         self.runtime.heap[handle.0].valid = false;
         self.runtime.heap[handle.0].invalidating = false;
         self.runtime.host_mut().invalidate_object(handle);
+        // `Finalize` ends with `DeleteAllMembers` (`tjsObject.cpp:467`), which
+        // empties the symbol table the way `Clear()` (`tjsObject.h:566`) does:
+        // `Count` drops to zero and every member a script kept -- the class
+        // functions `regmember` copied onto the instance, the native class's
+        // accessor members, this engine's layer bookkeeping members -- is gone.
+        // The object itself stays allocated, so `NativeInstanceSupport` in the
+        // reference keeps answering for it and a native wrapper that receives
+        // it as an argument still resolves a Layer; what died is every script
+        // member protocol (`GetValidity()`, `tjsObject.cpp:493`).
+        self.runtime.heap[handle.0].members.clear();
         Ok(true)
     }
 
@@ -2328,6 +2379,15 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
         is_new: bool,
         continuation: Continuation,
     ) -> Result<CallOutcome> {
+        if let Some(error) = self.invalid_object_error(handle) {
+            // The call protocol checks validity in both implementations of
+            // `FuncCall`: `tTJSCustomObject::FuncCall` (`tjsObject.cpp:1316`)
+            // and `tTJSInterCodeContext::FuncCall` (`tjsInterCodeExec.cpp:3076`)
+            // open with `if(!GetValidity()) return TJS_E_INVALIDOBJECT;`, so a
+            // corpse -- or an invalidated function object -- cannot be called
+            // as a plain value either.
+            return Err(error);
+        }
         let kind = self.runtime.heap[handle.0].kind.clone();
         match kind {
             ObjectKind::InterCode {
@@ -3809,7 +3869,11 @@ fn tjs_atoi(name: &str) -> i32 {
             .wrapping_mul(10)
             .wrapping_add(digit as i32 - '0' as i32);
     }
-    if negative { value.wrapping_neg() } else { value }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
 }
 
 fn escape_tjs_string_fragment(value: &str) -> String {
@@ -4024,6 +4088,87 @@ mod tests {
             error.message,
             "Cannot convert the variable type ((void) to Object)"
         );
+    }
+
+    /// `invalidate obj` runs `tTJSCustomObject::_Finalize` (`tjsObject.cpp:430`)
+    /// -> `Finalize` (`:451`) -> `DeleteAllMembers` (`:467`), and
+    /// `GetValidity()` is `!IsInvalidated` (`:493`): from then on every member
+    /// protocol on the object answers `TJS_E_INVALIDOBJECT` (-1006, "The object
+    /// is already invalidated", `string_table_en.rc:40`) -- `PropGet`
+    /// (`:1402`), `PropSet` (`:1476`), `FuncCall` (`:1316`) -- while `isvalid`
+    /// (`IsValid`, `:1743`) and a second `invalidate` (`Invalidate`, `:1697`)
+    /// answer false.  A kept reference is therefore *inert*, not a live object
+    /// that still reads its old members back.
+    #[test]
+    fn invalidated_object_member_protocol_reports_the_reference_invalid_object_error() {
+        for (source, anchor) in [
+            (
+                "class Probe { var kept = 7; var state = 1; function read() { return state; } } \
+                 global.target = new Probe(); \
+                 invalidate target; return target.kept;",
+                "PropGet",
+            ),
+            (
+                "class Probe { var kept = 7; } global.target = new Probe(); \
+                 invalidate target; target.kept = 9;",
+                "PropSet",
+            ),
+            (
+                "class Probe { var state = 1; function read() { return state; } } \
+                 global.target = new Probe(); \
+                 invalidate target; return target.read();",
+                "FuncCall",
+            ),
+        ] {
+            let error = failure(source);
+            assert_eq!(error.kind, TjsErrorKind::InvalidObject, "{anchor}");
+            assert_eq!(error.tjs_error_code(), Some(-1006), "{anchor}");
+            assert_eq!(
+                error.message, "The object is already invalidated",
+                "{anchor}"
+            );
+        }
+
+        for source in [
+            "class Probe { var kept = 7; } global.target = new Probe(); \
+             invalidate target; return (isvalid target);",
+            "class Probe { var kept = 7; } global.target = new Probe(); \
+             invalidate target; return (target isvalid);",
+        ] {
+            assert_eq!(
+                run(source).expect("isvalid"),
+                Variant::Integer(0),
+                "{source}"
+            );
+        }
+        // A second `invalidate` answers false rather than raising: `VM_INV`
+        // compares `Invalidate`'s result against `TJS_S_TRUE`
+        // (`tjsInterCodeExec.cpp:1254-1258`), and an invalidated object's
+        // `Invalidate` answers `TJS_E_INVALIDOBJECT` (`tjsObject.cpp:1697`).
+        assert_eq!(
+            run(
+                "class Probe { var kept = 7; } global.target = new Probe(); \
+                 invalidate target; global.again = invalidate target; return global.again;"
+            )
+            .expect("second invalidate"),
+            Variant::Integer(0)
+        );
+    }
+
+    /// A *closure* read off the object before it was invalidated is dispatched
+    /// on the function object rather than on the corpse, so the reference still
+    /// runs it -- with the corpse as `this` (`TJSDefaultFuncCall` selects
+    /// `clo.ObjThis`).  The failure inside the body is the corpse's own member
+    /// protocol, which is what the gate keys on.
+    #[test]
+    fn a_closure_taken_before_invalidate_still_runs_with_the_corpse_as_this() {
+        let error = failure(
+            "class Probe { var state = 4; function read() { return state; } } \
+             global.probe = new Probe(); global.take = probe.read; \
+             invalidate probe; return take();",
+        );
+        assert_eq!(error.kind, TjsErrorKind::InvalidObject);
+        assert_eq!(error.message, "The object is already invalidated");
     }
 
     /// The indirect form converts the receiver first as well
@@ -5038,7 +5183,10 @@ mod tests {
         // (`SetStringProperty` never checks the index, `tjsInterCodeExec.cpp:115`).
         let error = failure(r#"return "abc"[9] = "z";"#);
         assert_eq!(error.kind, TjsErrorKind::AccessDenied);
-        assert_eq!(error.message, "Invalid operation for Read-only or Write-only property");
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
         // A name that only *looks* like an index is a miss on the write side
         // too (`tjsInterCodeExec.cpp:115-120`).
         for source in [

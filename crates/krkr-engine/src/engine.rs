@@ -15614,8 +15614,21 @@ mod tests {
 
     /// GINKA's stand pool keeps `StandLayer` objects after `invalidate` and
     /// still calls `hasImage = 1` / `fillRect` / `copyRect` on them.
+    ///
+    /// That shape is not the reference's: `invalidate` runs `_Finalize`
+    /// (`tjsObject.cpp:430`) -> `Finalize` (`:451`) -> `DeleteAllMembers`
+    /// (`:467`) and leaves `GetValidity()` false (`:493`), so every member
+    /// protocol on the object -- reads (`PropGet`, `:1402`), writes
+    /// (`PropSet`, `:1476`), calls (`FuncCall`, `:1316`) -- raises
+    /// `TJS_E_INVALIDOBJECT` ("The object is already invalidated",
+    /// `string_table_en.rc:40`).  What keeps a stand pool working is the
+    /// *child* half of `tTJSNI_BaseLayer::Invalidate` (`LayerIntf.cpp:482`,
+    /// `:513-516`): children are only `Part()`ed, so a layer a live object
+    /// still reaches through `children` keeps its members and its image.  An
+    /// invalidated layer itself is dead in every direction, and this pins that
+    /// instead of the old re-attach-on-use approximation.
     #[test]
-    fn native_layer_drawing_reattaches_after_invalidate() {
+    fn native_layer_member_access_after_invalidate_raises_the_reference_invalid_object() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         engine
             .execute_script(
@@ -15624,25 +15637,50 @@ mod tests {
                 global.dest = new Layer();
                 dest.setSize(4, 4);
                 dest.setImageSize(4, 4);
+                global.before = dest.hasImage;
                 invalidate dest;
-                dest.hasImage = 1;
-                dest.fillRect(0, 0, 4, 4, 0xff112233);
-                return dest.hasImage;
                 "#,
             )
             .expect("script");
         let dest = object_handle(&engine, "dest");
-        let dest_id = engine
-            .host()
-            .native_layer(dest)
-            .expect("reattached native layer");
-        let image = engine
-            .host()
-            .layer_tree()
-            .layer(dest_id)
-            .and_then(|layer| layer.image.as_ref())
-            .expect("reattached image");
-        assert_eq!(image.upload.rgba.as_ref()[..4], [0x11, 0x22, 0x33, 255]);
+        assert_eq!(
+            engine
+                .execute_expression("inline.tjs", "before")
+                .expect("before"),
+            Variant::Integer(1),
+            "the layer carried the ctor image before the invalidate"
+        );
+        assert!(engine.host().native_layer(dest).is_none());
+        // `DeleteAllMembers` leaves nothing behind: the ctor's `hasImage`
+        // intent and the engine's layer bookkeeping members are gone, so no
+        // later read can revive a bitmap.
+        for name in [
+            "hasImage",
+            "__nativeLayerId",
+            "__nativeLayerProperty$hasImage",
+        ] {
+            assert_eq!(
+                engine.tjs_runtime.object_member(dest, name),
+                Variant::Void,
+                "{name} must not survive DeleteAllMembers"
+            );
+        }
+        for call in [
+            "return dest.hasImage;",
+            "return dest.imageWidth;",
+            "dest.hasImage = 1;",
+            "dest.fillRect(0, 0, 4, 4, 0xff112233);",
+            "dest.copyRect(0, 0, dest, 0, 0, 4, 4);",
+        ] {
+            let error = engine.execute_script("inline.tjs", call).expect_err(call);
+            assert_eq!(error.message, "The object is already invalidated", "{call}");
+        }
+        assert_eq!(
+            engine
+                .execute_script("inline.tjs", "return isvalid dest;")
+                .expect("isvalid"),
+            Variant::Integer(0)
+        );
     }
 
     #[test]

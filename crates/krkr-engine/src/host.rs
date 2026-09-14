@@ -44,17 +44,6 @@ use crate::{
 const IMAGE_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const IMAGE_CACHE_MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
 
-/// How long a script image load waits for its decode worker before falling
-/// back to the asynchronous path.
-///
-/// Official `tTJSNI_BaseLayer::LoadImages` loads through the synchronous
-/// `TVPLoadGraphic` (`LayerIntf.cpp:2514`), so a KAG loop that loads N
-/// graphics creates them all in one tick. Waiting here keeps small graphics
-/// on that schedule instead of letting each one cost a frame; a decode that
-/// exceeds the budget keeps the asynchronous path rather than stalling.
-#[cfg(not(target_arch = "wasm32"))]
-const SCRIPT_IMAGE_SYNC_BUDGET: Duration = Duration::from_millis(4);
-
 /// Bounds the in-memory host log; long headless runs with trace categories
 /// enabled would otherwise grow it without limit. When the cap is hit the
 /// oldest half is dropped in one drain.
@@ -2429,6 +2418,11 @@ impl KrkrHost {
         }
 
         self.layer_tree.remove_layer(layer_id);
+        // `Invalidate`'s `DeallocateImage`/`DeallocateCache`
+        // (`LayerIntf.cpp:2079-2088`) drops the layer's image state with the
+        // bitmap; the engine's record of the storage that filled it is part of
+        // that state, not a value a later re-attachment could reload from.
+        self.clear_layer_image_storage(layer_id);
         self.modal_layers
             .retain(|(_, entry_layer)| *entry_layer != layer_id);
         self.sync_modal_layer();
@@ -2646,14 +2640,21 @@ impl KrkrHost {
     }
 
     pub(crate) fn load_image_storage_for_script(&mut self, name: &str) -> Result<LayerImage> {
-        self.load_script_image(name, true)
+        self.load_script_image(name)
     }
 
-    /// Loads a script-visible graphic. `wait_for_decode` mirrors official
-    /// synchronous `TVPLoadGraphic` loads by letting a fast worker decode
-    /// finish inside the calling tick; cache warming passes `false` because a
-    /// hint must never block the VM.
-    fn load_script_image(&mut self, name: &str, wait_for_decode: bool) -> Result<LayerImage> {
+    /// Loads a script-visible graphic the way the reference does: official
+    /// `tTJSNI_BaseLayer::LoadImages` (`LayerIntf.cpp:2494`) and
+    /// `System.touchImages` (`GraphicsLoaderIntf.cpp:1809`) both load through
+    /// the synchronous `TVPLoadGraphic` (`:1672`), which resolves the storage,
+    /// reads and decodes it *inside the calling script call* and returns the
+    /// graphic; the graphic cache (`tTVPGraphicCache::FindAndTouchWithHash`,
+    /// `:1690-1700`) makes a repeat load free.  Nothing in the loader pumps
+    /// events (no `ProcessEvents` anywhere in `GraphicsLoaderIntf.cpp`), so no
+    /// other script stack can run while a load is in flight -- the reference
+    /// never parks and resumes a frame here, and neither do we.  The decode
+    /// worker is only our thread for the same synchronous work.
+    fn load_script_image(&mut self, name: &str) -> Result<LayerImage> {
         self.logs
             .push(format!("script image load requested `{name}`"));
         self.sync_image_cache_revision();
@@ -2663,7 +2664,6 @@ impl KrkrHost {
 
         #[cfg(test)]
         {
-            let _ = wait_for_decode;
             self.load_image_storage(name)
         }
 
@@ -2673,36 +2673,34 @@ impl KrkrHost {
                 return Err(self.script_image_error(name));
             }
             let revision = self.storage_revision();
-            if self
+            let queued = self
                 .pending_script_image_loads
                 .values()
-                .any(|(storage, _)| storage.eq_ignore_ascii_case(name))
+                .any(|(storage, _)| storage.eq_ignore_ascii_case(name));
+            if !queued {
+                let Some(manager) = self.resource_manager.as_ref() else {
+                    return self.load_image_storage(name);
+                };
+                let Some(id) = manager.request_image_decode(name.to_string(), revision) else {
+                    // The decode worker stopped; decoding here cannot strand
+                    // the call on a completion that will never arrive.
+                    return self.load_image_storage(name);
+                };
+                self.pending_script_image_loads
+                    .insert(id, (name.to_string(), revision));
+                self.logs.push(format!(
+                    "script image decode queued `{name}` (request {})",
+                    id.0
+                ));
+            }
+            #[cfg(target_arch = "wasm32")]
             {
-                return Err(TjsError::resource_pending(name.to_string()));
+                // The browser shell has no decode worker to wait on; the
+                // synchronous load above is its only path.
+                Err(TjsError::resource_pending(name.to_string()))
             }
-            let Some(manager) = self.resource_manager.as_ref() else {
-                return self.load_image_storage(name);
-            };
-            let Some(id) = manager.request_image_decode(name.to_string(), revision) else {
-                // The decode worker stopped; decoding here cannot strand the
-                // VM on a completion that will never arrive.
-                return self.load_image_storage(name);
-            };
-            self.pending_script_image_loads
-                .insert(id, (name.to_string(), revision));
-            self.logs.push(format!(
-                "script image decode queued `{name}` (request {})",
-                id.0
-            ));
-            // Official `TVPLoadGraphic` is synchronous, so a KAG loop that
-            // loads several graphics creates them all in one tick. Wait for a
-            // fast decode so small graphics keep that schedule; otherwise
-            // TJS/KAG resumes this native call after the completion lands.
             #[cfg(not(target_arch = "wasm32"))]
-            if wait_for_decode && let Some(result) = self.wait_for_script_image(name) {
-                return result;
-            }
-            Err(TjsError::resource_pending(name.to_string()))
+            self.wait_for_script_image(name)
         }
     }
 
@@ -2715,43 +2713,46 @@ impl KrkrHost {
         TjsError::runtime(format!("failed to decode image `{name}`: {error}"))
     }
 
-    /// Waits up to [`SCRIPT_IMAGE_SYNC_BUDGET`] for a queued script image
-    /// decode. `Some(result)` means the image landed (or failed) in time;
-    /// `None` tells the caller to keep the asynchronous path.
+    /// Waits for this call's queued decode, the way `TVPLoadGraphic` returns
+    /// only once the graphic is in the caller's hands.  A dead worker, or a
+    /// completion the host discarded, falls back to decoding here -- the
+    /// reference has no such states, it simply loads in the calling thread.
     #[cfg(not(target_arch = "wasm32"))]
-    fn wait_for_script_image(&mut self, name: &str) -> Option<Result<LayerImage>> {
-        self.wait_for_script_image_within(name, SCRIPT_IMAGE_SYNC_BUDGET)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn wait_for_script_image_within(
-        &mut self,
-        name: &str,
-        budget: Duration,
-    ) -> Option<Result<LayerImage>> {
-        let deadline = Instant::now() + budget;
+    fn wait_for_script_image(&mut self, name: &str) -> Result<LayerImage> {
         loop {
             if let Some(image) = self.image_cache.get(name) {
-                return Some(Ok(image.clone()));
+                return Ok(image.clone());
             }
             if self.script_image_errors.contains_key(name) {
-                return Some(Err(self.script_image_error(name)));
+                return Err(self.script_image_error(name));
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return None;
+            let request_pending = self
+                .pending_script_image_loads
+                .values()
+                .any(|(storage, _)| storage.eq_ignore_ascii_case(name));
+            if !request_pending {
+                // The host dropped this request (storage revision moved under
+                // it); nothing can complete it, so decode here.
+                return self.load_image_storage(name);
             }
+            // The completion is applied by its own wait, so the frame start
+            // must not treat it as a parked call to resume.
             let completion = self
                 .resource_manager
                 .as_ref()
-                .and_then(|manager| manager.wait_completion(deadline - now));
+                .and_then(|manager| manager.wait_completion_blocking());
             match completion {
-                // The synchronous wait applies its own completion; the frame
-                // start must not treat it as a suspended call to resume.
                 Some(completion) => {
                     self.handle_resource_completion(completion);
                 }
-                None => return None,
+                None => {
+                    // The worker is gone, so no completion can arrive for this
+                    // request; forget it before decoding here, or the engine
+                    // would report a resource wait that nothing will deliver.
+                    self.pending_script_image_loads
+                        .retain(|_, (storage, _)| !storage.eq_ignore_ascii_case(name));
+                    return self.load_image_storage(name);
+                }
             }
         }
     }
@@ -2909,10 +2910,11 @@ impl KrkrHost {
 
         #[cfg(not(test))]
         {
-            // Cache warming is a hint, not a reason to block the VM. Reuse
-            // the same queued decode path as Layer.loadImages; the completion
-            // will populate the bounded decoded-image cache on a later frame.
-            let image = self.load_script_image(name, false)?;
+            // `System.touchImages` warms through the same synchronous load as
+            // `Layer.loadImages`, exactly like the reference's `TVPLoadGraphic`
+            // loop in `TVPSystem::TouchImages` (`GraphicsLoaderIntf.cpp:1809`),
+            // so the touched bytes are in the cache when the call returns.
+            let image = self.load_script_image(name)?;
             Ok(image.upload.rgba.len())
         }
     }
@@ -3114,16 +3116,14 @@ impl KrkrHost {
                 manager.cancel(id);
             }
         }
-        // A cancelled decode never reports a completion, but the TJS call
-        // that asked for it is parked on `resource_pending` and only wakes
-        // when a script image load finishes. KRKR loads graphics
-        // synchronously, so nothing there can strand a script mid-call:
-        // forget the cancelled requests and wake the VM so the retry queues
-        // a fresh decode against the current storage layout.
+        // A cancelled decode never reports a completion. Script image loads
+        // wait inside their own call now, so a request can only be outstanding
+        // here when the storage revision moved from a frame boundary, not from
+        // inside a load: forget the cancelled requests and let the next load
+        // queue a fresh decode against the current storage layout.
         if !self.pending_script_image_loads.is_empty() {
             self.pending_script_image_loads.clear();
             self.script_image_errors.clear();
-            self.completed_script_image_loads = self.completed_script_image_loads.saturating_add(1);
         }
     }
 
@@ -4831,9 +4831,13 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// A worker that cannot answer (it stopped, or the shell dropped it) must
+    /// not leave the load stranded or the engine reporting a resource wait:
+    /// the wait decodes in the calling thread -- the reference's own load --
+    /// and forgets the queued request no completion can satisfy.
     #[test]
-    fn script_image_wait_finishes_a_queued_decode_in_the_same_tick() {
-        let root = temp_root("script-image-wait");
+    fn a_dead_decode_worker_falls_back_to_an_in_thread_load_and_forgets_the_request() {
+        let root = temp_root("script-image-dead-worker");
         fs::create_dir_all(&root).expect("create root");
         write_test_png(&root.join("button.png"), 2, 3);
         let storage = ProjectStorage::for_root(&root).expect("storage");
@@ -4848,38 +4852,32 @@ mod tests {
             .expect("worker accepts the decode");
         host.pending_script_image_loads
             .insert(id, ("button.png".to_string(), revision));
+        // No completion can arrive for that request any more.
+        host.resource_manager = None;
 
-        // A zero budget never waits, so the load stays asynchronous.
-        assert!(
-            host.wait_for_script_image_within("button.png", Duration::ZERO)
-                .is_none()
-        );
-
-        // A real budget applies the worker completion inside the same call,
-        // matching official synchronous `TVPLoadGraphic` loads.
         let image = host
-            .wait_for_script_image_within("button.png", Duration::from_secs(5))
-            .expect("decode lands within the budget")
-            .expect("decoded image");
+            .wait_for_script_image("button.png")
+            .expect("the fallback decodes in the calling thread");
         assert_eq!((image.upload.width, image.upload.height), (2, 3));
-        assert!(host.pending_script_image_loads.is_empty());
-
-        // The production budget path resolves from the cache without waiting.
         assert!(
-            host.wait_for_script_image("button.png")
-                .is_some_and(|result| result.is_ok())
+            host.pending_script_image_loads.is_empty(),
+            "a request no completion will satisfy must not stay pending"
+        );
+        assert!(
+            !host.has_pending_resource_loads(),
+            "the engine must not keep waiting for a resource nobody delivers"
         );
 
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    /// A decode that outlives the synchronous budget must still resolve the
-    /// suspended native call. The frame-start drain is the only wakeup, so a
-    /// query that never reports its completion would leave
-    /// `has_pending_resource_loads` set forever and freeze the scenario.
+    /// A decode that is already queued when the script asks for it (the worker
+    /// has not finished it yet) is still awaited by that load: the reference
+    /// has no state in which a script call returns before its graphic is in
+    /// hand, so nothing is left for a later frame to wake.
     #[test]
-    fn queued_script_image_decode_always_reports_its_completion() {
-        let root = temp_root("script-image-async");
+    fn a_queued_script_image_decode_is_awaited_by_the_load_that_needs_it() {
+        let root = temp_root("script-image-queued");
         fs::create_dir_all(&root).expect("create root");
         write_test_png(&root.join("button.png"), 2, 3);
         let storage = ProjectStorage::for_root(&root).expect("storage");
@@ -4896,36 +4894,25 @@ mod tests {
             .insert(id, ("button.png".to_string(), revision));
         assert!(host.has_pending_resource_loads());
 
-        // A zero budget keeps the asynchronous path: the request stays
-        // pending for the frame-start drain, exactly like a decode slower
-        // than `SCRIPT_IMAGE_SYNC_BUDGET`.
-        assert!(
-            host.wait_for_script_image_within("button.png", Duration::ZERO)
-                .is_none()
-        );
-
-        let mut wakeups = 0;
-        for _ in 0..10_000 {
-            let (_, script_image_completions) = host.take_completed_image_loads();
-            wakeups += script_image_completions;
-            if !host.has_pending_resource_loads() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        assert_eq!(
-            wakeups, 1,
-            "the parked script image call must be woken once"
-        );
+        // The wait runs the queued decode to completion inside the call.
+        let image = host
+            .wait_for_script_image("button.png")
+            .expect("the queued decode is awaited");
+        assert_eq!((image.upload.width, image.upload.height), (2, 3));
         assert!(!host.has_pending_resource_loads());
         assert!(host.script_image_errors.is_empty());
-        assert_eq!(
-            host.image_cache
-                .get("button.png")
-                .map(|image| (image.upload.width, image.upload.height)),
-            Some((2, 3))
-        );
+
+        // The wait applied its own completion, so the frame start has no
+        // script-image wakeup to deliver.
+        let (_, script_image_completions) = host.take_completed_image_loads();
+        assert_eq!(script_image_completions, 0);
+
+        // A repeat load is the reference's graphic-cache hit
+        // (`tTVPGraphicCache::FindAndTouchWithHash`, `:1690-1700`): the image
+        // comes back without a decode request of its own.
+        let again = host.wait_for_script_image("button.png").expect("cache hit");
+        assert_eq!((again.upload.width, again.upload.height), (2, 3));
+        assert!(!host.has_pending_resource_loads());
 
         fs::remove_dir_all(root).expect("cleanup");
     }

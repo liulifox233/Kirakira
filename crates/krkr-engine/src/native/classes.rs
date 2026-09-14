@@ -4514,11 +4514,13 @@ pub(crate) fn apply_completed_resource_loads(runtime: &mut Runtime<KrkrHost>) ->
     for completion in completions {
         apply_completed_image_load(runtime, completion)?;
     }
-    // `Layer.loadImages` carries an explicit target continuation, but image
-    // loads initiated by script helpers (for example the packed quick-menu
-    // loader) suspend the TJS VM while the decode worker runs.  Once the
-    // decoded bytes are in the cache, retry that native call so startup can
-    // continue and the following scenario can be loaded.
+    // `Layer.loadImages` carries an explicit target continuation, but a script
+    // helper (for example the packed quick-menu loader) used to suspend the TJS
+    // VM while the decode worker ran.  Script image loads now complete inside
+    // their own call, the way the reference's synchronous `TVPLoadGraphic`
+    // (`GraphicsLoaderIntf.cpp:1672`) does, so a script-image completion is not
+    // expected here; the resume stays as the safety net for a platform path
+    // that cannot wait inside the call and parks a frame on one.
     if script_image_completions > 0 && runtime.is_suspended() {
         runtime.resume_suspended()?;
     }
@@ -13012,24 +13014,27 @@ mod tests {
         assert_eq!(error.message, "Source layer has no image");
     }
 
-    /// The wrapper asks the *object* whether it is a Layer, and the reference's
-    /// instance belongs to that object for its whole life: `Invalidate`
-    /// (`LayerIntf.cpp:482`) stops transitions, parts the layer from the tree
-    /// and frees its image (`DeallocateImage`, `:2079`), but the class instance
-    /// stays hosted, so `NativeInstanceSupport(TJS_NIS_GETINSTANCE,
-    /// tTJSNC_Layer::ClassID, ...)` (`:7218` `operateRect`) keeps answering and
-    /// the source resolves like any other layer. Kirakira models invalidation
-    /// by dropping the instance from the host table and rebuilds it on use
-    /// (`ensure_native_layer_attached`) everywhere a script draws *on* the
-    /// layer (`this_render_layer_target`) or revives it (`hasImage = 1`), so a
-    /// source has to re-attach too. PARQUET's option page is the live case: on
-    /// a tab switch the page's slider widget repaints its own `tabImage` layer,
-    /// which `invalidate` took away with the page it belonged to, and the
-    /// source guard threw `Specify Layer or Bitmap class object` at `onPaint`
-    /// bytecode 1000 (compiled `SliderLayer.tjs`), aborting every later draw of
-    /// that event.
+    /// A Layer a *script* invalidated is not a live blit source.  The reference
+    /// keeps the class instance hosted (`Invalidate` never removes it), but
+    /// `DeallocateImage` (`LayerIntf.cpp:2079`) frees its image and `_Finalize`
+    /// deleted the object's members (`tjsObject.cpp:467`), so the wrapper that
+    /// asks the source for `GetMainImage()` finds NULL: the six Layer-or-Bitmap
+    /// wrappers report `TVPSpecifyLayerOrBitmap` (`LayerIntf.cpp:7150`
+    /// `copyRect`, `:7234` `operateRect`, `:7289` `stretchCopy`, `:7343`
+    /// `operateStretch`, `:7410` `affineCopy`, `:7484` `operateAffine`) and
+    /// `PiledCopy` reports `TVPSourceLayerHasNoImage` (`:4112`).  Kirakira
+    /// models invalidation by dropping the instance from the host table, so the
+    /// same wrappers answer the same refusals through the dropped instance --
+    /// and no member of the corpse can be read to revive it (the object is
+    /// invalid, `tjsObject.cpp:1402`).
+    ///
+    /// Residual model difference (reported): `PiledCopy` cannot tell a corpse
+    /// from an object that was never a Layer, because the instance that
+    /// carried the class identity is gone, so it reports its *wrapper* error
+    /// (`TVPSpecifyLayer`, `:7104`) where the reference reports the missing
+    /// bitmap.
     #[test]
-    fn layer_blits_accept_a_source_the_engine_reattaches_after_invalidate() {
+    fn layer_blits_reject_a_source_the_script_invalidated() {
         use crate::{EngineConfig, KrkrEngine};
 
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -13051,7 +13056,8 @@ mod tests {
             )
             .expect("script");
         // Every wrapper resolves the source before its blit runs, so each call
-        // gets an invalidated-but-still-alive source of its own.
+        // gets an invalidated source of its own; none of them resolves to a
+        // bitmap the reference would not have.
         for call in [
             "dest.copyRect(0, 0, detached, 0, 0, 2, 2);",
             "dest.operateRect(0, 0, detached, 0, 0, 2, 2, omAlpha);",
@@ -13059,31 +13065,50 @@ mod tests {
             "dest.operateStretch(0, 0, 2, 2, detached, 0, 0, 2, 2, omAlpha);",
             "dest.affineCopy(detached, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2);",
             "dest.operateAffine(detached, 0, 0, 2, 2, false, 0, 0, 2, 0, 0, 2, omAlpha);",
-            "dest.piledCopy(0, 0, detached, 0, 0, 2, 2);",
         ] {
             engine
                 .execute_script("inline.tjs", "global.detached = fresh();")
                 .expect("fresh invalidated source");
-            if let Err(error) = engine.execute_script("inline.tjs", call) {
-                panic!("{call}: {error}");
-            }
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("an invalidated source has no bitmap to hand the blit");
+            assert_eq!(
+                error.message, "Specify Layer or Bitmap class object",
+                "{call}"
+            );
         }
-        // The re-attached layer carries the ctor bitmap `AllocateImage`
-        // rebuilds (`hasImage` is still 1: `invalidate` frees the image, not
-        // the object's intent), so `copyRect` writes its neutral white.
-        assert_eq!(
-            layer_main_pixel(&mut engine, "dest.getMainPixel(0, 0)"),
-            0xffffff,
-            "copyRect blitted the re-attached bitmap"
-        );
+        // The corpse's own member protocol is what died with the invalidation:
+        // the source cannot be read, written or called back to life.
+        engine
+            .execute_script("inline.tjs", "global.detached = fresh();")
+            .expect("fresh invalidated source");
+        for call in [
+            "return detached.hasImage;",
+            "detached.hasImage = 1;",
+            "detached.fillRect(0, 0, 2, 2, 0xffffffff);",
+        ] {
+            let error = engine
+                .execute_script("inline.tjs", call)
+                .expect_err("an invalidated layer is inert");
+            assert_eq!(error.message, "The object is already invalidated", "{call}");
+        }
+        engine
+            .execute_script("inline.tjs", "global.detached = fresh();")
+            .expect("fresh invalidated source");
+        let error = engine
+            .execute_script("inline.tjs", "dest.piledCopy(0, 0, detached, 0, 0, 2, 2);")
+            .expect_err("an invalidated source has no bitmap to pile");
+        assert_eq!(error.message, "Specify Layer class object");
 
         // A freed layer keeps M184's refusal: `freeImage` recorded
         // `hasImage == 0` (`LayerIntf.cpp:2237` reads `MainImage != NULL`), so
-        // the rebuilt instance has no bitmap to hand the blit.
+        // the blit finds no bitmap -- through the wrapper for the six
+        // Layer-or-Bitmap calls and through `PiledCopy`'s own check for the
+        // pile, exactly as the reference distinguishes them.
         engine
             .execute_script(
                 "inline.tjs",
-                "global.freed = new Layer(); freed.setImageSize(2, 2); freed.freeImage(); invalidate freed;",
+                "global.freed = new Layer(); freed.setImageSize(2, 2); freed.freeImage();",
             )
             .expect("script");
         let error = engine
