@@ -445,6 +445,13 @@ fn per_archive_probe_open(archives: &[Xp3Archive<File>], path: &str) -> Option<(
 /// absolute qualifier matches a mount's path, a relative path with a directory
 /// matches a mount's path below `base`, and a bare name matches the mount
 /// directly below `base` before falling back to a file-name match.
+///
+/// "Absolute" here is [`archive_qualifier_is_absolute`], the classifier the
+/// provider itself decides with. This mirror states the *matching*, not the
+/// classification, so sharing the classifier keeps the two from drifting
+/// apart — an independent re-spelling of "starts with `/`" would have quietly
+/// kept mirroring the rule from before a Windows drive path was understood to
+/// be absolute, which is exactly what happened once.
 fn reference_archive_index(base: &Path, paths: &[&PathBuf], archive: &str) -> Option<usize> {
     fn normalize(path: &str) -> String {
         let folded = path.replace('\\', "/");
@@ -475,7 +482,7 @@ fn reference_archive_index(base: &Path, paths: &[&PathBuf], archive: &str) -> Op
             (logical, normalize(&path.to_string_lossy()))
         })
         .collect::<Vec<_>>();
-    if query.starts_with('/') {
+    if archive_qualifier_is_absolute(&query) {
         return mounts.iter().rposition(|(_, path)| path == &query);
     }
     if query.contains('/') {
@@ -729,6 +736,17 @@ fn hoisted_probe_lookups_agree_with_per_archive_normalization() {
         r"sys\extra.xp3",
         "sys/extra.xp3",
         "missing.xp3",
+        // Absolute spellings, including the ones only a Windows host would
+        // produce (`System.exePath` + the declared name): the mirror and the
+        // provider must agree about them on this host too, and both ask the
+        // classifier rather than a host's `Path` rules.
+        "/srv/game/extra.xp3",
+        r"\srv\game\extra.xp3",
+        "C:/game/extra.xp3",
+        r"C:\game\extra.xp3",
+        "c:extra.xp3",
+        "//server/share/extra.xp3",
+        r"\\server\share\extra.xp3",
     ] {
         for probe in PROBES {
             let reference_entry = reference_archive_index(&root, &mounts, archive_name)
