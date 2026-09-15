@@ -19,7 +19,6 @@ pub struct ParserOptions {
     pub ignore_cr: bool,
     pub process_special_tags: bool,
     pub process_cond: bool,
-    pub process_eval: bool,
     pub resolve_entities: bool,
     pub max_macro_depth: usize,
 }
@@ -30,7 +29,6 @@ impl Default for ParserOptions {
             ignore_cr: false,
             process_special_tags: true,
             process_cond: true,
-            process_eval: true,
             resolve_entities: true,
             max_macro_depth: 64,
         }
@@ -1237,17 +1235,15 @@ impl KagParser {
             return Ok(NextItem::Consumed);
         }
 
-        // The older spelling of the same gate. The reference parser itself only
-        // knows `cond` (`KAGParser.cpp:2223-2232`); `eval` is read by the tag
-        // handlers that want it, so the gate is applied to exactly the tags
-        // whose engine-side implementation stands in for such a handler
-        // (`tag_reads_eval_gate`) and to nothing else.
-        if self.options.process_eval
-            && tag_reads_eval_gate(&tag.tagname)
-            && !self.process_eval_attr(&tag, host)?
-        {
-            return Ok(NextItem::Consumed);
-        }
+        // `eval` — the older spelling of a tag gate — is deliberately *not*
+        // handled here. The reference parser gates on `cond` only
+        // (`KAGParser.cpp:2223-2232`, which drops that attribute and stores
+        // everything else), and each handler that wants `eval` reads it itself:
+        // evaluating it here too would run an arbitrary TJS expression a second
+        // time for every tag a project's own handler also inspects (and
+        // `Scripts.eval` may have side effects). The engine's own `[next]`
+        // implementation applies the same check in its arm
+        // (`kag_eval_allows`), so each path evaluates it exactly once.
 
         if self.options.resolve_entities {
             self.resolve_entities(&mut tag, host)?;
@@ -2077,31 +2073,6 @@ impl KagParser {
         host.eval_bool(&expression)
     }
 
-    /// The reference's `eval` check, as the handlers that have one write it:
-    /// `if (elm.eval == "" || Scripts.eval(elm.eval))` (`MainWindow.tjs:11599`).
-    /// A missing or empty attribute runs the tag without evaluating anything;
-    /// anything else is evaluated and decides.
-    ///
-    /// The attribute stays on the tag. The reference parser special-cases only
-    /// `cond` and drops that one (`KAGParser.cpp:2223-2232`), while `eval` is
-    /// stored like every other attribute and read by whoever wants it — a
-    /// parser that took it away would hide it from the project's own handlers
-    /// (GINKA's shipped `MainWindow.tjs` reads `a0.eval` for both `next` and
-    /// `exit`).
-    fn process_eval_attr<H>(&self, tag: &Tag, host: &mut H) -> Result<bool>
-    where
-        H: KagHost,
-    {
-        let Some(value) = tag.attr("eval") else {
-            return Ok(true);
-        };
-        let expression = self.attr_value_to_string(value, host)?;
-        if expression.is_empty() {
-            return Ok(true);
-        }
-        host.eval_bool(&expression)
-    }
-
     fn apply_macro_arguments(&self, tag: &mut Tag) {
         if self.macro_params.is_empty() {
             let mut attributes = Vec::new();
@@ -2823,40 +2794,6 @@ fn tag_supports_cond(tagname: &str, process_special_tags: bool) -> bool {
         ))
 }
 
-/// The tags whose *engine-owned* implementation stands in for a reference
-/// handler that gates on `eval`, i.e. the ones whose whole body the reference
-/// wraps in `if (elm.eval == "" || Scripts.eval(elm.eval))`.
-///
-/// Audited against the KAG3/KAGEX system template the roster games ship
-/// (`krkr2/kirikiri2/branches/kag3ex3/template/system/MainWindow.tjs`) and the
-/// reference parser (`kirikiri2/trunk/kirikiri2/src/core/utils/KAGParser.cpp`):
-///
-/// * `next` — `MainWindow.tjs:11599` closes the handler body with the gate, and
-///   the engine's own `[next]` implementation (`NativeFallbackTag::Next`) is
-///   that handler's stand-in, so the gate is applied here, where it runs for
-///   every `next` whichever project wrote the scenario. The bookkeeping the
-///   reference does *before* the gate (`if (autoLabelMode) { autoLabelCount++;
-///   storeAutoLabel(); }`, `:11594-11598`) has no counterpart in this engine —
-///   KAG's auto-label mode is a KAGWindow feature this engine does not
-///   implement at all (`autoLabelMode` appears nowhere in krkr-engine,
-///   krkr-kag or krkr-core) — so the gate skips nothing that exists here.
-/// * `exit` — deliberately **not** gated here. Its handler is the project's own
-///   (`MainWindow.tjs:11622`); it does its auto-label bookkeeping before the
-///   gate (`:11614-11621`) and only then decides, and the engine has no `exit`
-///   implementation to stand in for it. A parser-level gate would therefore
-///   only take the tag away from the handler that owns both the gate and that
-///   pre-gate work (GINKA's shipped `t1["exit"]` has the same shape), while for
-///   a project without an `exit` handler the tag does nothing either way.
-/// * `seladd`/`bradd`/`branch`/`mseladd` read `eval` as a value rather than a
-///   gate (`addSelect` `:4391-4403`, `addBranch` `:4532-4543`, `doBranch`
-///   `:4550`, `addMapSelect` `:4506-4508`), `beginskip` turns it into
-///   `enableLeftBeginSkip` and still runs (`:11646`), and no other tag's
-///   handler looks at it at all — the reference parser special-cases only
-///   `cond`, so gating any of them would be a divergence of its own.
-fn tag_reads_eval_gate(tagname: &str) -> bool {
-    matches!(tagname, "next")
-}
-
 fn is_kag_ws(ch: char) -> bool {
     ch == ' ' || ch == '\t'
 }
@@ -3273,114 +3210,52 @@ mod tests {
         assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
     }
 
-    /// The gate itself: `[next eval=…]` whose expression is false never reaches
-    /// the host (the reference wraps the whole `next` handler body in
-    /// `MainWindow.tjs:11599`).
+    /// `eval` is not a parser-level gate and not a parser-consumed attribute.
+    /// The reference parser special-cases only `cond` (`KAGParser.cpp:2223-2232`,
+    /// which drops that attribute) and stores every other one, while each
+    /// handler that wants `eval` evaluates it itself — and `Scripts.eval` is
+    /// arbitrary TJS that may have side effects, so the parser must not run it:
+    /// on a project-driven `[next]` the project's own handler is the *only*
+    /// evaluator, and a parser that evaluated it too would make it twice.
+    ///
+    /// `noexp` has no value in this host, so any evaluation here would fail the
+    /// call outright; the tags below cover the shapes the reference uses:
+    /// the engine-owned `next` (whose gate lives in the engine's arm,
+    /// `NativeFallbackTag::Next`), handler-owned gates (`exit`
+    /// `MainWindow.tjs:11622`, `seladd` `:4403` — its `selectTotalCount++`
+    /// bookkeeping runs before the gate — and `mseladd` `:4507`), value and
+    /// deferred uses (`bradd`/`branch` `:4532-4550`, `beginskip` `:11646`), and
+    /// a plain tag whose handler never reads it at all (`bg`).
     #[test]
-    fn eval_false_makes_next_a_no_op() {
-        let mut parser = KagParser::new();
-        parser
-            .load_scenario_text("first.ks", "[next storage=scn.ks eval=noexp][after]")
-            .unwrap();
-        let mut host = TestHost::default();
-        host.bools.insert("noexp".into(), false);
-
-        assert_eq!(next_with(&mut parser, &mut host).tagname, "after");
-        assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
-    }
-
-    /// A gate that passes must leave the tag exactly as the reference parser
-    /// built it: `eval` is not an attribute the parser consumes
-    /// (`KAGParser.cpp:2223-2232` drops only `cond`).
-    #[test]
-    fn eval_true_and_eval_empty_run_next_and_keep_the_attribute() {
+    fn eval_is_not_a_parser_gate_and_stays_on_the_tag() {
         let mut parser = KagParser::new();
         parser
             .load_scenario_text(
                 "first.ks",
-                "[next storage=scn.ks eval=yesexp][next storage=scn.ks eval=][next storage=scn.ks]",
+                "[next storage=scn.ks eval=noexp][exit storage=other.ks eval=noexp][seladd text=T eval=noexp][mseladd eval=noexp][bradd target=*t eval=noexp][branch eval=noexp][beginskip eval=noexp][bg storage=bg.png eval=noexp]",
             )
             .unwrap();
         let mut host = TestHost::default();
-        host.bools.insert("yesexp".into(), true);
 
-        let fired = next_with(&mut parser, &mut host);
-        assert_eq!(fired.tagname, "next");
-        assert_eq!(
-            fired.literal_attr("eval"),
-            Some("yesexp"),
-            "the parser must not take `eval` off the tag"
-        );
-        for _ in 0..2 {
-            assert_eq!(next_with(&mut parser, &mut host).tagname, "next");
-        }
-        assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
-    }
-
-    /// `exit` keeps its `eval` for the project's handler. The reference's `exit`
-    /// handler owns the gate *and* does its auto-label bookkeeping before it
-    /// (`MainWindow.tjs:11614-11622`), and this engine has no `exit`
-    /// implementation standing in for that handler, so the parser must hand the
-    /// tag through untouched (`tag_reads_eval_gate` names `next` only).
-    #[test]
-    fn eval_is_left_for_the_exit_handler() {
-        let mut parser = KagParser::new();
-        parser
-            .load_scenario_text("first.ks", "[exit storage=other.ks eval=noexp][after]")
-            .unwrap();
-        let mut host = TestHost::default();
-        host.bools.insert("noexp".into(), false);
-
-        let exit = next_with(&mut parser, &mut host);
-        assert_eq!(exit.tagname, "exit");
-        assert_eq!(exit.literal_attr("eval"), Some("noexp"));
-        assert_eq!(next_with(&mut parser, &mut host).tagname, "after");
-        assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
-    }
-
-    /// `eval` is not a universal gate: the reference reads it only in the
-    /// handlers `tag_reads_eval_gate` names, and the reference parser itself
-    /// leaves every attribute but `cond` on the tag (`KAGParser.cpp:2223-2232`).
-    /// These exempt tags must therefore reach the host with `eval` intact —
-    /// `seladd` uses it as its show flag, `bradd` stores it for `branch` to
-    /// evaluate later, `mseladd` reads it inside its own handler, and
-    /// `beginskip` uses it as `enableLeftBeginSkip` without skipping the tag.
-    #[test]
-    fn eval_is_a_pass_through_value_for_tags_without_a_reference_gate() {
-        let mut parser = KagParser::new();
-        parser
-            .load_scenario_text(
-                "first.ks",
-                "[seladd text=T eval=noexp][bradd target=*t eval=noexp][branch eval=noexp][beginskip eval=noexp][mseladd eval=noexp][bg storage=bg.png eval=noexp]",
-            )
-            .unwrap();
-        let mut host = TestHost::default();
-        host.bools.insert("noexp".into(), false);
-
-        for name in ["seladd", "bradd", "branch", "beginskip", "mseladd", "bg"] {
+        for name in [
+            "next",
+            "exit",
+            "seladd",
+            "mseladd",
+            "bradd",
+            "branch",
+            "beginskip",
+            "bg",
+        ] {
             let tag = next_with(&mut parser, &mut host);
             assert_eq!(tag.tagname, name);
             assert_eq!(
                 tag.literal_attr("eval"),
                 Some("noexp"),
-                "`{name}` lost the eval attribute the reference leaves for its handler"
+                "`{name}` must reach the host with its eval attribute intact"
             );
         }
         assert_eq!(parser.next_tag_with(&mut host).unwrap(), None);
-    }
-
-    #[test]
-    fn eval_gate_is_skipped_when_disabled() {
-        let mut parser = KagParser::new();
-        parser.options_mut().process_eval = false;
-        parser
-            .load_scenario_text("first.ks", "[next storage=scn.ks eval=noexp][after]")
-            .unwrap();
-        let mut host = TestHost::default();
-        host.bools.insert("noexp".into(), false);
-
-        assert_eq!(next_with(&mut parser, &mut host).tagname, "next");
-        assert_eq!(next_with(&mut parser, &mut host).tagname, "after");
     }
 
     #[test]
