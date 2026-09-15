@@ -88,6 +88,18 @@
 //!   engine has no such code, so the port reports a runtime error with the
 //!   same meaning.
 //!
+//! `check()`'s rejection of non-positive sizes is also what the artifact a
+//! game actually loads does. PARQUET ships no standalone `shrinkCopy.dll` —
+//! neither loose in its `plugin/` directory nor as a member of any of its
+//! archives — and the `Layer.shrinkCopy` its scripts call arrives inside
+//! `PackinOne.dll`'s bundle, whose own plugin list names `shrinkCopy.dll`. The
+//! bundled `check()` (`10014430h`, entered from `layerShrinkCopy` at
+//! `10027d90h`, which returns `TJS_E_INVALIDPARAM` when it fails) tests
+//! `sw > 0`, `sh > 0`, `dw > 0`, `dh > 0`, then `sw >= (long)dw`,
+//! `sh >= (long)dh`, then both layer buffers — the same guard, in the same
+//! order, as `main.cpp:110`. Tolerating a degenerate call would therefore
+//! diverge from the shipped binary as well as from the source.
+//!
 //! Faithfulness of the arithmetic: every clipping rule, table entry and sum
 //! below is a transcription of the lines cited above, and the tests derive
 //! their expectations by hand from that arithmetic (an exact 2:1 box average,
@@ -1427,11 +1439,24 @@ mod tests {
         assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::InvalidParam);
         assert_eq!(error.message, "Invalid argument");
 
-        // A zero destination width is `dw <= 0` (`main.cpp:110`).
-        let error = engine
-            .execute_expression("inline.tjs", "dst.shrinkCopy(0, 0, 0, 1, src, 0, 0, 2, 1)")
-            .expect_err("zero width");
-        assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::InvalidParam);
+        // Every non-positive size is `sw <= 0 || sh <= 0 || dw <= 0 ||
+        // dh <= 0` (`main.cpp:110`), in the artifact's order: the copy PARQUET
+        // loads (`PackinOne.dll`, no standalone `shrinkCopy.dll` ships) tests
+        // `sw > 0`, `sh > 0`, `dw > 0`, `dh > 0` before its enlargement tests
+        // (`check()` at `10014430h`). Tolerating any of them would be a
+        // divergence from the binary as well as from the source.
+        for expression in [
+            "dst.shrinkCopy(0, 0, 2, 1, src, 0, 0, 0, 1)", // sw = 0
+            "dst.shrinkCopy(0, 0, 2, 1, src, 0, 0, 2, 0)", // sh = 0
+            "dst.shrinkCopy(0, 0, 0, 1, src, 0, 0, 2, 1)", // dw = 0
+            "dst.shrinkCopy(0, 0, 2, 0, src, 0, 0, 2, 1)", // dh = 0
+            "dst.shrinkCopy(0, 0, -1, 1, src, 0, 0, 2, 1)", // dw < 0
+        ] {
+            let error = engine
+                .execute_expression("inline.tjs", expression)
+                .expect_err("non-positive size");
+            assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::InvalidParam);
+        }
 
         // A non-object source is `IsValidLayer(NULL)` (`main.cpp:17`).
         let error = engine
