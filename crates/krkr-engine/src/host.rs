@@ -898,6 +898,13 @@ impl KrkrHost {
     /// reachable for a bare stem too. The reference walks a hash table, so its
     /// order is arbitrary where ours is the order plugins registered in.
     ///
+    /// The probe is the *exact* one (`TVPIsExistentStorage`,
+    /// `StorageIntf.cpp:1220` — placed path plus auto paths, no extension
+    /// completion; our [`ProjectStoragePort::storage_exists_exact`]). The
+    /// convenience probe would answer true for a candidate that only exists
+    /// under another extension (`art.fake` through `art.fake.png`) and hand the
+    /// loader a storage name whose read resolves to a different file.
+    ///
     /// `None` means no loader answers and the built-in decode path — and its
     /// own extension suggestions — stand.
     pub(crate) fn graphic_loader_for(
@@ -913,7 +920,7 @@ impl KrkrHost {
         for loader in &self.graphic_loaders {
             for extension in loader.extensions() {
                 let candidate = format!("{storage}{}", extension.to_ascii_lowercase());
-                if storage_port.storage_exists(&candidate) {
+                if storage_port.storage_exists_exact(&candidate) {
                     return Some((Arc::clone(loader), candidate));
                 }
             }

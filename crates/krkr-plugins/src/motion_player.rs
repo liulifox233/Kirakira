@@ -189,7 +189,11 @@ impl KrkrPlugin for MotionPlayerPlugin {
     }
 
     fn unregister(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
-        unregister_graphic_loader(runtime, self.name());
+        // The `.mtn` loader is one registration shared with `emoteplayer.dll`
+        // (the same driver in another build): unlinking this alias leaves it in
+        // place while the other one is still linked, and drops it when this was
+        // the last.
+        unregister_motion_graphic_loader(runtime, self.name());
         Ok(())
     }
 }
@@ -625,6 +629,34 @@ fn register_motion_graphic_loader(runtime: &mut Runtime<KrkrHost>) {
             "motionplayer.dll: the .mtn graphic loader could not be registered: {error}"
         ));
     }
+}
+
+/// The module aliases the shared E-mote implementation answers as
+/// (`motionplayer.dll` and `emoteplayer.dll` are the same driver in two
+/// builds; both register this loader).
+const EMOTE_MODULE_ALIASES: [&str; 2] = ["motionplayer.dll", "emoteplayer.dll"];
+
+/// Drops the shared `.mtn` loader once the **last** E-mote alias is unlinked —
+/// the counterpart of the reference's `TVPUnregisterGraphicLoadingHandler`
+/// (`GraphicsLoaderIntf.cpp:184`), which the module that registered the handler
+/// calls.
+///
+/// One registration serves both aliases, so the ownership rule is "it lives
+/// while either alias is linked": a game may link both (probing which build it
+/// was shipped with) and unlink one, and that unlink must not take the claim
+/// away from the module still linked. `unlinked` is the alias being torn down;
+/// any *other* registered alias keeps the loader.
+pub(crate) fn unregister_motion_graphic_loader(runtime: &mut Runtime<KrkrHost>, unlinked: &str) {
+    let other_linked = runtime.host().linked_plugins().any(|name| {
+        !name.eq_ignore_ascii_case(unlinked)
+            && EMOTE_MODULE_ALIASES
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(name))
+    });
+    if other_linked {
+        return;
+    }
+    unregister_graphic_loader(runtime, "motionplayer.dll");
 }
 
 /// The E-mote driver answering for `.mtn` in the script image path — the
@@ -4603,5 +4635,61 @@ mod tests {
             0,
             "the loop's empty tick is delivered, not held"
         );
+    }
+
+    /// The shared `.mtn` loader lives while **either** E-mote alias is linked
+    /// and drops only when the last one is unlinked — in either order. The
+    /// loader is one registration serving two module aliases, so an unlink must
+    /// not take the claim away from the alias still linked.
+    ///
+    /// Driven through `Plugins.unlink` rather than the trait method, because
+    /// that is the path whose ordering matters: the host runs `unregister`
+    /// *before* the name leaves `linked_plugins` (`native/plugins.rs:62-70`),
+    /// so the rule can only look at the other alias.
+    #[test]
+    fn the_mtn_loader_survives_unlinking_one_emote_alias() {
+        use krkr_engine::plugin_api::graphic::graphic_loader_names;
+
+        fn loader_registered(engine: &KrkrEngine) -> bool {
+            graphic_loader_names(engine.tjs_runtime())
+                .iter()
+                .any(|name| name == "motionplayer.dll")
+        }
+
+        fn unlink(engine: &mut KrkrEngine, script: &str, name: &str) {
+            engine
+                .execute_script(script, &format!("Plugins.unlink(\"{name}\");"))
+                .unwrap_or_else(|error| panic!("unlink {name}: {error}"));
+        }
+
+        // `engine_with` installs `motionplayer.dll`; add the shared alias.
+        let mut emote_first = engine_with(&[]);
+        emote_first
+            .register_plugin(crate::EmotePlayerPlugin)
+            .expect("emoteplayer");
+        assert!(loader_registered(&emote_first), "the claim is registered");
+        unlink(&mut emote_first, "unlink_emote.tjs", "emoteplayer.dll");
+        assert!(
+            loader_registered(&emote_first),
+            "motionplayer.dll still owns the claim"
+        );
+        unlink(&mut emote_first, "unlink_motion.tjs", "motionplayer.dll");
+        assert!(
+            !loader_registered(&emote_first),
+            "the last alias drops the claim"
+        );
+
+        // The other order: motionplayer first, emoteplayer last.
+        let mut motion_first = engine_with(&[]);
+        motion_first
+            .register_plugin(crate::EmotePlayerPlugin)
+            .expect("emoteplayer");
+        unlink(&mut motion_first, "unlink_motion.tjs", "motionplayer.dll");
+        assert!(
+            loader_registered(&motion_first),
+            "emoteplayer.dll still owns the claim"
+        );
+        unlink(&mut motion_first, "unlink_emote.tjs", "emoteplayer.dll");
+        assert!(!loader_registered(&motion_first), "the last alias drops it");
     }
 }

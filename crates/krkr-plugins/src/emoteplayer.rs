@@ -66,17 +66,9 @@ impl KrkrPlugin for EmotePlayerPlugin {
         // (`crate::motion_player`), which this alias only borrows. Unlinking
         // `emoteplayer.dll` must therefore not tear down the registration while
         // `motionplayer.dll` — the module the loader is named after and carries
-        // the code for — is still linked.
-        let motionplayer_linked = runtime
-            .host()
-            .linked_plugins()
-            .any(|name| name.eq_ignore_ascii_case("motionplayer.dll"));
-        if !motionplayer_linked {
-            krkr_engine::plugin_api::graphic::unregister_graphic_loader(
-                runtime,
-                "motionplayer.dll",
-            );
-        }
+        // the code for — is still linked; the shared rule drops it when the
+        // last alias goes.
+        crate::motion_player::unregister_motion_graphic_loader(runtime, self.name());
         Ok(())
     }
 }

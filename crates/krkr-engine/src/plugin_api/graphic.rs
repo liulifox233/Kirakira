@@ -266,6 +266,28 @@ mod tests {
         })
     }
 
+    /// A loader that only records being asked, for the suggestion walk's pins:
+    /// its extension claims nothing about the bytes, so a pin asserts on
+    /// whether the walk selected it at all.
+    struct CountingLoader {
+        calls: Arc<AtomicU32>,
+    }
+
+    impl GraphicLoader for CountingLoader {
+        fn name(&self) -> &str {
+            "counting.dll"
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &[".fake"]
+        }
+
+        fn load(&self, _source: GraphicSource<'_>) -> std::result::Result<LoadedGraphic, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LoadedGraphic::still(fake_frame(9)))
+        }
+    }
+
     fn temp_root(tag: &str) -> PathBuf {
         static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
@@ -396,6 +418,51 @@ mod tests {
         assert!(
             message.contains("`nothing-here`") && !message.contains("fake.dll"),
             "no loader answered the stem: {message}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The suggestion walk probes existence **exactly** the way
+    /// `TVPIsExistentStorage` does (`StorageIntf.cpp:1220`: placed path plus
+    /// auto paths, no extension completion). A candidate the *convenience*
+    /// probe would find through another extension — `art.fake` answered by
+    /// `art.fake.png` — is not a storage the loader could read: selecting it
+    /// hands the loader a name whose read resolves to a different file.
+    ///
+    /// Fails before the probe was exact: `art.fake` looks existent, the loader
+    /// is asked (`calls == 1`) and the load succeeds, where the stem must stay
+    /// unclaimed and fail on its own.
+    #[test]
+    fn the_suggestion_walk_does_not_pick_a_candidate_only_extension_probing_finds() {
+        let (mut engine, root) = engine_with_root("suggest-exact");
+        let calls = Arc::new(AtomicU32::new(0));
+        register(
+            &mut engine,
+            Arc::new(CountingLoader {
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn GraphicLoader>,
+        );
+        // `art.fake` itself is gone; only `art.fake.png` exists, so the exact
+        // probe answers false and the completing probe would answer true.
+        fs::remove_file(root.join("art.fake")).expect("drop the exact file");
+        fs::write(root.join("art.fake.png"), b"not a png").expect("write the decoy");
+
+        let result = engine.execute_script(
+            "load.tjs",
+            r#"
+                var layer = new Layer(0, 0, 3, 2);
+                layer.loadImages("art");
+                "#,
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the loader was not asked for a candidate that does not exist exactly",
+        );
+        let error = result.expect_err("the stem is unclaimed");
+        assert!(
+            error.to_string().contains("`art`"),
+            "the failure names the requested storage: {error}"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
