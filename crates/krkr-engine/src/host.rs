@@ -797,7 +797,7 @@ impl KrkrHost {
     }
 
     /// Registers a plugin-owned graphic loader
-    /// (`TVPRegisterGraphicLoadingHandler`, `GraphicsLoaderIntf.cpp:142`), the
+    /// (`TVPRegisterGraphicLoadingHandler`, `GraphicsLoaderIntf.cpp:170`), the
     /// hook a plugin that answers for a storage format (`mtn`, and whatever
     /// else it ships) calls from [`crate::KrkrPlugin::register`]. From here on
     /// every script image load of a claimed extension goes through the loader
@@ -835,7 +835,7 @@ impl KrkrHost {
 
     /// Unregisters the loader registered under module name `name`, dropping
     /// every live graphic it handed the engine
-    /// (`TVPUnregisterGraphicLoadingHandler`, `GraphicsLoaderIntf.cpp:170`).
+    /// (`TVPUnregisterGraphicLoadingHandler`, `GraphicsLoaderIntf.cpp:184`).
     /// Returns whether a loader matched.
     pub fn unregister_graphic_loader(&mut self, name: &str) -> bool {
         let before = self.graphic_loaders.len();
@@ -874,60 +874,87 @@ impl KrkrHost {
     }
 
     fn graphic_loader_extension_owner(&self, extension: &str) -> Option<&str> {
-        self.graphic_loaders
-            .iter()
-            .find(|loader| {
-                loader
-                    .extensions()
-                    .iter()
-                    .any(|claimed| claimed.eq_ignore_ascii_case(extension))
-            })
+        self.graphic_loader_claiming(extension)
             .map(|loader| loader.name())
     }
 
-    /// The loader that claims `storage`'s extension, if any. This is the
-    /// reference's handler dispatch (`TVPInternalLoadGraphic`,
-    /// `GraphicsLoaderIntf.cpp:1524-1534`): the decision is made on the name
-    /// alone, before the storage is read or decoded.
-    pub(crate) fn graphic_loader_for(&self, storage: &str) -> Option<Arc<dyn GraphicLoader>> {
-        let extension = storage_extension(storage)?;
-        self.graphic_loaders
-            .iter()
-            .find(|loader| {
-                loader
-                    .extensions()
-                    .iter()
-                    .any(|claimed| claimed.eq_ignore_ascii_case(&extension))
-            })
-            .cloned()
+    fn graphic_loader_claiming(&self, extension: &str) -> Option<&Arc<dyn GraphicLoader>> {
+        self.graphic_loaders.iter().find(|loader| {
+            loader
+                .extensions()
+                .iter()
+                .any(|claimed| claimed.eq_ignore_ascii_case(extension))
+        })
     }
 
-    /// Loads `storage` through the plugin loader claiming its extension, or
-    /// `None` when no loader claims it (the built-in decode path then stands).
+    /// The loader that answers `storage`, with the storage name to read.
+    ///
+    /// A name that carries an extension is decided on the name alone
+    /// (`GraphicsLoaderIntf.cpp:1506`, throw `:1509`), before the storage is
+    /// read or decoded. A name *without* one is completed the way the
+    /// reference's suggestion walk does (`:1476`, walk `:1480-1503`): every
+    /// registered loader's extensions are tried in registration order and the
+    /// first `name + extension` that exists wins, so a plugin claim is
+    /// reachable for a bare stem too. The reference walks a hash table, so its
+    /// order is arbitrary where ours is the order plugins registered in.
+    ///
+    /// `None` means no loader answers and the built-in decode path — and its
+    /// own extension suggestions — stand.
+    pub(crate) fn graphic_loader_for(
+        &self,
+        storage: &str,
+    ) -> Option<(Arc<dyn GraphicLoader>, String)> {
+        if let Some(extension) = storage_extension(storage) {
+            return self
+                .graphic_loader_claiming(&extension)
+                .map(|loader| (Arc::clone(loader), storage.to_string()));
+        }
+        let storage_port = self.project_storage.as_ref()?;
+        for loader in &self.graphic_loaders {
+            for extension in loader.extensions() {
+                let candidate = format!("{storage}{}", extension.to_ascii_lowercase());
+                if storage_port.storage_exists(&candidate) {
+                    return Some((Arc::clone(loader), candidate));
+                }
+            }
+        }
+        None
+    }
+
+    /// Loads `storage` through the plugin loader that answers it, or `None`
+    /// when no loader does (the built-in decode path then stands).
     ///
     /// The storage bytes are read here and handed to the loader, which owns its
     /// container format completely; the engine turns the returned pixels into
     /// the layer image and — when the loader returned a live graphic — keeps it
     /// ticking.
     fn load_graphic_through_plugin(&mut self, storage: &str) -> Option<Result<LayerImage>> {
-        let loader = self.graphic_loader_for(storage)?;
-        Some(self.run_graphic_loader(loader, storage))
+        let (loader, resolved) = self.graphic_loader_for(storage)?;
+        Some(self.run_graphic_loader(loader, storage, &resolved))
     }
 
+    /// `requested` is the name the caller (a script, usually) asked for and is
+    /// what the image cache and a live graphic's binding are keyed by;
+    /// `resolved` is the storage read, which differs only for a name the
+    /// extension suggestion completed. The loader is handed `resolved`, the way
+    /// the reference hands its handler the suggested name
+    /// (`GraphicsLoaderIntf.cpp:1496`) — for the `.mtn` loader that is the
+    /// difference between a bare stem and the file it draws from.
     fn run_graphic_loader(
         &mut self,
         loader: Arc<dyn GraphicLoader>,
-        storage: &str,
+        requested: &str,
+        resolved: &str,
     ) -> Result<LayerImage> {
-        let bytes = self.read_binary_storage_for_kind(storage, AssetKind::Image)?;
+        let bytes = self.read_binary_storage_for_kind(resolved, AssetKind::Image)?;
         let loaded = loader
             .load(GraphicSource {
-                storage,
+                storage: resolved,
                 bytes: &bytes,
             })
             .map_err(|error| {
                 TjsError::runtime(format!(
-                    "failed to decode image `{storage}` through {}: {error}",
+                    "failed to decode image `{requested}` through {}: {error}",
                     loader.name()
                 ))
             })?;
@@ -937,21 +964,28 @@ impl KrkrHost {
         let frame = loaded.frame;
         let image = LayerImage::new(texture_id, frame.width, frame.height, frame.rgba.into());
         self.logs.push(format!(
-            "script image decoded `{storage}` ({}x{}, {} bytes) through graphic loader `{}`",
+            "script image decoded `{requested}` ({}x{}, {} bytes) through graphic loader `{}`{}",
             frame.width,
             frame.height,
             image.upload.rgba.len(),
-            loader.name()
+            loader.name(),
+            if requested == resolved {
+                String::new()
+            } else {
+                format!(" from the suggested storage `{resolved}`")
+            }
         ));
 
         // A fresh load of one storage supersedes any live graphic of it: the
-        // new image has a new texture id and no layer shows the old one.
+        // new image has a new texture id and no layer shows the old one. The
+        // binding is keyed by the name the caller asked for, which is what the
+        // layer's own image-storage record carries.
         self.live_graphics
-            .retain(|binding| binding.storage != storage);
+            .retain(|binding| binding.storage != requested);
         if let Some(handle) = loaded.live {
             self.live_graphics.push(LiveGraphicBinding {
                 loader: loader.name().to_string(),
-                storage: storage.to_string(),
+                storage: requested.to_string(),
                 texture_id,
                 size: (frame.width, frame.height),
                 elapsed: Duration::ZERO,
@@ -2947,9 +2981,11 @@ impl KrkrHost {
 
         // `TVPInternalLoadGraphic` decides on the name's extension *before* it
         // opens the storage and before any built-in decoder runs
-        // (`GraphicsLoaderIntf.cpp:1524-1534`): a plugin that claims it owns
-        // the format, and a name nobody claims keeps the decode path — and its
-        // "The image format could not be determined" error — exactly as before.
+        // (`GraphicsLoaderIntf.cpp:1506`, throw `:1509`; a name with no
+        // extension walks the handler table first, `:1480-1503`): a plugin that
+        // claims it owns the format, and a name nobody claims keeps the decode
+        // path — and its "The image format could not be determined" error —
+        // exactly as before.
         if let Some(result) = self.load_graphic_through_plugin(name) {
             let image = result?;
             self.image_cache.insert(name.to_string(), image.clone());

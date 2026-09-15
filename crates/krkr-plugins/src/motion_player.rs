@@ -629,7 +629,8 @@ fn register_motion_graphic_loader(runtime: &mut Runtime<KrkrHost>) {
 
 /// The E-mote driver answering for `.mtn` in the script image path — the
 /// reference's `TVPRegisterGraphicLoadingHandler` claim
-/// (`visual/GraphicsLoaderIntf.cpp:142`, dispatch `:1524-1534`), which is what
+/// (`visual/GraphicsLoaderIntf.cpp:170`, dispatch `:1506`/`:1509`, the
+/// missing-extension suggestion walk `:1480-1503`), which is what
 /// makes `Layer.loadImages("motion/title_bg.mtn")` and `System.touchImages`
 /// reach the plugin instead of the built-in decoders. PARQUET's title layer
 /// (`custom.ks` `*title_start`, the `GetTitleImageFile.UseMotion()` branch)
@@ -776,10 +777,13 @@ impl LiveGraphic for MotionGraphic {
             .canvas
             .render(&self.motion, &self.animation, tick as f32, &mut textures);
         playback.rendered_tick = Some(tick);
-        // An empty sample at the animation's tail is the animation saying
-        // "nothing is drawn here"; the last frame the layer already shows
-        // stands rather than the layer being wiped.
-        if frame.rgba.iter().all(|byte| *byte == 0) {
+        // An animation that plays **once** may end on a tick it draws nothing
+        // at (PARQUET's `title` and `logoflash` do): the last frame the layer
+        // already shows stands rather than the layer being wiped. A motion with
+        // a loop point wraps instead (`:757`), so an all-transparent sample
+        // there is part of the animation and is delivered like any other —
+        // holding it would stop the loop dead on one empty tick.
+        if playback.loop_ticks.is_none() && frame.rgba.iter().all(|byte| *byte == 0) {
             playback.held = true;
             return None;
         }
@@ -4515,6 +4519,89 @@ mod tests {
             integer(&mut engine, "layer.imageWidth"),
             100,
             "a frame swap keeps the loaded size"
+        );
+    }
+
+    /// Loads the fixture motion as a 100x80 script image into `global.layer`.
+    const LOAD_AS_IMAGE: &str = r#"
+        global.layer = new Layer(0, 0, 100, 80);
+        layer.loadImages("motion/hero.mtn");
+    "#;
+
+    /// One frame of engine time (`advance`'s `delta` reaches the live graphic
+    /// through `KrkrEngine::advance`).
+    fn advance(engine: &mut KrkrEngine, delta: Duration) {
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(1280.0, 720.0), 0.0), Vec::new()),
+                delta,
+            )
+            .expect("frame");
+    }
+
+    /// One layer whose 4x4 icon is drawn at tick 0 and gone from `empty_from`
+    /// on: an animation whose own tail samples all-transparent.
+    fn vanishing_layer(empty_from: i64, end: i64) -> Value {
+        object(vec![
+            ("label", text("body")),
+            ("coordinate", int(0)),
+            ("children", list(vec![])),
+            (
+                "frameList",
+                list(vec![
+                    object(vec![
+                        ("content", content("src/hero/white", [0, 0], 255)),
+                        ("time", int(0)),
+                        ("type", int(2)),
+                    ]),
+                    object(vec![("time", int(empty_from)), ("type", int(2))]),
+                    object(vec![("time", int(end)), ("type", int(0))]),
+                ]),
+            ),
+        ])
+    }
+
+    /// An all-transparent sample means "the animation is over" for a motion
+    /// that plays once — the layer keeps the frame it already shows — but a
+    /// looping motion must deliver it: one empty tick inside the loop is part
+    /// of the animation, and holding it would freeze the loop forever.
+    ///
+    /// Fails before the hold guard was scoped to one-shots: the looping half
+    /// kept the white icon (`white_near` stayed > 0) instead of clearing.
+    #[test]
+    fn a_looping_motion_is_not_held_on_an_empty_tick() {
+        let icons = || vec![("white", [255, 255, 255, 255])];
+
+        // `loopTime = -1`: the icon drawn at tick 0 stands past the empty tail.
+        let mut one_shot = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes_on_screen(icons(), vanishing_layer(20, 400), 400, -1, [100, 80, 0, 0]),
+        )]);
+        one_shot
+            .execute_script("load.tjs", LOAD_AS_IMAGE)
+            .expect("load");
+        assert!(white_near(&mut one_shot, 50, 40) > 0, "drawn at load");
+        advance(&mut one_shot, Duration::from_millis(420));
+        assert!(
+            white_near(&mut one_shot, 50, 40) > 0,
+            "the one-shot holds its last drawn frame"
+        );
+
+        // `loopTime = 40`: tick 25.2 of the second loop draws nothing, and the
+        // layer must follow the loop rather than freeze on the icon.
+        let mut looping = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes_on_screen(icons(), vanishing_layer(20, 400), 400, 40, [100, 80, 0, 0]),
+        )]);
+        looping
+            .execute_script("load.tjs", LOAD_AS_IMAGE)
+            .expect("load");
+        assert!(white_near(&mut looping, 50, 40) > 0, "drawn at load");
+        advance(&mut looping, Duration::from_millis(420));
+        assert_eq!(
+            white_near(&mut looping, 50, 40),
+            0,
+            "the loop's empty tick is delivered, not held"
         );
     }
 }

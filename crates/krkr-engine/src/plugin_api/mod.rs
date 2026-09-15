@@ -13,7 +13,8 @@
 //!   plugin format like E-mote's `.mtn` yields a real layer bitmap instead of
 //!   "The image format could not be determined" — the counterpart of
 //!   `TVPRegisterGraphicLoadingHandler`
-//!   (`visual/GraphicsLoaderIntf.cpp:142`, dispatch `:1524-1534`). A loader may
+//!   (`visual/GraphicsLoaderIntf.cpp:170`, dispatch `:1506`/`:1509`, the
+//!   missing-extension suggestion walk `:1480-1503`). A loader may
 //!   hand back a live graphic the engine re-uploads every frame, which is how
 //!   an animated motion stays animated as a layer image.
 //! * [`transition`] registers a transition handler provider under a name —

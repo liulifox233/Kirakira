@@ -62,9 +62,21 @@ impl KrkrPlugin for EmotePlayerPlugin {
     }
 
     fn unregister(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
-        // The `.mtn` loader is the shared motionplayer one; this module claims
-        // the same surface, so it registers and drops the same loader.
-        krkr_engine::plugin_api::graphic::unregister_graphic_loader(runtime, "motionplayer.dll");
+        // The `.mtn` loader belongs to the shared motionplayer implementation
+        // (`crate::motion_player`), which this alias only borrows. Unlinking
+        // `emoteplayer.dll` must therefore not tear down the registration while
+        // `motionplayer.dll` — the module the loader is named after and carries
+        // the code for — is still linked.
+        let motionplayer_linked = runtime
+            .host()
+            .linked_plugins()
+            .any(|name| name.eq_ignore_ascii_case("motionplayer.dll"));
+        if !motionplayer_linked {
+            krkr_engine::plugin_api::graphic::unregister_graphic_loader(
+                runtime,
+                "motionplayer.dll",
+            );
+        }
         Ok(())
     }
 }

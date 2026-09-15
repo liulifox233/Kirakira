@@ -3,12 +3,15 @@
 //! The reference's graphic load path is extension-dispatched: `TVPLoadGraphic`
 //! (`visual/GraphicsLoaderIntf.cpp:1672`) normalizes the storage name, checks
 //! the graphic cache and otherwise calls `TVPInternalLoadGraphic` (`:1452`),
-//! which extracts the name's extension (`TVPExtractStorageExt`, `:1487`) and
+//! which extracts the name's extension (`TVPExtractStorageExt`, `:1476`) and
 //! looks it up in the handler table built by the constructor (`:61-93`) plus
-//! `TVPRegisterGraphicLoadingHandler` (`:142`, plugin-facing declaration
+//! `TVPRegisterGraphicLoadingHandler` (`:170`, plugin-facing declaration
 //! `visual/GraphicsLoaderIntf.h:130`). An extension nobody claims throws
-//! `TVPUnknownGraphicFormat` — "The image format could not be determined" —
-//! and a claimed one hands the handler a `tTVPBaseBitmap` it fills through the
+//! `TVPUnknownGraphicFormat` (`:1506`, throw `:1509`) — "The image format could
+//! not be determined" — where a name with *no* extension walks the whole
+//! handler table first, probing `name + extension` and taking the first that
+//! exists (`:1480-1503`). A claimed one hands the handler a `tTVPBaseBitmap` it
+//! fills through the
 //! size/scanline callbacks (`tTVPGraphicLoadingHandlerForPlugin`,
 //! `GraphicsLoaderIntf.h:115-123`; invoked through
 //! `tTVPGraphicHandlerType::Load`, `visual/win32/GraphicsLoaderImpl.cpp:26`).
@@ -19,7 +22,7 @@
 //! and `tTVPBaseBitmap::Load` (`visual/BitmapIntf.cpp:92`) both go through
 //! `TVPLoadGraphic`, so a plugin that claims `.mtn` answers them and the layer
 //! gets a real bitmap instead of the format error. The reference unregisters
-//! around module unlink (`GraphicsLoaderIntf.cpp:170`).
+//! around module unlink (`GraphicsLoaderIntf.cpp:184`).
 //!
 //! This module is our counterpart, with one addition the reference does not
 //! need spelled out in its C++ (its handler keeps the layer's bitmap alive and
@@ -149,7 +152,7 @@ pub trait GraphicLoader: Send + Sync {
 }
 
 /// Registers `loader` — the counterpart of `TVPRegisterGraphicLoadingHandler`
-/// (`GraphicsLoaderIntf.cpp:142`).
+/// (`GraphicsLoaderIntf.cpp:170`).
 ///
 /// Idempotent for the same `Arc` (the engine runs every plugin's `register`
 /// twice); a *different* loader claiming an extension already claimed fails
@@ -163,7 +166,7 @@ pub fn register_graphic_loader(
 
 /// Unregisters the loader registered under module name `name`, dropping every
 /// live graphic it produced — the counterpart of
-/// `TVPUnregisterGraphicLoadingHandler` (`GraphicsLoaderIntf.cpp:170`).
+/// `TVPUnregisterGraphicLoadingHandler` (`GraphicsLoaderIntf.cpp:184`).
 /// Returns whether a loader was registered; the name is matched exactly.
 pub fn unregister_graphic_loader(runtime: &mut Runtime<KrkrHost>, name: &str) -> bool {
     runtime.host_mut().unregister_graphic_loader(name)
@@ -338,6 +341,62 @@ mod tests {
             Variant::String("3x2".to_string()),
         );
         assert_eq!(main_pixel(&mut engine), 1 << 16);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A storage name with **no** extension reaches a plugin claim the way the
+    /// reference's suggestion walk does (`GraphicsLoaderIntf.cpp:1480-1503`):
+    /// every registered loader's extensions are tried and the first
+    /// `name + extension` that exists wins. The image kind's static suggestion
+    /// list is untouched — the plugin's extension is simply considered too.
+    #[test]
+    fn an_extensionless_name_reaches_a_loader_that_can_complete_it() {
+        let (mut engine, root) = engine_with_root("suggest");
+        register(&mut engine, fake_loader(false) as Arc<dyn GraphicLoader>);
+
+        engine
+            .execute_script(
+                "load.tjs",
+                r#"
+                var layer = new Layer(0, 0, 3, 2);
+                layer.loadImages("art");
+                "#,
+            )
+            .expect("the suggested storage loads");
+        assert_eq!(
+            engine
+                .execute_expression("size.tjs", "layer.imageWidth + \"x\" + layer.imageHeight")
+                .expect("size"),
+            Variant::String("3x2".to_string()),
+        );
+        assert_eq!(main_pixel(&mut engine), 1 << 16);
+        assert!(
+            engine
+                .host()
+                .logs()
+                .iter()
+                .any(|line| line.contains("from the suggested storage `art.fake`")),
+            "the resolved name is reported",
+        );
+
+        // A stem no registered extension can complete never reaches the loader:
+        // the failure is the storage path's own, not a claim
+        // (`GraphicsLoaderIntf.cpp` would throw `TVPCannotSuggestGraphicExtension`
+        // there; the storage read reports the name it could not resolve).
+        let error = engine
+            .execute_script(
+                "missing.tjs",
+                r#"
+                var layer = new Layer(0, 0, 3, 2);
+                layer.loadImages("nothing-here");
+                "#,
+            )
+            .expect_err("no suggestion exists");
+        let message = error.to_string();
+        assert!(
+            message.contains("`nothing-here`") && !message.contains("fake.dll"),
+            "no loader answered the stem: {message}"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
