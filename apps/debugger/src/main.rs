@@ -35,11 +35,14 @@
 //!                           own `kag` object (storage/label/line/conductor
 //!                           status/wait keys), unlike `kag=` in the frame
 //!                           log which reflects the engine-side session
-//!   --kag-click <frame>     semantic click on frame n (repeatable): wake the
-//!                           conductor when it waits for a click, or create
-//!                           the click wait a `[s]` handler left unset and
-//!                           wake it — equivalent to a player's primary click
-//!                           and a no-op when the game is not waiting
+//!   --kag-click <frame>     semantic click on frame n (repeatable): a
+//!                           player's primary click, delivered through the
+//!                           engine's input dispatch (`kag.onPrimaryClick`),
+//!                           so an exception escaping the game's own handler
+//!                           is contained exactly like every other event's; a
+//!                           sleeping `[s]` conductor is woken through the
+//!                           game's own `waitClick`, and a click is a no-op
+//!                           when the game waits on neither
 //!   --kag-auto-click        keep issuing the semantic click on every frame
 //!                           the game's own conductor parks on a click wait,
 //!                           the KAGEX counterpart of --auto-click
@@ -336,44 +339,12 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
     config
 }
 
-/// Semantic click: the accessibility-style way to advance the game, defined
-/// in game terms instead of screen coordinates. Wakes the conductor when it
-/// already waits for a click, or — when the `[s]` handler has put the game to
-/// sleep without establishing a click wait — creates the wait the game's
-/// `waitClick` would normally build and then wakes it. Both paths are exactly
-/// what a player's primary click triggers in the official engine; when the
-/// game is not waiting the script is a no-op.
-const KAG_CLICK_SOURCE: &str = r#"
-(function() {
-    var k = global.kag;
-    if (typeof k != "Object") return "no-kag";
-    var c = typeof k.conductor == "Object" ? k.conductor : void;
-    var stor = typeof k.currentStorage == "String" ? k.currentStorage : "-";
-    var line = c != void ? c.curLine : -1;
-    if (c != void && c.status == c.mWait) {
-        c.trigger("click");
-        return "wake " + stor + ":" + line;
-    }
-    if (k.inSleep) {
-        // KAG3's waitClick(elm) ignores elm, but pass a dictionary so a
-        // KAGEX override that reads elm members cannot throw on a string.
-        if (k.waitClick != void) k.waitClick(%[]);
-        if (c != void && c.status == c.mWait) {
-            c.trigger("click");
-            return "wake-sleep " + stor + ":" + line;
-        }
-        return "sleep-no-wait " + stor + ":" + line;
-    }
-    return "not-waiting " + stor + ":" + line;
-})()
-"#;
-
 /// True when the game's own KAG conductor is parked on a click wait.
-/// `--kag-auto-click` uses this to skip the script evaluation on the frames
-/// where the click would be a no-op, which matters because a scene runs for
-/// tens of thousands of probe frames.  Unlike `--kag-click`, the sleeping
-/// `[s]` case is deliberately excluded: synthesizing the wait repeatedly would
-/// nest `waitClick` calls until the VM runs out of frames.
+/// `--kag-auto-click` uses this to skip the click on the frames where it
+/// would be a no-op, which matters because a scene runs for tens of
+/// thousands of probe frames.  The sleeping `[s]` state is left to an
+/// explicit `--kag-click`, so an auto-driven run never turns every frame of
+/// a sleep into a click.
 fn kag_awaits_click(engine: &KrkrEngine) -> bool {
     let runtime = engine.tjs_runtime();
     // The game builds `global.kag` and its members from `new` results, so the
@@ -400,6 +371,163 @@ fn kag_awaits_click(engine: &KrkrEngine) -> bool {
         .object_members(wait_until)
         .iter()
         .any(|(name, _)| name == "click")
+}
+
+/// True while the game's own KAG window sits in the `[s]` sleep state: the
+/// conductor has stopped without establishing a wait, and a player's click
+/// is the only thing that resumes it.
+fn kag_in_sleep(engine: &KrkrEngine) -> bool {
+    let runtime = engine.tjs_runtime();
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
+        return false;
+    };
+    runtime.object_member(kag, "inSleep").is_truthy()
+}
+
+/// The `[s]` sleep wake — the one semantic-click action the engine's input
+/// dispatch has no entry for.
+///
+/// A conductor that stopped through `[s]` (KAGEX's `s` handler sets `inSleep`
+/// and returns -1) waits on no signal key, so a primary click ends at
+/// `kag.onPrimaryClick`, and KAGEX's own handler only acts while the
+/// conductor waits.  Verified live on PARQUET's title: neither the semantic
+/// click nor a coordinate click past the engine's dispatch moves
+/// `title.ks@*wait:35`.  The harness therefore asks the game for the wait its
+/// own `waitClick` builds and fires it — the wake a click on the message
+/// layer produces, and what this flag has always done.  It is a game-side
+/// synthesis (the script runs the game's own two functions), so a raise from
+/// one of them is reported as the harness error it is; the click a game waits
+/// on goes through the engine instead.
+const KAG_SLEEP_WAKE_SOURCE: &str = r#"
+(function() {
+    var k = global.kag;
+    if (typeof k != "Object") return "no-kag";
+    var c = typeof k.conductor == "Object" ? k.conductor : void;
+    var stor = typeof k.currentStorage == "String" ? k.currentStorage : "-";
+    var line = c != void ? c.curLine : -1;
+    // KAG3's waitClick(elm) ignores elm, but pass a dictionary so a KAGEX
+    // override that reads elm members cannot throw on a string.
+    if (k.waitClick != void) k.waitClick(%[]);
+    if (c != void && c.status == c.mWait) {
+        c.trigger("click");
+        return "wake-sleep " + stor + ":" + line;
+    }
+    return "sleep-no-wait " + stor + ":" + line;
+})()
+"#;
+
+/// True when the game's KAG object exposes the primary-click entry the
+/// engine posts a player's click to.  The check mirrors
+/// `fire_kag_primary_click` (`engine.rs:2552-2567`) exactly, including the
+/// unwrap of the self-bound closure the game stores in `global.kag`: without
+/// the entry the engine's dispatch has nowhere to deliver a click, and the
+/// harness must say so instead of inventing a different call.
+fn kag_has_primary_click(engine: &KrkrEngine) -> bool {
+    let runtime = engine.tjs_runtime();
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
+        return false;
+    };
+    !matches!(runtime.object_member(kag, "onPrimaryClick"), Variant::Void)
+}
+
+/// `storage:line st=<status>` for a click report: enough of
+/// [`semantic_kag_state`] to tell which wait a click acted on.
+fn kag_click_context(engine: &KrkrEngine) -> String {
+    let runtime = engine.tjs_runtime();
+    let Some(kag) = runtime.global_member("kag").object_handle() else {
+        return "-".to_string();
+    };
+    let conductor = runtime.object_member(kag, "conductor").object_handle();
+    let member = |name: &str| match conductor {
+        Some(object) => runtime.object_member(object, name),
+        None => Variant::Void,
+    };
+    let line = match member("curLine") {
+        Variant::Integer(line) => line.to_string(),
+        _ => "-".to_string(),
+    };
+    let status = match member("status") {
+        Variant::Integer(status) => status_name(status),
+        _ => "-".to_string(),
+    };
+    let storage = match runtime.object_member(kag, "currentStorage") {
+        Variant::String(storage) => storage,
+        _ => "-".to_string(),
+    };
+    format!("{storage}:{line} st={status}")
+}
+
+/// Reports and arms one semantic click on the frame's input, and returns
+/// true when the click was armed.
+///
+/// Semantic click: the accessibility-style way to advance the game, defined
+/// in game terms instead of screen coordinates. It is the player's primary
+/// click, and it reaches the game the way the engine delivers one — as the
+/// input the engine's own dispatch handles — instead of the harness running
+/// the game's conductor itself.
+///
+/// `KrkrEngine::fire_kag_primary_click` (`engine.rs:2552`) is where a primary
+/// click reaches the game's own KAG object: it posts `kag.onPrimaryClick`
+/// through `call_event_method`, and that boundary (`engine.rs:2364-2403`)
+/// hands an exception escaping the handler to `System.exceptionHandler`,
+/// logs, and carries on — the reference's
+/// `TVP_CATCH_AND_SHOW_SCRIPT_EXCEPTION` disposition. Evaluating
+/// `conductor.trigger("click")` as a bare expression skipped that boundary,
+/// so a handler raise the real game contains ended the click as a debugger
+/// error and a headless run parked on an exception the game survives
+/// (M220's follow-up, M223).
+///
+/// A click only happens when the game is actually waiting on one — the
+/// conductor parked on a `click` wait, or the `[s]` sleep state — so a
+/// `--kag-click` on a frame where the game is not waiting stays the no-op it
+/// has always been.  What the game receives is the engine's primary click: a
+/// press and release that moves no cursor, so on a project whose cursor was
+/// never placed the engine's hit test finds no layer and
+/// `fire_kag_primary_click` posts the click to `kag.onPrimaryClick` itself;
+/// when an earlier `--click`/`--move` left the cursor over a layer, that
+/// layer's own handler takes the click — the same target a player's click
+/// there would select, and one whose raise the engine contains the same way.
+/// A sleeping `[s]` conductor keeps [`KAG_SLEEP_WAKE_SOURCE`].  `quiet`
+/// suppresses only the success lines, as `--kag-auto-click` has always
+/// behaved.
+fn arm_semantic_click(
+    runtime: &mut RuntimeSession,
+    frame_index: usize,
+    label: &str,
+    quiet: bool,
+) -> bool {
+    let context = kag_click_context(runtime.engine());
+    if !kag_has_primary_click(runtime.engine()) {
+        // No entry to deliver to: naming it beats arming a click the engine
+        // would drop, and beats the harness calling the game's conductor
+        // itself (the divergence this replaced).
+        println!(
+            "{label} frame={frame_index} -> no kag.onPrimaryClick; the engine's input dispatch has no primary-click entry to deliver ({context})"
+        );
+        return false;
+    }
+    if kag_awaits_click(runtime.engine()) {
+        if !quiet {
+            println!("{label} frame={frame_index} -> engine primary click ({context})");
+        }
+        return true;
+    }
+    if kag_in_sleep(runtime.engine()) {
+        match runtime
+            .engine_mut()
+            .execute_expression("krkr_debug_kag_sleep_wake.tjs", KAG_SLEEP_WAKE_SOURCE)
+        {
+            Ok(value) => {
+                if !quiet {
+                    println!("{label} frame={frame_index} -> {value}");
+                }
+            }
+            Err(error) => println!("{label} frame={frame_index} error: {error}"),
+        }
+        return false;
+    }
+    println!("{label} frame={frame_index} -> not waiting ({context})");
+    false
 }
 
 /// Reads the game's own KAG layer (`global.kag`, the KAG3/KAGEX object) rather
@@ -849,12 +977,18 @@ fn main() {
                 }
             }
         }
+        // The semantic click is armed onto this frame's input (the events
+        // built further down) and dispatched by the engine, so the game's own
+        // click handler runs inside `call_event_method`'s boundary — see
+        // `arm_semantic_click`.  The `[s]` sleep wake stays game-side and runs
+        // right here.
+        let mut semantic_click = false;
         for click_frame in &config.kag_clicks {
             if frame_index == *click_frame {
                 // A click is an action tied to its frame, not setup that can
-                // wait a few frames: while the VM is parked the click script
-                // returns `void` without waking anything, so name that and
-                // fail the run instead of dropping the click silently.
+                // wait a few frames: while the VM is parked the input is not
+                // dispatched to the game either, so name that and fail the run
+                // instead of dropping the click silently.
                 if runtime.engine().is_script_suspended() {
                     println!(
                         "kag-click frame={frame_index} error: {VM_SUSPENDED}; the click was not attempted"
@@ -862,16 +996,10 @@ fn main() {
                     injection_failed = true;
                     continue;
                 }
-                match runtime
-                    .engine_mut()
-                    .execute_expression("krkr_debug_kag_click.tjs", KAG_CLICK_SOURCE)
-                {
-                    Ok(value) => println!("kag-click frame={frame_index} -> {value}"),
-                    Err(error) => println!("kag-click frame={frame_index} error: {error}"),
-                }
+                semantic_click |= arm_semantic_click(&mut runtime, frame_index, "kag-click", false);
             }
         }
-        // A parked VM cannot run the click script either, so the automatic
+        // A parked VM cannot dispatch the click either, so the automatic
         // click skips until the VM runs again. The notice is printed once per
         // park instead of on every frame of a load window.
         if config.kag_auto_click {
@@ -882,20 +1010,10 @@ fn main() {
                 }
             } else {
                 kag_auto_click_parked = false;
-                if kag_awaits_click(runtime.engine()) {
-                    match runtime
-                        .engine_mut()
-                        .execute_expression("krkr_debug_kag_click.tjs", KAG_CLICK_SOURCE)
-                    {
-                        Ok(value) => {
-                            if !config.quiet {
-                                println!("kag-auto-click frame={frame_index} -> {value}");
-                            }
-                        }
-                        Err(error) => {
-                            println!("kag-auto-click frame={frame_index} error: {error}")
-                        }
-                    }
+                if kag_awaits_click(runtime.engine())
+                    && arm_semantic_click(&mut runtime, frame_index, "kag-auto-click", config.quiet)
+                {
+                    semantic_click = true;
                 }
             }
         }
@@ -932,6 +1050,22 @@ fn main() {
         // overwrote it with a stale zero timestamp.
         let frame_delta = delta.mul_f64(config.time_scale.max(0.0));
         let mut events = Vec::new();
+        if semantic_click {
+            // A player's primary click.  No `CursorMoved` is sent, so on a
+            // project whose cursor was never placed the engine's hit test
+            // finds no layer and `fire_kag_primary_click`
+            // (`engine.rs:2538`, `:2552`) hands the click to the game's KAG
+            // object itself; a cursor an earlier `--click`/`--move` left over
+            // a layer selects that layer's own handler instead.  Either way
+            // the game's handler runs inside `call_event_method`'s boundary,
+            // which contains its exception.
+            for state in [ButtonState::Pressed, ButtonState::Released] {
+                events.push(EngineEvent::PointerInput {
+                    button: PointerButton::Primary,
+                    state,
+                });
+            }
+        }
         for position in pending_interactive_releases.drain(..) {
             events.push(EngineEvent::CursorMoved { position });
             events.push(EngineEvent::PointerInput {
