@@ -61,15 +61,22 @@
 //!   registry lives inside the storage, so a strong handle would be a
 //!   reference cycle.
 //!
-//! One thing a provider cannot rely on yet:
+//! What a provider's listing is used for:
 //!
-//! * Media *auto paths* (`Storages.addAutoPath("psb://container.psb/")`) do not
-//!   reach a provider: the stored auto path keeps its `media://` spelling, but
-//!   the candidate join re-parses it through `Path`
-//!   (`crate::storage::auto_path_candidates`), which collapses the structural
-//!   `//` like any other separator run, so the candidate never reaches
-//!   `split_media_name`. The reference discovers those entries by listing each
-//!   auto path instead (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1035-1144`).
+//! * Media *auto paths* (`Storages.addAutoPath("psb://container.psb/")`) are
+//!   listed through the media the way the reference lists them
+//!   (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1035-1144`): every auto path
+//!   whose scheme a registered media owns is listed once per generation, the
+//!   listed children are placed on that path, and a lookup that misses the
+//!   current folder resolves through the placed media name
+//!   (`TVPGetPlacedPath`, `:1153-1197`). [`StorageMediaProvider::list`]'s
+//!   children are therefore the names the table can place, which is what
+//!   `proxy`'s dictionary scan (`0x100017a0`) supplies for PARQUET's
+//!   `Storages.addAutoPath("proxy://./")`. A provider that answers
+//!   `NotFound`/`Unsupported` has no listing here; its auto paths fall back to
+//!   the media's own existence probe, a divergence the reference does not have
+//!   (`GetListAt` is a required member of `iTVPStorageMedia`,
+//!   `StorageIntf.h:136`).
 
 pub use krkr_core::media::{
     FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name,
@@ -813,5 +820,347 @@ mod tests {
                 .expect("late media"),
             b"cloud"
         );
+    }
+
+    /// A media whose listing can change after the table was built, which
+    /// counts the `GetListAt` calls a rebuild makes, and whose first listing
+    /// can be held open so a rebuild can be interleaved with an auto-path
+    /// mutation deliberately (see [`ListingMedia::gated`]).
+    struct ListingMedia {
+        dirs: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
+        files: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
+        lists: std::sync::atomic::AtomicUsize,
+        /// Held by the first `list` call until the test releases it; later
+        /// calls find it empty and never block.
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        /// Signals every `list` call that has started.
+        listing_started: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl ListingMedia {
+        fn new() -> Self {
+            Self {
+                dirs: std::sync::Mutex::new(BTreeMap::new()),
+                files: std::sync::Mutex::new(BTreeMap::new()),
+                lists: std::sync::atomic::AtomicUsize::new(0),
+                release: std::sync::Mutex::new(None),
+                listing_started: None,
+            }
+        }
+
+        /// A media whose **first** listing blocks until the returned sender
+        /// fires, and which reports on the returned receiver that it has
+        /// started listing — so a test can put an `addAutoPath` (or a media
+        /// registration) *inside* a lookup's rebuild window instead of hoping
+        /// for a timing race.
+        fn gated() -> (
+            Self,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let media = Self {
+                listing_started: Some(started_tx),
+                release: std::sync::Mutex::new(Some(release_rx)),
+                ..Self::new()
+            };
+            (media, started_rx, release_tx)
+        }
+
+        fn with_child(self, dir: &str, child: &str, bytes: &[u8]) -> Self {
+            self.publish_child(dir, child, bytes);
+            self
+        }
+
+        /// Publishes a child the way a script filling `ProxyStorageMap` after
+        /// the first lookup does.
+        fn publish_child(&self, dir: &str, child: &str, bytes: &[u8]) {
+            self.dirs
+                .lock()
+                .expect("listing media lock")
+                .entry(dir.to_string())
+                .or_default()
+                .push(child.to_string());
+            self.files
+                .lock()
+                .expect("listing media lock")
+                .insert(format!("{dir}{child}"), bytes.to_vec());
+        }
+
+        fn list_calls(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl StorageMediaProvider for ListingMedia {
+        fn media_name(&self) -> &str {
+            "proxy"
+        }
+
+        fn exists(&self, name: &str) -> bool {
+            self.files
+                .lock()
+                .expect("listing media lock")
+                .contains_key(name)
+                || self
+                    .dirs
+                    .lock()
+                    .expect("listing media lock")
+                    .contains_key(name)
+        }
+
+        fn open(&self, name: &str) -> io::Result<Box<dyn ResourceStream>> {
+            let files = self.files.lock().expect("listing media lock");
+            let bytes = files.get(name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no entry `{name}`"))
+            })?;
+            Ok(Box::new(io::Cursor::new(bytes.clone())))
+        }
+
+        fn list(&self, name: &str) -> io::Result<Vec<String>> {
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(started) = &self.listing_started {
+                let _ = started.send(());
+            }
+            if let Some(release) = self.release.lock().expect("listing media lock").take() {
+                let _ = release.recv();
+            }
+            let dirs = self.dirs.lock().expect("listing media lock");
+            let children = dirs.get(name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no directory `{name}`"))
+            })?;
+            Ok(children.clone())
+        }
+    }
+
+    /// The reference's `TVPRebuildAutoPathTable` (`StorageIntf.cpp:1035-1144`):
+    /// a media-backed auto path is *listed* through its media, and a plain name
+    /// then resolves to the placed media name (`TVPGetPlacedPath` returns
+    /// `path + storagename`, `:1182-1192`). PARQUET's
+    /// `Storages.addAutoPath("proxy://./")` (`custom.tjs:545-552`) is the
+    /// shipped case this engine did not resolve.
+    #[test]
+    fn media_auto_path_places_a_plain_name_on_the_listing_media() {
+        let storage = storage_with(
+            FakeMedia::new("proxy")
+                .with_dir("./", &["krmovie.dll"])
+                .with_file("./krmovie.dll", b"MZ")
+                .with_file("./hidden.dll", b"MZ"),
+        );
+        storage.add_auto_path("proxy://./");
+
+        assert!(storage.storage_exists_exact("krmovie.dll"));
+        assert!(storage.storage_exists("krmovie.dll"));
+        assert_eq!(
+            storage.resolved_storage_name("krmovie.dll").as_deref(),
+            Some("proxy://./krmovie.dll")
+        );
+        assert_eq!(
+            storage.read_binary_vec("krmovie.dll").expect("placed name"),
+            b"MZ"
+        );
+        // The candidate the lookup walks keeps the media spelling, instead of
+        // folding the structural `//` into a dead `proxy:/` path.
+        let media_candidates = storage
+            .storage_candidates("krmovie.dll")
+            .expect("candidates")
+            .into_iter()
+            .filter(|candidate| candidate.starts_with("proxy"))
+            .collect::<Vec<_>>();
+        assert_eq!(media_candidates, vec!["proxy://./krmovie.dll".to_string()]);
+        // The direct spelling still resolves to the same media entry.
+        assert_eq!(
+            storage
+                .read_binary_vec("proxy://./krmovie.dll")
+                .expect("direct media read"),
+            b"MZ"
+        );
+
+        // The table holds only what the media's listing carries: `hidden.dll`
+        // is servable but not listed, so a plain request misses (`:1120-1125`).
+        assert!(storage.storage_exists("proxy://./hidden.dll"));
+        assert!(!storage.storage_exists_exact("hidden.dll"));
+        assert!(storage.read_binary_vec("hidden.dll").is_err());
+
+        // An unrelated name is still a miss.
+        assert!(!storage.storage_exists_exact("other.dll"));
+        assert!(!storage.storage_exists("other.dll"));
+    }
+
+    /// `Storages.addAutoPath` stores the path without the trailing delimiter
+    /// the reference requires (`TVPAddAutoPath` throws
+    /// `TVPMissingPathDelimiterAtLast`, `StorageIntf.cpp:1003-1005`); the
+    /// table re-delimits the media name space, so the media is listed at `./`
+    /// and the placed name is spelled `proxy://./krmovie.dll` — which is the
+    /// key `ProxyStorageMap` is filled with (`custom.tjs:551`).
+    #[test]
+    fn media_auto_path_restores_the_delimiter_the_engine_trims() {
+        let storage = storage_with(
+            FakeMedia::new("proxy")
+                .with_dir("./", &["krmovie.dll"])
+                .with_file("./krmovie.dll", b"MZ"),
+        );
+        storage.add_auto_path("proxy://.");
+
+        assert_eq!(
+            storage.resolved_storage_name("krmovie.dll").as_deref(),
+            Some("proxy://./krmovie.dll")
+        );
+        assert_eq!(
+            storage.read_binary_vec("krmovie.dll").expect("placed name"),
+            b"MZ"
+        );
+    }
+
+    /// `TVPGetPlacedPath` checks the name as given before it consults the
+    /// auto-path table (`StorageIntf.cpp:1169-1184`), so a media-backed auto
+    /// path never shadows a file of the current folder.
+    #[test]
+    fn a_media_auto_path_does_not_shadow_the_current_folder() {
+        let root = temp_root("shadow");
+        fs::create_dir_all(&root).expect("create project root");
+        fs::write(root.join("krmovie.dll"), b"local").expect("write file");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage
+            .register_media(Arc::new(
+                FakeMedia::new("proxy")
+                    .with_dir("./", &["krmovie.dll"])
+                    .with_file("./krmovie.dll", b"mapped"),
+            ))
+            .expect("register media");
+        storage.add_auto_path("proxy://./");
+
+        assert_eq!(
+            storage
+                .read_binary_vec("krmovie.dll")
+                .expect("current folder first"),
+            b"local"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The table is rebuilt when the reference rebuilds it — on an
+    /// `addAutoPath`/`removeAutoPath` (`TVPClearAutoPathCache`,
+    /// `StorageIntf.cpp:1014`, `:1032`) — and once per generation, not per
+    /// lookup (`AutoPathTableInit`, `:1038-1041`).
+    #[test]
+    fn the_media_auto_path_table_is_rebuilt_on_change_not_per_lookup() {
+        let media = Arc::new(ListingMedia::new().with_child("./", "first.bin", b"1"));
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage
+            .register_media(Arc::clone(&media) as Arc<dyn StorageMediaProvider>)
+            .expect("register media");
+        storage.add_auto_path("proxy://./");
+
+        assert!(storage.storage_exists_exact("first.bin"));
+        assert_eq!(media.list_calls(), 1);
+
+        // Further lookups — hits, misses and names the media serves without
+        // listing — reuse the table.
+        assert!(storage.storage_exists_exact("first.bin"));
+        assert!(!storage.storage_exists_exact("second.bin"));
+        assert!(!storage.storage_exists_exact("other.bin"));
+        assert_eq!(media.list_calls(), 1);
+
+        // A media that gains a listed child is not re-listed: the reference
+        // retires the table only on an auto-path change or an application
+        // deactivate (`TVPClearAutoPathCache`, `:978-997`), never per lookup.
+        media.publish_child("./", "second.bin", b"2");
+        assert!(!storage.storage_exists_exact("second.bin"));
+        assert!(storage.storage_exists("proxy://./second.bin"));
+        assert_eq!(media.list_calls(), 1);
+
+        // Removing the path and declaring it again retires the table, and the
+        // next lookup lists the media once more.
+        assert!(storage.remove_auto_path("proxy://./"));
+        storage.add_auto_path("proxy://./");
+        assert!(storage.storage_exists_exact("second.bin"));
+        assert_eq!(media.list_calls(), 2);
+    }
+
+    /// A retirement that lands while a rebuild is listing the media must win:
+    /// the reference holds one critical section across the rebuild and the
+    /// clear (`TVPCreateStreamCS`, `StorageIntf.cpp:1040`, `:1141` versus
+    /// `:999-1033`), so a clear can never interleave with a rebuild there and
+    /// a rebuild can never store a table the clear has already retired.
+    ///
+    /// The interleaving is **constructed deliberately**, not left to timing:
+    /// the media's first listing blocks until this test has declared the
+    /// second auto path, which is the window the reviewer's p2 describes. The
+    /// table the racing lookup stores must not be the one later lookups see —
+    /// otherwise `proxy://./extra/` stays unlisted for the session.
+    #[test]
+    fn a_rebuild_racing_a_new_auto_path_does_not_keep_the_old_table() {
+        let (media, listing_started, release_listing) = ListingMedia::gated();
+        media.publish_child("./", "first.bin", b"1");
+        media.publish_child("./extra/", "second.bin", b"2");
+        let media = Arc::new(media);
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage
+            .register_media(Arc::clone(&media) as Arc<dyn StorageMediaProvider>)
+            .expect("register media");
+        storage.add_auto_path("proxy://./");
+
+        // A worker lookup starts the rebuild and blocks inside the listing.
+        let worker = {
+            let storage = storage.clone();
+            std::thread::spawn(move || storage.storage_exists_exact("first.bin"))
+        };
+        listing_started
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the rebuild reached the media listing");
+
+        // The script thread declares a second media-backed auto path while the
+        // rebuild is inside `list`, then lets the listing finish.
+        storage.add_auto_path("proxy://./extra/");
+        release_listing.send(()).expect("release the listing");
+        assert!(worker.join().expect("lookup thread"));
+
+        // The retired state must survive: `second.bin` is placed by the path
+        // declared mid-rebuild, so a cached table built before it would leave
+        // it dead for the rest of the session.
+        assert!(storage.storage_exists_exact("second.bin"));
+        assert_eq!(
+            storage
+                .read_binary_vec("second.bin")
+                .expect("placed by the mid-rebuild auto path"),
+            b"2"
+        );
+    }
+
+    /// A media that cannot enumerate its name space contributes no table
+    /// entries, and the lookup asks the media itself about
+    /// `auto path + name`.
+    ///
+    /// The reference's `GetListAt` is part of `iTVPStorageMedia`
+    /// (`StorageIntf.h:136`) and proxyfs lists its dictionary (`0x100017a0`);
+    /// the port's `proxy` media does not list yet, and for its flat dictionary
+    /// keys the existence probe answers what that listing would have placed
+    /// (the auto path is consulted only after the current-folder check, so a
+    /// real file still wins). Pinned so the divergence stays visible.
+    #[test]
+    fn media_auto_path_without_a_listing_probes_the_media() {
+        let storage = storage_with(FakeMedia::new("proxy").with_file("./krmovie.dll", b"MZ"));
+        storage.add_auto_path("proxy://./");
+
+        assert_eq!(
+            storage.resolved_storage_name("krmovie.dll").as_deref(),
+            Some("proxy://./krmovie.dll")
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("krmovie.dll")
+                .expect("probed mapping"),
+            b"MZ"
+        );
+        let mut stream = storage
+            .open_storage("krmovie.dll")
+            .expect("probed mapping stream");
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).expect("stream reads");
+        assert_eq!(bytes, b"MZ");
+        assert!(!storage.storage_exists_exact("unmapped.dll"));
     }
 }
