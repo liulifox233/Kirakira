@@ -989,6 +989,70 @@ mod tests {
         assert!(!storage.storage_exists("other.dll"));
     }
 
+    /// The two shapes of the media half of the auto-path table, side by side,
+    /// because the reference only ever has the first.
+    ///
+    /// A media that can list contributes **entries** — the reference's
+    /// `GetListAt` path (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1119-1125`)
+    /// — so a name it serves but did not list is *not* placed. A media that
+    /// cannot list keeps this port's probe fallback, which places whatever its
+    /// `exists` claims; the reference has no such path.
+    ///
+    /// In this tree the only registered media without a listing is `lzfs`
+    /// (`proxy`, `psd`, `var` and `zip` all list since `ProxyMedia::list`
+    /// landed; there is no `psb` or `steam` media — `psb_file.rs` is the PSB
+    /// parser, and `krkrsteam.rs` deliberately installs no media). Its
+    /// reference counterpart does not list either: `lzfs.dll`'s `GetListAt` is
+    /// the shared no-op stub (`docs/plugins/lzfs.md:65`), so the reference
+    /// places *nothing* through an `lzfs://` auto path while this port places
+    /// what `lzfs`'s `exists` claims — a real, disclosed divergence rather
+    /// than an unported counterpart. It is kept deliberately: dropping the
+    /// fallback would change how `lzfs://` auto paths resolve in this engine
+    /// (including which bytes a name served through the media gets, since that
+    /// media decodes LZ4 frames), and `lzfs`'s own module is outside this
+    /// change. `media_auto_path_without_a_listing_probes_the_media` pins that
+    /// side of the divergence; this test pins the listing side.
+    #[test]
+    fn a_listing_media_places_only_what_it_listed_and_a_probe_media_places_what_it_has() {
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage
+            .register_media(Arc::new(
+                FakeMedia::new("proxy")
+                    .with_dir("./", &["krmovie.dll"])
+                    .with_file("./krmovie.dll", b"MZ")
+                    .with_file("./hidden.dll", b"MZ"),
+            ))
+            .expect("register the listing media");
+        let cloud = Arc::new(LateMedia::new());
+        cloud.publish("./cloud.bin", b"cloud");
+        let cloud: Arc<dyn StorageMediaProvider> = cloud;
+        storage
+            .register_media(cloud)
+            .expect("register the probe media");
+        storage.add_auto_path("proxy://./");
+        storage.add_auto_path("steam://./");
+
+        // Listing shape: `hidden.dll` is servable but was not listed, so the
+        // table has no entry for it and the request stays a miss.
+        assert!(storage.storage_exists("proxy://./hidden.dll"));
+        assert!(!storage.storage_exists_exact("hidden.dll"));
+        assert!(storage.read_binary_vec("hidden.dll").is_err());
+
+        // Probe shape: the media cannot enumerate its name space, so what its
+        // `exists` claims is what its auto path places.
+        assert!(storage.storage_exists("steam://./cloud.bin"));
+        assert_eq!(
+            storage.resolved_storage_name("cloud.bin").as_deref(),
+            Some("steam://./cloud.bin")
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("cloud.bin")
+                .expect("probe-placed read"),
+            b"cloud"
+        );
+    }
+
     /// `Storages.addAutoPath` stores the path without the trailing delimiter
     /// the reference requires (`TVPAddAutoPath` throws
     /// `TVPMissingPathDelimiterAtLast`, `StorageIntf.cpp:1003-1005`); the
@@ -1135,11 +1199,18 @@ mod tests {
     /// `auto path + name`.
     ///
     /// The reference's `GetListAt` is part of `iTVPStorageMedia`
-    /// (`StorageIntf.h:136`) and proxyfs lists its dictionary (`0x100017a0`);
-    /// the port's `proxy` media does not list yet, and for its flat dictionary
-    /// keys the existence probe answers what that listing would have placed
-    /// (the auto path is consulted only after the current-folder check, so a
-    /// real file still wins). Pinned so the divergence stays visible.
+    /// (`StorageIntf.h:136`), so a media that lists places only what it
+    /// enumerated; a media whose `list` answers `NotFound`/`Unsupported` keeps
+    /// this port's probe fallback, and for its flat names the existence probe
+    /// answers what a listing would have placed (the auto path is consulted
+    /// only after the current-folder check, so a real file still wins). The
+    /// fallback is a disclosed divergence — the only registered media without
+    /// a listing is `lzfs`, whose reference `GetListAt` is a no-op
+    /// (`docs/plugins/lzfs.md:65`), so the reference places nothing there —
+    /// pinned so it cannot disappear silently. Since `ProxyMedia::list`
+    /// landed, the real `proxy` media takes the *listing* path instead (see
+    /// `a_listing_media_places_only_what_it_listed_and_a_probe_media_places_what_it_has`);
+    /// the media here is a `proxy`-named double that returns no listing.
     #[test]
     fn media_auto_path_without_a_listing_probes_the_media() {
         let storage = storage_with(FakeMedia::new("proxy").with_file("./krmovie.dll", b"MZ"));

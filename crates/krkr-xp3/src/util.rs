@@ -42,19 +42,6 @@ impl From<io::Error> for Xp3Error {
     }
 }
 
-pub trait Xp3ExtractionFilter: Send + Sync {
-    fn apply(&self, uncompressed_offset: u64, buffer: &mut [u8], file_hash: u32);
-}
-
-impl<F> Xp3ExtractionFilter for F
-where
-    F: Fn(u64, &mut [u8], u32) + Send + Sync,
-{
-    fn apply(&self, uncompressed_offset: u64, buffer: &mut [u8], file_hash: u32) {
-        self(uncompressed_offset, buffer, file_hash);
-    }
-}
-
 pub fn normalize_entry_name(path: &str) -> Result<String> {
     let normalized_separators = path.replace('\\', "/");
     if normalized_separators.starts_with('/') {

@@ -7,8 +7,13 @@ use std::{
 };
 
 pub mod media;
+pub mod xp3;
 
 pub use media::{FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name};
+pub use xp3::{
+    Xp3ContentFilter, Xp3ContentFilterAction, Xp3ExtractionFilter, Xp3ExtractionFilterInfo,
+    Xp3FilterContext, Xp3FilterRegistry,
+};
 
 pub trait ResourceStream: Read + Seek + Send {}
 
@@ -262,6 +267,30 @@ pub trait ProjectStoragePort: StoragePort {
 
     fn write_binary_storage(&self, name: &str, mode: &str, bytes: &[u8]) -> io::Result<()>;
 
+    /// Creates the writable directory `name` on the backend's write root, for
+    /// the script-facing `Storages.createDirectory` (`fstat.dll`).
+    ///
+    /// The reference resolves the storage name to its local path and calls
+    /// Win32 `CreateDirectory(dir, NULL)` (`krkr2
+    /// src/plugins/win32/fstat/Main.cpp:578-596`), so the answers this must
+    /// reproduce are all `false` (which fstat reports as `0`):
+    ///
+    /// * an **already-existing** directory — `ERROR_ALREADY_EXISTS`; a
+    ///   successful `createDirectory` is a *creation*, not "it is there now";
+    /// * a **missing parent** — `CreateDirectory` creates only the final
+    ///   component, so this is `ERROR_PATH_NOT_FOUND`;
+    /// * a refusal from the filesystem (permissions, a read-only mount).
+    ///
+    /// The default refuses, which is what a backend without a writable
+    /// filesystem (a browser host, a test double) must do.
+    fn create_directory(&self, name: &str) -> io::Result<()> {
+        let _ = name;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this storage backend does not create directories",
+        ))
+    }
+
     fn add_auto_path(&self, path: &str);
 
     fn remove_auto_path(&self, path: &str) -> bool;
@@ -287,6 +316,20 @@ pub trait ProjectStoragePort: StoragePort {
     fn insert_external_memory(&self, path: &str, bytes: Vec<u8>);
 
     fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)>;
+
+    /// The XP3 filter registry this backend's archives consult
+    /// (`TVPSetXP3ArchiveExtractionFilter`/`TVPSetXP3ArchiveContentFilter`,
+    /// `Kirikiroid2/src/core/base/XP3Archive.cpp:30-41`).
+    ///
+    /// A plugin installs its filter into this object *after* the project's
+    /// archives were opened, and that is what the reference does too: the
+    /// archive holds no copy of the callbacks, it reads the slots when it
+    /// creates an entry stream and on every read. A backend whose archives are
+    /// not read by `krkr-xp3` — or that has none — answers `None`, so a plugin
+    /// can tell "no archives to filter here" from "installed".
+    fn xp3_filter_registry(&self) -> Option<Arc<Xp3FilterRegistry>> {
+        None
+    }
 
     /// Registers a storage media (`TVPRegisterStorageMedia`,
     /// `StorageIntf.cpp:530-538`), the plugin-facing way to add a URI scheme:
@@ -2141,15 +2184,7 @@ impl LayerTree {
             return;
         }
         for child in self.sorted_children(Some(id)) {
-            self.draw_source_face(
-                child.id,
-                origin,
-                clip,
-                opacity,
-                with_children,
-                model,
-                false,
-            );
+            self.draw_source_face(child.id, origin, clip, opacity, with_children, model, false);
         }
     }
 
@@ -2771,7 +2806,8 @@ impl Engine {
         message: &MessageLayerModel,
         suppressed_images: &BTreeSet<LayerId>,
     ) -> FrameOutput {
-        let output = self.running_layer_frame_output(input, layers, message, suppressed_images, None);
+        let output =
+            self.running_layer_frame_output(input, layers, message, suppressed_images, None);
         self.finalize_frame_output(output)
     }
 
@@ -3835,14 +3871,17 @@ mod tests {
         assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), Some(low));
 
         // An opaque disabled layer hits its own mask and therefore blocks.
-        layers.layer_mut(high).expect("high").set_image(LayerImage::new(
-            1,
-            2,
-            2,
-            Arc::from([
-                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            ]),
-        ));
+        layers
+            .layer_mut(high)
+            .expect("high")
+            .set_image(LayerImage::new(
+                1,
+                2,
+                2,
+                Arc::from([
+                    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                ]),
+            ));
         assert_eq!(layers.hit_test(Point::new(1.0, 1.0)), None);
     }
 
@@ -4025,10 +4064,7 @@ mod tests {
             TransitionMethod::from_name("blurfade"),
             TransitionMethod::Crossfade
         );
-        assert_eq!(
-            TransitionMethod::from_name(""),
-            TransitionMethod::Crossfade
-        );
+        assert_eq!(TransitionMethod::from_name(""), TransitionMethod::Crossfade);
     }
 
     /// The unknown-name path produces the reference's exact text: `%1` is the
@@ -4040,9 +4076,13 @@ mod tests {
         let error = TransitionMethod::try_from_name("furu-furu").expect_err("unknown name");
         assert_eq!(error.name, "furu-furu");
         assert_eq!(error.message(), "Cannot find transition handler furu-furu");
-        assert_eq!(error.to_string(), "Cannot find transition handler furu-furu");
+        assert_eq!(
+            error.to_string(),
+            "Cannot find transition handler furu-furu"
+        );
 
-        let spaced = TransitionMethod::try_from_name("wave ").expect_err("trailing space is a miss");
+        let spaced =
+            TransitionMethod::try_from_name("wave ").expect_err("trailing space is a miss");
         assert_eq!(spaced.message(), "Cannot find transition handler wave ");
     }
 

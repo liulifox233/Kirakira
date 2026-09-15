@@ -4,11 +4,12 @@
 //! layerExImage/layerExRaster/csvParser/process/tjsDataPack and more. Only the
 //! surface games actually call is functional:
 //!
-//! - `CSVParser`: real CSV parser with wtnbgo/csvParser field semantics and
-//!   its event convention: `parse`/`parseStorage` fire `doLine(fields, lineNo)`
-//!   on the callback target per row (the instance's `target` member when it
-//!   holds an object, otherwise the instance itself). Newlines embedded in
-//!   quoted fields are kept as written instead of being normalized to CRLF.
+//! - `CSVParser` and the shared `Scripts` helpers: the bundle compiles the
+//!   standalone `csvParser.dll` and `scriptsEx.dll` sub-plugins in, so it
+//!   installs *their* single implementation (`crate::csv_parser`,
+//!   `crate::scripts_ex`) instead of carrying a copy — which DLL a game links
+//!   no longer decides what `new CSVParser(...)`, `Scripts.clone`,
+//!   `Scripts.getMD5HashString` and friends answer.
 //! - `Storages.saveOctet` / `Storages.loadOctet`: binary storage I/O.
 //! - `System.urlencode` / `System.urldecode`: UTF-8 percent codec; decoding
 //!   leaves `+` untouched (no form-style space mapping).
@@ -22,8 +23,6 @@
 //!   writer emits that same container back, thumbnail leading, with the digest
 //!   seed in the header. See the `tjsDataPack` section for the reference
 //!   anchors and the deliberate divergences.
-//! - `Scripts.clone`: recursively clones arrays and dictionaries and delegates
-//!   other objects to their own `clone` method, matching scriptsEx.
 //!
 //! Everything else (System version/env shims, Layer effect methods, Process,
 //! fstat, proxyfs, ...) is a no-op stub returning benign values. The
@@ -31,7 +30,6 @@
 //! use it to restore system variables before choosing their opening flow.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::BTreeMap, sync::Arc};
 
 use krkr_engine::{KrkrHost, KrkrPlugin, plugin_api::layer::layer_bitmap_read};
 use krkr_tjs2::{
@@ -56,12 +54,16 @@ impl KrkrPlugin for PackinOnePlugin {
     }
 
     fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
-        install_csv_parser(runtime);
+        // `PackinOne.dll` compiles the standalone sub-plugins in; the bundle
+        // installs their one implementation instead of carrying copies, so the
+        // DLL a game links no longer decides what the shared surfaces do.
+        crate::csv_parser::install_csv_parser(runtime);
         install_storages_octet(runtime);
         install_system_ex(runtime);
         install_layer_effects(runtime);
         install_data_pack(runtime);
-        install_scripts_ex(runtime);
+        crate::scripts_ex::install_scripts_ex(runtime);
+        install_scripts_ex_extras(runtime);
         install_window_and_plugins(runtime);
         install_process(runtime);
         install_misc_classes(runtime);
@@ -124,348 +126,13 @@ fn native_void(
     Ok(Variant::Void)
 }
 
-fn ignore_property_set(
-    _runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    _value: Variant,
-) -> Result<()> {
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
-// CSVParser (functional)
-
-fn install_csv_parser(runtime: &mut Runtime<KrkrHost>) {
-    let handle = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
-            let called_as_super_constructor = this_obj.is_some();
-            let instance = this_obj
-                .map(|handle| runtime.bound_this(handle).unwrap_or(handle))
-                .filter(|handle| *handle != runtime.global_handle())
-                .unwrap_or_else(|| runtime.alloc_ordinary_object());
-            runtime.add_object_class_info(instance, "CSVParser");
-            // Keep native methods on the CSVParser class object.  Installing
-            // them directly on a subclass instance would shadow a script
-            // override such as UIListParser.parseStorage; the reference TJS
-            // native class participates in the normal superclass chain.
-            if !called_as_super_constructor {
-                install_csv_parser_members(runtime, instance);
-            }
-            set_csv_text(runtime, instance, String::new());
-            runtime.set_object_member(instance, "__csvFile", Variant::String(String::new()));
-            // new CSVParser(target?, separator?, newline?): the native KRKR
-            // parser accepts the separator as a character code (the standard
-            // config loaders pass `asc("\t")`).
-            let mut args = args.into_iter();
-            let target = args.next().unwrap_or_default();
-            runtime.set_object_member(instance, "target", target);
-            let separator = args
-                .next()
-                .and_then(|value| value.to_integer().ok())
-                .and_then(|value| u8::try_from(value).ok())
-                .filter(|value| *value != 0)
-                .unwrap_or(b',');
-            runtime.set_object_member(
-                instance,
-                "__csvSeparator",
-                Variant::Integer(i64::from(separator)),
-            );
-            Ok(Variant::Object(instance))
-        },
-    );
-    runtime.add_object_class_info(handle, "CSVParser");
-    install_csv_parser_members(runtime, handle);
-    runtime.set_global_member("CSVParser", Variant::Object(handle));
-}
-
-fn install_csv_parser_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    runtime.set_object_member(handle, "target", Variant::Void);
-    runtime.register_object_native(handle, "finalize", native_void);
-    runtime.register_object_native(handle, "init", csv_init);
-    runtime.register_object_native(handle, "initStorage", csv_init_storage);
-    runtime.register_object_native(handle, "getNextLine", csv_get_next_line);
-    runtime.register_object_native(handle, "parse", csv_parse);
-    runtime.register_object_native(handle, "parseStorage", csv_parse_storage);
-    runtime.register_object_native_property(
-        handle,
-        "currentLineNumber",
-        csv_current_line_number_get,
-        ignore_property_set,
-    );
-    runtime.register_object_native_property(handle, "file", csv_file_get, ignore_property_set);
-    runtime.register_object_native_property(handle, "offset", csv_offset_get, ignore_property_set);
-}
-
-fn csv_this(runtime: &Runtime<KrkrHost>, this_obj: Option<ObjectHandle>) -> Option<ObjectHandle> {
-    this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle))
-}
-
-fn csv_state_integer(runtime: &Runtime<KrkrHost>, this: ObjectHandle, name: &str) -> i64 {
-    match runtime.object_member(this, name) {
-        Variant::Integer(value) => value,
-        _ => 0,
-    }
-}
-
-fn csv_separator(runtime: &Runtime<KrkrHost>, this: ObjectHandle) -> u8 {
-    csv_state_integer(runtime, this, "__csvSeparator")
-        .try_into()
-        .ok()
-        .filter(|value| *value != 0)
-        .unwrap_or(b',')
-}
-
-fn set_csv_text(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle, text: String) {
-    runtime.set_object_member(this, "__csvText", Variant::String(text));
-    runtime.set_object_member(this, "__csvPos", Variant::Integer(0));
-    runtime.set_object_member(this, "__csvLineNo", Variant::Integer(0));
-}
-
-fn csv_init(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
-) -> Result<Variant> {
-    if let Some(this) = csv_this(runtime, this_obj) {
-        let text = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-        set_csv_text(runtime, this, text);
-    }
-    Ok(Variant::Void)
-}
-
-fn csv_init_storage(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
-) -> Result<Variant> {
-    let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-    let text = read_csv_storage_text(runtime, &name)?;
-    if let Some(this) = csv_this(runtime, this_obj) {
-        runtime.set_object_member(this, "__csvFile", Variant::String(name));
-        set_csv_text(runtime, this, text);
-    }
-    Ok(Variant::Void)
-}
-
-fn csv_get_next_line(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-    _args: Vec<Variant>,
-) -> Result<Variant> {
-    let Some(this) = csv_this(runtime, this_obj) else {
-        return Ok(Variant::Void);
-    };
-    let text = match runtime.object_member(this, "__csvText") {
-        Variant::String(text) => text,
-        _ => return Ok(Variant::Void),
-    };
-    let pos = csv_state_integer(runtime, this, "__csvPos") as usize;
-    if pos >= text.len() {
-        return Ok(Variant::Void);
-    }
-    let (fields, next_pos) = parse_csv_record(text.as_bytes(), pos, csv_separator(runtime, this));
-    let line_no = csv_state_integer(runtime, this, "__csvLineNo") + 1;
-    runtime.set_object_member(this, "__csvPos", Variant::Integer(next_pos as i64));
-    runtime.set_object_member(this, "__csvLineNo", Variant::Integer(line_no));
-    let fields = fields.into_iter().map(Variant::String).collect();
-    Ok(Variant::Object(runtime.alloc_array_object(fields)))
-}
-
-fn csv_parse(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
-) -> Result<Variant> {
-    if let Some(this) = csv_this(runtime, this_obj) {
-        if let Some(text) = args.first()
-            && !matches!(text, Variant::Void)
-        {
-            set_csv_text(runtime, this, text.clone().to_tjs_string()?);
-        }
-        csv_fire_do_line(runtime, this);
-    }
-    Ok(Variant::Void)
-}
-
-fn csv_parse_storage(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
-) -> Result<Variant> {
-    let name = args.first().cloned().unwrap_or_default().to_tjs_string()?;
-    let text = read_csv_storage_text(runtime, &name)?;
-    if let Some(this) = csv_this(runtime, this_obj) {
-        runtime.set_object_member(this, "__csvFile", Variant::String(name));
-        set_csv_text(runtime, this, text);
-        csv_fire_do_line(runtime, this);
-    }
-    Ok(Variant::Void)
-}
-
-/// Fires `doLine(fields, lineNo)` for every remaining row, matching the
-/// wtnbgo event convention: the callback target is the instance's `target`
-/// member when it holds an object, otherwise the instance itself; a target
-/// without `doLine` leaves the parser state untouched and fires nothing.
-/// `doLine` failures are logged and ignored, as the reference ignores
-/// FuncCall failures. `currentLineNumber` is updated before each call so it
-/// reflects the row being fired and ends at the total row count.
-fn csv_fire_do_line(runtime: &mut Runtime<KrkrHost>, this: ObjectHandle) {
-    // The game assigns `target` from `new`/`this` results, which are
-    // self-bound closures; the object behind the binding is the callback
-    // target.
-    let target = runtime
-        .object_member(this, "target")
-        .object_handle()
-        .unwrap_or(this);
-    let has_do_line = runtime
-        .resolve_object_member(target, "doLine")
-        .is_ok_and(|value| !matches!(value, Variant::Void));
-    if !has_do_line {
-        return;
-    }
-    let text = match runtime.object_member(this, "__csvText") {
-        Variant::String(text) => text,
-        _ => return,
-    };
-    let bytes = text.as_bytes();
-    let mut pos = csv_state_integer(runtime, this, "__csvPos") as usize;
-    let mut line_no = csv_state_integer(runtime, this, "__csvLineNo");
-    while pos < bytes.len() {
-        let (fields, next_pos) = parse_csv_record(bytes, pos, csv_separator(runtime, this));
-        pos = next_pos;
-        line_no += 1;
-        runtime.set_object_member(this, "__csvLineNo", Variant::Integer(line_no));
-        let fields = fields.into_iter().map(Variant::String).collect();
-        let fields = Variant::Object(runtime.alloc_array_object(fields));
-        if let Err(error) =
-            runtime.call_object_method(target, "doLine", vec![fields, Variant::Integer(line_no)])
-        {
-            runtime.host_mut().log(&format!(
-                "PackinOne.dll: CSVParser doLine call failed at line {line_no}: {error}"
-            ));
-        }
-    }
-    runtime.set_object_member(this, "__csvPos", Variant::Integer(pos as i64));
-}
-
-fn csv_current_line_number_get(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-) -> Result<Variant> {
-    let line_no = csv_this(runtime, this_obj)
-        .map(|this| csv_state_integer(runtime, this, "__csvLineNo"))
-        .unwrap_or(0);
-    Ok(Variant::Integer(line_no))
-}
-
-fn csv_file_get(
-    runtime: &mut Runtime<KrkrHost>,
-    this_obj: Option<ObjectHandle>,
-) -> Result<Variant> {
-    let file = csv_this(runtime, this_obj)
-        .and_then(|this| match runtime.object_member(this, "__csvFile") {
-            Variant::String(file) => Some(file),
-            _ => None,
-        })
-        .unwrap_or_default();
-    Ok(Variant::String(file))
-}
-
-fn csv_offset_get(
-    _runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-) -> Result<Variant> {
-    Ok(Variant::Integer(0))
-}
-
-/// Reads a CSV/TSV storage as text.
-///
-/// The reference `csvParser.dll` opens the file with `TVPCreateTextStreamForRead`,
-/// so it sees whatever the engine's text reader produces: plain UTF-16LE with a
-/// BOM, one of the KiriKiri ciphered stream modes (`FE FE <mode> FF FE`), or a
-/// legacy single-byte encoding.  Going through the host text path instead of
-/// decoding the raw bytes here keeps all of those working — `fgimage/standposition.txt`
-/// in particular is a mode 1 (bit-swapped UTF-16) stream, and decoding it as raw
-/// bytes turned every row into a single garbage field.
-///
-/// The host read path is also what makes lazily materialized Web packages work:
-/// a cache miss for a manifest-known file becomes a resumable ResourcePending
-/// request rather than a permanent "missing file".
-fn read_csv_storage_text(runtime: &mut Runtime<KrkrHost>, name: &str) -> Result<String> {
-    TjsHost::read_text(runtime.host_mut(), name, "")
-}
-
-/// Parses one record starting at `pos`, returning the fields and the position
-/// of the next record. All structural characters are ASCII, so byte-level
-/// scanning never splits a UTF-8 sequence. Blank lines yield zero fields and a
-/// trailing newline does not produce an extra record (wtnbgo behavior).
-fn parse_csv_record(bytes: &[u8], mut pos: usize, separator: u8) -> (Vec<String>, usize) {
-    let mut fields = Vec::new();
-    if is_eol(bytes, pos) {
-        return (fields, skip_eol(bytes, pos));
-    }
-    loop {
-        let (field, next_pos) = parse_csv_field(bytes, pos, separator);
-        fields.push(field);
-        pos = next_pos;
-        if pos < bytes.len() && bytes[pos] == separator {
-            pos += 1;
-        } else {
-            return (fields, skip_eol(bytes, pos));
-        }
-    }
-}
-
-fn parse_csv_field(bytes: &[u8], mut pos: usize, separator: u8) -> (String, usize) {
-    if pos < bytes.len() && bytes[pos] == b'"' {
-        pos += 1;
-        let mut field = Vec::new();
-        while pos < bytes.len() {
-            if bytes[pos] == b'"' {
-                if pos + 1 < bytes.len() && bytes[pos + 1] == b'"' {
-                    field.push(b'"');
-                    pos += 2;
-                } else {
-                    // wtnbgo: characters after the closing quote up to the
-                    // separator are still appended to the field.
-                    pos += 1;
-                    while pos < bytes.len() && bytes[pos] != separator && !is_eol(bytes, pos) {
-                        field.push(bytes[pos]);
-                        pos += 1;
-                    }
-                    break;
-                }
-            } else {
-                field.push(bytes[pos]);
-                pos += 1;
-            }
-        }
-        (String::from_utf8_lossy(&field).into_owned(), pos)
-    } else {
-        let start = pos;
-        while pos < bytes.len() && bytes[pos] != separator && !is_eol(bytes, pos) {
-            pos += 1;
-        }
-        (
-            String::from_utf8_lossy(&bytes[start..pos]).into_owned(),
-            pos,
-        )
-    }
-}
-
-fn is_eol(bytes: &[u8], pos: usize) -> bool {
-    pos < bytes.len() && (bytes[pos] == b'\r' || bytes[pos] == b'\n')
-}
-
-fn skip_eol(bytes: &[u8], mut pos: usize) -> usize {
-    if pos < bytes.len() && bytes[pos] == b'\r' {
-        pos += 1;
-    }
-    if pos < bytes.len() && bytes[pos] == b'\n' {
-        pos += 1;
-    }
-    pos
-}
+// CSVParser: the standalone `csvParser` module installs the class
+//
+// `PackinOne.dll` compiles the same `csvParser.dll` source in, so the bundle
+// installs the *one* implementation (`crate::csv_parser`) under the same
+// global rather than carrying its own copy with different answers. Which DLL a
+// game links therefore no longer decides what `new CSVParser(...)` does.
 
 // ---------------------------------------------------------------------------
 // Storages.saveOctet / loadOctet (functional)
@@ -2141,25 +1808,18 @@ fn data_pack_storage_name(name: &str) -> String {
 // ---------------------------------------------------------------------------
 // scriptsEx surface on Scripts
 
-fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
+/// The `Scripts` members only the bundle carries.
+///
+/// Everything shared with `scriptsEx.dll` — `getObjectKeys`,
+/// `getObjectCount`, `getObjectContext`, `isNullContext`, `equalStruct`,
+/// `equalStructNumericLoose`, `foreach`, `getMD5HashString`, `clone`,
+/// `rehash` — is installed by [`crate::scripts_ex::install_scripts_ex`], the
+/// one implementation both DLLs register. `encodeTBPS`/`decodeTBPS` and
+/// `safeEvalStorage` are this bundle's own surface.
+fn install_scripts_ex_extras(runtime: &mut Runtime<KrkrHost>) {
     let scripts = ensure_global_object(runtime, "Scripts");
     runtime.register_object_native(scripts, "encodeTBPS", first_arg_string);
     runtime.register_object_native(scripts, "decodeTBPS", first_arg_string);
-    runtime.register_object_native(scripts, "clone", scripts_clone);
-    runtime.register_object_native(scripts, "isNullContext", scripts_is_null_context);
-    let logged = Arc::new(AtomicBool::new(false));
-    runtime.register_object_native(
-        scripts,
-        "getMD5HashString",
-        move |runtime: &mut Runtime<KrkrHost>, _this_obj, _args| {
-            if !logged.swap(true, Ordering::Relaxed) {
-                runtime
-                    .host_mut()
-                    .log("PackinOne.dll: getMD5HashString returns an empty string stub");
-            }
-            Ok(Variant::String(String::new()))
-        },
-    );
     runtime.register_object_native(scripts, "safeEvalStorage", safe_eval_storage);
 }
 
@@ -2188,91 +1848,6 @@ fn safe_eval_storage(
             Ok(Variant::Void)
         }
     }
-}
-
-/// scriptsEx exposes whether a function/object closure carries an ObjThis
-/// context. Action.tjs uses this to bind unqualified completion callbacks to
-/// the action instance before invoking them.
-fn scripts_is_null_context(
-    _runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
-) -> Result<Variant> {
-    let is_null =
-        !matches!(args.first(), Some(Variant::Closure(closure)) if closure.this_obj.is_some());
-    Ok(Variant::Integer(i64::from(is_null)))
-}
-
-fn scripts_clone(
-    runtime: &mut Runtime<KrkrHost>,
-    _this_obj: Option<ObjectHandle>,
-    args: Vec<Variant>,
-) -> Result<Variant> {
-    let value = args.first().cloned().unwrap_or_default();
-    clone_scripts_value(runtime, &value, &mut BTreeMap::new())
-}
-
-fn clone_scripts_value(
-    runtime: &mut Runtime<KrkrHost>,
-    value: &Variant,
-    cloned: &mut BTreeMap<ObjectHandle, ObjectHandle>,
-) -> Result<Variant> {
-    // `Scripts.clone(new Dictionary())` and every `this`-born argument arrive
-    // as self-bound closures; clone the object behind the binding.
-    let Some(source) = value.object_handle() else {
-        return Ok(value.clone());
-    };
-    if let Some(dest) = cloned.get(&source) {
-        return Ok(Variant::Object(*dest));
-    }
-
-    if let Some(elements) = runtime.array_elements(source).map(Vec::from) {
-        let dest = runtime.alloc_array_object(Vec::new());
-        cloned.insert(source, dest);
-        for element in elements {
-            let element = clone_scripts_value(runtime, &element, cloned)?;
-            runtime.array_push(dest, element);
-        }
-        return Ok(Variant::Object(dest));
-    }
-
-    let is_dictionary = runtime
-        .object_class_infos(source)
-        .iter()
-        .any(|class| class == "Dictionary");
-    if is_dictionary {
-        // The Dictionary constructor answers a self-bound instance.
-        let constructor = runtime.global_member("Dictionary");
-        let Some(dest) = runtime
-            .call_function(constructor, Vec::new())?
-            .object_handle()
-        else {
-            return Ok(value.clone());
-        };
-        cloned.insert(source, dest);
-        for (name, member) in runtime.object_members(source) {
-            if scripts_clone_builtin_member(&name) {
-                continue;
-            }
-            let member = clone_scripts_value(runtime, &member, cloned)?;
-            runtime.set_object_member(dest, name, member);
-        }
-        return Ok(Variant::Object(dest));
-    }
-
-    if !matches!(runtime.object_member(source, "clone"), Variant::Void)
-        && let Ok(result) = runtime.call_object_method(source, "clone", Vec::new())
-    {
-        return Ok(result);
-    }
-    Ok(value.clone())
-}
-
-fn scripts_clone_builtin_member(name: &str) -> bool {
-    matches!(
-        name,
-        "clear" | "assign" | "assignStruct" | "saveStruct" | "loadStruct"
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2401,7 +1976,6 @@ mod tests {
     use krkr_assets::ProjectStorage;
     use krkr_core::{FrameInput, Size};
     use krkr_engine::{EngineConfig, KrkrEngine, SystemPaths};
-    use krkr_tjs2::runtime::Closure;
 
     use super::*;
 
@@ -3035,6 +2609,46 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// The bundle's `loadDataPack` reads the storage name it is handed first
+    /// and only then the engine's `name.pbd` alias. `tjsDataPack.dll` loads
+    /// the name it is given (KAGEX passes the bookmark's own file name,
+    /// `<saveDataLocation>data0.jpg`), while `PSDInfo.loadPBD` passes a base
+    /// name and needs the alias — so the exact name must win when both exist.
+    #[test]
+    fn load_data_pack_prefers_the_exact_name_over_the_pbd_alias() {
+        let root = test_root("packinone-datapack-alias");
+        let pack = |answer: u8| {
+            let mut bytes = b"KBAD100\0\x81\xa6".to_vec();
+            for unit in "answer".encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.push(answer);
+            bytes
+        };
+        fs::write(root.join("data0.jpg"), pack(42)).expect("write the bookmark file");
+        fs::write(root.join("data0.jpg.pbd"), pack(43)).expect("write its alias twin");
+        fs::write(root.join("base.pbd"), pack(44)).expect("write a base-named pack");
+
+        let mut engine = test_engine(&root);
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     return Scripts.loadDataPack(\"data0.jpg\").answer + \":\" +\n\
+                         Scripts.loadDataPack(\"base\").answer;\n\
+                 })()",
+            )
+            .expect("load data packs");
+
+        assert_eq!(
+            value,
+            Variant::String("42:44".to_string()),
+            "the exact name wins; the .pbd alias stays as the fallback"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     /// Files the port wrote before the container switch still load: a leading
     /// image, the `KBAD100` pack and the old 17-byte `KDPK` footer.
     #[test]
@@ -3223,29 +2837,28 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// `scriptsEx` exposes whether a function/object closure carries an
+    /// `ObjThis` context; Action.tjs uses this to bind unqualified completion
+    /// callbacks to the action instance before invoking them. The bundle
+    /// installs the standalone module's implementation, so the probe goes
+    /// through the script surface the game sees.
     #[test]
     fn scripts_is_null_context_matches_scriptsex_objthis_semantics() {
-        let mut runtime = Runtime::with_host(KrkrHost::default());
-        let object = runtime.alloc_ordinary_object();
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine.register_plugin(PackinOnePlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var plain = function() {};\n\
+                     var bound = (Scripts.getObjectContext incontextof Scripts);\n\
+                     return Scripts.isNullContext(plain) + \":\" +\n\
+                         Scripts.isNullContext(bound);\n\
+                 })()",
+            )
+            .expect("context probes");
 
-        assert_eq!(
-            scripts_is_null_context(
-                &mut runtime,
-                None,
-                vec![Variant::Closure(Closure::new(object, None))],
-            )
-            .expect("unbound closure"),
-            Variant::Integer(1)
-        );
-        assert_eq!(
-            scripts_is_null_context(
-                &mut runtime,
-                None,
-                vec![Variant::Closure(Closure::new(object, Some(object)))],
-            )
-            .expect("bound closure"),
-            Variant::Integer(0)
-        );
+        assert_eq!(value, Variant::String("1:0".to_string()));
     }
 
     /// `Scripts.clone` receives its argument through the VM, so a `new

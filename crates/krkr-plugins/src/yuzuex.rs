@@ -79,25 +79,21 @@
 //!
 //! # What remains open
 //!
-//! * **Media auto paths do not reach providers yet.** PARQUET's one real use
-//!   of the mapping is the auto path above, and the engine's auto-path table
-//!   is built from the filesystem/archive mounts only
-//!   (`krkr-assets/src/storage.rs`, `media.rs`'s "media auto paths" note) —
-//!   there is no `TVPRebuildAutoPathTable` for media, so a plain
-//!   `krmovie.dll` request does not become `proxy://./krmovie.dll` here yet.
-//!   A direct `proxy://./krmovie.dll` read does resolve. That discovery is
-//!   engine-side follow-up work (design open question A.5.3).
-//! * `GetListAt` is not implemented: the prefix scan's child-name form is not
-//!   fully pinned by the decompilation, and nothing in the engine asks a
-//!   media for a listing yet (the auto-path rebuild that does in the
-//!   reference is the same missing piece).
 //! * The three option-descriptor categories this DLL also embeds
 //!   (`yuzuex.md:34-36`) are deliberately not registered from this module:
 //!   they duplicate the categories `kagexopt.dll` carries, and the engine
 //!   merges duplicate categories, so a second copy would have to stay
 //!   idempotent for no gain (`docs/plugins/kagexopt.md:112`).
+//!
+//! The two former gaps are closed: the engine rebuilds a media-backed
+//! auto-path table by *listing* the media (`MediaAutoPathTable`,
+//! `krkr-assets/src/storage.rs`, the reference's `TVPRebuildAutoPathTable`),
+//! and the listing it reads is [`list`](ProxyMedia::list) below — the
+//! dictionary's keys, prefix-scanned the way the DLL's `GetListAt`
+//! (`0x100017a0`) enumerates them.
 
 use std::{
+    collections::BTreeMap,
     io,
     sync::{Arc, Mutex, OnceLock, Weak},
 };
@@ -300,6 +296,62 @@ impl StorageMediaProvider for ProxyMedia {
     /// the built-in stack.
     fn exists(&self, name: &str) -> bool {
         self.resolve(name).is_some()
+    }
+
+    /// `GetListAt` (`0x100017a0`): the dictionary's own keys, prefix-scanned.
+    ///
+    /// The decompiled DLL builds a `DictMemberGetCaller` over
+    /// `ProxyStorageMap` — an enumeration of its member names — and the
+    /// reference's auto-path rebuild is that lister's consumer
+    /// (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1119-1125`): the names a
+    /// media lists are the names its auto path *places*. Enumerating the keys
+    /// is therefore not the same question as [`Self::exists`] — a key whose
+    /// value is not a string is not a mapping (the redirect helper demands
+    /// one) but is still a key a listing returns, which is exactly the
+    /// divergence class the M215 errata narrowed the probe fallback to. The
+    /// engine's mirror keeps every key for this reason
+    /// ([`StorageScriptTable::keys`], as opposed to `entries`, which is the
+    /// mappings).
+    ///
+    /// Children are spelled the way the trait's contract asks for
+    /// (`iTVPStorageMedia::GetListAt`, `StorageIntf.h:136`; the fstat
+    /// spelling, `fstat/Main.cpp:469-472`): immediate children only, with a
+    /// trailing `/` on the ones that are a prefix of a longer key. Keys are
+    /// matched as the script wrote them — the engine hands the media the
+    /// `./`-prefixed name space the auto path carries — and a prefix no key
+    /// starts with is `NotFound`, the resolver's "this media does not serve a
+    /// directory here" miss.
+    fn list(&self, name: &str) -> io::Result<Vec<String>> {
+        let mut children = BTreeMap::<String, bool>::new();
+        for key in self.table.keys() {
+            let Some(rest) = key.strip_prefix(name) else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.split_once('/') {
+                Some((child, _)) => {
+                    children.insert(child.to_string(), true);
+                }
+                None => {
+                    children.entry(rest.to_string()).or_insert(false);
+                }
+            }
+        }
+        if children.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, name.to_string()));
+        }
+        Ok(children
+            .into_iter()
+            .map(|(child, is_directory)| {
+                if is_directory {
+                    format!("{child}/")
+                } else {
+                    child
+                }
+            })
+            .collect())
     }
 
     /// `Open` (`0x10001bb0`): resolve the name, open the target through the
@@ -579,6 +631,80 @@ mod tests {
             storage
                 .read_binary_storage("proxy://./unmapped.dll")
                 .is_err()
+        );
+    }
+
+    /// `GetListAt` (`0x100017a0`): the media *enumerates* the dictionary the
+    /// lookup reads, so the auto-path rebuild has a listing to work from
+    /// instead of probing `exists` per name. The reference's lister is a
+    /// prefix scan of `ProxyStorageMap`'s keys
+    /// (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1119-1125`), and its child
+    /// spelling is the trait's (`iTVPStorageMedia::GetListAt`,
+    /// `StorageIntf.h:136`): immediate children only, a trailing `/` on the
+    /// ones that are a prefix of a longer key.
+    #[test]
+    fn the_media_lists_the_dictionary_keys() {
+        let root = temp_root("lists");
+        write_file(&root, "plugin/krmovie.dll", b"dll bytes");
+        let mut engine = project_engine(&root);
+
+        let value = engine
+            .execute_script(
+                "list.tjs",
+                r#"
+                ProxyStorageMap["./krmovie.dll"] = System.exePath+"plugin/krmovie.dll";
+                ProxyStorageMap["./thumb/x.jpg"] = "plugin/x.jpg";
+                ProxyStorageMap["./octet.bin"] = <% 01 02 %>;
+                Storages.addAutoPath("proxy://./");
+                return Storages.dirlist("proxy://./").join(",");
+                "#,
+            )
+            .expect("list the media");
+
+        // `thumb/x.jpg` is a key under a sub-prefix, so the listing reports
+        // `thumb/` as a directory. `octet.bin` is listed even though its value
+        // is an octet: a listing enumerates *keys* (`DictMemberGetCaller`),
+        // while the media's redirect lookup refuses a non-string value — the
+        // exact shape the M215 errata named as the difference between a
+        // listing and an existence probe.
+        assert_eq!(
+            value.to_tjs_string().expect("string"),
+            "krmovie.dll,octet.bin,thumb/"
+        );
+        assert!(
+            !engine
+                .tjs_runtime()
+                .host()
+                .storage_exists("proxy://./octet.bin"),
+            "a non-string value is not a mapping"
+        );
+
+        // The auto path places a name the listing enumerated, with the media's
+        // own spelling (`TVPGetPlacedPath` returns `path + storagename`).
+        let value = engine
+            .execute_script(
+                "placed.tjs",
+                r#"return Storages.getPlacedPath("krmovie.dll");"#,
+            )
+            .expect("placed path");
+        assert_eq!(
+            value.to_tjs_string().expect("string"),
+            "proxy://./krmovie.dll"
+        );
+
+        // A prefix no key starts with is a miss, not an empty listing: the
+        // media answers `NotFound` and the resolver falls back to the built-in
+        // stack, which has no such directory either.
+        let error = engine
+            .execute_script(
+                "miss.tjs",
+                r#"return Storages.dirlist("proxy://./absent/");"#,
+            )
+            .expect_err("a prefix no key carries must miss");
+        assert!(
+            error.message.contains("not found"),
+            "unexpected message: {}",
+            error.message
         );
     }
 

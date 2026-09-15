@@ -13,9 +13,10 @@
 //! memory member is served by the host's read/write/listing calls. Names that
 //! exist only inside an XP3 take the path the reference takes there — `fstat`
 //! answers with `size` alone and the mutators answer 0 instead of touching the
-//! archive. The members the engine has no capability for (directory creation,
-//! the Windows shell picker) report failure honestly instead of pretending to
-//! succeed.
+//! archive. `createDirectory` goes through the storage port's
+//! `create_directory`, which keeps `CreateDirectory`'s answers; the Windows
+//! shell picker (`selectDirectory`) is the one member left reporting failure
+//! honestly instead of pretending to succeed.
 //!
 //! Deliberate divergences from the reference, all driven by the engine's
 //! storage model:
@@ -26,9 +27,8 @@
 //! - Attributes and timestamps map onto what POSIX exposes: the read-only bit
 //!   is settable, the creation time (`ctime`) is not, and `getFileAttributes`
 //!   on a missing path answers `0xFFFFFFFF` like the reference does.
-//! - Directory creation and `selectDirectory` need storage-layer and shell
-//!   support the engine does not have; they return the reference's failure
-//!   value (0) and log once.
+//! - `selectDirectory` needs a shell picker the engine does not have; it
+//!   returns the reference's failure value (0) and logs once.
 //! - `isExistentDirectory` takes a directory name with or without the trailing
 //!   `/` the reference demands (`Main.cpp:759-762`): this engine's
 //!   `getFullPath` drops the delimiter the reference's keeps, so scripts that
@@ -52,11 +52,11 @@ pub(crate) const META: PluginMeta = PluginMeta {
     feature: "Storages.fstat/dirlist/dirlistEx/copyFile/deleteFile/moveFile/truncateFile/\
               exportFile/getTime/setTime/getFileAttributes/getMD5HashString/getTemporaryName, \
               TemporaryFiles class",
-    notes: "Stat, digest, listing, copy/export and timestamp members work on storage names; \
-            directory creation and selectDirectory report failure because the storage layer has \
-            no directory-creation or shell-dialog capability. A directory with no entries is \
-            invisible to the engine's file-based storage resolution, and only the read-only \
-            attribute plus mtime/atime are settable on this platform.",
+    notes: "Stat, digest, listing, copy/export, timestamp and directory-creation members work on \
+            storage names; selectDirectory reports failure because the engine has no shell-dialog \
+            capability. A directory with no entries is invisible to the engine's file-based \
+            storage resolution, and only the read-only attribute plus mtime/atime are settable on \
+            this platform.",
     install: |engine| engine.register_plugin(FstatPlugin),
 };
 
@@ -725,20 +725,28 @@ fn storages_create_directory(
 ) -> Result<Variant> {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     let directory = required_string(&args, 0, "Storages.createDirectory")?;
-    if directory.is_empty() {
-        return Err(TjsError::bad_param_count());
-    }
     require_trailing_slash(&directory)?;
-    if runtime.host().storage_is_directory(&directory) {
-        return Ok(Variant::Integer(1));
-    }
-    log_once(
-        runtime,
-        &LOGGED,
-        "fstat.dll: createDirectory needs a mutable-storage API the engine does not expose; \
-         returning the reference's failure value",
-    );
-    Ok(Variant::Integer(0))
+    // The reference answers `CreateDirectory`'s BOOL straight back
+    // (`Main.cpp:586-595`): 1 only when this call *created* the directory, 0
+    // when it already existed, when a parent is missing, or when the
+    // filesystem refuses. The engine's storage port reproduces those rules.
+    let created = match runtime.host().project_storage() {
+        Ok(storage) => Some(storage.create_directory(&directory).is_ok()),
+        Err(_) => None,
+    };
+    let created = match created {
+        Some(created) => created,
+        None => {
+            log_once(
+                runtime,
+                &LOGGED,
+                "fstat.dll: createDirectory needs a project storage with a writable root; \
+                 returning the reference's failure value",
+            );
+            false
+        }
+    };
+    Ok(Variant::Integer(i64::from(created)))
 }
 
 fn storages_change_directory(
@@ -1476,6 +1484,50 @@ mod tests {
                 "{call}"
             );
         }
+    }
+
+    #[test]
+    fn create_directory_creates_once_and_answers_like_create_directory() {
+        let root = test_root("fstat-create-directory");
+        fs::create_dir_all(root.join("parent")).expect("create parent");
+        fs::write(root.join("probe.txt"), b"probe").expect("write probe");
+
+        let mut engine = test_engine(&root);
+        engine.register_plugin(FstatPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                "(function() {\n\
+                     var created = Storages.createDirectory(\"savedata/\");\n\
+                     var again = Storages.createDirectory(\"savedata/\");\n\
+                     var nested = Storages.createDirectory(\"parent/child/\");\n\
+                     var missingParent = Storages.createDirectory(\"absent/child/\");\n\
+                     var onAFile = Storages.createDirectory(\"probe.txt/\");\n\
+                     return created + \":\" + again + \":\" + nested + \":\" + \
+                         missingParent + \":\" + onAFile + \":\" +\n\
+                         Storages.isExistentDirectory(\"savedata/\") + \":\" +\n\
+                         Storages.isExistentDirectory(\"parent/child/\") + \":\" +\n\
+                         Storages.isExistentDirectory(\"absent/child/\");\n\
+                 })()",
+            )
+            .expect("create directories");
+
+        // Win32 `CreateDirectory` answers FALSE for a directory that is already
+        // there (`ERROR_ALREADY_EXISTS`), for a missing parent
+        // (`ERROR_PATH_NOT_FOUND`) and for a name a file occupies, so only the
+        // first two calls create anything — `parent` exists as a *parent* and
+        // `CreateDirectory` still builds its child.
+        assert_eq!(value, Variant::String("1:0:1:0:0:1:1:0".to_string()));
+        assert!(
+            root.join("savedata").is_dir(),
+            "Storages.createDirectory must create the directory on disk"
+        );
+        assert!(root.join("parent/child").is_dir(), "nested creation");
+        assert!(
+            !root.join("absent").exists(),
+            "a missing parent must not be created"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

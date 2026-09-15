@@ -14,7 +14,8 @@ use flate2::{Compression, write::ZlibEncoder};
 use krkr_core::StoragePort;
 
 use crate::{
-    SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3Entry, Xp3Error, Xp3OpenOptions,
+    SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3ContentFilterAction, Xp3Entry, Xp3Error,
+    Xp3ExtractionFilterInfo, Xp3FilterContext, Xp3FilterRegistry, Xp3OpenOptions,
     Xp3ResourceProvider, normalize_entry_name,
     parse::{XP3_INDEX_CONTINUE, XP3_INDEX_ENCODE_RAW, XP3_INDEX_ENCODE_ZLIB, parse_index},
 };
@@ -749,6 +750,175 @@ fn rejects_parent_paths_during_normalization() {
     );
     assert!(normalize_entry_name("../secret.ks").is_err());
     assert!(normalize_entry_name("/absolute.ks").is_err());
+}
+
+/// The reference reads `TVPXP3ArchiveExtractionFilter` inside its read loop
+/// (`XP3Archive.cpp:1047`), not once per stream, so a filter installed after
+/// the archive was opened — and after the entry was already read once — still
+/// changes what the next read returns.
+#[test]
+fn extraction_filter_installed_after_open_applies_to_later_reads() {
+    let registry = Arc::new(Xp3FilterRegistry::new());
+    let archive = Xp3Archive::open_with_options(
+        Cursor::new(build_archive(
+            &[FixtureEntry {
+                name: "secret.txt",
+                segments: vec![FixtureSegment::raw(b"plaintext")],
+                hash: 0x99,
+                time: None,
+            }],
+            BuildOptions::default(),
+        )),
+        Xp3OpenOptions::default().with_filter_registry(Arc::clone(&registry)),
+    )
+    .expect("open fixture");
+
+    let read_entry = |archive: &Xp3Archive<Cursor<Vec<u8>>>| {
+        let mut stream = archive
+            .open_by_name("secret.txt")
+            .expect("open entry")
+            .expect("entry exists");
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).expect("read entry");
+        bytes
+    };
+
+    // Read once with no filter installed: the bytes are the stored ones.
+    assert_eq!(read_entry(&archive), b"plaintext");
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let seen = Arc::clone(&seen);
+        registry.set_extraction_filter(Some(Arc::new(
+            move |info: Xp3ExtractionFilterInfo<'_>, _ctx: &mut Xp3FilterContext| {
+                seen.lock().expect("filter log").push((
+                    info.offset,
+                    info.file_hash,
+                    info.file_name.to_string(),
+                ));
+                for byte in info.buffer.iter_mut() {
+                    *byte ^= 0xff;
+                }
+            },
+        )));
+    }
+
+    let expected: Vec<u8> = b"plaintext".iter().map(|byte| byte ^ 0xff).collect();
+    assert_eq!(
+        read_entry(&archive),
+        expected,
+        "a filter installed after the archive opened must reach the read path"
+    );
+    // The extraction info carries the chunk's uncompressed offset, the entry's
+    // index hash and its name (`XP3Archive.cpp:1047-1048`).
+    assert_eq!(
+        *seen.lock().expect("filter log"),
+        vec![(0, 0x99, "secret.txt".to_string())]
+    );
+
+    // `TVPSetXP3FilterScript("")` clears the slots (`xp3filter.cpp:429-430`).
+    registry.set_extraction_filter(None);
+    assert_eq!(read_entry(&archive), b"plaintext");
+}
+
+/// `XP3_CONTENT_FILTER_FETCH_FULLDATA` (`XP3Archive.cpp:585-595`): the content
+/// filter runs when the stream is created, its `ctx` reaches every extraction
+/// call of that stream, and the entry is read whole through the extraction
+/// filter into the bytes the caller then reads.
+#[test]
+fn content_filter_fetches_the_full_entry_through_the_extraction_filter() {
+    let registry = Arc::new(Xp3FilterRegistry::new());
+    let archive = Xp3Archive::open_with_options(
+        Cursor::new(build_archive(
+            &[FixtureEntry {
+                name: "whole.bin",
+                segments: vec![FixtureSegment::raw(b"abcdefgh")],
+                hash: 7,
+                time: None,
+            }],
+            BuildOptions::default(),
+        )),
+        Xp3OpenOptions::default()
+            .with_filter_registry(Arc::clone(&registry))
+            .with_archive_name("data.xp3"),
+    )
+    .expect("open fixture");
+
+    let content_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let content_calls = Arc::clone(&content_calls);
+        registry.set_content_filter(Some(Arc::new(
+            move |file: &str, archive: &str, size: u64, ctx: &mut Xp3FilterContext| {
+                content_calls.lock().expect("content log").push((
+                    file.to_string(),
+                    archive.to_string(),
+                    size,
+                ));
+                ctx.set(2u32);
+                Xp3ContentFilterAction::FetchFull
+            },
+        )));
+    }
+    registry.set_extraction_filter(Some(Arc::new(
+        |info: Xp3ExtractionFilterInfo<'_>, ctx: &mut Xp3FilterContext| {
+            let shift = *ctx
+                .get::<u32>()
+                .expect("the content filter seeded the context");
+            for byte in info.buffer.iter_mut() {
+                *byte += u8::try_from(shift).expect("shift fits");
+            }
+        },
+    )));
+
+    let mut stream = archive
+        .open_by_name("whole.bin")
+        .expect("open entry")
+        .expect("entry exists");
+    let mut first = [0u8; 3];
+    stream.read_exact(&mut first).expect("first chunk");
+    assert_eq!(&first, b"cde");
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).expect("rest of the entry");
+    assert_eq!(rest, b"fghij");
+
+    assert_eq!(
+        *content_calls.lock().expect("content log"),
+        vec![("whole.bin".to_string(), "data.xp3".to_string(), 8)]
+    );
+}
+
+/// A content filter that answers `0` (`Decode`) leaves the archive read path
+/// alone, and the stream still reads through the *current* extraction filter.
+#[test]
+fn content_filter_decode_keeps_the_normal_read_path() {
+    let registry = Arc::new(Xp3FilterRegistry::new());
+    let archive = Xp3Archive::open_with_options(
+        Cursor::new(build_archive(
+            &[FixtureEntry {
+                name: "plain.bin",
+                segments: vec![FixtureSegment::zlib(b"decode me")],
+                hash: 3,
+                time: None,
+            }],
+            BuildOptions::default(),
+        )),
+        Xp3OpenOptions::default().with_filter_registry(Arc::clone(&registry)),
+    )
+    .expect("open fixture");
+
+    registry.set_content_filter(Some(Arc::new(
+        |_file: &str, _archive: &str, _size: u64, _ctx: &mut Xp3FilterContext| {
+            Xp3ContentFilterAction::Decode
+        },
+    )));
+
+    let mut stream = archive
+        .open_by_name("plain.bin")
+        .expect("open entry")
+        .expect("entry exists");
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).expect("read entry");
+    assert_eq!(bytes, b"decode me");
 }
 
 #[derive(Clone)]

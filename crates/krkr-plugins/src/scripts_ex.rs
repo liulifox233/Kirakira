@@ -106,7 +106,10 @@ const SCRIPTS_MEMBERS: &[&str] = &[
     "rehash",
 ];
 
-fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
+/// Installs the ten reference `Scripts` members. Shared with `PackinOne.dll`,
+/// which compiles the same sub-plugin in: the bundle installs this one
+/// implementation, so both DLLs answer the shared members identically.
+pub(crate) fn install_scripts_ex(runtime: &mut Runtime<KrkrHost>) {
     let scripts = match runtime.global_member("Scripts") {
         Variant::Object(handle) => handle,
         _ => {

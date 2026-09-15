@@ -42,43 +42,49 @@
 //! (`XP3Archive.cpp:30-33`) invoked from the archive read path for every
 //! chunk — `XP3Archive.cpp:1005-1010` in krkr2, `:1047-1052` in K2.
 //!
-//! # What this engine has, and what it does not
+//! # The seam this plugin installs into
 //!
-//! The equivalent primitive exists: `krkr-xp3` defines
-//! `Xp3ExtractionFilter::apply(uncompressed_offset, buffer, file_hash)`
-//! (`crates/krkr-xp3/src/util.rs:45-56`) and applies it per decompressed chunk
-//! with the same `(position, buffer, file_hash)` shape the reference's info
-//! struct carries (`crates/krkr-xp3/src/stream.rs:224-226`); it is configured
-//! through `Xp3OpenOptions::with_extraction_filter`
-//! (`crates/krkr-xp3/src/options.rs:47-53`).
+//! The engine now has one. `krkr-core` carries the vocabulary
+//! (`Xp3ExtractionFilter`, `Xp3ContentFilter`/`Xp3ContentFilterAction`,
+//! `Xp3ExtractionFilterInfo`, `Xp3FilterContext` and the `Xp3FilterRegistry`
+//! holding both slots), `krkr-xp3`'s archives hold that registry and read its
+//! slots *late* — the content filter when an entry stream is created
+//! (`crates/krkr-xp3/src/stream.rs:78-113`, K2 `XP3Archive.cpp:585-595`) and
+//! the extraction filter on every read chunk (`:284-293`, K2 `:1047-1053`) —
+//! and `krkr-engine` exposes the install to plugins as
+//! [`crate::plugin_api::xp3`] (`set_extraction_filter`/`set_content_filter`),
+//! handed out by `ProjectStoragePort::xp3_filter_registry`. Because the archive
+//! never captures a filter, an install from a plugin's `register` — which
+//! always runs after the project storage was built — reaches every later read,
+//! which is the reference's own ordering (`xp3filter.cpp:438-458` installs
+//! post-registration too). The engine end-to-end pin lives in
+//! `crates/krkr-engine/src/plugin_api/xp3.rs`
+//! (`a_plugin_installed_filter_changes_what_the_engine_reads`).
 //!
-//! **No plugin can reach it.** The archives are opened once while the project
-//! storage is built — `ProjectStorage::for_root` →
-//! `open_project_archives` → `Xp3ResourceProvider::open_archives`, i.e.
-//! *default* options with no filter (`crates/krkr-assets/src/storage.rs:260-264,
-//! 2624-2630`) — which happens before the engine exists and therefore before
-//! any `KrkrPlugin::register` runs; the filter is then frozen per entry stream
-//! (`crates/krkr-xp3/src/archive.rs:100-120`). The plugin-facing engine surface
-//! (`crates/krkr-engine/src/plugin_api/mod.rs:42-46`) is storage media,
-//! transitions, layer bitmaps and video, and there is no later
-//! `TVPSetXP3ArchiveExtractionFilter`-style setter anywhere in `crates/`
-//! (`with_extraction_filter` is constructed nowhere outside its own unit
-//! tests). The K2 **content filter does not exist at all**: no hook, no per-file
-//! context, no "read whole file" decision.
+//! # What is still missing here: the script bridge
 //!
-//! So the reference's hook — a callback installed into the engine's XP3 read
-//! path — has no seam to be installed into, and adding one would be an engine
-//! change (a plugin-facing XP3 API, plus an ordering decision: the filter must
-//! be settable *before* the project archives open, or the archives must be
-//! re-openable). Inventing that API inside this plugin would be a surface the
-//! reference does not have and the engine cannot honour; the gap is recorded as
-//! a finding instead (`.tower/comms/findings/` — "no plugin-facing XP3 filter
-//! seam", filed with M98).
+//! What this module cannot do yet is turn `xp3filter.tjs` into callbacks. The
+//! reference executes the configuration in a **private per-thread TJS engine**
+//! (`XP3FilterDecoder`, `K2 xp3filter.cpp:212-220`, `:295-354`) whose
+//! `Storages.setXP3ArchiveExtractionFilter`/`setXP3ArchiveContentFilter`
+//! members (`:306-316`) hand it the script's functions; the callbacks then run
+//! on the archive read path, which may be a resource worker, so the reference
+//! keeps one engine per thread. This port has no way to build such a private
+//! runtime from a plugin, and an extraction filter is `Send + Sync` precisely
+//! because it can be called off the script thread — the bridge has to solve
+//! that, not route a `Runtime` handle across it. So the decision path below
+//! reads the configuration and stops there, and no filter is installed.
+//!
+//! `Storages.setXP3ArchiveExtractionFilter`/`setXP3ArchiveContentFilter` stay
+//! **not** installed in the main engine: the reference installs them only
+//! inside the plugin's private script engine, and a main-engine copy would be
+//! a member the reference's main engine does not have. Now that
+//! `plugin_api::xp3` exists, a plugin's *Rust* side can install filters
+//! directly; the script-facing spelling remains private to the bridge.
 //!
 //! # What this port implements
 //!
-//! Exactly the part of the plugin that does not need the seam — the
-//! **decision path** the reference runs at registration:
+//! The **decision path** the reference runs at registration:
 //!
 //! * `register` probes `xp3filter.tjs` in the application path with the
 //!   no-search existence check (`TVPGetAppPath() + "xp3filter.tjs"` +
@@ -92,16 +98,15 @@
 //! * When it is **present** the reference reads it and activates both filters.
 //!   This port reads it (with the host's configured text encoding, the way
 //!   `TVPCreateTextStreamForRead(path, "")` does) and reports once through the
-//!   engine log that the engine has no XP3 filter seam, naming the file and the
-//!   missing capability. It does not install anything and it does not pretend:
-//!   registration still succeeds, because the archive read path was already
-//!   fixed when the project storage opened.
+//!   engine log that the script bridge is what is missing — the file was read,
+//!   but nothing executed its `Storages.setXP3Archive*` calls. Registration
+//!   still succeeds: the seam itself is live and reachable from a plugin's
+//!   Rust side (`crate::plugin_api::xp3`).
 //!
 //! `Storages.setXP3ArchiveExtractionFilter`/`setXP3ArchiveContentFilter` are
 //! deliberately **not** installed in the main engine: the reference installs
 //! them only inside the plugin's private script engines, and a main-engine copy
-//! would be a member the reference's main engine does not have (and, here, one
-//! with nothing to control).
+//! would be a member the reference's main engine does not have.
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{Result, runtime::Runtime};
@@ -114,12 +119,13 @@ pub(crate) const META: PluginMeta = PluginMeta {
     notes: "The reference's registration-time decision path is implemented: `xp3filter.tjs` in \
             the application path is probed with the no-search existence check, a missing file \
             leaves everything alone exactly like the reference, and a present file is read and \
-            reported once through the engine log. The hook itself cannot be installed: archives \
-            are opened with the engine's default options while the project storage is built, \
-            before any plugin registers, and the plugin-facing API has no XP3 filter setter — \
-            there is also no content-filter primitive at all. The gap is filed as a finding \
-            rather than papered over with an invented `Storages.setXP3Archive*` member (the \
-            reference exposes those only inside the plugin's own private script engines).",
+            reported once through the engine log. The engine's filter seam exists and a plugin's \
+            Rust side can install into it (`plugin_api::xp3`, backed by krkr-xp3's live-read \
+            `Xp3FilterRegistry`), but this module still installs nothing: the reference runs the \
+            configuration in a private per-thread TJS engine whose \
+            `Storages.setXP3Archive*` members hand it the script's callbacks, and this port has \
+            no way to build that bridge — so the module keeps reporting itself as missing, with \
+            the reason attached.",
     install: |engine| engine.register_plugin(Xp3FilterPlugin::new()),
 };
 
@@ -136,21 +142,21 @@ pub struct Xp3FilterPlugin {
     /// status contract (`crate::catalog`'s
     /// `every_entry_installs_the_plugin_it_names_and_only_a_placeholder_reports_itself`)
     /// requires a [`PluginStatus::Missing`] entry to report itself exactly once
-    /// per installation; the hook is still missing, so this module keeps
-    /// reporting that, with the *reason* attached.
+    /// per installation; the script bridge is still missing, so this module
+    /// keeps reporting that, with the *reason* attached.
     reported_missing: std::sync::atomic::AtomicBool,
-    /// Whether the missing-seam diagnostic has been written. The reference
+    /// Whether the missing-bridge diagnostic has been written. The reference
     /// probes (and loads) the configuration on every module registration; the
     /// probe still runs every time, only the report is once per plugin
     /// instance.
-    reported_seam: std::sync::atomic::AtomicBool,
+    reported_bridge: std::sync::atomic::AtomicBool,
 }
 
 impl Xp3FilterPlugin {
     pub fn new() -> Self {
         Self {
             reported_missing: std::sync::atomic::AtomicBool::new(false),
-            reported_seam: std::sync::atomic::AtomicBool::new(false),
+            reported_bridge: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -167,18 +173,19 @@ impl KrkrPlugin for Xp3FilterPlugin {
     }
 
     fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
-        // The status is `Missing` because the hook a game needs is not
-        // installable; a missing module stays visible in the log instead of
-        // silently absent (the `crate::placeholder` contract).
+        // The status is `Missing` because the script bridge a game needs is not
+        // built; a missing module stays visible in the log instead of silently
+        // absent (the `crate::placeholder` contract).
         if !self
             .reported_missing
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             runtime.host_mut().log(&format!(
-                "WARN plugin not implemented: {NAME} — the XP3 extraction/content filter hook has \
-                 no plugin-facing engine seam (project archives open with default options before \
-                 plugins register); only the reference's registration-time `xp3filter.tjs` \
-                 decision path runs and no TJS surface is installed"
+                "WARN plugin not implemented: {NAME} — the reference runs `xp3filter.tjs` in a \
+                 private per-thread TJS engine and installs its callbacks into the archive read \
+                 path; this port has the engine seam (`plugin_api::xp3`) while the script bridge \
+                 itself is unbuilt, so only the registration-time decision path runs and no \
+                 filter is installed"
             ));
         }
 
@@ -192,7 +199,7 @@ impl KrkrPlugin for Xp3FilterPlugin {
             return Ok(());
         };
         if self
-            .reported_seam
+            .reported_bridge
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             return Ok(());
@@ -200,22 +207,25 @@ impl KrkrPlugin for Xp3FilterPlugin {
 
         // The reference reads the file and executes it in a private TJS engine
         // that carries the two `Storages.setXP3Archive*` members
-        // (`K2 xp3filter.cpp:317, 440-455`). This engine cannot host that
-        // private runtime (the plugin-facing API has no way to build one) and
-        // has no filter to hand the script's callbacks to, so the read is the
-        // last meaningful step of the decision path and the gap is reported.
+        // (`K2 xp3filter.cpp:317, 440-455`), which hand it the script's
+        // callbacks. This port has no way to build that private runtime, and a
+        // filter is `Send + Sync` because it can be called off the script
+        // thread — so the bridge is what is missing, and the read is the last
+        // meaningful step of the decision path. The engine seam itself is live
+        // (`plugin_api::xp3`), so a Rust-side install would already work.
         let encoding = runtime.host().text_encoding().to_owned();
         let detail = match storage.read_text_storage(&path, &encoding) {
             Ok(text) => format!("{} bytes", text.len()),
             Err(error) => format!("unreadable: {error}"),
         };
         runtime.host_mut().log(&format!(
-            "WARN xp3filter: `{path}` is configured ({detail}), but this engine has no XP3 \
-             filter seam: project archives are opened with default options before plugins \
-             register (`krkr-assets/src/storage.rs:2624-2630`), `Xp3OpenOptions::\
-             with_extraction_filter` is never constructed in production code, and no \
-             content-filter primitive exists. The reference's extraction/content filters stay \
-             uninstalled; see the M98 finding `no plugin-facing XP3 filter seam`."
+            "WARN xp3filter: `{path}` is configured ({detail}), but this port has no script \
+             bridge: the engine's XP3 filter seam exists (`plugin_api::xp3` over krkr-xp3's \
+             `Xp3FilterRegistry`, read per entry-stream creation and per read chunk), while the \
+             configuration's `Storages.setXP3Archive*` callbacks need the reference's private \
+             per-thread TJS engine (`xp3filter.cpp:212-220`, `:295-354`), which this port does \
+             not build. The reference's extraction/content filters stay uninstalled; a Rust-side \
+             install through `plugin_api::xp3` needs no bridge."
         ));
         Ok(())
     }
@@ -301,8 +311,8 @@ mod tests {
             "the missing module must report itself once, got: {logs}"
         );
         assert!(
-            !logs.contains("no XP3 filter seam"),
-            "an absent configuration must not warn about the hook, got: {logs}"
+            !logs.contains("no script bridge"),
+            "an absent configuration must not warn about the bridge, got: {logs}"
         );
         // The reference's `Storages.setXP3Archive*` members exist only in its
         // private script engines; the main engine must not grow them.
@@ -322,10 +332,10 @@ mod tests {
     }
 
     /// The configured case: the decision path detects the file, reads it and
-    /// reports the missing engine seam instead of pretending to install a
+    /// reports the missing script bridge instead of pretending to install a
     /// filter.
     #[test]
-    fn a_present_configuration_reports_the_missing_seam() {
+    fn a_present_configuration_reports_the_missing_bridge() {
         let root = temp_root("present");
         fs::write(
             root.join(CONFIG_NAME),
@@ -343,7 +353,7 @@ mod tests {
             "the detection must be logged, got: {logs}"
         );
         assert!(
-            logs.contains("no XP3 filter seam"),
+            logs.contains("no script bridge"),
             "the missing capability must be named, got: {logs}"
         );
         assert!(
@@ -385,7 +395,7 @@ mod tests {
             .execute_expression("inline.tjs", "Plugins.link(\"xp3filter.dll\")")
             .expect("re-link");
         // One diagnostic per plugin instance, not one per link.
-        assert_eq!(logs(&engine).matches("no XP3 filter seam").count(), 1);
+        assert_eq!(logs(&engine).matches("no script bridge").count(), 1);
     }
 
     /// A host without project storage has no application path to probe; the
@@ -398,6 +408,6 @@ mod tests {
             .expect("install into a script-only host");
         let logs = logs(&engine);
         assert!(logs.contains("not implemented: xp3filter.dll"));
-        assert!(!logs.contains("no XP3 filter seam"));
+        assert!(!logs.contains("no script bridge"));
     }
 }
