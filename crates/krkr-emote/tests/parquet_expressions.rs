@@ -233,7 +233,7 @@ fn the_two_sd102_expressions_render_differently() {
     );
     assert!(
         bbox[0] >= face[0] / 2 && bbox[2] <= 1100 && bbox[1] >= 50 && bbox[3] <= 900,
-        "the difference stays inside the 1125x675 scene: bbox {bbox:?}"
+        "the difference stays inside the motion's 1500x900 screen box: bbox {bbox:?}"
     );
     println!(
         "SD102AA vs SD102AD: {count} pixels differ, bbox {bbox:?}; {face_count} of them inside the face rectangle {face:?} (bbox {face_bbox:?})"

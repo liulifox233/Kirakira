@@ -169,8 +169,11 @@ impl Canvas {
 /// `1003a850_FUN_1003a850.c:284`.
 ///
 /// Values outside the table fall back to [`SpriteBlend::Over`]; no shipped
-/// PARQUET motion contains one (the corpus uses `0x10`, `0x11`, `0x13` and
-/// `0x0`).
+/// PARQUET motion contains one. The corpus's own `bm` values are `0x10` (the
+/// default), `0x00` (`m2logo`, `splash`, `yuzulogo`), `0x01` (an additive
+/// `m2logo` sprite), `0x11` (`title_bg`'s additive sprite) and `0x13` (`sd101`'s
+/// haze layer — `sprites=64 blend_modes={16: 57, 19: 7}` over the six sampled
+/// ticks in each copy of the file).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SpriteBlend {
     /// `bm & 0xF` 0 (and every value the table does not name): source-over.
@@ -211,7 +214,8 @@ impl SpriteBlend {
 /// The four corner-colour multipliers of one draw item, in
 /// `[top-left, top-right, bottom-right, bottom-left]` order, or `None` when
 /// every corner is neutral (which draws bit-identically to ignoring the field
-/// entirely).
+/// entirely). That corner order is *inferred* from the quad's own build order,
+/// not recovered from the DLL — see `MotionDrawItem::corner_colors`.
 ///
 /// Each channel is scaled the way the reference's texture-colour stage scales
 /// it: 0x80 is exactly 1.0 under MODULATE2X (`bm & 0xF0 == 0x10`, the neutral

@@ -35,9 +35,10 @@
 //! Read from the shipping binaries rather than from documentation: the
 //! `motionplayer_nod3d.dll` Ghidra export (one `.c` per function plus
 //! `strings.tsv`), the D3D build's disassembly (`motionplayer.dll`, image base
-//! `0x10000000`), the plugin dossier (`docs/plugins/motionplayer.md`, whose
-//! member tables came from those two), and eluna's own recovery, whose
-//! comments cite the DLL `sub_` addresses per facility.
+//! `0x10000000`), and eluna's own recovery, whose comments cite the DLL `sub_`
+//! addresses per facility. The same DLLs are what the plugin in
+//! `crates/krkr-plugins/src/motion_player.rs` was built against, so that
+//! module's member surface is the cross-check for the TJS side.
 //!
 //! **Per tick, in the reference:** `MEmotePlayer::Init` parses the PSB
 //! `metadata` once — `variableList`, `instantVariableList`, `eyeControl`,
@@ -92,10 +93,11 @@
 //!    layer (nod3d `100385e0_FUN_100385e0.c`; the game branches on the member
 //!    answering void, `AffineSourceMotion.tjs:3237`), while eluna produces one
 //!    flat sprite list with no part-to-layer mapping;
-//! 2. the **script callbacks** `onAction` / `onSync` / `onFindMotion`
-//!    (dossier member list) — eluna records and replays an *API log*
-//!    (`record_api_log`/`replay_api_log_once`) but never invokes a host
-//!    callback;
+//! 2. the **script callbacks** `onAction` / `onSync` / `onFindMotion` (the
+//!    `Player` members this crate's plugin registers as declared stubs,
+//!    `crates/krkr-plugins/src/motion_player.rs`) — eluna records and replays an
+//!    *API log* (`record_api_log`/`replay_api_log_once`) but never invokes a
+//!    host callback;
 //! 3. the **sync/completion surface** `syncActive` / `syncWaiting` /
 //!    `skipToSync` / `completionType` / `independentLayerInherit` / `tags` /
 //!    `motionKey` (`eluna::emote_runtime_parity_report`, `sdk.rs:238-275`,
@@ -118,10 +120,11 @@
 //! eye/eyebrow/mouth control list, every timeline and every physics control is
 //! empty. The only authored variables are `language` (0..3) in five `sd*`
 //! members, with one or two parameterised layers each (the localised-text
-//! layers); the interesting render state is the per-sprite `bm` (`0x10`
-//! default, `0x00` in `m2logo`/`splash`/`yuzulogo`, one `0x11` sprite in
-//! `title_bg`, two `0x13` sprites in each `sd101`) and the authored corner
-//! colours (`m2logo`, `title_bg`, `yuzusourlogo`). So the reference's
+//! layers); the interesting render state is the per-sprite `bm` (the `0x10`
+//! default; `0x00` in `m2logo`/`splash`/`yuzulogo`; an additive `0x01` sprite
+//! in `m2logo`; `0x11` in `title_bg`; `0x13` on `sd101`'s haze layer, seven
+//! sprite instances over the six sampled ticks in each copy) and the authored
+//! corner colours (`m2logo`, `title_bg`, `yuzusourlogo`). So the reference's
 //! face/control pipeline has nothing to resolve here, and a frame difference
 //! between two SD animations is authored as different face *layers* — which
 //! [`Motion::draw_list`] already resolves.
@@ -151,6 +154,12 @@ pub struct MotionPlayer {
     normalized_data: Vec<u8>,
     player: ElunaPlayer,
     motion: String,
+    /// The active animation's own time: the tick the scene is sampled at, cut
+    /// back to 0 by [`MotionPlayer::set_motion`]. [`ElunaPlayer`] keeps one
+    /// clock for both the player's controls/timelines and the motion sample,
+    /// so the wrapper carries the animation's time next to it; see
+    /// [`MotionPlayer::elapsed_ticks`].
+    motion_ticks: f32,
 }
 
 impl MotionPlayer {
@@ -204,6 +213,7 @@ impl MotionPlayer {
             normalized_data,
             player,
             motion: animation.to_owned(),
+            motion_ticks: 0.0,
         };
         session.rebuild()?;
         Ok(session)
@@ -214,8 +224,22 @@ impl MotionPlayer {
         &self.motion
     }
 
-    /// Switches animation, restarting the clock the way `Player.motion =` does
-    /// in the reference (its `setMotion` rebuilds the frame at time 0).
+    /// Switches animation the way the reference switches motions: the new one
+    /// starts at its own time 0, and the session's player state — variables,
+    /// control timers, timelines — keeps running.
+    ///
+    /// The switch is `play(name, flags)` in the reference, not a property
+    /// write: the game only ever *reads* `_player.motion`
+    /// (`/mnt/hdd/tmp/m230/all/AffineSourceMotion.tjs.tjs:545,560`) and
+    /// changes motion with `_player.play(a0.motion, l2)` (`:2564`, and `:256`),
+    /// and this crate's plugin implements `play` as "put the player at tick 0
+    /// and start it" (`crates/krkr-plugins/src/motion_player.rs:2152-2156`),
+    /// keeping the player's variables — which is what this method does.
+    ///
+    /// *Verified*: the game's call shape and the plugin's tick-0 semantics.
+    /// *Inferred*: that the native player likewise keeps one clock for the
+    /// player and another for the motion's own time — eluna exposes a single
+    /// `elapsed_ticks`, so this wrapper carries the animation's time itself.
     pub fn set_motion(&mut self, animation: &str) -> Result<(), MotionError> {
         if self
             .schema
@@ -226,6 +250,7 @@ impl MotionPlayer {
             return Err(MotionError::MissingAnimation(animation.to_owned()));
         }
         self.motion = animation.to_owned();
+        self.motion_ticks = 0.0;
         self.player.skip();
         self.rebuild()
     }
@@ -244,9 +269,12 @@ impl MotionPlayer {
             .unwrap_or(0.0)
     }
 
-    /// Ticks since the session opened.
+    /// How far into the active animation the session is, in ticks — the time
+    /// its frames are sampled at. [`MotionPlayer::set_motion`] puts it back to
+    /// 0; the session's control timers and timelines are *not* rewound (they
+    /// run on the player's own clock, as in the reference).
     pub fn elapsed_ticks(&self) -> f32 {
-        self.player.elapsed_ticks()
+        self.motion_ticks
     }
 
     /// Advances the session by `delta_ticks` on the reference's 1/60 s tick
@@ -258,6 +286,7 @@ impl MotionPlayer {
         } else {
             0.0
         };
+        self.motion_ticks += delta;
         self.player.progress_ticks_without_physics(delta);
         self.rebuild_with_physics(delta)
     }
@@ -387,12 +416,13 @@ impl MotionPlayer {
                      psb: &eluna::PsbFile,
                      data: &[u8],
                      motion: &str,
+                     motion_ticks: f32,
                      previous: &EmoteStaticScene| {
             schema.build_motion_scene_at_with_resources_variables_previous_scene_and_ground_hook(
                 psb,
                 data,
                 motion,
-                player.elapsed_ticks(),
+                motion_ticks,
                 &player.evaluated_variable_values(),
                 previous,
                 None,
@@ -404,6 +434,7 @@ impl MotionPlayer {
             &self.psb,
             &self.normalized_data,
             &self.motion,
+            self.motion_ticks,
             &previous,
         )?;
         self.player.replace_scene(scene);
@@ -416,6 +447,7 @@ impl MotionPlayer {
                 &self.psb,
                 &self.normalized_data,
                 &self.motion,
+                self.motion_ticks,
                 &previous,
             )?;
             self.player.replace_scene(scene);

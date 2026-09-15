@@ -252,9 +252,18 @@ pub struct MotionDrawItem {
     /// and `bp`'s absence from the draw path); it travels with the item so a
     /// caller that needs it is not blocked by the adapter.
     pub blend_parameter: f32,
-    /// Native four-corner colours in serialized `0xRRGGBBAA` byte order,
-    /// mapped in the order the quad is built: `[top-left, top-right,
-    /// bottom-right, bottom-left]`. The default is the neutral
+    /// Native four-corner colours in serialized `0xRRGGBBAA` byte order.
+    ///
+    /// *Inferred, not recovered*: the four entries are mapped onto the quad in
+    /// build order, `[top-left, top-right, bottom-right, bottom-left]`, because
+    /// that is the order the rasteriser emits the quad's corners in. The DLL's
+    /// own vertex-colour order was not recovered (the D3D build's draw path
+    /// feeds four per-vertex values into its shader; neither build's export
+    /// pairs them with a corner). Every authored colour in PARQUET's 23 `.mtn`
+    /// members has all four corners equal, so the corpus cannot tell the orders
+    /// apart — a gradient-tinted sprite would be the first to do so.
+    ///
+    /// The default is the neutral
     /// MODULATE2X colour `0x808080FF`, whose `0x80` bytes are exactly 1.0 under
     /// that stage's `/128`, so an untinted sprite is bit-identical to one drawn
     /// without colour handling at all.

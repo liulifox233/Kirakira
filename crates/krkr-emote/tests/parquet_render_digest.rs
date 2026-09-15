@@ -18,14 +18,28 @@
 //! reference always carried — the frame's `bm` blend mode and its four corner
 //! colours (`crates/krkr-emote/src/render.rs`, `SpriteBlend`). Honouring them
 //! changes exactly the five members whose assets author non-default state, and
-//! nothing else: `m2logo` (red vertex colours on a `bm 0` logo), both `sd101`
-//! copies (a `bm 0x13` haze sprite), `title_bg` (one `bm 0x11` additive sprite)
-//! and `yuzusourlogo` (white MODULATE2X corners on its gray circles). The
-//! frame and item counts are unchanged, and
+//! nothing else: `m2logo` (red vertex colours plus one additive `bm 0x01`
+//! sprite), both `sd101` copies (a `bm 0x13` haze sprite), `title_bg` (one
+//! `bm 0x11` additive sprite) and `yuzusourlogo` (white MODULATE2X corners on
+//! its gray circles). The frame and item counts are unchanged, and
 //! `tests/parquet_expressions.rs::the_blend_state_changes_only_the_motions_that_author_it`
 //! pins that set. Under the neutral state — every other motion — the new code
 //! path is bit-identical to the old one, which the crate's own unit tests
 //! assert directly.
+//!
+//! **What this pin cannot see: blend modes whose effect needs a destination.**
+//! The canvas starts transparent and nothing clears it, and against a
+//! transparent destination every binary/alpha mode degenerates to the source
+//! colour (`dst = 0` makes additive identical to source-over, and the
+//! subtractive/multiply/screen terms vanish). So the digest moves for four of
+//! the five members — `title_bg`'s `bm 0x11` sprite is *not* one of them,
+//! although it does move under the game's own opaque `neutralColor` clear
+//! (`AffineSourceMotion.tjs:3230-3231`), which is why
+//! `tests/parquet_expressions.rs` renders over that clear instead of over
+//! transparency. The digest is still worth pinning: it is the only test that
+//! rasterises all 1,734 real frames, so it catches anything — sampler,
+//! transform, decode, compositor — that moves a pixel where the destination
+//! does not matter, and it is the guard the blend change was measured against.
 //!
 //! The archive path comes from `KRKR_EMOTE_PARQUET_DIR` and defaults to
 //! `/Users/ruri/Downloads/PARQUET`; when the game is not installed the test

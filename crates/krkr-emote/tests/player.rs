@@ -110,20 +110,97 @@ fn a_live_player_blinks_on_its_own_clock() {
     assert_eq!(player.variables()["face"], 1.0);
 }
 
+/// The session's animation clock: `set_motion` puts the new animation back to
+/// its own time 0 (the reference switches motions with `play`, not with a
+/// property write — see the method's docs), while the player's own state, which
+/// the controls and timelines run on, is untouched by the switch.
+#[test]
+fn set_motion_restarts_the_animations_clock() {
+    let motion = Arc::new(Motion::from_bytes(&blinking_motion()).expect("fixture loads"));
+    let mut player = MotionPlayer::with_motion(&motion, "idle").expect("player");
+
+    for _ in 0..40 {
+        player.advance_ticks(1.0).expect("tick");
+    }
+    assert_eq!(
+        player.elapsed_ticks(),
+        40.0,
+        "the animation has run 40 ticks"
+    );
+    // The eye control runs on the player's clock, not the animation's.
+    let variables_before = player.variables();
+
+    player.set_motion("lit").expect("switch");
+    assert_eq!(player.motion(), "lit");
+    assert_eq!(
+        player.elapsed_ticks(),
+        0.0,
+        "the new animation starts at its own time 0"
+    );
+    assert_eq!(
+        player.variables(),
+        variables_before,
+        "the session's variables survive the switch"
+    );
+
+    // …and it advances from there, not from the session's accumulated 40.
+    player.advance_ticks(3.0).expect("tick");
+    assert_eq!(player.elapsed_ticks(), 3.0);
+
+    // The sample time really is that clock: the `lit` frame carries a mask,
+    // and the idling `idle` animation's parameterised layer is back at local
+    // time 0 rather than at 43 ticks of the old animation.
+    player.set_motion("idle").expect("switch back");
+    assert_eq!(player.elapsed_ticks(), 0.0);
+    assert_eq!(
+        player.draw_list()[0].icon,
+        "eye_open",
+        "the restarted animation samples from its first frame"
+    );
+}
+
 /// The draw list a player produces carries the per-sprite state the reference
 /// keeps (`bm`, `bp`, the four corner colours) — the boundary the old adapter
 /// dropped on the floor.
+///
+/// The fixture's `lit` animation *authors* all three (mask-gated the way a
+/// game's frames are), so this fails if `from_sprite` stops reading them: the
+/// item would carry the defaults (`0x10`, `0.0`, the neutral gray) instead of
+/// the authored values, on both the static sampler's and the session's path.
 #[test]
-fn the_draw_list_carries_blend_and_corner_state() {
+fn the_draw_list_carries_the_authored_blend_and_corner_state() {
+    use support::player_fixture::{LIT_BLEND_MODE, LIT_BLEND_PARAMETER, LIT_CORNER_COLORS};
+
     let motion = Arc::new(Motion::from_bytes(&blinking_motion()).expect("fixture loads"));
-    let player = MotionPlayer::new(&motion).expect("the default animation opens");
-    assert_eq!(player.motion(), "idle");
-    let item = &player.draw_list()[0];
-    assert_eq!(item.blend_mode, 0x10, "an unauthored `bm` is the default");
-    assert_eq!(
-        item.corner_colors, [0x8080_80FF; 4],
-        "an unauthored colour is the neutral MODULATE2X gray"
-    );
-    assert_eq!(item.blend_parameter, 0.0);
-    assert_eq!(SpriteBlend::of(item.blend_mode), SpriteBlend::Over);
+    let authored = |item: &krkr_emote::MotionDrawItem| {
+        assert_eq!(
+            item.blend_mode, LIT_BLEND_MODE as u32,
+            "the frame's `bm` must survive the draw-list boundary"
+        );
+        assert_eq!(
+            item.blend_parameter, LIT_BLEND_PARAMETER as f32,
+            "the frame's `bp` must survive the draw-list boundary"
+        );
+        assert_eq!(
+            item.corner_colors,
+            LIT_CORNER_COLORS.map(|value| value as u32),
+            "the frame's four corner colours must survive, corner by corner"
+        );
+        assert_eq!(
+            SpriteBlend::of(item.blend_mode),
+            SpriteBlend::Mul,
+            "…and the renderer's table must read them"
+        );
+    };
+
+    // The static sampler crosses the same boundary.
+    let static_items = motion.draw_list("lit", 0.0).expect("lit samples");
+    assert_eq!(static_items.len(), 1);
+    authored(&static_items[0]);
+
+    // …and so does the live session's frame.
+    let player = MotionPlayer::with_motion(&motion, "lit").expect("player");
+    let items = player.draw_list();
+    assert_eq!(items.len(), 1);
+    authored(&items[0]);
 }
