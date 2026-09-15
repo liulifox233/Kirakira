@@ -30,9 +30,10 @@
 //!   a layer image, and the logo lives in that motion.
 //! * **The state machine** — `play`/`stop`/`progress`/`frameProgress`/`skip`/
 //!   `skipToSync`, `speed`, `tickCount`, `playing`, `loopTime`/`lastTime`, and
-//!   `setVariable(name, value[, time, easing])` with linear/smoothstep timed
-//!   writes are driven by the adapter's own model; a motion that does not loop
-//!   stops at its duration and clears `playing`.
+//!   `setVariable(name, value[, time, easing])` and `setColor(argb[, time,
+//!   easing])` with linear/smoothstep timed writes are driven by the adapter's
+//!   own model; a motion that does not loop stops at its duration and clears
+//!   `playing`.
 //! * **The time model (settled against the DLL)** — the plain time members are
 //!   milliseconds-facing and the `frame*` family is raw 1/60 s ticks, exactly
 //!   like the reference: `progress`'s handler converts with `×60/1000`
@@ -42,7 +43,11 @@
 //!   `FUN_10045ea0`/`FUN_10045ec0` while `frameTickCount`/`frameLastTime`/
 //!   `frameLoopTime` stay raw. The game's own chain is milliseconds end to end
 //!   (`EventIntf.cpp:951,991-997` `TVPGetTickCount` → `addContinuousHandler` →
-//!   `MainWindow` → `AffineLayer` → `_player.progress(_interval)`).
+//!   `MainWindow` → `AffineLayer` → `_player.progress(_interval)`), and the two
+//!   *timed writes* (`setVariable`, `setColor`) are tick-facing: the game
+//!   converts its milliseconds with `×60/1000` for `setVariable` itself, and
+//!   `setColor`'s `time` is on the same raw tick axis inside the DLL's colour
+//!   queue (see [`player_set_colour`] for the handler chain).
 //! * **The variables** — `setVariable`/`getVariable`/`contains` and the
 //!   `variableKeys` listing the game's `_getOptions` iterates are real: the
 //!   reference's `variableKeys` (handler `FUN_10015690`) collects the player's
@@ -229,6 +234,26 @@ struct VariableTween {
     easing: f64,
 }
 
+/// One colour write that eases over time (`setColor(argb, time, easing)` with
+/// a positive `time`).
+///
+/// The reference keeps these on the character part's colour queue:
+/// `FUN_100bf850` clears the queue and enqueues, `FUN_100bfa10` dequeues and
+/// ramps the four corner colours, so at most one fade is ever in flight and a
+/// second write replaces the first — the port models that as one slot.
+///
+/// `elapsed_ticks` is the fade's own clock: the reference advances it by the
+/// tick delta of *every* update call (`FUN_100541d0` → `FUN_100bfa10`), the
+/// same calls that move the motion itself, so the fade keeps running when a
+/// one-shot motion has ended and its timeline clock stopped.
+struct ColourTween {
+    from: u32,
+    to: u32,
+    elapsed_ticks: f64,
+    duration_ticks: f64,
+    easing: f64,
+}
+
 /// Everything a `Motion.Player` / `Motion.EmotePlayer` instance carries.
 #[derive(Default)]
 struct PlayerState {
@@ -252,6 +277,8 @@ struct PlayerState {
     loop_time: Option<f64>,
     variables: BTreeMap<String, f32>,
     tweens: Vec<VariableTween>,
+    /// The `setColor` fade in flight, if any (see [`ColourTween`]).
+    colour_tween: Option<ColourTween>,
     coord: [f64; 2],
     /// The `coordinate` member: the draw layer's z hint (used by the
     /// separate-layer path, kept for scripts here).
@@ -2286,6 +2313,11 @@ fn advance_player(state: &mut PlayerState, ticks: f64) -> bool {
     let duration = player_duration_ticks(state).filter(|duration| *duration > 0.0);
     let loop_time = player_loop_ticks(state);
 
+    // The colour fade is on this clock but not clamped by the motion's own
+    // timeline: the reference advances its colour queue by the tick delta of
+    // every update, whatever the animation is doing.
+    apply_colour_tween(state, ticks);
+
     if !state.playing || ticks == 0.0 {
         apply_variable_tweens(state);
         return false;
@@ -2342,6 +2374,46 @@ fn apply_variable_tweens(state: &mut PlayerState) {
     for index in finished.into_iter().rev() {
         state.tweens.remove(index);
     }
+}
+
+/// Advances the `setColor` fade by `ticks` and writes the colour it lands on.
+///
+/// This runs on every update call the player receives, next to the motion's
+/// own clock — the reference's colour queue is advanced by the same tick delta
+/// the timeline gets (`FUN_100541d0` → `FUN_100bfa10`), so a fade keeps running
+/// over a one-shot motion's held last frame and over a paused one, and a
+/// reloaded motion does not stop it either: the queue lives on the player, not
+/// on the motion. Tearing the plugin down drops the player and the fade with
+/// it.
+fn apply_colour_tween(state: &mut PlayerState, ticks: f64) {
+    let Some(tween) = state.colour_tween.take() else {
+        return;
+    };
+    let elapsed = tween.elapsed_ticks + ticks.max(0.0);
+    let t = (elapsed / tween.duration_ticks).clamp(0.0, 1.0);
+    let colour = lerp_colour(tween.from, tween.to, ease(t, tween.easing));
+    if t < 1.0 {
+        state.colour_tween = Some(ColourTween {
+            elapsed_ticks: elapsed,
+            ..tween
+        });
+    }
+    state.colour = colour;
+    state.colour_weight = colour;
+}
+
+/// Channel-wise ARGB interpolation — `f64` rounding per channel, because the
+/// reference ramps its four corner colours as floats
+/// (`FUN_100bfa10`: `from + (to - from) * eased`).
+fn lerp_colour(from: u32, to: u32, eased: f64) -> u32 {
+    let mut colour = 0u32;
+    for shift in [24, 16, 8, 0] {
+        let start = f64::from((from >> shift) & 0xff);
+        let end = f64::from((to >> shift) & 0xff);
+        let channel = (start + (end - start) * eased).round().clamp(0.0, 255.0) as u32;
+        colour |= channel << shift;
+    }
+    colour
 }
 
 /// eluna's frame easing (`vendor/eluna/crates/eluna/src/emote.rs:1348-1356`):
@@ -2573,6 +2645,14 @@ fn compose(outer: [f64; 6], inner: [f64; 6]) -> [f64; 6] {
 }
 
 impl PlayerState {
+    /// Sets the colour filter outright and drops any fade in flight — the
+    /// untimed `setColor`, and the timed form whose time is not positive.
+    fn set_colour(&mut self, colour: u32) {
+        self.colour = colour;
+        self.colour_weight = colour;
+        self.colour_tween = None;
+    }
+
     /// The colour filter `draw` applies: `setColor`'s ARGB (or `colorWeight`)
     /// with the player's `opacity` folded into its alpha.
     fn drawn_tint(&self) -> Tint {
@@ -2618,7 +2698,39 @@ fn player_clear(
 
 /// `setColor(argb[, time, easing])`: the character colour filter. The game
 /// passes `0xFF808080` for "none" and `0xFF000000 | colour` for a filter, and
-/// the two extra arguments of the timed form (milliseconds and easing).
+/// the two extra arguments of the timed form: **`time` is in raw 1/60 s ticks
+/// and `easing` is the shared curve parameter**.
+///
+/// # The unit, pinned
+///
+/// `motionplayer_nod3d.dll`'s `setColor` is the raw callback `FUN_100524a0`
+/// (accepts 1..3 arguments — the game's `setColor(argb)` and
+/// `setColor(argb, time, easing)` shapes): it reads the colour with
+/// `tTJSVariant::operator tjs_int`, the time as a real, and the easing through
+/// `FUN_10052bd0`, then hands them to `FUN_100525a0`, which builds the
+/// `{B,G,R,A}` corner-colour floats and calls `FUN_100bf850(part, time,
+/// easing, visible)`. That function enqueues a fade entry carrying the time
+/// verbatim when the time is positive and sets the colour immediately when it
+/// is not, and `FUN_100bfa10` ramps it as `speed = 1.0 / time; progress +=
+/// speed * delta` — with `delta` the **tick** delta of the update call: the
+/// two callers of the update are `FUN_100541a0`, which converts its
+/// milliseconds with `×60/1000` before calling, and `FUN_100541d0`, which
+/// takes raw ticks (`progress` and `frameProgress`). No `×60/1000` anywhere in
+/// the colour family, so `time` is on the raw tick axis, exactly like
+/// `setVariable`'s and unlike `progress`'s millisecond argument.
+///
+/// PARQUET does not convert: `AffineSourceMotion._setOptions` passes
+/// `+options.time` straight through as `_player.setColor(0xFF000000 | colour,
+/// time, easing)` (all 26 timed call sites in the shipped
+/// `system/AffineSourceMotion.tjs`), so the reference fades those over `time`
+/// 1/60 s ticks, and so does this port. eluna's SDK wrapper agrees on the
+/// axis: it converts its own milliseconds to emote ticks before calling
+/// `set_color_rgba(rgba, frame_count, easing)`.
+///
+/// A zero, negative or non-finite `time` snaps (the reference's `time <= 0`
+/// arm), replacing any fade in flight; a positive one starts a fade from the
+/// colour the player has right now, which is also what a second `setColor`
+/// during a fade does (the reference clears its queue first).
 fn player_set_colour(
     _runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -2629,9 +2741,28 @@ fn player_set_colour(
         .map(Variant::to_integer)
         .transpose()?
         .unwrap_or(0) as u32;
+    let time = args
+        .get(1)
+        .map(Variant::to_real)
+        .transpose()?
+        .unwrap_or(0.0);
+    let easing = args
+        .get(2)
+        .map(Variant::to_real)
+        .transpose()?
+        .unwrap_or(0.0);
     with_player_mut(this_obj, |state| {
-        state.colour = colour;
-        state.colour_weight = colour;
+        if time <= 0.0 || !time.is_finite() {
+            state.set_colour(colour);
+            return;
+        }
+        state.colour_tween = Some(ColourTween {
+            from: state.colour,
+            to: colour,
+            elapsed_ticks: 0.0,
+            duration_ticks: time,
+            easing,
+        });
     });
     Ok(Variant::Void)
 }
@@ -3933,6 +4064,208 @@ mod tests {
             .execute_script("finish.tjs", "player.progress(250);")
             .expect("finish");
         assert_eq!(real(&mut engine, "player.getVariable(\"x\")"), 1.0);
+    }
+
+    /// The 32/32 helper the `setColor` tests use: one player with a 60-tick
+    /// one-shot motion loaded and the work layer cleared.
+    fn colour_engine() -> KrkrEngine {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [8, 8], 255),
+                -1,
+            ),
+        )]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+    }
+
+    /// `setColor(argb, time, easing)` eases the colour filter over `time`
+    /// **1/60 s ticks** — the unit the DLL's colour queue is on
+    /// (`player_set_colour` carries the handler chain) — so `progress`'s
+    /// milliseconds are converted first. The game's own call shape
+    /// (`AffineSourceMotion._setOptions`) is the 3-argument one used here.
+    #[test]
+    fn set_color_fades_on_the_tick_axis() {
+        let mut engine = colour_engine();
+        engine
+            .execute_script(
+                "fade.tjs",
+                "player.play(\"idle\", 0); player.setColor(0xFF808080); \
+                 player.setColor(0x00000000, 60, 0);",
+            )
+            .expect("timed setColor");
+
+        // 500 ms is 30 of the fade's 60 ticks: halfway between the neutral
+        // filter and black on every channel (0xFF808080 + 0.5 × (0 - it)).
+        // Reading the argument as milliseconds would leave the colour at ~3%
+        // of the way, and ignoring it would leave it at the endpoint.
+        engine
+            .execute_script("half.tjs", "player.progress(500);")
+            .expect("progress");
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0x8040_4040,
+            "halfway through a 60-tick fade after 500 ms (30 ticks)"
+        );
+
+        engine
+            .execute_script("finish.tjs", "player.progress(500);")
+            .expect("progress");
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0x0000_0000,
+            "the fade lands exactly on its target"
+        );
+        // Finished: nothing keeps moving afterwards.
+        engine
+            .execute_script("settled.tjs", "player.progress(500);")
+            .expect("progress");
+        assert_eq!(real(&mut engine, "player.colorWeight") as u32, 0x0000_0000);
+    }
+
+    /// The `setColor` boundaries: a zero, negative or non-finite `time` snaps
+    /// and drops a fade in flight; a second timed write replaces the first and
+    /// starts from the colour on screen; `easing` is the shared `ease` curve
+    /// for any value, so an unexpected one cannot corrupt the colour.
+    #[test]
+    fn set_color_boundaries_snap_and_interrupt() {
+        let mut engine = colour_engine();
+        engine
+            .execute_script("play.tjs", "player.play(\"idle\", 0);")
+            .expect("play");
+
+        // time = 0: the colour lands at once and no fade follows it.
+        engine
+            .execute_script(
+                "zero.tjs",
+                "player.setColor(0xFF808080); player.setColor(0x00000000, 0, 0); \
+                 player.progress(500);",
+            )
+            .expect("zero time");
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0x0000_0000,
+            "a zero time sets the colour outright"
+        );
+
+        // A negative time drops the fade that was in flight rather than
+        // leaving it to overwrite the snapped colour afterwards.
+        engine
+            .execute_script(
+                "negative.tjs",
+                "player.setColor(0x00000000, 60, 0); \
+                 player.setColor(0xFF808080, -1, 0); player.progress(500);",
+            )
+            .expect("negative time");
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0xFF80_8080,
+            "a negative time snaps and cancels the earlier fade"
+        );
+
+        // A non-finite time takes the same arm: the fade in flight is dropped
+        // rather than left to run for an unbounded number of ticks.
+        engine
+            .execute_script(
+                "infinite.tjs",
+                "player.setColor(0xFF808080); player.setColor(0x00000000, 60, 0); \
+                 player.setColor(0xFFFFFFFF, 1e400, 0); player.progress(500);",
+            )
+            .expect("non-finite time");
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0xFFFF_FFFF,
+            "a non-finite time snaps and cancels the earlier fade"
+        );
+
+        // Interrupting a fade: the new one starts from what is on screen
+        // (0x80404040 at the halfway point above), not from the old `from`.
+        engine
+            .execute_script(
+                "interrupt.tjs",
+                "player.setColor(0xFF808080); player.setColor(0x00000000, 60, 0); \
+                 player.progress(500); player.setColor(0xFFFFFFFF, 60, 0); \
+                 player.progress(500);",
+            )
+            .expect("interrupt");
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0xC0A0_A0A0,
+            "halfway from 0x80404040 to white on every channel"
+        );
+
+        // The easing curve is `ease`: 0 linear, positive smoothstep, negative
+        // its inverse. 42 and -1 are both outside the game's 0/-1/1 set and
+        // still land on the same two curves.
+        for (easing, eased) in [(42.0_f64, 0.15625_f64), (-1.0, 0.4375)] {
+            engine
+                .execute_script(
+                    "easing.tjs",
+                    &format!(
+                        "player.setColor(0xFF808080); \
+                         player.setColor(0x00000000, 60, {easing}); \
+                         player.progress(250);"
+                    ),
+                )
+                .expect("easing");
+            // 0xFF808080 → 0x00000000 at `eased`, rounded per channel.
+            let alpha = (255.0 * (1.0 - eased)).round() as u32;
+            let rgb = (128.0 * (1.0 - eased)).round() as u32;
+            let expected = (alpha << 24) | (rgb << 16) | (rgb << 8) | rgb;
+            assert_eq!(
+                real(&mut engine, "player.colorWeight") as u32,
+                expected,
+                "easing {easing} uses the shared curve"
+            );
+        }
+    }
+
+    /// A fade runs on its own clock, not the motion's: a one-shot motion that
+    /// has ended (holding its last frame, `playing` cleared) does not freeze
+    /// it, and `play`ing the motion again does not restart it — the reference
+    /// keeps the colour queue on the player, not on the timeline.
+    #[test]
+    fn a_fade_outlives_the_motion_it_started_on() {
+        let mut engine = colour_engine();
+        engine
+            .execute_script(
+                "start.tjs",
+                "player.play(\"idle\", 0); player.setColor(0xFF808080); \
+                 player.setColor(0x00000000, 120, 0);",
+            )
+            .expect("start");
+
+        // 1000 ms = 60 ticks: past the 60-tick motion's end, halfway through
+        // the 120-tick fade.
+        engine
+            .execute_script("past_the_end.tjs", "player.progress(1000);")
+            .expect("progress");
+        assert_eq!(
+            integer(&mut engine, "player.playing"),
+            0,
+            "the one-shot motion has ended"
+        );
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0x8040_4040,
+            "the fade kept advancing after the motion stopped"
+        );
+
+        // Replaying the motion resets its own clock and must not reset the
+        // fade: the remaining 60 ticks still complete it.
+        engine
+            .execute_script(
+                "replay.tjs",
+                "player.play(\"idle\", 0); player.progress(1000);",
+            )
+            .expect("replay");
+        assert_eq!(
+            real(&mut engine, "player.colorWeight") as u32,
+            0x0000_0000,
+            "a replay does not restart or drop an in-flight fade"
+        );
     }
 
     /// `variableKeys` answers the TJS array `AffineSourceMotion._getOptions`
