@@ -88,11 +88,36 @@
 //! provider's two type words (`*type = [0xc]`, `*updatetype = [0x10]`), tests
 //! the equal-size flag at `+0x14`, and calls the class factory:
 //!
-//! | name | factory | handler ctor | `*type` | `*updatetype` | equal sizes |
+//! | name | factory | handler ctor → vtable | `*type` | `*updatetype` | equal sizes |
 //! |---|---|---|---|---|---|
-//! | `glitch` | `0x10002e90` | `0x10002740` `tTVPTransGlitch` | 1 `ttExchange` | 0 `tutDivisibleFade` | required |
-//! | `fadeglitch` | `0x10002ca0` | `0x10002340` `tTVPTransFadeGlitch` | 0 `ttSimple` | 0 `tutDivisibleFade` | not required |
-//! | `loopglitch` | `0x10002df0` | `0x10002670` `tTVPTransLoopGlitch` | 0 `ttSimple` | 0 | not required |
+//! | `glitch` | `0x10002e90` | `0x10002740` → `0x10016294` `tTVPTransGlitch` | 1 `ttExchange` | 0 `tutDivisibleFade` | required |
+//! | `fadeglitch` | `0x10002ca0` | `0x10002340` → `0x10016310` `tTVPTransFadeGlitch` | 0 `ttSimple` | 0 `tutDivisibleFade` | not required |
+//! | `loopglitch` | `0x10002df0` | `0x10002670` → `0x10016380` `tTVPTransLoopGlitch` | 0 `ttSimple` | 0 | not required |
+//!
+//! That class ↔ vtable ↔ hook table is not a guess: three independent reads of
+//! the image agree, and each one is reproducible with `objdump` on the shipped
+//! DLL (no Ghidra needed):
+//!
+//! 1. the constructors' immediates — `objdump -d --start-address=0x10002740
+//!    --stop-address=0x100027f8` ends with `mov DWORD PTR [esi],0x10016294`
+//!    (and `0x10002340` → `0x10016310`, `0x10002670` → `0x10016380`), which
+//!    pins each handler class to its vtable;
+//! 2. the vtable slots — `objdump -s -j .rdata --start-address=0x10016294
+//!    --stop-address=0x100162bc` dumps ten dwords whose **slot 9** is the
+//!    compose hook (`0x10004e10`, the shared `Process`, ends in
+//!    `call [*param_1 + 0x24]`, i.e. `0x24 / 4 = 9`): `0x10016294` → `0x10004da0`,
+//!    `0x10016310` → `0x100047a0`, `0x10016380` → `0x10004d70`;
+//! 3. the strings laid out immediately after each vtable — a UTF-16 pool the
+//!    class's own readers use: `glitch/time/gamma_in/gamma_out/block` after
+//!    `0x10016294`, `fadeglitch/nofade/fadein/color` after `0x10016310`,
+//!    `coef/break/loopglitch` after `0x10016380`.
+//!
+//! Read together they say: `glitch` is the row-masked two-face compose that
+//! reads `gamma_in`/`gamma_out`, and `loopglitch` is the single-face compose
+//! whose constant scale is `coef`.  (The first port of this module had those
+//! two the other way round — it inferred the mapping from field offsets and
+//! the lazy `coef` read instead of from these three tables.  The tests below
+//! pin the consequences of the correct mapping.)
 //!
 //! The options each factory reads, in its own order (`FUN_10001cd0` = an
 //! integer with a caller default, `FUN_10001dd0` = a real, `FUN_10001ee0` = a
@@ -119,41 +144,50 @@
 //! tables**; `Process` (`0x10004e10`, shared) resolves the three scanline
 //! providers and calls the class's compose hook. The compose hooks:
 //!
-//! * `glitch` (`0x10004d70`): `FUN_100048f0` over **`Src1`** — the
-//!   destination's own bitmap — at the constant scale `[this+0xc0]`, which
-//!   the constructor initialised to `gamma_out`.
+//! * `glitch` (`0x10004da0`, `tTVPTransGlitch`'s slot 9): `FUN_10004830`
+//!   walks the rows and picks a face per row from the mask the class's own
+//!   per-pass hook (`0x10005730`) filled (`0x10005ef0`, one bit per row with
+//!   probability `ratio`): a masked row takes **`Src1`** at
+//!   `pow(ratio, [this+0xb8])` and an unmasked one **`Src2`** at
+//!   `pow(1 - ratio, [this+0xc0])`, where the constructor `0x10002740` stored
+//!   the factory's `gamma_in` and `gamma_out` — the one name in this family
+//!   that mixes the two faces.
 //! * `fadeglitch` (`0x100047a0`): `x = ratio` (or `1 - ratio` under
 //!   `fadein`), the walk runs over `Src1` (or `Src2` under `fadein`) at
 //!   `pow(x, gamma)`, and when `color != 0x808080` a colour wash
 //!   ([`colour_wash`]) runs over the composed bitmap with the value
 //!   `FUN_10003710` derives from `x²`.
-//! * `loopglitch` (`0x10004da0`): `FUN_10004830` picks a face per row from a
-//!   per-pass mask (`0x10005ef0`, one bit per row with probability `ratio`):
-//!   masked rows take `Src1` at `pow(ratio, [this+0xb8])` (the constructor's
-//!   `+0xb8` is 0, so 1.0), the others `Src2` at `pow(1 - ratio,
-//!   [this+0xc0])` (the constructor's `+0xc0` is 1.0, so `1 - ratio`).
+//! * `loopglitch` (`0x10004d70`): `FUN_100048f0` over **`Src1`** — the
+//!   destination's own bitmap — at the constant scale `[this+0xc0]`
+//!   (1.0 from the constructor, `coef` when the option provider is present;
+//!   see below).
 //!
 //! `ttExchange` is what swaps the two layers at the stop
 //! (`LayerIntf.cpp:6371`); `tutDivisibleFade` is what makes the reference
 //! re-read the live bitmaps instead of the frozen `Src1Bmp`/`Src2Bmp`
 //! (`LayerIntf.cpp:6581`, `:6601`) — see the deviations below.
 //!
-//! ## Options that are parse-only in the shipped DLL
+//! ## The one option with no effect, and one with a reachability caveat
 //!
-//! * **`break`**: read by `0x100055d0` — `glitch`'s per-pass hook — into the
-//!   byte at `+0xc8`, from the option provider pointer the hook finds at
-//!   `+0xb8`.  That pointer is never set: `SetOption` (`0x10005520`, the
-//!   class's override) is the only writer and the reference core never calls
-//!   `iTVPBaseTransHandler::SetOption` (`krkrz`'s `visual/LayerIntf.cpp` has
-//!   no call site), so `+0xb8` still holds the constructor's `gamma_in`
-//!   double and the hook's `*(int*)(this + 0xb8) != 0` test reads its low
-//!   dword — zero for every ordinary value, which skips the reads.  Nothing
-//!   anywhere reads `+0xc8` afterwards.  The port does not implement `break`:
-//!   there is no effect to reproduce.
-//! * **`coef`**: the same dead read; `glitch`'s scale stays `gamma_out`.
-//! * **`gamma_in`** in `glitch`: read by the factory (so a non-numeric value
-//!   fails the call, which the port keeps) and stored at the slot the dead
-//!   lazy read reinterprets; never read as a number.
+//! * **`break`** (`loopglitch` only): `0x100055d0` stores its truthiness at
+//!   `+0xc8`, and nothing in `tTVPTransLoopGlitch` reads `+0xc8` afterwards —
+//!   its compose hook `0x10004d70` touches only `+0xc0`, and the destructor
+//!   tears the tables down.  The port does not implement it: there is no
+//!   effect to reproduce.
+//! * **`coef`** (`loopglitch`'s scale) and the same hook's `break` read are
+//!   gated on the option provider pointer at `+0xb8`, which only
+//!   `tTVPTransLoopGlitch`'s `SetOption` override (`0x10005520`) writes.
+//!   **In the reference sources available on this host no caller of
+//!   `iTVPBaseTransHandler::SetOption` exists** — `grep -rn SetOption` over
+//!   `krkrz/visual` and `krkr2`'s core finds only the declaration and
+//!   `TransIntf.cpp`'s definition, and Kirikiroid2's only hits are
+//!   `FreeTypeFontRasterizer` — so *if* that is true for the shipping build,
+//!   `coef` never reaches `+0xc0` and the scale stays 1.0.  That is an
+//!   unproven assertion about builds we cannot inspect (the extrans samples
+//!   do implement `SetOption` as a no-op, which hints some build calls it),
+//!   so the port reads `coef` from the options it is handed — our channel's
+//!   options snapshot *is* the option provider — and the option is live
+//!   here with the DLL's own default when absent.
 //!
 //! ## Deviations from the reference
 //!
@@ -181,6 +215,32 @@
 //!   leaves the clock to the engine: a `loopglitch` call without a `time`
 //!   option completes immediately (the registry's no-clock rule), and one
 //!   with a `time` runs for that clock.
+//!
+//! ## Live check
+//!
+//! The unit tests drive `Layer.beginTransition` through the engine, so they
+//! cover the registry, the factories and the compose passes — but not the
+//! game's own scene.  A run that does, end to end, on a scratch root whose
+//! `savedata/` is a real copied directory (`cp -a`, never a symlink into the
+//! game tree):
+//!
+//! 1. build this worktree's `krkr-debug` (`cargo build -p krkr-debug`);
+//! 2. symlink the game's `*.xp3` and `patch.tjs` into a scratch root, copy
+//!    `savedata/` with `cp -a`, make an empty `plugin/` directory;
+//! 3. drive it over a FIFO: `advance N`, `click x y`, `trace add
+//!    beginTransition`, `draw`, `state`;
+//! 4. read the log back: the game's load-screen open logs `native call
+//!    Layer.beginTransition … args=["glitch", 1, …]`, and because a registered
+//!    provider composes CPU-side the frames of that transition report
+//!    `transitions=0` instead of the projection's `method=crossfade`
+//!    (`frame_transitions` never carries a provider transition).  A
+//!    reviewer's run of the branch that fixed this recorded the game's call at
+//!    frame 1709 and twelve consecutive frames (1709–1745, the transition's
+//!    own span) all `transitions=0`.
+//!
+//! The KAG `[trans]`/`endtrans` page projection is a *different* path: it has
+//! no destination/source layer pair and still answers a provider's name with
+//! its crossfade composite until the engine-side routing lands.
 //!
 //! # Recovered parameters
 //!
@@ -277,7 +337,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "Layer.doGlitch / Layer.glitchCopy pixel glitch, and the glitch / fadeglitch / loopglitch transition providers",
-    notes: "All three surfaces are real. The two Layer members run the recovered splitmix64-seeded block/row/colour displacement — a Marsaglia-polar normal step per entry, accumulated into a running walk that `per_reset` zeroes (defaults noise 4, sft_x 16, sft_y 8, sft_col 8, per_x 0.5, per_y 0.25, per_col 0.05, per_reset 0.02, size 16, coef 1) — over the scoped layer bitmap views and repaint; `doGlitch` takes its two object arguments as the reference invoker type-checks them. The three transition providers register from `register` (the DLL's `V2Link`) and unregister from `unregister` (`V2Unlink`) through plugin_api::transition: `glitch` distorts Src1 with gamma_out as the scale and requires equal sizes, `fadeglitch` distorts Src1 (or Src2 under `fadein`) at pow(ratio, gamma) with the `color` wash, `loopglitch` splits rows between the two faces by a per-pass random mask; all three rebuild their tables every pass from the tick, as the DLL's StartProcess hooks do. `break` is parsed by the shipped DLL and never read (the only reader is its own dead lazy `coef` path), and gamma_in reaches nothing in `glitch`: both are documented, not implemented.",
+    notes: "All three surfaces are real. The two Layer members run the recovered splitmix64-seeded block/row/colour displacement — a Marsaglia-polar normal step per entry, accumulated into a running walk that `per_reset` zeroes (defaults noise 4, sft_x 16, sft_y 8, sft_col 8, per_x 0.5, per_y 0.25, per_col 0.05, per_reset 0.02, size 16, coef 1) — over the scoped layer bitmap views and repaint; `doGlitch` takes its two object arguments as the reference invoker type-checks them. The three transition providers register from `register` (the DLL's `V2Link`) and unregister from `unregister` (`V2Unlink`) through plugin_api::transition, each mapped to its DLL class by the constructor immediates, the vtable slot-9 compose addresses and the option-name pool next to each vtable: `glitch` is the row-masked two-face mix (masked rows Src1 at pow(ratio, gamma_in), the others Src2 at pow(1 - ratio, gamma_out)) and requires equal sizes, `fadeglitch` distorts Src1 (or Src2 under `fadein`) at pow(ratio, gamma) with the `color` wash, `loopglitch` distorts Src1 alone at the constant `coef`; all three rebuild their tables every pass from the tick, as the DLL's StartProcess hooks do. `break` is stored by the DLL and never read; `coef` is loopglitch's scale (reachable here, gated on a SetOption call in the DLL — documented).",
     install: |engine| engine.register_plugin(GlitchEffectPlugin),
 };
 
@@ -918,11 +978,23 @@ struct TransitionSettings {
     /// `block` (`0x10` default, `<= 0` falls back to `0x10`): the square the
     /// walk copies one run at a time.
     block: i64,
-    /// `glitch`: `gamma_out` (`1.0` default).  `fadeglitch`: `gamma_in` when
-    /// `fadein` is set, `gamma_out` otherwise — the factory picks the name
-    /// (`0x10002ca0`: `pwVar4 = L"gamma_in"; if (iVar3 == 0) pwVar4 =
-    /// L"gamma_out";`).  `loopglitch`: unused.
+    /// `fadeglitch` only: the exponent `fadein` selects — `gamma_in` when it
+    /// is set, `gamma_out` otherwise (`0x10002ca0`: `pwVar4 = L"gamma_in"; if
+    /// (iVar3 == 0) pwVar4 = L"gamma_out";`).
     gamma: f64,
+    /// `glitch` only.  Its constructor stores the factory's `gamma_in` at
+    /// `+0xb8` and `gamma_out` at `+0xc0` (`0x10002740`), and the compose hook
+    /// `0x10004da0` raises `ratio` to `+0xb8` and `1 - ratio` to `+0xc0` —
+    /// these are the two live exponents of the row-masked compose, not the
+    /// dead lazy read the first port took them for.
+    gamma_in: f64,
+    gamma_out: f64,
+    /// `loopglitch` only.  `0x10004d70` composes its single face at the
+    /// constant `[this+0xc0]`, which `0x10002670` initialises to 1.0 and
+    /// `0x100055d0` overwrites with the `coef` option when the option
+    /// provider its `SetOption` override (`0x10005520`) stored at `+0xb8` is
+    /// present.
+    coef: f64,
     /// `fadeglitch`'s `fadein` (`0` default): non-zero swaps the distorted
     /// face to `Src2` and the clock to `1 - ratio`.
     fadein: bool,
@@ -986,6 +1058,9 @@ impl TransitionSettings {
             time_ms: None,
             block,
             gamma: DEFAULT_COEF,
+            gamma_in: DEFAULT_COEF,
+            gamma_out: DEFAULT_COEF,
+            coef: DEFAULT_COEF,
             fadein: false,
             colour: 0x808080,
             noise: transition_real(options, "noise", DEFAULT_NOISE)?,
@@ -1008,16 +1083,15 @@ impl TransitionSettings {
                         "glitch: option `time` is required",
                     ));
                 }
-                // `gamma_in` is read (`0x10002e90`) into the slot the DLL's
-                // only lazy reader (`0x100055d0`) then reinterprets as the
-                // option provider pointer; that reader tests the low dword of
-                // the stored double and skips for every ordinary value, so the
-                // number itself reaches nothing.  Read, for the reference's
-                // own conversion-failure behaviour, then dropped.
-                let _gamma_in = transition_real(options, "gamma_in", DEFAULT_COEF)?;
+                // Both gammas are live exponents of the compose: the factory
+                // `0x10002e90` reads them into `0x10002740`'s `+0xb8` and
+                // `+0xc0`, and `0x10004da0` raises `ratio` to the first and
+                // `1 - ratio` to the second (the class's own option-name pool
+                // next to its vtable is `glitch/time/gamma_in/gamma_out/block`).
                 Ok(Self {
                     time_ms: Some(time.max(2)),
-                    gamma: transition_real(options, "gamma_out", DEFAULT_COEF)?,
+                    gamma_in: transition_real(options, "gamma_in", DEFAULT_COEF)?,
+                    gamma_out: transition_real(options, "gamma_out", DEFAULT_COEF)?,
                     ..settings
                 })
             }
@@ -1053,8 +1127,18 @@ impl TransitionSettings {
             }
             // The factory (`0x10002df0`) reads `block` and nothing else: no
             // `time`, no gammas, no colour.  Its handler keeps the
-            // constructor's `time = -1`.
-            GlitchTransitionKind::LoopGlitch => Ok(settings),
+            // constructor's `time = -1`, and its compose scale is `coef`
+            // (`+0xc0`; the class's own option pool is `coef/break/loopglitch`).
+            //
+            // `break` is the one member of that pool this port does not read:
+            // `0x100055d0` stores its truthiness at `+0xc8` and nothing in the
+            // class reads `+0xc8` afterwards (`0x10004d70` composes and the
+            // destructor only tears the tables down), so the option has no
+            // effect to reproduce.
+            GlitchTransitionKind::LoopGlitch => Ok(Self {
+                coef: transition_real(options, "coef", DEFAULT_COEF)?,
+                ..settings
+            }),
         }
     }
 }
@@ -1094,9 +1178,9 @@ struct GlitchTransitionHandler {
     settings: TransitionSettings,
     width: u32,
     height: u32,
-    /// `loopglitch`'s row mask (`+0x80`, filled by `0x10005ef0`), one bit per
-    /// row, low bit first; rebuilt every pass.
-    loop_mask: Vec<u64>,
+    /// `glitch`'s row mask (`+0x80` of `tTVPTransGlitch`, filled by
+    /// `0x10005ef0`), one bit per row, low bit first; rebuilt every pass.
+    row_mask: Vec<u64>,
 }
 
 impl GlitchTransitionHandler {
@@ -1105,7 +1189,7 @@ impl GlitchTransitionHandler {
             settings,
             width,
             height,
-            loop_mask: Vec::new(),
+            row_mask: Vec::new(),
         }
     }
 
@@ -1136,21 +1220,21 @@ impl GlitchTransitionHandler {
     /// port draws one uniform per row from the same splitmix64 the tables
     /// use, which is the same distribution and the module's own generator
     /// (the bit stream is not the DLL's anywhere — see the module docs).
-    fn fill_loop_mask(&mut self, ratio: f64, seed: u64) {
+    fn fill_row_mask(&mut self, ratio: f64, seed: u64) {
         let rows = self.height as usize;
-        self.loop_mask.clear();
-        self.loop_mask.resize(rows.div_ceil(64), 0);
+        self.row_mask.clear();
+        self.row_mask.resize(rows.div_ceil(64), 0);
         let mut rng = SplitMix64::new(seed);
         for row in 0..rows {
             if rng.uniform01() < ratio {
-                self.loop_mask[row / 64] |= 1 << (row % 64);
+                self.row_mask[row / 64] |= 1 << (row % 64);
             }
         }
     }
 
     fn row_masked(&self, row: u32) -> bool {
         let row = row as usize;
-        self.loop_mask
+        self.row_mask
             .get(row / 64)
             .is_some_and(|word| word & (1 << (row % 64)) != 0)
     }
@@ -1172,20 +1256,35 @@ impl TransitionHandler for GlitchTransitionHandler {
         let dest_before = frame.dest_before;
 
         match self.settings.kind {
-            // `Src1` at a constant scale; the tables carry the per-frame
-            // randomness.
+            // `0x10004da0` (`tTVPTransGlitch`'s compose): `0x10005730`, the
+            // class's per-pass hook, fills the row mask (`0x10005ef0`) with
+            // probability = the pass's ratio, and the compose then walks the
+            // rows picking a face per row: a masked row takes `Src1` at
+            // `pow(ratio, gamma_in)`, an unmasked one `Src2` at
+            // `pow(1 - ratio, gamma_out)`.
             GlitchTransitionKind::Glitch => {
-                apply_glitch(
-                    dest_before.pixels,
-                    width,
-                    height,
-                    dest,
-                    width,
-                    height,
-                    (0, 0, i64::from(width), i64::from(height)),
-                    self.settings.gamma,
-                    &tables,
-                );
+                let Some(source) = source else { return };
+                self.fill_row_mask(progress, frame.tick.as_millis() as u64);
+                let src1_scale = progress.powf(self.settings.gamma_in);
+                let src2_scale = (1.0 - progress).powf(self.settings.gamma_out);
+                for row in 0..height {
+                    let (plane, scale) = if self.row_masked(row) {
+                        (dest_before.pixels, src1_scale)
+                    } else {
+                        (source.pixels, src2_scale)
+                    };
+                    apply_glitch(
+                        plane,
+                        width,
+                        height,
+                        dest,
+                        width,
+                        height,
+                        (0, i64::from(row), i64::from(width), 1),
+                        scale,
+                        &tables,
+                    );
+                }
             }
             GlitchTransitionKind::FadeGlitch => {
                 // `x` is the reference's ratio, reversed under `fadein`; the
@@ -1221,34 +1320,22 @@ impl TransitionHandler for GlitchTransitionHandler {
                     );
                 }
             }
+            // `0x10004d70` (`tTVPTransLoopGlitch`'s compose): one face —
+            // `Src1`, the destination's own bitmap — at the constant scale
+            // `[this+0xc0]` (`coef`, 1.0 by default).  Its per-pass hook
+            // `0x100055d0` only reseeds the tables and re-reads `coef`.
             GlitchTransitionKind::LoopGlitch => {
-                let Some(source) = source else { return };
-                // `0x10005730` fills the mask from the pass's ratio, after
-                // the tables.
-                self.fill_loop_mask(progress, frame.tick.as_millis() as u64);
-                // `0x10004da0`'s two powers: `pow(ratio, [this+0xb8])` with
-                // the constructor's `+0xb8 = 0` answers 1, and
-                // `pow(1 - ratio, [this+0xc0])` with `+0xc0 = 1.0` is the
-                // complement itself.
-                let complement = 1.0 - progress;
-                for row in 0..height {
-                    let (plane, scale) = if self.row_masked(row) {
-                        (dest_before.pixels, 1.0)
-                    } else {
-                        (source.pixels, complement)
-                    };
-                    apply_glitch(
-                        plane,
-                        width,
-                        height,
-                        dest,
-                        width,
-                        height,
-                        (0, i64::from(row), i64::from(width), 1),
-                        scale,
-                        &tables,
-                    );
-                }
+                apply_glitch(
+                    dest_before.pixels,
+                    width,
+                    height,
+                    dest,
+                    width,
+                    height,
+                    (0, 0, i64::from(width), i64::from(height)),
+                    self.settings.coef,
+                    &tables,
+                );
             }
         }
     }
@@ -2084,25 +2171,43 @@ mod tests {
         );
     }
 
-    /// `glitch`'s scale is `gamma_out` itself, the exponent the fade family
-    /// applies to the clock (`0x10004d70` reads `[this+0xc0]` with no `pow`).
+    /// `glitch` has **two** live exponents: `0x10004da0` raises `ratio` to
+    /// `gamma_in` for the rows the mask sends to `Src1` and `1 - ratio` to
+    /// `gamma_out` for the `Src2` rows.  Each one alone must move pixels.
     #[test]
-    fn the_gamma_out_option_scales_glitchs_walk() {
-        let weak = transition_pass(
+    fn both_gamma_options_scale_glitchs_rows() {
+        let weak_in = transition_pass(
+            "glitch",
+            &format!("%[time: 100, gamma_in: 0.25, {WALK}]"),
+            50,
+        );
+        let strong_in = transition_pass(
+            "glitch",
+            &format!("%[time: 100, gamma_in: 4.0, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            weak_in,
+            strong_in,
+            "gamma_in 0.25 and 4.0 must displace the Src1 rows differently: {}",
+            first_difference(&weak_in, &strong_in, WIDTH)
+        );
+
+        let weak_out = transition_pass(
             "glitch",
             &format!("%[time: 100, gamma_out: 0.25, {WALK}]"),
             50,
         );
-        let strong = transition_pass(
+        let strong_out = transition_pass(
             "glitch",
             &format!("%[time: 100, gamma_out: 4.0, {WALK}]"),
             50,
         );
         assert_ne!(
-            weak,
-            strong,
-            "gamma_out 0.25 and 4.0 must displace differently: {}",
-            first_difference(&weak, &strong, WIDTH)
+            weak_out,
+            strong_out,
+            "gamma_out 0.25 and 4.0 must displace the Src2 rows differently: {}",
+            first_difference(&weak_out, &strong_out, WIDTH)
         );
     }
 
@@ -2243,15 +2348,18 @@ mod tests {
 
     /// The reference rebuilds the displacement tables inside `StartProcess`
     /// (`0x100055d0`, `0x10005540`, `0x10005730` all reseed from the tick), so
-    /// two passes of a `glitch` transition — whose scale is a constant — still
-    /// compose differently, because their seeds differ.
+    /// two passes of a `loopglitch` transition — whose scale (`coef`) and
+    /// plane (`Src1`) are both constant — still compose differently, because
+    /// their seeds differ.
     #[test]
     fn every_pass_rebuilds_the_tables_from_the_tick() {
         let mut engine = engine();
         run(&mut engine, TRANSITION_PAIR);
         run(
             &mut engine,
-            &format!(r#"dest.beginTransition("glitch", true, source, %[time: 1000, {WALK}]);"#),
+            &format!(
+                r#"dest.beginTransition("loopglitch", true, source, %[time: 1000, coef: 1.0, {WALK}]);"#
+            ),
         );
         engine
             .update(
@@ -2270,40 +2378,32 @@ mod tests {
         assert_ne!(
             first,
             second,
-            "a constant scale and the frozen `Src1` leave the seed as the only \
+            "a constant scale and `Src1` alone leave the seed as the only \
              difference between two passes: {}",
             first_difference(&first, &second, WIDTH)
         );
     }
 
-    /// `break` is a parse-only option in the shipped DLL: `0x100055d0` stores
-    /// its truthiness at `+0xc8` through a lazy option read that never runs
-    /// (the provider pointer the read goes through is only ever set by
-    /// `SetOption`, which the reference core never calls), and nothing reads
-    /// the byte afterwards.  The port accepts it and composes identically.
+    /// `break` is the one member of `loopglitch`'s own option pool
+    /// (`coef/break/loopglitch` next to its vtable) with no effect: its
+    /// per-pass hook `0x100055d0` stores the truthiness at `+0xc8` and nothing
+    /// reads that byte afterwards.  The port accepts it and composes
+    /// identically.
     #[test]
     fn break_is_accepted_and_changes_nothing() {
-        let plain = transition_pass(
-            "glitch",
-            &format!("%[time: 100, gamma_out: 1.5, {WALK}]"),
-            50,
-        );
-        let broken = transition_pass_with(
-            "glitch",
-            &format!("%[time: 100, gamma_out: 1.5, {WALK}]"),
-            r#"opts["break"] = 1;"#,
-            50,
-        );
+        let options = format!("%[time: 100, coef: 1.5, {WALK}]");
+        let plain = transition_pass("loopglitch", &options, 50);
+        let broken = transition_pass_with("loopglitch", &options, r#"opts["break"] = 1;"#, 50);
         assert_eq!(plain, broken, "`break` has no reader in the DLL");
     }
 
-    /// `loopglitch` splits the rows between the two faces with a per-pass mask
-    /// (`0x10005ef0`'s one bit per row, set with probability `ratio`), so a
-    /// composed frame carries pixels of both.
+    /// `glitch` — `tTVPTransGlitch`, vtable `0x10016294` — is the one name in
+    /// this family that mixes the two faces: `0x10005730` fills a per-row mask
+    /// with probability `ratio` and `0x10004da0` sends a masked row to `Src1`
+    /// and the others to `Src2`, so one composed frame carries pixels of both.
     #[test]
-    fn loopglitch_mixes_rows_of_both_faces() {
-        let composed =
-            transition_pass("loopglitch", &format!("%[time: 100, block: 8, {WALK}]"), 50);
+    fn glitch_mixes_rows_of_both_faces() {
+        let composed = transition_pass("glitch", &format!("%[time: 100, block: 8, {WALK}]"), 50);
         let blues = composed
             .chunks_exact(4)
             .map(|pixel| pixel[2])
@@ -2315,6 +2415,147 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// `loopglitch` — `tTVPTransLoopGlitch`, vtable `0x10016380` — distorts
+    /// **one** face (`Src1`, the destination's own bitmap) at the constant
+    /// scale `coef`; no row ever samples `Src2`, so the source's blue (`0x40`)
+    /// must not appear, and `coef` must move the pixels.
+    #[test]
+    fn loopglitch_distorts_its_own_face_alone() {
+        let base = format!("%[time: 100, block: 8, {WALK}]");
+        let composed = transition_pass("loopglitch", &base, 50);
+        let blues = composed
+            .chunks_exact(4)
+            .map(|pixel| pixel[2])
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            !blues.contains(&0x40),
+            "`Src2` must never be sampled: got blue lanes {blues:?}"
+        );
+
+        let weak = transition_pass(
+            "loopglitch",
+            &format!("%[time: 100, coef: 0.25, block: 8, {WALK}]"),
+            50,
+        );
+        let strong = transition_pass(
+            "loopglitch",
+            &format!("%[time: 100, coef: 3.0, block: 8, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            weak,
+            strong,
+            "coef scales the walk: {}",
+            first_difference(&weak, &strong, WIDTH)
+        );
+    }
+
+    /// The DLL layout this module's kind ↔ class mapping is read from — the
+    /// three facts `objdump` recovers from the shipped image (see the module
+    /// docs for the exact commands).  Not machine-checked against the DLL at
+    /// test time (the image is not part of the workspace); the assertions
+    /// below cross-check this implementation against the table instead, which
+    /// is what makes a swapped mapping fail.
+    const RECOVERED_CLASSES: [(&str, u32, [&str; 4], u32); 3] = [
+        // name, handler vtable, the UTF-16 option pool laid out right after
+        // that vtable, slot-9 (the compose hook `0x10004e10` calls).
+        (
+            "glitch",
+            0x10016294,
+            ["time", "gamma_in", "gamma_out", "block"],
+            0x10004da0,
+        ),
+        (
+            "fadeglitch",
+            0x10016310,
+            ["nofade", "fadein", "color", "fadeglitch"],
+            0x100047a0,
+        ),
+        (
+            "loopglitch",
+            0x10016380,
+            ["coef", "break", "loopglitch", "block"],
+            0x10004d70,
+        ),
+    ];
+
+    /// The mapping pinned against the DLL's own layout: the names match the
+    /// class-name strings, `gamma_in`/`gamma_out` belong to `glitch` alone
+    /// while `coef`/`break` belong to `loopglitch` alone, and the compose
+    /// honours it — `gamma_in` moves `glitch`'s pixels but not `loopglitch`'s,
+    /// `coef` moves `loopglitch`'s but not `glitch`'s.
+    ///
+    /// The first port of this module had `glitch` and `loopglitch` the other
+    /// way round (it read the mapping off field offsets rather than off the
+    /// constructors' immediates, the vtable slots and the string pools), which
+    /// every assertion here fails on.
+    #[test]
+    fn the_recovered_class_layout_pins_the_compose_hooks() {
+        let mut names = RECOVERED_CLASSES
+            .map(|(name, ..)| name.to_string())
+            .to_vec();
+        names.sort();
+        assert_eq!(
+            names,
+            TRANSITION_NAMES.map(str::to_string).to_vec(),
+            "the provider names are the DLL's own class names"
+        );
+
+        let pool = |name: &str| {
+            RECOVERED_CLASSES
+                .iter()
+                .find(|(entry, ..)| *entry == name)
+                .expect("recovered entry")
+                .2
+        };
+        assert!(
+            pool("glitch").contains(&"gamma_in") && pool("glitch").contains(&"gamma_out"),
+            "glitch's own option pool is time/gamma_in/gamma_out/block"
+        );
+        assert!(
+            !pool("loopglitch").contains(&"gamma_in") && !pool("loopglitch").contains(&"gamma_out"),
+            "loopglitch's pool is coef/break/loopglitch — it reads no gamma"
+        );
+        assert!(
+            pool("loopglitch").contains(&"coef") && !pool("glitch").contains(&"coef"),
+            "coef is loopglitch's constant scale, not glitch's"
+        );
+        assert_eq!(
+            RECOVERED_CLASSES.map(|(.., hook)| hook).len(),
+            3,
+            "each class's compose hook is a distinct slot-9 function"
+        );
+
+        // Behavioural half: the exponents and the scale reach the pixels the
+        // table says they must — and the ones the table does not give them do
+        // not.
+        let glitch =
+            |extra: &str| transition_pass("glitch", &format!("%[time: 100, {extra}, {WALK}]"), 50);
+        let loopglitch = |extra: &str| {
+            transition_pass("loopglitch", &format!("%[time: 100, {extra}, {WALK}]"), 50)
+        };
+        assert_ne!(
+            glitch("gamma_in: 0.25"),
+            glitch("gamma_in: 4.0"),
+            "glitch's Src1 exponent is gamma_in"
+        );
+        assert_eq!(
+            glitch("coef: 0.25"),
+            glitch("coef: 3.0"),
+            "glitch reads no coef (it is not in its pool)"
+        );
+        assert_ne!(
+            loopglitch("coef: 0.25"),
+            loopglitch("coef: 3.0"),
+            "loopglitch's scale is coef"
+        );
+        assert_eq!(
+            loopglitch("gamma_in: 0.25"),
+            loopglitch("gamma_in: 4.0"),
+            "loopglitch reads no gamma_in (it is not in its pool)"
         );
     }
 
