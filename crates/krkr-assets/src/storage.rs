@@ -14,9 +14,9 @@ use std::{
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use krkr_core::{ResourceData, ResourceDataSource, ResourceStream, StoragePort};
+use krkr_core::{ResourceData, ResourceDataSource, ResourceStream, StoragePort, Xp3FilterRegistry};
 use krkr_tjs2::{Result, TjsError};
-use krkr_xp3::Xp3ResourceProvider;
+use krkr_xp3::{Xp3OpenOptions, Xp3ResourceProvider};
 use memmap2::{Mmap, MmapOptions};
 
 use crate::media::{FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name};
@@ -101,6 +101,11 @@ struct ProjectStorageInner {
     /// lookup and raw-byte caches stay coherent, but leave this alone:
     /// official KRKR never drops decoded graphics because a file was written.
     graphic_revision: AtomicU64,
+    /// The filter slots the mounted archives consult. Handed to
+    /// [`Xp3ResourceProvider`] when the archives open and exposed through
+    /// [`krkr_core::ProjectStoragePort::xp3_filter_registry`], so a plugin can
+    /// install a filter long after the mounts were built.
+    xp3_filter_registry: Arc<Xp3FilterRegistry>,
 }
 
 /// Case-insensitive index over [`ProjectStorageInner::catalog_paths`].
@@ -293,6 +298,11 @@ enum LocatedResource {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RawCacheKey {
     revision: u64,
+    /// The XP3 filter registry's generation at read time. The archive read
+    /// path runs through the live filters, so bytes from before an install
+    /// must not be served after it — the reference has no byte cache and
+    /// re-reads through the current pointers (`XP3Archive.cpp:1047`).
+    filter_generation: u64,
     source: RawCacheSource,
 }
 
@@ -432,8 +442,21 @@ impl ProjectStorage {
     pub fn for_root(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let fs_layers = project_layers(&root);
-        let xp3_provider = open_project_archives(&root)?;
-        Ok(Self::new(Some(root), fs_layers, xp3_provider, Vec::new()))
+        // The archives and the plugins share this one registry: it is created
+        // before the archives are opened, handed to them, and exposed through
+        // `ProjectStoragePort::xp3_filter_registry`, so a filter installed
+        // after the mounts (the reference's `xp3filter.dll` timing) still
+        // reaches every read.
+        let xp3_filter_registry = Arc::new(Xp3FilterRegistry::new());
+        let xp3_provider = open_project_archives(&root, Arc::clone(&xp3_filter_registry))?;
+        Ok(Self::new_with_registry(
+            Some(root),
+            fs_layers,
+            xp3_provider,
+            Vec::new(),
+            BTreeMap::new(),
+            xp3_filter_registry,
+        ))
     }
 
     pub fn new(
@@ -451,6 +474,24 @@ impl ProjectStorage {
         xp3_provider: Option<Xp3ResourceProvider>,
         auto_paths: Vec<String>,
         memory_files: BTreeMap<String, Arc<[u8]>>,
+    ) -> Self {
+        Self::new_with_registry(
+            root,
+            fs_layers,
+            xp3_provider,
+            auto_paths,
+            memory_files,
+            Arc::new(Xp3FilterRegistry::new()),
+        )
+    }
+
+    fn new_with_registry(
+        root: Option<PathBuf>,
+        fs_layers: Vec<ProjectLayer>,
+        xp3_provider: Option<Xp3ResourceProvider>,
+        auto_paths: Vec<String>,
+        memory_files: BTreeMap<String, Arc<[u8]>>,
+        xp3_filter_registry: Arc<Xp3FilterRegistry>,
     ) -> Self {
         let mut catalog_paths = memory_files
             .keys()
@@ -492,6 +533,7 @@ impl ProjectStorage {
                 media_providers: RwLock::new(BTreeMap::new()),
                 revision: AtomicU64::new(1),
                 graphic_revision: AtomicU64::new(1),
+                xp3_filter_registry,
             }),
         }
     }
@@ -1563,6 +1605,45 @@ impl ProjectStorage {
         result
     }
 
+    /// Creates the directory `name` the way the reference's `fstat` plugin
+    /// does: the name is resolved through the same root mapping the write path
+    /// uses (`TVPNormalizeStorageName` + `TVPGetLocalName`,
+    /// `StorageIntf.cpp:549`, `:579-584`) and only the final component is
+    /// created — `CreateDirectory(dir, NULL)`
+    /// (`krkr2 src/plugins/win32/fstat/Main.cpp:586`) never builds parents and
+    /// fails with `ERROR_ALREADY_EXISTS` when the directory is already there,
+    /// so this is `fs::create_dir`, never `create_dir_all`.
+    ///
+    /// A media-qualified name has no local path in the reference either:
+    /// `TVPGetLocalName` throws `TVPCannotGetLocalName` when the media reports
+    /// no locally accessible name (`StorageIntf.cpp:581-584`), so one is
+    /// rejected here instead of becoming a folder named after its scheme.
+    #[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
+    pub fn create_directory(&self, name: &str) -> Result<()> {
+        if split_media_name(name).is_some() {
+            return Err(TjsError::runtime(format!(
+                "storage path must be a local name: {name}"
+            )));
+        }
+        let Some(root) = self.inner.root.as_ref() else {
+            return Err(TjsError::runtime(format!(
+                "cannot create a directory without a project root: {name}"
+            )));
+        };
+        let path = storage_write_path(root, name)?;
+        fs::create_dir(&path).map_err(io_error)?;
+        self.invalidate_write_caches();
+        Ok(())
+    }
+
+    /// The filter slots this storage's mounted archives consult
+    /// (`TVPSetXP3ArchiveExtractionFilter`). Installing into the returned
+    /// registry reaches every later stream creation and read, whether or not
+    /// the archive was opened before the install.
+    pub fn xp3_filter_registry(&self) -> Arc<Xp3FilterRegistry> {
+        Arc::clone(&self.inner.xp3_filter_registry)
+    }
+
     pub fn open_storage(&self, name: &str) -> io::Result<Box<dyn ResourceStream>> {
         match self.resolve_storage_io(name)? {
             LocatedResource::Fs { path, .. } => {
@@ -2044,6 +2125,7 @@ impl ProjectStorage {
         // `None` for one, so this resolver never remembers its bytes.
         let key = located.cache_source().map(|source| RawCacheKey {
             revision: self.revision(),
+            filter_generation: self.inner.xp3_filter_registry.generation(),
             source,
         });
         if let Some(key) = &key
@@ -2268,6 +2350,10 @@ impl krkr_core::ProjectStoragePort for ProjectStorage {
         ProjectStorage::write_binary_storage(self, name, mode, bytes).map_err(tjs_error_to_io)
     }
 
+    fn create_directory(&self, name: &str) -> io::Result<()> {
+        ProjectStorage::create_directory(self, name).map_err(tjs_error_to_io)
+    }
+
     fn add_auto_path(&self, path: &str) {
         ProjectStorage::add_auto_path(self, path);
     }
@@ -2302,6 +2388,16 @@ impl krkr_core::ProjectStoragePort for ProjectStorage {
 
     fn drain_memory_writes(&self) -> Vec<(String, Vec<u8>)> {
         ProjectStorage::drain_memory_writes(self)
+    }
+
+    fn xp3_filter_registry(&self) -> Option<Arc<Xp3FilterRegistry>> {
+        // A storage without archives has no read path to filter; answering
+        // `None` tells a plugin that instead of accepting an install nothing
+        // will ever consult.
+        self.inner
+            .xp3_provider
+            .is_some()
+            .then(|| ProjectStorage::xp3_filter_registry(self))
     }
 
     fn register_storage_media(&self, media: Arc<dyn StorageMediaProvider>) -> io::Result<()> {
@@ -3150,14 +3246,24 @@ pub fn storage_mode_offset(mode: &str) -> Option<u64> {
     (!offset.is_empty()).then(|| offset.parse().ok()).flatten()
 }
 
-pub(crate) fn open_project_archives(root: &Path) -> Result<Option<Xp3ResourceProvider>> {
+/// Opens every archive of `root` with `filters` as their shared filter
+/// registry (`Xp3ResourceProvider::open_archives_with_options`); the archives
+/// keep reading the registry's slots per stream creation and per read, which
+/// is what makes a filter installed after this call effective.
+pub(crate) fn open_project_archives(
+    root: &Path,
+    filters: Arc<Xp3FilterRegistry>,
+) -> Result<Option<Xp3ResourceProvider>> {
     let archives = project_archive_paths(root);
     if archives.is_empty() {
         return Ok(None);
     }
-    Xp3ResourceProvider::open_archives(archives)
-        .map(Some)
-        .map_err(|error| TjsError::runtime(format!("failed to open XP3 archives: {error}")))
+    Xp3ResourceProvider::open_archives_with_options(
+        archives,
+        Xp3OpenOptions::default().with_filter_registry(filters),
+    )
+    .map(Some)
+    .map_err(|error| TjsError::runtime(format!("failed to open XP3 archives: {error}")))
 }
 
 pub(crate) fn project_archive_paths(root: &Path) -> Vec<PathBuf> {
@@ -3851,6 +3957,74 @@ mod tests {
         assert_eq!(
             storage.resolved_storage_name("hero").as_deref(),
             Some("hero.png")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The XP3 filter seam end to end at the storage level: a host installs an
+    /// extraction filter *after* the project (and therefore its archives) was
+    /// built, and the bytes a later read returns go through it — including
+    /// when the same entry was already read (and cached) before the install.
+    ///
+    /// Reference timing: the extraction callback is read per chunk of every
+    /// read (`XP3Archive.cpp:1047`), so nothing about the mount's age can
+    /// freeze it; `xp3filter.dll` installs it from a post-registration step,
+    /// after the game's archives are open.
+    #[test]
+    fn an_extraction_filter_installed_after_the_mount_filters_later_reads() {
+        let root = temp_root("xp3-filter-install");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("data.xp3"),
+            build_xp3_archive(&[("secret/data.bin", b"cipher-me")]),
+        )
+        .expect("write data.xp3");
+
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        // Read once before any filter is installed: the raw cache now holds
+        // the unfiltered bytes for this entry.
+        assert_eq!(
+            storage
+                .read_binary_vec("secret/data.bin")
+                .expect("plain read"),
+            b"cipher-me".as_slice()
+        );
+
+        let registry = storage.xp3_filter_registry();
+        registry.set_extraction_filter(Some(std::sync::Arc::new(
+            |info: krkr_core::Xp3ExtractionFilterInfo<'_>,
+             _ctx: &mut krkr_core::Xp3FilterContext| {
+                assert_eq!(info.file_name, "secret/data.bin");
+                for byte in info.buffer.iter_mut() {
+                    *byte ^= 0xff;
+                }
+            },
+        )));
+
+        let expected: Vec<u8> = b"cipher-me".iter().map(|byte| byte ^ 0xff).collect();
+        assert_eq!(
+            storage
+                .read_binary_vec("secret/data.bin")
+                .expect("filtered read"),
+            expected.as_slice(),
+            "the cached pre-filter bytes must not be served after the install"
+        );
+
+        // The port hands the same registry to a plugin; a storage with no
+        // archives answers `None` instead.
+        let port: &dyn krkr_core::ProjectStoragePort = &storage;
+        assert!(port.xp3_filter_registry().is_some());
+
+        let memory = ProjectStorage::from_memory([("a.txt", b"a".to_vec())]);
+        let port: &dyn krkr_core::ProjectStoragePort = &memory;
+        assert!(port.xp3_filter_registry().is_none());
+
+        registry.set_extraction_filter(None);
+        assert_eq!(
+            storage
+                .read_binary_vec("secret/data.bin")
+                .expect("plain read again"),
+            b"cipher-me".as_slice()
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

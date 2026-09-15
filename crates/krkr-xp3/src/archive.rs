@@ -7,7 +7,9 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Result, SegmentCacheConfig, Xp3ExtractionFilter, Xp3OpenOptions};
+use krkr_core::Xp3FilterRegistry;
+
+use crate::{Result, SegmentCacheConfig, Xp3OpenOptions};
 use crate::{
     Xp3Entry, Xp3EntryStream, Xp3Error,
     cache::SegmentCache,
@@ -23,7 +25,12 @@ pub struct Xp3Archive<R> {
     by_ascii_lowercase_name: HashMap<String, usize>,
     base_offset: u64,
     file_len: u64,
-    extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
+    /// Shared with whoever installed the filters — the archives read the
+    /// slots per stream creation and per read, never a copy of them
+    /// (`XP3Archive.cpp:585`, `:1047`).
+    filters: Arc<Xp3FilterRegistry>,
+    /// The archive name the content filter is told (`XP3Archive.cpp:586`).
+    archive_name: String,
     segment_cache: Arc<SegmentCache>,
     reader_type: PhantomData<fn() -> R>,
 }
@@ -70,7 +77,8 @@ where
             by_ascii_lowercase_name,
             base_offset,
             file_len,
-            extraction_filter: options.extraction_filter,
+            filters: options.filter_registry.unwrap_or_default(),
+            archive_name: options.archive_name.unwrap_or_default(),
             segment_cache: Arc::new(SegmentCache::new(options.segment_cache)),
             reader_type: PhantomData,
         })
@@ -132,14 +140,16 @@ where
             .cloned()
             .ok_or_else(|| Xp3Error::NotFound(index.to_string()))?;
 
-        Ok(Xp3EntryStream::new(
+        Xp3EntryStream::open(
             self.reader.clone(),
             Arc::clone(&self.segment_cache),
-            self.extraction_filter.clone(),
+            Arc::clone(&self.filters),
             index,
             entry,
             self.file_len,
-        ))
+            &self.archive_name,
+        )
+        .map_err(Xp3Error::from)
     }
 
     pub fn base_offset(&self) -> u64 {
@@ -162,6 +172,19 @@ impl Xp3Archive<File> {
     }
 
     pub fn open_file_with_options(path: impl AsRef<Path>, options: Xp3OpenOptions) -> Result<Self> {
+        let path = path.as_ref();
+        // The content filter is told the archive's own name
+        // (`XP3Archive.cpp:586` reads `ArchiveName`); a file-backed archive
+        // knows it, the caller of `open_file*` should not have to repeat it.
+        let options = if options.archive_name.is_some() {
+            options
+        } else {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            options.with_archive_name(name)
+        };
         let file = File::open(path)?;
         Self::open_with_source(file, options, |file| {
             ArchiveSourceHandle::File(Arc::new(FileArchiveSource::new(file)))
@@ -178,7 +201,8 @@ impl<R> Clone for Xp3Archive<R> {
             by_ascii_lowercase_name: self.by_ascii_lowercase_name.clone(),
             base_offset: self.base_offset,
             file_len: self.file_len,
-            extraction_filter: self.extraction_filter.clone(),
+            filters: Arc::clone(&self.filters),
+            archive_name: self.archive_name.clone(),
             segment_cache: Arc::clone(&self.segment_cache),
             reader_type: PhantomData,
         }

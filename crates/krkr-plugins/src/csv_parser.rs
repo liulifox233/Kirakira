@@ -81,7 +81,10 @@ const CSV_PARSER_METHODS: &[&str] = &[
     "clear",
 ];
 
-fn install_csv_parser(runtime: &mut Runtime<KrkrHost>) {
+/// Installs the `CSVParser` global. Shared with `PackinOne.dll`, which
+/// compiles the same sub-plugin in: the bundle installs this one
+/// implementation, so both DLLs answer `new CSVParser(...)` identically.
+pub(crate) fn install_csv_parser(runtime: &mut Runtime<KrkrHost>) {
     let handle = runtime.alloc_native_constructor(
         |runtime: &mut Runtime<KrkrHost>, this_obj: Option<ObjectHandle>, args: Vec<Variant>| {
             let called_as_super_constructor = this_obj.is_some();
@@ -539,6 +542,8 @@ mod tests {
     use krkr_engine::{EngineConfig, KrkrEngine, SystemPaths};
     use krkr_tjs2::runtime::Variant;
 
+    use crate::packinone::PackinOnePlugin;
+
     use super::*;
 
     #[test]
@@ -609,6 +614,47 @@ mod tests {
             .expect("parse with no separator");
 
         assert_eq!(value, Variant::String("1:a,b:c,d".to_string()));
+    }
+
+    /// The bundle compiles this sub-plugin in, so `PackinOne.dll` and
+    /// `csvParser.dll` must answer `new CSVParser(void, 0)` identically. The
+    /// bundle used to coerce separator `0` to `,`, which made the answer
+    /// depend on which DLL the game linked — PackinOne precedes csvParser in
+    /// catalog order, so the difference was invisible until a game linked the
+    /// standalone module alone.
+    #[test]
+    fn the_bundle_and_the_standalone_module_agree_on_separator_zero() {
+        let probe = "(function() {\n\
+                         var parser = new CSVParser(void, 0);\n\
+                         parser.init(\"a,b\\r\\nc,d\");\n\
+                         var first = parser.getNextLine();\n\
+                         return first.count + \":\" + first[0];\n\
+                     })()";
+        let expected = Variant::String("1:a,b".to_string());
+
+        let mut bundle = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        bundle
+            .register_plugin(PackinOnePlugin)
+            .expect("PackInOne.dll");
+        assert_eq!(
+            bundle
+                .execute_expression("inline.tjs", probe)
+                .expect("bundle parser"),
+            expected,
+            "PackInOne.dll must keep separator 0"
+        );
+
+        let mut both = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        both.register_plugin(PackinOnePlugin)
+            .expect("PackInOne.dll");
+        both.register_plugin(CsvParserPlugin)
+            .expect("csvParser.dll");
+        assert_eq!(
+            both.execute_expression("inline.tjs", probe)
+                .expect("both DLLs linked"),
+            expected,
+            "the two DLLs must agree"
+        );
     }
 
     #[test]

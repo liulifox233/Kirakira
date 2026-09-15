@@ -5,9 +5,12 @@ use std::{
 };
 
 use flate2::read::ZlibDecoder;
+use krkr_core::{
+    Xp3ContentFilterAction, Xp3ExtractionFilterInfo, Xp3FilterContext, Xp3FilterRegistry,
+};
 
 use crate::{
-    Xp3Entry, Xp3ExtractionFilter, Xp3Segment, Xp3SegmentEncoding,
+    Xp3Entry, Xp3Segment, Xp3SegmentEncoding,
     cache::{SegmentCache, SegmentCacheKey},
     source::ArchiveSourceHandle,
     util::{checked_add_io, ensure_range_io, usize_from_u64_io},
@@ -18,10 +21,23 @@ pub struct Xp3EntryStream<R> {
     segments: Vec<Xp3Segment>,
     file_size: u64,
     file_hash: u32,
+    entry_name: String,
     position: u64,
     entry_index: usize,
     file_len: u64,
-    extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
+    /// The filter slots, read live on every chunk — the reference consults
+    /// `TVPXP3ArchiveExtractionFilter` inside `Read` (`XP3Archive.cpp:1047`),
+    /// never once per stream.
+    filters: Arc<Xp3FilterRegistry>,
+    /// The stream's `FilterContext` (`XP3Archive.cpp:586`, `:1054`): the
+    /// content filter seeds it when the stream is created, every extraction
+    /// call of this stream sees it.
+    filter_context: Xp3FilterContext,
+    /// Set when the content filter answered
+    /// [`Xp3ContentFilterAction::FetchFull`]: the whole entry was read into
+    /// memory at creation, through the extraction filter as it stood then,
+    /// and reads are served from those bytes (`XP3Archive.cpp:585-595`).
+    full_data: Option<Arc<[u8]>>,
     segment_cache: Arc<SegmentCache>,
     active_segment: Option<ActiveDecodedSegment>,
     reader_type: PhantomData<fn() -> R>,
@@ -36,7 +52,7 @@ impl<R> Xp3EntryStream<R> {
     pub(crate) fn new(
         reader: ArchiveSourceHandle<R>,
         segment_cache: Arc<SegmentCache>,
-        extraction_filter: Option<Arc<dyn Xp3ExtractionFilter>>,
+        filters: Arc<Xp3FilterRegistry>,
         entry_index: usize,
         entry: Xp3Entry,
         file_len: u64,
@@ -46,14 +62,49 @@ impl<R> Xp3EntryStream<R> {
             segments: entry.segments,
             file_size: entry.original_size,
             file_hash: entry.file_hash,
+            entry_name: entry.name,
             position: 0,
             entry_index,
             file_len,
-            extraction_filter,
+            filters,
+            filter_context: Xp3FilterContext::new(),
+            full_data: None,
             segment_cache,
             active_segment: None,
             reader_type: PhantomData,
         }
+    }
+
+    /// Creates a stream the way the reference's `CreateStreamByIndex` does
+    /// (`XP3Archive.cpp:576-604`): the content filter is asked about the entry
+    /// first — with this stream's fresh `FilterContext` — and when it answers
+    /// `FetchFull` the entry is read whole into memory and the caller reads
+    /// those bytes.
+    pub(crate) fn open(
+        reader: ArchiveSourceHandle<R>,
+        segment_cache: Arc<SegmentCache>,
+        filters: Arc<Xp3FilterRegistry>,
+        entry_index: usize,
+        entry: Xp3Entry,
+        file_len: u64,
+        archive_name: &str,
+    ) -> io::Result<Self>
+    where
+        R: Read + Seek + Send,
+    {
+        let mut stream = Self::new(reader, segment_cache, filters, entry_index, entry, file_len);
+        if let Some(filter) = stream.filters.content_filter() {
+            let action = filter.apply(
+                &stream.entry_name,
+                archive_name,
+                stream.file_size,
+                &mut stream.filter_context,
+            );
+            if action == Xp3ContentFilterAction::FetchFull {
+                stream.fetch_full_entry()?;
+            }
+        }
+        Ok(stream)
     }
 }
 
@@ -178,11 +229,15 @@ where
     }
 }
 
-impl<R> Read for Xp3EntryStream<R>
+impl<R> Xp3EntryStream<R>
 where
     R: Read + Seek + Send,
 {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+    /// The archive read path of `tTVPXP3ArchiveStream::Read`
+    /// (`XP3Archive.cpp:1040-1067`): walk the segments from the current
+    /// position and hand every chunk the extraction filter as it stands
+    /// *now*, with the stream's context.
+    fn read_archive_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() || self.position >= self.file_size {
             return Ok(0);
         }
@@ -221,8 +276,16 @@ where
                 }
             }
 
-            if let Some(filter) = &self.extraction_filter {
-                filter.apply(self.position, output, self.file_hash);
+            if let Some(filter) = self.filters.extraction_filter() {
+                filter.apply(
+                    Xp3ExtractionFilterInfo {
+                        offset: self.position,
+                        buffer: output,
+                        file_hash: self.file_hash,
+                        file_name: &self.entry_name,
+                    },
+                    &mut self.filter_context,
+                );
             }
 
             self.position =
@@ -231,6 +294,49 @@ where
         }
 
         Ok(written)
+    }
+
+    /// `XP3_CONTENT_FILTER_FETCH_FULLDATA` (`XP3Archive.cpp:589-593`): read the
+    /// whole entry through the archive path — so the extraction filter sees
+    /// every chunk, with this stream's context, exactly as it does when the
+    /// reference reads into `tTVPMemoryStream` — and serve reads from it.
+    fn fetch_full_entry(&mut self) -> io::Result<()> {
+        let len = usize_from_u64_io(self.file_size, "XP3 entry is too large to fetch whole")?;
+        let mut data = vec![0u8; len];
+        let mut filled = 0usize;
+        while filled < len {
+            let read = self.read_archive_chunk(&mut data[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled != len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "XP3 entry ended before its declared size",
+            ));
+        }
+        self.full_data = Some(Arc::from(data.into_boxed_slice()));
+        self.position = 0;
+        Ok(())
+    }
+}
+
+impl<R> Read for Xp3EntryStream<R>
+where
+    R: Read + Seek + Send,
+{
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if let Some(data) = &self.full_data {
+            let position = usize::try_from(self.position).unwrap_or(usize::MAX);
+            let remaining = data.get(position..).unwrap_or_default();
+            let len = remaining.len().min(buffer.len());
+            buffer[..len].copy_from_slice(&remaining[..len]);
+            self.position += u64::try_from(len).unwrap_or(0);
+            return Ok(len);
+        }
+        self.read_archive_chunk(buffer)
     }
 }
 
