@@ -2483,10 +2483,48 @@ impl KrkrHost {
         self.apply_layer_instance_to_render(handle);
     }
 
+    /// Appends `child` to `parent`'s child list — official `AddChild`
+    /// (`LayerIntf.cpp:576-593`), shared by the constructor's `(owner, parent)`
+    /// pair and a script `parent` write.
+    ///
+    /// A parent in absolute order mode hands the new child the previous last
+    /// sibling's absolute index plus one (`Children[count-2]` there).  The
+    /// child otherwise keeps the default 0, which is what
+    /// `GetAbsoluteOrderIndex` reports back (`:1253-1260`): KAGEX's env
+    /// ordering pass writes an index only when the read-back differs from the
+    /// one it computed (`system/world.tjs` `onUpdateAbsolute`), so a child left
+    /// without one must not answer with its sibling position — that answer
+    /// suppresses the very write that places the layer.
     fn add_native_layer_child(&mut self, parent: ObjectHandle, child: ObjectHandle) {
-        if let Some(parent) = self.native_layers.get_mut(&parent)
-            && !parent.children.contains(&child)
+        let attached = self
+            .native_layers
+            .get(&parent)
+            .is_some_and(|instance| instance.children.contains(&child));
+        if attached {
+            return;
+        }
+        let absolute = if self
+            .native_layer_property(parent, "absoluteOrderMode")
+            .is_some_and(|value| value.is_truthy())
         {
+            self.native_layers
+                .get(&parent)
+                .and_then(|instance| instance.children.last().copied())
+                .map(|last| {
+                    self.native_layer_property(last, "absolute")
+                        .and_then(|value| value.to_integer().ok())
+                        .unwrap_or(0)
+                        + 1
+                })
+        } else {
+            None
+        };
+        if let Some(absolute) = absolute
+            && let Some(instance) = self.native_layers.get_mut(&child)
+        {
+            instance.set_property("absolute", Variant::Integer(absolute));
+        }
+        if let Some(parent) = self.native_layers.get_mut(&parent) {
             parent.children.push(child);
             parent.children_dirty = true;
         }
