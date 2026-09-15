@@ -58,6 +58,16 @@
 //! member's `active` key; a value the layout has no active override for falls
 //! back to the property's reference default.
 //!
+//! The two shipped builds differ by one style key, and the module accepts it:
+//! build A (GINKA/少女世界, md5 `5aa3b6c8…`) reads `wordbreak` in `setDefault`
+//! (into the stored word-break bool) and in `setStyle` (into the active one),
+//! while build B (PARQUET, md5 `2213af66…`) has no `wordbreak` string in the
+//! binary at all. No shipped script sends the key — M163's scan of both games'
+//! archives and scenario files found zero hits — so this module takes the
+//! union, exactly as it does for `render`'s five-versus-six arity: build A's
+//! behaviour for a script that does send it, build B's for everything either
+//! game runs. `word_break` is a `setOption` key in both builds and stays one.
+//!
 //! The same constructor also seeds the line-breaking character sets the
 //! `setOption` keys replace (`following` 68 characters, `leading` 19,
 //! `begin`/`end` 10 each) and `kinsoku_max` 1 with `word_break` on; those are
@@ -245,7 +255,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "TextRenderBase",
-    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. render takes the DLL's six arguments, consumes argument 2 as the per-character base delay (the games' kag.actualChSpeed, with the reference's 0.001 fallback when it is 0 and argument 3 is positive), seeds every record's display time from it and scales the %d/%w codes by it while %a/%t stay absolute, and parses the message text format the games' TagTextConverter emits and the DLL's layout walker FUN_1000b8c0 interprets: \\n/raw newline/%n breaks, \\k key waits for getKeyWait(), \\w/\\x/\\i/\\r, $expr; through onEval, &name; through onGetGraphSize, %f/%r/%<n>;/%;/%B/%S/%b/%i/%s/%e/%p/%a/%d/%t/%w/%D/%l/#…; style and timing codes (%a/%d/%t/%w/%D honour ignore_delay; the last group's line-shift, indent and named-wait details are documented gaps), [ruby,count], and \\X as the literal X. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and the auto-indent/kinsoku rules still need engine work. Every method's argument floor is its command's declared parameter count (ncbind's ArgsCount: fewer is TJS_E_BADPARAMCOUNT, extras are ignored), so setRenderSize needs 2, getCharacters 2, getLinkRects/getLinkCharacters 1 and isLinkContains 3, while the games' own call shapes (setRenderSize(w, h), getCharacters(0, 0)) pass the full lists.",
+    notes: "All 55 reference members in registration order: 22 methods with the DLL's signatures and 33 properties with the DLL's constructor defaults and get-only access. setOption's 19 keys and setDefault's 18 style keys follow the DLL, unknown keys are ignored as there; build A's extra `wordbreak` style key (build B has no such string) is accepted in setDefault and setStyle as the union the module takes for render's arity; setFont/setStyle write the active style, resetFont/resetStyle copy the stored defaults into it. getCharacters(from, count) and calcShowCount(elapsed) match FUN_10003d90/FUN_10011080. render takes the DLL's six arguments, consumes argument 2 as the per-character base delay (the games' kag.actualChSpeed, with the reference's 0.001 fallback when it is 0 and argument 3 is positive), seeds every record's display time from it and scales the %d/%w codes by it while %a/%t stay absolute, and parses the message text format the games' TagTextConverter emits and the DLL's layout walker FUN_1000b8c0 interprets: \\n/raw newline/%n breaks, \\k key waits for getKeyWait(), \\w/\\x/\\i/\\r, $expr; through onEval, &name; through onGetGraphSize, %f/%r/%<n>;/%;/%B/%S/%b/%i/%s/%e/%p/%a/%d/%t/%w/%D/%l/#…; style and timing codes (%a/%d/%t/%w/%D honour ignore_delay; the last group's line-shift, indent and named-wait details are documented gaps), [ruby,count], and \\X as the literal X. Glyphs measure through the game's onGetTextWidth or the engine Font (getEscWidthX/getTextWidth); vertical layout, the link model and the auto-indent/kinsoku rules still need engine work. Every method's argument floor is its command's declared parameter count (ncbind's ArgsCount: fewer is TJS_E_BADPARAMCOUNT, extras are ignored), so setRenderSize needs 2, getCharacters 2, getLinkRects/getLinkCharacters 1 and isLinkContains 3, while the games' own call shapes (setRenderSize(w, h), getCharacters(0, 0)) pass the full lists.",
     install: |engine| engine.register_plugin(TextRenderPlugin),
 };
 
@@ -1091,6 +1101,29 @@ const LAYOUT_KEYS: &[(&str, &str)] = &[
     ("valign", "defaultValign"),
 ];
 
+/// The extra style key build A reads and build B has no string for:
+/// `wordbreak`. Build A's `setDefault` (`0x10016ff0`, decompiled line ~350)
+/// reads it into the stored word-break bool at `this + 0x48` and its
+/// `setStyle` (`0x100193a0`, `:1001974f-10019763`) into the active one at
+/// `this + 0x49`; build B's `FUN_100022f0`/`FUN_10002e30` read their 18 and 6
+/// keys and never look at it. No shipped script sends the key — M163's scan
+/// found zero `wordbreak` hits across both games' archives and scenario files —
+/// so accepting it is the same union this module already takes for `render`'s
+/// arity: build A's behaviour for a script that sends the key, build B's for
+/// everything either game runs.
+const STYLE_WORD_BREAK_KEY: &str = "wordbreak";
+
+/// The state key of the word-break flag: the one `setOption`'s `word_break`
+/// writes, and the one build A's `resetStyle` copies from the stored bool into
+/// the active one.
+const WORD_BREAK_KEY: &str = "word_break";
+
+/// The word-break flag's constructor value. Build A's constructor stores 1 into
+/// the stored bool (`10004840: movb $0x1,0x48(%edi)`, right after `kinsoku_max`
+/// 1 at `:1000486e`) and build B's into its single flag (`1000d6f9:
+/// movb $0x1,0x50(%edi)`), so the reference's word break starts on.
+const WORD_BREAK_DEFAULT: i64 = 1;
+
 /// The active members `resetFont` copies the stored defaults into, per
 /// `FUN_1000def0`: bold, italic, size, ruby size, ruby offset, face, color,
 /// shadow, shadow diff, shadow color, edge color and edge.
@@ -1151,6 +1184,15 @@ fn set_option(
                 state_store(runtime, this, property_state_key("vertical"), flag);
                 continue;
             }
+            // Build A's `setOption` writes the word-break bool into *both*
+            // style slots (`:10018cc1`, `:10018cc4`: `mov %al,0x49(%esi)`
+            // then `mov %al,0x48(%esi)`), where build B has the single flag
+            // the state store keeps below.
+            "word_break" => {
+                let flag = Variant::Integer(i64::from(value.to_integer().unwrap_or(0) != 0));
+                active_store(runtime, this, WORD_BREAK_KEY, flag.clone());
+                flag
+            }
             _ => Variant::Integer(i64::from(value.to_integer().unwrap_or(0) != 0)),
         };
         state_store(runtime, this, key, coerced);
@@ -1208,6 +1250,16 @@ fn set_style(
             coerce_variant(value, ValueKind::Real),
         );
     }
+    // Build A's `setStyle` reads one key more than build B's: `wordbreak` into
+    // the *active* word-break bool (`:1001975e-10019763`).
+    if let Some(value) = read_property(runtime, styles, STYLE_WORD_BREAK_KEY) {
+        active_store(
+            runtime,
+            this,
+            WORD_BREAK_KEY,
+            coerce_variant(value, ValueKind::Bool),
+        );
+    }
     Ok(Variant::Void)
 }
 
@@ -1229,6 +1281,12 @@ fn apply_styles(
         if let Some(value) = read(runtime, key, style_value_kind(property)) {
             state_store(runtime, instance, property_state_key(property), value);
         }
+    }
+    // Build A's `setDefault` reads one key more than build B's: `wordbreak`,
+    // into the *stored* word-break bool the `resetStyle` copy below reads back
+    // (`:10016ff0`, decompiled line ~350).
+    if let Some(value) = read(runtime, STYLE_WORD_BREAK_KEY, ValueKind::Bool) {
+        state_store(runtime, instance, WORD_BREAK_KEY, value);
     }
     if present(runtime, "fontsize") {
         // The DLL derives the unset dependents from `fontsize` when it is the
@@ -1372,6 +1430,18 @@ fn reset_style(
     for property in RESET_STYLE_PROPERTIES {
         active_refresh(runtime, this, property);
     }
+    // The word-break flag is one of the members `resetStyle` copies: the
+    // reference's own bytes are `mov 0x48(%ecx),%al; mov %al,0x49(%ecx)`
+    // (`:1000d5ce-1000d5d9`), and `resetFont` (`:1000d440-1000d579`) never
+    // touches either. A flag no script ever wrote keeps the constructor's
+    // value, so the copy is on like the DLL's.
+    let word_break = state_int(runtime, this, WORD_BREAK_KEY).unwrap_or(WORD_BREAK_DEFAULT);
+    active_store(
+        runtime,
+        this,
+        WORD_BREAK_KEY,
+        Variant::Integer(i64::from(word_break != 0)),
+    );
     Ok(Variant::Void)
 }
 
@@ -3295,6 +3365,63 @@ mod tests {
         // passes (`system/TextRender.tjs`: `t1["end"] = "」』）'"…"` for
         // `autoIndentEndCharacters`).
         assert_eq!(value, "1/b/e/f/l/7/0/1/1/1/1/1/1/1/1/1/1/1/1/1");
+    }
+
+    /// Build A's extra style key (`FUN_10016ff0`/`FUN_100193a0`): `wordbreak`
+    /// reaches the word-break flag from both commands — `setDefault` into the
+    /// stored bool, `setStyle` into the active one — and `resetStyle` carries
+    /// the stored one across (`:1000d5ce-1000d5d9`). Build B has no such key,
+    /// so this is the union the module takes for `render`'s arity; the key is
+    /// not a `setOption` key in either build, and the flag starts on.
+    #[test]
+    fn wordbreak_is_build_as_extra_style_key() {
+        let value = run(
+            r#"
+            var render = new TextRenderBase();
+            var probe = function() {
+                var state;
+                try { state = render.__krkr_text_render; } catch (e) { return "none/none"; }
+                var stored = state.word_break === void ? "none" : "" + state.word_break;
+                var active = state.active === void || state.active.word_break === void
+                    ? "none" : "" + state.active.word_break;
+                return stored + "/" + active;
+            };
+            var before = probe();
+            render.setDefault(%["wordbreak" => 1]);
+            var stored = probe();
+            render.setStyle(%["wordbreak" => 0]);
+            var styled = probe();
+            render.setOption(%["word_break" => 1]);
+            var optioned = probe();
+            render.setDefault(%["wordbreak" => 0]);
+            render.resetStyle();
+            var reset = probe();
+            render.setOption(%["wordbreak" => 1]);
+            var option_only = probe();
+            render.setDefault(%["wordbreak" => 7]);
+            var normalized = probe();
+            return before + "|" + stored + "|" + styled + "|" + optioned + "|" + reset
+                + "|" + option_only + "|" + normalized;
+            "#,
+        );
+        assert_eq!(value, "none/none|1/none|1/0|1/1|0/0|0/0|1/0");
+    }
+
+    /// `resetStyle` copies the stored word-break flag into the active slot even
+    /// when no `setDefault` ever wrote one: the DLL's constructor stores 1
+    /// (`10004840: movb $0x1,0x48(%edi)`), so the copy is on.
+    #[test]
+    fn reset_style_copies_the_constructor_word_break_flag() {
+        let value = run(
+            r#"
+            var render = new TextRenderBase();
+            render.resetStyle();
+            var state = render.__krkr_text_render;
+            return (state.word_break === void ? "none" : "" + state.word_break) + "/"
+                + state.active.word_break;
+            "#,
+        );
+        assert_eq!(value, "none/1");
     }
 
     /// The style keys (`FUN_100022f0`) write the members the `default*`

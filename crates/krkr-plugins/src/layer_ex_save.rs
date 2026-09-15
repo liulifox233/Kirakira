@@ -5,12 +5,12 @@
 //! <https://github.com/wtnbgo/layerExSave>
 //! (`docs/plugins/layer-ex-family.md` §2.4). Two surfaces:
 //!
-//! * **`Layer` class functions** (`utils.cpp:120-512`, `savepng.cpp`,
+//! * **`Layer` class functions** (`utils.cpp:120-583`, `savepng.cpp`,
 //!   `savetlg5.cpp`): `getCropRect`, `getCropRectZero`, `getDiffRect`,
 //!   `getDiffPixel`, `oozeColor`, `copyBlueToAlpha`, `isBlank`,
-//!   `clearAlpha`, `saveLayerImagePng`, `saveLayerImagePngOctet`,
-//!   `saveLayerImageTlg5`. (The compiled names come from the macros' first
-//!   argument — `NCB_ATTACH_FUNCTION(oozeColor, …)`,
+//!   `getAverageColor`, `clearAlpha`, `saveLayerImagePng`,
+//!   `saveLayerImagePngOctet`, `saveLayerImageTlg5`. (The compiled names come
+//!   from the macros' first argument — `NCB_ATTACH_FUNCTION(oozeColor, …)`,
 //!   `NCB_ATTACH_FUNCTION(copyBlueToAlpha, …)` — which is also what
 //!   `manual.tjs` documents; the dossier's `OozeColor`/`CopyBlueToAlpha`
 //!   capitalisation is not what the reference registers.)
@@ -38,9 +38,21 @@
 //! the TLG5 writer feeds its channel composition B, G, R, A, the order the
 //! format defines (`savetlg5.cpp:99-121`).
 //!
+//! `getAverageColor` averages all four bytes of the region and packs the means
+//! the same way — `(buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) |
+//! buffer[3]` — which on this buffer order puts the blue mean in bits 24-31
+//! and the alpha mean in bits 0-7: the `0xAARRGGBB` packing applied to a
+//! B, G, R, A buffer, so the value is that colour with blue and alpha
+//! exchanged. Buffer byte 0 is the blue channel in this file (`utils.cpp:398`,
+//! `:466`), so the reference's own sum and pack (`utils.cpp:556-578`) produce
+//! that rotated value — the shipped krkr2 `bin/win32/plugin/layerExSave.dll`
+//! has the same shape at `0x10012040` (four byte accumulators, the truncating
+//! `fistpll` pair, the `shl $8` packing chain). The port reproduces it — see
+//! [`average_color`].
+//!
 //! # Real vs mapped
 //!
-//! Real: all eight pixel helpers, the PNG writer (`savepng.cpp:111-275`
+//! Real: all nine pixel helpers, the PNG writer (`savepng.cpp:111-275`
 //! structure and error strings), the TLG5 writer (`savetlg5.cpp:16-171`,
 //! including the `TLG0.0` tag container) and the PNG octet form.
 //!
@@ -110,7 +122,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Implemented,
     feature: "Layer.saveLayerImagePng/Tlg5/PngOctet and the crop/diff/ooze/blank helpers; Window.startSaveLayerImage",
-    notes: "A port of layerExSave (utils.cpp:94-512 pixel helpers, savepng.cpp PNG writer, savetlg5.cpp TLG5 writer with the TLG0.0 tags container, Main.cpp:342-346 Window API). PNG and TLG5 are real decodable files (round-tripped through the engine's own loaders in tests); the deflate behind PNG is this module's fixed-Huffman LZ77 because no zlib is linkable from this crate — comp_lv keeps the reference's meaning (0 stores, -1 is zlib's default level 6, 1-9 press harder) while the algorithm differs, and an unprofitable compressed block falls back to stored like zlib. Window.startSaveLayerImage is synchronous (a simplification, not an engine limit: a worker thread could deliver events through System.addContinuousHandler), fires the reference's progress/done events inline with its percentage dedup and keeps the cancel/stop semantics; the reference's background thread and its save-layer clone become a pixel snapshot and the caller's layer object.",
+    notes: "A port of layerExSave (utils.cpp:94-583 pixel helpers, savepng.cpp PNG writer, savetlg5.cpp TLG5 writer with the TLG0.0 tags container, Main.cpp:342-346 Window API). PNG and TLG5 are real decodable files (round-tripped through the engine's own loaders in tests); the deflate behind PNG is this module's fixed-Huffman LZ77 because no zlib is linkable from this crate — comp_lv keeps the reference's meaning (0 stores, -1 is zlib's default level 6, 1-9 press harder) while the algorithm differs, and an unprofitable compressed block falls back to stored like zlib. Window.startSaveLayerImage is synchronous (a simplification, not an engine limit: a worker thread could deliver events through System.addContinuousHandler), fires the reference's progress/done events inline with its percentage dedup and keeps the cancel/stop semantics; the reference's background thread and its save-layer clone become a pixel snapshot and the caller's layer object.",
     install: |engine| engine.register_plugin(LayerExSavePlugin),
 };
 
@@ -150,9 +162,10 @@ impl KrkrPlugin for LayerExSavePlugin {
 
 /// The `Layer` class functions of `utils.cpp`/`savepng.cpp`/`savetlg5.cpp`,
 /// with the reference's own argument checks as the declared counts
-/// (`numparams < 1` for the diff/writers, `< 4` for `isBlank`, `< 1` for
-/// `oozeColor`; `copyBlueToAlpha`/`clearAlpha`/`getCropRect*` take any count
-/// and fail on their first missing argument instead).
+/// (`numparams < 1` for the diff/writers, `< 4` for `isBlank` and
+/// `getAverageColor`, `< 1` for `oozeColor`;
+/// `copyBlueToAlpha`/`clearAlpha`/`getCropRect*` take any count and fail on
+/// their first missing argument instead).
 type LayerFunction = (
     &'static str,
     NativeArgCount,
@@ -183,6 +196,11 @@ static LAYER_FUNCTIONS: &[LayerFunction] = &[
         layer_copy_blue_to_alpha,
     ),
     ("isBlank", NativeArgCount::AtLeast(4), layer_is_blank),
+    (
+        "getAverageColor",
+        NativeArgCount::AtLeast(4),
+        layer_get_average_color,
+    ),
     ("clearAlpha", NativeArgCount::Any, layer_clear_alpha),
     (
         "saveLayerImagePng",
@@ -332,7 +350,7 @@ fn arg_integer(args: &[Variant], index: usize) -> Result<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Crop, diff and blank helpers (utils.cpp:94-512)
+// Crop, diff, blank and average helpers (utils.cpp:94-583)
 // ---------------------------------------------------------------------------
 
 /// `GetCropRect`/`GetCropRectZero` (`utils.cpp:94-165`): scan the layer image
@@ -593,6 +611,74 @@ fn is_blank(
     Ok(true)
 }
 
+/// `getAverageColor(left, top, width, height)` (`utils.cpp:524-583`): the
+/// clipped rectangle's four per-byte means, packed the way the reference packs
+/// them.
+///
+/// The reference's buffer is B, G, R, A (`utils.cpp:398`, `:466`), and the
+/// function adds buffer byte 0 — the blue channel — into the variable it shifts
+/// into bits 24-31, byte 1 (green) into bits 16-23, byte 2 (red) into bits
+/// 8-15 and byte 3 (alpha) into bits 0-7. That is the `0xAARRGGBB` packing
+/// applied to a buffer whose bytes are not in that order, so the value a script
+/// sees carries the blue mean where an `0xAARRGGBB` colour keeps its alpha and
+/// the alpha mean where it keeps its blue. The port reproduces the DLL's
+/// value, not the one the reference's variable names (`a`, `r`, `g`, `b`)
+/// suggest: a game comparing the answer against a colour gets the same integer
+/// the reference produces.
+fn average_color(
+    pixels: &[u8],
+    geometry: Geometry,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> Result<i32> {
+    // The rectangle is clipped into the image, never rejected (`utils.cpp:536-546`).
+    let (mut left, mut top, mut width, mut height) = (left, top, width, height);
+    let image_width = geometry.width.min(i32::MAX as usize) as i32;
+    let image_height = geometry.height.min(i32::MAX as usize) as i32;
+    if left < 0 {
+        width = width.wrapping_add(left);
+        left = 0;
+    }
+    if top < 0 {
+        height = height.wrapping_add(top);
+        top = 0;
+    }
+    let cut = left.wrapping_add(width).wrapping_sub(image_width);
+    if cut > 0 {
+        width -= cut;
+    }
+    let cut = top.wrapping_add(height).wrapping_sub(image_height);
+    if cut > 0 {
+        height -= cut;
+    }
+    if width <= 0 || height <= 0 {
+        return Err(TjsError::runtime("invalid layer range"));
+    }
+    // The reference accumulates in doubles and divides by `width * height`;
+    // with every sum at most 255 * 2^32 the integer division here is the same
+    // quotient, and both truncate toward zero for a non-negative value.
+    let mut sums = [0u64; 4];
+    let mut count = 0u64;
+    for y in top..top.wrapping_add(height) {
+        for x in left..left.wrapping_add(width) {
+            let pixel = geometry.pixel(pixels, x as usize, y as usize);
+            sums[0] += u64::from(pixel[2]);
+            sums[1] += u64::from(pixel[1]);
+            sums[2] += u64::from(pixel[0]);
+            sums[3] += u64::from(pixel[3]);
+            count += 1;
+        }
+    }
+    let mean = |sum: u64| ((sum / count) & 0xff) as u32;
+    let packed =
+        (mean(sums[0]) << 24) | (mean(sums[1]) << 16) | (mean(sums[2]) << 8) | mean(sums[3]);
+    // `*result = (tjs_int)color;` (`utils.cpp:578`): the 32-bit cast sign-extends,
+    // so an average that fills bits 24-31 reaches the script negative.
+    Ok(packed as i32)
+}
+
 /// `clearAlpha` (`utils.cpp:485-510`): every pixel whose alpha is at or below
 /// `threshold` becomes `fillColor & 0xffffff` with a zero alpha byte.
 fn clear_alpha(pixels: &mut [u8], geometry: Geometry, threshold: i64, fill_color: i64) {
@@ -800,6 +886,26 @@ fn layer_is_blank(
     })
     .map_err(|_| TjsError::runtime("src must be Layer."))??;
     Ok(Variant::Integer(i64::from(blank)))
+}
+
+/// `Layer.getAverageColor(left, top, width, height)` (`utils.cpp:524-583`).
+fn layer_get_average_color(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let layer = this_layer(this_obj)?;
+    // `tjs_int left = *param[0];` (`utils.cpp:533-536`): the reference narrows
+    // each parameter to 32 bits, and reads all four before looking at the image.
+    let left = arg_integer(&args, 0)? as i32;
+    let top = arg_integer(&args, 1)? as i32;
+    let width = arg_integer(&args, 2)? as i32;
+    let height = arg_integer(&args, 3)? as i32;
+    let color = layer_bitmap_read(runtime, layer, |view| {
+        average_color(view.pixels, Geometry::read(view), left, top, width, height)
+    })
+    .map_err(|_| TjsError::runtime("src must be Layer."))??;
+    Ok(Variant::Integer(i64::from(color)))
 }
 
 /// `Layer.clearAlpha(threthold=0, fillColor=0)` (`utils.cpp:485-510`).
@@ -2246,6 +2352,7 @@ mod tests {
             "oozeColor",
             "copyBlueToAlpha",
             "isBlank",
+            "getAverageColor",
             "clearAlpha",
             "saveLayerImagePng",
             "saveLayerImagePngOctet",
@@ -2278,6 +2385,7 @@ mod tests {
             "layer.getDiffPixel();",
             "layer.oozeColor();",
             "layer.isBlank(0, 0, 1);",
+            "layer.getAverageColor(0, 0, 1);",
             "layer.saveLayerImagePng();",
             "layer.saveLayerImageTlg5();",
         ] {
@@ -2668,6 +2776,141 @@ mod tests {
                 .expect("integer"),
             1
         );
+    }
+
+    /// `getAverageColor(left, top, width, height)` (`utils.cpp:524-583`): the
+    /// clipped region's four per-byte means, packed the way the reference packs
+    /// them. Its buffer is B, G, R, A (`utils.cpp:398`, `:466`: byte 0 is the
+    /// blue channel), and the function adds byte 0 into the variable it shifts
+    /// into bits 24-31 — so the value a script sees has the blue mean where the
+    /// alpha byte of an `0xAARRGGBB` colour sits, then green, red and finally
+    /// the alpha mean in bits 0-7. The reference's names (`a`, `r`, `g`, `b`)
+    /// read the buffer as A, R, G, B, which is the rotation; this port returns
+    /// what the DLL returns, not what its comments describe.
+    #[test]
+    fn get_average_color_packs_the_reference_channel_order() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "layer.tjs",
+            r#"
+            global.layer = new Layer();
+            layer.setImageSize(3, 1);
+            layer.fillRect(0, 0, 1, 1, 0xff112233);
+            layer.fillRect(1, 0, 1, 1, 0x80405060);
+            layer.fillRect(2, 0, 1, 1, 0x000000ff);
+            "#,
+        );
+        let average = |engine: &mut KrkrEngine, call: &str| -> i64 {
+            engine
+                .execute_expression("average.tjs", call)
+                .expect("getAverageColor")
+                .to_integer()
+                .expect("integer")
+        };
+        // One pixel: A 0xff, R 0x11, G 0x22, B 0x33 — the blue mean lands on
+        // top, the alpha mean at the bottom.
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(0, 0, 1, 1)"),
+            0x332211ff
+        );
+        // A blue mean of 0x80 or more fills bits 24-31, and the reference casts
+        // the DWORD to the 32-bit `tjs_int`, so the script sees a negative
+        // integer (`utils.cpp:578`).
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(2, 0, 1, 1)"),
+            -16_777_216,
+            "0xff000000 as a signed 32-bit integer"
+        );
+        // Two pixels: (0x33 + 0x60) / 2 = 0x49 blue, (0x22 + 0x50) / 2 = 0x39
+        // green, (0x11 + 0x40) / 2 = 0x28 red and (0xff + 0x80) / 2 = 0xbf
+        // alpha, every mean truncated toward zero like the reference's
+        // `(DWORD)` cast of the double quotient.
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(0, 0, 2, 1)"),
+            0x493928bf
+        );
+        // The whole row, one pixel of it fully transparent: the alpha channel
+        // participates in the average too, and every mean floors
+        // (402/3 = 134, 383/3 = 127).
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(0, 0, 3, 1)"),
+            -2_044_322_945
+        );
+    }
+
+    /// The floor and the rectangle handling of `getAverageColor`
+    /// (`utils.cpp:526-553`): four parameters are the reference's own check,
+    /// the rectangle is clipped to the image first and only a rectangle that
+    /// collapses throws, and the parameters narrow to `tjs_int`.
+    #[test]
+    fn get_average_color_clips_its_rectangle() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "layer.tjs",
+            r#"
+            global.layer = new Layer();
+            layer.setImageSize(2, 1);
+            layer.fillRect(0, 0, 1, 1, 0xff112233);
+            layer.fillRect(1, 0, 1, 1, 0x80405060);
+            "#,
+        );
+        let average = |engine: &mut KrkrEngine, call: &str| -> i64 {
+            engine
+                .execute_expression("average.tjs", call)
+                .expect("getAverageColor")
+                .to_integer()
+                .expect("integer")
+        };
+        // `numparams < 4` is `TJS_E_BADPARAMCOUNT`.
+        for call in [
+            "layer.getAverageColor();",
+            "layer.getAverageColor(0, 0, 1);",
+        ] {
+            let error = engine.execute_script("bad.tjs", call).expect_err(call);
+            assert_eq!(
+                error.kind,
+                krkr_tjs2::TjsErrorKind::BadParamCount,
+                "{call}: {error:?}"
+            );
+        }
+        // A negative origin re-anchors the rectangle at 0 and subtracts the
+        // overlap from the width (`if (left < 0) { width += left; left = 0; }`),
+        // so this is the single pixel at (0, 0).
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(-1, 0, 2, 1)"),
+            0x332211ff
+        );
+        // An overlap past the right edge is cut off, not rejected.
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(1, 0, 2, 1)"),
+            0x60504080
+        );
+        // A rectangle that collapses throws (`utils.cpp:550`).
+        for call in [
+            "layer.getAverageColor(0, 0, 0, 1);",
+            "layer.getAverageColor(0, 0, 1, 0);",
+            "layer.getAverageColor(2, 0, 1, 1);",
+            "layer.getAverageColor(-3, 0, 2, 1);",
+        ] {
+            let error = engine.execute_script("bad.tjs", call).expect_err(call);
+            assert_eq!(error.message, "invalid layer range", "{call}");
+        }
+        // `tjs_int left = *param[0]` truncates a real toward zero.
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(0.9, 0.9, 1.9, 1.9)"),
+            0x332211ff
+        );
+        // A layer whose image was freed takes the reference's buffer-lookup
+        // failure (`GetLayerBufferAndSize` sees `hasImage` 0, `utils.cpp:56-68`).
+        let error = engine
+            .execute_script(
+                "bad.tjs",
+                "var empty = new Layer(); empty.freeImage(); empty.getAverageColor(0, 0, 1, 1);",
+            )
+            .expect_err("no image");
+        assert_eq!(error.message, "src must be Layer.");
     }
 
     /// `clearAlpha` (`utils.cpp:485-510`): pixels at or below the threshold

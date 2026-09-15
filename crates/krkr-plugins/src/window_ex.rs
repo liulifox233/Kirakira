@@ -101,6 +101,52 @@
 //!   `Scripts.eval` and routes it through `TVPExecuteExpression` when
 //!   `setEvalErrorLog(false)` is in effect (`main.cpp:2118-2129`).
 //!
+//! None of them can be backed from this module alone: every one needs
+//! `crates/krkr-engine` to grow a host-facing piece, and the shapes below are
+//! the smallest ones that make the member real. They are not a theoretical
+//! surface either — PARQUET's own `system/MainWindow.tjs` calls
+//! `System.getCursorPos`, `getDisplayMonitors` and `getMonitorInfo` (and its
+//! `system/Menus.tjs` / `main.xp3:uisystem.tjs` call `maximize`, `minimize`
+//! and `showRestore`), so the gaps are live for shipped content:
+//!
+//! * **cursor** — widen `KrkrHost::cursor_position` / `set_cursor_position`
+//!   (`host.rs:1416-1422`, `pub(crate)` today) to `pub`. The point the engine
+//!   stores is the frame's client-space `CursorMoved` position
+//!   (`engine.rs:1978`, `:2122`), so the exposed view has to be in desktop
+//!   coordinates like the reference's `GetCursorPos` — the shell can add the
+//!   main window's `left`/`top` (`host.rs:1976`), which it already keeps in
+//!   desktop coordinates. `System.getCursorPos` then answers the `%[x, y]`
+//!   dictionary (`main.cpp:1896-1908`) and `setCursorPos` its boolean, with
+//!   `false` — the reference's failed `SetCursorPos` — wherever the host
+//!   cannot move the OS cursor.
+//! * **monitors** — a `pub fn monitors(&self) -> Vec<MonitorSnapshot>`
+//!   (`name`, `primary`, monitor rect, work rect) fed from the shell's
+//!   `winit::monitor` list; `System.getDisplayMonitors` / `getMonitorInfo`
+//!   map onto it (`main.cpp:1782-1893`).
+//! * **desktop window operations** — a `pub fn window_action(&mut self,
+//!   window: ObjectHandle, action: WindowAction) -> bool` the shell drains,
+//!   the pattern `take_external_resource_requests` (`host.rs:1273`) already
+//!   uses, plus `pub fn window_state(&self, window: ObjectHandle) ->
+//!   WindowState` for `maximized`/`minimized` and the two box flags. Their
+//!   initial values come from the window style the reference creates —
+//!   `WS_OVERLAPPEDWINDOW`, i.e. `WS_MAXIMIZEBOX`/`WS_MINIMIZEBOX` on — which
+//!   is also why a window-less port answering 0 is a value the reference would
+//!   not produce for a live game window.
+//! * **icons** — the same action channel carrying a decoded icon; the `.ico`
+//!   decoder can live on either side, the window update cannot.
+//! * **message channel** — a `pub fn push_window_event(&mut self,
+//!   WindowEvent) -> Result<()>` the shell calls from its window-event loop,
+//!   dispatching the names tabulated in [`WINDOW_EX_EVENTS`] and reaching
+//!   `setMessageHook`'s bit hooks.
+//! * **`Pad` class** — a `Pad` native class in `native/classes.rs` (krkr2
+//!   `src/core/utils/PadIntf.cpp`), installed through `install_native_class`
+//!   (`classes.rs:43`); `install_pad_ex` above attaches `registerExEvent` as
+//!   soon as the global exists.
+//! * **`Debug.console`** — the object belongs to console.dll, not to windowEx:
+//!   neither shipped game ships console.dll, so the reference has no
+//!   `Debug.console` for this content either, and backing its seven functions
+//!   is a console-window emulation rather than a windowEx change.
+//!
 //! Nothing here is invented: a member the engine cannot back either keeps the
 //! reference's value for a window-less object or is absent with the
 //! capability named in [`META`]. The few places where this port answers a
