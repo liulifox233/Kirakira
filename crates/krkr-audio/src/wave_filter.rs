@@ -94,10 +94,12 @@ pub trait WaveFilter: Send + Sync {
     /// The returned format is folded into the chain, and it has to be the one
     /// the filter was connected with: this port's render path is fixed (stereo
     /// at the sound's own rate — the filters re-design themselves at connect
-    /// time instead of resampling), so a filter that answers a different
-    /// sample rate or channel count is refused by [`WaveFilterChain::build`],
-    /// released, and reported (the reference would hand the narrower format
-    /// on).  An `Err` is the reference's refusal to connect —
+    /// time and do not convert), so a filter that answers a different sample
+    /// rate or channel count is refused by [`WaveFilterChain::build`],
+    /// released, and reported.  The reference keeps such a filter (DirectSound
+    /// converts for it, see [`WaveFilterChain::spec`]), so that refusal is an
+    /// accepted divergence, not a faithful reading.  An `Err` is the
+    /// reference's refusal to connect —
     /// the shipped `wfBasicEffect.dll` throws `HiRes format not supported.`
     /// for a format wider than 32 bits or with more than four channels, and
     /// `Cannot connect multiple wave sound buffer at once.` when a second
@@ -236,10 +238,12 @@ impl WaveFilterChain {
                 }
                 // The render path is fixed: two channels (kira's `Frame` is a
                 // stereo pair and the decoder publishes stereo units) at the
-                // sound's own rate.  The reference would resample the format
-                // through its own buffer and hand the narrower one on; here a
-                // filter that answers a different format is refused, and the
-                // refusal names which half changed.
+                // sound's own rate — a filter here cannot convert.  The
+                // reference hands the narrower format on: its DirectSound
+                // secondary buffer is created in the chain's `InputFormat`
+                // (`sound/win32/WaveImpl.cpp:2938`) and DirectSound's own mixer
+                // converts.  Refusing is this port's accepted divergence for
+                // that capability, so the refusal names which half changed.
                 Ok(next) => {
                     // `recreate` connected the filter and may hold what that
                     // claims (the one-source rule): a filter the chain leaves
@@ -257,9 +261,12 @@ impl WaveFilterChain {
                     });
                 }
                 Err(reason) => {
-                    // Same release: a filter that refuses may still hold what
-                    // its `recreate` claimed.
-                    filter.clear();
+                    // No release here, deliberately: a filter that answers
+                    // `Err` owns the claim it took — the shipped filters
+                    // release before every `Err` they raise — and the one-source
+                    // `Err` is raised *while another chain holds the claim*, so
+                    // clearing it here would free that other chain's filter and
+                    // let a third chain drive a filter that is still playing.
                     skipped.push(WaveFilterSkip { id: *id, reason });
                 }
             }
@@ -278,11 +285,14 @@ impl WaveFilterChain {
     ///
     /// This port's render path is fixed (stereo at the sound's own rate: the
     /// decoder hands the buffer stereo units and kira resamples for the
-    /// device), and a filter cannot resample inside the chain, so the value is
-    /// always the sound's format: a filter that answers a different one is
+    /// device), and a filter cannot convert inside the chain, so the value is
+    /// always the sound's format.  A filter that answers a different one is
     /// refused at build time — [`WaveFilterChain::build`] releases it and
-    /// reports the refusal in its skips — where the reference would accept the
-    /// narrower format and resample.
+    /// reports the refusal in its skips.  The reference instead keeps such a
+    /// filter: its DirectSound secondary buffer is created in the chain's
+    /// `InputFormat` and DirectSound's mixer converts
+    /// (`sound/win32/WaveImpl.cpp:2938`), so refusing is an **accepted
+    /// divergence** for a capability this pipeline does not have.
     pub const fn spec(&self) -> PcmAudioSpec {
         self.spec
     }
@@ -601,6 +611,68 @@ mod tests {
             );
             unregister_wave_filter(id);
         }
+    }
+
+    /// A refused chain must not free a claim it never took.  `recreate`
+    /// answers `Err` while *another* chain holds the filter (chain A is still
+    /// playing it), so releasing on `Err` would drop chain A's claim — and a
+    /// third chain would then connect a filter that is still playing.  The
+    /// three-chain sequence is what makes that visible: A connects, B is
+    /// refused, **C is still refused while A lives**, and only dropping A
+    /// frees the filter.
+    #[test]
+    fn a_refused_chain_does_not_free_the_claim() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Claiming {
+            connected: AtomicBool,
+        }
+
+        impl WaveFilter for Claiming {
+            fn recreate(&self, spec: PcmAudioSpec) -> std::result::Result<PcmAudioSpec, String> {
+                if self.connected.swap(true, Ordering::SeqCst) {
+                    // The one-source refusal, raised while the other chain
+                    // holds the claim — and (like the shipped filters) without
+                    // releasing what this call did not take.
+                    return Err("Cannot connect multiple wave sound buffer at once.".to_string());
+                }
+                Ok(spec)
+            }
+            fn clear(&self) {
+                self.connected.store(false, Ordering::SeqCst);
+            }
+            fn update(&self) {}
+            fn reset(&self) {}
+            fn process(&self, _frames: &mut [f32]) {}
+        }
+
+        let id = register_wave_filter(Arc::new(Claiming {
+            connected: AtomicBool::new(false),
+        }));
+        let refused = "Cannot connect multiple wave sound buffer at once.";
+
+        // A connects.
+        let (a, skipped) = WaveFilterChain::build(&[id.raw()], spec());
+        assert_eq!(a.len(), 1, "the first chain connects: {skipped:?}");
+
+        // B is refused — and must leave A's claim alone.
+        let (b, skipped) = WaveFilterChain::build(&[id.raw()], spec());
+        assert!(b.is_empty(), "the second chain must not connect");
+        assert_eq!(skipped[0].reason, refused);
+
+        // C, while A is still alive, is refused for the same reason: a chain
+        // that never took the claim must not have freed it.
+        let (c, skipped) = WaveFilterChain::build(&[id.raw()], spec());
+        assert!(
+            c.is_empty(),
+            "a third chain must not connect a filter the first one is driving"
+        );
+        assert_eq!(skipped[0].reason, refused);
+
+        // Dropping A releases it (`Clear`), so the next chain connects.
+        drop(a);
+        let (d, skipped) = WaveFilterChain::build(&[id.raw()], spec());
+        assert_eq!(d.len(), 1, "the dropped chain released it: {skipped:?}");
     }
 
     /// The chain releases a filter it refuses.  A filter takes its one-source
