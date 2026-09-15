@@ -190,7 +190,7 @@ pub(crate) const ARRAY_METHOD_NAMES: &[&str] = &[
 /// `krkr-tjs2/src/runtime/builtins.rs:39-50`), so every key is data. The
 /// reference skips a dictionary member only when it carries the
 /// `TJS_HIDDENMEMBER` flag, which no dictionary key here does — filtering by
-/// name would silently drop real fields such as `%[count => 1]`, and it would
+/// name would silently drop real fields such as `%["count" => 1]`, and it would
 /// disagree with `getObjectCount`, which counts them. Array instances and
 /// engine-owned native objects do carry built-in method members, and
 /// `__`-prefixed names are host bookkeeping in every case, so those are
@@ -727,7 +727,7 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var data = %[first => 1, second => 2];\n\
+                     var data = %[\"first\" => 1, \"second\" => 2];\n\
                      var keys = Scripts.getObjectKeys(data);\n\
                      keys.sort();\n\
                      var plain = function() {};\n\
@@ -818,11 +818,11 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var data = %[count => 1, length => 2, save => 3];\n\
+                     var data = %[\"count\" => 1, \"length\" => 2, \"save\" => 3];\n\
                      var keys = Scripts.getObjectKeys(data);\n\
                      keys.sort();\n\
                      var copy = Scripts.clone(data);\n\
-                     Scripts.foreach(%[count => 9], function(key, value) {\n\
+                     Scripts.foreach(%[\"count\" => 9], function(key, value) {\n\
                          global.__seenKey = key + \"=\" + value;\n\
                      });\n\
                      var arrayKeys = Scripts.getObjectKeys([\"a\", \"b\"]);\n\
@@ -854,7 +854,7 @@ mod tests {
         );
 
         let error = engine
-            .execute_expression("inline.tjs", "Scripts.getMD5HashString(%[a => 1])")
+            .execute_expression("inline.tjs", "Scripts.getMD5HashString(%[\"a\" => 1])")
             .expect_err("a dictionary has no digest");
         assert!(
             error.message.contains("requires an octet"),
@@ -872,7 +872,7 @@ mod tests {
             "Scripts.getObjectCount()",
             "Scripts.getObjectContext()",
             "Scripts.isNullContext()",
-            "Scripts.foreach(%[a => 1])",
+            "Scripts.foreach(%[\"a\" => 1])",
             "Scripts.getMD5HashString()",
         ] {
             let error = engine
@@ -891,8 +891,8 @@ mod tests {
                 "inline.tjs",
                 "(function() {\n\
                      var out = \"\";\n\
-                     out += Scripts.equalStruct(%[a => 1, b => 2], %[a => 1, c => 3]);\n\
-                     out += \":\" + Scripts.equalStruct(%[a => 1], %[]);\n\
+                     out += Scripts.equalStruct(%[\"a\" => 1, \"b\" => 2], %[\"a\" => 1, \"c\" => 3]);\n\
+                     out += \":\" + Scripts.equalStruct(%[\"a\" => 1], %[]);\n\
                      out += \":\" + Scripts.equalStruct([1, 2], [1, 2]);\n\
                      out += \":\" + Scripts.equalStruct([1, 2], [1, 3]);\n\
                      out += \":\" + Scripts.equalStruct(1, 1.0);\n\
@@ -920,7 +920,7 @@ mod tests {
                      Scripts.foreach([\"a\", \"b\"], function(key, value) {\n\
                          global.__seen += key + \"=\" + value + \";\";\n\
                      });\n\
-                     var data = %[x => 1, y => 2];\n\
+                     var data = %[\"x\" => 1, \"y\" => 2];\n\
                      var stop = Scripts.foreach(data, function(key, value) {\n\
                          global.__keys += key;\n\
                          if (key == \"x\") return \"stopped\";\n\
@@ -967,7 +967,7 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var source = %[nested => [1, %[value => 2]]];\n\
+                     var source = %[\"nested\" => [1, %[\"value\" => 2]]];\n\
                      var copy = Scripts.clone(source);\n\
                      copy.nested[0] = 9;\n\
                      copy.nested[1].value = 7;\n\
@@ -1014,7 +1014,7 @@ mod tests {
         let value = engine
             .execute_expression(
                 "inline.tjs",
-                "(function() { Scripts.rehash(%[a => 1]); return \"ok\"; })()",
+                "(function() { Scripts.rehash(%[\"a\" => 1]); return \"ok\"; })()",
             )
             .expect("rehash");
         assert_eq!(value, Variant::String("ok".to_string()));

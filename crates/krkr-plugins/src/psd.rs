@@ -3083,7 +3083,7 @@ mod tests {
              try { psd.getLayerType(0); texts.add(\"ok\"); } catch (e) { texts.add(e.message); }\n\
              psd.load(\"fixture.psd\");\n\
              try { psd.getLayerType(9); texts.add(\"ok\"); } catch (e) { texts.add(e.message); }\n\
-             try { psd.getLayerData(%[not => \"a layer\"], 0); texts.add(\"ok\"); } catch (e) { texts.add(e.message); }\n\
+             try { psd.getLayerData(%[\"not\" => \"a layer\"], 0); texts.add(\"ok\"); } catch (e) { texts.add(e.message); }\n\
              try { psd.getLayerData(null, 0); texts.add(\"ok\"); } catch (e) { texts.add(e.message); }\n\
              try { psd.getLayerData(psd, 0); texts.add(\"ok\"); } catch (e) { texts.add(e.message); }\n\
              global.window = new Window();\n\

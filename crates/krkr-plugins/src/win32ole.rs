@@ -1280,11 +1280,11 @@ mod tests {
         let error = eval_error(&mut engine, "ole.missing()");
         assert_eq!(error.kind, TjsErrorKind::BadParamCount);
         assert_eq!(
-            eval(&mut engine, "ole.missing(0, \"answer\", %[value => 0])"),
+            eval(&mut engine, "ole.missing(0, \"answer\", %[\"value\" => 0])"),
             Variant::Integer(0)
         );
         assert_eq!(
-            eval(&mut engine, "ole.missing(1, \"answer\", %[value => 1])"),
+            eval(&mut engine, "ole.missing(1, \"answer\", %[\"value\" => 1])"),
             Variant::Integer(0)
         );
     }

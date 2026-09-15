@@ -165,7 +165,7 @@ fn instance_style_calls_are_member_not_found() {
     assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
     assert_eq!(error.message, "Member \"clear\" does not exist");
 
-    let error = failure("var d = new Dictionary(); d.assign(%[a => 1], 1);");
+    let error = failure("var d = new Dictionary(); d.assign(%[\"a\" => 1], 1);");
     assert_eq!(error.kind, TjsErrorKind::MemberNotFound);
     assert_eq!(error.message, "Member \"assign\" does not exist");
 
@@ -209,8 +209,8 @@ fn assign_clears_the_destination_before_copying() {
         run(
             "dictionary.tjs",
             r#"
-            var dest = %[stale => 1, shared => 1];
-            (Dictionary.assign incontextof dest)(%[shared => 2, fresh => 3], 1);
+            var dest = %["stale" => 1, "shared" => 1];
+            (Dictionary.assign incontextof dest)(%["shared" => 2, "fresh" => 3], 1);
             return (dest.stale === void) + ":" + dest.shared + ":" + dest.fresh;
             "#,
         ),
@@ -221,8 +221,8 @@ fn assign_clears_the_destination_before_copying() {
         run(
             "dictionary.tjs",
             r#"
-            var dest = %[stale => 1, shared => 1];
-            (Dictionary.assign incontextof dest)(%[shared => 2, fresh => 3], 0);
+            var dest = %["stale" => 1, "shared" => 1];
+            (Dictionary.assign incontextof dest)(%["shared" => 2, "fresh" => 3], 0);
             return dest.stale + ":" + dest.shared + ":" + dest.fresh;
             "#,
         ),
@@ -233,10 +233,10 @@ fn assign_clears_the_destination_before_copying() {
         run(
             "dictionary.tjs",
             r#"
-            var dest = %[stale => 1];
-            (Dictionary.assign incontextof dest)(%[a => 1]);
-            var second = %[stale => 1];
-            (Dictionary.assign incontextof second)(%[a => 1], void);
+            var dest = %["stale" => 1];
+            (Dictionary.assign incontextof dest)(%["a" => 1]);
+            var second = %["stale" => 1];
+            (Dictionary.assign incontextof second)(%["a" => 1], void);
             return (dest.stale === void) + ":" + (second.stale === void);
             "#,
         ),
@@ -254,7 +254,7 @@ fn assign_copies_keys_that_are_named_like_builtin_members() {
         run(
             "dictionary.tjs",
             r#"
-            var src = %[clear => "yes", assign => "no", count => 7, add => 8, length => 9];
+            var src = %["clear" => "yes", "assign" => "no", "count" => 7, "add" => 8, "length" => 9];
             var dest = %[];
             (Dictionary.assign incontextof dest)(src, 1);
             return dest.clear + ":" + dest.assign + ":" + dest.count + ":" +
@@ -283,7 +283,7 @@ fn assign_copies_keys_that_are_named_like_builtin_members() {
         run(
             "dictionary.tjs",
             r#"
-            var src = %[clear => "true", page => "back"];
+            var src = %["clear" => "true", "page" => "back"];
             var list = [];
             list.assign(src);
             return list.count + ":" + list[0] + "=" + list[1] + ":" + list[2] + "=" + list[3];
@@ -301,7 +301,7 @@ fn the_class_surface_does_not_leak_into_copies_or_arrays() {
         run(
             "dictionary.tjs",
             r#"
-            var src = %[answer => 42];
+            var src = %["answer" => 42];
             var dest = %[];
             (Dictionary.assign incontextof dest)(src, 1);
             return typeof dest.assign + ":" + typeof dest.clear + ":" +
@@ -314,7 +314,7 @@ fn the_class_surface_does_not_leak_into_copies_or_arrays() {
         run(
             "dictionary.tjs",
             r#"
-            var src = %[answer => 42];
+            var src = %["answer" => 42];
             var list = [];
             list.assign(src);
             return list.count + ":" + list[0] + ":" + list[1];
@@ -333,7 +333,7 @@ fn assign_from_an_array_reads_name_value_pairs() {
         run(
             "dictionary.tjs",
             r#"
-            var dest = %[stale => 1];
+            var dest = %["stale" => 1];
             (Dictionary.assign incontextof dest)(["a", 1, "b", 2], 1);
             return (dest.stale === void) + ":" + dest.a + ":" + dest.b;
             "#,
@@ -373,7 +373,7 @@ fn assign_to_itself_empties_the_destination() {
         run(
             "dictionary.tjs",
             r#"
-            var d = %[a => 1, b => 2];
+            var d = %["a" => 1, "b" => 2];
             (Dictionary.assign incontextof d)(d, 1);
             return (d.a === void) + ":" + (d.b === void);
             "#,
@@ -384,17 +384,17 @@ fn assign_to_itself_empties_the_destination() {
 
 #[test]
 fn assign_argument_errors_match_the_reference() {
-    let error = failure("(Dictionary.assign incontextof %[a => 1])();");
+    let error = failure("(Dictionary.assign incontextof %[\"a\" => 1])();");
     assert_eq!(error.kind, TjsErrorKind::BadParamCount);
     assert_eq!(error.message, "Invalid argument count");
 
-    let error = failure("(Dictionary.assign incontextof %[a => 1])(void, 1);");
+    let error = failure("(Dictionary.assign incontextof %[\"a\" => 1])(void, 1);");
     assert_eq!(error.message, "Accessing to null object");
 
-    let error = failure("(Dictionary.assign incontextof %[a => 1])(null, 1);");
+    let error = failure("(Dictionary.assign incontextof %[\"a\" => 1])(null, 1);");
     assert_eq!(error.message, "Accessing to null object");
 
-    let error = failure("(Dictionary.assign incontextof %[a => 1])(5, 1);");
+    let error = failure("(Dictionary.assign incontextof %[\"a\" => 1])(5, 1);");
     assert_eq!(error.message, "Accessing to null object");
 }
 
@@ -403,7 +403,7 @@ fn calling_the_class_object_reports_a_native_class_crash() {
     // `TJS_GET_NATIVE_INSTANCE` reads the native instance off `objthis`; the
     // class object has none, so the reference reports
     // `TJS_E_NATIVECLASSCRASH` instead of mutating the class.
-    let error = failure("Dictionary.assign(%[a => 1], 1);");
+    let error = failure("Dictionary.assign(%[\"a\" => 1], 1);");
     assert_eq!(error.kind, TjsErrorKind::NativeClassCrash);
     assert_eq!(error.message, "Invalid object context");
 
@@ -426,7 +426,7 @@ fn clear_empties_the_dictionary_and_keeps_the_class_intact() {
         run(
             "dictionary.tjs",
             r#"
-            var d = %[a => 1, b => 2];
+            var d = %["a" => 1, "b" => 2];
             (Dictionary.clear incontextof d)();
             return (d.a === void) + ":" + (d.b === void) + ":" + typeof Dictionary.clear;
             "#,
@@ -439,7 +439,7 @@ fn clear_empties_the_dictionary_and_keeps_the_class_intact() {
         run(
             "dictionary.tjs",
             r#"
-            var d = %[a => 1];
+            var d = %["a" => 1];
             (Dictionary.clear incontextof d)();
             return (d.clear === void) + ":" + (d.assign === void);
             "#,
@@ -457,9 +457,9 @@ fn assign_struct_copies_data_members_including_method_named_keys() {
         run(
             "dictionary.tjs",
             r#"
-            var src = %[answer => 42];
+            var src = %["answer" => 42];
             src.clear = "kept";
-            var dest = %[stale => 1];
+            var dest = %["stale" => 1];
             (Dictionary.assignStruct incontextof dest)(src);
             return (dest.stale === void) + ":" + dest.answer + ":" + dest.clear +
                 ":" + (dest.assign === void);
@@ -475,7 +475,7 @@ fn assign_struct_copies_data_members_including_method_named_keys() {
             "dictionary.tjs",
             r#"
             var dest = %[];
-            (Dictionary.assignStruct incontextof dest)(%[nested => %[a => 1]]);
+            (Dictionary.assignStruct incontextof dest)(%["nested" => %["a" => 1]]);
             return dest.nested.a;
             "#,
         ),
@@ -547,7 +547,7 @@ fn kagex_attribute_chain_reaches_the_free_arm() {
                 }
             }
             var handler = new Handler();
-            return handler.onTag(%[free => "true", page => "back"]) +
+            return handler.onTag(%["free" => "true", "page" => "back"]) +
                 ":" + handler.arm + ":" + handler.reached;
             "#,
         ),
@@ -561,7 +561,7 @@ fn kagex_attribute_chain_reaches_the_free_arm() {
             r#"
             var arm = "none";
             var dict = new Dictionary();
-            (Dictionary.assign incontextof dict)(%[clear => "true"], 1);
+            (Dictionary.assign incontextof dict)(%["clear" => "true"], 1);
             if (dict.uiload) { arm = "uiload"; }
             else if (dict.position) { arm = "position"; }
             else if (dict.current) { arm = "current"; }
@@ -724,10 +724,10 @@ fn dictionary_creation_size_changes_the_order() {
         Variant::String("e2,1,e,1,c,1,l2,1,a,1,b,1,w2,1,y2,1".into()),
         "an inline dictionary literal is `new Dictionary()` with no arguments"
     );
-    // The literal's own entries are inserted at construction, so `%[e2 => 1]`
+    // The literal's own entries are inserted at construction, so `%["e2" => 1]`
     // puts `e2` into the slot before the scripted `data.e = 1` runs.
     assert_eq!(
-        build("%[e2 => 1]"),
+        build("%[\"e2\" => 1]"),
         Variant::String("e,1,e2,1,c,1,l2,1,a,1,b,1,w2,1,y2,1".into())
     );
 }

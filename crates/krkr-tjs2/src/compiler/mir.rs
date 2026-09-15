@@ -3316,13 +3316,25 @@ impl ObjectBuilder {
                 }
             }
             syntax::ExprKind::Dictionary(entries) | syntax::ExprKind::ConstDictionary(entries) => {
+                // A dictionary element *evaluates* its key: `dic_elm` is
+                // `expr_no_comma "," expr_no_comma` (`syntax/tjs.y:799`) and
+                // `T_DICELM` compiles `(*node)[0]` and then emits
+                // `VM_SPIS %object.%name, %value` with the register that holds
+                // the key's value (`tjsInterCodeGen.cpp:2461-2472`).  A bare
+                // identifier is therefore a variable read, not a name: the
+                // `=>` spelling of the separator lexes as `T_COMMA`
+                // (`tjsLex.cpp:1367`, "just a replacement for comma, like
+                // perl"), so `%[ tag => name ]` is `{ <value of tag>:
+                // <value of name> }` -- PARQUET's name template builds its
+                // `${name}` key exactly that way (`LangNameBrackets` passes
+                // `tag = "name"`).  Only the literal forms are direct: the
+                // colon production wraps its symbol in a constant string node
+                // (`tjs.y:800-803`, which the parser rewrites into
+                // `ExprKind::String`), and a string key evaluates to itself.
                 let mut plan = Vec::with_capacity(entries.len());
                 let mut value_count = 0;
                 for entry in entries {
                     match &entry.key.kind {
-                        syntax::ExprKind::Identifier(name) => {
-                            plan.push(DictionaryKeyPlan::Direct(lowerer.intern_string(&name.name)));
-                        }
                         syntax::ExprKind::String(name) => {
                             plan.push(DictionaryKeyPlan::Direct(lowerer.intern_string(name)));
                         }
@@ -3336,10 +3348,7 @@ impl ObjectBuilder {
                 tasks.push(ExprTask::BuildDictionary { plan, value_count });
                 for entry in entries.iter().rev() {
                     tasks.push(ExprTask::Expr(&entry.value));
-                    if !matches!(
-                        &entry.key.kind,
-                        syntax::ExprKind::Identifier(_) | syntax::ExprKind::String(_)
-                    ) {
+                    if !matches!(&entry.key.kind, syntax::ExprKind::String(_)) {
                         tasks.push(ExprTask::Expr(&entry.key));
                     }
                 }
