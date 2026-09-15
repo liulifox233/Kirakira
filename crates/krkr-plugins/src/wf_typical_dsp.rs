@@ -217,21 +217,31 @@
 //! (that is a second RE pass on the 1.1 MB image), so those two prototypes are
 //! computed numerically here.
 //!
-//! **Not reachable from the audio path yet**: like `wfBasicEffect`, nothing in
-//! the engine consumes `WaveSoundBuffer.filters` or carries a filter chain
-//! through `AudioCommand`, so the filters run through their Rust `process`
-//! entry points only, and `interface` answers a sentinel integer rather than
-//! the reference's raw pointer. The missing seam is filed as a finding.
+//! **How a filter reaches the audio path**: like `wfBasicEffect`, the three
+//! constructors register their chain with the audio backend
+//! (`krkr_audio::register_wave_filter`) and `interface` publishes that
+//! registration id, which is what the engine reads out of
+//! `WaveSoundBuffer.filters` at `open` and what the backend resolves back to
+//! this object — `recreate` when the chain connects, `reset` at playback
+//! start, `process` per decoded unit (`iTVPBasicWaveFilter`,
+//! `sound/WaveIntf.h:130-137`).  The id is per instance and stable; the
+//! reference's raw pointer has no stand-in here.
 
-// The designer and its processing entry points are the module's contract:
-// nothing calls them until the `WaveSoundBuffer` filter chain exists, and the
-// numeric tests drive them directly. `result_large_err` is the crate-wide
+// The designer and its processing entry points are the module's contract: the
+// engine's chain calls them through `SharedFilter` (see the module docs) and
+// the numeric tests drive them directly. `result_large_err` is the crate-wide
 // `TjsError` size lint every native callback carries.
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
@@ -253,8 +263,10 @@ pub(crate) const META: PluginMeta = PluginMeta {
             shelf responses answer a clear error instead of a wrong filter (see the module docs). \
             The class installs on the `WaveSoundBuffer` class object like the reference \
             (`WaveSoundBuffer.WaveDSPFilter`, the binder's base — PARQUET's voiceeffect.tjs reads \
-            it there). The engine has no per-buffer filter chain yet, so the filter runs through \
-            its Rust `process` entry point only and `interface` answers a sentinel integer.",
+            it there), it consumes the constructor arguments the DLL's class entry reads, and \
+            each live filter registers its chain with the audio backend so the engine's \
+            `WaveSoundBuffer.filters` chain drives it while the buffer plays; `interface` answers \
+            that registration id (the port's stand-in for the raw `iTVPBasicWaveFilter*`).",
     install: |engine| engine.register_plugin(WfTypicalDspPlugin),
 };
 
@@ -269,17 +281,12 @@ impl KrkrPlugin for WfTypicalDspPlugin {
         install_wf_typical_dsp(runtime);
         runtime
             .host_mut()
-            .log("wfTypicalDSP.dll registered: WaveDSPFilter (designer local; no engine filter chain yet)");
+            .log("wfTypicalDSP.dll registered: WaveDSPFilter (driven by WaveSoundBuffer.filters)");
         Ok(())
     }
 }
 
 const PLUGIN_NAME: &str = "wfTypicalDSP.dll";
-
-/// The sentinel `interface` answers with (see the `wfBasicEffect` module: a
-/// Rust engine resolves the filter by object identity instead of publishing a
-/// raw `iTVPBasicWaveFilter*`).
-const INTERFACE_SENTINEL: i64 = 0x5746_0101;
 
 /// The sample rate behind slot 0 of the positional `setParams` form. The
 /// reference's default is `ParamInfo::defaultSampleRateParam()`'s
@@ -1836,10 +1843,122 @@ impl WaveDspState {
     }
 }
 
+/// One filter as the audio backend sees it: the designed chain behind a lock,
+/// plus the format the chain connected it with.
+///
+/// The reference hands the engine the filter object's address
+/// (`iTVPBasicWaveFilter*`, `sound/WaveIntf.h:130`); this is the Rust stand-in —
+/// an `Arc` the engine's chain holds through the id the class publishes from
+/// `interface`, shared with the script-side setters that re-design the same
+/// chain under the same lock.
+struct SharedFilter {
+    state: Mutex<FilterState>,
+    /// Whether a live chain holds this filter: the same one-source rule the
+    /// sibling `wfBasicEffect` port enforces (its DLL's adapter throws
+    /// [`MULTIPLE_BUFFER_ERROR`](crate::wf_basic_effect::MULTIPLE_BUFFER_ERROR)),
+    /// released when the chain drops.
+    connected: AtomicBool,
+}
+
+struct FilterState {
+    dsp: WaveDspState,
+    /// Format [`krkr_audio::WaveFilter::recreate`] connected with; `process`
+    /// reads its channel count from here (the reference's `Recreate` carries
+    /// the format the same way).
+    channels: u32,
+}
+
+impl krkr_audio::WaveFilter for SharedFilter {
+    fn recreate(
+        &self,
+        spec: krkr_audio::PcmAudioSpec,
+    ) -> std::result::Result<krkr_audio::PcmAudioSpec, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // One source at a time, like the sibling DLL family (see the field's
+        // note): the swap leaves the previous owner's claim intact.
+        if self.connected.swap(true, Ordering::SeqCst) {
+            return Err(crate::wf_basic_effect::MULTIPLE_BUFFER_ERROR.to_string());
+        }
+        // The DLL's source adapter rejects a format wider than 32 bits or with
+        // more than four channels (`HiRes format not supported.`, `0x10004e98`).
+        if !(1..=2).contains(&spec.channels) {
+            self.connected.store(false, Ordering::SeqCst);
+            return Err("invalid channels.".to_string());
+        }
+        // A re-design the DLL refuses (an unmodelled response, a bad cutoff)
+        // releases the claim too: the filter did not connect.
+        if let Err(error) = state.dsp.set_sample_rate(f64::from(spec.sample_rate)) {
+            self.connected.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        state.channels = spec.channels.max(1);
+        Ok(spec)
+    }
+
+    fn clear(&self) {
+        // The reference's `Clear` releases the connected source — the chain's
+        // hold, in this port's terms; the designed chain is the instance's and
+        // stays.
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    fn update(&self) {
+        // The setters re-design eagerly (`setParams`, the parameter
+        // properties), so the per-unit `Update` has nothing left to apply.
+    }
+
+    fn reset(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.dsp.chain.reset();
+    }
+
+    fn process(&self, frames: &mut [f32]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let channels = state.channels.max(1) as usize;
+        state.dsp.chain.process(frames, channels);
+    }
+}
+
+/// The registration plus the live state of one filter instance, by object.
+struct FilterSlot {
+    filter: Arc<SharedFilter>,
+    id: krkr_audio::WaveFilterId,
+}
+
 thread_local! {
-    /// Live filters by object handle, dropped by `finalize`.
-    static FILTERS: RefCell<BTreeMap<ObjectHandle, WaveDspState>> =
+    /// Live filters by object handle, dropped by `finalize`, which also
+    /// unregisters the filter from the audio backend.
+    static FILTERS: RefCell<BTreeMap<ObjectHandle, FilterSlot>> =
         const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Registers `state` with the audio backend and pairs it with its id.
+fn new_filter_slot(state: WaveDspState) -> FilterSlot {
+    let filter = Arc::new(SharedFilter {
+        state: Mutex::new(FilterState {
+            dsp: state,
+            channels: 2,
+        }),
+        connected: AtomicBool::new(false),
+    });
+    let id =
+        krkr_audio::register_wave_filter(Arc::clone(&filter) as Arc<dyn krkr_audio::WaveFilter>);
+    FilterSlot { filter, id }
+}
+
+/// The id the instance's `interface` property publishes: what the engine reads
+/// out of the `filters` array and the backend resolves back to this chain.
+fn filter_interface(handle: ObjectHandle) -> Option<i64> {
+    FILTERS.with(|filters| filters.borrow().get(&handle).map(|slot| slot.id.raw()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,7 +1985,11 @@ fn install_wf_typical_dsp(runtime: &mut Runtime<KrkrHost>) {
                     // instance is usable; a refused `new` must not leave a live
                     // filter behind.
                     apply_constructor_arguments(&mut state, &args)?;
-                    FILTERS.with(|filters| filters.borrow_mut().insert(instance, state));
+                    FILTERS.with(|filters| {
+                        filters
+                            .borrow_mut()
+                            .insert(instance, new_filter_slot(state))
+                    });
                 }
                 Err(error) => {
                     return Err(TjsError::runtime(format!(
@@ -1991,7 +2114,11 @@ fn install_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
         handle,
         "interface",
         NativePropertyAccess::ReadOnly,
-        |_runtime, _this| Ok(Variant::Integer(INTERFACE_SENTINEL)),
+        |_runtime, this| {
+            Ok(Variant::Integer(
+                this.and_then(filter_interface).unwrap_or(0),
+            ))
+        },
         |_runtime, _this, _value| Err(TjsError::access_denied()),
     );
 }
@@ -2010,7 +2137,17 @@ fn live_state(this: ObjectHandle) -> bool {
 }
 
 fn with_state<R>(handle: ObjectHandle, f: impl FnOnce(&mut WaveDspState) -> R) -> Option<R> {
-    FILTERS.with(|filters| filters.borrow_mut().get_mut(&handle).map(f))
+    let filter = FILTERS.with(|filters| {
+        filters
+            .borrow()
+            .get(&handle)
+            .map(|slot| Arc::clone(&slot.filter))
+    })?;
+    let mut state = filter
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Some(f(&mut state.dsp))
 }
 
 fn filter_finalize(
@@ -2019,7 +2156,13 @@ fn filter_finalize(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     if let Some(this) = this_obj {
-        FILTERS.with(|filters| filters.borrow_mut().remove(&this));
+        let removed = FILTERS.with(|filters| filters.borrow_mut().remove(&this));
+        // The engine's chain holds the same `Arc` until its own slot drops, so
+        // unregistering here ends the id's life (a stale `interface` value in a
+        // script's array stops resolving), not the chain object's.
+        if let Some(slot) = removed {
+            krkr_audio::unregister_wave_filter(slot.id);
+        }
     }
     Ok(Variant::Void)
 }
@@ -2860,15 +3003,80 @@ mod tests {
         }
     }
 
+    /// The link the engine's chain rests on: `interface` is the id this chain
+    /// is registered under with the audio backend, so a `filters` element
+    /// drives the very chain the script designed, and `finalize` ends that id's
+    /// life.
     #[test]
-    fn interface_is_a_read_only_sentinel() {
+    fn the_published_interface_drives_the_designed_chain() {
         let mut engine = engine();
+        let id = run(
+            &mut engine,
+            "(function() { global.f = new WaveSoundBuffer.WaveDSPFilter(); return f.interface; })()",
+        )
+        .to_integer()
+        .expect("interface is an integer id");
+
+        let spec = krkr_audio::PcmAudioSpec {
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        let (chain, skipped) = krkr_audio::WaveFilterChain::build(&[id], spec);
+        assert!(skipped.is_empty(), "the id resolves: {skipped:?}");
+        assert_eq!(chain.len(), 1);
+
+        // The default design is a low pass: DC passes, Nyquist is attenuated.
+        let mut dc = vec![1.0_f32; 2 * 64];
+        chain.process(&mut dc);
+        let dc_out = dc[dc.len() - 1].abs();
+        let mut nyquist: Vec<f32> = (0..64)
+            .flat_map(|frame| {
+                if frame % 2 == 0 {
+                    [1.0, 1.0]
+                } else {
+                    [-1.0, -1.0]
+                }
+            })
+            .collect();
+        chain.process(&mut nyquist);
+
+        assert!(dc_out > 0.5, "the designed low pass passes DC: {dc_out}");
+        assert!(
+            nyquist[nyquist.len() - 1].abs() < dc_out,
+            "and attenuates Nyquist: {} vs {dc_out}",
+            nyquist[nyquist.len() - 1].abs()
+        );
+
+        engine
+            .execute_script("dsp_finalize.tjs", "invalidate f;")
+            .expect("finalize");
+        assert!(
+            krkr_audio::resolve_wave_filter(id).is_none(),
+            "a finalized filter's id must stop resolving"
+        );
+    }
+
+    /// `interface` answers the id the filter is registered under with the audio
+    /// backend — the port's stand-in for the reference's
+    /// `iTVPBasicWaveFilter*` (`sound/WaveIntf.h:130`): per instance, stable,
+    /// non-zero, and read-only.
+    #[test]
+    fn interface_is_a_read_only_instance_id() {
+        let mut engine = engine();
+        let value = run(
+            &mut engine,
+            "(function() {\n\
+                 var first = new WaveSoundBuffer.WaveDSPFilter();\n\
+                 var second = new WaveSoundBuffer.WaveDSPFilter();\n\
+                 return (first.interface === first.interface) + \":\"\n\
+                     + (first.interface !== second.interface) + \":\"\n\
+                     + (first.interface !== 0);\n\
+             })()",
+        );
         assert_eq!(
-            run(
-                &mut engine,
-                "(function() { var f = new WaveSoundBuffer.WaveDSPFilter(); return f.interface; })()"
-            ),
-            Variant::Integer(INTERFACE_SENTINEL)
+            value,
+            Variant::String("1:1:1".to_string()),
+            "interface is a stable, per-instance, non-zero id"
         );
         let error = try_run(
             &mut engine,

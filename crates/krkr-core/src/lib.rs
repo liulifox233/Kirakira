@@ -744,6 +744,24 @@ pub enum AudioCommand {
         source: AudioSourceRef,
         load_policy: AudioLoadPolicy,
     },
+    /// Attaches an instance's `WaveSoundBuffer.filters` chain, replacing any
+    /// chain it had.
+    ///
+    /// `filters` carries the `interface` value of each element of the
+    /// instance's script-side `filters` array, in array order — the
+    /// reference's `RebuildFilterChain` (`sound/WaveIntf.cpp:865-905`) reads
+    /// exactly those elements and casts each element's `interface` to
+    /// `iTVPBasicWaveFilter*` (`sound/WaveIntf.h:130`).  In this engine the
+    /// integer is the opaque id of a filter a plugin registered with the audio
+    /// backend (`krkr_audio::register_wave_filter`), which is the closest
+    /// honest stand-in for the raw pointer; an id nothing is registered under
+    /// leaves the chain and is reported.  An empty list drops the chain
+    /// (`ClearFilterChain`, `:907-923`), which is what `open` on a buffer with
+    /// an empty array means.
+    SetFilters {
+        id: AudioInstanceId,
+        filters: Vec<i64>,
+    },
     Stop {
         id: AudioInstanceId,
         fade_seconds: f32,
