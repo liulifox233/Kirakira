@@ -18,15 +18,51 @@ pub(crate) fn install<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
     install_array_methods(runtime, array);
     let dictionary = runtime.register_global_native("Dictionary", native_dictionary::<H>);
     install_dictionary_methods(runtime, dictionary);
-    runtime.register_global_native("RegExp", native_regexp::<H>);
-    runtime.register_global_native("Date", native_date::<H>);
+    let regexp = runtime.register_global_native("RegExp", native_regexp::<H>);
+    install_empty_finalize(runtime, regexp);
+    let date = runtime.register_global_native("Date", native_date::<H>);
+    install_empty_finalize(runtime, date);
     let exception = runtime.register_global_native("Exception", native_exception::<H>);
+    install_empty_finalize(runtime, exception);
     // TJS superclass constructors are called as `super.Exception(...)`.
     // Native constructors therefore expose their own named member, just as
     // script class objects do, so the superclass lookup resolves to the
     // constructor instead of a missing/void value.
     runtime.set_object_member(exception, "Exception", Variant::Object(exception));
     install_math(runtime);
+}
+
+/// krkrz's empty native `finalize` (`TJS_DECL_EMPTY_FINALIZE_METHOD`,
+/// `tjsNative.h:380-383`): a method whose whole body is `return TJS_S_OK;`, so
+/// the call answers void and exists only to be callable.  Every class below
+/// declares it -- `Exception` (`tjsException.cpp:30`), `Math`
+/// (`tjsMath.cpp:108`), `RegExp` (`tjsRegExp.cpp:210`), `Date`
+/// (`tjsDate.cpp:51`) and `RandomGenerator` (`tjsRandomGenerator.cpp:267`) --
+/// and a missing member aborts the caller with
+/// `Member "finalize" does not exist`: PARQUET's `ConductorException extends
+/// Exception` calls `global.Exception.finalize(...)` from its own `finalize`.
+///
+/// The declaration carries no `TJS_STATICMEMBER`, so
+/// `tTJSNativeClass::CreateNew` copies it onto each instance as well
+/// (`tjsNative.cpp:340-364`); a script subclass that defines its own
+/// `finalize` keeps it, exactly as the engine-side registrations do
+/// (`crates/krkr-engine/src/native/classes.rs`, M146).
+fn install_empty_finalize<H: TjsHost + 'static>(runtime: &mut Runtime<H>, handle: ObjectHandle) {
+    if matches!(
+        runtime.object_member(handle, "finalize"),
+        Variant::Closure(_)
+    ) {
+        return;
+    }
+    runtime.register_object_native(handle, "finalize", empty_finalize::<H>);
+}
+
+fn empty_finalize<H: TjsHost + 'static>(
+    _runtime: &mut Runtime<H>,
+    _this_obj: Option<ObjectHandle>,
+    _args: Vec<Variant>,
+) -> Result<Variant> {
+    Ok(Variant::Void)
 }
 
 fn native_array<H: TjsHost + 'static>(
@@ -90,6 +126,7 @@ fn native_regexp<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "test", regexp_test::<H>);
     runtime.register_object_native(handle, "match", regexp_match::<H>);
     runtime.register_object_native(handle, "exec", regexp_match::<H>);
+    install_empty_finalize(runtime, handle);
     Ok(Variant::Object(handle))
 }
 
@@ -116,6 +153,7 @@ fn native_date<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "getMinutes", date_zero::<H>);
     runtime.register_object_native(handle, "getSeconds", date_zero::<H>);
     runtime.register_object_native(handle, "parse", date_parse::<H>);
+    install_empty_finalize(runtime, handle);
     Ok(Variant::Object(handle))
 }
 
@@ -141,12 +179,14 @@ fn native_exception<H: TjsHost + 'static>(
         .unwrap_or_default();
     runtime.heap[handle.0].set("message", Variant::String(message));
     runtime.heap[handle.0].set("trace", Variant::String(trace));
+    install_empty_finalize(runtime, handle);
     Ok(Variant::Object(handle))
 }
 
 fn install_math<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
     let math = runtime.alloc_object(Object::default());
     runtime.set_global_member("Math", Variant::Object(math));
+    install_empty_finalize(runtime, math);
 
     for (name, value) in [
         ("E", std::f64::consts::E),
@@ -194,6 +234,7 @@ fn install_math<H: TjsHost + 'static>(runtime: &mut Runtime<H>) {
     let random_generator =
         runtime.register_object_native(math, "RandomGenerator", random_generator::<H>);
     runtime.add_object_class_info(random_generator, "RandomGenerator");
+    install_empty_finalize(runtime, random_generator);
 }
 
 #[derive(Clone, Copy)]
@@ -321,6 +362,7 @@ fn random_generator<H: TjsHost + 'static>(
     runtime.register_object_native(handle, "random63", random_generator_random63::<H>);
     runtime.register_object_native(handle, "random64", random_generator_random64::<H>);
     runtime.register_object_native(handle, "serialize", random_generator_serialize::<H>);
+    install_empty_finalize(runtime, handle);
     Ok(Variant::Object(handle))
 }
 
@@ -665,14 +707,31 @@ fn array_save_struct<H: TjsHost + 'static>(
     Ok(Variant::Object(handle))
 }
 
+/// `Array.loadStruct` (`tjsArray.cpp:364-403`) reads one container and nothing
+/// else.  The receiver has to carry an Array native instance (`:366`,
+/// `TJS_GET_NATIVE_INSTANCE`), one parameter is mandatory (`:368`), its items
+/// are cleared *before* the stream is opened (`ni->Items.clear()`, `:373`), and
+/// then `tTJSBinarySerializer::IsBinary` decides the rest (`:379-385`): a
+/// `KBAD100\0` pack is deserialized into the receiver (`CreateArray`'s
+/// `RootArray` path, `tjsBinarySerializer.cpp:104-112`) and the call answers
+/// that same receiver (`ReadArray`'s `tTJSVariant(array, array)`, `:268-280`),
+/// while anything else -- a `TJS/ns0` data pack, a text struct, a path that
+/// cannot be read -- is `TJS_E_INVALIDPARAM` (`:400-402`).  There is no text
+/// fallback and no Integer success flag.
 fn array_load_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.loadStruct")?;
+    // Official: `TJS_GET_NATIVE_INSTANCE(ni, tTJSArrayNI)` (`tjsArray.cpp:366`)
+    // before the arity check (`:368`) and before the items are cleared
+    // (`:373`).
+    if runtime.heap[handle.0].array_elements().is_none() {
+        return Err(TjsError::native_class_crash());
+    }
     let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
-        return Ok(Variant::Integer(0));
+        return Err(TjsError::bad_param_count());
     };
     let path = path.to_tjs_string()?;
     let mode = args
@@ -680,28 +739,11 @@ fn array_load_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    // An Array keeps its items in index order, so a decoded temporary already
-    // holds the file's order (`assign_array_struct` below copies it verbatim);
-    // only a dictionary root needs restoring in place.
-    if let Some(value) = load_binary_struct(runtime, &path, &mode, None)? {
-        if let Variant::Object(src) = value
-            && runtime.heap[handle.0].array_elements().is_some()
-        {
-            assign_array_struct(runtime, handle, src)?;
-        }
-        return Ok(value);
+    runtime.heap[handle.0].array_clear();
+    if load_binary_struct(runtime, &path, &mode, Some(handle))?.is_none() {
+        return Err(TjsError::invalid_param());
     }
-    let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
-        return Ok(Variant::Integer(0));
-    };
-    let wrapped = format!("return ({text});");
-    if let Ok(Variant::Object(src)) =
-        compile_source_to_bytecode(&path, &wrapped).and_then(|file| runtime.execute_file(&file))
-    {
-        assign_array_struct(runtime, handle, src)?;
-        return Ok(Variant::Integer(1));
-    }
-    Ok(Variant::Integer(0))
+    Ok(Variant::Object(handle))
 }
 
 fn array_join<H: TjsHost + 'static>(
@@ -725,32 +767,42 @@ fn array_join<H: TjsHost + 'static>(
     Ok(Variant::String(parts.join(&separator)))
 }
 
+/// `Array.split` (`tjsArray.cpp:498-580`): the receiver's items are replaced
+/// in place -- `ni->Items.resize(0)` (`:508`) and then the pushes -- never the
+/// object itself, so every member on it and every alias of it survives, the
+/// same rule `Array.load` follows (`:270-332`).  The receiver still has to be
+/// an Array: `TJS_GET_NATIVE_INSTANCE` (`:505`) reports
+/// `TJS_E_NATIVECLASSCRASH` for anything else.
 fn array_split<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Array.split")?;
-    // Official: `if(numparams < 2) return TJS_E_BADPARAMCOUNT`
-    // (`tjsArray.cpp:506`).
+    // Official: `TJS_GET_NATIVE_INSTANCE(ni, tTJSArrayNI)` (`tjsArray.cpp:505`)
+    // first, then `if(numparams < 2) return TJS_E_BADPARAMCOUNT` (`:506`).
+    if runtime.heap[handle.0].array_elements().is_none() {
+        return Err(TjsError::native_class_crash());
+    }
     if args.len() < 2 {
         return Err(TjsError::bad_param_count());
     }
+    runtime.heap[handle.0].array_clear();
     let string = args[1].to_tjs_string()?;
     let purge_empty = args
         .get(3)
         .filter(|value| !matches!(value, Variant::Void))
         .is_some_and(Variant::is_truthy);
-    if let Some(regexp) = regexp_object_handle(runtime, &args[0]) {
+    let elements = if let Some(regexp) = regexp_object_handle(runtime, &args[0]) {
         let regex = regexp_regex(runtime, regexp)?;
-        runtime.heap[handle.0] = Object::array(split_string_by_regex(&string, &regex, purge_empty));
-        install_array_methods(runtime, handle);
-        return Ok(Variant::Object(handle));
-    }
-    let delimiters = args[0].to_tjs_string()?;
-    runtime.heap[handle.0] =
-        Object::array(split_delimited_string(&string, &delimiters, purge_empty));
-    install_array_methods(runtime, handle);
+        split_string_by_regex(&string, &regex, purge_empty)
+    } else {
+        let delimiters = args[0].to_tjs_string()?;
+        split_delimited_string(&string, &delimiters, purge_empty)
+    };
+    runtime.heap[handle.0].array_extend(elements);
+    // Official: `if(result) *result = tTJSVariant(objthis, objthis)` on both
+    // paths (`tjsArray.cpp:532`, `:575`).
     Ok(Variant::Object(handle))
 }
 
@@ -1079,6 +1131,37 @@ fn save_structured_value<H: TjsHost + 'static>(
     Ok(())
 }
 
+/// `Dictionary.loadStruct` (`tjsDictionary.cpp:51-121`) reads two containers.
+/// One parameter is mandatory (`:53`); a receiver that carries a Dictionary
+/// native instance is that call's `RootDictionary` and is cleared before the
+/// stream is opened (`ni->Clear()`, `:57-62`), while the class object -- which
+/// has no native instance -- is left alone and decoded into a throw-away
+/// dictionary (`if(!dic) dic = ...`, `:78-80`).  Then:
+///
+/// * `tTJSBinarySerializer::IsBinary` (`:72-76`) picks a `KBAD100\0` pack, the
+///   call answers the deserialized root (`if(result) *result = *var;`,
+///   `:84-88`), and a data pack of any other kind falls through to the text
+///   path below.
+/// * The text path (`:104-110`) reads the file with
+///   `tTJS::LoadTextDictionaryArray` (`tjs.cpp:607-624`), which compiles it as
+///   a TJS **expression** -- `SetText(result, buffer, NULL, true)`,
+///   `tjsScriptBlock.cpp:230-237`, "the script will be compiled as an
+///   expression if isexpression is true" -- and answers that expression's
+///   value.  This is the form the engine's own text writer produces
+///   (`%["key" => value, ...]`, and the reference documents the format as one
+///   "that can be interpreted as an expression"), so a text struct written by
+///   `saveStruct` reads back through it.  It is wired, not vestigial:
+///   `TJSCreateTextStreamForRead = TVPCreateTextStreamForRead`
+///   (`base/ScriptMgnIntf.cpp:486`).
+///
+/// Two deliberate limits.  The reference gates the text path on `if(result)` --
+/// the caller's result pointer, which a published native handler here never
+/// sees -- so this implementation always runs it; a statement-position call
+/// therefore evaluates the file where the reference would do nothing (the
+/// receiver is cleared in both cases).  And the `key = value` line format is
+/// not read: that parser was this crate's invention, not the reference's text
+/// form.  An unreadable path, and a text stream the host cannot provide, are
+/// `TJS_E_INVALIDPARAM` (`:121`).
 fn dictionary_load_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
@@ -1086,7 +1169,7 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
 ) -> Result<Variant> {
     let handle = require_this(this_obj, "Dictionary.loadStruct")?;
     let Some(path) = args.first().filter(|value| !matches!(value, Variant::Void)) else {
-        return Ok(Variant::Integer(0));
+        return Err(TjsError::bad_param_count());
     };
     let path = path.to_tjs_string()?;
     let mode = args
@@ -1094,14 +1177,7 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    // A static `Dictionary.loadStruct(...)` call arrives with the class object
-    // as `this`; KRKR deserializes into a throw-away dictionary in that case
-    // (`if(!dic) dic = TJSCreateDictionaryObject();`, `tjsDictionary.cpp:42-58`),
-    // so the class object is never written.  A real instance *is* the
-    // serializer's `RootDictionary` and is restored in place, in file order --
-    // after `ni->Clear()`, which the reference runs before it even opens the
-    // stream (`:49-52`).
-    let root = (!runtime.object_is_callable(handle)).then_some(handle);
+    let root = runtime.is_dictionary_instance(handle).then_some(handle);
     if let Some(root) = root {
         runtime.heap[root.0].members.clear();
     }
@@ -1109,32 +1185,26 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
         return Ok(value);
     }
     let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
-        return Ok(Variant::Integer(0));
+        return Err(TjsError::invalid_param());
     };
+    // `SetText` returns before it touches the result for an empty file
+    // (`tjsScriptBlock.cpp:238-239`), so the call answers void.
+    if text.trim().is_empty() {
+        return Ok(Variant::Void);
+    }
     let wrapped = format!("return ({text});");
-    if let Ok(Variant::Object(src)) =
-        compile_source_to_bytecode(&path, &wrapped).and_then(|file| runtime.execute_file(&file))
-    {
-        assign_dictionary_struct(runtime, handle, src)?;
-        return Ok(Variant::Integer(1));
-    }
-    runtime.heap[handle.0].members.clear();
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        runtime.heap[handle.0].set(key.to_string(), parse_struct_value(value));
-    }
-    Ok(Variant::Integer(1))
+    let file = compile_source_to_bytecode(&path, &wrapped)?;
+    runtime.execute_file(&file)
 }
 
 /// Reads `path` and deserializes it when it holds a `KBAD100` struct pack.
 ///
 /// `saveStruct` needs mode `"b"` to *write* the binary form, but KRKR's
 /// `loadStruct` sniffs the header itself and accepts a binary pack in any mode
-/// (`tjsDictionary.cpp` / `tjsArray.cpp`), returning the deserialized root
-/// value rather than a success flag.  `None` means the file is not a binary
-/// pack, which leaves the caller free to try the textual form.
+/// (`tjsDictionary.cpp:71-76` / `tjsArray.cpp:379-385`), returning the
+/// deserialized root value rather than a success flag.  `None` means the path
+/// is unreadable or is not a binary pack -- both are `TJS_E_INVALIDPARAM` to
+/// the callers.
 fn load_binary_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     path: &str,
@@ -1613,16 +1683,20 @@ pub(crate) fn decode_binary_struct<H: TjsHost + 'static>(
 
 /// Restores a struct pack, optionally *into* `root`.
 ///
-/// The reference's serializer takes the destination dictionary as its
-/// `RootDictionary` (`tTJSBinarySerializer(dic)`, `tjsDictionary.cpp:58-71`):
-/// `CreateDictionary` sizes that dictionary's own table with
-/// `RootDictionary->RebuildHash(count)` (`tjsBinarySerializer.cpp:80-88`) and
-/// `ReadDictionary` then adds every member in the order the file holds them
-/// (`:282-330` via `AddDictionary`'s `PropSetByVS`).  Handing `root` here
-/// reproduces that: the receiver is cleared, rebuilt at the count the stream
+/// The reference's serializer takes the destination container as its root
+/// (`tTJSBinarySerializer(dic)`, `tjsDictionary.cpp:58-71`; the array ctor,
+/// `tjsArray.cpp:383`): `CreateDictionary` sizes that dictionary's own table
+/// with `RootDictionary->RebuildHash(count)` (`tjsBinarySerializer.cpp:80-88`)
+/// and `ReadDictionary` then adds every member in the order the file holds them
+/// (`:282-330` via `AddDictionary`'s `PropSetByVS`), while `CreateArray` hands
+/// back the `RootArray` itself (`:104-112`).  Handing `root` here reproduces
+/// that: the receiver is cleared by its caller, rebuilt at the count the stream
 /// announces, and filled in file order -- one traversal, not a decode followed
-/// by a copy in the decoded temporary's `EnumMembers` order.  A nested
-/// dictionary is still created fresh with `new Dictionary(count)`'s sizing.
+/// by a copy in the decoded temporary's `EnumMembers` order.  A root of the
+/// other kind is the reference's type mismatch
+/// (`TJSThrowFrom_tjs_error(TJS_E_INVALIDPARAM)`, `:109-111`, `:90-92`); a
+/// nested dictionary is still created fresh with `new Dictionary(count)`'s
+/// sizing.
 pub(crate) fn decode_binary_struct_with_root<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     bytes: &[u8],
@@ -1640,7 +1714,7 @@ pub(crate) fn decode_binary_struct_with_root<H: TjsHost + 'static>(
         runtime,
         bytes: payload,
         index: 0,
-        root_dictionary: root,
+        root_container: root,
     };
     decoder.value().map(Some)
 }
@@ -1649,16 +1723,16 @@ struct BinaryStructDecoder<'a, H: TjsHost> {
     runtime: &'a mut Runtime<H>,
     bytes: &'a [u8],
     index: usize,
-    /// The receiver a root dictionary is restored into; taken by the outermost
-    /// [`BinaryStructDecoder::value`] so only a top-level dictionary can claim
-    /// it, exactly like the reference's `RootDictionary` being cleared right
-    /// after `CreateDictionary` consumes it.
-    root_dictionary: Option<ObjectHandle>,
+    /// The receiver a root container is restored into; taken by the outermost
+    /// [`BinaryStructDecoder::value`] so only the top-level value can claim it,
+    /// exactly like the reference's `RootDictionary`/`RootArray` being consumed
+    /// by the `CreateDictionary`/`CreateArray` that reads them.
+    root_container: Option<ObjectHandle>,
 }
 
 impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
     fn value(&mut self) -> Result<Variant> {
-        let root = self.root_dictionary.take();
+        let root = self.root_container.take();
         self.value_into(root)
     }
 
@@ -1704,11 +1778,11 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
             }
             0xdc => {
                 let len = self.read_u16()? as usize;
-                self.array(len)
+                self.array(len, root)
             }
             0xdd => {
                 let len = self.read_u32()? as usize;
-                self.array(len)
+                self.array(len, root)
             }
             0xde => {
                 let len = self.read_u16()? as usize;
@@ -1719,7 +1793,7 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
                 self.dictionary(len, root)
             }
             0xa0..=0xbf => self.string((ty - 0xa0) as usize),
-            0x90..=0x9f => self.array((ty - 0x90) as usize),
+            0x90..=0x9f => self.array((ty - 0x90) as usize, root),
             0x80..=0x8f => self.dictionary((ty - 0x80) as usize, root),
             _ => Err(TjsError::runtime("invalid binary struct tag")),
         }
@@ -1741,8 +1815,17 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
         Ok(Variant::Octet(self.read_bytes(len)?.to_vec()))
     }
 
-    fn array(&mut self, len: usize) -> Result<Variant> {
-        let handle = self.runtime.alloc_array_object(Vec::new());
+    fn array(&mut self, len: usize, root: Option<ObjectHandle>) -> Result<Variant> {
+        // `CreateArray` (`tjsBinarySerializer.cpp:104-112`): the receiver of a
+        // top-level array stream is the `RootArray` itself -- its items were
+        // cleared by the caller and are appended here in file order
+        // (`InsertArray`'s `Add`, `:120-130`) -- and a dictionary root under an
+        // array stream is the reference's type mismatch.
+        let handle = match root {
+            Some(handle) if self.runtime.heap[handle.0].array_elements().is_some() => handle,
+            Some(_) => return Err(TjsError::invalid_param()),
+            None => self.runtime.alloc_array_object(Vec::new()),
+        };
         for _ in 0..len {
             let value = self.value()?;
             self.runtime.heap[handle.0].array_push(value);
@@ -1756,12 +1839,14 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
         // (`tjsBinarySerializer.cpp:80-88`) and the entries are added in the
         // order the file holds them (`ReadDictionary`/`AddDictionary`,
         // `:282-330`).  A nested dictionary is created with its member count
-        // (`CreateDictionary`'s `CreateNew(count)` path, `:90-98`).
+        // (`CreateDictionary`'s `CreateNew(count)` path, `:90-98`), and a root
+        // of the other kind is the same type mismatch as above.
         let handle = match root {
-            Some(handle) => {
+            Some(handle) if self.runtime.is_dictionary_instance(handle) => {
                 self.runtime.heap[handle.0].members.rebuild(len as i64);
                 handle
             }
+            Some(_) => return Err(TjsError::invalid_param()),
             None => self.runtime.alloc_dictionary_object_sized(len as i64),
         };
         for _ in 0..len {
@@ -1823,23 +1908,6 @@ impl<'a, H: TjsHost + 'static> BinaryStructDecoder<'a, H> {
         let bytes = &self.bytes[self.index..end];
         self.index = end;
         Ok(bytes)
-    }
-}
-
-fn parse_struct_value(value: &str) -> Variant {
-    if value == "void" {
-        Variant::Void
-    } else if value == "null" {
-        Variant::Null
-    } else if let Ok(value) = value.parse::<i64>() {
-        Variant::Integer(value)
-    } else if let Some(value) = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    {
-        Variant::String(value.to_string())
-    } else {
-        Variant::String(value.to_string())
     }
 }
 

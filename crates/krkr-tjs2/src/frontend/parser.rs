@@ -2086,9 +2086,46 @@ mod tests {
         parse("var xs = [a => b];").expect("fat arrow separates array elements");
     }
 
+    /// `new` binds to a *function-evaluation* expression, and nothing else.
+    ///
+    /// The reference grammar spells it `unary_expr : "new" func_call_expr`
+    /// (`tjs2/syntax/tjs.y:668`) with
+    /// `func_call_expr : priority_expr "(" call_arg_list ")"` (`:739-741`), and
+    /// member access is a *priority* suffix (`priority_expr "." T_SYMBOL`,
+    /// `:699-703`) -- reachable only from inside that call.  So:
+    ///
+    /// | source | reference parse |
+    /// | --- | --- |
+    /// | `new Type()` | the constructor call |
+    /// | `new Type;` | syntax error -- the manual says so outright: "( ) を省略することはできません。JavaScript のように new Test と書くことはできません" (`docs/tjs2/j/contents/class.html`) |
+    /// | `new Type().member;` | **syntax error**: `.member` cannot follow the call directly |
+    /// | `(new Type()).member;` | the parenthesized result, then member access |
+    /// | `new factory()();` | accepted: `new` marks the outer call |
+    /// | `new Type().member();` | accepted, and it means `new ((Type()).member)()` -- `new` marks the call node itself (`$$ = $2; $$->SetOpecode(T_NEW);`, `tjs.y:668`), so the callee is `Type().member` |
+    ///
+    /// Verified against that grammar with bison (3.8.2, the same tables the
+    /// checked-in `tjs2/tjs.tab.cpp` was generated from): `new Type();`
+    /// parses, `new Type;` and `new Type().member;` are syntax errors, and
+    /// `(new Type()).member;` parses.
+    #[test]
+    fn new_expression_surface_matches_the_reference_grammar() {
+        parse("var value = new Type();").expect("the constructor call");
+        parse("var value = new Type;").expect_err("the call is mandatory");
+        parse("var value = new Type().member;").expect_err("the new call cannot be postfixed");
+        parse("var value = (new Type()).member;").expect("the parenthesized result is postfixable");
+        parse("var value = (new Type()).member(1);").expect("and callable");
+        parse("var value = (new Type())[0];").expect("and indexable");
+        parse("var value = new factory()();").expect("new accepts an outer call expression");
+        parse("var value = new Type().member();")
+            .expect("the member call is the constructor expression");
+    }
+
     #[test]
     fn rejects_named_function_expressions_and_new_without_call() {
         parse("var f = function named() {};").expect_err("named function expression");
+        // The `new` rows below are reference behaviour, not a parser gap: see
+        // `new_expression_surface_matches_the_reference_grammar` for the
+        // grammar rule behind each one.
         parse("var value = new Type;").expect_err("new requires a call expression");
         parse("var value = new Type().member;").expect_err("new result cannot be postfixed");
         parse("var value = new factory()();").expect("new accepts an outer call expression");
