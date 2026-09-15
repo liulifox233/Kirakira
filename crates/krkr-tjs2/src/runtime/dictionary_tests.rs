@@ -738,10 +738,16 @@ fn dictionary_creation_size_changes_the_order() {
 /// A host with the binary storage `loadStruct` reads, and the text storage its
 /// expression path reads.  `with` gives it only binary files, so the text path
 /// has nothing to fall back on -- which is what the container-rule test needs.
+///
+/// `calls` records every storage call as `kind name mode`, which is how the
+/// mode-grammar tests see what `saveStruct`/`loadStruct` asked the storage
+/// layer for: the mode string is the reference's own stream-mode grammar, not
+/// an argument this crate may reinterpret on the way in.
 #[derive(Default)]
 struct StructStorage {
     binary: BTreeMap<String, Vec<u8>>,
     files: BTreeMap<String, String>,
+    calls: Vec<String>,
 }
 
 impl StructStorage {
@@ -752,6 +758,7 @@ impl StructStorage {
                 .map(|(name, contents)| (name.to_string(), contents.to_vec()))
                 .collect(),
             files: BTreeMap::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -762,28 +769,42 @@ impl StructStorage {
                 .iter()
                 .map(|(name, contents)| (name.to_string(), contents.to_string()))
                 .collect(),
+            calls: Vec::new(),
         }
+    }
+
+    fn record(&mut self, kind: &str, name: &str, mode: &str) {
+        self.calls.push(format!("{kind} {name} {mode}"));
     }
 }
 
 impl TjsHost for StructStorage {
-    fn read_binary(&mut self, name: &str, _mode: &str) -> Result<Vec<u8>> {
+    fn read_binary(&mut self, name: &str, mode: &str) -> Result<Vec<u8>> {
+        self.record("read_binary", name, mode);
         self.binary
             .get(name)
             .cloned()
             .ok_or_else(|| TjsError::runtime(format!("cannot open {name}")))
     }
 
-    fn write_binary(&mut self, name: &str, _mode: &str, bytes: &[u8]) -> Result<()> {
+    fn write_binary(&mut self, name: &str, mode: &str, bytes: &[u8]) -> Result<()> {
+        self.record("write_binary", name, mode);
         self.binary.insert(name.to_string(), bytes.to_vec());
         Ok(())
     }
 
-    fn read_text(&mut self, name: &str, _mode: &str) -> Result<String> {
+    fn read_text(&mut self, name: &str, mode: &str) -> Result<String> {
+        self.record("read_text", name, mode);
         self.files
             .get(name)
             .cloned()
             .ok_or_else(|| TjsError::runtime(format!("cannot open {name}")))
+    }
+
+    fn write_text(&mut self, name: &str, mode: &str, text: &str) -> Result<()> {
+        self.record("write_text", name, mode);
+        self.files.insert(name.to_string(), text.to_string());
+        Ok(())
     }
 }
 
@@ -933,4 +954,121 @@ fn load_struct_restores_a_dictionary_receiver_in_place() {
         ),
         Variant::String("undefined:42:42".into())
     );
+}
+
+// ---------------------------------------------------------------------------
+// The mode string: `o<size>`, `z`, `b`
+
+/// The second argument of `Dictionary.saveStruct(file, mode)` is the
+/// reference's *stream mode*, and the node that reads it is the stream factory,
+/// not the serializer (`tjsDictionary.cpp:133-179`):
+///
+/// * a `b` anywhere in it -- `TJS_strchr(mode, 'b')`, `:143` -- picks
+///   `TJSCreateBinaryStreamForWrite` and the `KBAD100\0` pack (`:148-156`);
+///   every other mode goes to `TJSCreateTextStreamForWrite` (`:160`).
+/// * the mode string is then handed *verbatim* to that factory, which is what
+///   gives the rest of the grammar its meaning (`base/TextStream.cpp:343-500`):
+///   `o<digits>` opens the existing file and seeks to that offset (`:417`,
+///   `base/BinaryStream.cpp:52-76`), `z` selects zlib compression with an
+///   optional level digit (`:388-392`), and `c` the simple crypt (`:381-386`).
+/// * `Array.saveStruct` reads the same grammar against the same factory
+///   (`tjsArray.cpp:460-490`).
+///
+/// KAGEX's `BookMarkIO_Standard` is why the combined form matters: it writes
+/// the bookmark thumbnail first and then calls
+/// `(Dictionary.saveStruct incontextof data)(file, saveDataMode + "o" + size)`
+/// -- GINKA's `main/Config.tjs` sets `saveDataMode = "z"`, so the mode is
+/// `"zo<size>"`: append a compressed text struct at the end of the BMP that is
+/// already in the file.
+#[test]
+fn save_struct_mode_selects_the_container_and_reaches_the_storage() {
+    let (runtime, value) = execute_with_struct_storage(
+        StructStorage::default(),
+        r#"
+            var data = %["answer" => 42];
+            (Dictionary.saveStruct incontextof data)("plain.ksd");
+            (Dictionary.saveStruct incontextof data)("empty.ksd", "");
+            (Dictionary.saveStruct incontextof data)("pack.ksd", "b");
+            (Dictionary.saveStruct incontextof data)("bookmark.bmp", "zo31778");
+            (Dictionary.saveStruct incontextof data)("offset.ksd", "o31778");
+            (Dictionary.saveStruct incontextof data)("crypt.ksd", "c1");
+            var list = [1, 2];
+            (Array.saveStruct incontextof list)("list.ksd", "z9o5");
+            (Dictionary.loadStruct incontextof %[])("offset.ksd", "o31778");
+            return true;
+            "#,
+    );
+    assert_eq!(value, Variant::Integer(1));
+
+    // Every save picked its container from the mode and passed the mode on
+    // unread: a `b` is the only thing that selects the binary pack, and
+    // `"zo31778"` stays `"zo31778"` -- the storage layer is what turns the
+    // `o`/`z` characters into a seek and a compressor.
+    assert_eq!(
+        runtime.host().calls,
+        vec![
+            "write_text plain.ksd ",
+            "write_text empty.ksd ",
+            "write_binary pack.ksd b",
+            "write_text bookmark.bmp zo31778",
+            "write_text offset.ksd o31778",
+            "write_text crypt.ksd c1",
+            "write_text list.ksd z9o5",
+            // `loadStruct` sniffs the binary container first and re-reads the
+            // same name as text when it is not one (`tjsDictionary.cpp:71-76`,
+            // `:104-110`); both reads carry the mode.
+            "read_binary offset.ksd o31778",
+            "read_text offset.ksd o31778",
+        ]
+    );
+
+    // The containers themselves: the text writer emits the KRKR text stream
+    // (BOM + UTF-16LE) and the serializer's `(const) %[...]` form, the binary
+    // writer the `KBAD100\0` header.
+    assert_eq!(
+        runtime.host().files["empty.ksd"],
+        "(const) %[\n \"answer\" => 42\n]"
+    );
+    assert_eq!(
+        runtime.host().files["offset.ksd"],
+        runtime.host().files["plain.ksd"]
+    );
+    assert!(
+        runtime.host().binary["pack.ksd"].starts_with(b"KBAD100\0"),
+        "a `b` mode writes the reference's binary struct pack"
+    );
+}
+
+/// `Array.saveStruct`/`Array.loadStruct` read the same grammar against the same
+/// factory (`tjsArray.cpp:460-490`, `:364-403`), and `Array.loadStruct` reads
+/// one container and one container only -- so its mode is the *binary* stream's
+/// mode, and an `o<size>` there is the same seek on the same
+/// `TJS_BS_READ`/`TJS_BS_UPDATE` stream the text path uses.
+#[test]
+fn array_load_struct_mode_reaches_the_binary_container() {
+    let (runtime, value) = execute_with_struct_storage(
+        StructStorage::default(),
+        r#"
+            var list = [1, 2];
+            (Array.saveStruct incontextof list)("list.pbd", "b");
+            var loaded = [];
+            (Array.loadStruct incontextof loaded)("list.pbd", "o7");
+            return loaded.count + ":" + loaded[1];
+            "#,
+    );
+    assert_eq!(value, Variant::String("2:2".into()));
+    assert_eq!(
+        runtime.host().calls,
+        vec!["write_binary list.pbd b", "read_binary list.pbd o7"]
+    );
+}
+
+fn execute_with_struct_storage(
+    storage: StructStorage,
+    source: &str,
+) -> (Runtime<StructStorage>, Variant) {
+    let mut runtime = Runtime::with_host(storage);
+    let file = compile_source_to_bytecode("dictionary.tjs", source).expect("compile");
+    let value = runtime.execute_file(&file).expect("execute");
+    (runtime, value)
 }

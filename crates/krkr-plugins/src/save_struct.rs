@@ -26,6 +26,17 @@
 //! back by *evaluating* them, which works because TJS lexes `int`/`real` as
 //! unary casts; there is no loader in this plugin.
 //!
+//! This DLL is not the reference's *built-in* `Dictionary.saveStruct` /
+//! `Array.saveStruct`, which takes a stream mode string instead of a
+//! `newline`/`option` pair: `b` anywhere in it selects the `KBAD100\0` binary
+//! pack and everything else the text stream, whose factory reads `o<size>` as
+//! a seek and `z` as zlib compression
+//! (`tjsDictionary.cpp:133-179`, `base/BinaryStream.cpp:52-76`,
+//! `base/TextStream.cpp:343-640`).  That member lives in `krkr-tjs2`'s runtime
+//! (`save_structured_value`), and KAGEX's `BookMarkIO_Standard` bookmarks --
+//! `[BMP][struct]` with mode `"zo<size>"` -- go through it, never through
+//! `saveStruct2`.
+//!
 //! Deliberate divergences:
 //!
 //! - `newline` 0 selects CRLF and 1 LF, as in krkrz; `toStructString` defaults
@@ -955,6 +966,177 @@ mod tests {
                 .expect_err("a missing filename must fail");
             assert_eq!(error.message, "Invalid argument count", "{call}");
         }
+    }
+
+    /// The `[BMP][struct]` bookmark KAGEX's `BookMarkIO_Standard` writes, byte
+    /// for byte.
+    ///
+    /// GINKA's `main/Config.tjs` sets `saveThumbnail = 1` -- so the getter at
+    /// `system/MainWindow.tjs` object 464 picks `BookMarkIO_Standard` -- plus
+    /// `thumbnailWidth = 137`, `thumbnailDepth = 24`, `scWidth/scHeight =
+    /// 1280x720` and `saveDataMode = debugWindowEnabled ? "" : "z"`.  The
+    /// standard saver (object 467) is
+    ///
+    /// ```text
+    /// if (layer) layer.saveLayerImage(file, "bmp" + thumbnailDepth);
+    /// (Dictionary.saveStruct incontextof data)(file, saveDataMode + "o" + info.size);
+    /// ```
+    ///
+    /// and `BookMarkIO_Standard(dict)` (object 466) fills `info.size` with
+    /// `(width * 3 + 3 >> 2 << 2) * height + 54` -- the *length of the BMP*,
+    /// because the struct is appended at its end.  `info.height` is
+    /// `(int)(thumbnailWidth * scHeight / scWidth)` = 77, so the file is a
+    /// 137x77 24bpp BMP (54 + 412 * 77 = 31778 bytes) followed by the text
+    /// struct at offset 31778, written in mode `"zo31778"`: the stream factory
+    /// seeks the *existing* file to that offset (`base/TextStream.cpp:417`,
+    /// `base/BinaryStream.cpp:52-76`) and then writes the `fe fe 02`
+    /// crypt/compress signature, the UTF-16LE BOM, the compressed and the
+    /// uncompressed size and the deflate stream (`:428-462`, `:487-489`).
+    ///
+    /// Loading is `safeEvalStorage(file, "o" + info.size)` (object 468) --
+    /// KAGEX's `safeEvalStorage(data, *)` forwards the mode to
+    /// `Scripts.safeEvalStorage`/`Scripts.evalStorage` -- which positions the
+    /// read stream before it probes the BOM (`base/TextStream.cpp:76-140`).
+    #[test]
+    fn bookmarkio_standard_appends_a_compressed_struct_after_the_bmp() {
+        let root = test_root("bookmarkio-standard");
+        let mut engine = test_engine(&root);
+        engine.register_plugin(SaveStructPlugin).expect("plugin");
+        let value = engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(function() {
+                    var layer = new Layer();
+                    layer.setImageSize(137, 77);
+                    layer.fillRect(0, 0, 137, 77, 0x204080);
+                    layer.saveLayerImage("savedata/data0.bmp", "bmp24");
+                    layer.saveLayerImage("savedata/thumb-only.bmp", "bmp24");
+                    var size = (((137 * 3 + 3) >> 2) << 2) * 77 + 54;
+                    var data = %["id" => "GINKA", "core" => %["curLine" => 12]];
+                    (Dictionary.saveStruct incontextof data)(
+                        "savedata/data0.bmp", "z" + "o" + size);
+                    (Dictionary.saveStruct incontextof data)("savedata/plain.ksd");
+                    var viaEval = Scripts.evalStorage("savedata/data0.bmp", "o" + size);
+                    var viaLoad = (Dictionary.loadStruct incontextof %[])(
+                        "savedata/data0.bmp", "o" + size);
+                    // The `-debugwin=no` shape of the same call: `saveDataMode`
+                    // is `""`, so the mode is the bare `"o" + size` and the
+                    // struct is the plain text stream at the offset.  The
+                    // shipped default is the other one (`startup.tjs` leaves
+                    // `debugWindowEnabled` at `inXP3archivePacked` = 1), and the
+                    // reader is content-driven, so both load through the same
+                    // `evalStorage(file, "o" + size)`.
+                    layer.saveLayerImage("savedata/data1.bmp", "bmp24");
+                    (Dictionary.saveStruct incontextof data)(
+                        "savedata/data1.bmp", "o" + size);
+                    var plainEval = Scripts.evalStorage("savedata/data1.bmp", "o" + size);
+                    return size + ":" + viaEval.id + ":" + viaEval.core.curLine +
+                        ":" + viaLoad.id + ":" + plainEval.core.curLine;
+                })()"#,
+            )
+            .expect("write the bookmark");
+
+        // 31778 is the game's own prediction for a 137x77 24bpp BMP, and the
+        // BMP our engine writes for the same call has exactly that length --
+        // which is what makes the game's offset the struct's offset.
+        const SIZE: usize = (((137 * 3 + 3) / 4) * 4) * 77 + 54;
+        assert_eq!(SIZE, 31778);
+        assert_eq!(
+            value,
+            Variant::String("31778:GINKA:12:GINKA:12".to_string())
+        );
+
+        let bytes = fs::read(root.join("savedata/data0.bmp")).expect("bookmark file");
+        let thumbnail = fs::read(root.join("savedata/thumb-only.bmp")).expect("thumbnail");
+        let plain = fs::read(root.join("savedata/plain.ksd")).expect("plain struct");
+        assert_eq!(thumbnail.len(), SIZE);
+        assert_eq!(&thumbnail[..2], b"BM");
+        assert_eq!(
+            u32::from_le_bytes(thumbnail[10..14].try_into().expect("off bits")),
+            54
+        );
+        assert_eq!(
+            i32::from_le_bytes(thumbnail[18..22].try_into().expect("width")),
+            137
+        );
+        assert_eq!(
+            i32::from_le_bytes(thumbnail[22..26].try_into().expect("height")),
+            77
+        );
+        assert_eq!(
+            u16::from_le_bytes(thumbnail[28..30].try_into().expect("depth")),
+            24
+        );
+        // The offset write opened the file the thumbnail had just created
+        // (`TJS_BS_UPDATE`) and wrote from the offset on: every byte before it
+        // is untouched.
+        assert_eq!(
+            &bytes[..SIZE],
+            &thumbnail[..],
+            "the struct must not clobber the thumbnail"
+        );
+
+        // The framing the reference writes for a `z` mode: the two `0xfe` bytes
+        // and the mode byte, the UTF-16LE BOM `TVPCreateTextStreamForWrite`
+        // always emits, the two little-endian sizes the destructor back-fills
+        // (`ZStream->total_out`/`total_in`), and a zlib stream
+        // (`deflateInit`, so the payload starts with the `0x78` CMF byte).
+        assert_eq!(&bytes[SIZE..SIZE + 5], &[0xfe, 0xfe, 0x02, 0xff, 0xfe]);
+        let compressed = u64::from_le_bytes(bytes[SIZE + 5..SIZE + 13].try_into().expect("size"));
+        let uncompressed =
+            u64::from_le_bytes(bytes[SIZE + 13..SIZE + 21].try_into().expect("size"));
+        assert_eq!(bytes.len(), SIZE + 21 + compressed as usize);
+        assert_eq!(uncompressed as usize, plain.len() - 2);
+        assert_eq!(bytes[SIZE + 21], 0x78);
+
+        // The payload is byte-identical to the plain text stream's, minus its
+        // BOM: the compressed mode changes the container, not the struct.
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::ZlibDecoder::new(&bytes[SIZE + 21..]),
+            &mut payload,
+        )
+        .expect("inflate the struct");
+        assert_eq!(payload, plain[2..]);
+        let text = String::from_utf16(
+            &payload
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .expect("utf16 struct");
+        assert!(text.starts_with("(const) %[\n"), "{text}");
+        assert!(text.contains("\"core\" => (const) %[\n"), "{text}");
+
+        // The bare `"o" + size` form appends the plain text stream and nothing
+        // else: `TVPCreateTextStreamForWrite` writes only the BOM and the
+        // UTF-16LE payload when the mode names neither `z` nor `c`, and the
+        // offset write leaves the thumbnail in place.
+        let plain_bookmark = fs::read(root.join("savedata/data1.bmp")).expect("plain bookmark");
+        assert_eq!(plain_bookmark.len(), SIZE + plain.len());
+        assert_eq!(&plain_bookmark[SIZE..], &plain[..]);
+        assert_eq!(&plain_bookmark[..SIZE], &thumbnail[..]);
+
+        // `o<size>` seeks and never limits: rewriting a shorter struct at the
+        // same offset leaves the stale tail in place.  That is why KAGEX's
+        // `BookMarkIO_Standard.rewrite` calls `Storages.truncateFile` when it
+        // wants the file cut back, and why a plain `"z"` mode (no `o`, i.e.
+        // `TJS_BS_WRITE`) is the truncating form.
+        engine
+            .execute_expression(
+                "inline.tjs",
+                r#"(Dictionary.saveStruct incontextof %["id" => "x"])(
+                     "savedata/data0.bmp", "zo31778")"#,
+            )
+            .expect("shorter rewrite");
+        let rewritten = fs::read(root.join("savedata/data0.bmp")).expect("bookmark file");
+        assert_eq!(
+            rewritten.len(),
+            bytes.len(),
+            "an `o` mode write never truncates the file"
+        );
+        assert_eq!(&rewritten[..SIZE], &thumbnail[..]);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Decodes the engine's text-stream bytes (a UTF-16LE BOM plus UTF-16LE
