@@ -648,6 +648,14 @@ mod tests {
     /// bare wrapper turned those lookups into `checkSave失敗 : Member
     /// "saveStruct" does not exist` at boot and sent the game's
     /// `saveDataLocation` to the personal path.
+    ///
+    /// The round trip below writes that probe both ways and reads each form
+    /// with the reference's own reader: `Array.saveStruct(path)` writes text
+    /// unless the mode names `b` (`tjsArray.cpp:483-491`), and
+    /// `Array.loadStruct` reads the *binary* container and only that
+    /// (`:379-385`, `:400-402`) — the text form is read by
+    /// `Scripts.evalStorage`, the evaluator the whole text format exists for
+    /// (`crates/krkr-engine/src/native/scripts.rs:123`).
     #[test]
     fn array_class_object_keeps_the_builtin_surface() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -674,8 +682,8 @@ mod tests {
         }
 
         // The idiom itself has to work end to end, and a plain instance keeps
-        // working from the same wrapper: write and read the probe array the
-        // way `checkSave` does, then use the instance methods.
+        // working from the same wrapper: write the probe the way `checkSave`
+        // does, then use the instance methods.
         let root = test_root("savestruct-class-surface");
         let mut engine = test_engine(&root);
         engine.register_plugin(SaveStructPlugin).expect("plugin");
@@ -686,16 +694,18 @@ mod tests {
                     var probe = new Array();
                     probe.add(7);
                     (Array.saveStruct incontextof probe)("savecheck");
+                    (Array.saveStruct incontextof probe)("savecheck.ksd", "b");
                     var loaded = [];
-                    (Array.loadStruct incontextof loaded)("savecheck");
+                    (Array.loadStruct incontextof loaded)("savecheck.ksd");
                     var items = [];
                     items.add(1);
                     items.add(2);
-                    return loaded.count + ":" + loaded[0] + ":" + items.count;
+                    return loaded.count + ":" + loaded[0] + ":" + items.count + ":" +
+                        Scripts.evalStorage("savecheck")[0];
                 })()"#,
             )
             .expect("class surface round trip");
-        assert_eq!(value, Variant::String("1:7:2".to_string()));
+        assert_eq!(value, Variant::String("1:7:2:7".to_string()));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
