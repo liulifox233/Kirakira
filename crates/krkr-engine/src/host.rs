@@ -5950,7 +5950,7 @@ mod tests {
     /// window script reads. The script here is the reference's KAGEX window
     /// logic in miniature — `getInitialFullScreenState`, the `fullScreenMode`
     /// value map and `isPseudoMode`
-    /// (`krkrz`'s sibling, `krkr2/kirikiri2/trunk/kag3ex3/template/system/MainWindow.tjs:1142`,
+    /// (`krkrz`'s sibling, `krkr2/kirikiri2/branches/kag3ex3/template/system/MainWindow.tjs:1142`,
     /// `:1528-1545`, `:1562`) — and `Window.fullScreen` is what the desktop
     /// shell mirrors onto the host window (`KrkrEngine::window_fullscreen`).
     #[test]
@@ -5968,7 +5968,7 @@ mod tests {
         // The one window the game's scripts drive, then the reference's KAGEX
         // window logic in miniature: `getInitialFullScreenState`, the
         // `fullScreenMode` value map and `isPseudoMode`
-        // (`krkr2/kirikiri2/trunk/kag3ex3/template/system/MainWindow.tjs:1142`,
+        // (`krkr2/kirikiri2/branches/kag3ex3/template/system/MainWindow.tjs:1142`,
         // `:1528-1545`, `:1562`). `Window.fullScreen` is what the desktop shell
         // mirrors onto the host window (`KrkrEngine::window_fullscreen`).
         engine

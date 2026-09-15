@@ -287,7 +287,7 @@ pub const OPTION_DESCRIPTOR_PROVIDERS: &[(&str, &[OptionCategory])] = &[
 /// Every option category the engine's **linked** plugins declare, in provider
 /// order, de-duplicated by category name the way the reference engine merges
 /// the DLLs' JSON (`TVPMargeCommandDesc`,
-/// `krkrz/src/core/msg/win32/ReadOptionDesc.cpp:260-288`, which appends a
+/// `krkrz/msg/win32/ReadOptionDesc.cpp:260-288`, which appends a
 /// second declaration's options to the first category of that name).
 ///
 /// Linking is what gates a descriptor in the reference too: the option dialog
