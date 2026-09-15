@@ -997,11 +997,17 @@ mod tests {
     /// KAGEX's `safeEvalStorage(data, *)` forwards the mode to
     /// `Scripts.safeEvalStorage`/`Scripts.evalStorage` -- which positions the
     /// read stream before it probes the BOM (`base/TextStream.cpp:76-140`).
+    /// The test runs that whole chain too: `PackinOne`'s `Scripts.safeEvalStorage`
+    /// forwards its own arguments to `evalStorage`, so the mode arrives as the
+    /// `o<size>` read the game's loader performs.
     #[test]
     fn bookmarkio_standard_appends_a_compressed_struct_after_the_bmp() {
         let root = test_root("bookmarkio-standard");
         let mut engine = test_engine(&root);
         engine.register_plugin(SaveStructPlugin).expect("plugin");
+        engine
+            .register_plugin(crate::packinone::PackinOnePlugin)
+            .expect("packinone plugin");
         let value = engine
             .execute_expression(
                 "inline.tjs",
@@ -1019,6 +1025,7 @@ mod tests {
                     var viaEval = Scripts.evalStorage("savedata/data0.bmp", "o" + size);
                     var viaLoad = (Dictionary.loadStruct incontextof %[])(
                         "savedata/data0.bmp", "o" + size);
+                    var viaSafe = Scripts.safeEvalStorage("savedata/data0.bmp", "o" + size);
                     // The `-debugwin=no` shape of the same call: `saveDataMode`
                     // is `""`, so the mode is the bare `"o" + size` and the
                     // struct is the plain text stream at the offset.  The
@@ -1031,7 +1038,8 @@ mod tests {
                         "savedata/data1.bmp", "o" + size);
                     var plainEval = Scripts.evalStorage("savedata/data1.bmp", "o" + size);
                     return size + ":" + viaEval.id + ":" + viaEval.core.curLine +
-                        ":" + viaLoad.id + ":" + plainEval.core.curLine;
+                        ":" + viaLoad.id + ":" + viaSafe.core.curLine +
+                        ":" + plainEval.core.curLine;
                 })()"#,
             )
             .expect("write the bookmark");
@@ -1039,11 +1047,13 @@ mod tests {
         // 31778 is the game's own prediction for a 137x77 24bpp BMP, and the
         // BMP our engine writes for the same call has exactly that length --
         // which is what makes the game's offset the struct's offset.
-        const SIZE: usize = (((137 * 3 + 3) / 4) * 4) * 77 + 54;
+        // size : evalStorage.id : evalStorage.core.curLine : loadStruct.id :
+        // safeEvalStorage.core.curLine : plainEval.core.curLine
+        const SIZE: usize = (137usize * 3).div_ceil(4) * 4 * 77 + 54;
         assert_eq!(SIZE, 31778);
         assert_eq!(
             value,
-            Variant::String("31778:GINKA:12:GINKA:12".to_string())
+            Variant::String("31778:GINKA:12:GINKA:12:12".to_string())
         );
 
         let bytes = fs::read(root.join("savedata/data0.bmp")).expect("bookmark file");

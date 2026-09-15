@@ -1122,8 +1122,14 @@ fn dictionary_save_struct<H: TjsHost + 'static>(
 ///   the `fe fe 02` mode signature, the `ff fe` BOM, a placeholder for the two
 ///   little-endian sizes, and back-fills them from `ZStream->total_out` and
 ///   `total_in` when it closes (`base/TextStream.cpp:428-462`, `:487-489`).
-/// * `c`, `c<mode>` -- the simple crypt (`:381-386`), which this engine's
-///   storage layer writes as mode 1.
+/// * `c`, `c<digit>` -- the simple crypt.  The reference records 1 for a bare
+///   `c` and the digit otherwise, and then refuses any mode outside 1 and 2
+///   with `"unsupported cipher mode"` (`base/TextStream.cpp:381-397`), so
+///   `c`/`c1` are the bit-swap crypt, `c2` is the *compressed* stream, and
+///   `c0`/`c3`..`c9` throw.  This engine's storage layer writes mode 1 for any
+///   `c` and never rejects, so `c2` compresses nothing here and the refused
+///   modes write instead of failing; both readers are content-driven, which
+///   keeps the difference write-side only.
 ///
 /// KAGEX's `BookMarkIO_Standard.save` writes `saveDataMode + "o" + size`, and
 /// GINKA's `main/Config.tjs` sets `saveDataMode = debugWindowEnabled ? "" :
