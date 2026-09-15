@@ -1839,6 +1839,52 @@ mod tests {
         assert_eq!(result, Variant::Integer(3));
     }
 
+    #[test]
+    fn unqualified_identifier_store_compiles_to_plain_spd() {
+        // `tjsInterCodeGen.cpp:1909-1921` picks the store opcode from the
+        // assignment target's object node: the this-proxy takes `VM_SPD`
+        // (flags 0), a real receiver takes `VM_SPDE` (`MEMBERENSURE`), and
+        // `&`/declaration stores take `VM_SPDS`
+        // (`MEMBERENSURE|TJS_IGNOREPROP`, `:2699-2703`).  The flags are what
+        // makes the proxy fall through to the global for a miss
+        // (`tTJSObjectProxy::PropSet`, `tjsInterCodeExec.cpp:318-320`), so an
+        // assignment inside a method must not carry either flag: the
+        // declaration `var c = 0` is the only `spds` in this fixture, and the
+        // assignment in `f` was a second one before the fix.
+        let file = compile_source_to_bytecode(
+            "inline.tjs",
+            "var c = 0;\nfunction f() { c = c + 1; }\nf();\nreturn c;",
+        )
+        .expect("bytecode");
+        let top_level = file.top_level.expect("top-level");
+        let lines_of = |index: usize| file.disassemble_object(index).expect("disassemble");
+        // The store inside `f` is `spd %-2.*N` -- flags 0 on the this-proxy --
+        // and carries neither `MEMBERENSURE` (`spde`) nor
+        // `MEMBERENSURE|TJS_IGNOREPROP` (`spds`); before the fix it was a
+        // second `spds` there.
+        let body: Vec<String> = (0..file.objects.len())
+            .filter(|index| *index != top_level)
+            .flat_map(&lines_of)
+            .collect();
+        assert!(
+            body.iter().any(|line| line.contains("spd %-2.")),
+            "{body:#?}"
+        );
+        assert!(
+            !body
+                .iter()
+                .any(|line| line.contains("spds") || line.contains("spde")),
+            "{body:#?}"
+        );
+        // The fixture really does exercise a statically bound global: the
+        // top-level `var c = 0` is still an ensured, ignore-prop store.
+        let top = lines_of(top_level);
+        assert!(
+            top.iter().any(|line| line.contains("spds %-2.")),
+            "{top:#?}"
+        );
+    }
+
     fn disassemble_top_level(source: &str) -> Vec<String> {
         let file = compile_source_to_bytecode("inline.tjs", source).expect("bytecode");
         file.disassemble_object(file.top_level.expect("top-level"))

@@ -15180,6 +15180,15 @@ mod tests {
         // (`sysscn/prerenderfontex.tjs`, `spds` at bytecode 58).  The stored
         // value carries its own `ObjThis` (`tTJSVariant(objthis, objthis)`),
         // so the hook's setter still runs against the font, not the writer.
+        //
+        // The property object itself is fetched with `&` (`VM_GPDS`,
+        // `TJS_IGNOREPROP`), the reference's way to read a member past the
+        // property protocol (`tjsObject.cpp:1350-1353`) and what KAGEX's
+        // `objectHookInjection` uses for both directions (`&target[key]` /
+        // `&this.prop`, `kag3ex3/template/system/Utils.tjs:562`/`:573`).  A
+        // plain read would run the property protocol and, this property having
+        // no getter, raise -1007 before the hook could be installed
+        // (`tjsInterCodeExec.cpp:3134-3138`).
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         let seen = engine
             .execute_script(
@@ -15197,7 +15206,7 @@ mod tests {
                 global.hooked = function(v) { this.seen = "set:" + v; };
                 var build = function() {
                     ("property probe { setter(v) { (global.hooked incontextof this)(v); } }")!;
-                    return this.probe;
+                    return &this.probe;
                 } incontextof (new Dictionary());
                 global.fontLike = new FontLike();
                 fontLike.probe = build() incontextof null;

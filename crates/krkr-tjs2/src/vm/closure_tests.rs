@@ -876,11 +876,7 @@ fn a_bare_function_frame_writes_through_this_onto_the_callee() {
 /// global object: `%-2` is the this-proxy built with
 /// `proxy.SetObjects(objthis, global)` (`tjsInterCodeExec.cpp:789-806`), and
 /// `tTJSObjectProxy::PropGet` moves on to the second object for
-/// `TJS_E_MEMBERNOTFOUND` only (`:284-299`).  (The matching unqualified
-/// *store* path is a known divergence tracked separately: this engine lands
-/// an existing global's unqualified store on the callee object's table where
-/// the reference's proxy falls through to the global's, `:318-320` with
-/// `OBJ2` = `objthis ? objthis : Dispatch2` at `:264`.)
+/// `TJS_E_MEMBERNOTFOUND` only (`:284-299`).
 #[test]
 fn a_bare_function_frame_reads_unqualified_globals_through_the_proxy() {
     let mut runtime = Runtime::new();
@@ -891,6 +887,68 @@ fn a_bare_function_frame_reads_unqualified_globals_through_the_proxy() {
          return probe;",
     );
     assert_eq!(value, Variant::Integer(7));
+}
+
+/// Unqualified *stores* from a bare-function frame fall through the same way,
+/// because the official compiler emits flags 0 (`VM_SPD`) when the assignment
+/// target is the `T_THIS_PROXY` node and `MEMBERENSURE` (`VM_SPDE`) only for a
+/// real receiver (`tjsInterCodeGen.cpp:1909-1921`); the proxy then tries the
+/// primary and moves to the global only for `TJS_E_MEMBERNOTFOUND`, keeping
+/// `objthis` as the receiver (`tjsInterCodeExec.cpp:318-320`, `:264`).
+/// With `MEMBERENSURE` on the proxy the callee would answer the miss and grow
+/// its own copy of the global (`c = c + 1` inside a function would never
+/// update `global.c`).
+#[test]
+fn a_bare_function_frame_stores_unqualified_globals_through_the_proxy() {
+    // A *declared* top-level function carries the global as its ObjThis
+    // (`RegisterFunction` queues it with `changethis`,
+    // `tjsInterCodeGen.cpp:935-947`), so its frame's proxy starts at the
+    // global and the store lands there through either flag choice.  The
+    // pinning shape is a callee whose `this` is some other object -- here a
+    // class instance -- where the callee must answer the miss and let the
+    // proxy walk on.
+    assert_eq!(
+        ok("var c = 0;\n\
+            class Counter {\n\
+            \x20   function poke() { c = c + 1; }\n\
+            }\n\
+            var counter = new Counter();\n\
+            counter.poke();\n\
+            counter.poke();\n\
+            return c + \":\" + typeof counter.c;"),
+        Variant::String("2:undefined".to_string())
+    );
+    // The compound and increment spellings compile to the same place.
+    assert_eq!(
+        ok("var c = 0;\n\
+            class Counter {\n\
+            \x20   function poke() { c += 2; c++; }\n\
+            }\n\
+            var counter = new Counter();\n\
+            counter.poke();\n\
+            return c + \":\" + typeof counter.c;"),
+        Variant::String("3:undefined".to_string())
+    );
+
+    // The bare-call shape (a closure invoked with no receiver at all) runs on
+    // the callee object itself (`tjsVariant.h:226-232`), so it must fall
+    // through the same way.
+    let mut runtime = Runtime::new();
+    let file = compile_source_to_bytecode(
+        "closure-test.tjs",
+        "var c = 0;\n\
+         var probe = function() { c = c + 1; return c; };\n\
+         return probe;",
+    )
+    .expect("compile");
+    let probe = runtime.execute_file(&file).expect("install probe");
+    let callee = probe.object_handle().expect("function object");
+    assert_eq!(
+        runtime.call_function(probe, Vec::new()).expect("host call"),
+        Variant::Integer(1)
+    );
+    assert_eq!(runtime.global_member("c"), Variant::Integer(1));
+    assert_eq!(runtime.object_member(callee, "c"), Variant::Void);
 }
 
 /// A call made *from* a bare-function frame hands the callee that frame's own

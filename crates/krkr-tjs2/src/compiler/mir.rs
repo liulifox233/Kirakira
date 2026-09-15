@@ -1162,7 +1162,6 @@ pub fn lower_hir_program(
 struct BindingInfo {
     is_global: bool,
     scope_kind: hir::ScopeKind,
-    kind: hir::BindingKind,
 }
 
 #[derive(Clone, Debug)]
@@ -1220,7 +1219,6 @@ impl Lowerer {
                 BindingInfo {
                     is_global,
                     scope_kind,
-                    kind: binding.kind,
                 },
             );
         }
@@ -1268,13 +1266,6 @@ impl Lowerer {
             .binding
             .and_then(|id| self.binding(id))
             .is_some_and(|binding| binding.scope_kind == hir::ScopeKind::Class)
-    }
-
-    fn ident_is_property(&self, ident: &syntax::Ident) -> bool {
-        ident
-            .binding
-            .and_then(|id| self.binding(id))
-            .is_some_and(|binding| binding.kind == hir::BindingKind::Property)
     }
 
     fn intern_string(&mut self, text: &str) -> StringId {
@@ -3854,18 +3845,29 @@ impl ObjectBuilder {
         } else {
             Value::Slot(SlotId::ThisProxy)
         };
+        // The official compiler picks the store opcode from the assignment
+        // target's object node (`tjsInterCodeGen.cpp:1909-1921`): the
+        // this-proxy takes `VM_SPD` -- flags 0, no `MEMBERENSURE` and no
+        // `TJS_IGNOREPROP` -- while any other node takes `VM_SPDE`
+        // (`MEMBERENSURE`) or, in global-context mode, is reached as the
+        // `T_GLOBAL` node the symbol rewrite installs (`:2158`) and takes
+        // `VM_SPDE` too.  The flags are what makes the proxy's second object
+        // reachable: `tTJSObjectProxy::PropSet` moves to the global only for
+        // `TJS_E_MEMBERNOTFOUND` (`tjsInterCodeExec.cpp:318-320`), and
+        // `MEMBERENSURE` on the primary is what would make the receiver
+        // answer the miss with a member of its own instead
+        // (`tTJSCustomObject::PropSet`, `tjsObject.cpp:1500-1505`).  So an
+        // unqualified store never creates the name on the callee: it updates
+        // the global the proxy falls through to, or raises.
+        let flags = if self.force_global_context {
+            FLAGS_ENSURE_SET
+        } else {
+            FLAGS_DEFAULT_SET
+        };
         Ok(Place::Member {
             object,
             key: MemberKey::Direct(lowerer.intern_string(&ident.name)),
-            flags: if lowerer.ident_is_property(ident) || ident.binding.is_none() {
-                // Properties and statically unresolved identifiers (e.g. members
-                // inherited from a super class) must go through dynamic dispatch so
-                // property setters found at runtime are honored. Only statically
-                // known data members may bypass it.
-                FLAGS_DEFAULT_SET
-            } else {
-                FLAGS_IGNORE_PROP_SET
-            },
+            flags,
         })
     }
 
