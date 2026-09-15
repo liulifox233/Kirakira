@@ -18,6 +18,16 @@
 //!   and parse it through [`krkr_emote::Motion`] (eluna's PSB reader plus the
 //!   PARQUET-flavor adaptation). The handle the game gets back carries
 //!   `.metadata`, which its wrapper requires (`!l2.metadata === void`).
+//! * **The `.mtn` graphic loader** — the module claims `.mtn` in the engine's
+//!   script image path ([`krkr_engine::plugin_api::graphic`], the counterpart
+//!   of the reference's `TVPRegisterGraphicLoadingHandler`), so
+//!   `Layer.loadImages`/`System.touchImages` of a motion resolve to a real
+//!   bitmap instead of "The image format could not be determined". The frame is
+//!   the file's own root `screenSize` with the content centred on it, and it
+//!   stays **live**: the engine's frame clock advances the animation and swaps
+//!   the pixels of every layer showing it. PARQUET's title screen is exactly
+//!   that — `custom.ks` `*title_start`'s motion branch loads `title_bg.mtn` as
+//!   a layer image, and the logo lives in that motion.
 //! * **The state machine** — `play`/`stop`/`progress`/`frameProgress`/`skip`/
 //!   `skipToSync`, `speed`, `tickCount`, `playing`, `loopTime`/`lastTime`, and
 //!   `setVariable(name, value[, time, easing])` with linear/smoothstep timed
@@ -102,15 +112,20 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use krkr_emote::{
     EMOTE_TICKS_PER_SECOND, Motion, MotionDrawItem, TextureCache, Tint, render_draw_list_into,
 };
 use krkr_engine::{
     KrkrHost, KrkrPlugin,
-    plugin_api::layer::{
-        attach_canvas_layer, create_canvas_layer, fit_canvas_layer, layer_bitmap_write,
+    plugin_api::{
+        graphic::{
+            GraphicFrame, GraphicLoader, GraphicSource, LiveGraphic, LoadedGraphic,
+            register_graphic_loader, unregister_graphic_loader,
+        },
+        layer::{attach_canvas_layer, create_canvas_layer, fit_canvas_layer, layer_bitmap_write},
     },
 };
 use krkr_tjs2::{
@@ -130,6 +145,10 @@ pub(crate) const META: PluginMeta = PluginMeta {
             timed setVariable(name, value, time, easing) plus getVariable/contains/variableKeys drive the model's \
             own clock and variable state, and draw(layer) composites the sampled draw list into the layer bitmap \
             through plugin_api::layer with the player's coord/rotate/scale/affine transform and colour filter. \
+            The module also claims `.mtn` in the engine's script image path (plugin_api::graphic, the reference's \
+            TVPRegisterGraphicLoadingHandler), so Layer.loadImages of a motion yields a real bitmap sized by the \
+            file's screenSize and the engine keeps it animating frame by frame - PARQUET's title_bg.mtn (the title \
+            screen's decoration and PARQUET logo) loads exactly that way. \
             Motion.SeparateLayerAdaptor(owner) is a real drawable Layer (a plugin_api canvas) sized like its owner \
             and attached as its visible child, which is how the reference's adaptor reaches the screen under a \
             ltBinder owner; the game's clear/draw/Layer.assignImages publish path works on top of that. \
@@ -166,6 +185,11 @@ impl KrkrPlugin for MotionPlayerPlugin {
         GLOBAL_POOL.with(|pool| pool.borrow_mut().loaded.clear());
         WARNED.with(|warned| warned.borrow_mut().clear());
         install_motionplayer_compat(runtime);
+        Ok(())
+    }
+
+    fn unregister(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+        unregister_graphic_loader(runtime, self.name());
         Ok(())
     }
 }
@@ -573,6 +597,306 @@ pub(crate) fn install_motionplayer_compat(runtime: &mut Runtime<KrkrHost>) {
         "SeparateLayerAdaptor",
         Variant::Object(separate_adaptor),
     );
+
+    register_motion_graphic_loader(runtime);
+}
+
+// ---------------------------------------------------------------------------
+// The `.mtn` graphic loader (the script image path)
+// ---------------------------------------------------------------------------
+
+/// The extensions the loader answers. Only `.mtn` is claimed: the `.psb`
+/// *model* surface is one of this module's declared stubs (`EmotePlayer`), so
+/// a `.psb` asked for as an image keeps the engine's own honest
+/// "The image format could not be determined" instead of a half-load.
+const MOTION_EXTENSIONS: &[&str] = &[".mtn"];
+
+/// The module's graphic loader, kept in one place so the engine's double
+/// `register` (boot, then the first `Plugins.link`) hands back the same `Arc`
+/// and the registry treats the second call as a no-op.
+fn motion_graphic_loader() -> &'static Arc<dyn GraphicLoader> {
+    static LOADER: OnceLock<Arc<dyn GraphicLoader>> = OnceLock::new();
+    LOADER.get_or_init(|| Arc::new(MotionGraphicLoader) as Arc<dyn GraphicLoader>)
+}
+
+fn register_motion_graphic_loader(runtime: &mut Runtime<KrkrHost>) {
+    if let Err(error) = register_graphic_loader(runtime, Arc::clone(motion_graphic_loader())) {
+        runtime.host_mut().log(&format!(
+            "motionplayer.dll: the .mtn graphic loader could not be registered: {error}"
+        ));
+    }
+}
+
+/// The E-mote driver answering for `.mtn` in the script image path — the
+/// reference's `TVPRegisterGraphicLoadingHandler` claim
+/// (`visual/GraphicsLoaderIntf.cpp:142`, dispatch `:1524-1534`), which is what
+/// makes `Layer.loadImages("motion/title_bg.mtn")` and `System.touchImages`
+/// reach the plugin instead of the built-in decoders. PARQUET's title layer
+/// (`custom.ks` `*title_start`, the `GetTitleImageFile.UseMotion()` branch)
+/// loads its motion exactly this way.
+///
+/// The file's own data decides how the frame is laid out:
+///
+/// * **Animation** — the animation named like the storage file's stem when the
+///   file carries one (`logoflash.mtn` → `logoflash`), otherwise the file's
+///   first animation. A `.mtn` used as a scene image is authored around one
+///   entry motion (PARQUET's `title_bg.mtn` opens with `char_move`, the
+///   curtains-and-logo sweep the title uses), and the game names the animation
+///   itself only on the `Motion.ResourceManager` path, which has the storage
+///   name to match on.
+/// * **Canvas** — the file's root `screenSize` (`width`, `height`,
+///   `originX`, `originY`): the model space is the authored screen, centred on
+///   the origin (`title_bg.mtn` declares 1920x1080, and its mirrored sprite
+///   pairs — `bgframe1` at (+774,-489) and its flipped twin at (-774,+489) —
+///   confirm the origin is the screen centre). The frame is the screen, and the
+///   content is translated by `width/2 - originX`, `height/2 - originY`.
+///   A file without `screenSize` falls back to the bounds of the first
+///   non-empty frame, translated by `-min`, which keeps the frame the content
+///   itself asks for.
+/// * **Playback** — the load's bitmap is tick 0 and the graphic stays live; the
+///   engine's frame clock drives it from there (see [`MotionGraphic`]).
+struct MotionGraphicLoader;
+
+impl GraphicLoader for MotionGraphicLoader {
+    fn name(&self) -> &str {
+        "motionplayer.dll"
+    }
+
+    fn extensions(&self) -> &[&str] {
+        MOTION_EXTENSIONS
+    }
+
+    fn load(&self, source: GraphicSource<'_>) -> std::result::Result<LoadedGraphic, String> {
+        let motion = Motion::from_bytes(source.bytes).map_err(|error| error.to_string())?;
+        let animation = graphic_animation(&motion, source.storage).ok_or_else(|| {
+            format!(
+                "`{}` carries no animation (the file has no motion to play)",
+                source.storage
+            )
+        })?;
+        let canvas = MotionCanvas::of(&motion, &animation)?;
+
+        let motion = Arc::new(motion);
+        let mut textures = TextureCache::new(Arc::clone(&motion));
+        let frame = canvas.render(&motion, &animation, 0.0, &mut textures);
+        let playback = MotionPlayback::new(&motion, &animation);
+        Ok(LoadedGraphic {
+            frame,
+            live: Some(Arc::new(MotionGraphic {
+                motion,
+                animation,
+                canvas,
+                textures: Mutex::new(textures),
+                playback: Mutex::new(playback),
+            })),
+        })
+    }
+}
+
+/// One live `.mtn` image: the parsed motion, the animation it plays, the
+/// canvas it draws into and the frame clock the engine advances.
+///
+/// The engine asks for a frame with the time since the load
+/// ([`LiveGraphic::frame`]) and swaps every layer showing the image, which is
+/// this port's way of doing what the reference's handler does when it keeps
+/// drawing into the layer bitmap it was handed. A motion that plays once holds
+/// its last drawn frame — the animation's own tail (PARQUET's `title_bg.mtn`
+/// clears its priorities at `lastTime`) must not erase the layer the title
+/// screen is showing.
+struct MotionGraphic {
+    motion: Arc<Motion>,
+    animation: String,
+    canvas: MotionCanvas,
+    textures: Mutex<TextureCache>,
+    playback: Mutex<MotionPlayback>,
+}
+
+/// The frame clock of one live graphic: where the animation is, whether it
+/// loops, and whether it has ended with its last frame standing.
+struct MotionPlayback {
+    duration_ticks: f64,
+    /// `Some(point)` loops back to tick 0 at `point`; `None` plays once.
+    loop_ticks: Option<f64>,
+    /// The last tick a frame was rendered at, so a display refresh faster than
+    /// the animation's own 1/60 s resolution does not re-rasterise the scene.
+    rendered_tick: Option<f64>,
+    /// The animation ended (or ended without a frame) and the frame already
+    /// handed over stands.
+    held: bool,
+}
+
+impl MotionPlayback {
+    fn new(motion: &Motion, animation: &str) -> Self {
+        let (duration_ticks, loop_time) = motion
+            .animation(animation)
+            .map(|animation| (f64::from(animation.duration_ticks), animation.loop_time))
+            .unwrap_or((0.0, None));
+        let loop_ticks = loop_time
+            .map(f64::from)
+            .filter(|point| point.is_finite() && *point > 0.0);
+        Self {
+            duration_ticks,
+            loop_ticks,
+            rendered_tick: None,
+            held: false,
+        }
+    }
+}
+
+impl LiveGraphic for MotionGraphic {
+    fn frame(&self, elapsed: Duration) -> Option<GraphicFrame> {
+        let mut playback = self
+            .playback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if playback.held {
+            return None;
+        }
+        let elapsed_ticks = elapsed.as_secs_f64() * f64::from(EMOTE_TICKS_PER_SECOND);
+        let tick = match playback.loop_ticks {
+            Some(loop_ticks) => elapsed_ticks % loop_ticks,
+            None => {
+                if elapsed_ticks > playback.duration_ticks {
+                    playback.held = true;
+                    return None;
+                }
+                elapsed_ticks
+            }
+        };
+        if let Some(rendered) = playback.rendered_tick
+            && (tick - rendered).abs() < 0.5
+        {
+            return None;
+        }
+        let mut textures = self
+            .textures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let frame = self
+            .canvas
+            .render(&self.motion, &self.animation, tick as f32, &mut textures);
+        playback.rendered_tick = Some(tick);
+        // An empty sample at the animation's tail is the animation saying
+        // "nothing is drawn here"; the last frame the layer already shows
+        // stands rather than the layer being wiped.
+        if frame.rgba.iter().all(|byte| *byte == 0) {
+            playback.held = true;
+            return None;
+        }
+        Some(frame)
+    }
+}
+
+/// The animation a `.mtn` opens with: the one named like the storage file's
+/// stem when it exists, else the file's first animation.
+fn graphic_animation(motion: &Motion, storage: &str) -> Option<String> {
+    let stem = storage
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(storage)
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(storage);
+    if let Some(animation) = motion.animation(stem) {
+        return Some(animation.name.clone());
+    }
+    motion
+        .animations()
+        .first()
+        .map(|animation| animation.name.clone())
+}
+
+/// The bitmap a motion draws into: the file's authored screen, centred on the
+/// model origin.
+#[derive(Clone, Copy, Debug)]
+struct MotionCanvas {
+    width: u32,
+    height: u32,
+    offset_x: f32,
+    offset_y: f32,
+}
+
+impl MotionCanvas {
+    fn of(motion: &Motion, animation: &str) -> std::result::Result<Self, String> {
+        let root = &motion.psb().root;
+        if let Some(screen_size) = root.field("screenSize") {
+            let width = screen_size.field_u32("width").unwrap_or(0);
+            let height = screen_size.field_u32("height").unwrap_or(0);
+            if width > 0 && height > 0 {
+                let origin_x = screen_size.field_f32("originX").unwrap_or(0.0);
+                let origin_y = screen_size.field_f32("originY").unwrap_or(0.0);
+                return Ok(Self {
+                    width,
+                    height,
+                    // The model origin is the screen centre: the authored
+                    // `origin` is the model point the screen's own origin
+                    // sits on, so the translation is half the screen minus it.
+                    offset_x: width as f32 / 2.0 - origin_x,
+                    offset_y: height as f32 / 2.0 - origin_y,
+                });
+            }
+        }
+
+        // No `screenSize`: frame what the animation actually draws at its
+        // first non-empty tick.
+        for tick in [0.0f32, 1.0, 10.0, 30.0] {
+            let Ok(items) = motion.draw_list(animation, tick) else {
+                continue;
+            };
+            let mut bounds: Option<(f32, f32, f32, f32)> = None;
+            for item in items.iter().filter(|item| item.visible) {
+                let width = (item.size[0] * item.scale[0]).abs() * 0.5;
+                let height = (item.size[1] * item.scale[1]).abs() * 0.5;
+                let x = item.center[0] + item.world_transform[4];
+                let y = item.center[1] + item.world_transform[5];
+                let entry = bounds.get_or_insert((x - width, y - height, x + width, y + height));
+                entry.0 = entry.0.min(x - width);
+                entry.1 = entry.1.min(y - height);
+                entry.2 = entry.2.max(x + width);
+                entry.3 = entry.3.max(y + height);
+            }
+            if let Some((min_x, min_y, max_x, max_y)) = bounds
+                && max_x > min_x
+                && max_y > min_y
+            {
+                return Ok(Self {
+                    width: (max_x - min_x).ceil().max(1.0) as u32,
+                    height: (max_y - min_y).ceil().max(1.0) as u32,
+                    offset_x: -min_x,
+                    offset_y: -min_y,
+                });
+            }
+        }
+        Err(format!(
+            "`{animation}` draws nothing this loader can size a frame from"
+        ))
+    }
+
+    fn render(
+        &self,
+        motion: &Motion,
+        animation: &str,
+        ticks: f32,
+        textures: &mut TextureCache,
+    ) -> GraphicFrame {
+        let mut frame = GraphicFrame::transparent(self.width, self.height);
+        let Ok(mut items) = motion.draw_list(animation, ticks) else {
+            return frame;
+        };
+        for item in items.iter_mut() {
+            item.world_transform[4] += self.offset_x;
+            item.world_transform[5] += self.offset_y;
+        }
+        render_draw_list_into(
+            &mut frame.rgba,
+            self.width,
+            self.height,
+            &items,
+            textures,
+            Tint::default(),
+        );
+        frame
+    }
 }
 
 /// Which of the two player classes an instance belongs to.
@@ -2630,7 +2954,41 @@ mod tests {
             let pixel = writer.add_resource(block(colour));
             icon_fields.push((name, icon(&pixel)));
         }
-        let root = object(vec![
+        let root = motion_root(icon_fields, layer, last_time, loop_time, None);
+        writer.finish(4, &root)
+    }
+
+    /// [`motion_bytes_timed`] for a *scene* motion: the root carries the
+    /// `screenSize` a `.mtn` authored for a whole screen declares
+    /// (`title_bg.mtn`: `width 1920, height 1080, originX 0, originY 0`), which
+    /// is the canvas the script-image graphic loader draws into.
+    fn motion_bytes_on_screen(
+        icons: Vec<(&'static str, [u8; 4])>,
+        layer: Value,
+        last_time: i64,
+        loop_time: i64,
+        screen_size: [i64; 4],
+    ) -> Vec<u8> {
+        let mut writer = PsbWriter::default();
+        let mut icon_fields = Vec::new();
+        for (name, colour) in icons {
+            let pixel = writer.add_resource(block(colour));
+            icon_fields.push((name, icon(&pixel)));
+        }
+        let root = motion_root(icon_fields, layer, last_time, loop_time, Some(screen_size));
+        writer.finish(4, &root)
+    }
+
+    /// The PSB root of a one-source, one-`idle`-motion fixture, with the
+    /// optional `screenSize` block (`[width, height, originX, originY]`).
+    fn motion_root(
+        icon_fields: Vec<(&'static str, Value)>,
+        layer: Value,
+        last_time: i64,
+        loop_time: i64,
+        screen_size: Option<[i64; 4]>,
+    ) -> Value {
+        let mut root_fields = vec![
             ("id", text("motion")),
             ("label", text("Synthetic")),
             ("metadata", Value::Null),
@@ -2661,8 +3019,19 @@ mod tests {
                     ]),
                 )]),
             ),
-        ]);
-        writer.finish(4, &root)
+        ];
+        if let Some([width, height, origin_x, origin_y]) = screen_size {
+            root_fields.push((
+                "screenSize",
+                object(vec![
+                    ("width", int(width)),
+                    ("height", int(height)),
+                    ("originX", int(origin_x)),
+                    ("originY", int(origin_y)),
+                ]),
+            ));
+        }
+        object(root_fields)
     }
 
     /// One layer whose single frame carries `src` at `coord`.
@@ -4027,6 +4396,125 @@ mod tests {
             integer(&mut engine, "layer.getMainPixel(12, 12)"),
             0,
             "the un-rotated position is empty"
+        );
+    }
+
+    /// One layer whose 4x4 icon sits at `first` from tick 0 and at `second`
+    /// from tick 30 on: the animation the script-image loader keeps drawing.
+    fn moving_layer(first: [i64; 2], second: [i64; 2]) -> Value {
+        object(vec![
+            ("label", text("body")),
+            ("coordinate", int(0)),
+            ("children", list(vec![])),
+            (
+                "frameList",
+                list(vec![
+                    object(vec![
+                        ("content", content("src/hero/white", first, 255)),
+                        ("time", int(0)),
+                        ("type", int(2)),
+                    ]),
+                    object(vec![
+                        ("content", content("src/hero/white", second, 255)),
+                        ("time", int(30)),
+                        ("type", int(2)),
+                    ]),
+                    object(vec![("time", int(600)), ("type", int(0))]),
+                ]),
+            ),
+        ])
+    }
+
+    /// How many white pixels the 4x4 icon covers around `(cx, cy)` on the
+    /// layer, sampled one pixel at a time.
+    fn white_near(engine: &mut KrkrEngine, cx: i64, cy: i64) -> usize {
+        let mut count = 0;
+        for y in (cy - 4)..=(cy + 4) {
+            for x in (cx - 4)..=(cx + 4) {
+                if integer(engine, &format!("layer.getMainPixel({x}, {y})")) == 0x00ff_ffff {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// The `.mtn` graphic loader: `Layer.loadImages` of a motion resolves
+    /// through the plugin, into a bitmap the file's own `screenSize` sizes, and
+    /// the engine keeps it drawing frame by frame — the seam PARQUET's title
+    /// layer needs (`custom.ks` `*title_start`'s motion branch loads
+    /// `title_bg.mtn` as an image; without the loader that load is "The image
+    /// format could not be determined").
+    #[test]
+    fn a_mtn_script_image_load_is_a_live_motion_frame() {
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes_on_screen(
+                vec![("white", [255, 255, 255, 255])],
+                moving_layer([0, 0], [40, 20]),
+                600,
+                -1,
+                [100, 80, 0, 0],
+            ),
+        )]);
+
+        engine
+            .execute_script(
+                "load.tjs",
+                r#"
+                global.layer = new Layer(0, 0, 100, 80);
+                layer.loadImages("motion/hero.mtn");
+                "#,
+            )
+            .expect("the motion loads as a script image");
+
+        // The bitmap is the motion's authored screen, not the decoder's
+        // "unknown format" failure.
+        assert_eq!(integer(&mut engine, "layer.imageWidth"), 100);
+        assert_eq!(integer(&mut engine, "layer.imageHeight"), 80);
+        // The model space is screen-centred, so the icon at coord (0, 0)
+        // covers canvas pixels 48..52 around the canvas centre.
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(50, 40)"),
+            0x00ff_ffff,
+            "the motion's content lands at the canvas centre"
+        );
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(0, 0)"),
+            0,
+            "away from the content the frame stays transparent"
+        );
+
+        // The graphic is live: the engine's frame clock advances the motion and
+        // the layer follows it, without any script call.
+        assert!(
+            white_near(&mut engine, 50, 40) > 0,
+            "the icon starts centred"
+        );
+        assert_eq!(
+            white_near(&mut engine, 90, 60),
+            0,
+            "the second pose is still empty"
+        );
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(1280.0, 720.0), 0.0), Vec::new()),
+                Duration::from_secs(1),
+            )
+            .expect("frame");
+        assert!(
+            white_near(&mut engine, 90, 60) > 0,
+            "the second pose arrives on the engine's own clock"
+        );
+        assert_eq!(
+            white_near(&mut engine, 50, 40),
+            0,
+            "the icon left the centre"
+        );
+        assert_eq!(
+            integer(&mut engine, "layer.imageWidth"),
+            100,
+            "a frame swap keeps the loaded size"
         );
     }
 }

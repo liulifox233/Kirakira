@@ -8,6 +8,14 @@
 //! * [`storage`] registers a storage media (`psb`, `lzfs`, `proxy`, `steam`,
 //!   `var`, `zip`) on the project storage — the engine-side counterpart of
 //!   `TVPRegisterStorageMedia` (`krkrz/src/core/base/StorageIntf.cpp:530-538`).
+//! * [`graphic`] registers a graphic loader that claims storage extensions in
+//!   the script image path (`Layer.loadImages` and `System.touchImages`), so a
+//!   plugin format like E-mote's `.mtn` yields a real layer bitmap instead of
+//!   "The image format could not be determined" — the counterpart of
+//!   `TVPRegisterGraphicLoadingHandler`
+//!   (`visual/GraphicsLoaderIntf.cpp:142`, dispatch `:1524-1534`). A loader may
+//!   hand back a live graphic the engine re-uploads every frame, which is how
+//!   an animated motion stays animated as a layer image.
 //! * [`transition`] registers a transition handler provider under a name —
 //!   the counterpart of `TVPAddTransHandlerProvider`
 //!   (`krkrz/src/core/visual/TransIntf.cpp:307-324`): a provider owns its
@@ -39,6 +47,7 @@
 //! the algorithms, the clip-box application and the moment it calls
 //! `layer_update`.
 
+pub mod graphic;
 pub mod layer;
 pub mod storage;
 pub mod transition;
