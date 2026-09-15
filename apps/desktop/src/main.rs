@@ -38,7 +38,15 @@ use winit::{
     window::{Fullscreen, Window, WindowAttributes, WindowId},
 };
 
+mod options;
+
 fn main() -> ExitCode {
+    // `--options` renders the descriptor list and exits before the window and
+    // event loop exist, so it works on a host without a display.
+    let args = parse_desktop_args();
+    if args.list_options {
+        return list_desktop_options(args.project_root.as_deref(), &args.selections);
+    }
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
         Err(error) => {
@@ -48,8 +56,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (initial_project_root, console_path) = parse_desktop_args();
-    let mut app = DesktopApp::new(initial_project_root, console_path);
+    let (initial_project_root, console_path) = (args.project_root, args.console_path);
+    let mut app = DesktopApp::new(initial_project_root, console_path, args.selections);
 
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
@@ -62,23 +70,119 @@ fn main() -> ExitCode {
     }
 }
 
+/// The desktop shell's own command line.
+struct DesktopArgs {
+    project_root: Option<PathBuf>,
+    console_path: Option<PathBuf>,
+    /// `--option <name>=<value>`: the KAGEX option selections this launch
+    /// stores for the project (see [`options`]).
+    selections: Vec<options::OptionSelection>,
+    /// `--options`: print the linked plugins' option descriptors and exit.
+    list_options: bool,
+}
+
 /// `--debug-console <fifo>` attaches the shared `krkr-debug` console to this
 /// windowed process: an agent writes commands to the FIFO and reads the dumps
 /// from stdout while the player drives the game with the mouse and keyboard.
-fn parse_desktop_args() -> (Option<PathBuf>, Option<PathBuf>) {
-    let mut root = None;
-    let mut console = None;
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
+///
+/// `--options` and `--option <name>=<value>` are the shell's option surface
+/// for the descriptor registry the linked plugins declare — the stand-in for
+/// the reference engine's config dialog (`options`, and
+/// `docs/plugins/kagexopt.md`). Anything else that is not the project
+/// directory is left alone: the `-<name>=<value>` options the game reads
+/// itself are taken from the process arguments by the engine, and this shell
+/// never has to know them.
+fn parse_desktop_args() -> DesktopArgs {
+    let mut args = DesktopArgs {
+        project_root: None,
+        console_path: None,
+        selections: Vec::new(),
+        list_options: false,
+    };
+    let mut trailing = std::env::args_os().skip(1);
+    while let Some(arg) = trailing.next() {
         if arg == "--debug-console" {
-            console = args.next().map(PathBuf::from);
+            args.console_path = trailing.next().map(PathBuf::from);
             continue;
         }
-        if root.is_none() {
-            root = Some(PathBuf::from(arg));
+        if arg == "--options" {
+            args.list_options = true;
+            continue;
+        }
+        if arg == "--option" {
+            let Some(text) = trailing
+                .next()
+                .map(|value| value.to_string_lossy().into_owned())
+            else {
+                log_error("`--option` wants <name>=<value>");
+                std::process::exit(2);
+            };
+            match options::parse_selection(&text) {
+                Ok(selection) => args.selections.push(selection),
+                Err(error) => {
+                    log_error(&error);
+                    std::process::exit(2);
+                }
+            }
+            continue;
+        }
+        if args.project_root.is_none() {
+            // Anything else that begins with a dash is an engine option the
+            // game reads itself (`-bootfullscreen=yes`): the engine takes
+            // those from the process arguments, so it must not be mistaken for
+            // the project directory.
+            if !arg.to_string_lossy().starts_with('-') {
+                args.project_root = Some(PathBuf::from(arg));
+            }
         }
     }
-    (root.or_else(initial_project_root), console)
+    args.project_root = args.project_root.or_else(initial_project_root);
+    args
+}
+
+/// `--options`: render the option descriptors the linked plugins declare, with
+/// the value each one would answer right now, and exit. The project is
+/// optional; with one, `--option` selections are stored first and its option
+/// files are installed, so the printed values are the ones the run would see —
+/// and the option surface works on a host without a display, the way the
+/// reference's dialog can be opened before the game starts.
+fn list_desktop_options(
+    root: Option<&std::path::Path>,
+    selections: &[options::OptionSelection],
+) -> ExitCode {
+    let mut engine = match KrkrEngine::new(KrkrEngineConfig::default()) {
+        Ok(engine) => engine,
+        Err(error) => {
+            log_error(&format!("engine initialization failed: {error}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = register_reference_plugins(&mut engine) {
+        log_error(&format!("reference plugin registration failed: {error}"));
+        return ExitCode::FAILURE;
+    }
+    if let Some(root) = root {
+        for selection in selections {
+            match options::persist_selection(&engine, root, selection) {
+                Ok(path) => println!(
+                    "stored -{}={} in {}",
+                    selection.name,
+                    selection.raw,
+                    path.display()
+                ),
+                Err(error) => {
+                    log_error(&error);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        options::install_project_options(&mut engine, root);
+    } else if !selections.is_empty() {
+        log_error("`--option` needs the project directory to know which file to store it in");
+        return ExitCode::FAILURE;
+    }
+    print!("{}", options::option_listing(&engine, root));
+    ExitCode::SUCCESS
 }
 
 fn show_error(title: &str, message: &str) {
@@ -423,6 +527,9 @@ struct DesktopApp {
     initial_project_root: Option<PathBuf>,
     console_path: Option<PathBuf>,
     console: Option<ConsoleState>,
+    /// `--option <name>=<value>` selections this launch stores for the project
+    /// before it boots (see [`options`]).
+    option_selections: Vec<options::OptionSelection>,
     status: Option<DesktopStatus>,
     last_frame: Instant,
     rendered_frames: u64,
@@ -432,7 +539,11 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new(initial_project_root: Option<PathBuf>, console_path: Option<PathBuf>) -> Self {
+    fn new(
+        initial_project_root: Option<PathBuf>,
+        console_path: Option<PathBuf>,
+        option_selections: Vec<options::OptionSelection>,
+    ) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -446,6 +557,7 @@ impl DesktopApp {
             initial_project_root,
             console_path,
             console: None,
+            option_selections,
             status: None,
             last_frame: Instant::now(),
             rendered_frames: 0,
@@ -794,6 +906,19 @@ impl DesktopApp {
             self.state = DesktopState::FatalError;
             return false;
         }
+        match self.apply_project_options(&mut krkr_engine, &root) {
+            Ok(report) => {
+                for line in report {
+                    log_info(&line);
+                }
+            }
+            Err(error) => {
+                self.set_status(StatusLevel::Error, error.clone(), Some(window));
+                show_error("Invalid option selection", &error);
+                self.state = DesktopState::FatalError;
+                return false;
+            }
+        }
         let mut audio = AudioSystem::new();
         if let Err(error) = audio.prepare() {
             let message = format!("audio backend unavailable: {error}");
@@ -841,6 +966,41 @@ impl DesktopApp {
         self.clear_status(Some(window));
         log_info(&format!("entered engine: {}", root.display()));
         true
+    }
+
+    /// Stores this launch's `--option` selections and installs the project's
+    /// option files into the engine's argument stock — before `start_project`
+    /// runs a single script, which is when the reference's
+    /// `TVPInitProgramArgumentsAndDataPath` merges them too. Returns the log
+    /// lines to report, or the message for a selection the linked registry
+    /// refuses.
+    fn apply_project_options(
+        &self,
+        engine: &mut KrkrEngine,
+        root: &std::path::Path,
+    ) -> Result<Vec<String>, String> {
+        let mut report = Vec::new();
+        for selection in &self.option_selections {
+            let path = options::persist_selection(engine, root, selection)?;
+            report.push(format!(
+                "option `-{}={}` stored in {}",
+                selection.name,
+                selection.raw,
+                path.display()
+            ));
+        }
+        for (path, arguments) in options::install_project_options(engine, root) {
+            report.push(format!(
+                "project options from {}: {}",
+                path.display(),
+                if arguments.is_empty() {
+                    "nothing new (already on the command line)".to_string()
+                } else {
+                    arguments.join(" ")
+                }
+            ));
+        }
+        Ok(report)
     }
 
     fn persist_running_project(&mut self) {

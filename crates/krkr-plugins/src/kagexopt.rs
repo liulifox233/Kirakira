@@ -19,11 +19,49 @@
 //! engine's side, where any `-<name>=<value>` is already accepted and read
 //! back with `System.getArgument("-<name>")`.
 //!
-//! Not in this module (engine/desktop hooks): a config dialog that presents
-//! these options, the platform code that would apply 拡張ウィンドウ制御
-//! (`fullscreenmode`/`maximizemode`/`maximizezoom`/`mzpercent`/`restore*` map
-//! onto winit in `apps/desktop`), and the movie machinery's `vomstyle` switch
-//! — movies are always drawn into layers here, which is why
+//! # What the reference does with a descriptor (and what we do instead)
+//!
+//! The engine side of `docs/plugins/kagexopt.md` has three links, and the
+//! reference keeps all three outside the game scripts it ships:
+//!
+//! 1. **The option list.** `ConfigFormUnit::LoadOptionTree` merges the engine's
+//!    own descriptors with every plugin's (`TVPGetPluginCommandDesc` +
+//!    `TVPMargeCommandDesc`, `krkrz/environ/win32/ConfigFormUnit.cpp:127-145`,
+//!    `:305-399`) and renders the `user:true` ones; the selected index reads
+//!    the *current* value back from the argument stock
+//!    (`TVPGetCommandLine(L"-" + option.Name, …)`, `:358-363`).
+//! 2. **The chosen values become arguments.** `SaveSetting` writes every
+//!    option whose selection differs from its default into
+//!    `<datapath>/<exe>.cfu` (`:204-254`), and at startup the engine pushes
+//!    the command line, that file and the exe's own `.cf` into the argument
+//!    stock (`PushConfigFileOptions`, `krkrz/base/win32/SysInitImpl.cpp:1625-1634`)
+//!    before any script runs, so `System.getArgument("-<name>")` answers
+//!    (`SystemImpl.cpp:848-861`).
+//! 3. **The window group is applied by the game's scripts, not the engine.**
+//!    Neither the krkrz nor the krkr2 engine reads `fullscreenmode`,
+//!    `maximizemode`, `maximizezoom`, `mzpercent`, `restoremaximizebyf2w` or
+//!    `restorewindowpos` — the only consumers are the KAG3EX / KAGEX window
+//!    scripts, which map the argument onto the window: `fullScreenMode`
+//!    (`kag3ex3/template/system/MainWindow.tjs:1532-1541`), `maximizeMode`
+//!    (`:2006-2010`), the `-maximizezoom`/`-mzpercent` zoom choice (`:2046-2058`),
+//!    `-restoremaximizebyf2w` (`:1591`), `-restorewindowpos` (`:1053`) and
+//!    `-bootfullscreen`. A game that ships those scripts (PARQUET, GINKA and
+//!    少女世界的生存之道 all do) therefore changes its own window once the
+//!    argument is readable; the engine's part is exactly link 2.
+//!
+//! Our shell mirrors that split: `apps/desktop` renders the linked plugins'
+//! categories and persists a selection into the project's per-user
+//! `<exe name>.cfu` (`--options`, `--option`), and installs the file's lines
+//! into the engine's argument stock before `start_project()` — see
+//! `apps/desktop/src/options.rs`. That file is the games' own: KAGEX's
+//! `changeUserConf` writes `System.dataPath + <exe name> + ".cfu"` with
+//! `name="\xNN"` lines, so the `dbstyle`/`contfreq`-style choices a player
+//! makes in the game's menu are part of what the engine reads back.
+//! Nothing is mapped onto winit directly, because that is the game's job in
+//! the reference and doing both would apply the option twice.
+//!
+//! Not in this module: the movie machinery's `vomstyle` switch — movies are
+//! always drawn into layers here, which is why
 //! [`KagexOptPlugin::movie_display_method`] degrades every listed method to
 //! `layer`. `yuzuex.dll` embeds the same three categories; the descriptors
 //! live here once, beside the DLL that exports `GetOptionDesc`, so the

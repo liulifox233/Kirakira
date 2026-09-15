@@ -143,6 +143,79 @@ fn parse_process_arguments() -> BTreeMap<String, String> {
     result
 }
 
+/// Reads one configuration-file value the way `TJSParseString` reads the
+/// quoted form (`TVPParseCommandLineOne`, `krkrz/base/win32/SysInitImpl.cpp:1565-1571`):
+/// the value ends at the closing quote, `\xNNNN` is a UTF-16 code unit (one to
+/// four hex digits — the form `ConfigFormUnit::EncodeString` writes,
+/// `krkrz/environ/win32/ConfigFormUnit.cpp:287-300`) and the usual TJS escapes
+/// decode. An unquoted value is the rest of the line.
+fn parse_config_value(raw: &str) -> String {
+    let Some(quoted) = raw.strip_prefix('"') else {
+        return raw.to_string();
+    };
+    let mut units: Vec<u32> = Vec::new();
+    let mut chars = quoted.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('x') => {
+                    let mut value = 0u32;
+                    let mut digits = 0;
+                    while digits < 4 {
+                        let Some(digit) = chars.peek().copied().and_then(|c| c.to_digit(16)) else {
+                            break;
+                        };
+                        value = value * 16 + digit;
+                        digits += 1;
+                        chars.next();
+                    }
+                    if digits == 0 {
+                        units.push(u32::from('x'));
+                    } else {
+                        units.push(value);
+                    }
+                }
+                Some('n') => units.push(u32::from('\n')),
+                Some('r') => units.push(u32::from('\r')),
+                Some('t') => units.push(u32::from('\t')),
+                Some(escape) => units.push(u32::from(escape)),
+                None => {}
+            },
+            other => units.push(u32::from(other)),
+        }
+    }
+    // The escapes name UTF-16 code units, so a surrogate pair is one
+    // character; a lone surrogate (which Rust strings cannot hold) degrades to
+    // the replacement character rather than failing the boot.
+    let mut value = String::new();
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        if (0xD800..0xDC00).contains(&unit) {
+            if let Some(low) = units
+                .get(index + 1)
+                .copied()
+                .filter(|low| (0xDC00..0xE000).contains(low))
+            {
+                let combined = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                if let Some(ch) = char::from_u32(combined) {
+                    value.push(ch);
+                    index += 2;
+                    continue;
+                }
+            }
+            value.push('\u{FFFD}');
+        } else if let Some(ch) = char::from_u32(unit) {
+            value.push(ch);
+        } else {
+            value.push('\u{FFFD}');
+        }
+        index += 1;
+    }
+    value
+}
+
 fn trace_mask_from_env() -> u8 {
     std::env::var("KRKR_TRACE")
         .map(|value| parse_trace_mask(&value))
@@ -1364,13 +1437,65 @@ impl KrkrHost {
         &self.text_encoding
     }
 
-    pub(crate) fn command_argument(&self, name: &str) -> Option<String> {
+    /// The raw text of the argument `name` carries, or `None` when the option
+    /// was never given. `name` includes the leading dash, the way
+    /// `System.getArgument("-unseenskip")` and the reference's
+    /// `TVPGetCommandLine` ask for it; a bare `-name` argument reads back as
+    /// `"yes"` (`TVPGetCommandLine`, `krkrz/base/win32/SysInitImpl.cpp:1734-1755`).
+    pub fn command_argument(&self, name: &str) -> Option<String> {
         self.command_line.get(name).cloned()
     }
 
-    pub(crate) fn set_command_argument(&mut self, name: &str, value: &str) {
+    /// Sets one argument, the way `System.setArgument` and the reference's
+    /// option/config path do. `name` includes the leading dash.
+    pub fn set_command_argument(&mut self, name: &str, value: &str) {
         self.command_line
             .insert(name.to_string(), value.to_string());
+    }
+
+    /// Installs one configuration file's option lines into the argument
+    /// stock, the way the reference engine merges its per-user configuration
+    /// file at startup — before any script runs, so
+    /// `System.getArgument("-<name>")` already answers when the game's boot
+    /// code asks (`TVPInitProgramArgumentsAndDataPath` ->
+    /// `PushConfigFileOptions`, `krkrz/base/win32/SysInitImpl.cpp:1651-1703`).
+    /// The shell reads the file (its path is a native path only the shell
+    /// knows) and hands the text in.
+    ///
+    /// Line grammar, from `TVPParseCommandLineOne` (`:1550-1578`): `;` starts a
+    /// comment, `name` alone means `name=yes`, and `name=value` may quote its
+    /// value (`name="\x79\x65\x73"`, what `ConfigFormUnit::EncodeString`
+    /// writes, `krkrz/environ/win32/ConfigFormUnit.cpp:287-300`, and what
+    /// KAGEX's `changeUserConf` writes into the same file). An argument
+    /// already present — the command line itself — is left alone: the command
+    /// line has priority over the file. Returns the arguments it actually
+    /// installed (for the shell's log).
+    ///
+    /// One deliberate difference from the reference: `LoadLinesFromFile`
+    /// (`krkrz/environ/win32/Application.cpp:760-774`) keeps each line's
+    /// newline, so an *unquoted* value there carries it into the argument. The
+    /// dialog only ever writes quoted values, so no file the reference
+    /// produces is affected; a hand-written `name=value` reads back as `value`
+    /// here instead of `value\n`.
+    pub fn install_config_arguments(&mut self, contents: &str) -> Vec<String> {
+        let mut installed = Vec::new();
+        for line in contents.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
+            let (name, value) = match line.split_once('=') {
+                Some((name, value)) => (name, parse_config_value(value)),
+                None => (line, "yes".to_string()),
+            };
+            let argument = format!("-{name}");
+            if self.command_line.contains_key(&argument) {
+                continue;
+            }
+            self.command_line.insert(argument.clone(), value.clone());
+            installed.push(format!("{argument}={value}"));
+        }
+        installed
     }
 
     pub(crate) fn assign_system_message(&mut self, id: &str, message: &str) -> bool {
@@ -5769,5 +5894,117 @@ mod tests {
             .object_handle()
             .unwrap_or_else(|| panic!("layer global"));
         assert!(engine.host().native_layer(layer).is_none());
+    }
+
+    #[test]
+    fn config_file_arguments_follow_the_reference_grammar() {
+        let mut host = KrkrHost::default();
+        host.set_command_argument("-sentakushi", "commandline");
+
+        let installed = host.install_config_arguments(
+            "; ============================================================================\r\n\
+             ; *DO NOT EDIT* this file unless you are understanding what you are doing.\r\n\
+             unseenskip=\"\\x79\\x65\\x73\"\r\n\
+             maximizemode=fullscreen\n\
+             bootfullscreen\n\
+             \r\n\
+             sentakushi=file\n\
+             zoom=\"inner\" trailing text is ignored\n\
+             deffont=\"\\x3042\\x3044\\xD83D\\xDE00\"\n",
+        );
+
+        assert_eq!(
+            installed,
+            [
+                "-unseenskip=yes",
+                "-maximizemode=fullscreen",
+                "-bootfullscreen=yes",
+                "-zoom=inner",
+                "-deffont=あい😀",
+            ]
+        );
+        assert_eq!(host.command_argument("-unseenskip").as_deref(), Some("yes"));
+        assert_eq!(
+            host.command_argument("-maximizemode").as_deref(),
+            Some("fullscreen")
+        );
+        // A bare `name` is `name=yes` (`TVPParseCommandLineOne`), and the
+        // escapes name UTF-16 code units: `\xNN` (what the dialog writes),
+        // BMP characters and a surrogate pair.
+        assert_eq!(
+            host.command_argument("-bootfullscreen").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(host.command_argument("-deffont").as_deref(), Some("あい😀"));
+        // The command line has priority over the file, and an option the file
+        // does not mention stays absent.
+        assert_eq!(
+            host.command_argument("-sentakushi").as_deref(),
+            Some("commandline")
+        );
+        assert_eq!(host.command_argument("-mzpercent"), None);
+    }
+
+    /// A project option file's half of the consumer: what
+    /// [`KrkrHost::install_config_arguments`] installs is what the game's own
+    /// window script reads. The script here is the reference's KAGEX window
+    /// logic in miniature — `getInitialFullScreenState`, the `fullScreenMode`
+    /// value map and `isPseudoMode`
+    /// (`krkrz`'s sibling, `krkr2/kirikiri2/trunk/kag3ex3/template/system/MainWindow.tjs:1142`,
+    /// `:1528-1545`, `:1562`) — and `Window.fullScreen` is what the desktop
+    /// shell mirrors onto the host window (`KrkrEngine::window_fullscreen`).
+    #[test]
+    fn config_arguments_reach_the_script_and_drive_the_window() {
+        let mut engine = crate::KrkrEngine::new(crate::EngineConfig::default()).expect("engine");
+        let installed = engine.host_mut().install_config_arguments(
+            "bootfullscreen=yes\n\
+             fullscreenmode=\"\\x70\\x72\\x69\\x6d\\x61\\x72\\x79\\x6f\\x6e\\x6c\\x79\"\n",
+        );
+        assert_eq!(
+            installed,
+            ["-bootfullscreen=yes", "-fullscreenmode=primaryonly"]
+        );
+
+        // The one window the game's scripts drive, then the reference's KAGEX
+        // window logic in miniature: `getInitialFullScreenState`, the
+        // `fullScreenMode` value map and `isPseudoMode`
+        // (`krkr2/kirikiri2/trunk/kag3ex3/template/system/MainWindow.tjs:1142`,
+        // `:1528-1545`, `:1562`). `Window.fullScreen` is what the desktop shell
+        // mirrors onto the host window (`KrkrEngine::window_fullscreen`).
+        engine
+            .execute_script("inline.tjs", "global.kag = new Window();")
+            .expect("script");
+        let script = r#"
+            var boot = System.getArgument("-bootfullscreen");
+            var initial = (boot != "" && boot == "yes");
+            var raw = System.getArgument("-fullscreenmode");
+            var map = %[ auto:-1, primaryonly:0, usepseudo:1, pseudoall:3 ];
+            var mode = (raw != "" && typeof map[raw] != "undefined") ? map[raw] : -1;
+            // `isPseudoMode`: a real fullscreen unless the mapped mode says
+            // otherwise. `auto` would need `System.getDisplayMonitors`, which
+            // this engine does not install, so it keeps the window windowed.
+            var pseudo = (mode == 1 || mode == 3);
+            kag.fullScreen = initial && !pseudo;
+            return System.getArgument("-fullscreenmode") + ":" + mode + ":" + kag.fullScreen;
+        "#;
+
+        let value = engine.execute_script("inline.tjs", script).expect("script");
+        assert_eq!(value, Variant::String("primaryonly:0:1".to_string()));
+        assert!(engine.window_fullscreen());
+
+        // The same boot with the pseudo-fullscreen choice: the value the file
+        // carried is what decides, and the host window stays windowed.
+        engine
+            .host_mut()
+            .set_command_argument("-fullscreenmode", "usepseudo");
+        let value = engine.execute_script("inline.tjs", script).expect("script");
+        assert_eq!(value, Variant::String("usepseudo:1:0".to_string()));
+        assert!(!engine.window_fullscreen());
+
+        // An option the project never declared stays absent from the script.
+        let value = engine
+            .execute_script("inline.tjs", "return System.getArgument(\"-mzpercent\");")
+            .expect("script");
+        assert_eq!(value, Variant::Void);
     }
 }
