@@ -219,7 +219,20 @@ pub struct PcmTap {
     inner: Arc<TapShared>,
 }
 
-struct TapShared {
+impl PcmTap {
+    /// The handle a [`PcmTap::upgrade`] reconstitutes, for a process-wide slot
+    /// that must not keep the registry (or its ring buffers) alive once the
+    /// audio system that owns it is gone.
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<TapShared> {
+        Arc::downgrade(&self.inner)
+    }
+
+    pub(crate) fn upgrade(weak: &std::sync::Weak<TapShared>) -> Option<Self> {
+        weak.upgrade().map(|inner| Self { inner })
+    }
+}
+
+pub(crate) struct TapShared {
     capacity_frames: u32,
     instances: Mutex<BTreeMap<AudioInstanceId, Arc<TapInstance>>>,
 }

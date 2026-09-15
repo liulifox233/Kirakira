@@ -27,6 +27,13 @@
 //!   `Layer.mainImageBuffer*` in the reference (`LayerIntf.cpp:9513-9553`).
 //!   Per-layer plugin state slots live on [`crate::KrkrHost`]
 //!   (`layer_extension*`).
+//! * [`audio`] is the decoded-PCM readback of a playing `WaveSoundBuffer`: the
+//!   engine cannot name `krkr-audio`, so a plugin that can installs the
+//!   source (`WavePcmSource`), and the engine's `getVisBuffer` plus the
+//!   sample-reading plugins (`getSample.dll`, `fftgraph.dll`) read windows
+//!   through it — the counterpart of the reference's `GetVisBuffer`
+//!   (`sound/win32/WaveImpl.cpp:3274`), whose raw `short*` becomes a Rust
+//!   window here.
 //! * [`video`] opens a storage movie through the host's decoder factory and
 //!   re-exports the decoder vocabulary (`VideoPort`, `VideoFrame`, ...), so a
 //!   movie-drawing plugin (`layerExMovie`) can name what it decodes — the
@@ -53,6 +60,7 @@
 //! the algorithms, the clip-box application and the moment it calls
 //! `layer_update`.
 
+pub mod audio;
 pub mod graphic;
 pub mod layer;
 pub mod storage;

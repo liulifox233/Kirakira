@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     io::{self, Read, Seek, SeekFrom},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
     time::Duration,
 };
@@ -30,11 +30,12 @@ use kira::{
 #[cfg(not(target_arch = "wasm32"))]
 use kira::{Frame, sound::FromFileError};
 use krkr_core::{
-    AudioBus, AudioCommand, AudioInstanceId, AudioLoadPolicy, AudioSourceRef, PcmAudioSpec,
-    PcmStreamSource, ResourceStream, StoragePort,
+    AudioBus, AudioCommand, AudioLoadPolicy, AudioSourceRef, PcmStreamSource, ResourceStream,
+    StoragePort,
 };
 pub use krkr_core::{
-    AudioError, AudioEvent, AudioSink, AudioState, AudioStatusEvent, AudioStatusLevel,
+    AudioError, AudioEvent, AudioInstanceId, AudioSink, AudioState, AudioStatusEvent,
+    AudioStatusLevel, PcmAudioSpec,
 };
 pub use pcm_tap::{
     DEFAULT_CAPACITY_FRAMES, MAX_READ_FRAMES, PcmTap, PcmTapFeed, PcmTapSnapshot, PcmTapState,
@@ -228,11 +229,21 @@ impl Drop for AudioSystem {
 
 impl AudioSystem {
     pub fn new() -> Self {
+        let pcm_tap = PcmTap::default();
+        // Publish the process-wide handle: a plugin cannot be handed the
+        // `AudioSystem` this engine shell owns, but the sample readback
+        // (`getVisBuffer`, `getSample.dll`, `fftgraph.dll`) needs the live tap.
+        // The slot holds a weak handle, so the registry — and the ring buffers
+        // of the instances in it — is freed with the system that owns it; a
+        // process that builds a second system (tests) sees the newest one.
+        *active_tap_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pcm_tap.downgrade();
         Self {
             state: AudioState::Stopped,
             control_tx: None,
             event_rx: None,
-            pcm_tap: PcmTap::default(),
+            pcm_tap,
         }
     }
 
@@ -334,6 +345,26 @@ impl AudioSystem {
             AudioError::CommandFailed(error.to_string())
         })
     }
+}
+
+/// The PCM tap of the process's most recently created [`AudioSystem`], when one
+/// is still alive.
+///
+/// This is the readback a plugin reaches the decoded samples through: the
+/// engine names neither this crate nor the `AudioSystem` its shell owns, so the
+/// system publishes a weak handle here at construction (see
+/// [`AudioSystem::new`]). `None` means no audio system exists — the reference's
+/// "nothing to visualize" answer, not an error.
+pub fn active_pcm_tap() -> Option<PcmTap> {
+    let slot = active_tap_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    PcmTap::upgrade(&slot)
+}
+
+fn active_tap_slot() -> &'static Mutex<std::sync::Weak<pcm_tap::TapShared>> {
+    static SLOT: OnceLock<Mutex<std::sync::Weak<pcm_tap::TapShared>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(std::sync::Weak::new()))
 }
 
 impl AudioSink for AudioSystem {
@@ -577,6 +608,9 @@ fn handle_audio_command(command: AudioCommand, mut context: ControlContext<'_>) 
             source,
             load_policy,
         } => dispatch_preload(source, load_policy, &context),
+        AudioCommand::SetFilters { id, filters } => {
+            set_wave_filters(context.wave_filters, id, filters);
+        }
         AudioCommand::PlayPcmStream {
             id,
             bus,
@@ -2025,6 +2059,42 @@ fn linear_volume_to_decibels(volume: f32) -> Decibels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The process-wide handle the plugin-facing readback uses: an
+    /// `AudioSystem` publishes its tap's registry at construction
+    /// ([`active_pcm_tap`]), and the handle dies with the system that owns it
+    /// (the slot holds a weak reference), so a reader can never address a dead
+    /// sink's ring buffers.
+    #[test]
+    fn the_active_tap_is_the_newest_systems_registry_and_dies_with_it() {
+        let id = AudioInstanceId(4242);
+        {
+            let system = AudioSystem::new();
+            let spec = PcmAudioSpec {
+                sample_rate: 44_100,
+                channels: 2,
+            };
+            let feed = system.pcm_tap().register(id, spec);
+            feed.attach_decoded(
+                (0..8)
+                    .map(|index| Frame::new(index as f32, index as f32))
+                    .collect::<Vec<_>>()
+                    .into(),
+                false,
+            );
+            let published = active_pcm_tap().expect("the system published its tap");
+            assert!(
+                published.contains(id),
+                "the published handle is this system's registry"
+            );
+        }
+        // The system is gone: whoever reads next finds no registry (or another
+        // system's), never this one's retired instance.
+        assert!(
+            active_pcm_tap().is_none_or(|tap| !tap.contains(id)),
+            "a dropped audio system must not stay reachable"
+        );
+    }
 
     #[test]
     fn converts_linear_volume_to_decibels() {

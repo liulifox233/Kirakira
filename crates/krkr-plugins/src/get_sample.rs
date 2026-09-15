@@ -23,40 +23,43 @@
 //! Reading any of the three properties creates the per-object add-on state once
 //! with the current statics as its defaults (`:56-78, 139-149`).
 //!
-//! # What is real, and the engine gap behind the silent values
+//! # What is real
 //!
-//! The surface, the statics, the per-object state and both algorithms are the
-//! reference's; the window they run over comes from the fetch above.
+//! The surface, the statics, the per-object state, both algorithms and the
+//! sample source are the reference's.  The fetch asks the buffer's own
+//! `getVisBuffer` for the decoded PCM at the play cursor, the engine answers
+//! with the samples the audio backend is rendering
+//! (`crates/krkr-audio/src/pcm_tap.rs` through
+//! `krkr_engine::plugin_api::audio`, which `wf_basic_effect`'s
+//! `install_engine_audio_bridge` fills from the live tap), and a buffer that is
+//! not playing answers the reference's "no samples written", `0`.
 //!
-//! The fetch's data channel does not exist in this engine: the core
-//! `WaveSoundBuffer.getVisBuffer` is a no-op that returns `void`
-//! (`crates/krkr-engine/src/native/classes.rs:3232`) and the plugin ABI
-//! deliberately hands out no raw pointers, so every fetch reports "no samples
-//! written" and both accessors answer the reference's own not-playing value,
-//! `0`. The decoded PCM tap that would feed a real implementation exists in
-//! `krkr-audio` (`crates/krkr-audio/src/pcm_tap.rs`) but is neither wired into
-//! the engine's `WaveSoundBuffer` nor reachable from a plugin — an engine-side
-//! gap, filed as a finding. The plugin's own buffer is a Rust `Vec<i16>` and
-//! stays zero; the reference reads whatever the core wrote into its `malloc`
-//! buffer, which for a playing buffer is the audio.
+//! The one representational difference is the destination: the reference lends
+//! the engine its own `short*` and reads it back through the pointer
+//! (`main.cpp:20-24`, `:70-77`), and this engine has no pointer channel, so the
+//! destination is a TJS array the engine fills with the same samples.  The call
+//! still goes through the object's `getVisBuffer` member, so a script that
+//! replaced it is honoured exactly as in the reference.
 //!
 //! # Two owners of the same property names
 //!
 //! The engine also pre-implements `sampleValue`, `sampleCount` and
-//! `sampleAhead` as *instance-level* natives (`classes.rs:440-468`), installed
-//! on every instance at construction (`:3079-3014`), and an instance's own
-//! member shadows this module's class-level property. Game scripts therefore
-//! read/write the engine's values, which already have the reference's shape;
-//! `setDefaultCounts`/`setDefaultAheads` keep them in step by also writing the
-//! engine's global default member (`wave_static_property_backing_key`,
-//! `classes.rs:3150-3164`, read by the instance getters at `:3009-3014`). The
-//! class-level properties this module registers serve class-level reads
-//! (`WaveSoundBuffer.sampleCount`) and stay the reference's shapes there.
+//! `sampleAhead` — as *class-level* members, which is where this module's
+//! reference attach puts them too (`getSample/main.cpp:152-156`), so a linked
+//! `getSample.dll` replaces the engine's members instead of shadowing them, and
+//! an instance read resolves through the class either way
+//! (`crates/krkr-engine/src/native/classes.rs`,
+//! `PLUGIN_OWNED_WAVE_PROPERTIES`).  `setDefaultCounts`/`setDefaultAheads` keep
+//! the engine's statics in step by also writing its global default member
+//! (`wave_static_property_backing_key`), which the engine's class-level getters
+//! read.
+//!
 //! The reference's add-on constructor also sets `useVisBuffer = 1` on the
-//! object (`main.cpp:64-67`); that flag has no consumer here (`getVisBuffer` is
-//! the no-op above) and the engine keeps `useVisBuffer` as a class-level
-//! property, so the port leaves it alone instead of shadowing the engine's
-//! property member on every instance.
+//! object (`main.cpp:64-67`).  This engine's `useVisBuffer` stays the
+//! class-level property it was and has no consumer: `getVisBuffer` answers
+//! whenever the instance is playing and a sample source is installed, instead
+//! of gating on the flag (`sound/win32/WaveImpl.cpp:3278`).  The port therefore
+//! leaves the flag alone rather than writing a property nothing reads.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -70,9 +73,16 @@ use krkr_tjs2::{
 use crate::catalog::{PluginMeta, PluginStatus};
 
 pub(crate) const META: PluginMeta = PluginMeta {
-    status: PluginStatus::Shim,
+    status: PluginStatus::Implemented,
     feature: "WaveSoundBuffer.getSample / sampleValue / sampleCount / sampleAhead / setDefaultCounts / setDefaultAheads",
-    notes: "Surface, statics, per-object state and both algorithms are the reference's (getSample's average of the non-negative samples, sampleValue's max of (sample/32768)^2 over the fetched count) and are tested with synthetic windows; setDefaultCounts/setDefaultAheads store the statics and also write the engine's global default member, which drives the engine's own instance getters. The sample source is not real: this engine's WaveSoundBuffer.getVisBuffer is a no-op returning void (native/classes.rs:3232) and the plugin ABI has no pointer channel, so every fetch reports no samples and both accessors answer the reference's not-playing value 0. The engine's per-instance sampleValue/sampleCount/sampleAhead natives also shadow this module's class-level properties on instances, so instance reads stay the engine's. Wiring getVisBuffer over the krkr-audio PCM tap is the open engine gap (filed as a finding).",
+    notes: "Surface, statics, per-object state, both algorithms and the sample source are the \
+            reference's: the fetch runs through the buffer's own `getVisBuffer`, which the engine \
+            answers from the audio backend's decoded-PCM tap (krkr-engine's plugin_api::audio, \
+            filled by wfBasicEffect's tap bridge), so `getSample` and `sampleValue` read the PCM a \
+            playing buffer is rendering and answer 0 when it is not playing. The reference's raw \
+            `short*` destination is a TJS array here (no pointer channel); `useVisBuffer` stays an \
+            engine-side flag with no consumer. Tested with a scripted source and with the engine's \
+            own getVisBuffer.",
     install: |engine| engine.register_plugin(GetSamplePlugin),
 };
 
@@ -157,7 +167,55 @@ fn with_adapter_state<R>(object: ObjectHandle, update: impl FnOnce(&mut AdapterS
     })
 }
 
+/// One `getVisBuffer` fetch as this plugin sees it: `count` mono samples
+/// starting `ahead` frames past the play cursor, and the count the engine
+/// reported (`GetVisBuffer`'s return value,
+/// `sound/win32/WaveImpl.cpp:3327`).
+///
+/// The reference lends the engine its own `short*` and reads it back through
+/// the pointer; this engine has no pointer channel, so the destination is a
+/// TJS array the engine fills with the same samples — the reference's fetch
+/// with the pointer replaced by an array.  The call still goes through the
+/// object's own `getVisBuffer` member, so a script that replaced it is
+/// honoured exactly as in the reference.
+fn vis_samples(
+    runtime: &mut Runtime<KrkrHost>,
+    buffer: ObjectHandle,
+    count: i64,
+    ahead: i64,
+) -> Result<Vec<i16>> {
+    if count <= 0 {
+        return Ok(Vec::new());
+    }
+    let destination = runtime.alloc_array_object(Vec::new());
+    // `main.cpp:24`: FuncCall(getVisBuffer, {buffer, n, 1}).
+    let written = runtime
+        .call_object_method(
+            buffer,
+            "getVisBuffer",
+            vec![
+                Variant::Object(destination),
+                Variant::Integer(count),
+                Variant::Integer(1),
+                Variant::Integer(ahead),
+            ],
+        )?
+        .to_integer()
+        .unwrap_or(0);
+    let written = written.clamp(0, count) as usize;
+    let elements = runtime.array_elements(destination).unwrap_or_default();
+    Ok(elements
+        .iter()
+        .take(written)
+        .map(|value| value.to_integer().unwrap_or(0) as i16)
+        .collect())
+}
+
 fn install_get_sample(runtime: &mut Runtime<KrkrHost>) {
+    // The readback this module's fetch uses: the audio backend's decoded-PCM
+    // tap, installed through the engine's plugin API (see
+    // `wf_basic_effect`'s `install_engine_audio_bridge`).
+    crate::wf_basic_effect::install_engine_audio_bridge();
     let class = match runtime.global_member("WaveSoundBuffer") {
         Variant::Object(handle) => handle,
         _ => {
@@ -293,22 +351,12 @@ fn get_sample(
         return Ok(Variant::Void);
     };
 
-    // The reference's window: `malloc`'d by the plugin, filled by the engine
-    // through the pointer. There is no pointer channel here and the engine's
-    // `getVisBuffer` writes nothing (`classes.rs:3232`), so the window the
-    // algorithm sees is zeros — the reference's not-playing value.
-    let samples = vec![0i16; n as usize];
-    // `main.cpp:24`: FuncCall(getVisBuffer, {buffer, n, 1}). The reference's
-    // return code is getSample's own (`:37`): a failed fetch propagates.
-    runtime.call_object_method(
-        this,
-        "getVisBuffer",
-        vec![
-            Variant::Integer(0),
-            Variant::Integer(n),
-            Variant::Integer(1),
-        ],
-    )?;
+    // `main.cpp:24`: FuncCall(getVisBuffer, {buffer, n, 1}) — the engine fills
+    // the plugin's window through the pointer.  This engine has no pointer
+    // channel, so the same fetch is `plugin_api::audio`'s Rust window: `n` mono
+    // samples at the play cursor, empty when the buffer is not playing (the
+    // reference's "no samples written").
+    let samples = vis_samples(runtime, this, n, 0)?;
     Ok(Variant::Integer(average_non_negative(&samples)))
 }
 
@@ -324,32 +372,21 @@ fn sample_value(
     let counts = state.counts.max(0);
 
     // `memset(buf, 0, counts)` then `getVisBuffer(buf, counts, 1, aheads)`
-    // (`main.cpp:90-92`).
-    let mut samples = vec![0i16; counts as usize];
-    let fetched = runtime.call_object_method(
-        object,
-        "getVisBuffer",
-        vec![
-            Variant::Integer(0),
-            Variant::Integer(counts),
-            Variant::Integer(1),
-            Variant::Integer(state.aheads),
-        ],
-    );
-    let reported = match fetched {
-        Ok(value) => value.to_integer().unwrap_or(0),
+    // (`main.cpp:90-92`), read as the same Rust window `getSample` uses.
+    let mut samples = match vis_samples(runtime, object, counts, state.aheads) {
+        Ok(samples) => samples,
         Err(error) => {
             // `main.cpp:94`: a failed fetch only logs here.
             runtime.host_mut().log(&format!(
                 "getSample: getVisBuffer failed: {}",
                 error.message
             ));
-            0
+            Vec::new()
         }
     };
 
     // `main.cpp:96-97`: a count outside the buffer reads as the buffer size.
-    let mut count = reported;
+    let mut count = samples.len() as i64;
     if count > counts || count < 0 {
         count = counts;
     }
@@ -436,6 +473,8 @@ fn optional_integer(args: &[Variant], index: usize) -> Result<Option<i64>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use krkr_engine::{EngineConfig, KrkrEngine};
     use krkr_tjs2::runtime::Variant;
 
@@ -495,6 +534,60 @@ mod tests {
     /// The reference's average (`main.cpp:27-32`), on synthetic windows: the
     /// negatives are dropped from both the sum and the count, an all-negative
     /// window is 0, and the division is the integer division the C++ performs.
+    /// Row-24 pin: the fetch is the *playing* buffer's decoded PCM, so
+    /// `getSample` stops answering the not-playing zero.  The source is the
+    /// engine's plugin-API slot (`plugin_api::audio`), filled here by a
+    /// scripted window in place of the audio backend's tap.
+    #[test]
+    fn get_sample_reads_the_playing_pcm() {
+        use krkr_engine::plugin_api::audio::{
+            PcmAudioSpec, WavePcmRequest, WavePcmSource, WavePcmState, WavePcmWindow,
+            clear_wave_pcm_source, set_wave_pcm_source,
+        };
+
+        struct HalfScale;
+
+        impl WavePcmSource for HalfScale {
+            fn read_window(
+                &self,
+                _id: krkr_engine::plugin_api::audio::AudioInstanceId,
+                request: WavePcmRequest,
+            ) -> Option<WavePcmWindow> {
+                Some(WavePcmWindow {
+                    spec: PcmAudioSpec {
+                        sample_rate: 44_100,
+                        channels: 2,
+                    },
+                    state: WavePcmState::Playing,
+                    samples: (0..request.frames).flat_map(|_| [0.5_f32, 0.5]).collect(),
+                    available_frames: request.frames,
+                })
+            }
+        }
+
+        let _guard = crate::wf_basic_effect::lock_pcm_source();
+        let mut engine = engine_with_plugin();
+        set_wave_pcm_source(Arc::new(HalfScale));
+        let value = engine
+            .execute_expression(
+                "pcm.tjs",
+                "(function() { var buffer = new WaveSoundBuffer(); \
+                     buffer.open(\"tone.ogg\"); buffer.play(); \
+                     var samples = []; \
+                     var written = buffer.getVisBuffer(samples, 4, 1, 0); \
+                     return buffer.status + \":\" + written + \":\" + samples.count + \":\" + \
+                         samples[0] + \":\" + buffer.getSample(4); })()",
+            )
+            .expect("script")
+            .to_tjs_string()
+            .expect("string");
+        clear_wave_pcm_source();
+        assert_eq!(
+            value, "play:4:4:16384:16384",
+            "getSample must read the playing PCM (status:written:count:first:average)"
+        );
+    }
+
     #[test]
     fn get_sample_averages_only_the_non_negative_samples() {
         assert_eq!(average_non_negative(&[]), 0);
@@ -610,8 +703,8 @@ mod tests {
                 r#"
                 global.b = new WaveSoundBuffer();
                 global.vis_calls = "";
-                b.getVisBuffer = function(ptr, samples, channels, ahead) {
-                    global.vis_calls = global.vis_calls + "(" + ptr + "," + samples + "," + channels + ")";
+                b.getVisBuffer = function(dest, samples, channels, ahead) {
+                    global.vis_calls = global.vis_calls + "(" + (typeof dest) + "," + samples + "," + channels + ")";
                     return samples;
                 };
                 global.avg_default = b.getSample();
@@ -626,8 +719,10 @@ mod tests {
                 .expect("calls")
                 .to_tjs_string()
                 .expect("string"),
-            "(0,100,1)(0,4,1)",
-            "getSample fetches (ptr, n, 1); n <= 0 returns before the fetch",
+            "(Object,100,1)(Object,4,1)",
+            "getSample fetches (dest, n, 1) with an array destination (the reference \
+             lends a `short*`; this engine has no pointer channel); n <= 0 returns \
+             before the fetch",
         );
         assert_eq!(integer(&mut engine, "avg_default"), 0);
         assert_eq!(integer(&mut engine, "avg_four"), 0);

@@ -127,31 +127,43 @@
 //! return value was not recovered (this port returns the same sentinel as
 //! `interface`).
 //!
-//! **Not reachable from the audio path yet**: the engine's `WaveSoundBuffer`
+//! **How a filter reaches the audio path.**  The engine's `WaveSoundBuffer`
 //! owns a per-instance `filters` array (read-only member — the reference's
 //! `TJSCreateArrayObject` at `sound/WaveIntf.cpp:815` with a denied setter at
-//! `:1552`) but neither reads it nor carries a filter chain through
-//! `AudioCommand` (`crates/krkr-core/src/lib.rs:665` has no filter payload),
-//! so nothing calls [`FreeVerb::process`] while a buffer plays. The filters'
-//! `interface` property returns a **sentinel** integer instead of the
-//! reference's raw `iTVPBasicWaveFilter*`: the missing engine seam is filed as
-//! a finding, and [`GraphicEqualizer::process`] / [`FreeVerb::process`] /
-//! [`DelayEffect::process`] are the entry points a future chain would call.
+//! `:1552`); at `open` the engine reads each element's `interface` and
+//! publishes the values in array order (`AudioCommand::SetFilters`), and the
+//! audio backend resolves each value back to the DSP object
+//! (`krkr_audio::register_wave_filter`, which the three constructors call) and
+//! drives it from inside the sample path — `recreate` at connect time,
+//! `reset` when playback starts, `process` per decoded unit
+//! (`iTVPBasicWaveFilter`, `sound/WaveIntf.h:130-137`).  The
+//! `interface` property therefore answers a **per-instance registration id**
+//! instead of the reference's raw `iTVPBasicWaveFilter*`: the value is stable
+//! for an instance and meaningless outside the registration, and a stale one
+//! (a filter the script `finalize`d) stops resolving instead of being cast.
+//!
+//! The three DSP types stay directly callable (`process`/`reset`), which is
+//! what the numeric tests below drive; [`TapPcmSource`] in this module is the
+//! other half of the same boundary — the decoded-PCM readback the engine's
+//! `getVisBuffer` and the sample-reading plugins use.
 
 // The DSP types and their `process`/`reset` entry points are the module's
-// processing contract: nothing in the engine calls them until the
-// `WaveSoundBuffer` filter chain exists (see the last paragraph of the module
-// docs), and the numeric tests drive them directly. The unused-item lint is
-// silenced for the module so the ported coefficients and their API stay
-// together instead of being trimmed to the script surface. `result_large_err`
-// is the crate-wide `TjsError` size lint every native callback carries.
+// processing contract: the engine's chain calls them through `SharedFilter`
+// (see the module docs) and the numeric tests drive them directly, so the
+// ported coefficients and their API stay together. The unused-item lint is
+// silenced for the module because parts of that surface are exercised only by
+// tests. `result_large_err` is the crate-wide `TjsError` size lint every native
+// callback carries.
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
-use krkr_engine::{KrkrHost, KrkrPlugin};
+use krkr_engine::{KrkrHost, KrkrPlugin, plugin_api};
 use krkr_tjs2::{
     Result, TjsError,
     runtime::{NativePropertyAccess, ObjectHandle, Runtime, Variant},
@@ -160,18 +172,18 @@ use krkr_tjs2::{
 use crate::catalog::{PluginMeta, PluginStatus};
 
 pub(crate) const META: PluginMeta = PluginMeta {
-    status: PluginStatus::Shim,
+    status: PluginStatus::Implemented,
     feature: "GraphicEqualizer / StkFreeVerb / DelayEffect filters on WaveSoundBuffer",
     notes: "Real DSP (10-band peaking EQ, FreeVerb, damped feedback delay) with the recovered \
             member surface and parameter ranges, processing interleaved f32 PCM; the classes \
             install on the `WaveSoundBuffer` class object like the reference \
             (`WaveSoundBuffer.StkFreeVerb` / `.GraphicEqualizer` / `.DelayEffect`, the binder's \
-            base — PARQUET's voiceeffect.tjs reads them there). The engine has no per-buffer \
-            filter chain yet (`WaveSoundBuffer.filters` is the buffer's own read-only array and \
-            nothing consumes it, and `AudioCommand` carries no filter payload), so the filters run \
-            only through their Rust `process` entry points until that seam exists — `interface` \
-            answers a sentinel integer instead of a raw pointer. See the module docs for the \
-            re-derived constants and the parts that are inferred.",
+            base — PARQUET's voiceeffect.tjs reads them there), the constructors consume the ini \
+            arguments the DLL's class entries read, and each live filter registers its DSP object \
+            with the audio backend so the engine's `WaveSoundBuffer.filters` chain drives it \
+            while the buffer plays. `interface` answers that registration id (the port's stand-in \
+            for the raw `iTVPBasicWaveFilter*`). See the module docs for the re-derived constants \
+            and the parts that are inferred.",
     install: |engine| engine.register_plugin(WfBasicEffectPlugin),
 };
 
@@ -184,49 +196,251 @@ impl KrkrPlugin for WfBasicEffectPlugin {
 
     fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
         install_wf_basic_effect(runtime);
-        runtime
-            .host_mut()
-            .log("wfBasicEffect.dll registered: GraphicEqualizer / StkFreeVerb / DelayEffect (DSP local; no engine filter chain yet)");
+        // The engine reads `WaveSoundBuffer.filters` and publishes the ids these
+        // classes hand out through `interface`; the chain the audio backend
+        // builds from them calls back into these very objects.
+        install_engine_audio_bridge();
+        runtime.host_mut().log(
+            "wfBasicEffect.dll registered: GraphicEqualizer / StkFreeVerb / DelayEffect \
+             (DSP driven by WaveSoundBuffer.filters)",
+        );
         Ok(())
     }
 }
 
+/// The engine's [`plugin_api::audio::WavePcmSource`] over the audio backend's
+/// decoded-PCM tap.
+///
+/// The engine cannot name `krkr-audio` (or the `AudioSystem` its shell owns),
+/// so a plugin that can installs this adapter: `krkr_audio::active_pcm_tap()`
+/// is the live tap, and one read here is one reference `GetVisBuffer`: the
+/// samples of `buffer` starting `aheadsamples` frames past the play position,
+/// `numsamples` long (`sound/win32/WaveImpl.cpp:3274-3330`).
+struct TapPcmSource;
+
+impl plugin_api::audio::WavePcmSource for TapPcmSource {
+    fn read_window(
+        &self,
+        id: plugin_api::audio::AudioInstanceId,
+        request: plugin_api::audio::WavePcmRequest,
+    ) -> Option<plugin_api::audio::WavePcmWindow> {
+        let tap = krkr_audio::active_pcm_tap()?;
+        let channels = tap.spec(id)?.channels.max(1) as usize;
+        let snapshot = tap.read(
+            id,
+            krkr_audio::PcmTapWindow {
+                back_frames: 0,
+                ahead_frames: request.ahead_frames.saturating_add(request.frames),
+            },
+        )?;
+        // The reference starts its copy `aheadsamples` frames past the play
+        // position; the tap window starts at it, so the leading frames are the
+        // requested lead.
+        let skip = (request.ahead_frames as usize * channels).min(snapshot.frames.len());
+        Some(plugin_api::audio::WavePcmWindow {
+            spec: snapshot.spec,
+            state: match snapshot.state {
+                krkr_audio::PcmTapState::Playing => plugin_api::audio::WavePcmState::Playing,
+                krkr_audio::PcmTapState::Paused => plugin_api::audio::WavePcmState::Paused,
+                krkr_audio::PcmTapState::Stopped => plugin_api::audio::WavePcmState::Stopped,
+            },
+            samples: snapshot.frames[skip..].to_vec(),
+            available_frames: snapshot
+                .available_frames
+                .saturating_sub(request.ahead_frames),
+        })
+    }
+}
+
+/// Serialises the tests that install the process-wide PCM source
+/// (`plugin_api::audio`'s slot): the plugins' tests run in one process, and a
+/// source another test installed would otherwise answer their reads.
+#[cfg(test)]
+pub(crate) fn lock_pcm_source() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Installs the tap-backed PCM source into the engine's plugin API, replacing
+/// an equivalent one.
+///
+/// Every plugin that reads samples (`getSample.dll`, `fftgraph.dll`) installs
+/// it, so whichever registers first wins with the same adapter and a later
+/// registration is a no-op (`install_wave_pcm_source`); with no audio system
+/// alive the source answers nothing and the engine's `getVisBuffer` keeps the
+/// reference's not-playing `0`.
+pub(crate) fn install_engine_audio_bridge() {
+    plugin_api::audio::install_wave_pcm_source(Arc::new(TapPcmSource));
+}
+
 /// The canonical DLL name: what `Plugins.link` matches.
 const PLUGIN_NAME: &str = "wfBasicEffect.dll";
-
-/// The sentinel the `interface` property answers with.
-///
-/// The reference hands the engine a raw `iTVPBasicWaveFilter*` cast to an
-/// integer (`PhaseVocoderFilter.cpp:54`); a Rust engine cannot publish a
-/// pointer to a script-visible value, so the dossier's porting outline maps
-/// object identity to the filter instead and this is the non-null marker the
-/// script-side property answers. Each class gets its own value so a future
-/// chain can tell them apart before it resolves the object.
-const INTERFACE_SENTINEL_EQ: i64 = 0x5746_0001; // "WF" + GraphicEqualizer
-const INTERFACE_SENTINEL_FV: i64 = 0x5746_0002; // "WF" + StkFreeVerb
-const INTERFACE_SENTINEL_DL: i64 = 0x5746_0003; // "WF" + DelayEffect
 
 // ---------------------------------------------------------------------------
 // Per-instance state
 // ---------------------------------------------------------------------------
 
 /// One live filter instance. The TJS object owns the parameters; this is the
-/// processing state a future engine filter chain would look up by identity.
+/// processing state the engine's chain drives.
 enum EffectState {
     Equalizer(Box<GraphicEqualizer>),
     FreeVerb(FreeVerb),
     Delay(DelayEffect),
 }
 
+impl EffectState {
+    fn process(&mut self, frames: &mut [f32], channels: u32) {
+        match self {
+            EffectState::Equalizer(equalizer) => equalizer.process(frames, channels as usize),
+            EffectState::FreeVerb(reverb) => reverb.process(frames, channels as usize),
+            EffectState::Delay(delay) => delay.process(frames, channels as usize),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            EffectState::Equalizer(equalizer) => equalizer.reset(),
+            EffectState::FreeVerb(reverb) => reverb.reset(),
+            EffectState::Delay(delay) => delay.reset(),
+        }
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        match self {
+            EffectState::Equalizer(equalizer) => equalizer.set_sample_rate(sample_rate),
+            EffectState::FreeVerb(reverb) => reverb.set_sample_rate(sample_rate),
+            EffectState::Delay(delay) => delay.set_sample_rate(sample_rate),
+        }
+    }
+
+    fn sample_rate(&self) -> f32 {
+        match self {
+            EffectState::Equalizer(equalizer) => equalizer.sample_rate(),
+            EffectState::FreeVerb(reverb) => reverb.sample_rate(),
+            EffectState::Delay(delay) => delay.sample_rate(),
+        }
+    }
+}
+
+/// One filter as the audio backend sees it: the DSP state behind a lock, plus
+/// the format the chain connected it with.
+///
+/// The reference hands the engine the filter object's address
+/// (`iTVPBasicWaveFilter*`, `sound/WaveIntf.h:130`); this is the Rust stand-in
+/// — an `Arc` the engine's chain holds through the id the class publishes from
+/// `interface`, shared with the script-side setters that mutate the same DSP
+/// state under the same lock.  A filter therefore has exactly the reference's
+/// lifetime: registered when the TJS class constructs it, unregistered by
+/// `finalize`.
+struct SharedFilter {
+    state: Mutex<FilterState>,
+}
+
+struct FilterState {
+    effect: EffectState,
+    /// Format [`krkr_audio::WaveFilter::recreate`] was connected with: the
+    /// reference's `SimpleFloatSource` copies the format the same way
+    /// (`0x10004e8c`), and `process` reads its channel count from here.
+    channels: u32,
+}
+
+impl krkr_audio::WaveFilter for SharedFilter {
+    fn recreate(
+        &self,
+        spec: krkr_audio::PcmAudioSpec,
+    ) -> std::result::Result<krkr_audio::PcmAudioSpec, String> {
+        // The DLL's source adapter rejects a format wider than 32 bits or with
+        // more than four channels (`HiRes format not supported.`, `0x10004e98`)
+        // and every filter asks for one or two channels
+        // (`check_filter_channels`, `invalid channels.`).
+        check_filter_channels(spec.channels).map_err(str::to_string)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.effect.sample_rate() != spec.sample_rate as f32 {
+            state.effect.set_sample_rate(spec.sample_rate as f32);
+        }
+        state.channels = spec.channels.max(1);
+        Ok(spec)
+    }
+
+    fn clear(&self) {
+        // The reference's `Clear` releases the source the filter was connected
+        // to; this filter owns no resources of its own, and its state is the
+        // instance's, so there is nothing to release here.
+    }
+
+    fn update(&self) {
+        // The DLL's setters store their value and `update()` recomputes the
+        // coefficients; this port recomputes them in the setters eagerly, so
+        // the per-unit `Update` has nothing left to apply.
+    }
+
+    fn reset(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.effect.reset();
+    }
+
+    fn process(&self, frames: &mut [f32]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let channels = state.channels.max(1);
+        state.effect.process(frames, channels);
+    }
+}
+
+/// The registration plus the live state of one filter instance, by object.
+struct FilterSlot {
+    filter: Arc<SharedFilter>,
+    id: krkr_audio::WaveFilterId,
+}
+
 thread_local! {
     /// Filter instances by object handle. Entries are dropped by `finalize`,
-    /// the convention the other plugin modules in this crate use.
-    static FILTERS: RefCell<BTreeMap<ObjectHandle, EffectState>> =
+    /// which also unregisters the filter from the audio backend, the
+    /// convention the other plugin modules in this crate use.
+    static FILTERS: RefCell<BTreeMap<ObjectHandle, FilterSlot>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
+/// Registers `state` with the audio backend and pairs it with its id.
+fn new_filter_slot(state: EffectState) -> FilterSlot {
+    let filter = Arc::new(SharedFilter {
+        state: Mutex::new(FilterState {
+            effect: state,
+            channels: 2,
+        }),
+    });
+    let id =
+        krkr_audio::register_wave_filter(Arc::clone(&filter) as Arc<dyn krkr_audio::WaveFilter>);
+    FilterSlot { filter, id }
+}
+
+/// The id the instance's `interface` property publishes: what the engine reads
+/// out of the `filters` array and what the backend resolves back to this DSP
+/// object.
+fn filter_interface(handle: ObjectHandle) -> Option<i64> {
+    FILTERS.with(|filters| filters.borrow().get(&handle).map(|slot| slot.id.raw()))
+}
+
 fn with_state<R>(handle: ObjectHandle, f: impl FnOnce(&mut EffectState) -> R) -> Option<R> {
-    FILTERS.with(|filters| filters.borrow_mut().get_mut(&handle).map(f))
+    let filter = FILTERS.with(|filters| {
+        filters
+            .borrow()
+            .get(&handle)
+            .map(|slot| Arc::clone(&slot.filter))
+    })?;
+    let mut state = filter
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Some(f(&mut state.effect))
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +544,23 @@ impl GraphicEqualizer {
         };
         equalizer.rebuild();
         equalizer
+    }
+
+    /// The rate the biquads were designed for. The DLL's source adapter sets
+    /// the format when the filter is connected (`Recreate`), so this is the
+    /// chain's format, not the rate the object was constructed with.
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    /// Re-designs every band for `sample_rate` (`0x10007ac8`'s constructor
+    /// design, redone for the format the chain connected with).
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        if self.sample_rate == sample_rate {
+            return;
+        }
+        self.sample_rate = sample_rate;
+        self.rebuild();
     }
 
     /// The band count (always 10; the constructor allocates ten gains).
@@ -637,6 +868,23 @@ impl FreeVerb {
         None
     }
 
+    /// The rate the comb and allpass lengths were scaled from
+    /// (`Stk::sampleRate() / 44100`, `0x1000b892`).
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    /// Rescales every delay line for `sample_rate` (`0x1000b892`'s scaling,
+    /// redone for the format the chain connected with) and re-applies the
+    /// controls.
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        if self.sample_rate == sample_rate {
+            return;
+        }
+        self.sample_rate = sample_rate;
+        self.rebuild();
+    }
+
     /// `setMode`: freeze the tail.
     pub fn set_mode(&mut self, frozen: bool) {
         self.frozen = frozen;
@@ -802,6 +1050,21 @@ impl DelayEffect {
         self.positions = vec![0; 2];
         self.dampers = vec![OnePole::default(); 2];
         self.set_damping(self.damping);
+    }
+
+    /// The rate the delay lines were sized from.
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    /// Resizes the delay lines for `sample_rate` (`0x10002360`'s maximum-delay
+    /// sizing, redone for the format the chain connected with).
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        if self.sample_rate == sample_rate {
+            return;
+        }
+        self.sample_rate = sample_rate;
+        self.rebuild();
     }
 
     /// `Delay::setDelay` semantics (`0x1001019a`): a delay past the maximum is
@@ -979,9 +1242,10 @@ fn install_equalizer_class(runtime: &mut Runtime<KrkrHost>) {
                 equalizer.set_gain(band as i64, value.to_real()? as f32);
             }
             FILTERS.with(|filters| {
-                filters
-                    .borrow_mut()
-                    .insert(instance, EffectState::Equalizer(Box::new(equalizer)));
+                filters.borrow_mut().insert(
+                    instance,
+                    new_filter_slot(EffectState::Equalizer(Box::new(equalizer))),
+                );
             });
             Ok(Variant::Object(instance))
         },
@@ -999,7 +1263,11 @@ fn install_equalizer_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHand
         handle,
         "interface",
         NativePropertyAccess::ReadOnly,
-        |_runtime, _this| Ok(Variant::Integer(INTERFACE_SENTINEL_EQ)),
+        |_runtime, this| {
+            Ok(Variant::Integer(
+                this.and_then(filter_interface).unwrap_or(0),
+            ))
+        },
         |_runtime, _this, _value| Err(TjsError::access_denied()),
     );
 }
@@ -1098,7 +1366,7 @@ fn install_free_verb_class(runtime: &mut Runtime<KrkrHost>) {
             FILTERS.with(|filters| {
                 filters
                     .borrow_mut()
-                    .insert(instance, EffectState::FreeVerb(reverb));
+                    .insert(instance, new_filter_slot(EffectState::FreeVerb(reverb)));
             });
             Ok(Variant::Object(instance))
         },
@@ -1238,7 +1506,11 @@ fn install_free_verb_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHand
         handle,
         "interface",
         NativePropertyAccess::ReadOnly,
-        |_runtime, _this| Ok(Variant::Integer(INTERFACE_SENTINEL_FV)),
+        |_runtime, this| {
+            Ok(Variant::Integer(
+                this.and_then(filter_interface).unwrap_or(0),
+            ))
+        },
         |_runtime, _this, _value| Err(TjsError::access_denied()),
     );
 }
@@ -1265,7 +1537,7 @@ fn install_delay_class(runtime: &mut Runtime<KrkrHost>) {
             FILTERS.with(|filters| {
                 filters
                     .borrow_mut()
-                    .insert(instance, EffectState::Delay(delay));
+                    .insert(instance, new_filter_slot(EffectState::Delay(delay)));
             });
             Ok(Variant::Object(instance))
         },
@@ -1282,7 +1554,11 @@ fn install_delay_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
         handle,
         "interface",
         NativePropertyAccess::ReadOnly,
-        |_runtime, _this| Ok(Variant::Integer(INTERFACE_SENTINEL_DL)),
+        |_runtime, this| {
+            Ok(Variant::Integer(
+                this.and_then(filter_interface).unwrap_or(0),
+            ))
+        },
         |_runtime, _this, _value| Err(TjsError::access_denied()),
     );
 }
@@ -1434,7 +1710,13 @@ fn plugin_finalize(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     if let Some(this) = this_obj {
-        FILTERS.with(|filters| filters.borrow_mut().remove(&this));
+        let removed = FILTERS.with(|filters| filters.borrow_mut().remove(&this));
+        // The engine's chain holds the same `Arc` until its own slot drops, so
+        // unregistering here ends the *id's* life (a stale id in a script's
+        // `filters` array no longer resolves), not the DSP object's.
+        if let Some(slot) = removed {
+            krkr_audio::unregister_wave_filter(slot.id);
+        }
     }
     Ok(Variant::Void)
 }
@@ -1680,25 +1962,34 @@ mod tests {
         );
     }
 
-    /// Every class answers `interface` with the non-null value the port
-    /// documents, and the property is read-only.
+    /// Every class answers `interface` with the id its filter is registered
+    /// under with the audio backend — the port's stand-in for the reference's
+    /// `iTVPBasicWaveFilter*` (`sound/WaveIntf.h:130`): per instance (not an
+    /// address, so two filters of one class answer differently), stable across
+    /// reads, non-zero, and read-only.
     #[test]
-    fn interface_is_a_read_only_sentinel() {
+    fn interface_is_a_read_only_instance_id() {
         let mut engine = engine();
         let values = string(
             &mut engine,
             &format!(
                 "(function() {{\n\
                      var eq = new {EQ}();\n\
+                     var other = new {EQ}();\n\
                      var reverb = new {FREE_VERB}();\n\
                      var delay = new {DELAY}();\n\
-                     return eq.interface + \":\" + reverb.interface + \":\" + delay.interface;\n\
+                     var stable = (eq.interface === eq.interface);\n\
+                     var distinct = !(eq.interface === other.interface)\n\
+                         && !(eq.interface === reverb.interface)\n\
+                         && !(reverb.interface === delay.interface);\n\
+                     var nonNull = eq.interface !== 0 && reverb.interface !== 0 && delay.interface !== 0;\n\
+                     return stable + \":\" + distinct + \":\" + nonNull;\n\
                  }})()"
             ),
         );
         assert_eq!(
-            values,
-            format!("{INTERFACE_SENTINEL_EQ}:{INTERFACE_SENTINEL_FV}:{INTERFACE_SENTINEL_DL}")
+            values, "1:1:1",
+            "interface is a stable, per-instance, non-zero id"
         );
         let error = try_run(
             &mut engine,
@@ -1709,6 +2000,57 @@ mod tests {
             error.message,
             "Invalid operation for Read-only or Write-only property"
         );
+    }
+
+    /// The link rows 10/11 rest on: the value `interface` publishes is the id
+    /// the audio backend registered the very DSP object under
+    /// (`krkr_audio::register_wave_filter`), so the engine's chain — built from
+    /// the `filters` array's `interface` values — drives the filter the script
+    /// configured.  `finalize` ends that id's life, so a stale value in a
+    /// script's array stops resolving instead of being cast.
+    #[test]
+    fn the_published_interface_drives_the_scripted_filter() {
+        let mut engine = engine();
+        // The recovered crossfade is `dry * (1 - mix) + wet * mix`
+        // (`Effect::tick`), and the wet path is silent on the very first
+        // sample, so `effectMix 0.5` halves an impulse: the chain's output
+        // carries the mix this script configured.
+        let id = string(
+            &mut engine,
+            &format!(
+                "(function() {{ global.reverb = new {FREE_VERB}(0.5, 0.5, 0.5, 1.0, 0, 0); return reverb.interface; }})()"
+            ),
+        );
+        let id: i64 = id.parse().expect("interface is an integer id");
+
+        let spec = krkr_audio::PcmAudioSpec {
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        let (chain, skipped) = krkr_audio::WaveFilterChain::build(&[id], spec);
+        assert!(skipped.is_empty(), "the id resolves: {skipped:?}");
+        assert_eq!(chain.len(), 1);
+
+        let mut frames = vec![0.0_f32; 32];
+        frames[0] = 0.5;
+        frames[1] = 0.5;
+        chain.process(&mut frames);
+        assert!(
+            (frames[0] - 0.25).abs() < 1e-3 && (frames[1] - 0.25).abs() < 1e-3,
+            "the scripted filter is the one the chain drove, got {:?}",
+            &frames[..2]
+        );
+
+        engine
+            .execute_script("reverb_finalize.tjs", "invalidate reverb;")
+            .expect("finalize");
+        assert!(
+            krkr_audio::resolve_wave_filter(id).is_none(),
+            "a finalized filter's id must stop resolving"
+        );
+        let (dropped, skipped) = krkr_audio::WaveFilterChain::build(&[id], spec);
+        assert!(dropped.is_empty());
+        assert_eq!(skipped.len(), 1, "a stale id is reported, not invented");
     }
 
     /// Row-26 pin, `GraphicEqualizer`: the class entry (`0x10007fa0`) stores

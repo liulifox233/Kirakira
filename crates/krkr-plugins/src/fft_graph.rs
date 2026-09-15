@@ -27,7 +27,11 @@
 //! * **Samples** (`Main.cpp:36-65`): `soundBuffer.getVisBuffer(ptr, 2048, 1,
 //!   0)` — 2048 mono int16 samples at the play cursor. A call that succeeds
 //!   with `ret < 2048` zero-fills the buffer; a failed call leaves the previous
-//!   contents in place.
+//!   contents in place.  The reference lends the engine its own `short*` and
+//!   reads it back through the pointer; this engine has no pointer channel, so
+//!   the destination is a TJS array the engine fills with the same samples
+//!   (`plugin_api::audio` → the audio backend's decoded-PCM tap, installed by
+//!   `wf_basic_effect`'s `install_engine_audio_bridge`).
 //! * **Window** (`:100-107`): `w[i] = sin(pi*(i+0.5)/len) * (4/32768/len)`,
 //!   built once per length, stored as f32. The windowed data interleaves the
 //!   halves — `a[i] = s[i]*w[i]`, `a[i+len/2] = s[i+len/2]*w[len/2-1-i]`
@@ -79,16 +83,12 @@
 //!   spectrum per process) is a process-wide mutex-held [`Analyzer`] here. No
 //!   script runs while the lock is held, so a member call that re-enters
 //!   `drawFFTGraph` sees the previous state instead of deadlocking.
-//! * The sample fetch still calls the sound buffer's own `getVisBuffer`, the
-//!   reference's script-level contract, but this engine registers
-//!   `WaveSoundBuffer.getVisBuffer` as a no-op that returns `void`
-//!   (`native/classes.rs`): the result reads as 0, the buffer is zero-filled,
-//!   and the graph renders exactly the reference's own "not playing" state.
-//!   There is no raw-pointer channel to hand the engine a buffer (the plugin
-//!   ABI deliberately has none), so the port passes a null address and honours
-//!   the result the same way. Turning the graph live needs an engine-side
-//!   implementation of `getVisBuffer` over the decoded-PCM tap M31 added to
-//!   `krkr-audio`.
+//! * The sample fetch calls the sound buffer's own `getVisBuffer` — the
+//!   reference's script-level contract, so a script that replaced the member
+//!   still wins — and the engine answers it from the audio backend's decoded
+//!   PCM (`plugin_api::audio`, the tap `krkr-audio` publishes).  A buffer that
+//!   is not playing answers 0, which zero-fills the analyzer and renders the
+//!   reference's own "not playing" state.
 
 use std::{f64::consts::PI, sync::Mutex, sync::MutexGuard};
 
@@ -104,9 +104,15 @@ use krkr_tjs2::{
 use crate::catalog::{PluginMeta, PluginStatus};
 
 pub(crate) const META: PluginMeta = PluginMeta {
-    status: PluginStatus::Shim,
+    status: PluginStatus::Implemented,
     feature: "global drawFFTGraph(layer, soundBuffer, left, top, width, height [, options])",
-    notes: "The surface, the spectrum computation (sine window, 2048-sample DST, log bands, dB with fall-off and peak hold) and both drawing modes (type 0 fire, type 1 LCD bars with division/thick/oncolor/offcolor/bgcolor/peakcolor) are real and numerically tested. The sample source is not: krkr-engine's WaveSoundBuffer.getVisBuffer is still a no-op returning void, so the analyzer always sees 2048 zeros and draws the reference's own silence state. A live graph needs the engine's getVisBuffer backed by the PCM tap.",
+    notes: "The surface, the spectrum computation (sine window, 2048-sample DST, log bands, dB \
+            with fall-off and peak hold), both drawing modes (type 0 fire, type 1 LCD bars with \
+            division/thick/oncolor/offcolor/bgcolor/peakcolor) and the sample source are real and \
+            numerically tested: the fetch runs through the sound buffer's own `getVisBuffer`, \
+            which the engine answers from the audio backend's decoded-PCM tap, so a playing \
+            buffer paints a real spectrum and a silent one keeps the reference's silence state. \
+            The reference's raw `short*` destination is a TJS array here (no pointer channel).",
     install: |engine| engine.register_plugin(FftGraphPlugin),
 };
 
@@ -139,6 +145,11 @@ impl KrkrPlugin for FftGraphPlugin {
             NativeArgCount::AtLeast(MIN_PARAMS),
             draw_fft_graph,
         );
+        // The readback `fetch_vis_buffer` reads through the sound buffer's own
+        // `getVisBuffer`: the audio backend's decoded-PCM tap, installed
+        // through the engine's plugin API (see `wf_basic_effect`'s
+        // `install_engine_audio_bridge`).
+        crate::wf_basic_effect::install_engine_audio_bridge();
         runtime.host_mut().log(
             "fftgraph: drawFFTGraph(layer, soundBuffer, left, top, width, height [, options]) \
              registered (spectrum + both graph types real; the sound buffer's getVisBuffer is \
@@ -194,16 +205,24 @@ impl Analyzer {
     /// What `GetVisBuffer`'s result does to the sample buffer
     /// (`Main.cpp:59-63`): a successful call that reports fewer than
     /// [`SAMPLE_FRAMES`] written samples zero-fills; a failed call leaves the
-    /// buffer alone.
-    fn update_samples(&mut self, written: Option<i64>) {
+    /// buffer alone.  The reference's engine wrote the samples into the
+    /// plugin's own buffer through the pointer; here the window arrives as the
+    /// fetched slice and the same rule turns it into the buffer's contents.
+    fn update_samples(&mut self, window: Option<Vec<i16>>) {
         if self.samples.len() != SAMPLE_FRAMES {
             self.samples = vec![0; SAMPLE_FRAMES];
         }
-        if let Some(written) = written
-            && written < SAMPLE_FRAMES as i64
-        {
+        let Some(window) = window else {
+            // A failed call keeps the previous samples (`Main.cpp:62-63`).
+            return;
+        };
+        if window.len() < SAMPLE_FRAMES {
+            // `ZeroMemory(SampleBuffer, ...)` — the whole buffer, not just the
+            // missing tail (`Main.cpp:59-61`).
             self.samples.fill(0);
         }
+        let written = window.len().min(SAMPLE_FRAMES);
+        self.samples[..written].copy_from_slice(&window[..written]);
     }
 
     /// `DoFFT` (`Main.cpp:76-122`): window the samples, transform, cut DC.
@@ -715,23 +734,41 @@ fn draw_bar_graph(
 
 // --------------------------------------------------------------- the calls
 
-/// The reference's `GetVisBuffer` member call (`Main.cpp:48-57`): the pointer
-/// argument is null here — a Rust plugin has no native sample buffer to lend,
-/// and the engine's plugin ABI deliberately hands out no raw pointers — and the
-/// returned count is what `Main.cpp:59-63` inspects. `None` means the call
-/// failed, which leaves the previous sample buffer alone.
-fn fetch_vis_buffer(runtime: &mut Runtime<KrkrHost>, sound_buffer: ObjectHandle) -> Option<i64> {
-    let call = runtime.call_object_method(
-        sound_buffer,
-        "getVisBuffer",
-        vec![
-            Variant::Integer(0),
-            Variant::Integer(SAMPLE_FRAMES as i64),
-            Variant::Integer(1),
-            Variant::Integer(0),
-        ],
-    );
-    call.ok().map(|value| value.to_integer().unwrap_or(0))
+/// The reference's `GetVisBuffer` member call (`Main.cpp:48-57`):
+/// [`SAMPLE_FRAMES`] mono samples at the play cursor.  The reference lends the
+/// engine its own `short*`; this engine has no pointer channel, so the
+/// destination is a TJS array the engine fills with the same samples.  `None`
+/// means the call failed (`Main.cpp:59-63` leaves the previous buffer alone);
+/// a successful call with a short count is the zero-filled case the caller
+/// applies.
+fn fetch_vis_buffer(
+    runtime: &mut Runtime<KrkrHost>,
+    sound_buffer: ObjectHandle,
+) -> Option<Vec<i16>> {
+    let destination = runtime.alloc_array_object(Vec::new());
+    let written = runtime
+        .call_object_method(
+            sound_buffer,
+            "getVisBuffer",
+            vec![
+                Variant::Object(destination),
+                Variant::Integer(SAMPLE_FRAMES as i64),
+                Variant::Integer(1),
+                Variant::Integer(0),
+            ],
+        )
+        .ok()?
+        .to_integer()
+        .unwrap_or(0);
+    let written = written.clamp(0, SAMPLE_FRAMES as i64) as usize;
+    let elements = runtime.array_elements(destination)?;
+    Some(
+        elements
+            .iter()
+            .take(written)
+            .map(|value| value.to_integer().unwrap_or(0) as i16)
+            .collect(),
+    )
 }
 
 /// `tDrawFFTGraphFunction::FuncCall` (`Main.cpp:404-498`).
@@ -966,8 +1003,8 @@ mod tests {
                 global.visChannels = -1;
                 global.visAhead = -1;
                 global.sound = %[];
-                sound.getVisBuffer = function(ptr, numsamples, channels, ahead) {
-                    global.visPtr = ptr;
+                sound.getVisBuffer = function(dest, numsamples, channels, ahead) {
+                    global.visPtr = typeof dest;
                     global.visCount = numsamples;
                     global.visChannels = channels;
                     global.visAhead = ahead;
@@ -1038,7 +1075,7 @@ mod tests {
         engine
             .execute_script("draw.tjs", "drawFFTGraph(layer, sound, 2, 4, 40, 20);")
             .expect("draw");
-        let args: Vec<i64> = ["visPtr", "visCount", "visChannels", "visAhead"]
+        let args: Vec<i64> = ["visCount", "visChannels", "visAhead"]
             .iter()
             .map(|name| {
                 engine
@@ -1050,8 +1087,82 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec![0, SAMPLE_FRAMES as i64, 1, 0],
-            "getVisBuffer(ptr, 2048, 1, 0) — the pointer is null in this port",
+            vec![SAMPLE_FRAMES as i64, 1, 0],
+            "getVisBuffer(dest, 2048, 1, 0)",
+        );
+        let destination = engine
+            .execute_expression("arg.tjs", "visPtr")
+            .expect("arg")
+            .to_tjs_string()
+            .expect("string");
+        assert_eq!(
+            destination, "Object",
+            "the destination is the array the engine fills (the reference lends a `short*`)",
+        );
+    }
+
+    /// Row-24 pin: with the playing buffer's decoded PCM reaching
+    /// `GetVisBuffer`, the graph stops drawing the silence state — a tone
+    /// paints fire pixels above the rect's bottom row.
+    #[test]
+    fn a_playing_buffer_paints_a_real_spectrum() {
+        use std::sync::Arc;
+
+        use krkr_engine::plugin_api::audio::{
+            AudioInstanceId, PcmAudioSpec, WavePcmRequest, WavePcmSource, WavePcmState,
+            WavePcmWindow, clear_wave_pcm_source, set_wave_pcm_source,
+        };
+
+        struct Tone;
+
+        impl WavePcmSource for Tone {
+            fn read_window(
+                &self,
+                _id: AudioInstanceId,
+                request: WavePcmRequest,
+            ) -> Option<WavePcmWindow> {
+                // A 1 kHz tone at a third of full scale, both channels.
+                let samples = (0..request.frames)
+                    .flat_map(|index| {
+                        let phase = std::f32::consts::TAU * 1_000.0 * index as f32 / 44_100.0;
+                        let value = phase.sin() / 3.0;
+                        [value, value]
+                    })
+                    .collect();
+                Some(WavePcmWindow {
+                    spec: PcmAudioSpec {
+                        sample_rate: 44_100,
+                        channels: 2,
+                    },
+                    state: WavePcmState::Playing,
+                    samples,
+                    available_frames: request.frames,
+                })
+            }
+        }
+
+        let _guard = crate::wf_basic_effect::lock_pcm_source();
+        let mut engine = engine_with_layer();
+        set_wave_pcm_source(Arc::new(Tone));
+        engine
+            .execute_script(
+                "tone.tjs",
+                r#"
+                global.buffer = new WaveSoundBuffer();
+                buffer.open("tone.ogg");
+                buffer.play();
+                drawFFTGraph(layer, buffer, 2, 4, 40, 20);
+                "#,
+            )
+            .expect("draw");
+        clear_wave_pcm_source();
+
+        // The silence state paints only the bottom row's peak pixels; the tone
+        // must paint fire pixels above it.
+        let painted = (5..23).any(|y| (2..42).any(|x| pixel(&mut engine, x, y) != 0));
+        assert!(
+            painted,
+            "a playing buffer's spectrum must paint above the silence row"
         );
     }
 

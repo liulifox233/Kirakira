@@ -1,7 +1,10 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -3709,7 +3712,7 @@ fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: Ob
         handle,
         "getVisBuffer",
         NativeArgCount::AtLeast(3),
-        native_wave_noop,
+        wave_sound_buffer_get_vis_buffer,
     );
 }
 
@@ -3779,6 +3782,11 @@ fn wave_sound_buffer_open(
     runtime
         .host_mut()
         .open_native_audio_storage(this, storage)?;
+    // `Open` rebuilds the sample chain right after the decoder exists
+    // (`sound/win32/WaveImpl.cpp:2924-2938`: `Clear` -> decoder -> loop manager
+    // -> `RebuildFilterChain`), so the chain this instance names reaches the
+    // backend before the `play` that follows.
+    queue_wave_filter_chain(runtime, this);
     let opened_storage = runtime
         .host()
         .native_audio_buffer(this)
@@ -4113,6 +4121,168 @@ fn native_wave_noop(
     _args: Vec<Variant>,
 ) -> Result<Variant> {
     Ok(Variant::Void)
+}
+
+/// Publishes the instance's `filters` array to the audio backend, the way
+/// `RebuildFilterChain` reads it at `Open` (`sound/WaveIntf.cpp:865-905`):
+/// each element's `interface` value, in array order, is what the backend
+/// resolves to a filter (`AudioCommand::SetFilters`).
+///
+/// An element without an `interface` is skipped exactly as the reference skips
+/// it (`:887`, `if (TJS_FAILED(...)) continue;`); an empty array on a buffer
+/// that had a chain publishes an empty list, which drops it
+/// (`ClearFilterChain`, `:907-923`), while an empty array on a buffer that
+/// never published one queues nothing (the rebuild is a no-op there, and the
+/// engine's command sequence stays the one the playback tests pin).  The
+/// reference folds the array over the decoder once per `Open` — a filter added
+/// to the array afterwards is not in the chain until the next `open` — and
+/// this engine follows that.
+fn queue_wave_filter_chain(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) -> bool {
+    let Some(id) = runtime
+        .host()
+        .native_audio_buffer(handle)
+        .map(|buffer| buffer.id)
+    else {
+        return false;
+    };
+    let filters = runtime.object_member(handle, &wave_property_backing_key("filters"));
+    let mut ids = Vec::new();
+    if let Some(array) = filters.object_handle()
+        && let Some(elements) = runtime.array_elements(array)
+    {
+        for element in elements {
+            let Some(object) = element.object_handle() else {
+                continue;
+            };
+            if let Variant::Integer(value) = runtime.object_member(object, "interface") {
+                ids.push(value);
+            }
+        }
+    }
+    // An empty array on a buffer that never had a chain is a no-op: publishing
+    // it would put a command on the queue that the backend has nothing to do
+    // with, and the engine's own call sequence is observable (`play`/`pause`
+    // ordering).  A buffer that *did* have a chain publishes the empty list,
+    // which is the reference's `ClearFilterChain` at `open`.
+    if ids.is_empty() && !wave_filters_were_published(runtime, handle) {
+        return false;
+    }
+    runtime.set_object_member(
+        handle,
+        WAVE_FILTERS_PUBLISHED_KEY,
+        Variant::Integer(i64::from(!ids.is_empty())),
+    );
+    runtime
+        .host_mut()
+        .queue_audio_command(AudioCommand::SetFilters { id, filters: ids });
+    true
+}
+
+/// Whether this instance ever published a non-empty chain — the state that
+/// decides whether an empty `filters` array at the next `open` still has a
+/// chain to drop (`ClearFilterChain`, `sound/WaveIntf.cpp:907-923`).
+const WAVE_FILTERS_PUBLISHED_KEY: &str = "__nativeWaveFiltersPublished";
+
+fn wave_filters_were_published(runtime: &Runtime<KrkrHost>, handle: ObjectHandle) -> bool {
+    matches!(
+        runtime.object_member(handle, WAVE_FILTERS_PUBLISHED_KEY),
+        Variant::Integer(1)
+    )
+}
+
+/// `tTJSNI_WaveSoundBuffer::GetVisBuffer`
+/// (`sound/win32/WaveImpl.cpp:3274-3330`): `numsamples` samples starting
+/// `aheadsamples` frames past the play position, as 16-bit samples, and how
+/// many were written — `0` when the instance is not playing, the requested
+/// channel count is neither mono nor the stream's own (`:3284`), or the
+/// destination cannot take samples.
+///
+/// The reference writes through a `tjs_int16*`.  This engine has no pointer
+/// channel, so the destination is a **TJS array of samples**: the elements are
+/// replaced with the window, and the call answers the number of samples
+/// written, the same count the reference's callers use
+/// (`getSample/main.cpp:96`).  A numeric first argument — the reference's
+/// pointer form, which this engine cannot write through — answers `0` and is
+/// noted in the log once, rather than pretending samples were delivered.
+///
+/// The samples come from [`crate::plugin_api::audio`], i.e. from the audio
+/// backend's decoded-PCM tap through the source a plugin installs; with no
+/// source every call answers the reference's not-playing `0`.
+fn wave_sound_buffer_get_vis_buffer(
+    runtime: &mut Runtime<KrkrHost>,
+    this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    use crate::plugin_api::audio::{WavePcmRequest, read_wave_pcm_window};
+
+    let this = match native_audio_this(runtime, this_obj, "WaveSoundBuffer.getVisBuffer") {
+        Ok(this) => this,
+        Err(_) => return Ok(Variant::Integer(0)),
+    };
+    let samples_requested = args
+        .get(1)
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(0)
+        .max(0) as u32;
+    let channels = args
+        .get(2)
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(0)
+        .max(0) as u32;
+    let ahead = args
+        .get(3)
+        .map(Variant::to_integer)
+        .transpose()?
+        .unwrap_or(0)
+        .max(0) as u32;
+
+    // The destination first: a call that cannot deliver samples must not spin
+    // up a read, and the reference's `dest` is its first parameter.
+    let destination = args.first().and_then(Variant::object_handle);
+    if destination.is_none()
+        && args
+            .first()
+            .is_some_and(|value| !matches!(value, Variant::Void))
+    {
+        static VIS_POINTER_WARNED: AtomicBool = AtomicBool::new(false);
+        if !VIS_POINTER_WARNED.swap(true, Ordering::Relaxed) {
+            runtime.host_mut().log(
+                "WaveSoundBuffer.getVisBuffer: a numeric destination cannot be written to; \
+                 pass an array to receive the samples (the reference's raw pointer has no \
+                 stand-in here)",
+            );
+        }
+        return Ok(Variant::Integer(0));
+    }
+    let Some(window) =
+        read_wave_pcm_window(runtime, this, WavePcmRequest::new(ahead, samples_requested))
+    else {
+        return Ok(Variant::Integer(0));
+    };
+    // `if (channels != Format.Format.nChannels && channels != 1) return 0;`
+    // (`sound/win32/WaveImpl.cpp:3284`).
+    if channels != 1 && channels != window.spec.channels {
+        return Ok(Variant::Integer(0));
+    }
+    let samples = window.to_i16(channels);
+    // The reference copies exactly `numsamples` samples, wrapping inside its
+    // ring as it goes (`:3309-3324`); the tap window is already that length.
+    let samples = if samples.len() > samples_requested as usize {
+        &samples[..samples_requested as usize]
+    } else {
+        &samples[..]
+    };
+    let Some(destination) = destination else {
+        // No destination at all: the reference still reports what it wrote.
+        return Ok(Variant::Integer(samples.len() as i64));
+    };
+    runtime.array_clear(destination);
+    for sample in samples {
+        runtime.array_push(destination, Variant::Integer(i64::from(*sample)));
+    }
+    Ok(Variant::Integer(samples.len() as i64))
 }
 
 fn native_audio_this(
@@ -12422,6 +12592,163 @@ mod tests {
             Variant::Real(0.42),
             "the plugin's class member must win over any instance member"
         );
+    }
+
+    /// Row-10 pin: `open` publishes the instance's `filters` array to the audio
+    /// backend — each element's `interface` value, in array order, exactly the
+    /// elements `RebuildFilterChain` reads and casts (`sound/WaveIntf.cpp:865-905`).
+    /// An element without an `interface` member is skipped, as the reference
+    /// skips it (`:887`), an empty array publishes an empty list (which drops
+    /// the chain, `ClearFilterChain` `:907-923`), and the array is read once per
+    /// `open` — a filter added afterwards is not in the chain until the next
+    /// one, which is also the reference's behaviour.
+    #[test]
+    fn wave_sound_buffer_open_publishes_the_filter_chain() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        engine
+            .execute_script(
+                "wave_chain.tjs",
+                r#"
+                var first = %[interface: 0x1001];
+                var second = %[interface: 0x1002];
+                var without = %[];
+                var buffer = new WaveSoundBuffer();
+                buffer.filters.add(first);
+                buffer.filters.add(without);
+                buffer.filters.add(second);
+                buffer.open("bgm.ogg");
+                "#,
+            )
+            .expect("script");
+        let commands = engine.host_mut().take_audio_commands();
+        let chain = commands
+            .iter()
+            .find_map(|command| match command {
+                AudioCommand::SetFilters { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .expect("open must publish the chain");
+        assert_eq!(
+            chain,
+            vec![0x1001, 0x1002],
+            "the elements' interface values in array order, the member-less element skipped"
+        );
+
+        // A later `open` with an emptied array drops the chain, and a filter
+        // added between opens is not in it (the reference rebuilds at `Open`).
+        engine
+            .execute_script(
+                "wave_chain_reopen.tjs",
+                r#"
+                buffer.filters.clear();
+                buffer.filters.add(%[interface: 0x2001]);
+                buffer.open("bgm.ogg");
+                "#,
+            )
+            .expect("script");
+        let commands = engine.host_mut().take_audio_commands();
+        let chain = commands
+            .iter()
+            .find_map(|command| match command {
+                AudioCommand::SetFilters { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .expect("the second open publishes the array it saw");
+        assert_eq!(chain, vec![0x2001]);
+
+        engine
+            .execute_script(
+                "wave_chain_late.tjs",
+                r#"
+                buffer.filters.clear();
+                buffer.filters.add(%[interface: 0x3001]);
+                buffer.play();
+                "#,
+            )
+            .expect("script");
+        let commands = engine.host_mut().take_audio_commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AudioCommand::SetFilters { .. })),
+            "a filter added after `open` waits for the next `open`, like the reference: {commands:?}"
+        );
+        let _ = Variant::Void;
+    }
+
+    /// Row-24 pin: `getVisBuffer` over a *playing* buffer answers the samples
+    /// the audio backend is rendering — nonzero, the reference's fetch
+    /// (`sound/win32/WaveImpl.cpp:3274-3330`) with its raw `short*` destination
+    /// standing in as a TJS array — and the returned count is what the
+    /// reference's callers use.
+    #[test]
+    fn get_vis_buffer_reads_the_playing_samples() {
+        use crate::plugin_api::audio::{
+            WavePcmRequest, WavePcmSource, WavePcmState, WavePcmWindow, clear_wave_pcm_source,
+            set_wave_pcm_source,
+        };
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        struct ScriptedSource;
+
+        impl WavePcmSource for ScriptedSource {
+            fn read_window(
+                &self,
+                _id: AudioInstanceId,
+                request: WavePcmRequest,
+            ) -> Option<WavePcmWindow> {
+                // Interleaved stereo, `request.frames` frames starting
+                // `request.ahead_frames` past the cursor, each frame the same
+                // value in both channels so the mono downmix is exact.
+                let samples = (0..request.frames)
+                    .flat_map(|index| {
+                        let value = (request.ahead_frames + index) as f32 / 32767.0;
+                        [value, value]
+                    })
+                    .collect();
+                Some(WavePcmWindow {
+                    spec: crate::plugin_api::audio::PcmAudioSpec {
+                        sample_rate: 44_100,
+                        channels: 2,
+                    },
+                    state: WavePcmState::Playing,
+                    samples,
+                    available_frames: request.frames,
+                })
+            }
+        }
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        set_wave_pcm_source(Arc::new(ScriptedSource));
+        let value = engine
+            .execute_script(
+                "vis_buffer.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.open("tone.ogg");
+                buffer.play();
+                var samples = [];
+                var written = buffer.getVisBuffer(samples, 4, 1, 0);
+                var aheaded = [];
+                var written_ahead = buffer.getVisBuffer(aheaded, 2, 1, 2);
+                var stopped = new WaveSoundBuffer();
+                var silent = [];
+                var written_stopped = stopped.getVisBuffer(silent, 4, 1, 0);
+                return written + ":" + samples.join(",") + ":" + written_ahead + ":"
+                    + aheaded.join(",") + ":" + written_stopped + ":" + silent.count;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("4:0,1,2,3:2:2,3:0:0".to_string()),
+            "a playing buffer delivers its samples (and the lead), a stopped one nothing"
+        );
+        clear_wave_pcm_source();
     }
 
     #[test]

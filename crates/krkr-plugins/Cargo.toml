@@ -19,6 +19,14 @@ lz4_flex = "0.11"
 # official amalgamation (3.x, the reference's version line) with the host C
 # compiler, exactly like the reference's `sqlite3.c`.
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+# The audio DSP plugins (`wfBasicEffect.dll`, `wfTypicalDSP.dll`) and the
+# sample readback (`getSample.dll`, `fftgraph.dll`) sit at the engine's audio
+# boundary: the filter chain and the decoded-PCM tap both live in `krkr-audio`,
+# which the engine deliberately does not depend on.  A production dependency is
+# what lets these plugins drive the chain (`krkr_audio::WaveFilter`,
+# `register_wave_filter`) and read the tap
+# (`krkr_audio::active_pcm_tap`) without the engine carrying an audio backend.
+krkr-audio.workspace = true
 # `httprequest.dll` needs an HTTP(S) client. `ureq` is blocking and
 # pure-Rust (rustls) with no async runtime, matching this engine's dependency
 # style; the reference is equally synchronous inside its worker thread.
@@ -38,5 +46,4 @@ flate2 = "1.1"
 
 [dev-dependencies]
 krkr-assets.workspace = true
-krkr-audio.workspace = true
 krkr-core.workspace = true
