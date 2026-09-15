@@ -7,10 +7,10 @@
 //!
 //! * **`Layer` class functions** (`utils.cpp:120-583`, `savepng.cpp`,
 //!   `savetlg5.cpp`): `getCropRect`, `getCropRectZero`, `getDiffRect`,
-//!   `getDiffPixel`, `oozeColor`, `copyBlueToAlpha`, `isBlank`,
-//!   `getAverageColor`, `clearAlpha`, `saveLayerImagePng`,
-//!   `saveLayerImagePngOctet`, `saveLayerImageTlg5`. (The compiled names come
-//!   from the macros' first argument — `NCB_ATTACH_FUNCTION(oozeColor, …)`,
+//!   `getDiffPixel`, `oozeColor`, `copyBlueToAlpha`, `isBlank`, `clearAlpha`,
+//!   `getAverageColor`, `saveLayerImagePng`, `saveLayerImagePngOctet`,
+//!   `saveLayerImageTlg5`. (The compiled names come from the macros' first
+//!   argument — `NCB_ATTACH_FUNCTION(oozeColor, …)`,
 //!   `NCB_ATTACH_FUNCTION(copyBlueToAlpha, …)` — which is also what
 //!   `manual.tjs` documents; the dossier's `OozeColor`/`CopyBlueToAlpha`
 //!   capitalisation is not what the reference registers.)
@@ -42,13 +42,16 @@
 //! the same way — `(buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) |
 //! buffer[3]` — which on this buffer order puts the blue mean in bits 24-31
 //! and the alpha mean in bits 0-7: the `0xAARRGGBB` packing applied to a
-//! B, G, R, A buffer, so the value is that colour with blue and alpha
-//! exchanged. Buffer byte 0 is the blue channel in this file (`utils.cpp:398`,
-//! `:466`), so the reference's own sum and pack (`utils.cpp:556-578`) produce
-//! that rotated value — the shipped krkr2 `bin/win32/plugin/layerExSave.dll`
-//! has the same shape at `0x10012040` (four byte accumulators, the truncating
-//! `fistpll` pair, the `shl $8` packing chain). The port reproduces it — see
-//! [`average_color`].
+//! B, G, R, A buffer, i.e. the average with **all four bytes reversed** — the
+//! blue mean sits where an `0xAARRGGBB` colour keeps its alpha, the green mean
+//! where it keeps its red, the red mean where it keeps its green, and the alpha
+//! mean where it keeps its blue (blue↔alpha *and* red↔green, not a
+//! two-channel swap). Buffer byte 0 is the blue channel in this file
+//! (`utils.cpp:398`, `:466`), so the reference's own sum and pack
+//! (`utils.cpp:556-578`) produce that rotated value — the shipped krkr2
+//! `bin/win32/plugin/layerExSave.dll` has the same shape at `0x10012040` (four
+//! byte accumulators, the truncating `fistpll` pair, the `shl $8` packing
+//! chain). The port reproduces it — see [`average_color`].
 //!
 //! # Real vs mapped
 //!
@@ -196,12 +199,12 @@ static LAYER_FUNCTIONS: &[LayerFunction] = &[
         layer_copy_blue_to_alpha,
     ),
     ("isBlank", NativeArgCount::AtLeast(4), layer_is_blank),
+    ("clearAlpha", NativeArgCount::Any, layer_clear_alpha),
     (
         "getAverageColor",
         NativeArgCount::AtLeast(4),
         layer_get_average_color,
     ),
-    ("clearAlpha", NativeArgCount::Any, layer_clear_alpha),
     (
         "saveLayerImagePng",
         NativeArgCount::AtLeast(1),
@@ -620,11 +623,12 @@ fn is_blank(
 /// into bits 24-31, byte 1 (green) into bits 16-23, byte 2 (red) into bits
 /// 8-15 and byte 3 (alpha) into bits 0-7. That is the `0xAARRGGBB` packing
 /// applied to a buffer whose bytes are not in that order, so the value a script
-/// sees carries the blue mean where an `0xAARRGGBB` colour keeps its alpha and
-/// the alpha mean where it keeps its blue. The port reproduces the DLL's
-/// value, not the one the reference's variable names (`a`, `r`, `g`, `b`)
-/// suggest: a game comparing the answer against a colour gets the same integer
-/// the reference produces.
+/// sees has all four bytes reversed relative to the documented colour: the blue
+/// mean lands where an `0xAARRGGBB` colour keeps its alpha, the green mean where
+/// it keeps its red, the red mean where it keeps its green, and the alpha mean
+/// where it keeps its blue. The port reproduces the DLL's value, not the one the
+/// reference's variable names (`a`, `r`, `g`, `b`) suggest: a game comparing the
+/// answer against a colour gets the same integer the reference produces.
 fn average_color(
     pixels: &[u8],
     geometry: Geometry,
@@ -907,8 +911,11 @@ fn layer_get_average_color(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
-    // `tjs_int left = *param[0];` (`utils.cpp:533-536`): the reference narrows
-    // each parameter to 32 bits, and reads all four before looking at the image.
+    // `tjs_int left = *param[0];` (`utils.cpp:533-536`): each parameter narrows
+    // to 32 bits. The reference does its `GetLayerBufferAndSize` first
+    // (`:526-532`), so a layer with no image throws `src must be Layer.` there
+    // even for an argument that cannot convert, while this port converts first —
+    // the same order `is_blank` above uses.
     let left = arg_integer(&args, 0)? as i32;
     let top = arg_integer(&args, 1)? as i32;
     let width = arg_integer(&args, 2)? as i32;
@@ -2364,8 +2371,8 @@ mod tests {
             "oozeColor",
             "copyBlueToAlpha",
             "isBlank",
-            "getAverageColor",
             "clearAlpha",
+            "getAverageColor",
             "saveLayerImagePng",
             "saveLayerImagePngOctet",
             "saveLayerImageTlg5",
