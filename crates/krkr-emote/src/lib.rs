@@ -12,6 +12,13 @@
 //!   file-level handles needed to read texture bytes.
 //! - [`Motion::draw_list`] — the sampled draw list at a tick, produced by
 //!   eluna's Emote scene builder on top of the adapted model.
+//! - [`MotionPlayer`] — a live session over the same model: the authored
+//!   variable table, the per-tick control pass (eye/brow/mouth, blink timers),
+//!   timelines and the evaluated-variable scene rebuild, i.e. what the
+//!   reference's `MEmotePlayer` runs. [`Motion::draw_list`] is the *static*
+//!   constructor and does none of it; [`MotionPlayer`]'s own module docs map
+//!   the reference surface onto eluna's implementation and list what eluna
+//!   still lacks.
 //!
 //! ## PARQUET's motion flavor
 //!
@@ -52,7 +59,10 @@
 //! 1. [`Motion::from_bytes`] with the storage bytes of the `.mtn` file,
 //! 2. [`Motion::animations`] / [`Motion::sources`] to implement the
 //!    `ResourceManager` metadata and motion/label listings,
-//! 3. [`Motion::draw_list`] (or [`Motion::draw_list_with_variables`]) per frame,
+//! 3. [`MotionPlayer::advance_ticks`] + [`MotionPlayer::draw_list`] per frame
+//!    for a *live* session (authored variables, controls, timelines), or
+//!    [`Motion::draw_list`] (or [`Motion::draw_list_with_variables`]) for a
+//!    static sample the caller drives itself,
 //! 4. [`TextureCache`] + [`render_draw_list`] to composite that list into the
 //!    layer's RGBA bitmap (a [`Canvas`] over the layer's pixels),
 //! 5. [`Motion::scene_at`] / [`Motion::psb`] / [`Motion::schema`] when it needs
@@ -64,12 +74,18 @@
 //! (`Motion`/`Motion.Player`/`Motion.EmotePlayer`/`Motion.ResourceManager`)
 //! on top of this seam; the end-to-end test in that module drives a synthetic
 //! motion through those classes into a layer bitmap.
+//!
+//! `examples/motion_probe.rs` is the read-only probe over the game's own
+//! assets: it dumps an animation's draw list, the corner-colour/blend state of
+//! every sprite and (with `MOTION_PROBE_SCAN=1`) the runtime tables of all 23
+//! `.mtn` members.
 
 mod decode;
 mod error;
 mod model;
 mod motion;
 mod normalize;
+mod player;
 mod reference;
 mod render;
 
@@ -81,8 +97,9 @@ pub use model::{
 };
 pub use motion::Motion;
 pub use normalize::NormalizeReport;
+pub use player::MotionPlayer;
 pub use render::{
-    Canvas, RenderReport, TextureCache, Tint, render_draw_list, render_draw_list_into,
+    Canvas, RenderReport, SpriteBlend, TextureCache, Tint, render_draw_list, render_draw_list_into,
 };
 
 /// The eluna API this crate builds on, re-exported so consumers do not have to
@@ -91,6 +108,6 @@ pub use render::{
 pub use eluna::{
     EMOTE_TICKS_PER_SECOND, EmoteDrawFrameInfo, EmoteDrawPass, EmoteMeshPatch, EmoteModelSchema,
     EmoteSceneBounds, EmoteSchemaError, EmoteStaticScene, EmoteStaticSprite, EmoteTextureIcon,
-    EmoteTextureSource, PsbError, PsbFile, PsbValue, emote_ticks_to_milliseconds,
+    EmoteTextureSource, PsbError, PsbFile, PsbValue, TimelinePlayMode, emote_ticks_to_milliseconds,
     milliseconds_to_emote_ticks,
 };

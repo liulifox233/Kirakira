@@ -12,6 +12,8 @@ pub enum MotionError {
     Schema(eluna::EmoteSchemaError),
     /// The requested animation name does not exist in the model.
     MissingAnimation(String),
+    /// The requested timeline name does not exist in the model.
+    MissingTimeline(String),
     /// The requested resource index is not in the container.
     MissingResource(u32),
     /// A resource is there but its pixels cannot be decoded.
@@ -27,6 +29,7 @@ impl fmt::Display for MotionError {
             Self::Psb(error) => write!(f, "PSB container error: {error}"),
             Self::Schema(error) => write!(f, "E-mote schema error: {error}"),
             Self::MissingAnimation(name) => write!(f, "animation '{name}' does not exist"),
+            Self::MissingTimeline(name) => write!(f, "timeline '{name}' does not exist"),
             Self::MissingResource(index) => {
                 write!(f, "the container has no resource {index}")
             }
@@ -46,6 +49,7 @@ impl Error for MotionError {
             Self::Schema(error) => Some(error),
             Self::Decode(error) => Some(error),
             Self::MissingAnimation(_)
+            | Self::MissingTimeline(_)
             | Self::MissingResource(_)
             | Self::UnknownTextureResource(_) => None,
         }

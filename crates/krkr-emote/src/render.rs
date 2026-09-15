@@ -15,14 +15,27 @@
 //! covers a sub-rectangle of its texture (FreeMote's icons) and one that owns
 //! its texture (PARQUET's synthetic per-icon textures) both land correctly.
 //!
-//! # Alpha
+//! # Alpha, blend modes and corner colours
 //!
 //! The canvas holds straight (non-premultiplied) R, G, B, A bytes — the
-//! engine's own layer store — and items are composited source-over:
-//! `dst = src * a + dst * (1 - a)` with `a = pixel_alpha * item.opacity *
-//! tint.alpha`. `item.opacity` is the sprite's own opacity, which is where the
-//! motion's `opa` value ends up (eluna divides the file's byte by 255; the
-//! adapter passes the field through).
+//! engine's own layer store — and every item is composited with the equation
+//! the reference selects for it: the sprite's blend mode (below) enters as
+//! `dst = src * a + dst * (1 - a)` for the default source-over case, with
+//! `a = pixel_alpha * item.opacity * tint.alpha`. `item.opacity` is the
+//! sprite's own opacity, which is where the motion's `opa` value ends up
+//! (eluna divides the file's byte by 255; the adapter passes the field
+//! through).
+//!
+//! Two per-sprite fields the reference always carried are honoured here:
+//!
+//! - [`SpriteBlend`] — the sprite's native `bm` low nibble, which the DLL
+//!   turns into its D3D blend table ([`SpriteBlend`] carries the transcription
+//!   and the addresses it was read from). It chooses the composite equation
+//!   for the item instead of the fixed source-over the module used to apply.
+//! - the four corner colours — the item's per-quad tint, interpolated across
+//!   the quad barycentrically, with the neutral values (`0x808080` under
+//!   MODULATE2X, `0xFFFFFFFF` otherwise) exactly 1.0 so an untinted sprite
+//!   stays bit-identical to one drawn with no colour handling at all.
 //!
 //! # Not yet rendered
 //!
@@ -108,26 +121,225 @@ impl Canvas {
     }
 }
 
-/// Source-over composite of one straight-alpha pixel into an RGBA plane.
-fn blend(pixels: &mut [u8], width: u32, x: i32, y: i32, rgba: [u8; 4], alpha: f32) {
+/// The reference's per-sprite blend equation, selected by the low nibble of a
+/// sprite's native `bm` (`MotionDrawItem::blend_mode`).
+///
+/// The mapping is the shipping `ep` player's own blend table, read from the
+/// D3D build's binary (`motionplayer.dll`, image base `0x10000000`): the
+/// per-sprite state function at VA `0x10006c40` masks `bm` with `0x0f`
+/// (`10006c4c: and $0xf,%ecx`), uses that as an index into a 7-entry table of
+/// `(BLENDOP, DESTBLEND, SRCBLEND)` triples at VA `0x1012a980`
+/// (`10006d5b: lea (%ebx,%ebx,2),%edi` … `10006d60: mov 0x1012a980(%edi,%edi,1),%edx`,
+/// pushed with `D3DRS_BLENDOP` `0xab`), and selects the texture-colour stage
+/// op from the high nibble (`10006c68: cmp $0x10,%eax` →
+/// `SetTextureStageState(0, D3DTSS_COLOROP, 5)` MODULATE2X, else `4`
+/// MODULATE). The draw path feeds it the sprite record's `bm` field
+/// (`1004731c: mov 0xc4(%esi),%eax` … `10047320: call 0x10006c40`). The table
+/// bytes, dumped from the file at `0x128f80`:
+///
+/// | `bm & 0xF` | BLENDOP | DESTBLEND | SRCBLEND | operation |
+/// | ---------- | ------- | --------- | -------- | --------- |
+/// | 0 | ADD (1) | INVSRCALPHA (6) | SRCALPHA (5) | source-over |
+/// | 1 | ADD (1) | ONE (2) | SRCALPHA (5) | additive |
+/// | 2 | REVSUBTRACT (3) | ONE (2) | SRCALPHA (5) | subtractive |
+/// | 3 | ADD (1) | INVSRCALPHA (6) | DESTCOLOR (9) | multiply |
+/// | 4 | ADD (1) | ONE (2) | INVDESTCOLOR (10) | screen |
+/// | 5 | REVSUBTRACT (3) | ONE (2) | SRCALPHA (5) | subtractive |
+/// | 6 | ADD (1) | ZERO (1) | ONE (2) | copy |
+///
+/// Entries 2 and 5 are byte-identical in the shipped table, and the no-D3D
+/// build selects the *same* per-entry operation as a TVP layer type
+/// (`motionplayer_nod3d.dll`, `1003a850_FUN_1003a850.c:393-406`):
+///
+/// ```c
+/// switch(*puStack_350 & 0xf) {           // bm & 0xF
+///   case 1:          puStack_468 = 0xe;  // ltPsAdditive
+///   case 2: case 5:  puStack_468 = 0xf;  // ltPsSubtractive
+///   case 3:          puStack_468 = 0x10; // ltPsMultiplicative
+///   case 4:          puStack_468 = 0x11; // ltPsScreen
+///   case 6:          bVar11 = true;      // …and falls through
+///   case 0:          puStack_468 = 0x2;  // ltTransparent
+/// }
+/// ```
+///
+/// (the layer-type numbers are `visual/drawable.h:20-45` of the reference
+/// tree). Two independent renderers therefore agree entry by entry, and the
+/// `0xF == 6` copy entry is additionally special-cased as the opaque path in
+/// `FUN_100385e0` (`decompiled/100385e0_FUN_100385e0.c:169-172`) and at
+/// `1003a850_FUN_1003a850.c:284`.
+///
+/// Values outside the table fall back to [`SpriteBlend::Over`]; no shipped
+/// PARQUET motion contains one (the corpus uses `0x10`, `0x11`, `0x13` and
+/// `0x0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SpriteBlend {
+    /// `bm & 0xF` 0 (and every value the table does not name): source-over.
+    Over,
+    /// `bm & 0xF` 1: additive.
+    Add,
+    /// `bm & 0xF` 2 or 5: subtractive (`dest - src * alpha`).
+    Sub,
+    /// `bm & 0xF` 3: multiply.
+    Mul,
+    /// `bm & 0xF` 4: screen.
+    Screen,
+    /// `bm & 0xF` 6: copy — the source replaces the destination, alpha
+    /// included.
+    Copy,
+}
+
+impl SpriteBlend {
+    /// The blend equation a sprite's native `bm` selects.
+    pub fn of(blend_mode: u32) -> Self {
+        match blend_mode & 0x0F {
+            1 => Self::Add,
+            2 | 5 => Self::Sub,
+            3 => Self::Mul,
+            4 => Self::Screen,
+            6 => Self::Copy,
+            _ => Self::Over,
+        }
+    }
+
+    /// Whether this sprite's corner colours are doubled, the reference's
+    /// MODULATE2X texture-colour stage (`bm & 0xF0 == 0x10`).
+    pub fn modulates_2x(blend_mode: u32) -> bool {
+        (blend_mode & 0xF0) == 0x10
+    }
+}
+
+/// The four corner-colour multipliers of one draw item, in
+/// `[top-left, top-right, bottom-right, bottom-left]` order, or `None` when
+/// every corner is neutral (which draws bit-identically to ignoring the field
+/// entirely).
+///
+/// Each channel is scaled the way the reference's texture-colour stage scales
+/// it: 0x80 is exactly 1.0 under MODULATE2X (`bm & 0xF0 == 0x10`, the neutral
+/// colour the frames carry) and 0xFF is 1.0 under MODULATE. Only the colour
+/// channels take that scale; the corner alpha is a plain 0..255 opacity
+/// factor, so a neutral corner keeps the sprite's own alpha untouched.
+///
+/// A quad whose four corners carry the *same* colour is returned as
+/// [`CornerShading::Uniform`]: the reference's vertex colours are then constant
+/// across the quad, and interpolating four equal values would only add
+/// rounding drift to an otherwise exact 1.0.
+fn corner_shading(item: &MotionDrawItem) -> Option<CornerShading> {
+    let neutral = if SpriteBlend::modulates_2x(item.blend_mode) {
+        0x80
+    } else {
+        0xFF
+    };
+    let scale = neutral as f32;
+    let factor = |packed: u32| {
+        [
+            ((packed >> 24) & 0xFF) as f32 / scale,
+            ((packed >> 16) & 0xFF) as f32 / scale,
+            ((packed >> 8) & 0xFF) as f32 / scale,
+            (packed & 0xFF) as f32 / 255.0,
+        ]
+    };
+    let uniform = *item.corner_colors.first()?;
+    if item.corner_colors.iter().all(|corner| *corner == uniform) {
+        let factor = factor(uniform);
+        if factor == [1.0; 4] {
+            return None;
+        }
+        return Some(CornerShading::Uniform(factor));
+    }
+    Some(CornerShading::PerCorner(item.corner_colors.map(factor)))
+}
+
+/// One item's per-corner colour multipliers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CornerShading {
+    /// All four corners carry the same colour.
+    Uniform([f32; 4]),
+    /// A gradient: one factor set per quad corner, in
+    /// `[top-left, top-right, bottom-right, bottom-left]` order.
+    PerCorner([[f32; 4]; 4]),
+}
+
+/// One sprite pixel into the straight-alpha plane under `mode`.
+///
+/// Every mode is the reference's own software shape: compute the mode's
+/// *colour* from the destination and the source, then alpha-blend that colour
+/// onto the destination with the source's alpha. That is what TVP's
+/// Photoshop-family kernels do — the nod3d build reaches them through the
+/// layer types the DLL selects for `bm` (see [`SpriteBlend`]), and their math
+/// is `visual/gl/blend_functor_c.h`: `ps_alpha_blend_func` is
+/// `d + (s - d) * a / 255`, `ps_mul_blend_func` pre-multiplies
+/// `s = d * s / 255` into the same lerp, `ps_add_blend_func` saturates
+/// `d + s`, `ps_sub_blend_func` saturates `d - s`, and `ps_screen_blend_func`
+/// lerps toward `s + d - s * d / 255`.
+///
+/// The plane stays straight alpha, so the premultiplied result is divided back
+/// out exactly as the source-over case always did; with an opaque destination
+/// (what the game clears its draw target to) the division is by 1 and the
+/// equation is literally the reference's lerp.
+fn composite(
+    pixels: &mut [u8],
+    width: u32,
+    x: i32,
+    y: i32,
+    rgba: [u8; 4],
+    alpha: f32,
+    mode: SpriteBlend,
+) {
     let alpha = alpha.clamp(0.0, 1.0);
-    if alpha <= 0.0 {
+    // A fully transparent source contributes nothing under every blending
+    // mode except copy, where it is exactly the clear it says it is.
+    if alpha <= 0.0 && mode != SpriteBlend::Copy {
         return;
     }
     let offset = (y as usize * width as usize + x as usize) * 4;
     let da = pixels[offset + 3] as f32 / 255.0;
-    // `1.0 - alpha`, the destination's weight, is the same subexpression in
-    // `out_a` and in every channel, so it is evaluated once; each channel keeps
-    // its own `dst * da * one_minus_alpha` association, which is not the same
-    // f32 product as `dst * (da * one_minus_alpha)`.
-    let one_minus_alpha = 1.0 - alpha;
-    let out_a = alpha + da * one_minus_alpha;
+    let dst = [
+        pixels[offset] as f32,
+        pixels[offset + 1] as f32,
+        pixels[offset + 2] as f32,
+    ];
+    let dp = [dst[0] * da, dst[1] * da, dst[2] * da];
+    let src = [rgba[0] as f32, rgba[1] as f32, rgba[2] as f32];
+    if mode == SpriteBlend::Copy {
+        // The copy entry replaces the destination outright, alpha included.
+        let dp = [src[0] * alpha, src[1] * alpha, src[2] * alpha];
+        let divisor = alpha.max(f32::EPSILON);
+        for channel in 0..3 {
+            pixels[offset + channel] = round_channel((dp[channel] / divisor).clamp(0.0, 255.0));
+        }
+        pixels[offset + 3] = round_channel(alpha * 255.0);
+        return;
+    }
+    let colour = match mode {
+        SpriteBlend::Over | SpriteBlend::Copy => src,
+        // The mode colour is computed on the *straight* destination, which is
+        // what the reference's kernels read out of the target.
+        SpriteBlend::Add => [
+            (src[0] + dst[0]).min(255.0),
+            (src[1] + dst[1]).min(255.0),
+            (src[2] + dst[2]).min(255.0),
+        ],
+        SpriteBlend::Sub => [
+            (dst[0] - src[0]).max(0.0),
+            (dst[1] - src[1]).max(0.0),
+            (dst[2] - src[2]).max(0.0),
+        ],
+        SpriteBlend::Mul => [
+            dst[0] * src[0] / 255.0,
+            dst[1] * src[1] / 255.0,
+            dst[2] * src[2] / 255.0,
+        ],
+        SpriteBlend::Screen => [
+            src[0] + dst[0] - dst[0] * src[0] / 255.0,
+            src[1] + dst[1] - dst[1] * src[1] / 255.0,
+            src[2] + dst[2] - dst[2] * src[2] / 255.0,
+        ],
+    };
+    let out_a = (alpha + da * (1.0 - alpha)).clamp(0.0, 1.0);
     let divisor = out_a.max(f32::EPSILON);
     for channel in 0..3 {
-        let src = rgba[channel] as f32;
-        let dst = pixels[offset + channel] as f32;
-        let value = (src * alpha + dst * da * one_minus_alpha) / divisor;
-        pixels[offset + channel] = round_channel(value);
+        let value = colour[channel] * alpha + dp[channel] * (1.0 - alpha);
+        pixels[offset + channel] = round_channel((value / divisor).clamp(0.0, 255.0));
     }
     pixels[offset + 3] = round_channel(out_a * 255.0);
 }
@@ -262,6 +474,16 @@ pub struct RenderReport {
     pub skipped_missing_texture: usize,
     /// Items whose mesh patch was ignored and whose plain quad was drawn.
     pub plain_quad_mesh: usize,
+    /// Items composited with a non-default blend equation
+    /// ([`SpriteBlend`]): additive, subtractive, multiply, screen, copy.
+    pub blended_add: usize,
+    pub blended_sub: usize,
+    pub blended_mul: usize,
+    pub blended_screen: usize,
+    pub blended_copy: usize,
+    /// Items whose four corner colours are not the neutral pair, so their quad
+    /// was tinted per corner instead of sampling the texture as authored.
+    pub tinted_corners: usize,
 }
 
 /// Renders a draw list into an owned [`Canvas`], in the list's own draw order.
@@ -307,6 +529,17 @@ pub fn render_draw_list_into(
             report.skipped_missing_texture += 1;
             continue;
         };
+        match SpriteBlend::of(item.blend_mode) {
+            SpriteBlend::Over => {}
+            SpriteBlend::Add => report.blended_add += 1,
+            SpriteBlend::Sub => report.blended_sub += 1,
+            SpriteBlend::Mul => report.blended_mul += 1,
+            SpriteBlend::Screen => report.blended_screen += 1,
+            SpriteBlend::Copy => report.blended_copy += 1,
+        }
+        if corner_shading(item).is_some() {
+            report.tinted_corners += 1;
+        }
         draw_quad_into(pixels, width, height, texture, item, tint, alpha);
         report.drawn += 1;
     }
@@ -376,12 +609,64 @@ fn draw_quad_into(
             [item.uv[0] * w, item.uv[3] * h],
         ),
     ];
+    // The quad's corners are built in `[top-left, top-right, bottom-right,
+    // bottom-left]` order, which is the order `corner_factors` reports; the
+    // two triangles carry the corners they span.
+    let shade = Shading {
+        blend: SpriteBlend::of(item.blend_mode),
+        colours: corner_shading(item),
+    };
     rasterize_triangle(
-        pixels, width, height, texture, quad[0], quad[1], quad[2], tint, alpha,
+        pixels,
+        width,
+        height,
+        texture,
+        quad[0],
+        quad[1],
+        quad[2],
+        [0, 1, 2],
+        tint,
+        alpha,
+        shade,
     );
     rasterize_triangle(
-        pixels, width, height, texture, quad[0], quad[2], quad[3], tint, alpha,
+        pixels,
+        width,
+        height,
+        texture,
+        quad[0],
+        quad[2],
+        quad[3],
+        [0, 2, 3],
+        tint,
+        alpha,
+        shade,
     );
+}
+
+/// One item's blend equation and its corner-colour shading.
+#[derive(Clone, Copy, Debug)]
+struct Shading {
+    blend: SpriteBlend,
+    /// `None` when every corner is neutral, which is the common case and the
+    /// one that must stay bit-identical to drawing without colour handling.
+    colours: Option<CornerShading>,
+}
+
+impl Shading {
+    /// The three vertex colours of a triangle spanning quad corners
+    /// `[a, b, c]`, or `None` when the item is untinted or uniformly tinted
+    /// (whose per-vertex values would all be that same colour).
+    fn triangle(&self, corners: [usize; 3]) -> Option<[[f32; 4]; 3]> {
+        match self.colours? {
+            CornerShading::Uniform(_) => None,
+            CornerShading::PerCorner(colours) => Some([
+                colours[corners[0]],
+                colours[corners[1]],
+                colours[corners[2]],
+            ]),
+        }
+    }
 }
 
 /// Maps one sprite-local point onto the canvas: scale/rotation about the
@@ -437,8 +722,10 @@ fn rasterize_triangle(
     v0: Vertex,
     mut v1: Vertex,
     mut v2: Vertex,
+    mut corners: [usize; 3],
     tint: Tint,
     alpha: f32,
+    shading: Shading,
 ) {
     let mut area = edge(v0, v1, v2.x, v2.y);
     if !area.is_finite() || area == 0.0 {
@@ -446,8 +733,14 @@ fn rasterize_triangle(
     }
     if area < 0.0 {
         std::mem::swap(&mut v1, &mut v2);
+        corners.swap(1, 2);
         area = -area;
     }
+    let colours = shading.triangle(corners);
+    let uniform = match shading.colours {
+        Some(CornerShading::Uniform(factor)) => Some(factor),
+        _ => None,
+    };
 
     let min_x = v0.x.min(v1.x).min(v2.x).floor().max(0.0) as i32;
     let min_y = v0.y.min(v1.y).min(v2.y).floor().max(0.0) as i32;
@@ -482,9 +775,41 @@ fn rasterize_triangle(
             let u = (w1 * v0.u + w2 * v1.u + w0 * v2.u) / area;
             let v = (w1 * v0.v + w2 * v1.v + w0 * v2.v) / area;
             let rgba = tint.applied(sample_bilinear(texture, u, v));
-            blend(pixels, width, x, y, rgba, alpha * rgba[3] as f32 / 255.0);
+            let (rgba, alpha) = match (colours, uniform) {
+                // The reference's four-corner colours, interpolated across the
+                // quad exactly like the texture coordinates are: each vertex
+                // carries its corner's factor and the pixel takes the same
+                // barycentric mix.
+                (Some([c0, c1, c2]), _) => {
+                    let mut factor = [0.0f32; 4];
+                    for (channel, out) in factor.iter_mut().enumerate() {
+                        *out = (w1 * c0[channel] + w2 * c1[channel] + w0 * c2[channel]) / area;
+                    }
+                    shaded(rgba, alpha, factor)
+                }
+                (None, Some(factor)) => shaded(rgba, alpha, factor),
+                (None, None) => (rgba, alpha),
+            };
+            composite(
+                pixels,
+                width,
+                x,
+                y,
+                rgba,
+                alpha * rgba[3] as f32 / 255.0,
+                shading.blend,
+            );
         }
     }
+}
+
+/// Applies one corner-colour factor set to a sampled texel.
+fn shaded(rgba: [u8; 4], alpha: f32, factor: [f32; 4]) -> ([u8; 4], f32) {
+    let mut out = rgba;
+    for channel in 0..3 {
+        out[channel] = round_channel(out[channel] as f32 * factor[channel]);
+    }
+    (out, alpha * factor[3])
 }
 
 /// `x.floor()` as an integer and as an f32, without the libm `floorf` call.
@@ -600,6 +925,9 @@ mod tests {
             opacity,
             z: 0.0,
             visible: true,
+            blend_mode: 0x10,
+            blend_parameter: 0.0,
+            corner_colors: [0x8080_80FF; 4],
             world_transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             mesh: None,
             label: None,
@@ -632,6 +960,163 @@ mod tests {
             canvas.pixel(3, 8),
             Some([0, 0, 0, 0]),
             "outside stays clear"
+        );
+    }
+
+    /// The reference's blend table, entry by entry, and the raster behaviour of
+    /// each equation over an opaque destination.
+    #[test]
+    fn blend_modes_select_the_references_equations() {
+        assert_eq!(SpriteBlend::of(0x10), SpriteBlend::Over);
+        assert_eq!(SpriteBlend::of(0x00), SpriteBlend::Over);
+        assert_eq!(SpriteBlend::of(0x11), SpriteBlend::Add);
+        assert_eq!(SpriteBlend::of(0x12), SpriteBlend::Sub);
+        assert_eq!(SpriteBlend::of(0x15), SpriteBlend::Sub);
+        assert_eq!(SpriteBlend::of(0x13), SpriteBlend::Mul);
+        assert_eq!(SpriteBlend::of(0x14), SpriteBlend::Screen);
+        assert_eq!(SpriteBlend::of(0x16), SpriteBlend::Copy);
+        assert_eq!(SpriteBlend::of(0x17), SpriteBlend::Over);
+        assert!(SpriteBlend::modulates_2x(0x10));
+        assert!(!SpriteBlend::modulates_2x(0x00));
+    }
+
+    /// Draws one 4x4 opaque-white quad with `alpha` over a mid-gray pixel and
+    /// returns what the centre became.
+    fn over_gray(blend_mode: u32, alpha: u8, colour: u32) -> [u8; 4] {
+        let texture = texture(4, 4, [255, 255, 255, 255]);
+        let mut canvas = Canvas::new(8, 8);
+        for pixel in canvas.pixels_mut().chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[128, 128, 128, 255]);
+        }
+        let mut item = item([4.0, 4.0], [4.0, 4.0], 1.0);
+        item.blend_mode = blend_mode;
+        item.corner_colors = [colour; 4];
+        draw_quad(
+            &mut canvas,
+            &texture,
+            &item,
+            Tint::IDENTITY,
+            f32::from(alpha) / 255.0,
+        );
+        canvas.pixel(4, 4).expect("centre")
+    }
+
+    /// Each equation's arithmetic against the reference's software kernels:
+    /// `d + (c - d) * a` with `c` the mode's own colour — white for source-over,
+    /// `d + s` additive, `d - s` subtractive, `s * d / 255` multiply and
+    /// `s + d - s * d / 255` screen.
+    #[test]
+    fn blend_equations_land_on_the_reference_values() {
+        let white = 0xFFFF_FFFF;
+        assert_eq!(
+            over_gray(0x10, 128, white),
+            [192, 192, 192, 255],
+            "source-over: the reference's lerp, rounded"
+        );
+        assert_eq!(
+            over_gray(0x11, 128, white),
+            [192, 192, 192, 255],
+            "additive saturates the sum, then alpha-blends it (ps_add_blend_func)"
+        );
+        assert_eq!(
+            over_gray(0x12, 128, white),
+            [64, 64, 64, 255],
+            "subtractive bottoms the sum out at 0, then alpha-blends it"
+        );
+        assert_eq!(
+            over_gray(0x13, 128, white),
+            [128, 128, 128, 255],
+            "white multiplies to the destination itself"
+        );
+        assert_eq!(
+            over_gray(0x14, 128, white),
+            [192, 192, 192, 255],
+            "white screens the destination to 255, then alpha-blends it"
+        );
+        assert_eq!(
+            over_gray(0x16, 128, white),
+            [255, 255, 255, 128],
+            "copy replaces the destination and its alpha"
+        );
+
+        // A dark source shows the difference between over and multiply.
+        let black = 0x0000_00FF;
+        assert_eq!(over_gray(0x10, 255, black), [0, 0, 0, 255]);
+        assert_eq!(over_gray(0x13, 255, black), [0, 0, 0, 255]);
+        assert_eq!(
+            over_gray(0x12, 255, black),
+            [128, 128, 128, 255],
+            "subtracting black leaves the destination"
+        );
+    }
+
+    /// The corner colours tint the quad: the neutral pair is an exact identity,
+    /// MODULATE2X doubles, and a gradient reaches the corners it names.
+    #[test]
+    fn corner_colours_tint_the_quad() {
+        let texture = texture(4, 4, [100, 100, 100, 255]);
+        let draw = |colour: u32, blend_mode: u32| {
+            let mut canvas = Canvas::new(1, 1);
+            let mut item = item([0.5, 0.5], [1.0, 1.0], 1.0);
+            item.blend_mode = blend_mode;
+            item.corner_colors = [colour; 4];
+            draw_quad(&mut canvas, &texture, &item, Tint::IDENTITY, 1.0);
+            canvas.pixel(0, 0).expect("the single pixel")
+        };
+        assert_eq!(
+            draw(0x8080_80FF, 0x10),
+            [100, 100, 100, 255],
+            "the D3D MODULATE2X neutral gray is exactly 1.0"
+        );
+        assert_eq!(
+            draw(0xFFFF_FFFF, 0x00),
+            [100, 100, 100, 255],
+            "the MODULATE neutral white is exactly 1.0"
+        );
+        assert_eq!(
+            draw(0xFFFF_FFFF, 0x10),
+            [199, 199, 199, 255],
+            "MODULATE2X doubles the texel (100 * 255/128 = 199.2)"
+        );
+        assert_eq!(
+            draw(0x8000_00FF, 0x10),
+            [100, 0, 0, 255],
+            "one channel through the same 1.0 scale"
+        );
+        assert_eq!(draw(0xFF00_00FF, 0x10), [199, 0, 0, 255], "and doubled");
+        assert_eq!(
+            draw(0x4040_4080, 0x10),
+            [50, 50, 50, 128],
+            "0x40 through the 1.0 scale, and the corner alpha scales opacity"
+        );
+    }
+
+    /// The four corners are interpolated across the quad, so a gradient tints
+    /// each corner with its own colour.
+    #[test]
+    fn a_corner_gradient_reaches_each_corner() {
+        let texture = texture(4, 4, [255, 255, 255, 255]);
+        let mut canvas = Canvas::new(4, 4);
+        let mut item = item([2.0, 2.0], [4.0, 4.0], 1.0);
+        item.blend_mode = 0x10;
+        // Top-left red, top-right green, bottom-right blue, bottom-left black.
+        item.corner_colors = [0xFF00_00FF, 0x00FF_00FF, 0x0000_FFFF, 0x0000_00FF];
+        draw_quad(&mut canvas, &texture, &item, Tint::IDENTITY, 1.0);
+        let [r, g, b, _] = canvas.pixel(0, 0).expect("top-left");
+        assert!(
+            r > g && r > b && g < 96 && b < 96,
+            "top-left is red: {:?}",
+            (r, g, b)
+        );
+        let [r, g, b, _] = canvas.pixel(3, 0).expect("top-right");
+        assert!(g > r && g > b, "top-right is green: {:?}", (r, g, b));
+        let [r, g, b, _] = canvas.pixel(3, 3).expect("bottom-right");
+        assert!(b > r && b > g, "bottom-right is blue: {:?}", (r, g, b));
+        let [r, g, b, _] = canvas.pixel(0, 3).expect("bottom-left");
+        assert!(
+            r < 96 && g < 96 && b < 96,
+            "bottom-left is black: {:?}",
+            (r, g, b)
         );
     }
 
@@ -968,7 +1453,7 @@ mod tests {
                         let mut old = [dst_rgb, dst_rgb.wrapping_add(3), dst_rgb, dst_a];
                         let mut new = old;
                         reference::blend(&mut old, 1, 0, 0, rgba, alpha);
-                        blend(&mut new, 1, 0, 0, rgba, alpha);
+                        composite(&mut new, 1, 0, 0, rgba, alpha, SpriteBlend::Over);
                         assert_eq!(
                             old, new,
                             "alpha={alpha} src={src} dst={dst_rgb}/{dst_a} rgba={rgba:?}"
