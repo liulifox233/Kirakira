@@ -3475,7 +3475,7 @@ impl KagSession {
     ) -> Result<TagAction> {
         if matches!(
             tag.tagname.as_str(),
-            "syshook" | "sysjump" | "addSysHook" | "addSysScript"
+            "syshook" | "sysjump" | "addSysHook" | "addsyshook" | "addSysScript" | "addsysscript"
         ) {
             runtime.host_mut().log(&format!(
                 "KAG control tag `{}` attrs={:?}",
@@ -3512,8 +3512,16 @@ impl KagSession {
         // returns success for every unknown tag.
         if matches!(
             tag.tagname.as_str(),
-            "syshook" | "addSysHook" | "addSysScript"
+            "syshook" | "addSysHook" | "addsyshook" | "addSysScript" | "addsysscript"
         ) {
+            return self.process_native_fallback_tag(parser, runtime, owner, &tag);
+        }
+        // `[next]` is KAG's own transition tag (`MainWindow.tjs`): it offers
+        // itself to the project's `onNext` function hooks and only when none of
+        // them takes it does the scenario move. Both halves live in the
+        // engine's handler, so a generic game `onTag` that reports every
+        // unknown tag as handled cannot swallow the transition.
+        if tag.tagname == "next" {
             return self.process_native_fallback_tag(parser, runtime, owner, &tag);
         }
         if tag.tagname == "sysjump" {
@@ -3577,7 +3585,7 @@ impl KagSession {
             {
                 if matches!(
                     tag.tagname.as_str(),
-                    "syshook" | "addSysHook" | "addSysScript"
+                    "syshook" | "addSysHook" | "addsyshook" | "addSysScript" | "addsysscript"
                 ) {
                     runtime.host_mut().log(&format!(
                         "KAG unknown handler dispatch tag={} handler={:?}",
@@ -3600,7 +3608,7 @@ impl KagSession {
                 )?;
                 if matches!(
                     tag.tagname.as_str(),
-                    "syshook" | "addSysHook" | "addSysScript"
+                    "syshook" | "addSysHook" | "addsyshook" | "addSysScript" | "addsysscript"
                 ) {
                     runtime.host_mut().log(&format!(
                         "KAG unknown handler result tag={} value={:?}",
@@ -3679,6 +3687,142 @@ impl KagSession {
                 }
             }
         }
+    }
+
+    /// Runs the project's own `onNext` function hooks for `[next]`, exactly as
+    /// the reference's `next` handler does with
+    /// `forEachFunctionHook("onNext", storage, target)`: a hook that answers
+    /// with anything but void has taken the tag. GINKA's world player is such a
+    /// hook (`world.onNext`, registered through `kag.addHook`) and its
+    /// `[next storage="scn000.ks"]` names a scene the player resolves itself,
+    /// not a scenario file — leaving the transition to the engine would ask the
+    /// filesystem for a storage that does not exist.
+    #[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
+    fn run_on_next_hooks(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        storage: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<bool> {
+        let Some(kag) = runtime.global_member("kag").object_handle() else {
+            return Ok(false);
+        };
+        if matches!(
+            runtime.object_member(kag, "forEachFunctionHook"),
+            Variant::Void
+        ) {
+            return Ok(false);
+        }
+        let argument = |value: Option<&str>| match value {
+            Some(value) => Variant::String(value.to_string()),
+            None => Variant::Void,
+        };
+        let value = self.call_tag_handler(
+            runtime,
+            kag,
+            "forEachFunctionHook",
+            vec![
+                Variant::String("onNext".to_string()),
+                argument(storage),
+                argument(target),
+            ],
+        )?;
+        Ok(!matches!(value, Variant::Void))
+    }
+
+    /// The `(storage, target)` a `[sysjump from=A to=B]` transition loads.
+    ///
+    /// The reference resolves the destination through the system-script
+    /// registry rather than by naming a file: `SystemManager.kagJump` ->
+    /// `_jump` looks up `SystemScript.get("<to>.from.<from>")` and runs
+    /// `kag.process` on that entry's own `storage`/`target` (PARQUET/GINKA
+    /// `sysscn/system.tjs`), which is what the `[addSysScript]` declarations in
+    /// the projects' `custom.ks` populate. `SystemScriptMap.get` in turn falls
+    /// back to the entry named by the text before the first dot, so
+    /// `[sysjump to=game]` still reaches an `[addSysScript name=game
+    /// storage=start]` declaration, and both entry forms append the `.ks` a
+    /// declaration left off. `<to>.ks` — a scenario named after the destination
+    /// — is the engine's last resort for a project that never registered the
+    /// hook; a registry entry wins wherever the two both exist.
+    fn resolve_sysjump(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        from: &str,
+        to: &str,
+    ) -> (String, Option<String>) {
+        if let Some(entry) = self.sysjump_registry_entry(from, to) {
+            return entry;
+        }
+        // The declarations are normally already in the table by the time a
+        // project jumps (its `custom.ks` runs at boot, and each `[addSysScript]`
+        // registers itself); a project that reaches a sysjump first still gets
+        // the same declarations from the scan, exactly as `[syshook]` does.
+        self.load_system_hook_declarations(runtime);
+        self.sysjump_registry_entry(from, to)
+            .unwrap_or_else(|| (format!("{to}.ks"), None))
+    }
+
+    fn sysjump_registry_entry(&self, from: &str, to: &str) -> Option<(String, Option<String>)> {
+        let exact = format!("{to}.from.{from}");
+        if let Some(storage) = self
+            .system_hooks
+            .get(&exact)
+            .and_then(|hook| hook.storage.as_deref())
+            .filter(|storage| is_sysjump_storage(storage))
+        {
+            let target = self.system_hooks[&exact].target.clone();
+            return Some((sysjump_storage(storage), target));
+        }
+        self.system_hooks
+            .get(to)
+            .and_then(|hook| hook.storage.as_deref())
+            .filter(|storage| is_sysjump_storage(storage))
+            .map(|storage| (sysjump_storage(storage), None))
+    }
+
+    /// The engine-driven read of the project's `custom.ks` hook declarations,
+    /// for the sessions that reach a `[syshook]`/`[sysjump]` before the project
+    /// has executed the declarations themselves. The declarations are read with
+    /// the reference scenario reader's line rules (a `;` line is a comment, a
+    /// declaration is a `[addSysHook`/`[addSysScript` tag) and their attribute
+    /// values with the reference tag parser's quoting rules (`hook_attr`).
+    fn load_system_hook_declarations(&mut self, runtime: &mut Runtime<KrkrHost>) {
+        if !self.system_hooks.is_empty() {
+            return;
+        }
+        let Ok(text) = runtime.host_mut().read_text_storage_for_tjs("custom.ks") else {
+            return;
+        };
+        for line in text.lines() {
+            // The reference's scenario reader skips a `;` line before it looks
+            // for tags, so a declaration that is commented out is not in its
+            // hook table either.
+            if is_hook_comment_line(line) {
+                continue;
+            }
+            let Some(start) = line
+                .find("[addSysHook")
+                .or_else(|| line.find("[addSysScript"))
+            else {
+                continue;
+            };
+            let command = &line[start..];
+            let Some(hook_name) = hook_attr(command, "name") else {
+                continue;
+            };
+            self.system_hooks.insert(
+                hook_name,
+                SystemHook {
+                    storage: hook_attr(command, "storage"),
+                    target: hook_attr(command, "target"),
+                    call: command.starts_with("[addSysHook") && decl_jump_or_call(command, true),
+                },
+            );
+        }
+        runtime.host_mut().log(&format!(
+            "KAG loaded {} system hook declarations",
+            self.system_hooks.len()
+        ));
     }
 
     fn process_native_fallback_tag(
@@ -3852,11 +3996,12 @@ impl KagSession {
                 let hook = SystemHook {
                     storage: tag.literal_attr("storage").and_then(non_empty_string),
                     target: tag.literal_attr("target").and_then(non_empty_string),
+                    // `[addSysHook]` registers a call unless the declaration
+                    // says otherwise (`iscall = !+jump`, `_JumpOrCall`), and an
+                    // `[addSysScript]` entry is only ever a jump destination
+                    // (`SystemScript.kagAddScript`).
                     call: match native_tag {
-                        NativeFallbackTag::AddSysHook => {
-                            kag_bool_attr(tag, "call").unwrap_or(false)
-                        }
-                        NativeFallbackTag::AddSysScript => false,
+                        NativeFallbackTag::AddSysHook => jump_or_call_attr(tag, true),
                         _ => false,
                     },
                 };
@@ -3870,41 +4015,7 @@ impl KagSession {
                 let Some(name) = tag.literal_attr("name") else {
                     return Ok(TagAction::Continue);
                 };
-                if self.system_hooks.is_empty() {
-                    if let Ok(text) = runtime.host_mut().read_text_storage_for_tjs("custom.ks") {
-                        for line in text.lines() {
-                            // The reference's scenario reader skips a `;` line
-                            // before it looks for tags, so a declaration that is
-                            // commented out is not in its hook table either.
-                            if is_hook_comment_line(line) {
-                                continue;
-                            }
-                            let Some(start) = line
-                                .find("[addSysHook")
-                                .or_else(|| line.find("[addSysScript"))
-                            else {
-                                continue;
-                            };
-                            let command = &line[start..];
-                            let Some(hook_name) = hook_attr(command, "name") else {
-                                continue;
-                            };
-                            self.system_hooks.insert(
-                                hook_name,
-                                SystemHook {
-                                    storage: hook_attr(command, "storage"),
-                                    target: hook_attr(command, "target"),
-                                    call: command.starts_with("[addSysHook")
-                                        && hook_is_call(command),
-                                },
-                            );
-                        }
-                        runtime.host_mut().log(&format!(
-                            "KAG loaded {} system hook declarations",
-                            self.system_hooks.len()
-                        ));
-                    }
-                }
+                self.load_system_hook_declarations(runtime);
                 let hook = self.system_hooks.get(name).cloned().or_else(|| {
                     runtime.host().system_hook(name).map(|hook| SystemHook {
                         storage: hook.storage,
@@ -3949,29 +4060,74 @@ impl KagSession {
                 self.state = KagTaskState::Running;
                 Ok(TagAction::Continue)
             }
-            NativeFallbackTag::SysJump => {
-                let target = tag
-                    .literal_attr("to")
-                    .ok_or_else(|| TjsError::runtime("sysjump requires `to`"))?;
-                let storage = if target.ends_with(".ks") {
-                    target.to_string()
-                } else {
-                    format!("{target}.ks")
-                };
+            NativeFallbackTag::Next => {
+                // The reference's `next` handler (`MainWindow.tjs`, the `next`
+                // tag): `exp` first, then nothing at all when the tag names
+                // neither `storage` nor `target`, then the project's own
+                // `onNext` function hooks — GINKA's world player answers those
+                // with the scene it advances to — and only when no hook took
+                // the tag KAG's own transition, `process(storage, target)`.
+                if let Some(expression) = tag.literal_attr("exp") {
+                    execute_expression_on_runtime(runtime, "kag next", expression)?;
+                }
+                let storage = tag
+                    .literal_attr("storage")
+                    .filter(|value| !value.is_empty());
+                let target = tag.literal_attr("target").filter(|value| !value.is_empty());
+                if storage.is_none() && target.is_none() {
+                    return Ok(TagAction::Continue);
+                }
+                if self.run_on_next_hooks(runtime, storage, target)? {
+                    return Ok(TagAction::Continue);
+                }
                 let mut host = EngineKagHost::for_owner(runtime, owner);
-                // `[sysjump]` loads the target scenario through the parser,
-                // which runs the project's `onScenarioLoad`/`onScenarioLoaded`
-                // first: a claimed exception means the jump did not happen, so
-                // the session keeps its own scenario and message layer instead
-                // of killing the frame, and a park keeps its
-                // `ResourcePending` marker so the tag loop requeues the tag
+                // The transition itself is what `[jump]` performs (load the
+                // scenario, move to the label); the park handling around it is
+                // `[sysjump]`'s, so a wait for a remote resource requeues the
+                // tag and a claimed exception leaves the session running in the
+                // scenario it was already in.
+                let checkpoint = parser.store();
+                if let Err(error) = parser.go_to_with(storage, target, &mut host) {
+                    let escaped = host.script_exception_or(error);
+                    if is_resource_pending_error(&escaped) {
+                        parser
+                            .restore(checkpoint)
+                            .map_err(|error| TjsError::runtime(error.to_string()))?;
+                    }
+                    handle_escaped_script_exception(runtime, "KAG `[next]` transition", escaped)?;
+                    return Ok(TagAction::Continue);
+                }
+                self.pending_tags.clear();
+                self.state = KagTaskState::Running;
+                Ok(TagAction::Continue)
+            }
+            NativeFallbackTag::SysJump => {
+                let from = tag.literal_attr("from").unwrap_or_default();
+                let to = tag
+                    .literal_attr("to")
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| TjsError::runtime("sysjump requires `to`"))?;
+                let (storage, target) = self.resolve_sysjump(runtime, from, to);
+                let mut host = EngineKagHost::for_owner(runtime, owner);
+                // `[sysjump]` loads the destination through the parser, which
+                // runs the project's `onScenarioLoad`/`onScenarioLoaded` first:
+                // a claimed exception means the jump did not happen, so the
+                // session keeps its own scenario and message layer instead of
+                // killing the frame, and a park keeps its `ResourcePending`
+                // marker so the tag loop requeues the tag
                 // (`handle_escaped_script_exception` never consults the handler
                 // for a wait). The park also rewinds the parser to the tag, so
                 // the retry re-runs the load and its callbacks from the start
                 // even when the scenario was already installed when the call
-                // was aborted.
+                // was aborted. The registry entry carries a label as well (the
+                // reference's `kag.process(storage, target)`), which the load
+                // alone would leave unentered.
                 let checkpoint = parser.store();
-                if let Err(error) = parser.load_scenario_with(storage, &mut host) {
+                let mut moved = parser.load_scenario_with(storage.clone(), &mut host);
+                if let Some(target) = target.as_deref().filter(|_| moved.is_ok()) {
+                    moved = parser.go_to_with(Some(&storage), Some(target), &mut host);
+                }
+                if let Err(error) = moved {
                     let escaped = host.script_exception_or(error);
                     if is_resource_pending_error(&escaped) {
                         parser
@@ -4285,18 +4441,6 @@ fn hook_attr(command: &str, name: &str) -> Option<String> {
     non_empty_string(decl_attr(command, name)?)
 }
 
-/// The boolean `call` attribute of a declaration, with the value mapping the
-/// tag path applies to the same attribute (`kag_bool_attr`): the bare flag the
-/// reference's attribute reader turns into `true` is a call, and `call=false`
-/// — which `command.contains(" call")` read as one — is not. The reference's
-/// own template reads the attribute value the same way (`_JumpOrCall` computes
-/// `iscall = +call`; PARQUET's compiled `data/system/System.tjs`), so a
-/// declaration read from `custom.ks` and the same declaration met as a tag
-/// register the same flavour.
-fn hook_is_call(command: &str) -> bool {
-    matches!(decl_attr(command, "call"), Some("true" | "yes" | "1"))
-}
-
 /// `true` for a `custom.ks` line the reference's scenario reader skips as a
 /// comment: it strips leading tabs when it splits a scenario into lines
 /// (`KAGParser.cpp:147-148`) and then skips any line whose first character is
@@ -4400,6 +4544,7 @@ enum NativeFallbackTag {
     TempSave,
     TempLoad,
     Noop,
+    Next,
     SysJump,
     GotoStart,
     LayCount,
@@ -4434,8 +4579,8 @@ impl NativeFallbackTag {
             "wait" => Self::Wait,
             "eval" => Self::Eval,
             "trace" => Self::Trace,
-            "addSysHook" => Self::AddSysHook,
-            "addSysScript" => Self::AddSysScript,
+            "addSysHook" | "addsyshook" => Self::AddSysHook,
+            "addSysScript" | "addsysscript" => Self::AddSysScript,
             "syshook" => Self::SysHook,
             "cm" | "ct" | "er" => Self::ClearText,
             "image" => Self::Image,
@@ -4449,6 +4594,7 @@ impl NativeFallbackTag {
             "tempsave" => Self::TempSave,
             "tempload" => Self::TempLoad,
             "commit" | "history" | "defstyle" | "resetstyle" | "ruby" => Self::Noop,
+            "next" => Self::Next,
             "sysjump" => Self::SysJump,
             "gotostart" => Self::GotoStart,
             "laycount" => Self::LayCount,
@@ -5141,6 +5287,35 @@ fn kag_bool_attr(tag: &Tag, name: &str) -> Option<bool> {
     }
 }
 
+/// The jump/call flavour of a `[addSysHook]` tag, read the way the reference's
+/// `_JumpOrCall` reads the same two attributes (`iscall = caller's default`;
+/// a named `call` sets `iscall = +call`, a named `jump` overrides it with
+/// `iscall = !+jump`; PARQUET/GINKA `sysscn/system.tjs`). A bare flag is
+/// `"true"` by the time it reaches here, so `[addSysHook name=x jump ...]`
+/// registers a jump, `[addSysHook name=x call=false ...]` a jump too, and a
+/// declaration naming neither keeps the `kagAdd` default — a call.
+fn jump_or_call_attr(tag: &Tag, default: bool) -> bool {
+    if let Some(jump) = kag_bool_attr(tag, "jump") {
+        return !jump;
+    }
+    kag_bool_attr(tag, "call").unwrap_or(default)
+}
+
+/// The declaration-text twin of [`jump_or_call_attr`] for the `custom.ks`
+/// scanners, which read a raw line instead of a parsed tag.
+fn decl_jump_or_call(command: &str, default: bool) -> bool {
+    if let Some(jump) = decl_bool_attr(command, "jump") {
+        return !jump;
+    }
+    decl_bool_attr(command, "call").unwrap_or(default)
+}
+
+/// The boolean value of one `name=value` attribute of a declaration; `None`
+/// when the declaration does not carry the attribute.
+fn decl_bool_attr(command: &str, name: &str) -> Option<bool> {
+    decl_attr(command, name).map(|value| matches!(value, "true" | "yes" | "1"))
+}
+
 fn tag_i64(tag: &Tag, name: &str) -> Result<Option<i64>> {
     tag.literal_attr(name)
         .map(|value| {
@@ -5153,6 +5328,26 @@ fn tag_i64(tag: &Tag, name: &str) -> Result<Option<i64>> {
 
 fn non_empty_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The storage a system-script entry names, with the `.ks` the reference
+/// appends to an extensionless one (`SystemScriptMap.getValue`, `_JumpOrCall`:
+/// `storage += ".ks"` unless the name already carries it).
+fn sysjump_storage(storage: &str) -> String {
+    if storage.contains(".ks") {
+        return storage.to_string();
+    }
+    format!("{storage}.ks")
+}
+
+/// `true` for a system-script `storage` a transition can load. A value that
+/// still carries its `&` is one the engine's own `custom.ks` scan read raw —
+/// the project never executed that declaration, or the scan ran first — and the
+/// evaluation is what names the scenario (`&GetVolumeFileName("start.ks")` is
+/// not a storage), so such an entry is treated as unregistered and the caller's
+/// fallback stands.
+fn is_sysjump_storage(storage: &str) -> bool {
+    !storage.is_empty() && !storage.starts_with('&')
 }
 
 fn apply_laycount_tag(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<()> {
@@ -21302,6 +21497,71 @@ mod tests {
             hook_storages("[addSysHook name=\"probe\" call storage=\"hook.ks\" target=\"*probe\"]"),
             vec!["hook.ks".to_string(), "first.ks".to_string()]
         );
+        // The reference's own default: `kagAdd` hands `_JumpOrCall` a `1`, so a
+        // declaration that names neither attribute registers a call, and the
+        // bare `jump` flag the shipped declarations write (`[addSysHook
+        // name="title.loop" jump storage=...]`) registers a jump.
+        assert_eq!(
+            hook_storages("[addSysHook name=\"probe\" storage=\"hook.ks\" target=\"*probe\"]"),
+            vec!["hook.ks".to_string(), "first.ks".to_string()]
+        );
+        assert_eq!(
+            hook_storages("[addSysHook name=\"probe\" jump storage=\"hook.ks\" target=\"*probe\"]"),
+            vec!["hook.ks".to_string()]
+        );
+        assert_eq!(
+            hook_storages(
+                "[addSysHook name=\"probe\" jump=false storage=\"hook.ks\" target=\"*probe\"]"
+            ),
+            vec!["hook.ks".to_string(), "first.ks".to_string()]
+        );
+    }
+
+    /// The same `call`/`jump` reading on the tag path: the engine's own
+    /// `[addSysHook]` handler registers the declaration with the flavour the
+    /// reference's `_JumpOrCall` computes, so a bare `[addSysHook]` met as a
+    /// scenario tag and the same declaration read out of `custom.ks` cannot
+    /// disagree. `[syshook]` runs the hook either way; only the call leaves the
+    /// caller on the parser's call stack.
+    #[test]
+    fn kag_add_sys_hook_tag_defaults_to_a_call_and_reads_jump() {
+        fn hook_storages(declaration: &str) -> Vec<String> {
+            let root = temp_root();
+            fs::create_dir_all(&root).expect("create temp root");
+            fs::write(
+                root.join("first.ks"),
+                format!("{declaration}\n[syshook name=probe]\n[s]"),
+            )
+            .expect("write scenario");
+            fs::write(root.join("hook.ks"), "*probe\nHOOK[s]").expect("write hook scenario");
+
+            let mut engine = image_test_engine(&root);
+            engine.load_kag_scenario("first.ks").expect("load scenario");
+            engine.tick().expect("system hook");
+            assert_eq!(engine.message_layer().lines, vec!["HOOK".to_string()]);
+            let storages = engine
+                .kag_parser()
+                .store()
+                .storage_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            fs::remove_dir_all(root).expect("cleanup");
+            storages
+        }
+
+        assert_eq!(
+            hook_storages("[addSysHook name=probe storage=hook.ks target=*probe]"),
+            vec!["hook.ks".to_string(), "first.ks".to_string()]
+        );
+        assert_eq!(
+            hook_storages("[addSysHook name=probe jump storage=hook.ks target=*probe]"),
+            vec!["hook.ks".to_string()]
+        );
+        assert_eq!(
+            hook_storages("[addSysHook name=probe call=false storage=hook.ks target=*probe]"),
+            vec!["hook.ks".to_string()]
+        );
     }
 
     /// `hook_attr` reads an attribute name as a whole token and stops at the
@@ -21382,6 +21642,222 @@ mod tests {
         let tick = engine.tick().expect("retried system jump");
         assert_eq!(tick.state, KagTaskState::Finished);
         assert_eq!(engine.message_layer().lines, vec!["B".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `[sysjump from=A to=B]` reaches the destination the project registered
+    /// for that pair, not a scenario named after `B`. The reference looks the
+    /// pair up in its system-script registry as `B.from.A` and runs
+    /// `kag.process` on the entry's own `storage`/`target`
+    /// (`SystemManager.kagJump` -> `_jump`; PARQUET/GINKA `sysscn/system.tjs`),
+    /// which is how GINKA's `[sysjump from="title" to="game"]` reaches
+    /// `start_vol1.ks@*start` although no `game.ks` exists in the game at all.
+    /// The decoy file is the name the engine used to derive; the registry entry
+    /// has to win.
+    #[test]
+    fn kag_sysjump_resolves_through_the_sys_script_registry() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[sysjump from=title to=game][s]")
+            .expect("write scenario");
+        fs::write(
+            root.join("custom.ks"),
+            "[addSysScript name=\"game.from.title\" storage=\"start\" target=\"*start\"]\n",
+        )
+        .expect("write sys-script declarations");
+        fs::write(root.join("start.ks"), "*start\nGAMESTART[s]").expect("write target scenario");
+        fs::write(root.join("game.ks"), "DECOY[s]").expect("write decoy scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("system jump");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["GAMESTART".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The registry's own fallback, `SystemScriptMap.get`'s inheritance from the
+    /// entry named before the first dot: a project that declared only
+    /// `[addSysScript name=game storage=start]` still moves on
+    /// `[sysjump from=title to=game]`, entering `start.ks` at its first item.
+    #[test]
+    fn kag_sysjump_inherits_the_storage_of_its_target_entry() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[sysjump from=title to=game][s]")
+            .expect("write scenario");
+        fs::write(
+            root.join("custom.ks"),
+            "[addSysScript name=\"game\" storage=\"start\"]\n",
+        )
+        .expect("write sys-script declarations");
+        fs::write(root.join("start.ks"), "FIRST[s]").expect("write target scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("system jump");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["FIRST".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A project with no registry entry for the pair keeps the engine's last
+    /// resort, the scenario named after the destination (`[sysjump to=load]`
+    /// loading `load.ks`), so the projects whose sys-script files are named that
+    /// way keep moving.
+    #[test]
+    fn kag_sysjump_without_a_registry_entry_loads_the_target_scenario() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[sysjump from=game to=load][s]").expect("write scenario");
+        fs::write(
+            root.join("custom.ks"),
+            "[addSysScript name=\"game.from.title\" storage=\"start\" target=\"*start\"]\n",
+        )
+        .expect("write sys-script declarations");
+        fs::write(root.join("load.ks"), "LOAD[s]").expect("write target scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("system jump");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["LOAD".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `[next storage=X target=Y]` is KAG's own transition tag, the same load
+    /// and label move `[jump]` performs (`MainWindow.tjs`, the `next` tag:
+    /// `process(storage, target)`). GINKA's volume select reaches its scene
+    /// through it (`start.ks@*jump` -> `[next storage=&tf.start_storage
+    /// target=&tf.start_target]`), so a project whose `[next]` is dropped never
+    /// starts its scene.
+    #[test]
+    fn kag_next_loads_its_storage_and_enters_its_target() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[next storage=\"scn000.ks\" target=\"*envstart\"][s]",
+        )
+        .expect("write scenario");
+        fs::write(root.join("scn000.ks"), "*envstart\nSCENE[s]").expect("write scene scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("next transition");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["SCENE".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The reference's `next` handler returns before it looks at the scenario
+    /// when the tag names neither `storage` nor `target` (`MainWindow.tjs`), so
+    /// an argument-less `[next]` leaves the scenario where it is.
+    #[test]
+    fn kag_next_without_storage_or_target_is_a_no_op() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[next]AFTER[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("argument-less next tag");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["AFTER".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `[next]` offers itself to the project's own `onNext` function hooks
+    /// before KAG moves (`forEachFunctionHook("onNext", storage, target)`), and
+    /// a hook that answers with anything but void has taken the tag. That is
+    /// how GINKA's world player plays `[next storage="scn000.ks"]`: the name is
+    /// a scene its own player resolves, and no such scenario file exists, so
+    /// the engine must not move the scenario itself.
+    #[test]
+    fn kag_next_hands_the_tag_to_the_projects_on_next_hooks() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[next storage=\"scn000.ks\" target=\"\"]AFTER[s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "kag-next-hook.tjs",
+                r#"
+                global.kag = new Dictionary();
+                global.nextHook = "";
+                kag.forEachFunctionHook = function(name, storage, target) {
+                    global.nextHook = "" + name + "|" + storage + "|" + target;
+                    return 1;
+                };
+                "#,
+            )
+            .expect("install onNext hook");
+        let tick = engine.tick().expect("handled next tag");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("nextHook"),
+            Variant::String("onNext|scn000.ks|".to_string())
+        );
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["AFTER".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// `&expr` attribute values are evaluated before a tag reaches any handler:
+    /// the reference's parser runs `TVPExecuteExpression` over the value and
+    /// stores the result string (`KAGParser.cpp:1587-1590`), so
+    /// `[scenestart storage=&tf.start_storage target=&tf.start_target]` hands
+    /// the handler the scene the project stored, not the source text it was
+    /// written with. Without that the project's own scene starter receives a
+    /// string it cannot look anything up with and dies where it stands.
+    #[test]
+    fn kag_unknown_tag_attributes_reach_the_handler_evaluated() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[scenestart storage=&tf.start_storage target=&tf.start_target]\nAFTER[s]",
+        )
+        .expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "kag-tag-entity.tjs",
+                r#"
+                global.tf = new Dictionary();
+                tf.start_storage = "scn000.ks";
+                tf.start_target = "*envstart";
+                global.handlerProbe = new Dictionary();
+                global.probeSeen = "";
+                handlerProbe.onUnknownTag = function(name, elm) {
+                    global.probeSeen = "" + name + "|" + elm.storage + "|" + elm.target;
+                };
+                "#,
+            )
+            .expect("install tag handler");
+        let handler = expression_object(&mut engine, "handlerProbe");
+        engine.set_kag_handler(handler);
+        let tick = engine.tick().expect("tag with entity attributes");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(
+            engine.tjs_runtime().global_member("probeSeen"),
+            Variant::String("scenestart|scn000.ks|*envstart".to_string())
+        );
+        assert_eq!(engine.message_layer().lines, vec!["AFTER".to_string()]);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
