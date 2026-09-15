@@ -1104,6 +1104,38 @@ fn dictionary_save_struct<H: TjsHost + 'static>(
     Ok(Variant::Object(handle))
 }
 
+/// `name` and `mode` are the reference's own pair
+/// (`tjsDictionary.cpp:133-179`, `tjsArray.cpp:455-490`): the mode string is a
+/// *stream mode* handed to the stream factory, not a flag this crate owns.  A
+/// `b` anywhere in it (`TJS_strchr(mode.c_str(), TJS_W('b'))`,
+/// `tjsDictionary.cpp:143`) selects the `KBAD100\0` binary serializer, and
+/// every other mode the text stream writer (`:148-156`, `:160-166`).  The rest
+/// of the grammar belongs to that factory
+/// (`base/BinaryStream.cpp:52-76`, `base/TextStream.cpp:343-640`) and is only
+/// meaningful because the mode reaches it untouched:
+///
+/// * `o<digits>` -- open the *existing* file in update mode and seek to that
+///   offset.  `_TVPCreateStream` resolves anything but `TJS_BS_WRITE` through
+///   `TVPGetPlacedPath` ("file must exist", `StorageIntf.cpp:1242-1244`), so
+///   an `o` mode never creates the file and never truncates it.
+/// * `z`, `z<level>` -- zlib-compress the UTF-16LE payload.  The stream writes
+///   the `fe fe 02` mode signature, the `ff fe` BOM, a placeholder for the two
+///   little-endian sizes, and back-fills them from `ZStream->total_out` and
+///   `total_in` when it closes (`base/TextStream.cpp:428-462`, `:487-489`).
+/// * `c`, `c<digit>` -- the simple crypt.  The reference records 1 for a bare
+///   `c` and the digit otherwise, and then refuses any mode outside 1 and 2
+///   with `"unsupported cipher mode"` (`base/TextStream.cpp:381-397`), so
+///   `c`/`c1` are the bit-swap crypt, `c2` is the *compressed* stream, and
+///   `c0`/`c3`..`c9` throw.  This engine's storage layer writes mode 1 for any
+///   `c` and never rejects, so `c2` compresses nothing here and the refused
+///   modes write instead of failing; both readers are content-driven, which
+///   keeps the difference write-side only.
+///
+/// KAGEX's `BookMarkIO_Standard.save` writes `saveDataMode + "o" + size`, and
+/// GINKA's `main/Config.tjs` sets `saveDataMode = debugWindowEnabled ? "" :
+/// "z"`: the thumbnail BMP is already in the file and the struct is appended
+/// at its last byte, so both the offset and the compressor have to survive the
+/// trip to the storage layer.
 fn save_structured_value<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     handle: ObjectHandle,
@@ -1205,6 +1237,17 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
 /// deserialized root value rather than a success flag.  `None` means the path
 /// is unreadable or is not a binary pack -- both are `TJS_E_INVALIDPARAM` to
 /// the callers.
+///
+/// The mode reaches the storage layer with the read, which is what makes an
+/// `o<size>` load work: the reference's binary stream seeks to the offset
+/// before the header is sniffed (`base/BinaryStream.cpp:28-50`), and its text
+/// stream does the same before it probes the BOM
+/// (`base/TextStream.cpp:76-84`, `:97-140`) -- so a struct appended behind a
+/// thumbnail is found by *where* it starts, never by the mode naming `b`.  The
+/// `z` half of `BookMarkIO_Standard.load`'s `"o"+size` mode is likewise
+/// content, not mode: the reader recognises the `fe fe 02` signature it finds
+/// at the offset (`:97-140`), which is why a `"zo<size>"` write is read back by
+/// an `"o<size>"` load.
 fn load_binary_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     path: &str,
