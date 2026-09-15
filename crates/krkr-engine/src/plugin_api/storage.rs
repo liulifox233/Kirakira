@@ -102,8 +102,8 @@ pub fn storage_media_names(runtime: &Runtime<KrkrHost>) -> Vec<String> {
     runtime.host().storage_media_names()
 }
 
-/// The mirror of one watched global dictionary: the `key -> value` string
-/// mappings a script wrote, readable from any thread.
+/// The mirror of one watched global dictionary: the members a script wrote,
+/// readable from any thread.
 ///
 /// This is the point of the type: a media may run on the script thread, on a
 /// resource worker or on a media thread (`StorageMediaProvider` is
@@ -112,17 +112,27 @@ pub fn storage_media_names(runtime: &Runtime<KrkrHost>) -> Vec<String> {
 /// the script thread ([`refresh_storage_tables`]) and the media reads them
 /// here; no TJS handle crosses a thread boundary.
 ///
-/// Keys and values are exactly what the script wrote. Only string values are
-/// copied — an octet, integer, object or `void` value is not a name, and the
-/// reference's own readers demand a string (the `proxy` media treats a
-/// non-string `ProxyStorageMap` value as unmapped; `varfile` is the one
-/// reference reader that accepts octets, for a *file* value rather than a name
-/// mapping). The lookup is exact; a media that wants prefix semantics scans
-/// [`entries`](Self::entries), the way the reference media's lister prefixes
-/// its dictionary scan.
+/// The mirror keeps two views of the same members, because the reference asks
+/// two different questions of its dictionary:
+///
+/// * a **lookup** ([`get`](Self::get), [`entries`](Self::entries)) demands a
+///   string value — the `proxy` media's redirect helper reads the value as the
+///   target name and treats anything else as unmapped, and `varfile` is the
+///   one reference reader that accepts octets, for a *file* value;
+/// * a **listing** ([`keys`](Self::keys)) enumerates member *names*
+///   whatever their values are, which is what `iTVPStorageMedia::GetListAt`
+///   does (`DictMemberGetCaller` over `ProxyStorageMap`) and therefore what a
+///   media-backed auto path places. A key whose value is not a string is a
+///   name the reference's listing returns and its redirect refuses; keeping
+///   only the string entries would hide such a key from the listing.
+///
+/// Keys and values are exactly what the script wrote; the lookup is exact.
+/// [`len`](Self::len)/[`is_empty`](Self::is_empty) count *mappings*, i.e. keys
+/// with a string value, so "no mappings" keeps meaning "nothing to resolve
+/// through".
 #[derive(Debug, Default)]
 pub struct StorageScriptTable {
-    entries: RwLock<BTreeMap<String, String>>,
+    entries: RwLock<BTreeMap<String, Option<String>>>,
 }
 
 impl StorageScriptTable {
@@ -131,29 +141,37 @@ impl StorageScriptTable {
     }
 
     /// The value mapped to `key`, or `None` when the script mapped nothing
-    /// under it. Exact, case- and separator-preserving: policy belongs to the
-    /// media.
+    /// under it or mapped a non-string value there. Exact, case- and
+    /// separator-preserving: policy belongs to the media.
     pub fn get(&self, key: &str) -> Option<String> {
-        self.read().get(key).cloned()
+        self.read().get(key).cloned().flatten()
     }
 
-    /// A snapshot of every mapping, sorted by key.
+    /// A snapshot of every mapping — the keys with a string value — sorted by
+    /// key.
     pub fn entries(&self) -> Vec<(String, String)> {
         self.read()
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone())))
             .collect()
     }
 
+    /// Every member name the script wrote, whatever its value's type, sorted
+    /// by key — the set a media's `GetListAt` enumerates and a lookup does not.
+    pub fn keys(&self) -> Vec<String> {
+        self.read().keys().cloned().collect()
+    }
+
+    /// The number of mappings (keys with a string value).
     pub fn len(&self) -> usize {
-        self.read().len()
+        self.read().values().filter(|value| value.is_some()).count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.read().is_empty()
+        self.len() == 0
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, String>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Option<String>>> {
         // A panic while a script-thread refresh held the write lock must not
         // take the engine's storage resolution down with it: the map is a
         // mirror and a half-written refresh is simply replaced by the next
@@ -163,7 +181,7 @@ impl StorageScriptTable {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn replace(&self, entries: BTreeMap<String, String>) {
+    fn replace(&self, entries: BTreeMap<String, Option<String>>) {
         let mut guard = self
             .entries
             .write()
@@ -236,24 +254,25 @@ fn refresh_storage_table(runtime: &Runtime<KrkrHost>, global_name: &str) {
     let Some(table) = runtime.host().storage_script_table(global_name) else {
         return;
     };
-    table.replace(script_string_members(runtime, global_name));
+    table.replace(script_members(runtime, global_name));
 }
 
-/// The string members of the watched global, as a fresh map. A non-object
-/// global (including `void`) has none.
-fn script_string_members(
+/// The members of the watched global, as a fresh map. A non-object global
+/// (including `void`) has none. A non-string value is kept as `None`: the name
+/// is real (a listing enumerates it) but not a mapping (a lookup refuses it).
+fn script_members(
     runtime: &Runtime<KrkrHost>,
     global_name: &str,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<String, Option<String>> {
     let Some(object) = runtime.global_member(global_name).object_handle() else {
         return BTreeMap::new();
     };
     runtime
         .object_members(object)
         .into_iter()
-        .filter_map(|(key, value)| match value {
-            Variant::String(text) => Some((key, text)),
-            _ => None,
+        .map(|(key, value)| match value {
+            Variant::String(text) => (key, Some(text)),
+            _ => (key, None),
         })
         .collect()
 }
@@ -311,11 +330,14 @@ mod tests {
         );
     }
 
-    /// Only string values are mirrored: an octet, integer or object value is
-    /// not a storage name (`yuzuex`'s `uistand` keeps octet thumbnails in the
-    /// same dictionary, and the reference media demands a string).
+    /// A lookup mirrors string values only: an octet, integer or object value
+    /// is not a storage name (`yuzuex`'s `uistand` keeps octet thumbnails in
+    /// the same dictionary, and the reference media demands a string). The
+    /// *listing* keeps every key, because the reference's `GetListAt`
+    /// enumerates member names — a key with a non-string value is a name a
+    /// listing returns and a redirect refuses.
     #[test]
-    fn refresh_mirrors_string_members_only() {
+    fn refresh_mirrors_string_members_only_for_lookups_and_every_key_for_listings() {
         let mut engine = engine();
         let table = watch_storage_dictionary(engine.tjs_runtime_mut(), "Mixed");
         engine
@@ -334,6 +356,15 @@ mod tests {
         assert_eq!(table.get("o"), None);
         assert_eq!(table.get("i"), None);
         assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.keys(),
+            vec![
+                "a".to_string(),
+                "i".to_string(),
+                "o".to_string(),
+                "s".to_string()
+            ]
+        );
     }
 
     /// The refresh re-reads the global *by name*: replacing it follows the new

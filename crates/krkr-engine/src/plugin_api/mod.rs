@@ -32,6 +32,11 @@
 //!   movie-drawing plugin (`layerExMovie`) can name what it decodes — the
 //!   plugin-side counterpart of the reference's DirectShow graph, with the
 //!   engine owning backend selection the way `VideoOverlay` does.
+//! * [`xp3`] installs the archive filters (`xp3filter.dll`'s
+//!   `TVPSetXP3ArchiveExtractionFilter`/`TVPSetXP3ArchiveContentFilter`) into
+//!   the registry the mounted archives consult — the reference reads those
+//!   callbacks per entry-stream creation and per read, so a plugin registering
+//!   after the project storage was built still reaches every later read.
 //!
 //! The core types a plugin has to name — the storage port a wrapping media
 //! resolves its inner names through, and the media trait it implements — are
@@ -53,6 +58,7 @@ pub mod layer;
 pub mod storage;
 pub mod transition;
 pub mod video;
+pub mod xp3;
 
 pub use krkr_core::{ProjectStoragePort, ResourceData, ResourceStream, StorageMediaProvider};
 pub use transition::{

@@ -989,6 +989,56 @@ mod tests {
         assert!(!storage.storage_exists("other.dll"));
     }
 
+    /// The two shapes of the media half of the auto-path table, side by side.
+    /// A media that can list contributes **entries** — the reference's
+    /// `GetListAt` path (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1119-1125`)
+    /// — so a name it serves but did not list is *not* placed. A media with no
+    /// listing at all keeps the probe fallback, so a name its `exists` claims
+    /// *is* placed: that is the divergence the M215 errata narrowed the `proxy`
+    /// case out of (`ProxyMedia::list` landed; the `steam`/`psb`/`lzfs` media
+    /// in this tree still have no listing, while their reference counterparts
+    /// do — `steam/Storages.cpp:399-410`, `psdfile/psdclass.cpp:728`).
+    #[test]
+    fn a_listing_media_places_only_what_it_listed_and_a_probe_media_places_what_it_has() {
+        let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
+        storage
+            .register_media(Arc::new(
+                FakeMedia::new("proxy")
+                    .with_dir("./", &["krmovie.dll"])
+                    .with_file("./krmovie.dll", b"MZ")
+                    .with_file("./hidden.dll", b"MZ"),
+            ))
+            .expect("register the listing media");
+        let cloud = Arc::new(LateMedia::new());
+        cloud.publish("./cloud.bin", b"cloud");
+        let cloud: Arc<dyn StorageMediaProvider> = cloud;
+        storage
+            .register_media(cloud)
+            .expect("register the probe media");
+        storage.add_auto_path("proxy://./");
+        storage.add_auto_path("steam://./");
+
+        // Listing shape: `hidden.dll` is servable but was not listed, so the
+        // table has no entry for it and the request stays a miss.
+        assert!(storage.storage_exists("proxy://./hidden.dll"));
+        assert!(!storage.storage_exists_exact("hidden.dll"));
+        assert!(storage.read_binary_vec("hidden.dll").is_err());
+
+        // Probe shape: the media cannot enumerate its name space, so what its
+        // `exists` claims is what its auto path places.
+        assert!(storage.storage_exists("steam://./cloud.bin"));
+        assert_eq!(
+            storage.resolved_storage_name("cloud.bin").as_deref(),
+            Some("steam://./cloud.bin")
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("cloud.bin")
+                .expect("probe-placed read"),
+            b"cloud"
+        );
+    }
+
     /// `Storages.addAutoPath` stores the path without the trailing delimiter
     /// the reference requires (`TVPAddAutoPath` throws
     /// `TVPMissingPathDelimiterAtLast`, `StorageIntf.cpp:1003-1005`); the
