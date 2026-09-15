@@ -230,11 +230,12 @@ impl MotionPlayer {
     ///
     /// The switch is `play(name, flags)` in the reference, not a property
     /// write: the game only ever *reads* `_player.motion`
-    /// (`/mnt/hdd/tmp/m230/all/AffineSourceMotion.tjs.tjs:545,560`) and
-    /// changes motion with `_player.play(a0.motion, l2)` (`:2564`, and `:256`),
-    /// and this crate's plugin implements `play` as "put the player at tick 0
-    /// and start it" (`crates/krkr-plugins/src/motion_player.rs:2152-2156`),
-    /// keeping the player's variables — which is what this method does.
+    /// (`AffineSourceMotion.tjs:545,560`; decompiled from the game's archives,
+    /// as the rest of this file's script citations are) and changes motion with
+    /// `_player.play(a0.motion, l2)` (`:2564`, and `:256`), and this crate's
+    /// plugin implements `play` as "put the player at tick 0 and start it"
+    /// (`crates/krkr-plugins/src/motion_player.rs:2152-2156`), keeping the
+    /// player's variables — which is what this method does.
     ///
     /// *Verified*: the game's call shape and the plugin's tick-0 semantics.
     /// *Inferred*: that the native player likewise keeps one clock for the
@@ -395,7 +396,20 @@ impl MotionPlayer {
         &self.player
     }
 
-    /// Mutable access to the underlying eluna session.
+    /// Mutable access to the underlying eluna session — for the parts of the
+    /// player surface this wrapper does not name (physics, stereovision,
+    /// mirroring, …).
+    ///
+    /// One caveat for the session-shaping knobs: `ElunaPlayer::set_paused(true)`
+    /// freezes the control pass inside eluna (`progress_ticks_internal` returns
+    /// before `evaluate_runtime_pipeline`,
+    /// `vendor/eluna/crates/eluna/src/runtime.rs:2313-2315`), while
+    /// [`MotionPlayer::advance_ticks`] still moves the animation clock — so a
+    /// paused session keeps drawing new frames of the animation with its face
+    /// controllers frozen, not a frozen picture. Nothing in this repository
+    /// pauses a session today; a plugin that wires `Player.pause` has to decide
+    /// between pausing the whole session (stop calling `advance_ticks`) and
+    /// eluna's narrower freeze.
     pub fn inner_mut(&mut self) -> &mut ElunaPlayer {
         &mut self.player
     }

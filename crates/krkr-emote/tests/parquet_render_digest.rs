@@ -27,19 +27,23 @@
 //! path is bit-identical to the old one, which the crate's own unit tests
 //! assert directly.
 //!
-//! **What this pin cannot see: blend modes whose effect needs a destination.**
-//! The canvas starts transparent and nothing clears it, and against a
-//! transparent destination every binary/alpha mode degenerates to the source
-//! colour (`dst = 0` makes additive identical to source-over, and the
-//! subtractive/multiply/screen terms vanish). So the digest moves for four of
-//! the five members — `title_bg`'s `bm 0x11` sprite is *not* one of them,
-//! although it does move under the game's own opaque `neutralColor` clear
-//! (`AffineSourceMotion.tjs:3230-3231`), which is why
-//! `tests/parquet_expressions.rs` renders over that clear instead of over
-//! transparency. The digest is still worth pinning: it is the only test that
-//! rasterises all 1,734 real frames, so it catches anything — sampler,
-//! transform, decode, compositor — that moves a pixel where the destination
-//! does not matter, and it is the guard the blend change was measured against.
+//! **What this pin cannot see: the destination-dependent half of a mode.**
+//! The canvas starts transparent and nothing clears it, and at `dst = 0` the
+//! compositor's mode colour collapses per mode (`crates/krkr-emote/src/render.rs`,
+//! `composite`): Add and Screen coincide with source-over, Copy likewise
+//! replaces with the source, while Sub falls to `max(0 - src, 0) = 0` and Mul
+//! to `0 * src / 255 = 0` — black. So only a sprite whose mode collapses *to*
+//! source-over is invisible here; `sd101`'s `bm 0x13` (Mul, neutral corners)
+//! moves the digest on a transparent canvas, which is why four of the five
+//! members move it and only `title_bg`'s additive sprite does not — that one
+//! needs the opaque destination the game itself prepares
+//! (`AffineSourceMotion.tjs:3230-3231` clears the target to `neutralColor`
+//! before every frame), which is why `tests/parquet_expressions.rs` renders
+//! over that clear instead of over transparency. The digest is still worth
+//! pinning: it is the only test that rasterises all 1,734 real frames, so it
+//! catches anything — sampler, transform, decode, compositor — that moves a
+//! pixel without needing a destination, and it is the guard the blend change
+//! was measured against.
 //!
 //! The archive path comes from `KRKR_EMOTE_PARQUET_DIR` and defaults to
 //! `/Users/ruri/Downloads/PARQUET`; when the game is not installed the test
