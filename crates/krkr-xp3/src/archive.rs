@@ -152,6 +152,16 @@ where
         .map_err(Xp3Error::from)
     }
 
+    /// The filter registry this archive reads — the one
+    /// [`Xp3OpenOptions::with_filter_registry`] carried, or a private one when
+    /// the archive was opened without any. An exchange between two archives
+    /// (a provider that wraps a set opened together) is only meaningful when
+    /// they share one, which [`Xp3ResourceProvider`](crate::Xp3ResourceProvider)
+    /// guarantees for the sets it opens.
+    pub fn filter_registry(&self) -> Arc<Xp3FilterRegistry> {
+        Arc::clone(&self.filters)
+    }
+
     pub fn base_offset(&self) -> u64 {
         self.base_offset
     }

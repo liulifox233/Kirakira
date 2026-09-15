@@ -989,15 +989,29 @@ mod tests {
         assert!(!storage.storage_exists("other.dll"));
     }
 
-    /// The two shapes of the media half of the auto-path table, side by side.
+    /// The two shapes of the media half of the auto-path table, side by side,
+    /// because the reference only ever has the first.
+    ///
     /// A media that can list contributes **entries** — the reference's
     /// `GetListAt` path (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1119-1125`)
-    /// — so a name it serves but did not list is *not* placed. A media with no
-    /// listing at all keeps the probe fallback, so a name its `exists` claims
-    /// *is* placed: that is the divergence the M215 errata narrowed the `proxy`
-    /// case out of (`ProxyMedia::list` landed; the `steam`/`psb`/`lzfs` media
-    /// in this tree still have no listing, while their reference counterparts
-    /// do — `steam/Storages.cpp:399-410`, `psdfile/psdclass.cpp:728`).
+    /// — so a name it serves but did not list is *not* placed. A media that
+    /// cannot list keeps this port's probe fallback, which places whatever its
+    /// `exists` claims; the reference has no such path.
+    ///
+    /// In this tree the only registered media without a listing is `lzfs`
+    /// (`proxy`, `psd`, `var` and `zip` all list since `ProxyMedia::list`
+    /// landed; there is no `psb` or `steam` media — `psb_file.rs` is the PSB
+    /// parser, and `krkrsteam.rs` deliberately installs no media). Its
+    /// reference counterpart does not list either: `lzfs.dll`'s `GetListAt` is
+    /// the shared no-op stub (`docs/plugins/lzfs.md:65`), so the reference
+    /// places *nothing* through an `lzfs://` auto path while this port places
+    /// what `lzfs`'s `exists` claims — a real, disclosed divergence rather
+    /// than an unported counterpart. It is kept deliberately: dropping the
+    /// fallback would change how `lzfs://` auto paths resolve in this engine
+    /// (including which bytes a name served through the media gets, since that
+    /// media decodes LZ4 frames), and `lzfs`'s own module is outside this
+    /// change. `media_auto_path_without_a_listing_probes_the_media` pins that
+    /// side of the divergence; this test pins the listing side.
     #[test]
     fn a_listing_media_places_only_what_it_listed_and_a_probe_media_places_what_it_has() {
         let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
@@ -1185,11 +1199,18 @@ mod tests {
     /// `auto path + name`.
     ///
     /// The reference's `GetListAt` is part of `iTVPStorageMedia`
-    /// (`StorageIntf.h:136`) and proxyfs lists its dictionary (`0x100017a0`);
-    /// the port's `proxy` media does not list yet, and for its flat dictionary
-    /// keys the existence probe answers what that listing would have placed
-    /// (the auto path is consulted only after the current-folder check, so a
-    /// real file still wins). Pinned so the divergence stays visible.
+    /// (`StorageIntf.h:136`), so a media that lists places only what it
+    /// enumerated; a media whose `list` answers `NotFound`/`Unsupported` keeps
+    /// this port's probe fallback, and for its flat names the existence probe
+    /// answers what a listing would have placed (the auto path is consulted
+    /// only after the current-folder check, so a real file still wins). The
+    /// fallback is a disclosed divergence — the only registered media without
+    /// a listing is `lzfs`, whose reference `GetListAt` is a no-op
+    /// (`docs/plugins/lzfs.md:65`), so the reference places nothing there —
+    /// pinned so it cannot disappear silently. Since `ProxyMedia::list`
+    /// landed, the real `proxy` media takes the *listing* path instead (see
+    /// `a_listing_media_places_only_what_it_listed_and_a_probe_media_places_what_it_has`);
+    /// the media here is a `proxy`-named double that returns no listing.
     #[test]
     fn media_auto_path_without_a_listing_probes_the_media() {
         let storage = storage_with(FakeMedia::new("proxy").with_file("./krmovie.dll", b"MZ"));

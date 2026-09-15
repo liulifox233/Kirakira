@@ -1,6 +1,6 @@
 use std::{fs::File, io, path::Path, sync::Arc};
 
-use krkr_core::{ResourceStream, StoragePort};
+use krkr_core::{ResourceStream, StoragePort, Xp3FilterRegistry};
 
 use crate::{Result, Xp3Archive, Xp3Entry, Xp3Error, Xp3OpenOptions, normalize_entry_name};
 
@@ -11,6 +11,11 @@ pub struct Xp3ResourceProvider {
     /// KRKR's auto-path table stores `archive.xp3>` entries that address one
     /// specific archive, so the provider has to keep that identity around.
     archive_names: Arc<[String]>,
+    /// The filter registry this provider's archives read. The provider owns it
+    /// so "the registry the archives consult" and "the registry the host hands
+    /// a plugin" can never be two different objects
+    /// (`ProjectStoragePort::xp3_filter_registry`).
+    filter_registry: Arc<Xp3FilterRegistry>,
 }
 
 impl Xp3ResourceProvider {
@@ -31,11 +36,22 @@ impl Xp3ResourceProvider {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        // One registry for every archive of this provider — the caller's when
+        // the options carried one, else a fresh one. The archives read it per
+        // entry-stream creation and per read, so they must share the handle
+        // the host exposes; giving each archive its own would make an install
+        // through that handle reach nothing.
+        let filter_registry = options.filter_registry.clone().unwrap_or_default();
         let mut archives = Vec::new();
         let mut names = Vec::new();
         for path in paths {
             let path = path.as_ref();
-            archives.push(Xp3Archive::open_file_with_options(path, options.clone())?);
+            archives.push(Xp3Archive::open_file_with_options(
+                path,
+                options
+                    .clone()
+                    .with_filter_registry(Arc::clone(&filter_registry)),
+            )?);
             names.push(
                 path.file_name()
                     .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -45,15 +61,33 @@ impl Xp3ResourceProvider {
         Ok(Self {
             archives: archives.into(),
             archive_names: names.into(),
+            filter_registry,
         })
     }
 
+    /// Wraps archives that were opened elsewhere. They keep the registry they
+    /// were opened with; the provider reports the *first* archive's, which is
+    /// exact for the normal case — a set opened together from one
+    /// [`Xp3OpenOptions`] shares one registry — and is documented here because
+    /// a heterogeneous set would leave the other archives reading a registry
+    /// no host can reach.
     pub fn from_archives(archives: Vec<Xp3Archive<File>>) -> Self {
+        let filter_registry = archives
+            .first()
+            .map(Xp3Archive::filter_registry)
+            .unwrap_or_default();
         let archive_names = vec![String::new(); archives.len()];
         Self {
             archives: archives.into(),
             archive_names: archive_names.into(),
+            filter_registry,
         }
+    }
+
+    /// The filter registry every archive of this provider reads — the object a
+    /// plugin installs into (`TVPSetXP3ArchiveExtractionFilter`).
+    pub fn filter_registry(&self) -> Arc<Xp3FilterRegistry> {
+        Arc::clone(&self.filter_registry)
     }
 
     pub fn archive_count(&self) -> usize {
