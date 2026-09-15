@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -11,7 +11,7 @@ use krkr_core::{
     FrameOutput, ImageUpload, LayerId, MessageLayerModel, Point, PointerButton, Size,
     TextInputEvent, TransitionMethod, TransitionParams, TransitionScrollFrom, TransitionScrollStay,
 };
-use krkr_kag::{KagError, KagParser, ParserSnapshot, Tag};
+use krkr_kag::{Attribute, AttributeValue, KagError, KagParser, ParserSnapshot, Tag};
 use krkr_tjs2::{
     Result, TjsError,
     debug::Pause,
@@ -2949,6 +2949,11 @@ struct KagSession {
     clear_page_on_click: bool,
     clear_page_on_timer: bool,
     message_layer: MessageLayerModel,
+    /// Frame counter for the tag-dispatch trace only (`trace_tag_dispatch`):
+    /// one increment per `run_until_yield_with_parser` call, i.e. per engine
+    /// frame, so the numbers line up with the debugger's per-frame
+    /// `--watch-expr`/`--kag-state` output.
+    trace_frame: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2993,6 +2998,7 @@ impl KagSession {
             clear_page_on_click: false,
             clear_page_on_timer: false,
             message_layer: MessageLayerModel::default(),
+            trace_frame: 0,
         }
     }
 
@@ -3262,6 +3268,7 @@ impl KagSession {
     ) -> Result<EngineTickResult> {
         let started = BudgetTimer::start();
         let mut tags_processed = 0;
+        self.trace_frame = self.trace_frame.saturating_add(1);
 
         if self.state != KagTaskState::Running {
             return Ok(EngineTickResult {
@@ -3348,9 +3355,11 @@ impl KagSession {
                 });
             }
 
+            let mut from_pending_tags = true;
             let tag = match self.pending_tags.pop_front() {
                 Some(tag) => Some(tag),
                 None => {
+                    from_pending_tags = false;
                     let mut host = EngineKagHost::for_owner(runtime, owner);
                     match parser.next_tag_with(&mut host) {
                         Ok(tag) => tag,
@@ -3433,6 +3442,7 @@ impl KagSession {
             };
 
             tags_processed += 1;
+            self.trace_tag_dispatch(runtime, parser, &tag, from_pending_tags);
             debug_check_kag_tag(parser, runtime, &tag)?;
             let action = match self.process_tag(parser, runtime, owner, tag.clone()) {
                 Ok(action) => action,
@@ -3464,6 +3474,75 @@ impl KagSession {
                 }
             }
         }
+    }
+
+    /// Frame-level tag-dispatch trace for ordering investigations, off unless
+    /// the `kag` trace category is on (`KRKR_TRACE=kag`, or `all`).
+    ///
+    /// The two events an ordering bug between a scenario write and a later read
+    /// can be seen in are the *fetch* (the session pulls the tag, resolving its
+    /// `&entity` attributes on the way) and the *dispatch* to the project's own
+    /// handler. Both happen inside this loop, so a `fetch` line is followed by
+    /// a `handler` line for the same frame unless the tag was requeued
+    /// (`fetch[queue]`) or took the engine's native path (`handler[native]`).
+    /// `KRKR_KAG_TAG_TRACE=set,scenestart` narrows the output to the tags an
+    /// investigation is about; the frame numbers are one per engine frame and
+    /// line up with the debugger's own per-frame output.
+    fn trace_tag_dispatch(
+        &self,
+        runtime: &mut Runtime<KrkrHost>,
+        parser: &KagParser,
+        tag: &Tag,
+        from_pending_tags: bool,
+    ) {
+        if !runtime.host().trace_enabled(TraceCategory::Kag) || !kag_tag_trace_wanted(&tag.tagname)
+        {
+            return;
+        }
+        let attributes = tag
+            .attributes
+            .iter()
+            .map(|attribute| match attribute {
+                Attribute::Named { name, value } => {
+                    format!("{name}={}", kag_trace_attr_value(value))
+                }
+                Attribute::Spread => "*".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let origin = if from_pending_tags { "queue" } else { "parser" };
+        let message = format!(
+            "tagtrace: frame={} fetch[{origin}] {} line={} label={} tag={} attrs=[{}]",
+            self.trace_frame,
+            parser.cur_storage().unwrap_or_default(),
+            tag.location.line,
+            parser.cur_label().unwrap_or_default(),
+            tag.tagname,
+            attributes,
+        );
+        runtime.host_mut().trace(TraceCategory::Kag, &message);
+    }
+
+    /// The dispatch half of [`Self::trace_tag_dispatch`]: which project handler
+    /// received the tag and which conductor step it answered with.
+    fn trace_tag_handler(
+        &self,
+        runtime: &mut Runtime<KrkrHost>,
+        tag: &Tag,
+        handler: &str,
+        value: &Variant,
+    ) {
+        if !runtime.host().trace_enabled(TraceCategory::Kag) || !kag_tag_trace_wanted(&tag.tagname)
+        {
+            return;
+        }
+        let message = format!(
+            "tagtrace: frame={} handler[{handler}] tag={} step={}",
+            self.trace_frame,
+            tag.tagname,
+            kag_trace_variant(value),
+        );
+        runtime.host_mut().trace(TraceCategory::Kag, &message);
     }
 
     fn process_tag(
@@ -3574,6 +3653,7 @@ impl KagSession {
                     "onTag",
                     vec![Variant::Object(tag_object)],
                 )?;
+                self.trace_tag_handler(runtime, tag, "onTag", &value);
                 return self.apply_tjs_handler_step(tag.clone(), value).map(Some);
             }
 
@@ -3615,10 +3695,12 @@ impl KagSession {
                         tag.tagname, value
                     ));
                 }
+                self.trace_tag_handler(runtime, tag, "onUnknownTag", &value);
                 return self.apply_tjs_handler_step(tag.clone(), value).map(Some);
             }
         }
 
+        self.trace_tag_handler(runtime, tag, "native", &Variant::Void);
         Ok(None)
     }
 
@@ -4750,6 +4832,51 @@ impl NativeFallbackTag {
 }
 
 const TJS_NATIVE_FALLBACK_STEP: i64 = -1_000_000;
+
+/// `KRKR_KAG_TAG_TRACE` narrows the tag-dispatch trace to the named tags
+/// (comma-separated, case-insensitive); unset or empty traces every tag.
+pub(crate) fn kag_tag_trace_wanted(tagname: &str) -> bool {
+    static FILTER: OnceLock<Vec<String>> = OnceLock::new();
+    let filter = FILTER.get_or_init(|| {
+        std::env::var("KRKR_KAG_TAG_TRACE")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|name| name.trim().to_ascii_lowercase())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    filter.is_empty() || filter.iter().any(|name| name.eq_ignore_ascii_case(tagname))
+}
+
+fn kag_trace_attr_value(value: &AttributeValue) -> String {
+    match value {
+        AttributeValue::Literal(text) => kag_trace_truncate(text),
+        AttributeValue::Expression(expression) => format!("&{}", kag_trace_truncate(expression)),
+        AttributeValue::MacroArgument(argument) => format!("%{}", kag_trace_truncate(argument)),
+        AttributeValue::Void => "<void>".to_string(),
+    }
+}
+
+fn kag_trace_variant(value: &Variant) -> String {
+    match value {
+        Variant::Void => "<void>".to_string(),
+        Variant::String(text) => kag_trace_truncate(text),
+        other => format!("{other:?}"),
+    }
+}
+
+fn kag_trace_truncate(text: &str) -> String {
+    const LIMIT: usize = 48;
+    if text.chars().count() <= LIMIT {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(LIMIT).collect();
+    truncated.push('…');
+    truncated
+}
 
 fn push_unique_handler(candidates: &mut Vec<ObjectHandle>, handler: Option<ObjectHandle>) {
     let Some(handler) = handler else {

@@ -364,7 +364,8 @@ fn kag_get_next_tag(
             if matches!(
                 tag.tagname.as_str(),
                 "syshook" | "sysjump" | "addSysHook" | "addSysScript"
-            ) {
+            ) || crate::engine::kag_tag_trace_wanted(&tag.tagname)
+            {
                 host.vm.runtime_mut().host_mut().log(&format!(
                     "KAG getNextTag -> `{}` attrs={:?}",
                     tag.tagname, tag.attributes
