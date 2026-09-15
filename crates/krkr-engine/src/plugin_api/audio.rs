@@ -26,7 +26,9 @@
 //! **When the source is missing.** A host with no audio backend (the browser
 //! shells, `--virtual-audio`, a test that never installs one) has no tap, so
 //! [`read_wave_pcm_window`] answers `None` and every consumer returns the
-//! reference's not-playing value instead of inventing samples.  That is the
+//! reference's not-playing value instead of inventing samples.  The web shell
+//! is that host even though its dependency graph now carries `krkr-audio`:
+//! no `AudioSystem` is installed there, so nothing publishes a tap.  That is the
 //! same answer the reference gives for a buffer that is not playing; it is not
 //! a lie about a playing one — [`WavePcmSource`] is the only sample source this
 //! engine has, and a plugin that needs different samples installs its own.

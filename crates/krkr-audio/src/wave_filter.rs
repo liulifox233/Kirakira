@@ -91,11 +91,13 @@ pub trait WaveFilter: Send + Sync {
     /// Attaches the filter to a source of `spec` samples — the reference's
     /// `Recreate`, which answers the format the next stage sees.
     ///
-    /// The returned format is folded into the chain, but only its sample rate
-    /// reaches the port's filters: the render path is stereo end to end, so a
-    /// filter that answers a different channel count is refused by
-    /// [`WaveFilterChain::build`] and reported (the reference would hand the
-    /// narrower format on).  An `Err` is the reference's refusal to connect —
+    /// The returned format is folded into the chain, and it has to be the one
+    /// the filter was connected with: this port's render path is fixed (stereo
+    /// at the sound's own rate — the filters re-design themselves at connect
+    /// time instead of resampling), so a filter that answers a different
+    /// sample rate or channel count is refused by [`WaveFilterChain::build`],
+    /// released, and reported (the reference would hand the narrower format
+    /// on).  An `Err` is the reference's refusal to connect —
     /// the shipped `wfBasicEffect.dll` throws `HiRes format not supported.`
     /// for a format wider than 32 bits or with more than four channels, and
     /// `Cannot connect multiple wave sound buffer at once.` when a second
@@ -228,24 +230,38 @@ impl WaveFilterChain {
                 continue;
             };
             match filter.recreate(current) {
-                Ok(next) if next.channels == current.channels => {
+                Ok(next) if next == current => {
                     current = next;
                     filters.push(filter);
                 }
-                // The render path is two channels all the way down (kira's
-                // `Frame` is a stereo pair and the decoder publishes stereo
-                // units), so a filter that asks for a different channel count
-                // cannot be honoured.  The reference would resample the format
-                // through its own buffer; refusing is the honest answer here,
-                // and the refusal is reported like any other.
-                Ok(next) => skipped.push(WaveFilterSkip {
-                    id: *id,
-                    reason: format!(
-                        "cannot change the channel count ({} -> {})",
-                        current.channels, next.channels
-                    ),
-                }),
-                Err(reason) => skipped.push(WaveFilterSkip { id: *id, reason }),
+                // The render path is fixed: two channels (kira's `Frame` is a
+                // stereo pair and the decoder publishes stereo units) at the
+                // sound's own rate.  The reference would resample the format
+                // through its own buffer and hand the narrower one on; here a
+                // filter that answers a different format is refused, and the
+                // refusal names which half changed.
+                Ok(next) => {
+                    // `recreate` connected the filter and may hold what that
+                    // claims (the one-source rule): a filter the chain leaves
+                    // out is released, or the claim leaks and the element can
+                    // never join a chain again — and the next failure would
+                    // blame the one-source rule instead of the format.
+                    filter.clear();
+                    skipped.push(WaveFilterSkip {
+                        id: *id,
+                        reason: format!(
+                            "cannot change the connected format \
+                             ({} Hz {}ch -> {} Hz {}ch)",
+                            current.sample_rate, current.channels, next.sample_rate, next.channels
+                        ),
+                    });
+                }
+                Err(reason) => {
+                    // Same release: a filter that refuses may still hold what
+                    // its `recreate` claimed.
+                    filter.clear();
+                    skipped.push(WaveFilterSkip { id: *id, reason });
+                }
             }
         }
         (
@@ -260,12 +276,13 @@ impl WaveFilterChain {
     /// The format the chain connected with — the reference reads
     /// `FilterOutput->GetFormat()` here (`sound/win32/WaveImpl.cpp:2938`).
     ///
-    /// A filter may narrow the sample rate it was connected with (the port's
-    /// filters re-design themselves at [`WaveFilter::recreate`] time rather
-    /// than resampling), but the channel count is the sound's: the render path
-    /// is stereo end to end, so a filter that asks for another channel count
-    /// is refused at build time and reported in [`WaveFilterChain::build`]'s
-    /// skips.
+    /// This port's render path is fixed (stereo at the sound's own rate: the
+    /// decoder hands the buffer stereo units and kira resamples for the
+    /// device), and a filter cannot resample inside the chain, so the value is
+    /// always the sound's format: a filter that answers a different one is
+    /// refused at build time — [`WaveFilterChain::build`] releases it and
+    /// reports the refusal in its skips — where the reference would accept the
+    /// narrower format and resample.
     pub const fn spec(&self) -> PcmAudioSpec {
         self.spec
     }
@@ -529,12 +546,13 @@ mod tests {
         unregister_wave_filter(accepting_id);
     }
 
-    /// A filter that answers a different *channel* count than it was connected
-    /// with is refused: the render path is stereo end to end, so the format
-    /// folding stops at the sample rate (see [`WaveFilterChain::spec`]), and
-    /// the refusal is reported rather than silently ignored.
+    /// A filter that answers a different format than it was connected with is
+    /// refused: the render path is fixed (stereo at the sound's rate), so
+    /// [`WaveFilterChain::spec`] always reports the sound's format and the
+    /// refusal is reported rather than silently ignored — for either half of
+    /// the format.
     #[test]
-    fn a_filter_changing_the_channel_count_is_refused_and_reported() {
+    fn a_filter_changing_the_format_is_refused_and_reported() {
         struct ToMono;
 
         impl WaveFilter for ToMono {
@@ -554,15 +572,91 @@ mod tests {
             }
         }
 
-        let id = register_wave_filter(Arc::new(ToMono));
+        struct HalfRate;
+
+        impl WaveFilter for HalfRate {
+            fn recreate(&self, spec: PcmAudioSpec) -> std::result::Result<PcmAudioSpec, String> {
+                Ok(PcmAudioSpec {
+                    sample_rate: spec.sample_rate / 2,
+                    channels: spec.channels,
+                })
+            }
+            fn clear(&self) {}
+            fn update(&self) {}
+            fn reset(&self) {}
+            fn process(&self, _frames: &mut [f32]) {}
+        }
+
+        let to_mono = register_wave_filter(Arc::new(ToMono));
+        let half_rate = register_wave_filter(Arc::new(HalfRate));
+        for (id, changed) in [(to_mono, "ch"), (half_rate, "Hz")] {
+            let (chain, skipped) = WaveFilterChain::build(&[id.raw()], spec());
+            assert!(chain.is_empty(), "the changing filter must not join");
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].id, id.raw());
+            assert!(
+                skipped[0].reason.contains(changed),
+                "the reason names what changed ({changed}): {:?}",
+                skipped[0].reason
+            );
+            unregister_wave_filter(id);
+        }
+    }
+
+    /// The chain releases a filter it refuses.  A filter takes its one-source
+    /// claim inside `recreate` and releases it in `clear`; without the release
+    /// a refused filter would stay claimed for the rest of the process — it
+    /// could never join a chain again, and the next attempt would be reported
+    /// as the one-source rule instead of the format.
+    #[test]
+    fn a_filter_the_chain_refuses_is_released() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ClaimingMono {
+            connected: AtomicBool,
+        }
+
+        impl WaveFilter for ClaimingMono {
+            fn recreate(&self, spec: PcmAudioSpec) -> std::result::Result<PcmAudioSpec, String> {
+                if self.connected.swap(true, Ordering::SeqCst) {
+                    return Err("Cannot connect multiple wave sound buffer at once.".to_string());
+                }
+                Ok(PcmAudioSpec {
+                    sample_rate: spec.sample_rate,
+                    channels: 1,
+                })
+            }
+            fn clear(&self) {
+                self.connected.store(false, Ordering::SeqCst);
+            }
+            fn update(&self) {}
+            fn reset(&self) {}
+            fn process(&self, _frames: &mut [f32]) {}
+        }
+
+        let filter = Arc::new(ClaimingMono {
+            connected: AtomicBool::new(false),
+        });
+        let id = register_wave_filter(Arc::clone(&filter) as Arc<dyn WaveFilter>);
+
         let (chain, skipped) = WaveFilterChain::build(&[id.raw()], spec());
-        assert!(chain.is_empty(), "the narrowing filter must not join");
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].id, id.raw());
+        assert!(chain.is_empty());
         assert!(
-            skipped[0].reason.contains("channel count"),
-            "the reason names the refusal: {:?}",
-            skipped[0].reason
+            skipped[0].reason.contains("format"),
+            "the first refusal is the format: {skipped:?}"
+        );
+        assert!(
+            !filter.connected.load(Ordering::SeqCst),
+            "the refused filter must be released"
+        );
+
+        // The second attempt fails for the same reason — a leaked claim would
+        // answer the one-source rule here.
+        let (chain, skipped) = WaveFilterChain::build(&[id.raw()], spec());
+        assert!(chain.is_empty());
+        assert!(
+            skipped[0].reason.contains("format"),
+            "a leaked claim would blame the one-source rule: {skipped:?}"
         );
         unregister_wave_filter(id);
     }
