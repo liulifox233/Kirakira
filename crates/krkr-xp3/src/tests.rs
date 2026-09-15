@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -16,7 +16,7 @@ use krkr_core::StoragePort;
 use crate::{
     SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3ContentFilterAction, Xp3Entry, Xp3Error,
     Xp3ExtractionFilterInfo, Xp3FilterContext, Xp3FilterRegistry, Xp3OpenOptions,
-    Xp3ResourceProvider, normalize_entry_name,
+    Xp3ResourceProvider, archive_qualifier_is_absolute, normalize_entry_name,
     parse::{XP3_INDEX_CONTINUE, XP3_INDEX_ENCODE_RAW, XP3_INDEX_ENCODE_ZLIB, parse_index},
 };
 
@@ -438,16 +438,66 @@ fn per_archive_probe_open(archives: &[Xp3Archive<File>], path: &str) -> Option<(
 
 /// Mirrors `Xp3ResourceProvider::archive_index`, which the probe hoist does
 /// not touch: the reference walk has to visit the mount the provider resolved.
-fn reference_archive_index(names: &[String], archive: &str) -> Option<usize> {
-    let wanted = archive
-        .replace('\\', "/")
-        .rsplit('/')
-        .next()?
-        .to_ascii_lowercase();
-    if wanted.is_empty() {
+///
+/// A qualifier is a storage path, not a file name — `TVPRebuildAutoPathTable`
+/// reads the archive at the spelling before `>` (`StorageIntf.cpp:1055-1066`)
+/// and `_TVPCreateStream` opens exactly that file (`:1249-1260`) — so an
+/// absolute qualifier matches a mount's path, a relative path with a directory
+/// matches a mount's path below `base`, and a bare name matches the mount
+/// directly below `base` before falling back to a file-name match.
+///
+/// "Absolute" here is [`archive_qualifier_is_absolute`], the classifier the
+/// provider itself decides with. This mirror states the *matching*, not the
+/// classification, so sharing the classifier keeps the two from drifting
+/// apart — an independent re-spelling of "starts with `/`" would have quietly
+/// kept mirroring the rule from before a Windows drive path was understood to
+/// be absolute, which is exactly what happened once.
+fn reference_archive_index(base: &Path, paths: &[&PathBuf], archive: &str) -> Option<usize> {
+    fn normalize(path: &str) -> String {
+        let folded = path.replace('\\', "/");
+        let absolute = folded.starts_with('/');
+        let body = folded
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect::<Vec<_>>()
+            .join("/")
+            .to_ascii_lowercase();
+        if absolute { format!("/{body}") } else { body }
+    }
+
+    let query = normalize(archive.strip_prefix("file://").unwrap_or(archive));
+    if query.is_empty() {
         return None;
     }
-    names.iter().rposition(|name| name.as_str() == wanted)
+    let mounts = paths
+        .iter()
+        .map(|path| {
+            let logical = if path.is_relative() {
+                Some(normalize(&path.to_string_lossy()))
+            } else {
+                path.strip_prefix(base)
+                    .ok()
+                    .map(|relative| normalize(&relative.to_string_lossy()))
+            };
+            (logical, normalize(&path.to_string_lossy()))
+        })
+        .collect::<Vec<_>>();
+    if archive_qualifier_is_absolute(&query) {
+        return mounts.iter().rposition(|(_, path)| path == &query);
+    }
+    if query.contains('/') {
+        return mounts
+            .iter()
+            .rposition(|(logical, _)| logical.as_deref() == Some(query.as_str()));
+    }
+    mounts
+        .iter()
+        .rposition(|(logical, _)| logical.as_deref() == Some(query.as_str()))
+        .or_else(|| {
+            mounts
+                .iter()
+                .rposition(|(_, path)| path.rsplit('/').next().is_some_and(|name| name == query))
+        })
 }
 
 /// The pre-change lookup inside one named archive: normalize once and let the
@@ -598,18 +648,16 @@ fn hoisted_probe_lookups_agree_with_per_archive_normalization() {
     )
     .expect("write extra archive");
 
-    let provider = Xp3ResourceProvider::open_archives([&data_path, &patch_path, &extra_path])
-        .expect("open provider");
+    // Opened below the fixture root so a qualifier's own spelling is what picks
+    // a mount (`sys/extra.xp3` below this root names no mount).
+    let provider =
+        Xp3ResourceProvider::open_archives_below(&root, [&data_path, &patch_path, &extra_path])
+            .expect("open provider");
     let reference = [&data_path, &patch_path, &extra_path].map(|path| {
         Xp3Archive::open_file(path)
             .unwrap_or_else(|error| panic!("open reference {path:?}: {error}"))
     });
-    let names = [&data_path, &patch_path, &extra_path].map(|path| {
-        path.file_name()
-            .expect("fixture file name")
-            .to_string_lossy()
-            .to_ascii_lowercase()
-    });
+    let mounts = [&data_path, &patch_path, &extra_path];
 
     // Name shapes the two resolvers can receive: stored spellings, ASCII case
     // variants (including one the ASCII-only fold cannot reach), an
@@ -683,11 +731,25 @@ fn hoisted_probe_lookups_agree_with_per_archive_normalization() {
         "data.xp3",
         "patch.xp3",
         "PATCH.XP3",
+        "extra.xp3",
+        r".\extra.xp3",
         r"sys\extra.xp3",
+        "sys/extra.xp3",
         "missing.xp3",
+        // Absolute spellings, including the ones only a Windows host would
+        // produce (`System.exePath` + the declared name): the mirror and the
+        // provider must agree about them on this host too, and both ask the
+        // classifier rather than a host's `Path` rules.
+        "/srv/game/extra.xp3",
+        r"\srv\game\extra.xp3",
+        "C:/game/extra.xp3",
+        r"C:\game\extra.xp3",
+        "c:extra.xp3",
+        "//server/share/extra.xp3",
+        r"\\server\share\extra.xp3",
     ] {
         for probe in PROBES {
-            let reference_entry = reference_archive_index(&names, archive_name)
+            let reference_entry = reference_archive_index(&root, &mounts, archive_name)
                 .and_then(|index| per_archive_probe_entry_in(&reference, index, probe).cloned());
             assert_eq!(
                 provider.get_entry_in(archive_name, probe).cloned(),
@@ -696,6 +758,34 @@ fn hoisted_probe_lookups_agree_with_per_archive_normalization() {
             );
         }
     }
+
+    // A qualifier that carries a directory names the mount at that path, so a
+    // directory this fixture does not mount resolves nothing — `sys/extra.xp3`
+    // is not the `extra.xp3` the provider holds (`TVPRebuildAutoPathTable`
+    // reads the archive at the spelling before `>`, `StorageIntf.cpp:1060`,
+    // and `_TVPCreateStream` opens exactly that file, `:1249-1260`).
+    assert!(
+        provider
+            .get_entry_in(r"sys\extra.xp3", "only-extra.ks")
+            .is_none()
+    );
+    assert!(
+        provider
+            .get_entry_in("sys/extra.xp3", "only-extra.ks")
+            .is_none()
+    );
+    assert!(
+        provider
+            .get_entry_in("/elsewhere/extra.xp3", "only-extra.ks")
+            .is_none()
+    );
+    assert!(provider.open_in("sys/extra.xp3", "only-extra.ks").is_err());
+    assert_eq!(
+        provider
+            .get_entry_in("extra.xp3", "only-extra.ks")
+            .map(|entry| entry.name.as_str()),
+        Some("only-extra.ks")
+    );
 
     // Concrete answers the differential helpers share too little code with to
     // prove on their own. The newest mount is searched first; inside one mount
@@ -729,6 +819,177 @@ fn hoisted_probe_lookups_agree_with_per_archive_normalization() {
     assert_eq!(pinned_bytes, b"patch");
 
     fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+/// Reads the bytes one named mount serves for a member, `None` when either the
+/// mount or the member is not there.
+fn read_pinned_entry(
+    provider: &Xp3ResourceProvider,
+    archive: &str,
+    member: &str,
+) -> Option<Vec<u8>> {
+    let mut stream = provider.open_in(archive, member).ok()?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Two mounted archives that share a file name in different directories. The
+/// reference resolves an `archive.xp3>` qualifier as the storage path it
+/// spells — `TVPRebuildAutoPathTable` reads the archive at the part before `>`
+/// (`StorageIntf.cpp:1055-1066`) and `_TVPCreateStream` opens exactly that file
+/// (`:1249-1260`) — so `sys/x.xp3` is the archive below `sys/`, never the root
+/// file that happens to share its name.
+#[test]
+fn archive_qualifier_names_the_mount_its_path_spells() {
+    let root = temp_root("qualifier");
+    fs::create_dir_all(root.join("sys")).expect("create sys dir");
+    let sys_path = root.join("sys/x.xp3");
+    let root_path = root.join("x.xp3");
+    fs::write(
+        &sys_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "dup.bin",
+                    segments: vec![FixtureSegment::raw(b"from-sys")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "sys_only.bin",
+                    segments: vec![FixtureSegment::raw(b"sys-only")],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write sys archive");
+    fs::write(
+        &root_path,
+        build_archive(
+            &[
+                FixtureEntry {
+                    name: "dup.bin",
+                    segments: vec![FixtureSegment::raw(b"from-root")],
+                    hash: 0,
+                    time: None,
+                },
+                FixtureEntry {
+                    name: "root_only.bin",
+                    segments: vec![FixtureSegment::raw(b"root-only")],
+                    hash: 0,
+                    time: None,
+                },
+            ],
+            BuildOptions::default(),
+        ),
+    )
+    .expect("write root archive");
+
+    // The mount list is the project's: `sys/*.xp3` first, then the root's, so
+    // a name-only walk would end at the root archive.
+    let provider = Xp3ResourceProvider::open_archives_below(&root, [&sys_path, &root_path])
+        .expect("open provider");
+    let sys_bytes = Some(b"from-sys".to_vec());
+    let root_bytes = Some(b"from-root".to_vec());
+
+    // The declared directory decides, in every spelling of the same path.
+    assert_eq!(
+        read_pinned_entry(&provider, "sys/x.xp3", "dup.bin"),
+        sys_bytes
+    );
+    assert_eq!(
+        read_pinned_entry(&provider, r"sys\x.xp3", "dup.bin"),
+        sys_bytes
+    );
+    assert_eq!(
+        read_pinned_entry(&provider, "SYS/X.XP3", "dup.bin"),
+        sys_bytes
+    );
+    assert_eq!(
+        read_pinned_entry(&provider, &sys_path.to_string_lossy(), "dup.bin"),
+        sys_bytes
+    );
+    assert_eq!(
+        read_pinned_entry(&provider, "sys/x.xp3", "sys_only.bin"),
+        Some(b"sys-only".to_vec())
+    );
+
+    // A bare name is the file in the root directory, which is the later mount.
+    assert_eq!(read_pinned_entry(&provider, "x.xp3", "dup.bin"), root_bytes);
+    assert_eq!(
+        read_pinned_entry(&provider, "x.xp3", "root_only.bin"),
+        Some(b"root-only".to_vec())
+    );
+    assert_eq!(read_pinned_entry(&provider, "x.xp3", "sys_only.bin"), None);
+
+    // A directory no mount lives in resolves nothing: the archive named does
+    // not exist, and a same-named file elsewhere is a different archive.
+    assert_eq!(read_pinned_entry(&provider, "other/x.xp3", "dup.bin"), None);
+    assert_eq!(
+        read_pinned_entry(&provider, "/elsewhere/x.xp3", "dup.bin"),
+        None
+    );
+    // A Windows-shaped absolute qualifier is absolute on this host too, so it
+    // can never fall back to a same-named mount: the pre-fix file-name walk
+    // served the root `x.xp3` for `C:/game/x.xp3`.
+    assert_eq!(
+        read_pinned_entry(&provider, "C:/game/x.xp3", "dup.bin"),
+        None
+    );
+    assert_eq!(
+        read_pinned_entry(&provider, r"C:\game\x.xp3", "dup.bin"),
+        None
+    );
+
+    fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+/// The classifier both halves of the qualified-name rule call. It has to answer
+/// the same way on every host — a Windows declaration must not become a
+/// relative path merely because the engine runs on Unix — so the table is
+/// pinned here, on a Unix host, including the drive and UNC spellings a Windows
+/// build would see (`System.exePath` in KAG3's `Initialize.tjs:48-53`) and the
+/// backslash spellings ZIP-style launchers use.
+#[test]
+fn archive_qualifiers_classify_absoluteness_on_any_host() {
+    for absolute in [
+        "/x.xp3",
+        "/root/sys/x.xp3",
+        "/",
+        r"\x.xp3",
+        r"\root\sys\x.xp3",
+        "C:/game/x.xp3",
+        r"C:\game\x.xp3",
+        "c:/game/x.xp3",
+        "Z:/x.xp3",
+        "//server/share/x.xp3",
+        r"\\server\share\x.xp3",
+    ] {
+        assert!(
+            archive_qualifier_is_absolute(absolute),
+            "{absolute:?} names an absolute storage path"
+        );
+    }
+    for relative in [
+        "",
+        "x.xp3",
+        "sub/x.xp3",
+        r"sub\x.xp3",
+        "./x.xp3",
+        ".\\x.xp3",
+        "C:x.xp3",
+        "1:/x.xp3",
+        "file://./x.xp3",
+    ] {
+        assert!(
+            !archive_qualifier_is_absolute(relative),
+            "{relative:?} names a relative storage path"
+        );
+    }
 }
 
 #[test]

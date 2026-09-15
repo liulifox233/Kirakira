@@ -16,7 +16,7 @@ use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use krkr_core::{ResourceData, ResourceDataSource, ResourceStream, StoragePort, Xp3FilterRegistry};
 use krkr_tjs2::{Result, TjsError};
-use krkr_xp3::Xp3ResourceProvider;
+use krkr_xp3::{Xp3ResourceProvider, archive_qualifier_is_absolute};
 use memmap2::{Mmap, MmapOptions};
 
 use crate::media::{FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name};
@@ -2636,7 +2636,7 @@ fn storage_candidate_groups(
     let names = storage_lookup_names(name, kind)?;
     let mut groups = Vec::with_capacity(names.len());
     for name in names {
-        let clean = clean_relative_path(&name)?;
+        let clean = clean_lookup_name(&name)?;
         let mut candidates = Vec::with_capacity(auto_paths.len() + 1);
         push_unique_storage_candidate(&mut candidates, &clean);
         for auto_path in auto_paths.iter().rev() {
@@ -2655,7 +2655,7 @@ fn exact_storage_candidates_with_auto_paths(
     media_table: &MediaAutoPathTable,
 ) -> Result<Vec<String>> {
     let normalized = normalize_storage_separators(name);
-    let clean = clean_relative_path(&normalized)?;
+    let clean = clean_lookup_name(&normalized)?;
     let mut candidates = Vec::with_capacity(auto_paths.len() + 1);
     push_unique_storage_candidate(&mut candidates, &clean);
     for auto_path in auto_paths.iter().rev() {
@@ -2701,14 +2701,29 @@ fn auto_path_candidates(
     }
 }
 
-/// Returns the archive file name of an `.../archive.xp3>prefix` auto path.
+/// Returns the archive path of an `.../archive.xp3>prefix` auto path, spelled
+/// the way the auto path declared it.
+///
+/// The reference keeps the declared path whole: `TVPAddAutoPath` stores the
+/// normalized auto path (`StorageIntf.cpp:999-1015`), `TVPRebuildAutoPathTable`
+/// splits it at `>` and reads the archive at the part before it (`:1055-1105`,
+/// `:1060`, `:1066`), and `TVPGetPlacedPath` returns that spelling with the
+/// requested storage name appended (`:1189`). `_TVPCreateStream` then hands the
+/// same leading part to `TVPArchiveCache::Get` (`:1249-1260`), whose
+/// `TVPIsExistentStorageNoSearch` probe and `TVPOpenArchive` take the storage
+/// path as it stands (`:757-780`, `:799-830`). A declared directory is
+/// therefore part of the archive's identity; dropping it to the file name
+/// would let `sys/image.xp3>` name any other mounted `image.xp3`.
 fn auto_path_archive(auto_path: &str) -> Option<String> {
-    let path = normalize_storage_separators(auto_path);
-    let (outer, _) = path.split_once('>')?;
+    let normalized = normalize_storage_name(auto_path).ok()?;
+    let (outer, _) = normalized.split_once('>')?;
+    if outer.is_empty() {
+        return None;
+    }
     let name = outer.rsplit('/').next()?;
     name.rsplit_once('.')
         .filter(|(_, extension)| extension.eq_ignore_ascii_case("xp3"))
-        .map(|_| name.to_string())
+        .map(|_| outer.to_string())
 }
 
 /// Splits a candidate produced from an archive-scoped auto path.
@@ -2799,7 +2814,7 @@ const STORAGE_EXTENSIONS: [&str; 14] = [
 /// reach `PageBreak.png` and never the `PageBreak.asd` sidecar.
 fn storage_lookup_names(name: &str, kind: StorageLoadKind) -> Result<Vec<String>> {
     let name = normalize_storage_separators(name);
-    clean_relative_path(&name)?;
+    clean_lookup_name(&name)?;
     let path = Path::new(&name);
     if path
         .extension()
@@ -3238,7 +3253,11 @@ pub(crate) fn open_project_archives(root: &Path) -> Result<Option<Xp3ResourcePro
     if archives.is_empty() {
         return Ok(None);
     }
-    Xp3ResourceProvider::open_archives(archives)
+    // The root is handed to the provider because an `archive.xp3>` auto path
+    // declares a storage path, not a file name: `sys/data.xp3>` has to reach
+    // the mount at `<root>/sys/data.xp3` even when `<root>/data.xp3` exists
+    // too (`Xp3ResourceProvider::archive_index`).
+    Xp3ResourceProvider::open_archives_below(root, archives)
         .map(Some)
         .map_err(|error| TjsError::runtime(format!("failed to open XP3 archives: {error}")))
 }
@@ -3265,6 +3284,33 @@ fn xp3_files_in_directory(root: &Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     archives.sort();
     archives
+}
+
+/// One lookup spelling, cleaned for the candidate walk. An
+/// `archive.xp3>member` name whose archive part is absolute keeps that
+/// spelling: the reference splits a storage name at `>` before it does any
+/// path work (`TVPIsExistentStorageNoSearchNoNormalize`, `StorageIntf.cpp:804-830`)
+/// and opens the archive at exactly that storage path, so
+/// `System.exePath + "patch.xp3>" + member` — the spelling KAG3's
+/// `Initialize.tjs:52-53` declares and `TVPGetPlacedPath` hands back
+/// (`:1189`) — is a valid name. Every other spelling stays a project-relative
+/// path, and the in-archive part is still compacted by
+/// [`normalize_storage_name`] the way the reference compacts it
+/// (`:400-453`).
+///
+/// Absoluteness is [`archive_qualifier_is_absolute`], the same classifier the
+/// provider's mount match uses: the two halves of one rule must agree about a
+/// spelling on every host, and `Path::is_absolute` would disagree about a
+/// Windows drive path between a Unix and a Windows build.
+#[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
+fn clean_lookup_name(name: &str) -> Result<PathBuf> {
+    let absolute_archive = name
+        .split_once('>')
+        .is_some_and(|(archive, _)| archive_qualifier_is_absolute(archive));
+    if absolute_archive {
+        return normalize_storage_name(name).map(PathBuf::from);
+    }
+    clean_relative_path(name)
 }
 
 pub(crate) fn clean_relative_path(path: &str) -> Result<PathBuf> {
@@ -3667,6 +3713,27 @@ mod tests {
         root
     }
 
+    /// Two archives that share a file name in different directories: one below
+    /// `sys/` and one at the root, both holding `dup.bin`, plus one member only
+    /// each. The mount list is `sys/*.xp3` first, then the root's
+    /// (`project_archive_paths`), so a name-only lookup falls back to the root
+    /// copy and any other outcome comes from an archive-qualified auto path.
+    fn project_with_shadowed_archive_name(prefix: &str) -> PathBuf {
+        let root = temp_root(prefix);
+        fs::create_dir_all(root.join("sys")).expect("create sys");
+        fs::write(
+            root.join("sys/x.xp3"),
+            build_xp3_archive(&[("dup.bin", b"from-sys"), ("sys-only.bin", b"sys-only")]),
+        )
+        .expect("write sys/x.xp3");
+        fs::write(
+            root.join("x.xp3"),
+            build_xp3_archive(&[("dup.bin", b"from-root"), ("root-only.bin", b"root-only")]),
+        )
+        .expect("write x.xp3");
+        root
+    }
+
     /// Ground truth, krkrz `TVPGetPlacedPath` (`StorageIntf.cpp:1164-1195`):
     /// the current folder is probed first, then the auto path table by
     /// basename. `TVPAddAutoPath` appends to `TVPAutoPathList`
@@ -3811,6 +3878,143 @@ mod tests {
             storage.resolved_storage_name("z-only.bin").as_deref(),
             Some("z.xp3>z-only.bin")
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// An `archive.xp3>` auto path names the archive the *path* addresses, not
+    /// every mounted file that shares its name. The reference keeps the
+    /// declared path whole — `TVPAddAutoPath` stores the normalized auto path
+    /// (`StorageIntf.cpp:999-1015`), `TVPRebuildAutoPathTable` reads the
+    /// archive at the part before `>` (`:1055-1066`) and `TVPGetPlacedPath`
+    /// returns that spelling with the request's name appended (`:1189`), which
+    /// `_TVPCreateStream` opens as one exact file (`:1249-1260`) — so
+    /// `sys/x.xp3>` reads `sys/x.xp3` even when a root `x.xp3` is mounted after
+    /// it and holds the same member.
+    #[test]
+    fn qualified_auto_path_selects_the_archive_its_path_names() {
+        let root = project_with_shadowed_archive_name("qualified-sys");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+        storage.add_auto_path("sys/x.xp3>");
+
+        assert_eq!(
+            storage
+                .read_binary_vec("dup.bin")
+                .expect("declared archive"),
+            b"from-sys".as_slice()
+        );
+        assert_eq!(
+            storage.resolved_storage_name("dup.bin").as_deref(),
+            Some("sys/x.xp3>dup.bin")
+        );
+        // The other archive still serves what only it holds, through the
+        // engine's mount-wide scan.
+        assert_eq!(
+            storage
+                .read_binary_vec("root-only.bin")
+                .expect("root member"),
+            b"root-only".as_slice()
+        );
+        assert_eq!(
+            storage.read_binary_vec("sys-only.bin").expect("sys member"),
+            b"sys-only".as_slice()
+        );
+
+        // The same path spelled the way KAG3's `Initialize.tjs` declares it:
+        // `System.exePath + "sys/x.xp3>"` is the fixture root plus the name.
+        let absolute = ProjectStorage::for_root(&root).expect("storage");
+        absolute.add_auto_path(&format!("{}>", root.join("sys/x.xp3").display()));
+        assert_eq!(
+            absolute.read_binary_vec("dup.bin").expect("absolute"),
+            b"from-sys".as_slice()
+        );
+        // Its placed name is a storage name like any other: reading it back
+        // resolves the same mount (`TVPGetPlacedPath` hands the declared
+        // spelling out, `StorageIntf.cpp:1189`, and every storage API takes it
+        // again).
+        assert_eq!(
+            absolute.resolved_storage_name("dup.bin").as_deref(),
+            Some(format!("{}>dup.bin", root.join("sys/x.xp3").display()).as_str())
+        );
+        let placed = absolute
+            .resolved_storage_name("dup.bin")
+            .expect("placed name");
+        assert_eq!(
+            absolute.read_binary_vec(&placed).expect("round trip"),
+            b"from-sys".as_slice()
+        );
+
+        // A bare qualifier names the file in the root directory, which is the
+        // later mount — the answer this engine already gave.
+        let bare = ProjectStorage::for_root(&root).expect("storage");
+        bare.add_auto_path("x.xp3>");
+        assert_eq!(
+            bare.read_binary_vec("dup.bin").expect("root mount"),
+            b"from-root".as_slice()
+        );
+        assert_eq!(
+            bare.resolved_storage_name("dup.bin").as_deref(),
+            Some("x.xp3>dup.bin")
+        );
+
+        // A directory that names no mount pins nothing: the qualified
+        // candidate misses, and the member resolves the way an undeclared
+        // member does.
+        let elsewhere = ProjectStorage::for_root(&root).expect("storage");
+        elsewhere.add_auto_path("overlay/x.xp3>");
+        assert_eq!(
+            elsewhere.read_binary_vec("dup.bin").expect("mount-wide"),
+            b"from-root".as_slice()
+        );
+        assert_eq!(
+            elsewhere.resolved_storage_name("dup.bin").as_deref(),
+            Some("dup.bin")
+        );
+        assert!(elsewhere.read_binary_vec("overlay/x.xp3>dup.bin").is_err());
+        assert!(!elsewhere.storage_exists_exact("overlay/x.xp3>dup.bin"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// An archive-qualified name addresses exactly one mount, so an explicit
+    /// `archive.xp3>member` read follows the same rule — a wrong directory
+    /// fails instead of serving a same-named archive's bytes.
+    #[test]
+    fn explicit_archive_address_follows_the_declared_path() {
+        let root = project_with_shadowed_archive_name("qualified-explicit");
+        let storage = ProjectStorage::for_root(&root).expect("storage");
+
+        assert_eq!(
+            storage
+                .read_binary_vec("sys/x.xp3>dup.bin")
+                .expect("sys member"),
+            b"from-sys".as_slice()
+        );
+        assert_eq!(
+            storage
+                .read_binary_vec("x.xp3>dup.bin")
+                .expect("root member"),
+            b"from-root".as_slice()
+        );
+        // An absolute qualifier keeps its own spelling in the placed name, the
+        // way `TVPGetPlacedPath` returns the declared path with the request's
+        // name appended (`StorageIntf.cpp:1189`).
+        let absolute = format!("{}>dup.bin", root.join("sys/x.xp3").display());
+        assert_eq!(
+            storage.read_binary_vec(&absolute).expect("absolute member"),
+            b"from-sys".as_slice()
+        );
+        assert_eq!(
+            storage.resolved_storage_name(&absolute).as_deref(),
+            Some(absolute.as_str())
+        );
+        assert!(storage.read_binary_vec("other/x.xp3>dup.bin").is_err());
+        assert!(storage.read_binary_vec("sys/x.xp3>root-only.bin").is_err());
+        assert!(storage.read_binary_vec("x.xp3>sys-only.bin").is_err());
+        // A Windows drive spelling is absolute here too (`System.exePath` is a
+        // `C:\…` path on that host), so it is never reduced to a file name and
+        // can never serve the `x.xp3` this root happens to hold; the resolver
+        // half and this lookup half use the same classifier.
+        assert!(storage.read_binary_vec("C:/game/x.xp3>dup.bin").is_err());
+        assert!(storage.read_binary_vec(r"C:\game\x.xp3>dup.bin").is_err());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

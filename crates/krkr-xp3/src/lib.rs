@@ -27,7 +27,7 @@ pub use krkr_core::{
     Xp3FilterContext, Xp3FilterRegistry,
 };
 pub use options::{SegmentCacheConfig, Xp3OpenOptions};
-pub use provider::Xp3ResourceProvider;
+pub use provider::{Xp3ResourceProvider, archive_qualifier_is_absolute};
 pub use stream::Xp3EntryStream;
 pub use util::{Result, Xp3Error, normalize_entry_name};
 
