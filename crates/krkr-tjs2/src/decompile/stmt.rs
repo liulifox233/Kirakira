@@ -33,9 +33,10 @@ pub(crate) struct BodyOutput {
 }
 
 /// Builds a stable marker identifier for an unhandled fragment. The emitter
-/// post-process replaces `marker;` lines with `// <unhandled: reason>`
-/// comments; the sanitized reason is part of the identifier so the comment
-/// can name the unmatched pattern.
+/// post-process replaces the marker with an `<unhandled: reason>` comment
+/// (`//` where the marker is the whole line, `/* ... */` where it shares the
+/// line with code); the sanitized reason is part of the identifier so the
+/// comment can name the unmatched pattern.
 pub(crate) fn unhandled_marker(reason: &str) -> String {
     super::count_unhandled_fragment();
     let mut hash = 0xcbf2_9ce4_8422_2325u64;

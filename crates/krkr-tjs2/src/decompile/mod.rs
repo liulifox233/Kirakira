@@ -9,8 +9,9 @@
 //!
 //! The scanner is a forward dataflow pass keyed to the official compiler's
 //! emission patterns (see `stmt`); fragments no pattern covers yet are
-//! emitted as `// <unhandled: ...>` comments — decompilation never fails on
-//! unknown bytecode, it degrades.
+//! emitted as `<unhandled: ...>` comments (`//` where the marker is the whole
+//! line, `/* ... */` where it shares the line with code) — decompilation
+//! never fails on unknown bytecode, it degrades.
 
 mod control;
 mod emit;

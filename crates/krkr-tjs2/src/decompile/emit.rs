@@ -1,5 +1,9 @@
 //! Text emission: renders the reconstructed program and post-processes
-//! unhandled markers into `// <unhandled: ...>` comments.
+//! unhandled markers into comments — `// <unhandled: ...>` when the marker is
+//! the whole line, `/* <unhandled: ...> */` when it shares its line with code
+//! (bodies the printer renders inline). The identifier must not survive: it
+//! reads an undefined variable, so evaluating it throws `MemberNotFound`, and
+//! a `//` form on a shared line would comment out the code after the marker.
 
 use crate::frontend::printer::print_program;
 use crate::frontend::syntax::Program;
@@ -11,9 +15,11 @@ pub struct DecompileStats {
     /// Number of unhandled bytecode fragments (constructs no pattern covers).
     pub unhandled: usize,
     /// Number of dropped regions: reachable bytecode the walk abandoned,
-    /// marked in the output as `// <unhandled: dropped region ...>` with its
-    /// byte range. Counted apart from [`Self::unhandled`] so the pattern-gap
-    /// measure keeps its meaning (the fuzz corpus's completeness net).
+    /// marked in the output with its byte range as `// <unhandled: dropped
+    /// region ...>` (or `/* <unhandled: ...> */` where the marker shares its
+    /// line with code). Counted apart from [`Self::unhandled`] so the
+    /// pattern-gap measure keeps its meaning (the fuzz corpus's completeness
+    /// net).
     pub dropped_regions: usize,
 }
 
