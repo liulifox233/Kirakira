@@ -2950,9 +2950,13 @@ struct KagSession {
     clear_page_on_timer: bool,
     message_layer: MessageLayerModel,
     /// Frame counter for the tag-dispatch trace only (`trace_tag_dispatch`):
-    /// one increment per `run_until_yield_with_parser` call, i.e. per engine
-    /// frame, so the numbers line up with the debugger's per-frame
-    /// `--watch-expr`/`--kag-state` output.
+    /// one increment per `run_until_yield_with_parser` call, i.e. one per engine
+    /// frame, counted **from the frame the session started running** — not the
+    /// debugger's absolute frame index. A session created by the console's
+    /// `load` (or by `load_kag_scenario`) begins at its own frame 1 whatever
+    /// frame the host was at, so add that offset when comparing with
+    /// `--watch-expr`/`--kag-state` output (the probe of M240's row 1 loads at
+    /// host frame 1300 and reports the reading tag at session frame 21).
     trace_frame: u64,
 }
 
@@ -3525,6 +3529,10 @@ impl KagSession {
 
     /// The dispatch half of [`Self::trace_tag_dispatch`]: which project handler
     /// received the tag and which conductor step it answered with.
+    ///
+    /// Both halves print `self.trace_frame`, which counts *session* frames (see
+    /// [`Self::trace_frame`]); pair them with the host's own frame counter only
+    /// after adding the session's start offset.
     fn trace_tag_handler(
         &self,
         runtime: &mut Runtime<KrkrHost>,
@@ -4835,6 +4843,66 @@ const TJS_NATIVE_FALLBACK_STEP: i64 = -1_000_000;
 
 /// `KRKR_KAG_TAG_TRACE` narrows the tag-dispatch trace to the named tags
 /// (comma-separated, case-insensitive); unset or empty traces every tag.
+///
+/// The trace itself is enabled by the `kag` category of `KRKR_TRACE`
+/// (`KRKR_TRACE=kag`, or `all`) and covers both sides of a project's tag flow:
+///
+/// * the engine session's own loop (`KagSession::trace_tag_dispatch` /
+///   `trace_tag_handler` in `engine.rs`), which logs every tag it fetches or
+///   dequeues with its resolved attributes and the handler step it got back;
+/// * the native `KAGParser.getNextTag` (`native/kag.rs`), which is how a project
+///   that brings its own conductor (GINKA/PARQUET/少女世界的生存之道 and the KAGEX
+///   family generally) pulls its tags itself, so its fetches carry the same
+///   filter and would otherwise be invisible.
+///
+/// Worked example — M240's row-3 pin, which shows why GINKA's
+/// `[ev file=warning1 fade=300]` runs ~1 s instead of 300 ms. Everything below
+/// is reproducible on a GINKA scratch root; the numbers are from a 2026-09-16
+/// run of the tip that added this comment.
+///
+/// 1. The engine hands the tag over verbatim (this filter plus
+///    `logs -n 200 getNextTag`):
+///    ```text
+///    log: KAG getNextTag -> `ev` attrs=[Named { name: "file", value: Literal("warning1") },
+///                                        Named { name: "fade", value: Literal("300") }]
+///    ```
+/// 2. The episode really does run ~1 s while its neighbours run their own
+///    values: `--kag-state` shows the conductor's `waitall` at
+///    `custom.ks@*logo:170` (the preceding `[endtrans fade=300 sync]`) spanning
+///    18 frames and the one at `*logo:172` (`[ev file=warning1 fade=300]`)
+///    spanning 63 frames — ~300 ms against ~1 s at the 60 Hz frame clock.
+/// 3. Hot-patch the game's own command handler to report what it is handed
+///    (`--at-frame 300 --at-script "$(cat patch.tjs)"`, the patch installed on
+///    `KAGEnvImage.afterCommand` and printing the tag's `fade` plus the env's
+///    `trans`):
+///    ```text
+///    (function(){
+///        var owner = global.KAGEnvImage, o = owner.afterCommand;
+///        owner.afterCommand = function(a0) {
+///            if (a0.tagname == "ev") { System.inform("M240AC2 tag=" + a0.tagname
+///                + " fade=" + a0.fade + " trans=" + (this.trans === void ? "void"
+///                : ("" + this.trans.time + "/[" + this.trans.method + "]"))); }
+///            return (o incontextof this)(a0);
+///        };
+///    })();
+///    ```
+///    which answers
+///    ```text
+///    log: System.inform: M240AC2 tag=ev fade=300 trans=1000/[]
+///    ```
+///    i.e. the command arrives with `fade=300` while `trans` is *already*
+///    `time=1000, method=""` — GINKA's `KAGEnvTrans.afterCommand` only builds a
+///    trans from `fade` when `trans === void`, so the fallback cannot fire and
+///    the default wins. That default is data, not a mystery: the shipped
+///    `envinit.tjs` gives the `ev` object's class (`event`) `"trans","normal"`
+///    and defines `transitions.normal = %[time:1000, method:"", sync:true]`
+///    (plus a global `fadeValue => 1000` fallback).
+///    Caveat for anyone re-running it: a wrapped `afterCommand` makes GINKA's
+///    conductor stop at the episode (the wrapped run ends at `*logo:172`
+///    `st=stop`, while the unpatched run's `waitall` there spans the 63 frames
+///    of step 2), so read the pin from the log — the *unpatched* run is the one
+///    that measures the durations. The engine itself is clean here: it delivers
+///    the attribute and leaves the game's transition selection alone.
 pub(crate) fn kag_tag_trace_wanted(tagname: &str) -> bool {
     static FILTER: OnceLock<Vec<String>> = OnceLock::new();
     let filter = FILTER.get_or_init(|| {
