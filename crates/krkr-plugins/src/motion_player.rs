@@ -270,6 +270,9 @@ struct PlayerState {
     texture_cache: Option<TextureCache>,
     /// Current position, in 1/60 s ticks.
     tick: f64,
+    /// The last tick whose sample carried something to draw, remembered for
+    /// the tail of a one-shot animation ([`player_draw`]).
+    held_tick: Option<f32>,
     speed: f64,
     playing: bool,
     completion_type: i64,
@@ -2119,8 +2122,14 @@ fn numeric_player_member(state: &PlayerState, name: &str) -> Option<f64> {
 fn set_numeric_player_member(state: &mut PlayerState, name: &str, value: f64) {
     match name {
         "speed" => state.speed = value,
-        "tickCount" => state.tick = milliseconds_to_ticks(value).max(0.0),
-        "frameTickCount" => state.tick = value.max(0.0),
+        "tickCount" => {
+            state.tick = milliseconds_to_ticks(value).max(0.0);
+            state.held_tick = None;
+        }
+        "frameTickCount" => {
+            state.tick = value.max(0.0);
+            state.held_tick = None;
+        }
         "completionType" => state.completion_type = value as i64,
         "loopTime" => state.loop_time = Some(milliseconds_to_ticks(value)),
         "frameLoopTime" => state.loop_time = Some(value),
@@ -2200,6 +2209,7 @@ fn player_play(
         state.motion_storage = Some(storage);
         state.animation = animation;
         state.tick = 0.0;
+        state.held_tick = None;
         state.tweens.clear();
         state.playing = true;
     });
@@ -2543,9 +2553,31 @@ fn player_draw(
         let state = players.get_mut(&this)?;
         let motion = Arc::clone(state.motion.as_ref()?);
         let animation = state.animation.clone();
-        let tick = state.tick as f32;
         let variables = state.variables.clone();
-        let Ok(mut items) = motion.draw_list_with_variables(&animation, tick, &variables) else {
+        // A one-shot animation can end on a tick it draws nothing at
+        // (PARQUET's `title` and `logoflash` do): the file holds its content to
+        // the animation's `lastTime` with a type-0 HOLD frame
+        // (`evaluate_frame_list` "leaves the layer's previous state
+        // untouched"), so what the layer drew last must stand.  The game
+        // clears the canvas and draws again every frame
+        // (`AffineSourceMotion.drawAffine`'s `_player.clear(a0, l1)`), so
+        // holding means drawing the last sampled frame again — the same rule
+        // the `.mtn` script-image loader applies to the same tail
+        // ([`MotionGraphic`]).
+        let one_shot = motion
+            .animation(&animation)
+            .is_none_or(|animation| !animation.loop_time.is_some_and(|loop_time| loop_time > 0.0));
+        let mut tick = state.tick as f32;
+        let mut sampled = motion.draw_list_with_variables(&animation, tick, &variables);
+        if let Ok(items) = &sampled {
+            if items.iter().any(|item| item.visible) {
+                state.held_tick = Some(tick);
+            } else if one_shot && let Some(held) = state.held_tick {
+                tick = held;
+                sampled = motion.draw_list_with_variables(&animation, tick, &variables);
+            }
+        }
+        let Ok(mut items) = sampled else {
             runtime.host_mut().log(&format!(
                 "motionplayer.dll: draw: animation {animation:?} cannot be sampled"
             ));
@@ -4924,6 +4956,99 @@ mod tests {
                 ]),
             ),
         ])
+    }
+
+    /// The env motion source draws as `clear` + `draw` every frame
+    /// (`system/AffineSourceMotion.tjs` `drawAffine`: `_player.clear(a0, l1)`
+    /// then `_player.draw(a0)`), so a one-shot animation whose tail samples
+    /// nothing would wipe the canvas it drew a moment earlier — the file's own
+    /// type-0 HOLD frame at the animation's `lastTime` means the layer keeps
+    /// its state.  PARQUET's `title_bg.mtn` is exactly that shape: its `title`
+    /// animation draws the PARQUET logo at ticks 35..121 and nothing from 125
+    /// to `lastTime` 150 (measured on the shipped file), so the player
+    /// re-draws its last sampled tick — the same rule the `.mtn` script-image
+    /// loader applies to the same tail.
+    ///
+    /// Fails before the hold: the second draw leaves the canvas cleared, and
+    /// PARQUET's title loses the logo once the motion has played out.
+    #[test]
+    fn a_one_shot_player_holds_its_last_drawn_frame_over_an_empty_tail() {
+        let layer = || {
+            object(vec![
+                ("label", text("body")),
+                ("coordinate", int(0)),
+                ("children", list(vec![])),
+                (
+                    "frameList",
+                    list(vec![
+                        object(vec![
+                            ("content", content("src/hero/white", [8, 8], 255)),
+                            ("time", int(0)),
+                            ("type", int(2)),
+                        ]),
+                        object(vec![("time", int(20)), ("type", int(2))]),
+                        object(vec![("time", int(400)), ("type", int(0))]),
+                    ]),
+                ),
+            ])
+        };
+        let mut engine = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(vec![("white", [255, 255, 255, 255])], layer(), -1),
+        )]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script(
+                "inside.tjs",
+                "player.play(\"idle\", 0); player.progress(100); \
+                 player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw inside the content");
+        assert!(
+            white_near(&mut engine, 8, 8) > 0,
+            "the icon draws while the animation has content"
+        );
+
+        engine
+            .execute_script(
+                "tail.tjs",
+                // Tick 36: past the content (20), before the animation ends (60).
+                "player.progress(500); \
+                 player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw on the empty tail");
+        assert!(
+            white_near(&mut engine, 8, 8) > 0,
+            "the one-shot player holds the frame it last drew over the empty tail"
+        );
+
+        // A looping animation must follow its loop: an empty tick inside the
+        // loop is part of the animation and is delivered like any other.
+        let mut looping = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(vec![("white", [255, 255, 255, 255])], layer(), 40),
+        )]);
+        looping.execute_script("setup.tjs", SETUP).expect("setup");
+        looping
+            .execute_script(
+                "loop.tjs",
+                "player.play(\"idle\", 0); player.progress(100); \
+                 player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw inside the loop");
+        assert!(white_near(&mut looping, 8, 8) > 0, "the loop draws");
+        looping
+            .execute_script(
+                "loop_tail.tjs",
+                // Tick 30 sits past the content (20) and inside the loop (40).
+                "player.progress(400); player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw on the loop's empty tick");
+        assert_eq!(
+            white_near(&mut looping, 8, 8),
+            0,
+            "a looping motion's empty tick is delivered, not held"
+        );
     }
 
     /// An all-transparent sample means "the animation is over" for a motion

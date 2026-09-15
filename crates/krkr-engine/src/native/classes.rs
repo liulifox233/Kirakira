@@ -2534,6 +2534,17 @@ fn layer_parent_object(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> Opti
 /// Official `GetAbsoluteOrderIndex()` (`LayerIntf.cpp:1253-1260`): no parent
 /// reports 0, a parent in absolute order mode reports the child's stored
 /// absolute index, and anywhere else `absolute` *is* the sibling order.
+///
+/// The stored index in absolute order mode is the reference's
+/// `AbsoluteOrderIndex` field — `0` until the field is written
+/// (`LayerIntf.cpp:309`), which the parent's mode entry snapshots to the live
+/// sibling order (`:1253-1258`) and `AddChild` advances past the previous last
+/// sibling (`:576-593`).  Reporting the live order for a child that carries no
+/// stored index is *not* equivalent: KAGEX's own ordering pass writes
+/// `absolute` only when the read-back differs from the index it computed
+/// (`system/world.tjs` `onUpdateAbsolute`: `if(!(a1.absolute == l0))`), so a
+/// fabricated live value can suppress the very write that would place the
+/// layer.
 fn layer_absolute_order_index(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) -> i64 {
     let Some(parent) = layer_parent_object(runtime, layer) else {
         return 0;
@@ -2543,7 +2554,7 @@ fn layer_absolute_order_index(runtime: &Runtime<KrkrHost>, layer: ObjectHandle) 
         return live_order();
     }
     match layer_property_value(runtime, layer, "absolute") {
-        Variant::Void => live_order(),
+        Variant::Void => 0,
         value => value.to_integer().unwrap_or_else(|_| live_order()),
     }
 }
@@ -13112,6 +13123,50 @@ mod tests {
             .execute_expression("layer_floors.tjs", "layer.setPos(1)")
             .expect_err("a short setPos call must fail");
         assert_eq!(error.kind, krkr_tjs2::TjsErrorKind::BadParamCount);
+    }
+
+    /// The reference's `AbsoluteOrderIndex` bookkeeping: a child that joins a
+    /// parent in absolute order mode takes the previous last sibling's index
+    /// plus one (`LayerIntf.cpp:576-593` `AddChild`) and a child that carries
+    /// no index answers the field's default 0, not its live sibling position
+    /// (`:1253-1260` `GetAbsoluteOrderIndex`, `:309`).
+    ///
+    /// KAGEX's env ordering pass writes `absolute` only when the value it
+    /// computed differs from the read-back (`system/world.tjs`
+    /// `onUpdateAbsolute`: `if(!(a1.absolute == l0)) a1.absolute = l0`), so
+    /// answering the live position for an index-less layer swallows the write
+    /// that would place it: PARQUET's title motion layer stayed at z 0 under
+    /// the still layer that paints over the logo, even though the game asked
+    /// for it above (`title_bg` level 1, `syslay_bg` level 0).
+    ///
+    /// Fails before the fix: `first.absolute` reported the live sibling order
+    /// (1 once `second` had moved below it) instead of 0.
+    #[test]
+    fn absolute_order_mode_children_keep_the_reference_absolute_index() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "absolute_order.tjs",
+                r#"
+                var window = new Window();
+                var parent = new Layer(window, null);
+                parent.absoluteOrderMode = 1;
+                var first = new Layer(window, parent);
+                var second = new Layer(window, parent);
+                var third = new Layer(window, parent);
+                second.absolute = -1;
+                return [first.absolute, second.absolute, third.absolute, first.order].join(",");
+                "#,
+            )
+            .expect("script");
+        assert_eq!(
+            value,
+            Variant::String("0,-1,2,1".to_string()),
+            "the joined children advance past the last sibling's index, and a \
+             child without one keeps the default instead of its sibling position"
+        );
     }
 
     /// The `tTJSNC_Window` floors (`visual/WindowIntf.cpp` :832/:842/:852/:879/
