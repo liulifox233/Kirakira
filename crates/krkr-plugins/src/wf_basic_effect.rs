@@ -509,6 +509,13 @@ pub struct FreeVerb {
     width: f32,
     effect_mix: f32,
     frozen: bool,
+    /// The integer behind the `extend` member: the DLL's class entry stores
+    /// the constructor's sixth argument at `instance + 0xc8`
+    /// (`0x10007f2f`) and `extend`'s getter reads exactly that field
+    /// (`0x100021c0`: `mov esi,[ecx+0xc8]`) before it calls into the STK
+    /// sub-object.  PARQUET's ini passes `1000` there
+    /// (`Verb(0.75, 0.75, 0.25, 1.0, 0, 1000)`).
+    extend: i64,
     combs_left: Vec<FreeVerbComb>,
     combs_right: Vec<FreeVerbComb>,
     allpasses_left: Vec<FreeVerbAllpass>,
@@ -524,6 +531,7 @@ impl FreeVerb {
             width: FREEVERB_DEFAULT_WIDTH,
             effect_mix: FREEVERB_DEFAULT_EFFECT_MIX,
             frozen: false,
+            extend: 0,
             combs_left: Vec::new(),
             combs_right: Vec::new(),
             allpasses_left: Vec::new(),
@@ -633,6 +641,18 @@ impl FreeVerb {
     pub fn set_mode(&mut self, frozen: bool) {
         self.frozen = frozen;
         self.apply_controls();
+    }
+
+    /// The `extend` member's integer.  The DLL keeps it at `+0xc8` and its
+    /// non-const getter (`0x100021c0`) hands it to the STK sub-object; what
+    /// that call does to the reverb was not recovered, so this port stores the
+    /// value and answers it back instead of inventing an effect.
+    pub fn extend(&self) -> i64 {
+        self.extend
+    }
+
+    pub fn set_extend(&mut self, value: i64) {
+        self.extend = value;
     }
 
     pub fn reset(&mut self) {
@@ -943,14 +963,25 @@ fn install_wf_basic_effect(runtime: &mut Runtime<KrkrHost>) {
 /// property.
 fn install_equalizer_class(runtime: &mut Runtime<KrkrHost>) {
     let class = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
+        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, args: Vec<Variant>| {
             let instance = new_plugin_instance(runtime, "GraphicEqualizer");
             let sample_rate = native_sample_rate(runtime);
+            let mut equalizer = GraphicEqualizer::new(sample_rate);
+            // The DLL's class entry (`0x10007fa0`) reads the constructor
+            // arguments as the ten band gains: `AsReal(param[i])` is stored
+            // into `instance + 0xc4 + 4*i` — the same array `setGain`
+            // (`0x10002250`) writes — for as long as `i <= 9`, and every
+            // further argument is dropped (`cmp esi,0x9; ja`,
+            // `0x1000804d`-`0x10008065`).  PARQUET's `EQ` wrapper
+            // (`voiceeffect.tjs` object 49) passes the ini's ten values
+            // through, so this is the only place they reach the filter.
+            for (band, value) in args.iter().take(EQ_BAND_FREQUENCIES.len()).enumerate() {
+                equalizer.set_gain(band as i64, value.to_real()? as f32);
+            }
             FILTERS.with(|filters| {
-                filters.borrow_mut().insert(
-                    instance,
-                    EffectState::Equalizer(Box::new(GraphicEqualizer::new(sample_rate))),
-                );
+                filters
+                    .borrow_mut()
+                    .insert(instance, EffectState::Equalizer(Box::new(equalizer)));
             });
             Ok(Variant::Object(instance))
         },
@@ -1023,13 +1054,51 @@ fn equalizer_get_gain(
 /// `StkFreeVerb`: the five recovered properties plus `extend` and `interface`.
 fn install_free_verb_class(runtime: &mut Runtime<KrkrHost>) {
     let class = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
+        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, args: Vec<Variant>| {
             let instance = new_plugin_instance(runtime, "StkFreeVerb");
             let sample_rate = native_sample_rate(runtime);
+            let mut reverb = FreeVerb::new(sample_rate);
+            // The DLL's class entry (`0x10007d90`) reads up to six arguments,
+            // each one absent leaving the field at its constructor default —
+            // the ini line `Verb(0.75, 0.75, 0.25, 1.0, 0, 1000)` spells every
+            // one of them out:
+            //
+            // | arg | member | DLL |
+            // | --- | ------ | --- |
+            // | 0 | `effectMix` | the `effectMix` setter (`0x10001ea0`): stores the double at `+0xc0` and calls the STK virtual at `+0xd0+0xc`, i.e. `Effect::setEffectMix` (`0x1000b6a0`) |
+            // | 1 | `roomSize` | `0x1000af90`: `0.28 * r + 0.7` into `+0x40` (the comb feedback `scaleroom`/`offsetroom` constants at `0x1002a110`/`0x1002a118`) |
+            // | 2 | `damping` | `0x1000afb0`: `0.4 * d` into `+0x50` (`scaledamp`, `0x1002a108`) |
+            // | 3 | `width` | `0x1000afd0`: the value into `+0x78` |
+            // | 4 | `mode` | `0x1000afe0`: the integer's low byte into `+0x80` |
+            // | 5 | `extend` | `0x10007f2f`: `AsInteger` into `+0xc8` |
+            //
+            // Every conversion is the DLL's (`AsReal` for 1-3, `AsInteger` for
+            // 4-5) and the mode is the low byte of that integer, not "nonzero"
+            // (`movzx ecx,al`, `0x10007ef4`).
+            if let Some(value) = args.first() {
+                if let Some(warning) = reverb.set_effect_mix(value.to_real()? as f32) {
+                    runtime.host_mut().log(warning);
+                }
+            }
+            if let Some(value) = args.get(1) {
+                reverb.set_room_size(value.to_real()? as f32);
+            }
+            if let Some(value) = args.get(2) {
+                reverb.set_damping(value.to_real()? as f32);
+            }
+            if let Some(value) = args.get(3) {
+                reverb.set_width(value.to_real()? as f32);
+            }
+            if let Some(value) = args.get(4) {
+                reverb.set_mode(value.to_integer()? as u8 != 0);
+            }
+            if let Some(value) = args.get(5) {
+                reverb.set_extend(value.to_integer()?);
+            }
             FILTERS.with(|filters| {
                 filters
                     .borrow_mut()
-                    .insert(instance, EffectState::FreeVerb(FreeVerb::new(sample_rate)));
+                    .insert(instance, EffectState::FreeVerb(reverb));
             });
             Ok(Variant::Object(instance))
         },
@@ -1136,14 +1205,34 @@ fn install_free_verb_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHand
     );
     // `extend` is the one member of the StkFreeVerb group whose getter is
     // non-const (`GetterCallback<P8StkFreeVerb@@AEH…>`, RTTI at `0x10033b70`);
-    // its return value was not recovered, so it answers the same sentinel as
-    // `interface` here.
+    // it reads the integer the constructor stored at `+0xc8` and hands it to
+    // the STK sub-object (`0x100021c0`).  What that call changes was not
+    // recovered, so the port stores and answers the value — the constructor
+    // argument PARQUET's ini passes — instead of inventing an effect.
     runtime.register_object_native_property_with_access(
         handle,
         "extend",
-        NativePropertyAccess::ReadOnly,
-        |_runtime, _this| Ok(Variant::Integer(INTERFACE_SENTINEL_FV)),
-        |_runtime, _this, _value| Err(TjsError::access_denied()),
+        NativePropertyAccess::ReadWrite,
+        |_runtime, this| {
+            let extend = this
+                .and_then(|this| {
+                    with_state(this, |state| free_verb_ref(state).map(FreeVerb::extend))
+                })
+                .flatten()
+                .unwrap_or(0);
+            Ok(Variant::Integer(extend))
+        },
+        |_runtime, this, value| {
+            let extend = value.to_integer()?;
+            if let Some(this) = this {
+                with_state(this, |state| {
+                    if let Some(reverb) = free_verb_mut(state) {
+                        reverb.set_extend(extend);
+                    }
+                });
+            }
+            Ok(())
+        },
     );
     runtime.register_object_native_property_with_access(
         handle,
@@ -1158,13 +1247,25 @@ fn install_free_verb_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHand
 /// the read-only `interface` property.
 fn install_delay_class(runtime: &mut Runtime<KrkrHost>) {
     let class = runtime.alloc_native_constructor(
-        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, _args: Vec<Variant>| {
+        |runtime: &mut Runtime<KrkrHost>, _this: Option<ObjectHandle>, args: Vec<Variant>| {
             let instance = new_plugin_instance(runtime, "DelayEffect");
             let sample_rate = native_sample_rate(runtime);
+            let mut delay = DelayEffect::new(sample_rate);
+            // The DLL's class entry (`0x10009300`) calls the very function the
+            // `init` member is (`0x10002360`, registered at `0x10009ae8`):
+            // `if (numparams > 0) WaveDelay::init(instance, numparams, param)`
+            // (`0x10009366`-`0x10009372`), and `init` itself ignores fewer than
+            // three arguments (`cmp ebp,0x2; jle`).  The constructor's
+            // arguments are therefore exactly `init`'s.
+            if let Some(init) = delay_init_arguments(&args)? {
+                for warning in apply_delay_init(&mut delay, &init) {
+                    runtime.host_mut().log(warning);
+                }
+            }
             FILTERS.with(|filters| {
                 filters
                     .borrow_mut()
-                    .insert(instance, EffectState::Delay(DelayEffect::new(sample_rate)));
+                    .insert(instance, EffectState::Delay(delay));
             });
             Ok(Variant::Object(instance))
         },
@@ -1189,6 +1290,57 @@ fn install_delay_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) 
 /// `init(p0, p1, p2, p3?)`: the recovered argument handling of
 /// `WaveDelay::init` (`0x10002360`) — fewer than three arguments is a no-op,
 /// the fourth is optional.
+/// The `WaveDelay::init` parameters (`0x10002360`), shared by the member and
+/// by the class entry (which calls the same function,
+/// `sound`… `wfBasicEffect.dll:0x10009372`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DelayInit {
+    /// `p0`, an integer: the delay in milliseconds (`+0xcc`).
+    delay_millis: f32,
+    /// `p1`, a real: the one-pole damping pole (`+0xd4`).
+    damping: f32,
+    /// `p2`, a real: the feedback (`+0xd8`).
+    feedback: f32,
+    /// The optional `p3`, an integer: the maximum delay (`+0xc0`).
+    max_delay_millis: Option<f32>,
+}
+
+/// Reads the `init` arguments: fewer than three are ignored entirely
+/// (`0x10002360`'s `cmp ebp,0x2; jle`), and the conversions are the DLL's
+/// (`AsInteger` for `p0`/`p3`, `AsReal` for `p1`/`p2`).
+fn delay_init_arguments(args: &[Variant]) -> Result<Option<DelayInit>> {
+    if args.len() < 3 {
+        return Ok(None);
+    }
+    let max_delay_millis = match args.get(3) {
+        Some(value) if !matches!(value, Variant::Void) => Some(value.to_integer()? as f32),
+        _ => None,
+    };
+    Ok(Some(DelayInit {
+        delay_millis: args[0].to_integer()? as f32,
+        damping: args[1].to_real()? as f32,
+        feedback: args[2].to_real()? as f32,
+        max_delay_millis,
+    }))
+}
+
+/// Applies the parsed `init` parameters and answers the recovered warnings
+/// (`Delay::setDelay` beyond the maximum, `OnePole::setPole` at `|pole| >= 1`).
+fn apply_delay_init(delay_effect: &mut DelayEffect, init: &DelayInit) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if let Some(warning) = delay_effect.set_damping(init.damping) {
+        warnings.push(warning);
+    }
+    delay_effect.set_feedback(init.feedback);
+    if let Some(max_delay) = init.max_delay_millis {
+        delay_effect.set_max_delay_millis(max_delay);
+    }
+    if let Some(warning) = delay_effect.set_delay_millis(init.delay_millis) {
+        warnings.push(warning);
+    }
+    warnings
+}
+
 fn delay_init(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -1197,32 +1349,14 @@ fn delay_init(
     let Some(this) = plugin_this(runtime, this_obj) else {
         return Ok(Variant::Void);
     };
-    if args.len() < 3 {
+    let Some(init) = delay_init_arguments(&args)? else {
         return Ok(Variant::Void);
-    }
-    let delay = args[0].to_integer()? as f32;
-    let damping = args[1].to_real()? as f32;
-    let feedback = args[2].to_real()? as f32;
-    let max_delay = match args.get(3) {
-        Some(value) if !matches!(value, Variant::Void) => Some(value.to_integer()? as f32),
-        _ => None,
     };
     let warnings = with_state(this, |state| {
         let EffectState::Delay(delay_effect) = state else {
             return Vec::new();
         };
-        let mut warnings = Vec::new();
-        if let Some(warning) = delay_effect.set_damping(damping) {
-            warnings.push(warning);
-        }
-        delay_effect.set_feedback(feedback);
-        if let Some(max_delay) = max_delay {
-            delay_effect.set_max_delay_millis(max_delay);
-        }
-        if let Some(warning) = delay_effect.set_delay_millis(delay) {
-            warnings.push(warning);
-        }
-        warnings
+        apply_delay_init(delay_effect, &init)
     })
     .unwrap_or_default();
     for warning in warnings {
@@ -1546,8 +1680,8 @@ mod tests {
         );
     }
 
-    /// Every class answers `interface` (and StkFreeVerb its `extend`) with the
-    /// non-null sentinel the port documents, and the properties are read-only.
+    /// Every class answers `interface` with the non-null value the port
+    /// documents, and the property is read-only.
     #[test]
     fn interface_is_a_read_only_sentinel() {
         let mut engine = engine();
@@ -1558,15 +1692,13 @@ mod tests {
                      var eq = new {EQ}();\n\
                      var reverb = new {FREE_VERB}();\n\
                      var delay = new {DELAY}();\n\
-                     return eq.interface + \":\" + reverb.interface + \":\" + reverb.extend + \":\" + delay.interface;\n\
+                     return eq.interface + \":\" + reverb.interface + \":\" + delay.interface;\n\
                  }})()"
             ),
         );
         assert_eq!(
             values,
-            format!(
-                "{INTERFACE_SENTINEL_EQ}:{INTERFACE_SENTINEL_FV}:{INTERFACE_SENTINEL_FV}:{INTERFACE_SENTINEL_DL}"
-            )
+            format!("{INTERFACE_SENTINEL_EQ}:{INTERFACE_SENTINEL_FV}:{INTERFACE_SENTINEL_DL}")
         );
         let error = try_run(
             &mut engine,
@@ -1576,6 +1708,167 @@ mod tests {
         assert_eq!(
             error.message,
             "Invalid operation for Read-only or Write-only property"
+        );
+    }
+
+    /// Row-26 pin, `GraphicEqualizer`: the class entry (`0x10007fa0`) stores
+    /// `AsReal(param[i])` into band `i`'s gain — the array `setGain` writes —
+    /// for as long as `i <= 9` and drops every further argument
+    /// (`cmp esi,0x9; ja`, `0x1000804d`), so PARQUET's `EQ(band0..band9)`
+    /// wrapper configures the ten bands and nothing else.
+    #[test]
+    fn the_equalizer_constructor_assigns_the_band_gains() {
+        let mut engine = engine();
+        let probes = [(0, 0.5), (1, 1.5), (2, 2.0), (3, 1.0), (9, 1.0)];
+        for (band, expected) in probes {
+            let value = real(
+                &mut engine,
+                &format!(
+                    "(function() {{ var eq = new {EQ}(0.5, 1.5, 2.0); return eq.getGain({band}); }})()"
+                ),
+            );
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "band {band} should be {expected}, got {value}"
+            );
+        }
+
+        // Ten values, then an eleventh the DLL drops.
+        let capped = [(0, 0.0), (9, 9.0)];
+        for (band, expected) in capped {
+            let value = real(
+                &mut engine,
+                &format!(
+                    "(function() {{ var eq = new {EQ}(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 123.5); return eq.getGain({band}); }})()"
+                ),
+            );
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "an eleventh argument is dropped; band {band} should be {expected}, got {value}"
+            );
+        }
+
+        // The arguments are the same field `setGain` writes.
+        let after_set_gain = real(
+            &mut engine,
+            &format!(
+                "(function() {{ var eq = new {EQ}(0.5); eq.setGain(0, 3.0); return eq.getGain(0); }})()"
+            ),
+        );
+        assert!((after_set_gain - 3.0).abs() < 1e-6);
+    }
+
+    /// Row-26 pin, `StkFreeVerb`: the class entry (`0x10007d90`) reads up to
+    /// six arguments — `effectMix`, `roomSize`, `damping`, `width`, `mode`
+    /// (the integer's low byte) and `extend` — which is exactly the ini line
+    /// `Verb(0.75, 0.75, 0.25, 1.0, 0, 1000)` PARQUET passes
+    /// (`voiceeffect.tjs`, object 48).
+    #[test]
+    fn the_free_verb_constructor_applies_the_ini_line() {
+        let mut engine = engine();
+        let two = [("effectMix", 0.6), ("roomSize", 0.4)];
+        for (member, expected) in two {
+            let value = real(
+                &mut engine,
+                &format!(
+                    "(function() {{ var v = new {FREE_VERB}(0.6, 0.4); return v.{member}; }})()"
+                ),
+            );
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "{member} should be {expected}, got {value}"
+            );
+        }
+
+        let full = [
+            ("effectMix", 0.75),
+            ("roomSize", 0.75),
+            ("damping", 0.25),
+            ("width", 1.0),
+        ];
+        for (member, expected) in full {
+            let value = real(
+                &mut engine,
+                &format!(
+                    "(function() {{ var v = new {FREE_VERB}(0.75, 0.75, 0.25, 1.0, 0, 1000); return v.{member}; }})()"
+                ),
+            );
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "{member} should be {expected}, got {value}"
+            );
+        }
+        let rest = string(
+            &mut engine,
+            &format!(
+                "(function() {{ var v = new {FREE_VERB}(0.75, 0.75, 0.25, 1.0, 0, 1000); return v.mode + \":\" + v.extend; }})()"
+            ),
+        );
+        assert_eq!(rest, "0:1000");
+
+        // The mode argument is the integer's low byte (`movzx ecx,al`,
+        // `0x10007ef4`), not "nonzero".
+        let mode = string(
+            &mut engine,
+            &format!(
+                "(function() {{\n\
+                     var frozen = new {FREE_VERB}(0.5, 0.5, 0.5, 0.5, 1);\n\
+                     var wrapped = new {FREE_VERB}(0.5, 0.5, 0.5, 0.5, 256);\n\
+                     return frozen.mode + \":\" + wrapped.mode;\n\
+                 }})()"
+            ),
+        );
+        assert_eq!(mode, "1:0");
+    }
+
+    /// Row-26 pin, `DelayEffect`: the class entry (`0x10009300`) calls the very
+    /// function the `init` member is (`0x10002360`), so the constructor's
+    /// arguments are `init`'s — and `init` ignores fewer than three
+    /// (`cmp ebp,0x2; jle`).  The class exposes no property for them, so the
+    /// probe is the filter state itself.
+    #[test]
+    fn the_delay_constructor_is_init() {
+        let mut engine = engine();
+        // The expression returns the self-bound instance (a closure whose
+        // owner is the object), so unwrap it the way the engine's readers do.
+        let object = run(
+            &mut engine,
+            &format!("(function() {{ return new {DELAY}(120, 0.5, 0.25, 250); }})()"),
+        );
+        let handle = object.object_handle().expect("an object");
+        let handle = engine.tjs_runtime().bound_this(handle).unwrap_or(handle);
+        let probed = with_state(handle, |state| match state {
+            EffectState::Delay(delay) => (
+                delay.delay_millis(),
+                delay.damping(),
+                delay.feedback(),
+                delay.max_delay_millis(),
+            ),
+            _ => panic!("expected a delay"),
+        })
+        .expect("the instance is live");
+        assert!((probed.0 - 120.0).abs() < 1e-3, "delay: {probed:?}");
+        assert!((probed.1 - 0.5).abs() < 1e-3, "damping pole: {probed:?}");
+        assert!((probed.2 - 0.25).abs() < 1e-3, "feedback: {probed:?}");
+        assert!((probed.3 - 250.0).abs() < 1e-3, "max delay: {probed:?}");
+
+        // Fewer than three arguments leaves the defaults, exactly like `init`.
+        let short = run(
+            &mut engine,
+            &format!("(function() {{ return new {DELAY}(120, 0.5); }})()"),
+        );
+        let handle = short.object_handle().expect("an object");
+        let handle = engine.tjs_runtime().bound_this(handle).unwrap_or(handle);
+        let untouched = with_state(handle, |state| match state {
+            EffectState::Delay(delay) => (delay.delay_millis(), delay.feedback()),
+            _ => panic!("expected a delay"),
+        })
+        .expect("the instance is live");
+        let default = DelayEffect::new(44100.0);
+        assert_eq!(
+            untouched,
+            (default.delay_millis(), default.feedback()),
+            "a short list is ignored"
         );
     }
 

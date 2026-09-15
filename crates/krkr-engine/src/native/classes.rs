@@ -446,6 +446,19 @@ fn install_wave_native_properties(
     preserve_script_properties: bool,
 ) {
     for &property in WAVE_NATIVE_PROPERTIES {
+        // `sampleValue` / `sampleCount` / `sampleAhead` are not core members
+        // of the reference's `WaveSoundBuffer` at all: `getSample.dll` attaches
+        // all three *to the class* with ncbind's `NCB_ATTACH_CLASS_WITH_HOOK`
+        // (`getSample/main.cpp:152-156`), and an instance read resolves through
+        // that class member with the hook's per-object state.  Installing them
+        // per instance here would shadow the plugin's members (and the
+        // engine's own class-level defaults), so the instance keeps the class
+        // surface only — the objects the engine seeds in
+        // `apply_constructor_defaults` are the *backing* keys, not the
+        // property names, and stay.
+        if preserve_script_properties && PLUGIN_OWNED_WAVE_PROPERTIES.contains(&property) {
+            continue;
+        }
         if preserve_script_properties && runtime.object_member_is_property(handle, property) {
             continue;
         }
@@ -3385,6 +3398,15 @@ const WAVE_NATIVE_PROPERTIES: &[&str] = &[
     "globalFocusMode",
     "useVisBuffer",
 ];
+
+/// The members that belong to a plugin class extension rather than to the
+/// core `WaveSoundBuffer`, and that therefore stay **class-level** members:
+/// `getSample.dll`'s three accessors (`getSample/main.cpp:152-156`).  The
+/// engine installs its own defaults for them on the class
+/// (`WAVE_NATIVE_PROPERTIES`), a linked plugin replaces them there, and an
+/// instance read resolves through the class either way — which is the
+/// reference's shape, where the core class declares none of them.
+const PLUGIN_OWNED_WAVE_PROPERTIES: &[&str] = &["sampleValue", "sampleCount", "sampleAhead"];
 
 fn wave_native_property_get(
     runtime: &mut Runtime<KrkrHost>,
@@ -11655,6 +11677,10 @@ const WAVE_SOUND_BUFFER_METHODS: &[NativeMethodSpec] = &[
 pub(crate) static WAVE_SOUND_BUFFER_CLASS: NativeClassSpec = NativeClassSpec {
     name: "WaveSoundBuffer",
     methods: WAVE_SOUND_BUFFER_METHODS,
+    // Instance placeholders.  `sampleValue` / `sampleCount` / `sampleAhead` are
+    // deliberately absent: `getSample.dll` owns them (see
+    // [`PLUGIN_OWNED_WAVE_PROPERTIES`]), they live on the class, and a `void`
+    // placeholder here would shadow that class member on every instance.
     properties: &[
         "position",
         "samplePosition",
@@ -11664,9 +11690,6 @@ pub(crate) static WAVE_SOUND_BUFFER_CLASS: NativeClassSpec = NativeClassSpec {
         "volume",
         "volume2",
         "pan",
-        "sampleValue",
-        "sampleCount",
-        "sampleAhead",
         "posX",
         "posY",
         "posZ",
@@ -12314,6 +12337,93 @@ mod tests {
     /// (`:1540-1554`) hands the same array back on every read, and the setter
     /// is denied (`TJS_DENY_NATIVE_PROP_SETTER`, `:1552`): a script write
     /// fails with `TJS_E_ACCESSDENYED` and leaves the instance's array alone.
+    #[test]
+    /// Row-25 pin: `sampleValue` / `sampleCount` / `sampleAhead` are a plugin
+    /// class extension, not core members — `getSample.dll` attaches all three
+    /// to the `WaveSoundBuffer` class with ncbind's
+    /// `NCB_ATTACH_CLASS_WITH_HOOK` (`getSample/main.cpp:152-156`) and the
+    /// core class declares none of them (`WaveIntf.cpp` has no such property)
+    /// — so an instance read resolves through the class.  Installing them per
+    /// instance would shadow the plugin's member *and* the engine's own
+    /// class-level defaults; this pins both directions.
+    #[test]
+    fn plugin_class_level_sample_members_are_visible_on_an_instance() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::{NativePropertyAccess, Variant};
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+
+        // No plugin linked: an instance read reaches the engine's class-level
+        // defaults, and a store with the same shape still lands in the
+        // instance's own backing value.
+        let defaults = engine
+            .execute_script(
+                "wave_sample_defaults.tjs",
+                "var buffer = new WaveSoundBuffer(); \
+                 return buffer.sampleValue + ':' + buffer.sampleCount + ':' + buffer.sampleAhead;",
+            )
+            .expect("script");
+        assert_eq!(
+            defaults,
+            Variant::String("+0.0:100:0".to_string()),
+            "sampleValue is a real (the engine's not-playing answer), the other two integers"
+        );
+        let sample_value = engine
+            .execute_script(
+                "wave_sample_value.tjs",
+                "var buffer = new WaveSoundBuffer(); return buffer.sampleValue;",
+            )
+            .expect("script");
+        assert_eq!(sample_value, Variant::Real(0.0));
+
+        let per_object = engine
+            .execute_script(
+                "wave_sample_store.tjs",
+                "var first = new WaveSoundBuffer(); var second = new WaveSoundBuffer(); \
+                 first.sampleCount = 7; first.sampleAhead = 3; \
+                 return first.sampleCount + ':' + first.sampleAhead + ':' \
+                     + second.sampleCount + ':' + second.sampleAhead;",
+            )
+            .expect("script");
+        assert_eq!(
+            per_object,
+            Variant::String("7:3:100:0".to_string()),
+            "a class-level property keeps per-object state"
+        );
+
+        // A plugin registering the member on the class — what getSample.dll
+        // does — must be visible on an instance.
+        let class = match engine.tjs_runtime().global_member("WaveSoundBuffer") {
+            Variant::Object(handle) => handle,
+            other => panic!("WaveSoundBuffer is not an object: {other:?}"),
+        };
+        engine
+            .tjs_runtime_mut()
+            .register_object_native_property_with_access(
+                class,
+                "sampleValue",
+                NativePropertyAccess::ReadOnly,
+                |_runtime: &mut krkr_tjs2::runtime::Runtime<KrkrHost>,
+                 _this: Option<krkr_tjs2::runtime::ObjectHandle>| {
+                    Ok(Variant::Real(0.42))
+                },
+                |_runtime: &mut krkr_tjs2::runtime::Runtime<KrkrHost>,
+                 _this: Option<krkr_tjs2::runtime::ObjectHandle>,
+                 _value: Variant| { Ok(()) },
+            );
+        let visible = engine
+            .execute_script(
+                "wave_sample_plugin.tjs",
+                "var buffer = new WaveSoundBuffer(); return buffer.sampleValue;",
+            )
+            .expect("script");
+        assert_eq!(
+            visible,
+            Variant::Real(0.42),
+            "the plugin's class member must win over any instance member"
+        );
+    }
+
     #[test]
     fn wave_sound_buffer_filters_is_a_per_instance_array() {
         use crate::{EngineConfig, KrkrEngine};
