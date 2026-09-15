@@ -58,6 +58,14 @@ pub enum InteractiveCommand {
         all: bool,
     },
     Trace(TraceCommand),
+    /// Render text through a `TextRender` class and dump the per-character
+    /// records the layout produced.
+    TextRender {
+        class: String,
+        size: i64,
+        width: f64,
+        text: String,
+    },
     Quit,
 }
 
@@ -264,6 +272,7 @@ pub fn parse_interactive_command(line: &str) -> Result<InteractiveCommand, Strin
             }
         }
         "members" | "props" => parse_members_command(rest),
+        "textrender" | "text-render" => parse_textrender_command(rest),
         "trace" => parse_trace_command(rest),
         "q" | "quit" => Ok(InteractiveCommand::Quit),
         "help" => Ok(InteractiveCommand::Help),
@@ -337,6 +346,71 @@ pub fn parse_members_command(rest: &str) -> Result<InteractiveCommand, String> {
         expression: remainder.to_string(),
         filter,
         all,
+    })
+}
+
+/// `textrender [--class <name>] [--size <px>] [--width <px>] <text>`
+///
+/// The command renders `<text>` through the game's own TextRender class and
+/// dumps the character records ([`textrender_source`] documents the call
+/// order). Verifying the message text format's escapes — `\n` breaks, `\k`
+/// waits, `%f…;` style codes — used to mean hand-writing a TJS probe and
+/// re-deriving the game's own setup order every time. The text is passed
+/// verbatim: a typed `\n` stays the two characters the message format uses as
+/// a line break, not a newline a TJS literal would fold it into.
+pub fn parse_textrender_command(rest: &str) -> Result<InteractiveCommand, String> {
+    const USAGE: &str = "usage: textrender [--class <name>] [--size <px>] [--width <px>] <text>";
+    let mut class = "TextRenderBase".to_string();
+    let mut size = 48_i64;
+    let mut width = 800.0_f64;
+    let mut remainder = rest.trim();
+    while let Some(flag) = remainder
+        .split_whitespace()
+        .next()
+        .filter(|token| token.starts_with("--"))
+    {
+        let tail = remainder[flag.len()..].trim_start();
+        let (value, next) = match flag {
+            "--class" | "--size" | "--width" => tail
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| USAGE.to_string())?,
+            _ => return Err(format!("unknown textrender option `{flag}`; {USAGE}")),
+        };
+        match flag {
+            "--class" => class = value.to_string(),
+            "--size" => {
+                size = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|size| *size > 0)
+                    .ok_or_else(|| "--size must be a positive integer".to_string())?;
+            }
+            "--width" => {
+                width = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|width| *width >= 0.0)
+                    .ok_or_else(|| "--width must be a non-negative number".to_string())?;
+            }
+            _ => unreachable!("flags are matched above"),
+        }
+        remainder = next.trim_start();
+    }
+    if remainder.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let mut chars = class.chars();
+    let starts_ident = chars
+        .next()
+        .is_some_and(|ch| ch.is_alphabetic() || matches!(ch, '_' | '$'));
+    if !starts_ident || !chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | '$')) {
+        return Err(format!("--class must be an identifier, not `{class}`"));
+    }
+    Ok(InteractiveCommand::TextRender {
+        class,
+        size,
+        width,
+        text: remainder.to_string(),
     })
 }
 
@@ -441,6 +515,148 @@ pub fn parse_interactive_until(rest: &str) -> Result<(InteractiveUntil, usize), 
         return Err("until accepts at most one max_frames value".to_string());
     }
     Ok((condition, max_frames))
+}
+
+/// The TJS script the `textrender` command runs.
+///
+/// The order is the game's own message path: a `Font` first (`setFont`
+/// registers the size and face the layout reads — a probe that skips it
+/// measures an empty font), then the render box, then
+/// `render(text, indent, speed, …)` with the argument shape the games pass
+/// (`system/TextRender.tjs` → `render(a3, a4, a7, a8, 0, 0)`). The records
+/// come back through `getCharacters(0, 0)`, the call shape the game's own
+/// redraw path uses, and the waits through `getKeyWait()`.
+pub fn textrender_source(class: &str, size: i64, width: f64, text: &str) -> String {
+    let literal = tjs_string_literal(text);
+    format!(
+        r#"(function() {{
+    var tr = new {class}();
+    var fnt = new Font();
+    fnt.height = {size};
+    tr.setFont(fnt);
+    tr.setRenderSize({width}, 0);
+    tr.render({literal}, 0, 0, 0, 0, 0);
+    var out = %[];
+    out.renderCount = tr.renderCount;
+    out.renderLines = tr.renderLines;
+    out.characters = tr.getCharacters(0, 0);
+    out.keywaits = tr.getKeyWait();
+    return out;
+}})()"#
+    )
+}
+
+/// A TJS string literal for arbitrary console text.
+///
+/// The text is passed **verbatim**: a typed `\n` becomes the two characters
+/// the message format uses as a line break (`\k`, `%f…;` the same way), not a
+/// newline the literal would fold it into.
+fn tjs_string_literal(text: &str) -> String {
+    let mut literal = String::with_capacity(text.len() + 2);
+    literal.push('"');
+    for ch in text.chars() {
+        match ch {
+            '\\' => literal.push_str("\\\\"),
+            '"' => literal.push_str("\\\""),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            other => literal.push(other),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+/// Runs [`textrender_source`] and prints the render counters, one line per
+/// character record (text, position, line, size, face, colour, style flags,
+/// delay) and every `getKeyWait()` entry.
+pub fn report_textrender(
+    runtime: &mut RuntimeSession,
+    class: &str,
+    size: i64,
+    width: f64,
+    text: &str,
+) {
+    let source = textrender_source(class, size, width, text);
+    let value = match evaluate_interactive_expression(runtime, &source) {
+        Ok(value) => value,
+        Err(error) => {
+            println!("interactive textrender_error class={class} text={text:?}: {error}");
+            return;
+        }
+    };
+    let Some(out) = value.object_handle() else {
+        println!(
+            "interactive textrender_error class={class} text={text:?}: the render returned no record set"
+        );
+        return;
+    };
+    let engine = runtime.engine();
+    let tjs = engine.tjs_runtime();
+    let render_count = tjs
+        .object_member(out, "renderCount")
+        .to_integer()
+        .unwrap_or(0);
+    let render_lines = tjs
+        .object_member(out, "renderLines")
+        .to_integer()
+        .unwrap_or(0);
+    println!(
+        "interactive textrender class={class} size={size} width={width} text={text:?} renderLines={render_lines} renderCount={render_count}"
+    );
+    let characters = tjs.object_member(out, "characters").object_handle();
+    for (index, record) in characters
+        .and_then(|characters| tjs.array_elements(characters))
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let Some(record) = record.object_handle() else {
+            continue;
+        };
+        let int = |name: &str| tjs.object_member(record, name).to_integer().unwrap_or(0);
+        let text = tjs
+            .object_member(record, "text")
+            .to_tjs_string()
+            .unwrap_or_default();
+        let face = tjs
+            .object_member(record, "face")
+            .to_tjs_string()
+            .unwrap_or_default();
+        let link = tjs
+            .object_member(record, "link")
+            .to_tjs_string()
+            .unwrap_or_default();
+        let delay = tjs.object_member(record, "delay").to_real().unwrap_or(0.0);
+        println!(
+            "textrender char[{index}] text={text:?} x={} y={} line={} size={} cw={} face={face:?} color={:#010x} bold={} italic={} shadow={} edge={} delay={delay} link={link:?}",
+            int("x"),
+            int("y"),
+            int("line"),
+            int("size"),
+            int("cw"),
+            int("color"),
+            int("bold"),
+            int("italic"),
+            int("shadow"),
+            int("edge"),
+        );
+    }
+    let keywaits = tjs.object_member(out, "keywaits").object_handle();
+    for (index, wait) in keywaits
+        .and_then(|keywaits| tjs.array_elements(keywaits))
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let Some(wait) = wait.object_handle() else {
+            continue;
+        };
+        let pos = tjs.object_member(wait, "pos").to_integer().unwrap_or(0);
+        let time = tjs.object_member(wait, "time").to_real().unwrap_or(0.0);
+        println!("textrender keywait[{index}] pos={pos} time={time}");
+    }
 }
 
 /// Apply a command from a caller that records only the live draw list (the
@@ -741,7 +957,7 @@ pub fn apply_interactive_control_with_frame(
             }
         }
         InteractiveCommand::Help => println!(
-            "interactive commands: advance [n], until <condition> [max], run, pause, click <x> <y>, state, layers [filter], layer <id>, hit <x> <y>, draw, probe, auto [on|off], autopoint <x> <y>|off, load <storage>, logs [-n tail] [needle]..., trace [list|add|rm|off|names] [pattern]..., resources, shot [--raw] <path>, expr <tjs>, members [-a] [-f substr] <expr>, q"
+            "interactive commands: advance [n], until <condition> [max], run, pause, click <x> <y>, state, layers [filter], layer <id>, hit <x> <y>, draw, probe, auto [on|off], autopoint <x> <y>|off, load <storage>, logs [-n tail] [needle]..., trace [list|add|rm|off|names] [pattern]..., resources, shot [--raw] <path>, expr <tjs>, members [-a] [-f substr] <expr>, textrender [--class name] [--size px] [--width px] <text>, q"
         ),
         InteractiveCommand::Logs { needles, tail } => {
             let matches = runtime
@@ -804,6 +1020,12 @@ pub fn apply_interactive_control_with_frame(
             }
             Err(error) => println!("interactive members_error={error}"),
         },
+        InteractiveCommand::TextRender {
+            class,
+            size,
+            width,
+            text,
+        } => report_textrender(runtime, &class, size, width, &text),
         InteractiveCommand::Trace(command) => {
             apply_trace_command(runtime.engine_mut().tjs_runtime_mut(), command)
         }

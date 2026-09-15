@@ -38,14 +38,30 @@ thread_local! {
     /// Total unhandled-fragment markers created during the current
     /// decompilation (across every nested code object).
     static UNHANDLED_TOTAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Dropped-region markers created during the current decompilation.
+    ///
+    /// Kept apart from [`UNHANDLED_TOTAL`] although the markers render the
+    /// same way: "unhandled fragment" is the decompiler's pattern-gap
+    /// measure (the fuzz corpus's completeness net), while a dropped region
+    /// is bytecode the walk abandoned — a gap in coverage, not in the
+    /// pattern set.
+    static DROPPED_REGIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn count_unhandled_fragment() {
     UNHANDLED_TOTAL.with(|total| total.set(total.get() + 1));
 }
 
+pub(crate) fn count_dropped_region() {
+    DROPPED_REGIONS.with(|total| total.set(total.get() + 1));
+}
+
 fn take_unhandled_total() -> usize {
     UNHANDLED_TOTAL.with(|total| total.replace(0))
+}
+
+fn take_dropped_regions() -> usize {
+    DROPPED_REGIONS.with(|total| total.replace(0))
 }
 
 /// RAII entry into the decompilation chain; returns `None` when
@@ -103,6 +119,7 @@ pub fn decompile(file: &BytecodeFile, options: &DecompileOptions) -> Result<Deco
     skeleton::merge_for_init(&mut statements);
     // The marker count spans every nested code object decompiled in place.
     stats.unhandled = take_unhandled_total();
+    stats.dropped_regions = take_dropped_regions();
     let program = Program {
         statements,
         span: crate::error::Span::empty(0),

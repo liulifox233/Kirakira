@@ -8,8 +8,13 @@ use crate::frontend::syntax::Program;
 pub struct DecompileStats {
     /// Number of code objects that were decompiled.
     pub objects: usize,
-    /// Number of unhandled bytecode fragments.
+    /// Number of unhandled bytecode fragments (constructs no pattern covers).
     pub unhandled: usize,
+    /// Number of dropped regions: reachable bytecode the walk abandoned,
+    /// marked in the output as `// <unhandled: dropped region ...>` with its
+    /// byte range. Counted apart from [`Self::unhandled`] so the pattern-gap
+    /// measure keeps its meaning (the fuzz corpus's completeness net).
+    pub dropped_regions: usize,
 }
 
 #[derive(Clone, Debug)]

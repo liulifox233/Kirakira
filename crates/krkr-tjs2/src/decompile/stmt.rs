@@ -100,6 +100,11 @@ pub(crate) struct Scanner<'f> {
     regs: BTreeMap<i16, Expr>,
     flag: Option<Cond>,
     declared: BTreeSet<i16>,
+    /// Bytecode offsets whose instructions were processed. The control-flow
+    /// walk reads it when the body is finished: an instruction nobody
+    /// processed belongs to a region the decompilation dropped, and the
+    /// caller must say so instead of presenting a partial body as the whole.
+    scanned: BTreeSet<usize>,
     /// Bytecode offset of the earliest `VM_SPDS` store of each name declared
     /// on `this` in this object, keyed by name.
     ///
@@ -138,6 +143,7 @@ impl<'f> Scanner<'f> {
             regs: BTreeMap::new(),
             flag: None,
             declared: BTreeSet::new(),
+            scanned: BTreeSet::new(),
             declaration_offsets: declaration_offsets(file, object),
             materialized: BTreeSet::new(),
             out: Vec::new(),
@@ -208,6 +214,11 @@ impl<'f> Scanner<'f> {
 
     pub(crate) fn unhandled_count(&self) -> usize {
         self.unhandled
+    }
+
+    /// Bytecode offsets whose instructions were processed on some path.
+    pub(crate) fn scanned_offsets(&self) -> &BTreeSet<usize> {
+        &self.scanned
     }
 
     /// Extracts the current condition expression (the VM flag as a boolean
@@ -303,6 +314,7 @@ impl<'f> Scanner<'f> {
         }
         let mut side = Vec::new();
         for inst in &slice[..slice.len() - 1] {
+            self.scanned.insert(inst.offset);
             let effect = self.effect(inst);
             match effect {
                 Effect::Def {
@@ -345,6 +357,7 @@ impl<'f> Scanner<'f> {
             }
         }
         let last = &slice[slice.len() - 1];
+        self.scanned.insert(last.offset);
         self.finalize(last, side);
     }
 
