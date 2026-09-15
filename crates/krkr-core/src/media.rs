@@ -105,6 +105,16 @@ pub trait StorageMediaProvider: Send + Sync {
     /// trailing `/` on directories (`fstat/Main.cpp:469-472`,
     /// `dirlist/Main.cpp:56-64`).
     ///
+    /// The engine also reads this listing as the auto-path table's media half
+    /// (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1119-1125`): the children a
+    /// media-backed auto path lists become the names
+    /// `TVPGetPlacedPath` places on that path (`:1185-1191`), which is how
+    /// `Storages.addAutoPath("proxy://./")` makes a plain `krmovie.dll`
+    /// request reach the `proxy` media. A name a media serves but does not
+    /// list is therefore *not* placed by its auto path; the current-folder
+    /// check stays ahead of the table (`:1169-1184`), so a listing can never
+    /// shadow a real file.
+    ///
     /// `ErrorKind::NotFound` or `ErrorKind::Unsupported` mean "this media does
     /// not serve a directory here" — the resolver then falls back to the
     /// built-in stack, exactly like a failed existence probe. Any other error

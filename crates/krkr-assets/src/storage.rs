@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    ffi::OsStr,
     fs::{self, File},
     hash::Hash,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
@@ -23,6 +24,10 @@ use crate::media::{FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, s
 const RAW_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const RAW_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 const EXTERNAL_MEMORY_CACHE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
+/// How often a lookup retries the media auto-path rebuild after a retirement
+/// won the race (see `ProjectStorage::media_auto_path_table`). Retirements are
+/// script-thread events, so a second attempt normally sees a stable list.
+const MEDIA_AUTO_PATH_REBUILD_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct ProjectStorage {
@@ -74,6 +79,17 @@ struct ProjectStorageInner {
     /// native filesystem-backed views never use it.
     memory_writes: Mutex<BTreeMap<String, Arc<[u8]>>>,
     auto_paths: RwLock<Vec<String>>,
+    /// The media half of the auto-path table, cached the way the reference
+    /// caches it (`TVPRebuildAutoPathTable`, `StorageIntf.cpp:1035-1144`).
+    /// `None` means "rebuild before the next lookup"; the auto-path mutations
+    /// and media registration retire it (`TVPClearAutoPathCache`, `:978-983`,
+    /// called by `TVPAddAutoPath`/`TVPRemoveAutoPath`, `:1014`, `:1032`).
+    media_auto_paths: Mutex<Option<MediaAutoPathCache>>,
+    /// Bumped by every retirement of [`Self::media_auto_paths`], so a rebuild
+    /// that started before it can tell that the table it just built predates
+    /// the new auto-path list and must not be cached (the reference keeps the
+    /// two under one critical section, `StorageIntf.cpp:1040`, `:1141`).
+    media_auto_paths_generation: AtomicU64,
     /// Registered storage media (`TVPRegisterStorageMedia`), keyed by the
     /// lowercased media name so `psb://` and `PSB://` reach the same provider.
     /// A `RwLock` because plugins register while the engine serves reads from
@@ -140,6 +156,90 @@ impl CatalogIndex {
         self.basenames
             .get(basename_lower)
             .and_then(|path| path.as_deref())
+    }
+}
+
+/// The media half of the auto-path table (`TVPRebuildAutoPathTable`,
+/// `StorageIntf.cpp:1035-1144`).
+///
+/// The reference builds it by *listing* every auto path through the media
+/// manager (`TVPStorageMediaManager::GetListAt`, `:509-515`): each listed
+/// child becomes a `name → auto path` entry (`:1119-1125`), a later
+/// declaration replacing an earlier one for the same name
+/// (`tTJSHashTable::Add`, `tjs2/tjsHashSearch.h:245-250`), and
+/// `TVPGetPlacedPath` places a request with the entry's path (`*result +
+/// storagename`, `:1185-1191`).
+///
+/// Only auto paths whose scheme a registered media owns are listed here. A
+/// plain folder or an `archive.xp3>` auto path stays on the engine's
+/// filesystem/XP3 candidate walk, which resolves them live and
+/// case-insensitively instead of from a snapshot.
+#[derive(Debug, Default)]
+struct MediaAutoPathTable {
+    /// Every auto path a registered media owns, with the media name space the
+    /// engine hands the media (`everything after ://`, `StorageIntf.cpp:164-168`).
+    media_paths: BTreeSet<String>,
+    /// Listed child name → the auto path that listed it.
+    entries: BTreeMap<String, String>,
+    /// Media-backed auto paths whose media cannot enumerate its name space.
+    /// `GetListAt` is a required member of `iTVPStorageMedia`
+    /// (`StorageIntf.h:136`); a provider that answers `NotFound`/`Unsupported`
+    /// has no listing here yet, so the lookup asks the media about
+    /// `auto path + name` instead of consulting `entries`.
+    probes: BTreeSet<String>,
+}
+
+impl MediaAutoPathTable {
+    /// The name the table places `clean` with, when this auto path is the one
+    /// that owns the request's storage name (`TVPGetPlacedPath` looks the
+    /// table up under `TVPExtractStorageName(normalized)` and returns
+    /// `*result + storagename`, `StorageIntf.cpp:1182-1192`).
+    fn placed_name(&self, auto_path: &str, clean: &Path) -> Option<String> {
+        if !self.media_paths.contains(auto_path) {
+            return None;
+        }
+        let storagename = clean.file_name().and_then(OsStr::to_str)?;
+        let listed = self
+            .entries
+            .get(storagename)
+            .is_some_and(|listed_by| listed_by == auto_path);
+        if !listed && !self.probes.contains(auto_path) {
+            return None;
+        }
+        Some(join_media_auto_path(auto_path, storagename))
+    }
+}
+
+/// The cached media half of the auto-path table, with the generation of the
+/// auto-path list it was built from.
+///
+/// The generation is what keeps a [retirement](ProjectStorage::clear_media_auto_paths)
+/// from being overwritten by a rebuild that was already listing the media: the
+/// reference holds one critical section across both
+/// (`tTJSCriticalSectionHolder cs_holder(TVPCreateStreamCS)`,
+/// `StorageIntf.cpp:1040`, released after `AutoPathTableInit = true`, `:1141`;
+/// `TVPAddAutoPath`/`TVPRemoveAutoPath` take the same section, `:999-1015`,
+/// `:1017-1033`), so a clear can never interleave with a rebuild there.
+#[derive(Debug)]
+struct MediaAutoPathCache {
+    generation: u64,
+    table: Arc<MediaAutoPathTable>,
+}
+
+/// `*result + storagename` (`StorageIntf.cpp:1189`): the placed name is the
+/// auto path with the request's storage name appended.
+///
+/// `Storages.addAutoPath` stores the path without the trailing delimiter the
+/// reference requires (`TVPAddAutoPath` throws
+/// `TVPMissingPathDelimiterAtLast` otherwise, `:1003-1005`), so the delimiter
+/// is put back here — `proxy://./` reaches the media as the `./` its
+/// dictionary is keyed with (`tMediaRecord::GetDomainAndPath`, `:164-168`).
+fn join_media_auto_path(auto_path: &str, storagename: &str) -> String {
+    let base = auto_path.trim_end_matches('/');
+    if base.is_empty() {
+        storagename.to_string()
+    } else {
+        format!("{base}/{storagename}")
     }
 }
 
@@ -387,6 +487,8 @@ impl ProjectStorage {
                 catalog_index: RwLock::new(catalog_index),
                 memory_writes: Mutex::new(BTreeMap::new()),
                 auto_paths: RwLock::new(auto_paths),
+                media_auto_paths: Mutex::new(None),
+                media_auto_paths_generation: AtomicU64::new(0),
                 media_providers: RwLock::new(BTreeMap::new()),
                 revision: AtomicU64::new(1),
                 graphic_revision: AtomicU64::new(1),
@@ -627,6 +729,9 @@ impl ProjectStorage {
         };
         if !auto_paths.iter().any(|item| item == &path) {
             auto_paths.push(path);
+            // `TVPAddAutoPath` clears the auto-path cache (`StorageIntf.cpp:1014`),
+            // which is what retires the table the last lookup built.
+            self.clear_media_auto_paths();
             self.invalidate_caches();
         }
     }
@@ -645,9 +750,136 @@ impl ProjectStorage {
         });
         let removed = before != auto_paths.len();
         if removed {
+            // `TVPRemoveAutoPath` clears the cache too (`StorageIntf.cpp:1032`).
+            self.clear_media_auto_paths();
             self.invalidate_caches();
         }
         removed
+    }
+
+    /// Retires the cached media half of the auto-path table
+    /// (`TVPClearAutoPathCache`, `StorageIntf.cpp:978-983`): the next lookup
+    /// that needs it lists the media-backed auto paths again.
+    ///
+    /// The generation is bumped *before* the cache is cleared, so a rebuild
+    /// that is inside the media listing while this runs cannot store its
+    /// now-stale table afterwards ([`Self::media_auto_path_table`] refuses a
+    /// store whose generation moved). The reference gets the same guarantee
+    /// from one critical section around the rebuild and the clear
+    /// (`StorageIntf.cpp:1040`, `:1141` versus `:999-1033`).
+    fn clear_media_auto_paths(&self) {
+        self.inner
+            .media_auto_paths_generation
+            .fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut table) = self.inner.media_auto_paths.lock() {
+            *table = None;
+        }
+    }
+
+    /// The media half of the auto-path table, rebuilt on demand and cached
+    /// until something retires it — what `TVPRebuildAutoPathTable` does with
+    /// its `AutoPathTableInit` flag (`StorageIntf.cpp:1035-1043`).
+    ///
+    /// The rebuild does not hold the cache lock (it can list a container), so
+    /// the pair is made atomic the way the reference's critical section makes
+    /// it (`TVPCreateStreamCS`, `:1040`, `:1141`): the generation the rebuild
+    /// started from is re-checked before the store, a retirement that landed
+    /// meanwhile wins, and the attempt is repeated so the lookup that lost the
+    /// race still answers from the retired list. Only after
+    /// [`MEDIA_AUTO_PATH_REBUILD_ATTEMPTS`] lost attempts is a table returned
+    /// without being cached — nothing stale can survive in the cache.
+    fn media_auto_path_table(&self) -> Arc<MediaAutoPathTable> {
+        for _ in 0..MEDIA_AUTO_PATH_REBUILD_ATTEMPTS {
+            let generation = self
+                .inner
+                .media_auto_paths_generation
+                .load(Ordering::SeqCst);
+            if let Ok(cache) = self.inner.media_auto_paths.lock()
+                && let Some(cached) = cache.as_ref()
+                && cached.generation == generation
+            {
+                return Arc::clone(&cached.table);
+            }
+            let table = Arc::new(self.rebuild_media_auto_path_table());
+            if let Ok(mut cache) = self.inner.media_auto_paths.lock()
+                && self
+                    .inner
+                    .media_auto_paths_generation
+                    .load(Ordering::SeqCst)
+                    == generation
+            {
+                *cache = Some(MediaAutoPathCache {
+                    generation,
+                    table: Arc::clone(&table),
+                });
+                return table;
+            }
+            // A retirement landed while the media was being listed: this table
+            // may predate it and must not overwrite the retirement, so it is
+            // not cached and the next attempt rebuilds from the new list.
+        }
+        Arc::new(self.rebuild_media_auto_path_table())
+    }
+
+    /// Lists every media-backed auto path through its media
+    /// (`TVPStorageMediaManager::GetListAt`, `StorageIntf.cpp:1119`), the step
+    /// that makes `Storages.addAutoPath("proxy://./")` place a plain name on
+    /// the media.
+    ///
+    /// The auto path is stored the way `Storages.addAutoPath` left it — without
+    /// the trailing delimiter the reference's `TVPAddAutoPath` requires — so
+    /// the media is handed the re-delimited name space the reference would
+    /// have stored (`:1003-1007`): `proxy://./` lists `./`, not `.`.
+    fn rebuild_media_auto_path_table(&self) -> MediaAutoPathTable {
+        let mut table = MediaAutoPathTable::default();
+        for auto_path in self.auto_paths() {
+            // The reference's archive branch (`:1055-1105`) lists an
+            // `archive.xp3>prefix` auto path out of the archive itself; those
+            // keep resolving through the engine's XP3 candidate walk.
+            if auto_path.contains('>') {
+                continue;
+            }
+            let Some((media_name, media_path)) = split_media_name(&auto_path) else {
+                // A plain folder: the built-in stack resolves it per lookup,
+                // live and case-insensitively.
+                continue;
+            };
+            let Some(provider) = self.media_provider(media_name) else {
+                // An unregistered scheme keeps falling through to the built-in
+                // stack, the divergence `crate::media` records; the reference
+                // throws `TVPUnsupportedMediaName` out of the listing
+                // (`StorageIntf.cpp:211-222`).
+                continue;
+            };
+            table.media_paths.insert(auto_path.clone());
+            let namespace = if media_path.ends_with('/') {
+                media_path.to_string()
+            } else {
+                format!("{media_path}/")
+            };
+            match provider.list(&namespace) {
+                Ok(children) => {
+                    for child in children {
+                        // `GetListAt` adds files, never directories
+                        // (`tTVPFileMedia::GetListAt`, `base/win32/StorageImpl.cpp:132-141`),
+                        // and a child that still carries a delimiter is one the
+                        // reference's storage-name lookup could not reach.
+                        if child.is_empty() || child.ends_with('/') || child.contains('/') {
+                            continue;
+                        }
+                        table.entries.insert(child, auto_path.clone());
+                    }
+                }
+                // `GetListAt` is part of `iTVPStorageMedia`
+                // (`StorageIntf.h:136`); a provider that cannot list yet
+                // contributes no entries, and the lookup asks it about
+                // `auto path + name` instead.
+                Err(_) => {
+                    table.probes.insert(auto_path.clone());
+                }
+            }
+        }
+        table
     }
 
     pub fn clear_archive_cache(&self) -> Result<()> {
@@ -716,7 +948,14 @@ impl ProjectStorage {
         providers.insert(name, provider);
         drop(providers);
         // A newly registered media can satisfy names that previously missed,
-        // so the negative lookup entries have to go.
+        // so the negative lookup entries have to go, and an auto path whose
+        // scheme it now owns can be listed for the first time. The reference
+        // does not clear its auto-path table at registration
+        // (`TVPRegisterStorageMedia`, `StorageIntf.cpp:530-533`) because a
+        // plugin registers at load time, before any game script adds a path;
+        // registration here can happen mid-session (`Plugins.link`), so the
+        // table is retired as well.
+        self.clear_media_auto_paths();
         self.invalidate_caches();
         Ok(())
     }
@@ -733,6 +972,10 @@ impl ProjectStorage {
             .map(|mut providers| providers.remove(&name).is_some())
             .unwrap_or(false);
         if removed {
+            // The scheme has no provider any more, so its auto-path entries
+            // must go with it (see `register_media` on why this is cleared
+            // here while the reference only clears on an auto-path change).
+            self.clear_media_auto_paths();
             self.invalidate_caches();
         }
         removed
@@ -835,12 +1078,21 @@ impl ProjectStorage {
         if self.find_absolute_storage(name).ok().flatten().is_some() {
             return true;
         }
-        let Ok(candidates) = exact_storage_candidates_with_auto_paths(name, &self.auto_paths())
-        else {
+        let Ok(candidates) = exact_storage_candidates_with_auto_paths(
+            name,
+            &self.auto_paths(),
+            &self.media_auto_path_table(),
+        ) else {
             return false;
         };
 
         for candidate in candidates {
+            // A media-backed auto-path candidate is itself a media name: the
+            // reference places the name and then dispatches on it
+            // (`StorageIntf.cpp:1189`, `:1279-1289`).
+            if self.media_location(&candidate).is_some() {
+                return true;
+            }
             if let Some((archive, member)) = split_archive_candidate(&candidate) {
                 if self
                     .inner
@@ -1371,7 +1623,12 @@ impl ProjectStorage {
         name: &str,
         kind: StorageLoadKind,
     ) -> Result<Vec<String>> {
-        storage_candidates_with_auto_paths(name, &self.auto_paths(), kind)
+        storage_candidates_with_auto_paths(
+            name,
+            &self.auto_paths(),
+            &self.media_auto_path_table(),
+            kind,
+        )
     }
 
     fn resolve_storage(&self, name: &str) -> Result<LocatedResource> {
@@ -1418,8 +1675,13 @@ impl ProjectStorage {
             return storage.ok_or_else(|| storage_not_found(name));
         }
 
-        let groups =
-            storage_candidate_groups(name, &self.auto_paths(), kind).map_err(tjs_error_to_io)?;
+        let groups = storage_candidate_groups(
+            name,
+            &self.auto_paths(),
+            &self.media_auto_path_table(),
+            kind,
+        )
+        .map_err(tjs_error_to_io)?;
         // Candidates are ordered the way the reference searches: the requested
         // name itself (the project folder) first, then one candidate per auto
         // path in *reverse* declaration order, so the last `Storages.addAutoPath`
@@ -1451,6 +1713,14 @@ impl ProjectStorage {
         // whether that declaration names a folder or an archive.
         for candidates in &groups {
             for candidate in candidates {
+                // A media-backed auto-path candidate is a media name
+                // (`TVPGetPlacedPath` returns `proxy://./krmovie.dll`, and
+                // `_TVPCreateStream` then opens it through the media,
+                // `StorageIntf.cpp:1189`, `:1279-1289`).
+                if let Some(storage) = self.media_location(candidate) {
+                    self.cache_lookup(kind, name, Some(storage.clone()));
+                    return Ok(storage);
+                }
                 if let Some((archive, member)) = split_archive_candidate(candidate) {
                     if let Some(provider) = &self.inner.xp3_provider
                         && let Some(entry) = provider.get_entry_in(archive, member)
@@ -2263,12 +2533,11 @@ fn infer_encoding_from_path(path: &Path) -> Option<&'static Encoding> {
 fn storage_candidates_with_auto_paths(
     name: &str,
     auto_paths: &[String],
+    media_table: &MediaAutoPathTable,
     kind: StorageLoadKind,
 ) -> Result<Vec<String>> {
-    Ok(storage_candidate_groups(name, auto_paths, kind)?
-        .into_iter()
-        .flatten()
-        .collect())
+    let groups = storage_candidate_groups(name, auto_paths, media_table, kind)?;
+    Ok(groups.into_iter().flatten().collect())
 }
 
 /// Candidate spellings for one lookup, grouped by the requested spelling: the
@@ -2282,6 +2551,7 @@ fn storage_candidates_with_auto_paths(
 fn storage_candidate_groups(
     name: &str,
     auto_paths: &[String],
+    media_table: &MediaAutoPathTable,
     kind: StorageLoadKind,
 ) -> Result<Vec<Vec<String>>> {
     let names = storage_lookup_names(name, kind)?;
@@ -2291,7 +2561,7 @@ fn storage_candidate_groups(
         let mut candidates = Vec::with_capacity(auto_paths.len() + 1);
         push_unique_storage_candidate(&mut candidates, &clean);
         for auto_path in auto_paths.iter().rev() {
-            for candidate in auto_path_candidates(auto_path, &clean) {
+            for candidate in auto_path_candidates(auto_path, &clean, media_table) {
                 push_unique_storage_name(&mut candidates, candidate);
             }
         }
@@ -2303,20 +2573,39 @@ fn storage_candidate_groups(
 fn exact_storage_candidates_with_auto_paths(
     name: &str,
     auto_paths: &[String],
+    media_table: &MediaAutoPathTable,
 ) -> Result<Vec<String>> {
     let normalized = normalize_storage_separators(name);
     let clean = clean_relative_path(&normalized)?;
     let mut candidates = Vec::with_capacity(auto_paths.len() + 1);
     push_unique_storage_candidate(&mut candidates, &clean);
     for auto_path in auto_paths.iter().rev() {
-        for candidate in auto_path_candidates(auto_path, &clean) {
+        for candidate in auto_path_candidates(auto_path, &clean, media_table) {
             push_unique_storage_name(&mut candidates, candidate);
         }
     }
     Ok(candidates)
 }
 
-fn auto_path_candidates(auto_path: &str, clean: &Path) -> Vec<String> {
+/// The candidates one auto path contributes for `clean`. A media-backed auto
+/// path contributes the name its media placed (`TVPGetPlacedPath` returns
+/// `auto path + storagename`, `StorageIntf.cpp:1189`); every other auto path
+/// contributes the folder/archive join the engine has always resolved.
+fn auto_path_candidates(
+    auto_path: &str,
+    clean: &Path,
+    media_table: &MediaAutoPathTable,
+) -> Vec<String> {
+    if media_table.media_paths.contains(auto_path) {
+        // The table only places names this auto path listed: the reference
+        // rebuilds it by listing the media (`TVPRebuildAutoPathTable`,
+        // `StorageIntf.cpp:1035-1144`), so a name the listing does not carry
+        // has no entry and misses, even when the media itself would serve it.
+        return media_table
+            .placed_name(auto_path, clean)
+            .into_iter()
+            .collect();
+    }
     let Some(inner) = normalize_auto_path(auto_path) else {
         return Vec::new();
     };
@@ -3139,13 +3428,16 @@ mod tests {
         );
     }
 
-    /// The media auto-path divergence `crate::media`'s module doc records: the
-    /// stored auto path keeps its `media://` spelling, but joining a candidate
-    /// re-parses the path through `Path`, which collapses the structural `//`
-    /// before the name is ever handed to `split_media_name`. Pinned so neither
-    /// half of the statement drifts unnoticed.
+    /// A media-backed auto path whose scheme has no registered provider keeps
+    /// the folder join: the reference would throw `TVPUnsupportedMediaName` out
+    /// of its listing (`StorageIntf.cpp:211-222`), and this engine's
+    /// unregistered schemes keep resolving through the built-in stack (the
+    /// divergence `crate::media` records). Once a provider owns the scheme the
+    /// candidate is the placed media name — `crate::media`'s
+    /// `media_auto_path_places_a_plain_name_on_the_listing_media` pins that
+    /// half.
     #[test]
-    fn media_auto_path_candidates_still_fold_the_media_prefix() {
+    fn media_auto_path_candidates_without_a_provider_keep_the_folder_join() {
         let storage = ProjectStorage::new(None, Vec::new(), None, Vec::new());
         storage.add_auto_path("psb://container.psb/");
 
