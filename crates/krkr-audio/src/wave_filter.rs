@@ -57,7 +57,7 @@
 //! | ---- | ----- | ------ |
 //! | a storage buffer (`WaveSoundBuffer.open`) | yes | the reference decodes every buffer through the chain on its own thread (`sound/win32/WaveImpl.cpp:2348-2364`), so a filtered instance is loaded whole and played through [`FilteredPcmDecoder`], the closest of this engine's paths |
 //! | a live PCM stream (movie soundtracks, `AudioCommand::PlayPcmStream`) | no | a movie's audio goes through the movie graph (`VideoOverlay`), which has no `filters` property in the reference either; the engine never attaches a chain to a video instance's audio id |
-//! | kira's own streaming file decoder | no, by design | its frames are private, so a filtered instance is routed to the static path instead (`dispatch_play_load`) rather than silently playing unfiltered |
+//! | kira's own streaming file decoder | no, by design | its frames are private, so a filtered instance is routed to the static path instead (`dispatch_play_load`) rather than silently playing unfiltered; the same opacity is why an *unfiltered* streaming sound — a looping BGM by default — registers no PCM tap either (see `register_sound_tap`) |
 //! | a paused / armed buffer | yes, silent | the chain is built and reset at a play whose stream stays paused (M207's armed play, M213's `open`-clears-the-pause); pausing does not touch it |
 //!
 //! The chain's lifetime follows the reference's, not the stream's: the list an
@@ -89,14 +89,21 @@ use krkr_core::PcmAudioSpec;
 /// mutability.
 pub trait WaveFilter: Send + Sync {
     /// Attaches the filter to a source of `spec` samples — the reference's
-    /// `Recreate`.  The returned format is what the chain hands the next
-    /// filter (and finally the buffer), so a filter may narrow it.  An
-    /// `Err` is the reference's refusal to connect (the shipped
-    /// `wfBasicEffect.dll` throws `HiRes format not supported.` for a format
-    /// wider than 32 bits or with more than four channels, and
-    /// `Cannot connect multiple wave sound buffer at once.` for a second
-    /// upstream source): the element is left out of the chain and the reason
-    /// is reported.
+    /// `Recreate`, which answers the format the next stage sees.
+    ///
+    /// The returned format is folded into the chain, but only its sample rate
+    /// reaches the port's filters: the render path is stereo end to end, so a
+    /// filter that answers a different channel count is refused by
+    /// [`WaveFilterChain::build`] and reported (the reference would hand the
+    /// narrower format on).  An `Err` is the reference's refusal to connect —
+    /// the shipped `wfBasicEffect.dll` throws `HiRes format not supported.`
+    /// for a format wider than 32 bits or with more than four channels, and
+    /// `Cannot connect multiple wave sound buffer at once.` when a second
+    /// upstream source is connected while one is live — and the element is
+    /// left out of the chain with the reason reported.  A filter that is
+    /// already held by a live chain must refuse the reconnect: the chain
+    /// releases its filters when it drops ([`WaveFilterChain`]'s `Drop`), which
+    /// is the reference's `Clear`.
     fn recreate(&self, spec: PcmAudioSpec) -> Result<PcmAudioSpec, String>;
 
     /// Releases what [`WaveFilter::recreate`] built — `Clear`, called when the
@@ -221,10 +228,23 @@ impl WaveFilterChain {
                 continue;
             };
             match filter.recreate(current) {
-                Ok(next) => {
+                Ok(next) if next.channels == current.channels => {
                     current = next;
                     filters.push(filter);
                 }
+                // The render path is two channels all the way down (kira's
+                // `Frame` is a stereo pair and the decoder publishes stereo
+                // units), so a filter that asks for a different channel count
+                // cannot be honoured.  The reference would resample the format
+                // through its own buffer; refusing is the honest answer here,
+                // and the refusal is reported like any other.
+                Ok(next) => skipped.push(WaveFilterSkip {
+                    id: *id,
+                    reason: format!(
+                        "cannot change the channel count ({} -> {})",
+                        current.channels, next.channels
+                    ),
+                }),
                 Err(reason) => skipped.push(WaveFilterSkip { id: *id, reason }),
             }
         }
@@ -237,8 +257,15 @@ impl WaveFilterChain {
         )
     }
 
-    /// The format the chain hands the buffer — the reference's
-    /// `FilterOutput->GetFormat()` (`sound/win32/WaveImpl.cpp:2938`).
+    /// The format the chain connected with — the reference reads
+    /// `FilterOutput->GetFormat()` here (`sound/win32/WaveImpl.cpp:2938`).
+    ///
+    /// A filter may narrow the sample rate it was connected with (the port's
+    /// filters re-design themselves at [`WaveFilter::recreate`] time rather
+    /// than resampling), but the channel count is the sound's: the render path
+    /// is stereo end to end, so a filter that asks for another channel count
+    /// is refused at build time and reported in [`WaveFilterChain::build`]'s
+    /// skips.
     pub const fn spec(&self) -> PcmAudioSpec {
         self.spec
     }
@@ -277,6 +304,19 @@ impl WaveFilterChain {
         for filter in &self.filters {
             filter.process(frames);
         }
+    }
+}
+
+impl Drop for WaveFilterChain {
+    /// Dropping the chain releases what it connected: the reference's
+    /// `ClearFilterChain` per-filter `Clear()` (`sound/WaveIntf.cpp:907-923`)
+    /// runs when the buffer clears its chain (at `open` and unload), and this
+    /// chain lives exactly as long as one playback — so a filter is free to
+    /// join the next chain, and one that is still held by a live chain refuses
+    /// the reconnect (`WaveFilter::recreate`'s one-buffer rule, the shipped
+    /// DLL's `Cannot connect multiple wave sound buffer at once.`).
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -487,6 +527,44 @@ mod tests {
 
         unregister_wave_filter(rejecting_id);
         unregister_wave_filter(accepting_id);
+    }
+
+    /// A filter that answers a different *channel* count than it was connected
+    /// with is refused: the render path is stereo end to end, so the format
+    /// folding stops at the sample rate (see [`WaveFilterChain::spec`]), and
+    /// the refusal is reported rather than silently ignored.
+    #[test]
+    fn a_filter_changing_the_channel_count_is_refused_and_reported() {
+        struct ToMono;
+
+        impl WaveFilter for ToMono {
+            fn recreate(&self, spec: PcmAudioSpec) -> std::result::Result<PcmAudioSpec, String> {
+                Ok(PcmAudioSpec {
+                    sample_rate: spec.sample_rate,
+                    channels: 1,
+                })
+            }
+            fn clear(&self) {}
+            fn update(&self) {}
+            fn reset(&self) {}
+            fn process(&self, frames: &mut [f32]) {
+                for sample in frames.iter_mut() {
+                    *sample *= 3.0;
+                }
+            }
+        }
+
+        let id = register_wave_filter(Arc::new(ToMono));
+        let (chain, skipped) = WaveFilterChain::build(&[id.raw()], spec());
+        assert!(chain.is_empty(), "the narrowing filter must not join");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].id, id.raw());
+        assert!(
+            skipped[0].reason.contains("channel count"),
+            "the reason names the refusal: {:?}",
+            skipped[0].reason
+        );
+        unregister_wave_filter(id);
     }
 
     /// An `interface` value nobody registered (a script-fabricated one) is

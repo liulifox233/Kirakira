@@ -925,9 +925,19 @@ fn handle_prepared_audio(
 /// there is nothing this tap can serve: the function returns `None` for a
 /// streaming sound, **no tap instance is registered for its id**, and
 /// [`PcmTap::read`], [`PcmTap::state`] and [`PcmTap::cursor`] answer `None` for
-/// it — consumers must treat that as "no PCM available". Feeding streaming
-/// sounds needs `StreamingSoundData::from_decoder` with a decoder of our own
-/// that publishes the frames it decodes.
+/// it — consumers must treat that as "no PCM available".
+///
+/// This is the readback's one real gap, and it is the *common* case: a looping
+/// BGM is loaded with [`AudioLoadPolicy::Streaming`] by default
+/// ([`resolve_play_policy`]), so the engine's `getVisBuffer`, `getSample.dll`
+/// and `fftgraph.dll` see silence for it (`only_static_sounds_register_a_tap`
+/// pins that).  Closing it needs a decoder of our own for that path —
+/// `StreamingSoundData::from_decoder` with a file decoder that publishes every
+/// chunk it decodes, which means decoding the formats ourselves instead of
+/// letting kira do it — or loading such a sound whole (which costs its full
+/// decoded size for every BGM, the thing the streaming path exists to avoid).
+/// A buffer that carries filters or is loaded statically is unaffected:
+/// [`FilteredPcmDecoder`] publishes what it renders, so its tap works.
 fn register_sound_tap(
     pcm_tap: &PcmTap,
     id: AudioInstanceId,

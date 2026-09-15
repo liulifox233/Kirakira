@@ -31,6 +31,15 @@
 //! a lie about a playing one — [`WavePcmSource`] is the only sample source this
 //! engine has, and a plugin that needs different samples installs its own.
 //!
+//! **The one playback path with no samples.** A sound kira decodes itself — a
+//! storage load whose policy is `Streaming` (`AudioLoadPolicy::Auto` picks it
+//! for a looping or BGM buffer) — keeps its frames in kira's private decode
+//! queue, so `krkr-audio` registers no tap for it and reads for that instance
+//! answer `None`, exactly as for a host with no backend.  A statically loaded
+//! buffer (SE, voice, preloaded sounds, and any buffer that carries filters)
+//! does register one.  Closing the streaming gap needs a file decoder of our
+//! own in `krkr-audio` (`register_sound_tap` documents the two routes).
+//!
 //! **Thread contract.** The engine reads windows on the script thread and the
 //! source reads the tap (which is lock-protected and never blocks a producer,
 //! see `krkr-audio`'s `pcm_tap` module), so [`WavePcmSource: Send + Sync`] is a

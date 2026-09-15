@@ -237,7 +237,10 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
@@ -276,9 +279,9 @@ impl KrkrPlugin for WfTypicalDspPlugin {
 
     fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
         install_wf_typical_dsp(runtime);
-        runtime.host_mut().log(
-            "wfTypicalDSP.dll registered: WaveDSPFilter (designer local; \u{200b}driven by \u{200b}WaveSoundBuffer.filters)",
-        );
+        runtime
+            .host_mut()
+            .log("wfTypicalDSP.dll registered: WaveDSPFilter (driven by WaveSoundBuffer.filters)");
         Ok(())
     }
 }
@@ -1850,6 +1853,11 @@ impl WaveDspState {
 /// chain under the same lock.
 struct SharedFilter {
     state: Mutex<FilterState>,
+    /// Whether a live chain holds this filter: the same one-source rule the
+    /// sibling `wfBasicEffect` port enforces (its DLL's adapter throws
+    /// [`MULTIPLE_BUFFER_ERROR`](crate::wf_basic_effect::MULTIPLE_BUFFER_ERROR)),
+    /// released when the chain drops.
+    connected: AtomicBool,
 }
 
 struct FilterState {
@@ -1869,19 +1877,32 @@ impl krkr_audio::WaveFilter for SharedFilter {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // One source at a time, like the sibling DLL family (see the field's
+        // note): the swap leaves the previous owner's claim intact.
+        if self.connected.swap(true, Ordering::SeqCst) {
+            return Err(crate::wf_basic_effect::MULTIPLE_BUFFER_ERROR.to_string());
+        }
         // The DLL's source adapter rejects a format wider than 32 bits or with
         // more than four channels (`HiRes format not supported.`, `0x10004e98`).
         if !(1..=2).contains(&spec.channels) {
+            self.connected.store(false, Ordering::SeqCst);
             return Err("invalid channels.".to_string());
         }
-        state.dsp.set_sample_rate(f64::from(spec.sample_rate))?;
+        // A re-design the DLL refuses (an unmodelled response, a bad cutoff)
+        // releases the claim too: the filter did not connect.
+        if let Err(error) = state.dsp.set_sample_rate(f64::from(spec.sample_rate)) {
+            self.connected.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
         state.channels = spec.channels.max(1);
         Ok(spec)
     }
 
     fn clear(&self) {
-        // Nothing of the filter's own to release: the chain is the instance's
-        // state, like the reference's, which only releases the connected source.
+        // The reference's `Clear` releases the connected source — the chain's
+        // hold, in this port's terms; the designed chain is the instance's and
+        // stays.
+        self.connected.store(false, Ordering::SeqCst);
     }
 
     fn update(&self) {
@@ -1927,6 +1948,7 @@ fn new_filter_slot(state: WaveDspState) -> FilterSlot {
             dsp: state,
             channels: 2,
         }),
+        connected: AtomicBool::new(false),
     });
     let id =
         krkr_audio::register_wave_filter(Arc::clone(&filter) as Arc<dyn krkr_audio::WaveFilter>);

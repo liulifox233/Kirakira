@@ -160,7 +160,10 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use krkr_engine::{KrkrHost, KrkrPlugin, plugin_api};
@@ -334,6 +337,13 @@ impl EffectState {
 /// `finalize`.
 struct SharedFilter {
     state: Mutex<FilterState>,
+    /// Whether a live chain holds this filter.  The shipped DLL's source
+    /// adapter refuses a second upstream source
+    /// ([`MULTIPLE_BUFFER_ERROR`]), and a chain releases its filters when it
+    /// drops (`krkr_audio::WaveFilterChain`'s `Drop`, the reference's
+    /// `Clear`), so the same filter may join the next chain but not two at
+    /// once.
+    connected: AtomicBool,
 }
 
 struct FilterState {
@@ -353,7 +363,17 @@ impl krkr_audio::WaveFilter for SharedFilter {
         // more than four channels (`HiRes format not supported.`, `0x10004e98`)
         // and every filter asks for one or two channels
         // (`check_filter_channels`, `invalid channels.`).
-        check_filter_channels(spec.channels).map_err(str::to_string)?;
+        // `Cannot connect multiple wave sound buffer at once.` (`0x10029798`,
+        // thrown from `0x10004e75` when a second source is connected while one
+        // is live).  The swap leaves the previous owner's claim intact: only the
+        // chain that got `false` may release it.
+        if self.connected.swap(true, Ordering::SeqCst) {
+            return Err(MULTIPLE_BUFFER_ERROR.to_string());
+        }
+        if let Err(reason) = check_filter_channels(spec.channels) {
+            self.connected.store(false, Ordering::SeqCst);
+            return Err(reason.to_string());
+        }
         let mut state = self
             .state
             .lock()
@@ -367,8 +387,9 @@ impl krkr_audio::WaveFilter for SharedFilter {
 
     fn clear(&self) {
         // The reference's `Clear` releases the source the filter was connected
-        // to; this filter owns no resources of its own, and its state is the
-        // instance's, so there is nothing to release here.
+        // to — the chain's hold on it, in this port's terms.  The DSP state is
+        // the instance's and stays.
+        self.connected.store(false, Ordering::SeqCst);
     }
 
     fn update(&self) {
@@ -416,6 +437,7 @@ fn new_filter_slot(state: EffectState) -> FilterSlot {
             effect: state,
             channels: 2,
         }),
+        connected: AtomicBool::new(false),
     });
     let id =
         krkr_audio::register_wave_filter(Arc::clone(&filter) as Arc<dyn krkr_audio::WaveFilter>);
@@ -2051,6 +2073,110 @@ mod tests {
         let (dropped, skipped) = krkr_audio::WaveFilterChain::build(&[id], spec);
         assert!(dropped.is_empty());
         assert_eq!(skipped.len(), 1, "a stale id is reported, not invented");
+    }
+
+    /// The shipped DLL's one-buffer rule, behaviourally: its source adapter
+    /// throws `Cannot connect multiple wave sound buffer at once.`
+    /// (`0x10029798`) while a source is connected, and the chain releases its
+    /// filters when it drops — the reference's `Clear` — so the same filter may
+    /// join the next chain but not two live ones.
+    #[test]
+    fn a_filter_held_by_a_live_chain_refuses_a_second_connection() {
+        let mut engine = engine();
+        let id: i64 = string(
+            &mut engine,
+            &format!("(function() {{ var v = new {FREE_VERB}(); return v.interface; }})()"),
+        )
+        .parse()
+        .expect("interface is an integer id");
+        let spec = krkr_audio::PcmAudioSpec {
+            sample_rate: 44_100,
+            channels: 2,
+        };
+
+        let (first, skipped) = krkr_audio::WaveFilterChain::build(&[id], spec);
+        assert!(skipped.is_empty(), "the first chain connects: {skipped:?}");
+        assert_eq!(first.len(), 1);
+
+        let (second, skipped) = krkr_audio::WaveFilterChain::build(&[id], spec);
+        assert!(second.is_empty(), "a second live chain must not connect");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, MULTIPLE_BUFFER_ERROR);
+
+        drop(first);
+        let (third, skipped) = krkr_audio::WaveFilterChain::build(&[id], spec);
+        assert!(
+            skipped.is_empty(),
+            "a dropped chain releases the filter: {skipped:?}"
+        );
+        assert_eq!(third.len(), 1);
+    }
+
+    /// The engine↔backend seam itself: `TapPcmSource` is the only code that
+    /// maps a `krkr-audio` tap window into the engine's
+    /// [`plugin_api::audio::WavePcmWindow`], so this drives a real
+    /// [`krkr_audio::PcmTap`] (through the process-wide handle an
+    /// `AudioSystem` publishes) and pins the mapping — the `aheadsamples`
+    /// lead, the format, the state and the availability count.
+    #[test]
+    fn the_tap_adapter_maps_the_window_the_engine_reads() {
+        use krkr_engine::plugin_api::audio::{WavePcmRequest, WavePcmSource, WavePcmState};
+
+        let _guard = lock_pcm_source();
+        let system = krkr_audio::AudioSystem::new();
+        let tap = krkr_audio::active_pcm_tap().expect("the system published its tap");
+        let id = krkr_audio::AudioInstanceId(7171);
+        let spec = krkr_audio::PcmAudioSpec {
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let feed = tap.register(id, spec);
+        // Arm the ring before publishing (an unread tap ignores publishes) and
+        // publish 16 frames at coordinates 0..16, both channels equal so the
+        // values are easy to read back.
+        let _ = tap.read(id, krkr_audio::PcmTapWindow::ahead(0));
+        let samples: Vec<f32> = (0..16)
+            .flat_map(|index| [index as f32, index as f32])
+            .collect();
+        feed.push_at(0, &samples);
+        feed.set_source_position(0);
+
+        let source = TapPcmSource;
+        // The reference's window without a lead: frames 0..4.
+        let window = source
+            .read_window(id, WavePcmRequest::new(0, 4))
+            .expect("the tap has the frames");
+        assert_eq!(window.spec, spec);
+        assert_eq!(window.state, WavePcmState::Playing);
+        assert_eq!(
+            window.samples,
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+            "the window starts at the cursor"
+        );
+        assert_eq!(window.available_frames, 4);
+
+        // `aheadsamples`: the window starts that many frames past the cursor,
+        // which is the lead the reference's ring read applies
+        // (`GetVisBuffer`, `sound/win32/WaveImpl.cpp:3296-3298`).
+        let window = source
+            .read_window(id, WavePcmRequest::new(2, 2))
+            .expect("the tap has the frames");
+        assert_eq!(
+            window.samples,
+            vec![2.0, 2.0, 3.0, 3.0],
+            "the lead is skipped, not delivered"
+        );
+        assert_eq!(window.available_frames, 2);
+
+        // Past the published frames: the tap answers, the window is empty.
+        let window = source
+            .read_window(id, WavePcmRequest::new(40, 2))
+            .expect("the instance is tapped");
+        assert_eq!(window.available_frames, 0);
+
+        feed.stop();
+        drop(system);
+        krkr_engine::plugin_api::audio::clear_wave_pcm_source();
     }
 
     /// Row-26 pin, `GraphicEqualizer`: the class entry (`0x10007fa0`) stores

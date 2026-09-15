@@ -4267,13 +4267,15 @@ fn wave_sound_buffer_get_vis_buffer(
         return Ok(Variant::Integer(0));
     }
     let samples = window.to_i16(channels);
-    // The reference copies exactly `numsamples` samples, wrapping inside its
-    // ring as it goes (`:3309-3324`); the tap window is already that length.
-    let samples = if samples.len() > samples_requested as usize {
-        &samples[..samples_requested as usize]
-    } else {
-        &samples[..]
-    };
+    // How many of them are real audio.  The reference copies `numsamples`
+    // samples and wraps inside its ring when the read runs past the end
+    // (`:3309-3324`), i.e. it can hand back stale audio; a caller's short-count
+    // rule (fftgraph zero-fills, `Main.cpp:59-63`) expects the count to be the
+    // truth, so this reports the frames the tap actually has.
+    let written = (window.available_frames as usize)
+        .min(samples_requested as usize)
+        .min(samples.len());
+    let samples = &samples[..written];
     let Some(destination) = destination else {
         // No destination at all: the reference still reports what it wrote.
         return Ok(Variant::Integer(samples.len() as i64));
@@ -12498,16 +12500,6 @@ mod tests {
         );
     }
 
-    /// PARQUET's voice-filter wrapper reads the member first:
-    /// `FilterHackedEnvWaveSoundBuffer.searchPlayableStorage` starts with
-    /// `filters.clear()` (`sysscn/voiceeffect.tjs`), so a native
-    /// `WaveSoundBuffer` that answers `void` aborts the prologue with
-    /// `Cannot convert the variable type ((void) to Object)`.
-    /// `WaveIntf.cpp:815` creates the array in the NI constructor, the getter
-    /// (`:1540-1554`) hands the same array back on every read, and the setter
-    /// is denied (`TJS_DENY_NATIVE_PROP_SETTER`, `:1552`): a script write
-    /// fails with `TJS_E_ACCESSDENYED` and leaves the instance's array alone.
-    #[test]
     /// Row-25 pin: `sampleValue` / `sampleCount` / `sampleAhead` are a plugin
     /// class extension, not core members — `getSample.dll` attaches all three
     /// to the `WaveSoundBuffer` class with ncbind's
@@ -12516,6 +12508,10 @@ mod tests {
     /// — so an instance read resolves through the class.  Installing them per
     /// instance would shadow the plugin's member *and* the engine's own
     /// class-level defaults; this pins both directions.
+    // The test registers a native property, whose closure carries the crate's
+    // `TjsError`-sized `Err` (`result_large_err`, the lint every native
+    // callback in this crate already trips).
+    #[allow(clippy::result_large_err)]
     #[test]
     fn plugin_class_level_sample_members_are_visible_on_an_instance() {
         use crate::{EngineConfig, KrkrEngine};
@@ -12591,6 +12587,71 @@ mod tests {
             visible,
             Variant::Real(0.42),
             "the plugin's class member must win over any instance member"
+        );
+    }
+
+    /// The written count is bounded by what the tap really has: the reference's
+    /// ring read would wrap into stale audio past the end
+    /// (`sound/win32/WaveImpl.cpp:3309-3324`), and a caller's short-count rule
+    /// (fftgraph zero-fills when fewer samples were written, `Main.cpp:59-63`)
+    /// needs the truth.
+    #[test]
+    fn get_vis_buffer_reports_only_the_available_frames() {
+        use crate::plugin_api::audio::{
+            WavePcmRequest, WavePcmSource, WavePcmState, WavePcmWindow, clear_wave_pcm_source,
+            set_wave_pcm_source,
+        };
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        struct ShortSource;
+
+        impl WavePcmSource for ShortSource {
+            fn read_window(
+                &self,
+                _id: AudioInstanceId,
+                request: WavePcmRequest,
+            ) -> Option<WavePcmWindow> {
+                Some(WavePcmWindow {
+                    spec: crate::plugin_api::audio::PcmAudioSpec {
+                        sample_rate: 44_100,
+                        channels: 2,
+                    },
+                    state: WavePcmState::Playing,
+                    samples: (0..request.frames)
+                        .flat_map(|index| {
+                            let value = index as f32 / 32767.0;
+                            [value, value]
+                        })
+                        .collect(),
+                    // Only the first two frames of any window carry decoded
+                    // audio — a tap whose ring has not filled yet.
+                    available_frames: request.frames.min(2),
+                })
+            }
+        }
+
+        let _guard = pcm_source_lock();
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        set_wave_pcm_source(Arc::new(ShortSource));
+        let value = engine
+            .execute_script(
+                "vis_short.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.open("tone.ogg");
+                buffer.play();
+                var samples = [];
+                var written = buffer.getVisBuffer(samples, 4, 1, 0);
+                return written + ":" + samples.count + ":" + samples.join(",");
+                "#,
+            )
+            .expect("script");
+        clear_wave_pcm_source();
+        assert_eq!(
+            value,
+            Variant::String("2:2:0,1".to_string()),
+            "only the frames the tap has are written and counted"
         );
     }
 
@@ -12679,6 +12740,14 @@ mod tests {
         let _ = Variant::Void;
     }
 
+    /// Serialises the tests that install the process-wide PCM source
+    /// (`plugin_api::audio`'s slot): they run in one process, and a source
+    /// another test installed would answer their reads.
+    fn pcm_source_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Row-24 pin: `getVisBuffer` over a *playing* buffer answers the samples
     /// the audio backend is rendering — nonzero, the reference's fetch
     /// (`sound/win32/WaveImpl.cpp:3274-3330`) with its raw `short*` destination
@@ -12722,6 +12791,7 @@ mod tests {
             }
         }
 
+        let _guard = pcm_source_lock();
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
         set_wave_pcm_source(Arc::new(ScriptedSource));
         let value = engine
@@ -12751,6 +12821,15 @@ mod tests {
         clear_wave_pcm_source();
     }
 
+    /// PARQUET's voice-filter wrapper reads the member first:
+    /// `FilterHackedEnvWaveSoundBuffer.searchPlayableStorage` starts with
+    /// `filters.clear()` (`sysscn/voiceeffect.tjs`), so a native
+    /// `WaveSoundBuffer` that answers `void` aborts the prologue with
+    /// `Cannot convert the variable type ((void) to Object)`.
+    /// `WaveIntf.cpp:815` creates the array in the NI constructor, the getter
+    /// (`:1540-1554`) hands the same array back on every read, and the setter
+    /// is denied (`TJS_DENY_NATIVE_PROP_SETTER`, `:1552`): a script write
+    /// fails with `TJS_E_ACCESSDENYED` and leaves the instance's array alone.
     #[test]
     fn wave_sound_buffer_filters_is_a_per_instance_array() {
         use crate::{EngineConfig, KrkrEngine};
