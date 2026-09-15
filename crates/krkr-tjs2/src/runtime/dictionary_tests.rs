@@ -735,10 +735,13 @@ fn dictionary_creation_size_changes_the_order() {
 // ---------------------------------------------------------------------------
 // `loadStruct`'s container rule
 
-/// A host with only the binary storage `loadStruct` reads.
+/// A host with the binary storage `loadStruct` reads, and the text storage its
+/// expression path reads.  `with` gives it only binary files, so the text path
+/// has nothing to fall back on -- which is what the container-rule test needs.
 #[derive(Default)]
 struct StructStorage {
     binary: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, String>,
 }
 
 impl StructStorage {
@@ -747,6 +750,17 @@ impl StructStorage {
             binary: files
                 .iter()
                 .map(|(name, contents)| (name.to_string(), contents.to_vec()))
+                .collect(),
+            files: BTreeMap::new(),
+        }
+    }
+
+    fn with_text(files: &[(&str, &str)]) -> Self {
+        Self {
+            binary: BTreeMap::new(),
+            files: files
+                .iter()
+                .map(|(name, contents)| (name.to_string(), contents.to_string()))
                 .collect(),
         }
     }
@@ -764,6 +778,13 @@ impl TjsHost for StructStorage {
         self.binary.insert(name.to_string(), bytes.to_vec());
         Ok(())
     }
+
+    fn read_text(&mut self, name: &str, _mode: &str) -> Result<String> {
+        self.files
+            .get(name)
+            .cloned()
+            .ok_or_else(|| TjsError::runtime(format!("cannot open {name}")))
+    }
 }
 
 fn run_with_struct_storage(files: &[(&str, &[u8])], source: &str) -> Variant {
@@ -778,14 +799,19 @@ fn struct_storage_failure(files: &[(&str, &[u8])], source: &str) -> TjsError {
     runtime.execute_file(&file).expect_err("script must fail")
 }
 
-/// `Dictionary.loadStruct` reads the reference's container only:
-/// `tTJSBinarySerializer::IsBinary` decides (`tjsDictionary.cpp:72-76`) against
-/// the eight-byte `KBAD100\0` header (`tjsBinarySerializer.cpp:19-21`), and a
-/// readable path holding anything else fails with `TJS_E_INVALIDPARAM`
-/// (`return TJS_E_INVALIDPARAM;`, `:121`).  There is no Integer success flag,
-/// and no line-based reconstruction of the file.
+fn run_with_text_storage(files: &[(&str, &str)], source: &str) -> Variant {
+    let mut runtime = Runtime::with_host(StructStorage::with_text(files));
+    let file = compile_source_to_bytecode("dictionary.tjs", source).expect("compile");
+    runtime.execute_file(&file).expect("execute")
+}
+
+/// `Dictionary.loadStruct` reads the binary container through
+/// `tTJSBinarySerializer::IsBinary` (`tjsDictionary.cpp:72-76`) and answers the
+/// deserialized root, never an Integer success flag.  A data pack of another
+/// kind is not a container: with no text stream to fall back on, the call fails
+/// with `TJS_E_INVALIDPARAM` (`return TJS_E_INVALIDPARAM;`, `:121`).
 #[test]
-fn load_struct_accepts_only_the_binary_container() {
+fn load_struct_answers_the_binary_container_or_invalid_param() {
     // A `TJS/4s0` data pack (`PackinOne.dll`'s LZ4 framing), which is what
     // `patch.xp3>title.pbd` holds.
     let error = struct_storage_failure(
@@ -795,21 +821,69 @@ fn load_struct_accepts_only_the_binary_container() {
     assert_eq!(error.kind, TjsErrorKind::InvalidParam);
     assert_eq!(error.tjs_error_code(), Some(-1003));
 
-    // A text struct is not a container either: the reference's text path reads
-    // the file as a *script expression* (`LoadTextDictionaryArray`,
-    // `tjs.cpp:607-624`) and only when the caller wants the value, which the
-    // TJS2-side reader here cannot see; a `key = value` file parses under
-    // neither rule.
-    let error = struct_storage_failure(
-        &[("state.ksd", b"answer = 42\r\n")],
-        r#"return Dictionary.loadStruct("state.ksd");"#,
-    );
-    assert_eq!(error.kind, TjsErrorKind::InvalidParam);
-
-    // An unreadable path: the reference's stream creation fails first and
-    // answers `TJS_E_INVALIDPARAM` too (`tjsDictionary.cpp:71-72`).
+    // An unreadable path: the reference's binary stream creation fails first
+    // and answers `TJS_E_INVALIDPARAM` too (`tjsDictionary.cpp:71-72`).
     let error = struct_storage_failure(&[], r#"return Dictionary.loadStruct("missing.ksd");"#);
     assert_eq!(error.kind, TjsErrorKind::InvalidParam);
+}
+
+/// The reference's *second* container: the text path
+/// (`tjsDictionary.cpp:104-110`) hands the file to
+/// `tTJS::LoadTextDictionaryArray` (`tjs.cpp:607-624`), which compiles it as a
+/// TJS `expression` -- `SetText(result, buffer, NULL, true)`
+/// (`tjsScriptBlock.cpp:230-237`) -- and the call answers that expression's
+/// value.  The engine writes exactly such an expression, so a text struct reads
+/// back through it, and the answer is the value, not an Integer success flag.
+#[test]
+fn load_struct_reads_the_text_form_as_an_expression() {
+    assert_eq!(
+        run_with_text_storage(
+            &[(
+                "state.ksd",
+                r#"%["answer" => 42, "child" => %["name" => "nested"]]"#,
+            )],
+            r#"
+            var loaded = Dictionary.loadStruct("state.ksd");
+            return typeof loaded + ":" + loaded.answer + ":" + loaded.child.name;
+            "#,
+        ),
+        Variant::String("Object:42:nested".into())
+    );
+
+    // Any expression, not just a dictionary literal: the reference answers
+    // `*result = *var` for whatever the file evaluates to.
+    assert_eq!(
+        run_with_text_storage(
+            &[("scalar.ksd", "7 + 35")],
+            r#"return Dictionary.loadStruct("scalar.ksd");"#,
+        ),
+        Variant::Integer(42)
+    );
+
+    // An empty file is not an error: `SetText` returns before it touches the
+    // result (`tjsScriptBlock.cpp:238-239`), so the call answers void.
+    assert_eq!(
+        run_with_text_storage(
+            &[("empty.ksd", "")],
+            r#"return Dictionary.loadStruct("empty.ksd");"#,
+        ),
+        Variant::Void
+    );
+
+    // The `key = value` line format was this crate's invention and stays out:
+    // it is not an expression, so the text path does not turn it into members.
+    let mut runtime = Runtime::with_host(StructStorage::with_text(&[(
+        "lines.ksd",
+        "answer = 42\r\n",
+    )]));
+    let file = compile_source_to_bytecode(
+        "dictionary.tjs",
+        r#"return Dictionary.loadStruct("lines.ksd");"#,
+    )
+    .expect("compile");
+    runtime
+        .execute_file(&file)
+        .expect_err("the line format is not the reference's text form");
 }
 
 /// The positive half: a `KBAD100\0` pack decodes and the call answers the

@@ -5,6 +5,7 @@ use std::{
 
 use regex::RegexBuilder;
 
+use crate::compile_source_to_bytecode;
 use crate::error::{Result, TjsError};
 use crate::runtime::object::Object;
 use crate::runtime::value::{ObjectHandle, Variant};
@@ -1130,21 +1131,37 @@ fn save_structured_value<H: TjsHost + 'static>(
     Ok(())
 }
 
-/// `Dictionary.loadStruct` (`tjsDictionary.cpp:51-121`) reads the reference's
-/// container and nothing else.  One parameter is mandatory (`:53`); a receiver
-/// that carries a Dictionary native instance is that call's `RootDictionary`
-/// and is cleared before the stream is opened (`ni->Clear()`, `:57-62`), while
-/// the class object -- which has no native instance -- is left alone and
-/// decoded into a throw-away dictionary (`if(!dic) dic = ...`, `:78-80`).  The
-/// container is then decided by `tTJSBinarySerializer::IsBinary` (`:72-76`) and
-/// the call answers the deserialized root (`if(result) *result = *var;`,
-/// `:84-88`); anything else -- a `TJS/ns0` data pack, a text struct, a path
-/// that cannot be read -- is `TJS_E_INVALIDPARAM` (`:121`).  There is no text
-/// fallback and no Integer success flag.  (The reference's text path compiles
-/// the file as a *script expression* and runs only when the caller wants the
-/// value -- `if(result)` / `LoadTextDictionaryArray`, `:104-118`, `tjs.cpp:607` --
-/// which a native handler here cannot see; the engine's `Scripts.evalStorage`
-/// is this crate's reader for that form.)
+/// `Dictionary.loadStruct` (`tjsDictionary.cpp:51-121`) reads two containers.
+/// One parameter is mandatory (`:53`); a receiver that carries a Dictionary
+/// native instance is that call's `RootDictionary` and is cleared before the
+/// stream is opened (`ni->Clear()`, `:57-62`), while the class object -- which
+/// has no native instance -- is left alone and decoded into a throw-away
+/// dictionary (`if(!dic) dic = ...`, `:78-80`).  Then:
+///
+/// * `tTJSBinarySerializer::IsBinary` (`:72-76`) picks a `KBAD100\0` pack, the
+///   call answers the deserialized root (`if(result) *result = *var;`,
+///   `:84-88`), and a data pack of any other kind falls through to the text
+///   path below.
+/// * The text path (`:104-110`) reads the file with
+///   `tTJS::LoadTextDictionaryArray` (`tjs.cpp:607-624`), which compiles it as
+///   a TJS **expression** -- `SetText(result, buffer, NULL, true)`,
+///   `tjsScriptBlock.cpp:230-237`, "the script will be compiled as an
+///   expression if isexpression is true" -- and answers that expression's
+///   value.  This is the form the engine's own text writer produces
+///   (`%["key" => value, ...]`, and the reference documents the format as one
+///   "that can be interpreted as an expression"), so a text struct written by
+///   `saveStruct` reads back through it.  It is wired, not vestigial:
+///   `TJSCreateTextStreamForRead = TVPCreateTextStreamForRead`
+///   (`base/ScriptMgnIntf.cpp:486`).
+///
+/// Two deliberate limits.  The reference gates the text path on `if(result)` --
+/// the caller's result pointer, which a published native handler here never
+/// sees -- so this implementation always runs it; a statement-position call
+/// therefore evaluates the file where the reference would do nothing (the
+/// receiver is cleared in both cases).  And the `key = value` line format is
+/// not read: that parser was this crate's invention, not the reference's text
+/// form.  An unreadable path, and a text stream the host cannot provide, are
+/// `TJS_E_INVALIDPARAM` (`:121`).
 fn dictionary_load_struct<H: TjsHost + 'static>(
     runtime: &mut Runtime<H>,
     this_obj: Option<ObjectHandle>,
@@ -1164,10 +1181,20 @@ fn dictionary_load_struct<H: TjsHost + 'static>(
     if let Some(root) = root {
         runtime.heap[root.0].members.clear();
     }
-    let Some(value) = load_binary_struct(runtime, &path, &mode, root)? else {
+    if let Some(value) = load_binary_struct(runtime, &path, &mode, root)? {
+        return Ok(value);
+    }
+    let Ok(text) = runtime.host_mut().read_text(&path, &mode) else {
         return Err(TjsError::invalid_param());
     };
-    Ok(value)
+    // `SetText` returns before it touches the result for an empty file
+    // (`tjsScriptBlock.cpp:238-239`), so the call answers void.
+    if text.trim().is_empty() {
+        return Ok(Variant::Void);
+    }
+    let wrapped = format!("return ({text});");
+    let file = compile_source_to_bytecode(&path, &wrapped)?;
+    runtime.execute_file(&file)
 }
 
 /// Reads `path` and deserializes it when it holds a `KBAD100` struct pack.
