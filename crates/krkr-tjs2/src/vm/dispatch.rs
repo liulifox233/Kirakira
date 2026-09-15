@@ -894,35 +894,26 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
                 context: BytecodeContextType::Property,
             } => {
                 let file = self.runtime.script_file(file_id)?;
-                // A script `property` with no getter answers
-                // `TJS_E_ACCESSDENYED` through the default-property protocol
-                // (`TJSDefaultPropGet` forwards everything but
-                // NOTIMPL/INVALIDTYPE/INVALIDOBJECT, `tjsObject.cpp:1376-1379`),
-                // which is what [`Vm::default_prop_get`] implements for the
-                // `*property` operator.
+                // `TJSDefaultPropGet` (`tjsObject.cpp:1347-1389`, reached from
+                // every `tTJSCustomObject::PropGet`, `:1432`) invokes the
+                // property object's own default-property protocol
+                // (`PropGet(0, NULL, ...)`) and propagates every failure that
+                // is not NOTIMPL/INVALIDTYPE/INVALIDOBJECT.  A `tTJSInterCodeContext`
+                // of `ctProperty` with a null `PropGetter` answers
+                // `TJS_E_ACCESSDENYED` there (`tjsInterCodeExec.cpp:3134-3138`),
+                // so a plain member read of a setter-only property raises
+                // -1007 in krkrz.
                 //
-                // This member-read path deliberately keeps handing the
-                // property object back instead, and that is a known deviation
-                // from the reference (`tTJSInterCodeContext::PropGet` answers
-                // TJS_E_ACCESSDENYED when `PropGetter` is null,
-                // `tjsInterCodeExec.cpp:3134-3140`, and `TJSDefaultPropGet`
-                // propagates it): the engine's KAGEX support reads a freshly
-                // defined setter-only property to get that object
-                // (`objectHookInjection`'s `var t1 = this.prop;
-                //  ("property prop {...}")!; l0[l5] = t1 incontextof l4`),
-                // pinned by `krkr-engine`'s
-                // `layer_font_reads_back_bound_to_the_font_like_krkr`
-                // (`engine.rs:13297`), which fails if -1007 is raised here.
-                //
-                // A follow-up engine mission owns the decision: the
-                // reference's sanctioned way to read the property object
-                // itself is `&obj.prop` (TJS_IGNOREPROP), which the engine
-                // already implements.  If real KAGEX uses that form, the
-                // engine test can be fixed and this path changed to
-                // `Err(TjsError::access_denied())` like `default_prop_get`
-                // above; until then the leniency stays, filed as a finding.
+                // The sanctioned way to obtain the property object itself is
+                // the `&` form: `VM_GPDS` carries `TJS_IGNOREPROP`, which makes
+                // `TJSDefaultPropGet` skip the protocol and hand the member
+                // back (`tjsObject.cpp:1350-1353`), and KAGEX's
+                // `objectHookInjection` uses exactly that shape -- `&target[key]`
+                // to find the old property (`:562`) and `&this.prop` to return
+                // the new one (`:573`) in
+                // `kirikiri2/branches/kag3ex3/template/system/Utils.tjs`.
                 let Some(getter) = file.objects[object_index].prop_getter else {
-                    return Ok(None);
+                    return Err(TjsError::access_denied());
                 };
                 let effective_this = self.effective_member_this(closure_this, caller_this)?;
                 Ok(Some(self.execute_file_object_with_this(
@@ -4365,17 +4356,28 @@ mod tests {
 
     #[test]
     fn calling_a_property_object_reports_invalid_type() {
-        // `tTJSInterCodeContext::FuncCall` answers `TJS_E_INVALIDTYPE` for a
-        // property context (`tjsInterCodeExec.cpp:3100-3101`).
+        // A *local* holding the property object is called as a plain value:
+        // `VM_CALL` (`tjsInterCodeExec.cpp:2370`) goes straight to
+        // `tTJSInterCodeContext::FuncCall` with no member name, which answers
+        // `TJS_E_INVALIDTYPE` for a property context (`:3100-3101`).  The two
+        // other shapes do run the property protocol first: a member call
+        // (`holder.Value()`) reaches `TJSDefaultFuncCall`, which retries with
+        // `PropGet(0, NULL, ...)` when the property object answers
+        // INVALIDTYPE (`tjsObject.cpp:1289-1300`, `:1249-1278`), and a global
+        // holding the object is read again through the proxy at the call
+        // site -- both raise -1007 for this setter-only property.
         let error = failure(
             "class Holder {\n\
              \x20   property Value {\n\
              \x20       setter(value) { this.stored = value; }\n\
              \x20   }\n\
              }\n\
-             var holder = new Holder();\n\
-             var accessor = holder.Value;\n\
-             return accessor();",
+             function poke() {\n\
+             \x20   var holder = new Holder();\n\
+             \x20   var accessor = &holder.Value;\n\
+             \x20   return accessor();\n\
+             }\n\
+             return poke();",
         );
         assert_eq!(error.kind, TjsErrorKind::InvalidType, "{}", error.message);
         assert_eq!(
@@ -4442,7 +4444,7 @@ mod tests {
              \x20   }\n\
              }\n\
              var holder = new Holder();\n\
-             var accessor = holder.Value;\n\
+             var accessor = &holder.Value;\n\
              return *accessor;",
         );
         assert_eq!(error.kind, TjsErrorKind::AccessDenied);
@@ -4508,24 +4510,121 @@ mod tests {
     }
 
     #[test]
-    fn member_read_hands_a_script_property_object_back() {
-        // Reading the member itself does not dereference the property: the
-        // engine hands the property object back, which is how KAGEX's
-        // `objectHookInjection` obtains the property it installs on another
-        // object (`krkr-engine`'s
-        // `layer_font_reads_back_bound_to_the_font_like_krkr` pins it).
+    fn member_read_of_a_setter_only_property_denies_access() {
+        // A member read of a variant holding a property object goes through
+        // `TJSDefaultPropGet` (`tjsObject.cpp:1347-1389`, called from
+        // `tTJSCustomObject::PropGet`, `:1432`), which invokes the property
+        // object's own default-property protocol and propagates every failure
+        // that is not NOTIMPL/INVALIDTYPE/INVALIDOBJECT.  A script `property`
+        // with no getter answers `TJS_E_ACCESSDENYED` there
+        // (`tjsInterCodeExec.cpp:3134-3138`), so `holder.Value` raises -1007
+        // in krkrz.
+        let error = failure(
+            "class Holder {\n\
+             \x20   property Value {\n\
+             \x20       setter(value) { this.stored = value; }\n\
+             \x20   }\n\
+             }\n\
+             var holder = new Holder();\n\
+             return holder.Value;",
+        );
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{}", error.message);
+        assert_eq!(error.tjs_error_code(), Some(-1007));
+        assert_eq!(
+            error.message,
+            "Invalid operation for Read-only or Write-only property"
+        );
+
+        // `typeof` reads the member through the same `PropGet` and maps only
+        // `TJS_E_MEMBERNOTFOUND` to "undefined" (`TypeOfMemberDirect`,
+        // `tjsInterCodeExec.cpp:2127-2143`), so -1007 propagates.
+        let error = failure(
+            "class Holder {\n\
+             \x20   property Value {\n\
+             \x20       setter(value) { this.stored = value; }\n\
+             \x20   }\n\
+             }\n\
+             var holder = new Holder();\n\
+             return typeof holder.Value;",
+        );
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{}", error.message);
+
+        // A member call reaches the property object too: `TJSDefaultFuncCall`
+        // retries with `PropGet(0, NULL, ...)` when the property context
+        // answers INVALIDTYPE (`tjsObject.cpp:1289-1300`, `:1249-1278`), so
+        // the denial is raised before anything is called.
+        let error = failure(
+            "class Holder {\n\
+             \x20   property Value {\n\
+             \x20       setter(value) { this.stored = value; }\n\
+             \x20   }\n\
+             }\n\
+             var holder = new Holder();\n\
+             return holder.Value();",
+        );
+        assert_eq!(error.kind, TjsErrorKind::AccessDenied, "{}", error.message);
+
+        // The member protocol itself is untouched: `delete` reaches the
+        // symbol table without `PropGet`, and a write still runs the setter.
+        assert_eq!(
+            run("class Holder {\n\
+                 \x20   var stored = 0;\n\
+                 \x20   property Value {\n\
+                 \x20       setter(value) { this.stored = value; }\n\
+                 \x20   }\n\
+                 }\n\
+                 var holder = new Holder();\n\
+                 holder.Value = 5;\n\
+                 var removed = delete holder.Value;\n\
+                 return holder.stored + \":\" + removed;")
+            .expect("write and delete"),
+            Variant::String("5:1".to_string())
+        );
+    }
+
+    #[test]
+    fn ignore_prop_read_hands_the_property_object_back() {
+        // The reference's sanctioned way to obtain the property object itself
+        // is the `&` form: `VM_GPDS` passes `TJS_IGNOREPROP`, which makes
+        // `TJSDefaultPropGet` skip the property protocol and hand the member
+        // back (`tjsObject.cpp:1350-1353`).  KAGEX's `objectHookInjection`
+        // uses exactly that shape -- `&target[key]` to find the old property
+        // (`:562`) and `&this.prop` to return the new one (`:573`) in
+        // `kirikiri2/branches/kag3ex3/template/system/Utils.tjs` -- so the
+        // denial above does not affect it.
         let value = run("class Holder {\n\
              \x20   property Value {\n\
              \x20       setter(value) { this.stored = value; }\n\
              \x20   }\n\
              }\n\
              var holder = new Holder();\n\
-             return holder.Value;")
+             return &holder.Value;")
         .expect("read");
         assert!(
             matches!(value, Variant::Closure(_) | Variant::Object(_)),
             "expected the property object, got {value:?}"
         );
+    }
+
+    #[test]
+    fn kagex_style_hook_injection_installs_and_runs_a_property() {
+        // The whole `objectHookInjection` shape end to end: the property is
+        // defined by a string eval, handed on with `&this.prop`
+        // (`Utils.tjs:573`), installed on the target with the `&` store
+        // (`:575`, `VM_SPDS`), and a later plain write runs the injected
+        // setter -- which is what the denial above must not disturb.
+        let value = run("var hooked = \"\";\n\
+             global.sink = function(value) { hooked = hooked + value; };\n\
+             var makeprop = function() {\n\
+             \x20   (\"property probe { setter(v) { (global.sink incontextof this)(v); } }\")!;\n\
+             \x20   return &this.probe;\n\
+             } incontextof %[];\n\
+             var target = %[];\n\
+             (&target.probe) = makeprop() incontextof null;\n\
+             target.probe = 42;\n\
+             return hooked;")
+        .expect("hook injection");
+        assert_eq!(value.to_tjs_string().expect("string"), "42");
     }
 
     #[test]
