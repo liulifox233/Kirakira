@@ -88,13 +88,46 @@ fn normalize_mount_path(path: &str) -> String {
     normalized
 }
 
+/// Whether an `archive.xp3>` qualifier names an absolute storage path, decided
+/// the same way on every host.
+///
+/// Both halves of the qualified-name rule — the provider's mount match
+/// ([`Xp3ResourceProvider::archive_index`]) and the storage's candidate
+/// cleaning (`clean_lookup_name`) — must agree about one spelling wherever the
+/// engine runs, which is why absoluteness is not `Path::is_absolute`: that
+/// answers per host and would send a Windows declaration
+/// (`C:/game/data.xp3` — the spelling KAG3's `Initialize.tjs:48-53` builds from
+/// `System.exePath`) down the *relative* branch on a Unix host and the
+/// absolute one on Windows, so the two halves would contradict each other on
+/// one of them.
+///
+/// * a rooted `/…` or `\…`, which also covers a UNC share (`//host/share…`,
+///   `\\host\share…`) — the reference's file media treats a leading `\` as a
+///   local path like any other (`tTVPFileMedia::GetLocallyAccessibleName`,
+///   `base/win32/StorageImpl.cpp:152-195`);
+/// * a drive path `C:/…`, `C:\…`, any ASCII letter followed by `:` and a
+///   delimiter. A drive-*relative* `C:x.xp3` carries no delimiter and is not
+///   absolute, which is what the Windows path rules the reference is written
+///   against say.
+pub fn archive_qualifier_is_absolute(archive: &str) -> bool {
+    let bytes = archive.as_bytes();
+    match bytes.first() {
+        None => false,
+        Some(b'/') | Some(b'\\') => true,
+        Some(first) if first.is_ascii_alphabetic() => {
+            let delimiter = bytes.get(2);
+            bytes.get(1) == Some(&b':') && (delimiter == Some(&b'/') || delimiter == Some(&b'\\'))
+        }
+        Some(_) => false,
+    }
+}
+
 /// Drops a `file://` scheme from a qualifier: the reference's media manager
 /// hands the media only the text after `media://` (`GetDomainAndPath`,
 /// `StorageIntf.cpp:164-168`, used by `Open`/`CheckExistentStorage`, `:498`,
 /// `:506`), so `addAutoPath("file://./x.xp3>")` names the same archive as
 /// `"x.xp3>"` for the file media that owns this engine's built-in stack. Any
-/// other scheme (or a drive-letter `C:` spelling) is left alone and simply
-/// matches no mount.
+/// other scheme is left alone and simply matches no mount.
 fn strip_file_media(archive: &str) -> String {
     const SCHEME: &str = "file://";
     let folded = archive.replace('\\', "/");
@@ -300,22 +333,37 @@ impl Xp3ResourceProvider {
     /// root, so:
     ///
     /// * a path with a directory names one mount: `sys/data.xp3` is the mount
-    ///   below the provider's base, `/…/sys/data.xp3` an absolute mount path,
-    ///   and a directory that names no mount resolves nothing — a same-named
-    ///   file elsewhere is a different archive, not a fallback;
+    ///   below the provider's base, an absolute spelling (`/…/sys/data.xp3`,
+    ///   `C:/game/data.xp3` — [`archive_qualifier_is_absolute`]) the mount at
+    ///   that path, and a directory that names no mount resolves nothing — a
+    ///   same-named file elsewhere is a different archive, not a fallback;
     /// * a bare name addresses the file in the current directory, i.e. the
-    ///   mount sitting directly below the base, and only then falls back to the
-    ///   file-name walk for mounts the provider was given without a base.
+    ///   mount sitting directly below the base.
     ///
-    /// The file-name fallback is what a caller that mounted archives by path
-    /// alone can honestly answer (`get_entry_in("patch.xp3", …)`), and it is
-    /// the last match in the list — the order `get_entry` walks in reverse.
+    /// Two leniencies sit on top of that rule. Both are this engine's, both
+    /// change only the reported placement and never which bytes are served
+    /// (the name-only mount scan reaches the same member either way), and both
+    /// stand where the reference would throw out of `TVPArchiveCache::Get`
+    /// (`StorageIntf.cpp:769-773`):
+    ///
+    /// * a bare name that names no mount directly below the base still falls
+    ///   back to the file-name walk, which is what a caller that mounted
+    ///   archives by path alone can honestly answer
+    ///   (`get_entry_in("patch.xp3", …)`) and what every bare qualifier did
+    ///   before the path rule landed;
+    /// * a qualified candidate whose archive names no mount misses, and the
+    ///   storage then tries that spelling's unqualified candidates and the
+    ///   mount-wide scan (`ProjectStorage::resolve_storage_io_for_kind`)
+    ///   instead of failing the lookup.
+    ///
+    /// The fallback is the last match in the list — the order `get_entry`
+    /// walks in reverse.
     fn archive_index(&self, archive: &str) -> Option<usize> {
         let query = normalize_mount_path(&strip_file_media(archive));
         if query.is_empty() {
             return None;
         }
-        if query.starts_with('/') {
+        if archive_qualifier_is_absolute(&query) {
             return self.mounts.iter().rposition(|mount| mount.path == query);
         }
         if query.contains('/') {

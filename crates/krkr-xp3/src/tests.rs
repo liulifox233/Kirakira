@@ -16,7 +16,7 @@ use krkr_core::StoragePort;
 use crate::{
     SegmentCacheConfig, XP3_MAGIC, Xp3Archive, Xp3ContentFilterAction, Xp3Entry, Xp3Error,
     Xp3ExtractionFilterInfo, Xp3FilterContext, Xp3FilterRegistry, Xp3OpenOptions,
-    Xp3ResourceProvider, normalize_entry_name,
+    Xp3ResourceProvider, archive_qualifier_is_absolute, normalize_entry_name,
     parse::{XP3_INDEX_CONTINUE, XP3_INDEX_ENCODE_RAW, XP3_INDEX_ENCODE_ZLIB, parse_index},
 };
 
@@ -915,8 +915,63 @@ fn archive_qualifier_names_the_mount_its_path_spells() {
         read_pinned_entry(&provider, "/elsewhere/x.xp3", "dup.bin"),
         None
     );
+    // A Windows-shaped absolute qualifier is absolute on this host too, so it
+    // can never fall back to a same-named mount: the pre-fix file-name walk
+    // served the root `x.xp3` for `C:/game/x.xp3`.
+    assert_eq!(
+        read_pinned_entry(&provider, "C:/game/x.xp3", "dup.bin"),
+        None
+    );
+    assert_eq!(
+        read_pinned_entry(&provider, r"C:\game\x.xp3", "dup.bin"),
+        None
+    );
 
     fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+/// The classifier both halves of the qualified-name rule call. It has to answer
+/// the same way on every host — a Windows declaration must not become a
+/// relative path merely because the engine runs on Unix — so the table is
+/// pinned here, on a Unix host, including the drive and UNC spellings a Windows
+/// build would see (`System.exePath` in KAG3's `Initialize.tjs:48-53`) and the
+/// backslash spellings ZIP-style launchers use.
+#[test]
+fn archive_qualifiers_classify_absoluteness_on_any_host() {
+    for absolute in [
+        "/x.xp3",
+        "/root/sys/x.xp3",
+        "/",
+        r"\x.xp3",
+        r"\root\sys\x.xp3",
+        "C:/game/x.xp3",
+        r"C:\game\x.xp3",
+        "c:/game/x.xp3",
+        "Z:/x.xp3",
+        "//server/share/x.xp3",
+        r"\\server\share\x.xp3",
+    ] {
+        assert!(
+            archive_qualifier_is_absolute(absolute),
+            "{absolute:?} names an absolute storage path"
+        );
+    }
+    for relative in [
+        "",
+        "x.xp3",
+        "sub/x.xp3",
+        r"sub\x.xp3",
+        "./x.xp3",
+        ".\\x.xp3",
+        "C:x.xp3",
+        "1:/x.xp3",
+        "file://./x.xp3",
+    ] {
+        assert!(
+            !archive_qualifier_is_absolute(relative),
+            "{relative:?} names a relative storage path"
+        );
+    }
 }
 
 #[test]

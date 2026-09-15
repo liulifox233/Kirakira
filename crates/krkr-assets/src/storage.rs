@@ -16,7 +16,7 @@ use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use krkr_core::{ResourceData, ResourceDataSource, ResourceStream, StoragePort, Xp3FilterRegistry};
 use krkr_tjs2::{Result, TjsError};
-use krkr_xp3::Xp3ResourceProvider;
+use krkr_xp3::{Xp3ResourceProvider, archive_qualifier_is_absolute};
 use memmap2::{Mmap, MmapOptions};
 
 use crate::media::{FILE_MEDIA_NAME, StorageMediaProvider, is_valid_media_name, split_media_name};
@@ -3297,11 +3297,16 @@ fn xp3_files_in_directory(root: &Path) -> Vec<PathBuf> {
 /// path, and the in-archive part is still compacted by
 /// [`normalize_storage_name`] the way the reference compacts it
 /// (`:400-453`).
+///
+/// Absoluteness is [`archive_qualifier_is_absolute`], the same classifier the
+/// provider's mount match uses: the two halves of one rule must agree about a
+/// spelling on every host, and `Path::is_absolute` would disagree about a
+/// Windows drive path between a Unix and a Windows build.
 #[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
 fn clean_lookup_name(name: &str) -> Result<PathBuf> {
     let absolute_archive = name
         .split_once('>')
-        .is_some_and(|(archive, _)| Path::new(archive).is_absolute());
+        .is_some_and(|(archive, _)| archive_qualifier_is_absolute(archive));
     if absolute_archive {
         return normalize_storage_name(name).map(PathBuf::from);
     }
@@ -4004,6 +4009,12 @@ mod tests {
         assert!(storage.read_binary_vec("other/x.xp3>dup.bin").is_err());
         assert!(storage.read_binary_vec("sys/x.xp3>root-only.bin").is_err());
         assert!(storage.read_binary_vec("x.xp3>sys-only.bin").is_err());
+        // A Windows drive spelling is absolute here too (`System.exePath` is a
+        // `C:\…` path on that host), so it is never reduced to a file name and
+        // can never serve the `x.xp3` this root happens to hold; the resolver
+        // half and this lookup half use the same classifier.
+        assert!(storage.read_binary_vec("C:/game/x.xp3>dup.bin").is_err());
+        assert!(storage.read_binary_vec(r"C:\game\x.xp3>dup.bin").is_err());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
