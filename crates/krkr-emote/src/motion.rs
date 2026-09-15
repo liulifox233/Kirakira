@@ -310,7 +310,7 @@ fn pixel_dimension(value: f32) -> u32 {
 }
 
 impl MotionDrawItem {
-    fn from_sprite(sprite: &EmoteStaticSprite) -> Self {
+    pub(crate) fn from_sprite(sprite: &EmoteStaticSprite) -> Self {
         Self {
             texture: sprite.texture_name.clone(),
             resource_index: sprite.texture_resource_index,
@@ -328,6 +328,9 @@ impl MotionDrawItem {
             opacity: sprite.opacity,
             z: sprite.z,
             visible: sprite.visible,
+            blend_mode: sprite.blend_mode,
+            blend_parameter: sprite.blend_parameter,
+            corner_colors: sprite.corner_colors,
             world_transform: sprite.world_transform,
             mesh: sprite.mesh,
             label: sprite.label.clone(),

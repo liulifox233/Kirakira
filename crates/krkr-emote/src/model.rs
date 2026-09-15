@@ -238,6 +238,36 @@ pub struct MotionDrawItem {
     pub opacity: f32,
     pub z: f32,
     pub visible: bool,
+    /// Native decoded-frame blend mode (`bm`), eluna's `EmoteStaticSprite`
+    /// `blend_mode` (`vendor/eluna/crates/eluna/src/emote.rs:338`).
+    ///
+    /// The low nibble selects the blend equation the reference applies; the
+    /// `0x10` bit selects the MODULATE2X texture-colour stage. The mapping is
+    /// `emoteplayer`'s own: see [`crate::render::SpriteBlend`] for the table
+    /// and the DLL addresses it was read from. `0x10` — the neutral,
+    /// source-over default — is what a frame without a `bm` field carries.
+    pub blend_mode: u32,
+    /// Native decoded-frame blend parameter (`bp`). The reference's standard
+    /// 2-D consumer does not read it (its parity notes list `bm/bp` retention
+    /// and `bp`'s absence from the draw path); it travels with the item so a
+    /// caller that needs it is not blocked by the adapter.
+    pub blend_parameter: f32,
+    /// Native four-corner colours in serialized `0xRRGGBBAA` byte order.
+    ///
+    /// *Inferred, not recovered*: the four entries are mapped onto the quad in
+    /// build order, `[top-left, top-right, bottom-right, bottom-left]`, because
+    /// that is the order the rasteriser emits the quad's corners in. The DLL's
+    /// own vertex-colour order was not recovered (the D3D build's draw path
+    /// feeds four per-vertex values into its shader; neither build's export
+    /// pairs them with a corner). Every authored colour in PARQUET's 23 `.mtn`
+    /// members has all four corners equal, so the corpus cannot tell the orders
+    /// apart — a gradient-tinted sprite would be the first to do so.
+    ///
+    /// The default is the neutral
+    /// MODULATE2X colour `0x808080FF`, whose `0x80` bytes are exactly 1.0 under
+    /// that stage's `/128`, so an untinted sprite is bit-identical to one drawn
+    /// without colour handling at all.
+    pub corner_colors: [u32; 4],
     /// 2x3 affine transform `[m11, m12, m21, m22, tx, ty]`.
     pub world_transform: [f32; 6],
     pub mesh: Option<eluna::EmoteMeshPatch>,

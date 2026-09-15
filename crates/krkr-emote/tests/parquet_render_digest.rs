@@ -13,6 +13,38 @@
 //! with `--nocapture` (the failure message prints the digest it saw) on the
 //! commit whose output becomes the new contract, and update both constants.
 //!
+//! **M237 moved it once, deliberately.** The renderer had been compositing
+//! every sprite source-over and ignoring the two per-sprite fields the
+//! reference always carried — the frame's `bm` blend mode and its four corner
+//! colours (`crates/krkr-emote/src/render.rs`, `SpriteBlend`). Honouring them
+//! changes exactly the five members whose assets author non-default state, and
+//! nothing else: `m2logo` (red vertex colours plus one additive `bm 0x01`
+//! sprite), both `sd101` copies (a `bm 0x13` haze sprite), `title_bg` (one
+//! `bm 0x11` additive sprite) and `yuzusourlogo` (white MODULATE2X corners on
+//! its gray circles). The frame and item counts are unchanged, and
+//! `tests/parquet_expressions.rs::the_blend_state_changes_only_the_motions_that_author_it`
+//! pins that set. Under the neutral state — every other motion — the new code
+//! path is bit-identical to the old one, which the crate's own unit tests
+//! assert directly.
+//!
+//! **What this pin cannot see: the destination-dependent half of a mode.**
+//! The canvas starts transparent and nothing clears it, and at `dst = 0` the
+//! compositor's mode colour collapses per mode (`crates/krkr-emote/src/render.rs`,
+//! `composite`): Add and Screen coincide with source-over, Copy likewise
+//! replaces with the source, while Sub falls to `max(0 - src, 0) = 0` and Mul
+//! to `0 * src / 255 = 0` — black. So only a sprite whose mode collapses *to*
+//! source-over is invisible here; `sd101`'s `bm 0x13` (Mul, neutral corners)
+//! moves the digest on a transparent canvas, which is why four of the five
+//! members move it and only `title_bg`'s additive sprite does not — that one
+//! needs the opaque destination the game itself prepares
+//! (`AffineSourceMotion.tjs:3230-3231` clears the target to `neutralColor`
+//! before every frame), which is why `tests/parquet_expressions.rs` renders
+//! over that clear instead of over transparency. The digest is still worth
+//! pinning: it is the only test that rasterises all 1,734 real frames, so it
+//! catches anything — sampler, transform, decode, compositor — that moves a
+//! pixel without needing a destination, and it is the guard the blend change
+//! was measured against.
+//!
 //! The archive path comes from `KRKR_EMOTE_PARQUET_DIR` and defaults to
 //! `/Users/ruri/Downloads/PARQUET`; when the game is not installed the test
 //! prints a skip note and passes, like the other real-asset tests.
@@ -34,7 +66,12 @@ const CANVAS: (u32, u32) = (1280, 720);
 ///
 /// Produced by the pre-M154 renderer at the mission's base commit (`5d605f9`):
 /// 954 frames, 2909 items, digest `9951313929727531003`.
-const GOLDEN_DIGEST: u64 = 9_951_313_929_727_531_003;
+///
+/// Re-pinned once, by M237, when the renderer started honouring the sprites'
+/// blend modes and corner colours: 954 frames, 2909 items (unchanged),
+/// digest `6713103675942426750`. See the module docs for the five motions that
+/// move and the neutral case that does not.
+const GOLDEN_DIGEST: u64 = 6_713_103_675_942_426_750;
 
 /// Frames whose draw list was non-empty (the sampled animations that draw).
 const GOLDEN_FRAMES: usize = 954;
