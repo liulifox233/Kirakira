@@ -12697,10 +12697,10 @@ mod tests {
 
     /// `Font.getTextHeight` answers `std::abs(Font.Height)`, whatever the text
     /// is: `tTJSNI_Font::GetTextHeight` returns `std::abs(Font.Height)` for a
-    /// stand-alone font (`LayerIntf.cpp:9811-9815`) and delegates to
+    /// stand-alone font (`LayerIntf.cpp:9821-9825`) and delegates to
     /// `MainImage->GetTextHeight` for a layer-bound one, whose `GetTextSize`
     /// sets `TextHeight = std::abs(Font.Height)` on both branches
-    /// (`LayerBitmapImpl.cpp:1622`, `:1640`). Only the *width* sums per-glyph
+    /// (`LayerBitmapImpl.cpp:1612`, `:1627`). Only the *width* sums per-glyph
     /// advances, so the height never depends on the measured string.
     ///
     /// PARQUET's `sysscn/PreRenderFontEx.tjs` shrinks a pre-rendered glyph with
