@@ -16,6 +16,14 @@
 //! playback"; that was wrong. E-mote is M2's character-animation SDK (motion
 //! data in PSB containers), and no public source exists for either binary.
 //!
+//! Linking this file also claims `.mtn` in the engine's script image path: the
+//! shared implementation registers the graphic loader
+//! ([`krkr_engine::plugin_api::graphic`], the reference's
+//! `TVPRegisterGraphicLoadingHandler`), so a game whose `CanLoadPlugin` chain
+//! starts here gets working `.mtn` script images — PARQUET's title screen
+//! (`custom.ks` `*title_start`) loads `title_bg.mtn` as a layer image and the
+//! PARQUET logo lives in that motion.
+//!
 //! What is real and what is not is the motionplayer module's story, verbatim —
 //! see [`crate::motion_player`] (the state machine, the storage loading and the
 //! layer-path rendering are wired; physics, timelines, mesh deformation,
@@ -34,7 +42,9 @@ pub(crate) const META: PluginMeta = PluginMeta {
             Motion.EmotePlayer / Motion.ResourceManager / Motion.SeparateLayerAdaptor surface through \
             crate::motion_player::install_motionplayer_compat, so a game whose CanLoadPlugin chain starts \
             here gets the wired .mtn path (load, play/progress/stop, variables, layer rendering) instead of \
-            a missing class. The gaps are motionplayer's: physics, timelines, mesh deformation, particles, \
+            a missing class. The `.mtn` script-image loader is registered here too (the shared implementation \
+            claims the extension the reference's driver does, so Layer.loadImages of a motion yields a live \
+            frame). The gaps are motionplayer's: physics, timelines, mesh deformation, particles, \
             separate-layer mode and .psb model playback are stubs that warn once; see crate::motion_player.",
     install: |engine| engine.register_plugin(EmotePlayerPlugin),
 };
@@ -48,6 +58,17 @@ impl KrkrPlugin for EmotePlayerPlugin {
 
     fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
         crate::motion_player::install_motionplayer_compat(runtime);
+        Ok(())
+    }
+
+    fn unregister(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+        // The `.mtn` loader belongs to the shared motionplayer implementation
+        // (`crate::motion_player`), which this alias only borrows. Unlinking
+        // `emoteplayer.dll` must therefore not tear down the registration while
+        // `motionplayer.dll` — the module the loader is named after and carries
+        // the code for — is still linked; the shared rule drops it when the
+        // last alias goes.
+        crate::motion_player::unregister_motion_graphic_loader(runtime, self.name());
         Ok(())
     }
 }

@@ -1346,6 +1346,12 @@ impl KrkrEngine {
         // does not model, so the rule runs unconditionally here.
         let now = self.tjs_runtime.host().tick_count_millis();
         self.tjs_runtime.tjs_rehash_tick(now);
+        // Live plugin graphics (an animated `.mtn` used as a layer image)
+        // advance with the frame clock, the way the reference's graphic
+        // handler keeps drawing into the layer bitmap it was handed. This runs
+        // before the frame's scripts so a script that inspects the layer sees
+        // the frame it will be drawn with.
+        self.tjs_runtime.host_mut().tick_live_graphics(delta);
         if let Err(error) = apply_completed_resource_loads(&mut self.tjs_runtime) {
             if is_resource_pending_error(&error) {
                 self.kag_session.state = KagTaskState::WaitingResource;

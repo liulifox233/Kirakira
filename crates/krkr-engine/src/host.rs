@@ -29,6 +29,7 @@ use crate::{
     KrkrPlugin,
     native::video::VideoOverlayState,
     plugin_api::{
+        graphic::{GraphicFrame, GraphicLoader, GraphicSource, LiveGraphic},
         storage::StorageScriptTable,
         transition::{
             TransitionFace, TransitionFrame, TransitionHandler, TransitionHandlerProvider,
@@ -442,6 +443,14 @@ pub struct KrkrHost {
     /// script thread.  Design Part A.3.5 of
     /// `docs/plugins/plugin-facing-engine-facilities.md`.
     storage_script_tables: BTreeMap<String, Arc<StorageScriptTable>>,
+    /// Plugin-owned graphic loaders, in registration order
+    /// (`TVPRegisterGraphicLoadingHandler`, `plugin_api::graphic`). Each one
+    /// claims storage extensions in the script image path.
+    graphic_loaders: Vec<Arc<dyn GraphicLoader>>,
+    /// Live graphics a loader handed the engine: the storage name, the texture
+    /// id its bitmap uses and the loader's handle. The host ticks each one per
+    /// frame and replaces the pixels of every layer showing that texture.
+    live_graphics: Vec<LiveGraphicBinding>,
     kag_parsers: BTreeMap<ObjectHandle, KagParser>,
     kag_parser_revisions: BTreeMap<ObjectHandle, u64>,
     layer_tree: LayerTree,
@@ -553,6 +562,8 @@ impl Default for KrkrHost {
             script_linked_plugins: BTreeSet::new(),
             transition_providers: BTreeMap::new(),
             storage_script_tables: BTreeMap::new(),
+            graphic_loaders: Vec::new(),
+            live_graphics: Vec::new(),
             kag_parsers: BTreeMap::new(),
             kag_parser_revisions: BTreeMap::new(),
             layer_tree: LayerTree::new(),
@@ -783,6 +794,304 @@ impl KrkrHost {
             .as_ref()
             .map(|storage| storage.storage_media_names())
             .unwrap_or_default()
+    }
+
+    /// Registers a plugin-owned graphic loader
+    /// (`TVPRegisterGraphicLoadingHandler`, `GraphicsLoaderIntf.cpp:170`), the
+    /// hook a plugin that answers for a storage format (`mtn`, and whatever
+    /// else it ships) calls from [`crate::KrkrPlugin::register`]. From here on
+    /// every script image load of a claimed extension goes through the loader
+    /// instead of the built-in decoders.
+    ///
+    /// Idempotent for the same `Arc` — `register` runs at boot and again on the
+    /// first `Plugins.link` — while a *different* loader claiming an extension
+    /// that is already claimed fails, so a genuine conflict is visible instead
+    /// of silently shadowed (the reference's hash would keep whichever handler
+    /// was added last).
+    pub fn register_graphic_loader(&mut self, loader: Arc<dyn GraphicLoader>) -> Result<()> {
+        if self
+            .graphic_loaders
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &loader))
+        {
+            return Ok(());
+        }
+        for extension in loader.extensions() {
+            if let Some(owner) = self.graphic_loader_extension_owner(extension) {
+                return Err(TjsError::runtime(format!(
+                    "cannot register graphic loader `{}`: extension `{extension}` is already claimed by `{owner}`",
+                    loader.name()
+                )));
+            }
+        }
+        self.logs.push(format!(
+            "graphic loader `{}` registered for {}",
+            loader.name(),
+            loader.extensions().join(", ")
+        ));
+        self.graphic_loaders.push(loader);
+        Ok(())
+    }
+
+    /// Unregisters the loader registered under module name `name`, dropping
+    /// every live graphic it handed the engine
+    /// (`TVPUnregisterGraphicLoadingHandler`, `GraphicsLoaderIntf.cpp:184`).
+    /// Returns whether a loader matched.
+    pub fn unregister_graphic_loader(&mut self, name: &str) -> bool {
+        let before = self.graphic_loaders.len();
+        self.graphic_loaders.retain(|loader| loader.name() != name);
+        if self.graphic_loaders.len() == before {
+            return false;
+        }
+        self.live_graphics.retain(|binding| binding.loader != name);
+        self.logs
+            .push(format!("graphic loader `{name}` unregistered"));
+        true
+    }
+
+    /// The registered loaders' module names, sorted. Diagnostics and tests.
+    pub fn graphic_loader_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .graphic_loaders
+            .iter()
+            .map(|loader| loader.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The extensions the registered loaders claim, sorted and deduplicated.
+    pub fn claimed_graphic_extensions(&self) -> Vec<String> {
+        let mut extensions: Vec<String> = self
+            .graphic_loaders
+            .iter()
+            .flat_map(|loader| loader.extensions())
+            .map(|extension| extension.to_ascii_lowercase())
+            .collect();
+        extensions.sort();
+        extensions.dedup();
+        extensions
+    }
+
+    fn graphic_loader_extension_owner(&self, extension: &str) -> Option<&str> {
+        self.graphic_loader_claiming(extension)
+            .map(|loader| loader.name())
+    }
+
+    fn graphic_loader_claiming(&self, extension: &str) -> Option<&Arc<dyn GraphicLoader>> {
+        self.graphic_loaders.iter().find(|loader| {
+            loader
+                .extensions()
+                .iter()
+                .any(|claimed| claimed.eq_ignore_ascii_case(extension))
+        })
+    }
+
+    /// The loader that answers `storage`, with the storage name to read.
+    ///
+    /// A name that carries an extension is decided on the name alone
+    /// (`GraphicsLoaderIntf.cpp:1506`, throw `:1509`), before the storage is
+    /// read or decoded. A name *without* one is completed the way the
+    /// reference's suggestion walk does (`:1476`, walk `:1480-1503`): every
+    /// registered loader's extensions are tried in registration order and the
+    /// first `name + extension` that exists wins, so a plugin claim is
+    /// reachable for a bare stem too. The reference walks a hash table, so its
+    /// order is arbitrary where ours is the order plugins registered in.
+    ///
+    /// The probe is the *exact* one (`TVPIsExistentStorage`,
+    /// `StorageIntf.cpp:1220` — placed path plus auto paths, no extension
+    /// completion; our [`ProjectStoragePort::storage_exists_exact`]). The
+    /// convenience probe would answer true for a candidate that only exists
+    /// under another extension (`art.fake` through `art.fake.png`) and hand the
+    /// loader a storage name whose read resolves to a different file.
+    ///
+    /// `None` means no loader answers and the built-in decode path — and its
+    /// own extension suggestions — stand.
+    pub(crate) fn graphic_loader_for(
+        &self,
+        storage: &str,
+    ) -> Option<(Arc<dyn GraphicLoader>, String)> {
+        if let Some(extension) = storage_extension(storage) {
+            return self
+                .graphic_loader_claiming(&extension)
+                .map(|loader| (Arc::clone(loader), storage.to_string()));
+        }
+        let storage_port = self.project_storage.as_ref()?;
+        for loader in &self.graphic_loaders {
+            for extension in loader.extensions() {
+                let candidate = format!("{storage}{}", extension.to_ascii_lowercase());
+                if storage_port.storage_exists_exact(&candidate) {
+                    return Some((Arc::clone(loader), candidate));
+                }
+            }
+        }
+        None
+    }
+
+    /// Loads `storage` through the plugin loader that answers it, or `None`
+    /// when no loader does (the built-in decode path then stands).
+    ///
+    /// The storage bytes are read here and handed to the loader, which owns its
+    /// container format completely; the engine turns the returned pixels into
+    /// the layer image and — when the loader returned a live graphic — keeps it
+    /// ticking.
+    fn load_graphic_through_plugin(&mut self, storage: &str) -> Option<Result<LayerImage>> {
+        let (loader, resolved) = self.graphic_loader_for(storage)?;
+        Some(self.run_graphic_loader(loader, storage, &resolved))
+    }
+
+    /// `requested` is the name the caller (a script, usually) asked for and is
+    /// what the image cache and a live graphic's binding are keyed by;
+    /// `resolved` is the storage read, which differs only for a name the
+    /// extension suggestion completed. The loader is handed `resolved`, the way
+    /// the reference hands its handler the suggested name
+    /// (`GraphicsLoaderIntf.cpp:1496`) — for the `.mtn` loader that is the
+    /// difference between a bare stem and the file it draws from.
+    fn run_graphic_loader(
+        &mut self,
+        loader: Arc<dyn GraphicLoader>,
+        requested: &str,
+        resolved: &str,
+    ) -> Result<LayerImage> {
+        let bytes = self.read_binary_storage_for_kind(resolved, AssetKind::Image)?;
+        let loaded = loader
+            .load(GraphicSource {
+                storage: resolved,
+                bytes: &bytes,
+            })
+            .map_err(|error| {
+                TjsError::runtime(format!(
+                    "failed to decode image `{requested}` through {}: {error}",
+                    loader.name()
+                ))
+            })?;
+
+        let texture_id = self.next_texture_id;
+        self.next_texture_id = self.next_texture_id.saturating_add(1);
+        let frame = loaded.frame;
+        let image = LayerImage::new(texture_id, frame.width, frame.height, frame.rgba.into());
+        self.logs.push(format!(
+            "script image decoded `{requested}` ({}x{}, {} bytes) through graphic loader `{}`{}",
+            frame.width,
+            frame.height,
+            image.upload.rgba.len(),
+            loader.name(),
+            if requested == resolved {
+                String::new()
+            } else {
+                format!(" from the suggested storage `{resolved}`")
+            }
+        ));
+
+        // A fresh load of one storage supersedes any live graphic of it: the
+        // new image has a new texture id and no layer shows the old one. The
+        // binding is keyed by the name the caller asked for, which is what the
+        // layer's own image-storage record carries.
+        self.live_graphics
+            .retain(|binding| binding.storage != requested);
+        if let Some(handle) = loaded.live {
+            self.live_graphics.push(LiveGraphicBinding {
+                loader: loader.name().to_string(),
+                storage: requested.to_string(),
+                texture_id,
+                size: (frame.width, frame.height),
+                elapsed: Duration::ZERO,
+                size_mismatch_logged: false,
+                handle,
+            });
+        }
+        Ok(image)
+    }
+
+    /// Advances every live graphic and swaps the pixels of the layers showing
+    /// it. The engine calls this once per frame tick, before the frame's
+    /// scripts run, so a layer image that came from an animated `.mtn` keeps
+    /// animating the way the reference's handler keeps drawing into the bitmap
+    /// it was handed (`TVPRegisterGraphicLoadingHandler`'s
+    /// `tTVPGraphicScanLineCallback`, `GraphicsLoaderIntf.h:115-123`).
+    ///
+    /// Which layers show it is the engine's own record of what each layer's
+    /// image was loaded from ([`KrkrHost::layer_image_storage`]) rather than a
+    /// texture id: `LoadImages` decodes *into* the layer's own plane
+    /// (`tTJSNI_BaseLayer::MainImage`, `LayerIntf.cpp:2494`), so the plane is a
+    /// copy of the load's bitmap and carries its own texture id. A layer whose
+    /// image was meanwhile freed or replaced keeps what it has.
+    pub(crate) fn tick_live_graphics(&mut self, delta: Duration) {
+        if self.live_graphics.is_empty() {
+            return;
+        }
+        let mut updates: Vec<(String, TextureId, GraphicFrame)> = Vec::new();
+        let mut size_mismatches: Vec<String> = Vec::new();
+        for binding in self.live_graphics.iter_mut() {
+            binding.elapsed += delta;
+            let Some(frame) = binding.handle.frame(binding.elapsed) else {
+                continue;
+            };
+            if (frame.width, frame.height) != binding.size {
+                if !binding.size_mismatch_logged {
+                    binding.size_mismatch_logged = true;
+                    size_mismatches.push(format!(
+                        "{} (`{}`) produced a {}x{} frame where its load was {}x{}; the layer keeps the loaded size",
+                        binding.loader,
+                        binding.storage,
+                        frame.width,
+                        frame.height,
+                        binding.size.0,
+                        binding.size.1
+                    ));
+                }
+                continue;
+            }
+            updates.push((binding.storage.clone(), binding.texture_id, frame));
+        }
+        for message in size_mismatches {
+            self.logs.push(format!(
+                "WARN graphic loader {message} (later frames of this size are dropped)"
+            ));
+        }
+
+        for (storage, texture_id, frame) in updates {
+            let pixels: Arc<[u8]> = frame.rgba.into();
+            self.image_cache.insert(
+                storage.clone(),
+                LayerImage::new(texture_id, frame.width, frame.height, Arc::clone(&pixels)),
+            );
+            let touched: Vec<LayerId> = self
+                .layer_image_storages
+                .iter()
+                .filter(|(_, stored)| stored.eq_ignore_ascii_case(&storage))
+                .map(|(layer_id, _)| *layer_id)
+                .collect();
+            for layer_id in touched {
+                // A layer that lost its image (`freeImage`, a save/restore
+                // replacement) must not get one resurrected, and one whose
+                // plane is a different size is not this graphic's to fill.
+                let updated = self
+                    .layer_tree
+                    .layer_mut(layer_id)
+                    .and_then(|layer| layer.image.as_mut())
+                    .is_some_and(|image| {
+                        if image.upload.width != frame.width || image.upload.height != frame.height
+                        {
+                            return false;
+                        }
+                        image.upload.rgba = Arc::clone(&pixels);
+                        true
+                    });
+                if !updated {
+                    continue;
+                }
+                // `ImageModified = true` (`LayerIntf.cpp:6597`) for the same
+                // reason a provider transition sets it: the bitmap changed
+                // outside any script call and the runtime has to be told once
+                // it is in hand again.
+                if let Some(handle) = self.native_object_for_layer(layer_id)
+                    && !self.provider_image_modifications.contains(&handle)
+                {
+                    self.provider_image_modifications.push(handle);
+                }
+            }
+        }
     }
 
     /// Records a storage media's script-table watch
@@ -2677,6 +2986,19 @@ impl KrkrHost {
             return Ok(image.clone());
         }
 
+        // `TVPInternalLoadGraphic` decides on the name's extension *before* it
+        // opens the storage and before any built-in decoder runs
+        // (`GraphicsLoaderIntf.cpp:1506`, throw `:1509`; a name with no
+        // extension walks the handler table first, `:1480-1503`): a plugin that
+        // claims it owns the format, and a name nobody claims keeps the decode
+        // path — and its "The image format could not be determined" error —
+        // exactly as before.
+        if let Some(result) = self.load_graphic_through_plugin(name) {
+            let image = result?;
+            self.image_cache.insert(name.to_string(), image.clone());
+            return Ok(image);
+        }
+
         // The decoder consumes raw bytes, but both the storage lookup and a
         // deferred publication must resolve the name as an image
         // (`TVPInternalLoadGraphic` suggests graphic extensions only), not as a
@@ -2711,6 +3033,13 @@ impl KrkrHost {
         self.sync_image_cache_revision();
         if let Some(image) = self.image_cache.get(name) {
             return Ok(image.clone());
+        }
+
+        // A plugin loader claiming this extension loads synchronously in the
+        // calling script call, the way the reference's in-call load does; the
+        // decode worker below only exists for the built-in formats.
+        if self.graphic_loader_for(name).is_some() {
+            return self.load_image_storage(name);
         }
 
         #[cfg(test)]
@@ -2883,6 +3212,9 @@ impl KrkrHost {
 
     pub(crate) fn clear_graphic_cache(&mut self) {
         self.image_cache.clear();
+        // `Cache.clear` drops the cached images, and a live graphic is one of
+        // them; its handle goes with the entry.
+        self.live_graphics.clear();
         if let Some(manager) = self.resource_manager.as_ref()
             && let Err(error) = manager.clear_decoded_image_cache_blocking()
         {
@@ -3140,6 +3472,7 @@ impl KrkrHost {
         if self.image_cache_revision != revision {
             self.cancel_pending_resource_tasks();
             self.image_cache.clear();
+            self.live_graphics.clear();
             self.completed_image_loads.clear();
             self.pending_image_loads.clear();
             self.image_target_generations.clear();
@@ -3151,6 +3484,9 @@ impl KrkrHost {
         self.cancel_pending_resource_tasks();
         self.image_cache_revision = self.storage_revision();
         self.image_cache.clear();
+        // The images a loader was keeping live left the cache with everything
+        // else: the handles go too, and the layers keep their last frame.
+        self.live_graphics.clear();
         self.pending_image_loads.clear();
         self.completed_image_loads.clear();
         self.image_target_generations.clear();
@@ -4359,6 +4695,38 @@ pub(crate) struct CompletedImageLoad {
 pub(crate) enum ImageLoadState {
     Ready(Box<CompletedImageLoad>),
     Pending,
+}
+
+/// One live graphic a plugin loader handed the engine: the storage name and
+/// texture id its bitmap uses, the clock the loader is asked about, and the
+/// loader's own handle. Dropping the binding drops the handle, which is how a
+/// plugin learns its graphic is gone.
+///
+/// `Clone` (the host is cloneable for snapshots) shares the handle through its
+/// `Arc`: the graphic's own clock lives inside the plugin and a clone must not
+/// restart it.
+#[derive(Clone)]
+struct LiveGraphicBinding {
+    loader: String,
+    storage: String,
+    texture_id: TextureId,
+    size: (u32, u32),
+    elapsed: Duration,
+    /// A live frame whose size differs from the loaded one is dropped; the
+    /// reason is logged once per graphic instead of once per frame.
+    size_mismatch_logged: bool,
+    handle: Arc<dyn LiveGraphic>,
+}
+
+/// The storage name's extension, lowercased and dot-included (`.mtn`), the way
+/// the reference keys its handler table (`TVPExtractStorageExt`,
+/// `GraphicsLoaderIntf.cpp:61-93`). The last path segment decides, and an
+/// archive-qualified name (`data.xp3>member`) looks at the member; a segment
+/// with no dot has no extension and is never claimed by a loader.
+pub(crate) fn storage_extension(storage: &str) -> Option<String> {
+    let segment = storage.rsplit(['/', '\\', '>']).next().unwrap_or(storage);
+    let (_, extension) = segment.rsplit_once('.')?;
+    (!extension.is_empty()).then(|| format!(".{}", extension.to_ascii_lowercase()))
 }
 
 #[derive(Clone)]
