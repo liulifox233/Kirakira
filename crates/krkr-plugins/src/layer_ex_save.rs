@@ -46,9 +46,13 @@
 //! blue mean sits where an `0xAARRGGBB` colour keeps its alpha, the green mean
 //! where it keeps its red, the red mean where it keeps its green, and the alpha
 //! mean where it keeps its blue (blue↔alpha *and* red↔green, not a
-//! two-channel swap). Buffer byte 0 is the blue channel in this file
-//! (`utils.cpp:398`, `:466`), so the reference's own sum and pack
-//! (`utils.cpp:556-578`) produce that rotated value — the shipped krkr2
+//! two-channel swap). Buffer byte 0 is the blue channel in this file — the
+//! read-side alias says so itself, `BufRefT p = sbuf; // B領域` against
+//! `WrtRefT q = dbuf+3; // A領域` (`utils.cpp:417-418`, the same numbering in
+//! both copies of the file) — so the reference's own sum and pack
+//! (`utils.cpp:553-578`: the accumulators, the loop, the divisions and the
+//! `DWORD` pack; trunk copy, the only one with this member) produce that
+//! rotated value — the shipped krkr2
 //! `bin/win32/plugin/layerExSave.dll` has the same shape at `0x10012040` (four
 //! byte accumulators, the truncating `fistpll` pair, the `shl $8` packing
 //! chain). The port reproduces it — see [`average_color`].
@@ -580,7 +584,7 @@ fn copy_blue_to_alpha(
 /// or `top` is the reference's `invalid layer range`.
 ///
 /// The four parameters arrive as `tjs_int` in the reference
-/// (`tjs_int left = *param[0];`, `:441-444`), i.e. narrowed to 32 bits, and
+/// (`tjs_int left = *param[0];`, `:450-453`), i.e. narrowed to 32 bits, and
 /// the sums are `int` arithmetic that the reference lets wrap. The port takes
 /// the same narrowing and wraps the same way, so a script value outside the
 /// 32-bit range behaves like the reference's and the additions can never
@@ -614,11 +618,13 @@ fn is_blank(
     Ok(true)
 }
 
-/// `getAverageColor(left, top, width, height)` (`utils.cpp:524-583`): the
-/// clipped rectangle's four per-byte means, packed the way the reference packs
-/// them.
+/// `getAverageColor(left, top, width, height)` (`utils.cpp:524-583`, trunk copy):
+/// the clipped rectangle's four per-byte means, packed the way the reference
+/// packs them.
 ///
-/// The reference's buffer is B, G, R, A (`utils.cpp:398`, `:466`), and the
+/// The reference's buffer is B, G, R, A — its own read alias names the pair,
+/// `BufRefT p = sbuf; // B領域` with `WrtRefT q = dbuf+3; // A領域`
+/// (`utils.cpp:417-418`) — and the
 /// function adds buffer byte 0 — the blue channel — into the variable it shifts
 /// into bits 24-31, byte 1 (green) into bits 16-23, byte 2 (red) into bits
 /// 8-15 and byte 3 (alpha) into bits 0-7. That is the `0xAARRGGBB` packing
@@ -637,7 +643,8 @@ fn average_color(
     width: i32,
     height: i32,
 ) -> Result<i32> {
-    // The rectangle is clipped into the image, never rejected (`utils.cpp:536-546`).
+    // The rectangle is clipped into the image, never rejected
+    // (`utils.cpp:542-547`: the two negative-origin steps and the two `cut` steps).
     let (mut left, mut top, mut width, mut height) = (left, top, width, height);
     let image_width = geometry.width.min(i32::MAX as usize) as i32;
     let image_height = geometry.height.min(i32::MAX as usize) as i32;
@@ -664,9 +671,10 @@ fn average_color(
     if width <= 0 || height <= 0 {
         return Err(TjsError::runtime("invalid layer range"));
     }
-    // The reference accumulates in doubles and divides by `width * height`;
-    // with every sum at most 255 * 2^32 the integer division here is the same
-    // quotient, and both truncate toward zero for a non-negative value.
+    // The reference accumulates in doubles and divides by `width * height`
+    // (`utils.cpp:553-557`, `:569-572`); with every sum at most 255 * 2^32 the
+    // integer division here is the same quotient, and both truncate toward zero
+    // for a non-negative value.
     let mut sums = [0u64; 4];
     let mut count = 0u64;
     for y in top..top.wrapping_add(height) {
@@ -682,9 +690,9 @@ fn average_color(
     if count == 0 {
         // `left + width` (or `top + height`) overflowed, so the clip above left
         // the rectangle unclipped and the loop bound is the wrapped value: the
-        // reference's own loop body never runs either, and its `a /= size`
-        // divides a zero sum, answering 0. Dividing by this zero count instead
-        // would kill the process.
+        // reference's own loop body never runs either (`utils.cpp:560-568`), and
+        // its `a /= size` (`:569-572`) divides a zero sum, answering 0. Dividing
+        // by this zero count instead would kill the process.
         return Ok(0);
     }
     let mean = |sum: u64| ((sum / count) & 0xff) as u32;
@@ -891,7 +899,7 @@ fn layer_is_blank(
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
-    // `tjs_int left = *param[0];` (`utils.cpp:441-444`): the reference narrows
+    // `tjs_int left = *param[0];` (`utils.cpp:450-453`): the reference narrows
     // each parameter to 32 bits before checking it.
     let left = arg_integer(&args, 0)? as i32;
     let top = arg_integer(&args, 1)? as i32;
@@ -904,18 +912,18 @@ fn layer_is_blank(
     Ok(Variant::Integer(i64::from(blank)))
 }
 
-/// `Layer.getAverageColor(left, top, width, height)` (`utils.cpp:524-583`).
+/// `Layer.getAverageColor(left, top, width, height)` (`utils.cpp:524-583`, trunk copy).
 fn layer_get_average_color(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
     args: Vec<Variant>,
 ) -> Result<Variant> {
     let layer = this_layer(this_obj)?;
-    // `tjs_int left = *param[0];` (`utils.cpp:533-536`): each parameter narrows
-    // to 32 bits. The reference does its `GetLayerBufferAndSize` first
-    // (`:526-532`), so a layer with no image throws `src must be Layer.` there
-    // even for an argument that cannot convert, while this port converts first —
-    // the same order `is_blank` above uses.
+    // `tjs_int left = *param[0];` (`utils.cpp:537-540`, trunk copy): each
+    // parameter narrows to 32 bits. The reference runs `GetLayerBufferAndSize`
+    // first (`:531-535`), so a layer with no image throws `src must be Layer.`
+    // there even for an argument that cannot convert, while this port converts
+    // first — the same order `is_blank` above uses.
     let left = arg_integer(&args, 0)? as i32;
     let top = arg_integer(&args, 1)? as i32;
     let width = arg_integer(&args, 2)? as i32;
@@ -2770,7 +2778,7 @@ mod tests {
         range_error(&mut engine, "layer.isBlank(-1, 0, 1, 1);");
         range_error(&mut engine, "layer.isBlank(0, -1, 1, 1);");
 
-        // The parameters narrow to `tjs_int` first (`utils.cpp:441-444`), so
+        // The parameters narrow to `tjs_int` first (`utils.cpp:450-453`), so
         // an out-of-range script value behaves exactly like the reference's
         // and the sums cannot overflow: 2^63-1 truncates to -1, while i32::MAX
         // plus a width wraps negative and scans nothing.
@@ -2797,10 +2805,12 @@ mod tests {
         );
     }
 
-    /// `getAverageColor(left, top, width, height)` (`utils.cpp:524-583`): the
-    /// clipped region's four per-byte means, packed the way the reference packs
-    /// them. Its buffer is B, G, R, A (`utils.cpp:398`, `:466`: byte 0 is the
-    /// blue channel), and the function adds byte 0 into the variable it shifts
+    /// `getAverageColor(left, top, width, height)` (`utils.cpp:524-583`, trunk
+    /// copy): the clipped region's four per-byte means, packed the way the
+    /// reference packs them. Its buffer is B, G, R, A — the read alias names the
+    /// pair, `BufRefT p = sbuf; // B領域` and `WrtRefT q = dbuf+3; // A領域`
+    /// (`utils.cpp:417-418`: byte 0 is the blue channel) — and the function adds
+    /// byte 0 into the variable it shifts
     /// into bits 24-31 — so the value a script sees has the blue mean where the
     /// alpha byte of an `0xAARRGGBB` colour sits, then green, red and finally
     /// the alpha mean in bits 0-7. The reference's names (`a`, `r`, `g`, `b`)
@@ -2858,10 +2868,11 @@ mod tests {
         );
     }
 
-    /// The floor and the rectangle handling of `getAverageColor`
-    /// (`utils.cpp:526-553`): four parameters are the reference's own check,
-    /// the rectangle is clipped to the image first and only a rectangle that
-    /// collapses throws, and the parameters narrow to `tjs_int`.
+    /// The floor and the rectangle handling of `getAverageColor` (trunk copy:
+    /// the floor `utils.cpp:526-528`, the clip `:542-547`, the range check
+    /// `:549-551`): four parameters are the reference's own check, the rectangle
+    /// is clipped to the image first and only a rectangle that collapses throws,
+    /// and the parameters narrow to `tjs_int`.
     #[test]
     fn get_average_color_clips_its_rectangle() {
         let mut engine = engine();
@@ -2922,7 +2933,8 @@ mod tests {
             0x332211ff
         );
         // A layer whose image was freed takes the reference's buffer-lookup
-        // failure (`GetLayerBufferAndSize` sees `hasImage` 0, `utils.cpp:56-68`).
+        // failure (`GetLayerSize`'s `hasImage` test at `utils.cpp:18`, reached
+        // through the read-side `GetLayerBufferAndSize` at `:38-49`).
         let error = engine
             .execute_script(
                 "bad.tjs",
