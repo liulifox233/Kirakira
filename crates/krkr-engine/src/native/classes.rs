@@ -8772,13 +8772,15 @@ fn font_get_text_height(
 ) -> Result<Variant> {
     let font = this_font_spec(runtime, this_obj)?;
     ensure_font_file_loaded(runtime, &font)?;
-    let text = first_text_arg(&args)?;
-    let height = runtime
-        .host()
-        .font_system()
-        .text_metrics(&font, &text)
-        .height;
-    Ok(Variant::Integer(height.ceil() as i64))
+    let _text = first_text_arg(&args)?;
+    // `tTJSNI_Font::GetTextHeight` is `std::abs(Font.Height)`
+    // (`LayerIntf.cpp:9821-9825`), also for a layer-bound font, whose
+    // `MainImage` answers `GetTextSize`'s `TextHeight = std::abs(Font.Height)`
+    // on both branches (`LayerBitmapImpl.cpp:1612`, `:1627`). The text never
+    // enters the height, so measuring the ink instead would hand
+    // `sysscn/PreRenderFontEx` a taller `shrinkCopy` source than the reference
+    // uses.
+    Ok(Variant::Integer(font.height.round() as i64))
 }
 
 fn font_get_esc_width_x(
@@ -12691,6 +12693,46 @@ mod tests {
             value,
             Variant::String(format!("|{}", ["Invalid argument count"; 9].join("|")))
         );
+    }
+
+    /// `Font.getTextHeight` answers `std::abs(Font.Height)`, whatever the text
+    /// is: `tTJSNI_Font::GetTextHeight` returns `std::abs(Font.Height)` for a
+    /// stand-alone font (`LayerIntf.cpp:9821-9825`) and delegates to
+    /// `MainImage->GetTextHeight` for a layer-bound one, whose `GetTextSize`
+    /// sets `TextHeight = std::abs(Font.Height)` on both branches
+    /// (`LayerBitmapImpl.cpp:1612`, `:1627`). Only the *width* sums per-glyph
+    /// advances, so the height never depends on the measured string.
+    ///
+    /// PARQUET's `sysscn/PreRenderFontEx.tjs` shrinks a pre-rendered glyph with
+    /// `l1 = resizeLayer.font.getTextHeight(text)` as the source height and the
+    /// destination's `dh = (int)(l1 * fontZoom)`; measuring the ink instead of
+    /// the font height feeds `shrinkCopy` a taller rectangle than the reference
+    /// does.
+    #[test]
+    fn font_get_text_height_is_the_font_height() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "font_height.tjs",
+                r#"
+                var font = new Font();
+                font.face = "MS Gothic";
+                font.height = 10;
+                var short = font.getTextHeight("l");
+                var tall = font.getTextHeight("あ");
+                var empty = font.getTextHeight("");
+                font.height = 37;
+                var changed = font.getTextHeight("l");
+                font.height = -12;
+                var negative = font.getTextHeight("l");
+                return short + "/" + tall + "/" + empty + "/" + changed + "/" + negative;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("10/10/10/37/12".to_string()));
     }
 
     /// The `WaveSoundBuffer` floors (`WaveIntf.cpp:1036` `open`, `:1069`
