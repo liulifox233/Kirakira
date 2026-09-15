@@ -27,8 +27,9 @@
 //! §4), and the bundled source (`src/plugins/win32/win32dialog/main.cpp` in the
 //! kirikiri2 trunk — the line numbers cited below, identical to the krkrz
 //! snapshot this module was written against) agrees member for member. That
-//! build registers four members the source does not have, and they are Win32
-//! window operations on the dialog's own `HWND`:
+//! build registers five members the source does not have: the four Win32
+//! window operations below, and the parameter-less `setActive()` (registered
+//! here without a floor). The four are operations on the dialog's own `HWND`:
 //!
 //! * `getPlacement()` / `setPlacement(dict)` wrap `GetWindowPlacement` /
 //!   `SetWindowPlacement`; `setPlacement` is a raw callback that answers
@@ -211,7 +212,7 @@ fn install_dialog_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
             empty_string,
         );
     }
-    // Two arguments: `void SetItemInt(int id, int value)` (`:436`), `void
+    // Two arguments: `void SetItemInt(int id, int value)` (`:437`), `void
     // SetItemText(int id, NameT string)` (`:451`), `void SetItemEnabled(int
     // id, bool en)` (`:458`), `void SetSize(int w, int h)` (`:493`),
     // `void SetPos(int x, int y)` (`:492`), and the `onNotify(long wp,
@@ -281,10 +282,11 @@ fn install_dialog_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
         );
     }
     // No parameter at all: `bool UnlockItemUpdate()` (`:428`), `VarT
-    // GetBaseUnits()` (`:566`), `void closeProgress()` (`:994`), `void
-    // BringToFront()` (`:1289`), and the shipped DLL's `void setActive()` and
-    // its two rectangle readers `VarT getWindowRect() const` /
-    // `VarT getClientRect() const`, which register no parameter either.
+    // GetBaseUnits()` (`:565`), `void closeProgress()` (`:994`), `void
+    // BringToFront()` (`:1289`), the source's two rectangle readers `VarT
+    // GetWindowRect() const` / `VarT GetClientRect() const` (`:505`, `:516`,
+    // registered `:1730-1731`), and the shipped DLL's `void setActive()`,
+    // which the source does not register.
     for name in ["bringToFront", "closeProgress", "setActive"] {
         runtime.register_object_native(handle, name, native_void);
     }
@@ -1983,7 +1985,7 @@ mod tests {
                 "d.setItemLong(1, 0, 5)",
             ),
             ("getItemLong", "d.getItemLong(1)", "d.getItemLong(1, 0)"),
-            // `void SetItemInt(int, int)` (`:436`), `int GetItemInt(int)`
+            // `void SetItemInt(int, int)` (`:437`), `int GetItemInt(int)`
             // (`:430`).
             ("setItemInt", "d.setItemInt(1)", "d.setItemInt(1, 0)"),
             ("getItemInt", "d.getItemInt()", "d.getItemInt(1)"),
@@ -2160,9 +2162,9 @@ mod tests {
             ),
             // Nested classes: `Header.store(dict)` / `Items.store(dict)`
             // (`:1308`, `:1338`), `DrawItem.draw(Bitmap, int, int)` (`:130`),
-            // `Notify.getByte/Word/DWord(int)`, `Blob.getByte/…/getText(int)`
-            // and `setByte/…/setText(int, v)` (`:154-176`), the static
-            // `Blob.ReferPointer(DWORD)` (`:176`).
+            // `Notify.getByte/Word/DWord(int)` (`:154-156`),
+            // `Blob.getByte/…/getText(int)` and `setByte/…/setText(int, v)`
+            // (`:168-176`), the static `Blob.ReferPointer(DWORD)` (`:176`).
             (
                 "Header.store",
                 "var h = new WIN32Dialog.Header(); h.store()",
@@ -2184,9 +2186,29 @@ mod tests {
                 "var n = new WIN32Dialog.Notify(); n.getByte(0)",
             ),
             (
+                "Notify.getWord",
+                "var n = new WIN32Dialog.Notify(); n.getWord()",
+                "var n = new WIN32Dialog.Notify(); n.getWord(0)",
+            ),
+            (
+                "Notify.getDWord",
+                "var n = new WIN32Dialog.Notify(); n.getDWord()",
+                "var n = new WIN32Dialog.Notify(); n.getDWord(0)",
+            ),
+            (
                 "Blob.getByte",
                 "var b = new WIN32Dialog.Blob(8); b.getByte()",
                 "var b = new WIN32Dialog.Blob(8); b.getByte(0)",
+            ),
+            (
+                "Blob.getWord",
+                "var b = new WIN32Dialog.Blob(8); b.getWord()",
+                "var b = new WIN32Dialog.Blob(8); b.getWord(0)",
+            ),
+            (
+                "Blob.getDWord",
+                "var b = new WIN32Dialog.Blob(8); b.getDWord()",
+                "var b = new WIN32Dialog.Blob(8); b.getDWord(0)",
             ),
             (
                 "Blob.getText",
@@ -2197,6 +2219,16 @@ mod tests {
                 "Blob.setByte",
                 "var b = new WIN32Dialog.Blob(8); b.setByte(0)",
                 "var b = new WIN32Dialog.Blob(8); b.setByte(0, 1)",
+            ),
+            (
+                "Blob.setWord",
+                "var b = new WIN32Dialog.Blob(8); b.setWord(0)",
+                "var b = new WIN32Dialog.Blob(8); b.setWord(0, 1)",
+            ),
+            (
+                "Blob.setDWord",
+                "var b = new WIN32Dialog.Blob(8); b.setDWord(0)",
+                "var b = new WIN32Dialog.Blob(8); b.setDWord(0, 1)",
             ),
             (
                 "Blob.setText",
