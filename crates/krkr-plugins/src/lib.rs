@@ -119,6 +119,7 @@ pub use k2compat::K2CompatPlugin;
 pub use kag_parser_ex::KagParserExPlugin;
 pub use kag_parser_exb::KagParserExbPlugin;
 pub use kagexopt::KagexOptPlugin;
+pub use kagexopt::{OptionCategory, OptionDesc, OptionKind, OptionValue};
 pub use kaicho_trans::KaichoTransPlugin;
 pub use kirikiroid2::Kirikiroid2Plugin;
 pub use krkrsteam::KrkrSteamPlugin;
@@ -271,6 +272,47 @@ pub fn default_plugin_names() -> impl Iterator<Item = &'static str> {
     CATALOG.iter().map(|entry| entry.name)
 }
 
+/// The plugins whose DLLs ship option descriptors (`GetOptionDesc`), with the
+/// category list each one declares — the crate's stand-in for the resource
+/// `IDR_OPTION_DESC_JSON` that `TVPGetPluginCommandDesc` reads out of a loaded
+/// DLL. `yuzuex.dll` embeds the same three categories as `kagexopt.dll`; it is
+/// deliberately absent here because it does not carry a second copy of the
+/// table (`yuzuex.rs` consumes this one), which the no-duplicate-category test
+/// below pins.
+pub const OPTION_DESCRIPTOR_PROVIDERS: &[(&str, &[OptionCategory])] = &[
+    ("kagexopt.dll", kagexopt::OPTION_CATEGORIES),
+    ("krmovie.dll", krmovie::OPTION_CATEGORIES),
+];
+
+/// Every option category the engine's **linked** plugins declare, in provider
+/// order, de-duplicated by category name the way the reference engine merges
+/// the DLLs' JSON (`TVPMargeCommandDesc`,
+/// `krkrz/msg/win32/ReadOptionDesc.cpp:260-288`, which appends a
+/// second declaration's options to the first category of that name).
+///
+/// Linking is what gates a descriptor in the reference too: the option dialog
+/// only sees the DLLs it finds on disk (`ConfigFormUnit::LoadPluginOptionDesc`,
+/// `krkrz/environ/win32/ConfigFormUnit.cpp:127-145`). A profile that leaves
+/// `kagexopt.dll` out (`GameProfile::only`) gets no 拡張ウィンドウ制御 group, so
+/// a shell driving its option surface from here cannot offer — or apply — an
+/// option the game's install does not ship.
+pub fn linked_option_categories(engine: &KrkrEngine) -> Vec<&'static OptionCategory> {
+    let linked: BTreeSet<&str> = engine.host().linked_plugins().collect();
+    let mut categories: Vec<&'static OptionCategory> = Vec::new();
+    for (plugin, declared) in OPTION_DESCRIPTOR_PROVIDERS {
+        if !linked.contains(*plugin) {
+            continue;
+        }
+        for category in *declared {
+            if categories.iter().any(|seen| seen.name == category.name) {
+                continue;
+            }
+            categories.push(category);
+        }
+    }
+    categories
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +369,55 @@ mod tests {
             );
         }
         assert_eq!(default_plugin_names().count(), CATALOG.len());
+    }
+
+    /// The merge in [`linked_option_categories`] keeps the first category of a
+    /// name, while `TVPMargeCommandDesc` appends a second declaration's
+    /// options to it. With one declaration per category name the two agree;
+    /// this pins that they still do, so a future provider that ships a
+    /// duplicate category cannot silently lose its options.
+    #[test]
+    fn no_two_providers_declare_the_same_category_name() {
+        let mut seen: Vec<&str> = Vec::new();
+        for (plugin, categories) in OPTION_DESCRIPTOR_PROVIDERS {
+            for category in *categories {
+                assert!(
+                    !seen.contains(&category.name),
+                    "{plugin} declares a second `{}` category",
+                    category.name
+                );
+                seen.push(category.name);
+            }
+        }
+    }
+
+    #[test]
+    fn linked_option_categories_follow_what_the_profile_linked() {
+        let mut engine = KrkrEngine::new(krkr_engine::EngineConfig::default()).expect("engine");
+        // Nothing linked: the option dialog in the reference sees no DLL, so
+        // there is nothing to render or apply.
+        assert!(linked_option_categories(&engine).is_empty());
+
+        register_profile_plugins(&mut engine, &GameProfile::only(["krmovie.dll"]))
+            .expect("plugins");
+        let categories = linked_option_categories(&engine);
+        assert_eq!(
+            categories
+                .iter()
+                .map(|category| category.name)
+                .collect::<Vec<_>>(),
+            ["デバッグ"],
+            "kagexopt.dll is not linked, so its three categories must not appear"
+        );
+
+        register_reference_plugins(&mut engine).expect("plugins");
+        assert_eq!(
+            linked_option_categories(&engine)
+                .iter()
+                .map(|category| category.name)
+                .collect::<Vec<_>>(),
+            ["ゲーム全般", "ムービー", "拡張ウィンドウ制御", "デバッグ"],
+            "the full profile links both descriptor providers, in provider order"
+        );
     }
 }
