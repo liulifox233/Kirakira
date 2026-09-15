@@ -364,10 +364,20 @@ impl<'f> BodyDecompiler<'f> {
         if let (Some(first), Some(last)) = (dropped.first(), dropped.last()) {
             self.unhandled += 1;
             super::count_dropped_region();
-            statements.push(self.marker(&format!(
+            let marker = self.marker(&format!(
                 "dropped region bytecode 0x{first:x} to 0x{last:x} {} instructions never reconstructed",
                 dropped.len()
-            )));
+            ));
+            // The marker renders as a comment, but here it is a statement:
+            // appended after the implicit `srv`/`ret` epilogue it would keep
+            // `drop_trailing_bare_return` from removing that epilogue, and
+            // every dropped body would grow a `return;` the original never
+            // had. Put it before one.
+            let at = match statements.last().map(|statement| &statement.kind) {
+                Some(StmtKind::Return(None)) => statements.len() - 1,
+                _ => statements.len(),
+            };
+            statements.insert(at, marker);
         }
         self.unhandled += self.scanner.unhandled_count();
         statements.extend(self.scanner.take_out());
@@ -1349,13 +1359,18 @@ impl<'f> BodyDecompiler<'f> {
                     // The else side ends control flow where it stands (a
                     // `throw`, a `return`, a `break`): the merge is still
                     // reached through the then branch, which jumps to it, so
-                    // the body continues there.  Propagating `Returned`
-                    // ended the whole walk at the if/else and silently
-                    // dropped every statement after it -- exactly the shape
-                    // PARQUET's `system/Initialize.tjs` ends its top level
-                    // with (an if/else whose else throws, then the KAG
-                    // system loader).
-                    SeqEnd::Returned => (if_stmt, SeqEnd::StoppedAt(merge)),
+                    // the *body* continues there and the region is live
+                    // bytecode.  Propagating `Returned` ends the whole walk at
+                    // the if/else and drops that region silently -- exactly
+                    // the shape PARQUET's `system/Initialize.tjs` ends its top
+                    // level with (an if/else whose else throws, then the KAG
+                    // system loader).  Continuing at the merge here was tried
+                    // and is wrong: nested constructs reach the same merge
+                    // through their own scans, so every level re-emitted the
+                    // shared region (Initialize.tjs grew 16x in instructions,
+                    // `kag.process("first.ks")` 32 times) -- the continuation
+                    // needs an emit-once guard; until then the dropped region
+                    // is reported by the marker below instead of duplicated.
                     other => (if_stmt, other),
                 }
             }
@@ -2165,22 +2180,61 @@ mod tests {
     }
 
     /// The `Initialize.tjs` shape: an `if/else` whose else side ends control
-    /// flow (a `throw`), with statements after the if/else. The merge is
-    /// reached through the then branch, so those statements are live code and
-    /// must be reconstructed; the walk used to propagate the else side's
-    /// `Returned` and end the body at the if/else (PARQUET's
-    /// `system/Initialize.tjs` stopped at the `Config.tjs` loader, and its
-    /// summary line still said "0 unhandled fragments").
+    /// flow (a `throw`), with statements after the if/else. The walk abandons
+    /// that region — the else side's `Returned` ends the body at the if/else —
+    /// and the fixture's job is that the output **says so**: a dropped-region
+    /// marker with the byte range. Before this work the same decompilation
+    /// ended silently, under a summary line that still read "0 unhandled
+    /// fragments" (PARQUET's `system/Initialize.tjs` stopped at the
+    /// `Config.tjs` loader this way).
+    ///
+    /// Continuing the walk at the merge was tried in this branch and is
+    /// wrong: nested constructs reach the same merge through their own scans,
+    /// so every nesting level re-emitted the shared region (Initialize.tjs
+    /// grew from 2442 to 9599 instructions and one `kag.process` call
+    /// appeared 32 times). The tail statement is therefore allowed at most
+    /// once here — an emit-once guard is the real fix and is filed as its own
+    /// task.
     #[test]
-    fn a_throwing_else_branch_keeps_the_statements_after_it() {
-        let (text, unhandled) = decompile(
+    fn a_throwing_else_branch_reports_the_abandoned_tail() {
+        let text = rendered(
             "var hit = 0; \
              if (flag) { hit = 1; } else { throw new Exception(\"boom\"); } \
              hit = hit + 2;",
         );
-        assert!(text.contains("hit = hit + 2;"), "{text}");
         assert!(text.contains("throw"), "{text}");
-        assert_eq!(unhandled, 0, "{text}");
+        assert!(
+            text.contains("// <unhandled: dropped region bytecode 0x"),
+            "the abandoned tail must be named: {text}"
+        );
+        assert!(
+            text.matches("hit = hit + 2;").count() <= 1,
+            "the tail must be abandoned or reconstructed once, never duplicated: {text}"
+        );
+    }
+
+    /// The marker is a comment, not code: it must not keep the implicit
+    /// function epilogue alive. `drop_trailing_bare_return` only looks at the
+    /// last statement, so appending the marker after a body's `srv`/`ret`
+    /// would leave every dropped function ending in a `return;` the original
+    /// never had.
+    #[test]
+    fn a_dropped_region_does_not_keep_the_implicit_return() {
+        let text = rendered(
+            "function f(n) { var i = 0; while (i < n) { i = i + 1; if (i == 3) continue; } }",
+        );
+        assert!(text.contains("dropped region bytecode 0x"), "{text}");
+        let mut previous = "";
+        for line in text.lines() {
+            if line.contains("dropped region") {
+                assert_ne!(
+                    previous.trim(),
+                    "return;",
+                    "the marker must not resurrect the epilogue: {text}"
+                );
+            }
+            previous = line;
+        }
     }
 
     /// The reviewer's complaint: a body the walk cannot finish was reported as

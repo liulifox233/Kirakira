@@ -157,7 +157,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use krkr_assets::{NativeAssetStore, ProjectStorage};
@@ -919,6 +919,10 @@ fn main() {
     // draw list.
     let mut last_frame_output: Option<FrameOutput> = None;
     let mut pending_audio_stops: Vec<AudioInstanceId> = Vec::new();
+    // The last non-info status the sink itself reported (a codec that could
+    // not load, a backend that could not open a device), named in the end-of-
+    // run audio verdict.
+    let mut audio_last_report: Option<String> = None;
     let mut pending_interactive_releases = Vec::new();
     let mut pending_interactive_clicks = Vec::new();
     // `(path, raw)`: a shot issued while no frame is available yet.
@@ -1269,6 +1273,12 @@ fn main() {
                 for event in &runtime_frame.audio {
                     if let krkr_core::AudioEvent::Status(status) = event {
                         println!("audio status={:?} {}", status.level, status.message);
+                        // The backend can die before the first command (no
+                        // output device), where nothing fails synchronously:
+                        // the error only exists in this event, and the end of
+                        // the run must not then look like a healthy sink that
+                        // happened to play nothing.
+                        audio_last_report = Some(status.message.clone());
                     }
                 }
                 let frame = runtime_frame.engine;
@@ -1506,7 +1516,39 @@ fn main() {
             semantic_kag_state(runtime.engine()).unwrap_or_else(|| "-".to_string())
         );
     }
-    report_audio_tap(audio_tap.as_ref(), audio_degraded.load(Ordering::Relaxed));
+    // A backend that cannot open a device fails on its own thread, and a run
+    // that ends before the worker reports (a five-frame probe) would then read
+    // exactly like a healthy sink that played nothing. Give a silent real sink
+    // a short grace to report before the verdict is printed; the events are
+    // handled the way `RuntimeSession` handles them, so watching for the
+    // report here drops nothing.
+    if audio_tap.is_some() && audio_last_report.is_none() && !audio_degraded.load(Ordering::Relaxed)
+    {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline && audio_last_report.is_none() {
+            for event in runtime.audio_mut().poll_events() {
+                match event {
+                    krkr_core::AudioEvent::Status(status) => {
+                        println!("audio status={:?} {}", status.level, status.message);
+                        audio_last_report = Some(status.message);
+                    }
+                    krkr_core::AudioEvent::PlaybackStopped { id } => {
+                        if let Err(error) = runtime.engine_mut().notify_audio_stopped(id) {
+                            println!("audio completion error: {error}");
+                        }
+                    }
+                }
+            }
+            if audio_last_report.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    report_audio_tap(
+        audio_tap.as_ref(),
+        audio_degraded.load(Ordering::Relaxed),
+        audio_last_report.as_deref(),
+    );
     println!("done frames={}", config.max_frames);
     // A requested dump is a result the caller scripted around: a layer image
     // or a shot that could not be written must be reported and fail the run,
@@ -1664,49 +1706,78 @@ impl AudioSink for DebugAudioSink {
     }
 }
 
+/// The verdict line of the audio path.
+///
+/// The three ways a run can end with nothing decoded look alike in a bare
+/// count: the silent sink asked for it (`--virtual-audio`), the backend was
+/// unavailable and the run degraded, or a live sink simply played nothing.
+/// Only the first is the operator's choice, and a sink that reported an error
+/// must name it — otherwise a dead backend and a healthy silent run are
+/// byte-identical (the review's measurement).
+fn audio_verdict(
+    instances: usize,
+    rendered: u64,
+    virtual_sink: bool,
+    degraded: bool,
+    last_report: Option<&str>,
+) -> String {
+    if virtual_sink {
+        return format!(
+            "audio decoded instances={instances} rendered_frames={rendered} (virtual sink: nothing decodes)"
+        );
+    }
+    if degraded {
+        return format!(
+            "audio decoded instances={instances} rendered_frames={rendered} (the backend was unavailable; the run continued on the silent sink, nothing decodes)"
+        );
+    }
+    match last_report {
+        Some(report) => format!(
+            "audio decoded instances={instances} rendered_frames={rendered} (the sink reported: {report})"
+        ),
+        None => format!("audio decoded instances={instances} rendered_frames={rendered}"),
+    }
+}
+
 /// Reports what the audio path actually did, from the decoder's PCM tap.
 ///
 /// `cursor` is the instance's rendered-frame clock: frames the decoder
 /// actually played. A virtual run has no tap, so it reports nothing decoded —
 /// the difference a probe needs between "the audio path ran" and "the
 /// commands were merely consumed".
-fn report_audio_tap(tap: Option<&PcmTap>, degraded: bool) {
-    let Some(tap) = tap else {
-        println!("audio decoded instances=0 rendered_frames=0 (virtual sink: nothing decodes)");
-        return;
-    };
-    if degraded {
-        println!(
-            "audio decoded instances=0 rendered_frames=0 (the backend was unavailable; the run continued on the silent sink, nothing decodes)"
-        );
-        return;
-    }
-    let ids = tap.instance_ids();
-    let mut rendered = 0_u64;
+fn report_audio_tap(tap: Option<&PcmTap>, degraded: bool, last_report: Option<&str>) {
     let mut lines = Vec::new();
-    for id in &ids {
-        let cursor = tap.cursor(*id).unwrap_or(0);
-        rendered += cursor;
-        let spec = tap
-            .spec(*id)
-            .map(|spec| format!("{}Hz/{}ch", spec.sample_rate, spec.channels))
-            .unwrap_or_else(|| "?".to_string());
-        let state = tap.state(*id).map(|state| format!("{state:?}"));
-        // The tap only allocates when somebody reads; a 480-frame window
-        // (~10 ms) is enough to tell decoded audio from silence.
-        let recent = tap
-            .read_recent(*id, 480)
-            .map(|snapshot| snapshot.available_frames)
-            .unwrap_or(0);
-        lines.push(format!(
-            "audio instance id={} spec={spec} state={} rendered_frames={cursor} recent_decoded_frames={recent}/480",
-            id.0,
-            state.as_deref().unwrap_or("?")
-        ));
+    let mut rendered = 0_u64;
+    let mut instances = 0;
+    if let Some(tap) = tap
+        && !degraded
+    {
+        let ids = tap.instance_ids();
+        instances = ids.len();
+        for id in &ids {
+            let cursor = tap.cursor(*id).unwrap_or(0);
+            rendered += cursor;
+            let spec = tap
+                .spec(*id)
+                .map(|spec| format!("{}Hz/{}ch", spec.sample_rate, spec.channels))
+                .unwrap_or_else(|| "?".to_string());
+            let state = tap.state(*id).map(|state| format!("{state:?}"));
+            // The tap only allocates when somebody reads; a 480-frame window
+            // (~10 ms) is enough to tell decoded audio from silence.
+            let recent = tap
+                .read_recent(*id, 480)
+                .map(|snapshot| snapshot.available_frames)
+                .unwrap_or(0);
+            lines.push(format!(
+                "audio instance id={} spec={spec} state={} rendered_frames={cursor} recent_decoded_frames={recent}/480",
+                id.0,
+                state.as_deref().unwrap_or("?")
+            ));
+        }
     }
     println!(
-        "audio decoded instances={} rendered_frames={rendered}",
-        ids.len()
+        "{}",
+        audio_verdict(instances, rendered, tap.is_none(), degraded, last_report)
     );
     for line in lines {
         println!("{line}");
@@ -1995,6 +2066,40 @@ mod tests {
         assert!(parse_interactive_command("textrender --size 0 x").is_err());
         assert!(parse_interactive_command("textrender --nope x").is_err());
         assert!(parse_interactive_command("textrender --class 1bad x").is_err());
+    }
+
+    /// The three ways a run can end with nothing decoded must not read alike:
+    /// the silent sink is the operator's own choice, a degraded run says so,
+    /// and a sink that reported an error is named — a dead backend used to be
+    /// byte-identical to a healthy run that simply played nothing (the
+    /// review's measurement of the asynchronous failure path).
+    #[test]
+    fn the_audio_verdict_names_the_sink_it_actually_had() {
+        assert_eq!(
+            super::audio_verdict(0, 0, true, false, None),
+            "audio decoded instances=0 rendered_frames=0 (virtual sink: nothing decodes)"
+        );
+        assert!(
+            super::audio_verdict(0, 0, false, true, None)
+                .contains("the backend was unavailable; the run continued on the silent sink"),
+            "{}",
+            super::audio_verdict(0, 0, false, true, None)
+        );
+        assert!(
+            super::audio_verdict(
+                0,
+                0,
+                false,
+                false,
+                Some("audio backend is unavailable: no output device")
+            )
+            .contains("(the sink reported: audio backend is unavailable: no output device)"),
+            "a dead backend must not look like a silent game"
+        );
+        assert_eq!(
+            super::audio_verdict(2, 25_595_788, false, false, None),
+            "audio decoded instances=2 rendered_frames=25595788"
+        );
     }
 
     /// The reviewed wiring: every run was handed a `VirtualAudioSink`, so no
