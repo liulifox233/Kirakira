@@ -2564,9 +2564,18 @@ fn player_draw(
         // holding means drawing the last sampled frame again — the same rule
         // the `.mtn` script-image loader applies to the same tail
         // ([`MotionGraphic`]).
-        let one_shot = motion
-            .animation(&animation)
-            .is_none_or(|animation| !animation.loop_time.is_some_and(|loop_time| loop_time > 0.0));
+        //
+        // Whether the animation loops is the *effective* loop time — the one
+        // the tick source advances by ([`player_loop_ticks`]: a script
+        // `loopTime`/`frameLoopTime` write first, else the file's own) — and
+        // the reference's rule over it is `loopTime < 0` for one-shot
+        // (`MMotionPlayer::Progress`, `sub_10350870`: a non-negative
+        // `loopTime` wraps at `lastTime`, a negative one clamps there;
+        // `vendor/eluna/crates/eluna/src/emote.rs:3514-3545`).  Keying the
+        // hold on the file's value instead froze a looping animation on an
+        // empty tick whenever a script moved the loop point — or when the file
+        // itself wrote `loopTime 0`, which loops.
+        let one_shot = player_loop_ticks(state) < 0.0;
         let mut tick = state.tick as f32;
         let mut sampled = motion.draw_list_with_variables(&animation, tick, &variables);
         if let Ok(items) = &sampled {
@@ -4958,6 +4967,30 @@ mod tests {
         ])
     }
 
+    /// [`vanishing_layer`] with the icon placed where the player draws it:
+    /// `Motion.Player` applies no canvas offset, so `coord` is where the
+    /// item's origin lands (`two_frame_layer`'s convention for the 32x32 work
+    /// layer `SETUP` builds).
+    fn vanishing_icon_layer(coord: [i64; 2], empty_from: i64, end: i64) -> Value {
+        object(vec![
+            ("label", text("body")),
+            ("coordinate", int(0)),
+            ("children", list(vec![])),
+            (
+                "frameList",
+                list(vec![
+                    object(vec![
+                        ("content", content("src/hero/white", coord, 255)),
+                        ("time", int(0)),
+                        ("type", int(2)),
+                    ]),
+                    object(vec![("time", int(empty_from)), ("type", int(2))]),
+                    object(vec![("time", int(end)), ("type", int(0))]),
+                ]),
+            ),
+        ])
+    }
+
     /// The env motion source draws as `clear` + `draw` every frame
     /// (`system/AffineSourceMotion.tjs` `drawAffine`: `_player.clear(a0, l1)`
     /// then `_player.draw(a0)`), so a one-shot animation whose tail samples
@@ -4973,25 +5006,7 @@ mod tests {
     /// PARQUET's title loses the logo once the motion has played out.
     #[test]
     fn a_one_shot_player_holds_its_last_drawn_frame_over_an_empty_tail() {
-        let layer = || {
-            object(vec![
-                ("label", text("body")),
-                ("coordinate", int(0)),
-                ("children", list(vec![])),
-                (
-                    "frameList",
-                    list(vec![
-                        object(vec![
-                            ("content", content("src/hero/white", [8, 8], 255)),
-                            ("time", int(0)),
-                            ("type", int(2)),
-                        ]),
-                        object(vec![("time", int(20)), ("type", int(2))]),
-                        object(vec![("time", int(400)), ("type", int(0))]),
-                    ]),
-                ),
-            ])
-        };
+        let layer = || vanishing_icon_layer([8, 8], 20, 400);
         let mut engine = engine_with(&[(
             MOTION_STORAGE,
             motion_bytes(vec![("white", [255, 255, 255, 255])], layer(), -1),
@@ -5048,6 +5063,91 @@ mod tests {
             white_near(&mut looping, 8, 8),
             0,
             "a looping motion's empty tick is delivered, not held"
+        );
+    }
+
+    /// The hold belongs to a *one-shot* animation, and "one-shot" is the
+    /// **effective** loop time the tick source advances by — a script
+    /// `loopTime`/`frameLoopTime` write first, else the file's own
+    /// ([`player_loop_ticks`]) — never the file's value alone:
+    /// `MMotionPlayer::Progress` (`sub_10350870`) wraps at `lastTime` for a
+    /// non-negative `loopTime` and only clamps for a negative one
+    /// (`vendor/eluna/crates/eluna/src/emote.rs:3514-3545`), and a script
+    /// write replaces the file's member (`numeric_player_member`'s
+    /// `loopTime`).
+    ///
+    /// Fails before the fix — the predicate read the file's `loopTime > 0` —
+    /// in both halves: a script `loopTime` on a file that plays once, and a
+    /// file whose own `loopTime` is 0.  Both loop, so both must deliver the
+    /// empty tick instead of freezing on the frame drawn before it.
+    #[test]
+    fn the_hold_follows_the_effective_loop_time_not_the_files() {
+        // Half one: the file plays once, the script moves the loop point.
+        let mut scripted = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                vanishing_icon_layer([8, 8], 20, 60),
+                -1,
+            ),
+        )]);
+        scripted.execute_script("setup.tjs", SETUP).expect("setup");
+        scripted
+            .execute_script(
+                "scripted_loop.tjs",
+                // 500 ms = 30 ticks, inside the animation.
+                "player.play(\"idle\", 0); player.loopTime = 500; \
+                 player.progress(100); player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw inside the content");
+        assert!(
+            white_near(&mut scripted, 8, 8) > 0,
+            "the icon draws while the animation has content"
+        );
+        scripted
+            .execute_script(
+                "scripted_tail.tjs",
+                // Tick 36: past the content (20), before the animation ends (60).
+                "player.progress(500); player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw on the loop's empty tick");
+        assert_eq!(
+            white_near(&mut scripted, 8, 8),
+            0,
+            "a script `loopTime` makes it a loop: its empty tick is delivered, not held"
+        );
+
+        // Half two: the file's own `loopTime` is 0, which loops to tick 0.
+        let mut file_zero = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                vanishing_icon_layer([8, 8], 20, 60),
+                0,
+            ),
+        )]);
+        file_zero.execute_script("setup.tjs", SETUP).expect("setup");
+        file_zero
+            .execute_script(
+                "file_zero.tjs",
+                "player.play(\"idle\", 0); \
+                 player.progress(100); player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw inside the content");
+        assert!(
+            white_near(&mut file_zero, 8, 8) > 0,
+            "the icon draws while the animation has content"
+        );
+        file_zero
+            .execute_script(
+                "file_zero_tail.tjs",
+                "player.progress(500); player.clear(layer, 0); player.draw(layer);",
+            )
+            .expect("draw on the loop's empty tick");
+        assert_eq!(
+            white_near(&mut file_zero, 8, 8),
+            0,
+            "a file `loopTime` of 0 loops: its empty tick is delivered, not held"
         );
     }
 
