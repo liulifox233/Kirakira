@@ -118,18 +118,19 @@
 //! (`:268`), everything else the switch one with `src1lv = Phase` and
 //! `src2lv = Phase - Vague` (`:292-293`).
 //!
-//! **Gap**: this build's provider channel has no image provider — a provider's
-//! `start_transition` receives options, layer type and sizes only, a running
-//! handler only the two bitmap faces, and neither can reach the project
-//! storage (`KrkrHost::load_image_storage` is `pub(crate)`; a provider is a
-//! `'static Arc` and cannot borrow the host). So [`load_rule_image`] cannot
-//! fetch the graphic and the provider fails the way the reference fails a rule
-//! it cannot load (`dim.cpp:422-423`). Everything *after* the load — the mono
-//! box blur, the negation order, the phase table and both blend families — is
-//! ported and unit-tested against hand-built bitmaps; wiring the load up is
-//! one call once the channel carries an image provider. Reading the rule out
-//! of a script object instead would invent surface the reference does not
-//! have, so the failure is reported rather than substituted.
+//! **Not wired**: the M79 registry carries an image provider — a factory opts
+//! in through [`TransitionHandlerProvider::start_transition_with`] and loads
+//! the graphic through `TransitionContext::load_image` (`plugin_api::transition`,
+//! the reference's `iTVPSimpleImageProvider::LoadImage`) — but this module
+//! still implements only the pre-context `start_transition` entry point, so
+//! [`load_rule_image`] cannot reach the project storage and fails the way the
+//! reference fails a rule it cannot load (`dim.cpp:422-423`).  Everything
+//! *after* the load — the mono box blur, the negation order, the phase table
+//! and both blend families — is ported and unit-tested against hand-built
+//! bitmaps; switching the factory to `start_transition_with` and reading the
+//! 8bpp plane out of the context is the one following change.  Reading the
+//! rule out of a script object instead would invent surface the reference does
+//! not have, so the failure is reported rather than substituted.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -167,7 +168,7 @@ const LT_ADD_ALPHA: i32 = 12;
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "blur / dim transitions",
-    notes: "Real providers for both names: `blur` is complete (option surface, integral-image box blur, layer-type composites). `dim`'s option surface, mono rule box blur, negation, phase table and universal-transition blends are ported, but its `rule` graphic cannot be fetched — the provider channel carries no image provider — so starting `dim` reports the reference's rule-load failure.",
+    notes: "Real providers for both names: `blur` is complete (option surface, integral-image box blur, layer-type composites). `dim`'s option surface, mono rule box blur, negation, phase table and universal-transition blends are ported, but its `rule` graphic is not loaded: the factory still uses the pre-context `start_transition` entry point instead of `TransitionContext::load_image`, so starting `dim` reports the reference's rule-load failure (the one following change is the factory switch, not any missing engine surface).",
     install: |engine| engine.register_plugin(KaichoTransPlugin),
 };
 
@@ -879,11 +880,14 @@ impl RuleImage {
 /// scaled to the transition's size (`TransIntf.cpp:139-162`,
 /// `TVPLoadGraphic(..., glmGrayscale)`).
 ///
-/// **This build cannot perform it**: the M79 provider channel carries no image
-/// provider (see the module docs), so the reference's failure path is the only
-/// reachable one — `TVPThrowExceptionMessage(TJS_W("ルール画像 %1 を読み込む
-/// ことができません"), rulename)` (`dim.cpp:422-423`). The message keeps the
-/// reference's text and names the reason the port cannot do better.
+/// **This module does not perform it yet**: the factory only implements
+/// `start_transition`, which has no [`TransitionContext`], so the reference's
+/// failure path is the only reachable one — `TVPThrowExceptionMessage(TJS_W("ルール画像 %1 を読み込む
+/// ことができません"), rulename)` (`dim.cpp:422-423`).  The context's
+/// `load_image` is the seam that carries it (see the module docs); the message
+/// keeps the reference's text and names the reason the port cannot do better.
+///
+/// [`TransitionContext`]: krkr_engine::plugin_api::transition::TransitionContext
 fn load_rule_image(
     name: &str,
     _width: u32,
@@ -1899,6 +1903,33 @@ mod tests {
             .execute_script("link.tjs", r#"Plugins.unlink("KaichoTrans.dll");"#)
             .expect("unlink");
         assert!(transition_provider_names(engine.tjs_runtime()).is_empty());
+    }
+
+    /// A name the engine's own kernels answer to is already registered — the
+    /// reference's always-present default providers — and the registry refuses
+    /// it with the reference's `TVPTransAlreadyRegistered` text.
+    #[test]
+    fn the_registry_refuses_a_default_kernel_name() {
+        struct WaveNamed;
+
+        impl TransitionHandlerProvider for WaveNamed {
+            fn name(&self) -> &str {
+                "wave"
+            }
+
+            fn start_transition(
+                &self,
+                _request: &TransitionRequest,
+            ) -> std::result::Result<Box<dyn TransitionHandler>, TransitionHandlerError>
+            {
+                unreachable!("the registry refuses this provider before any factory runs")
+            }
+        }
+
+        let mut engine = engine();
+        let error = register_transition_provider(engine.tjs_runtime_mut(), Arc::new(WaveNamed))
+            .expect_err("a kernel name is taken");
+        assert_eq!(error.message, "Transition wave already registerd");
     }
 
     #[test]

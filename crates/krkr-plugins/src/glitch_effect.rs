@@ -47,16 +47,140 @@
 //! `layer.doGlitch(layer, %[…])` distorts in place and
 //! `dest.glitchCopy(src, %[…])` copies through the distortion.
 //!
-//! **Mapped, not implemented**: the three transition names. Registering a
-//! transition provider needs an engine-side registry that accepts a plugin's
-//! own name and kernel; this engine has none yet, and its name lookup degrades
-//! a linked plugin's names to `crossfade`
-//! (`crates/krkr-engine/src/native/classes.rs`, `PLUGIN_TRANSITION_NAMES`).
-//! So `trans method=glitch` / `Layer.beginTransition("glitch", …)` resolves
-//! and cross-fades instead of glitching — the compat alternative the dossier
-//! describes, which M54 put in place. The handler option names that only the
-//! transition path reads (`time`, `block`, `break`, `nofade`, `fadein`,
-//! `gamma_in`, `gamma_out`, `color`) are therefore parsed by nothing here.
+//! **Real**: the three transition providers, and `Layer.doGlitch` /
+//! `Layer.glitchCopy`. The two members are attached to the engine's global
+//! `Layer` class exactly where the binder puts them (`crate::catalog`'s
+//! `install` registers a [`KrkrPlugin`], whose `register` runs the same
+//! named-member bind), and they run the recovered distortion over the
+//! engine's scoped bitmap views ([`krkr_engine::plugin_api::layer`] — the
+//! memory-safe stand-in for the reference's `mainImageBufferForWrite`) and
+//! repaint through `Layer.update()`.
+//!
+//! The call shapes follow the reference's invokers: `doGlitch(sourceLayer,
+//! optionsObject)` type-checks **two** objects (`0x10002fb0`) and answers
+//! `TJS_E_BADPARAMCOUNT` otherwise, while `glitchCopy(sourceLayer, options?)`
+//! requires its layer object and defaults every option name it reads. The
+//! layer the call goes through is the destination in both, so
+//! `layer.doGlitch(layer, %[…])` distorts in place and
+//! `dest.glitchCopy(src, %[…])` copies through the distortion.
+//!
+//! The three transition names register from [`KrkrPlugin::register`] through
+//! [`krkr_engine::plugin_api::transition`] and unregister from
+//! [`KrkrPlugin::unregister`] — the DLL's `V2Link`/`V2Unlink` — so each name
+//! answers exactly while the module is linked and falls back to the official
+//! `Cannot find transition handler <name>` once it is not. The engine's
+//! interim linked-shim projection (`PLUGIN_TRANSITION_NAMES`) is never
+//! reached for them any more: the registry is consulted first.  `V2Unlink`
+//! (`0x10001040`) calls `0x10006050` → `0x10003130`, three
+//! `TVPRemoveTransHandlerProvider` calls, and its member-unbind helper
+//! (`FUN_100012a0`) is a no-op in this build — the two `Layer` members stay
+//! bound after an unlink, which is what this module's `unregister` does too.
+//! (`V2Unlink` gates the removal on `TVPPluginGlobalRefCount`; the engine's
+//! plugin host decides when `unregister` runs.)
+//!
+//! # The three providers
+//!
+//! The registration helpers (`0x100053f0` `glitch`, `0x10005310`
+//! `fadeglitch`, `0x10005380` `loopglitch`) each build one
+//! `tTVPTransHandlerProvider<T>` singleton and hand it to
+//! `TVPAddTransHandlerProvider`; the template's `StartTransition` (`0x100059b0`
+//! / `0x10005870` / `0x10005910`, one per template instantiation) reads the
+//! provider's two type words (`*type = [0xc]`, `*updatetype = [0x10]`), tests
+//! the equal-size flag at `+0x14`, and calls the class factory:
+//!
+//! | name | factory | handler ctor | `*type` | `*updatetype` | equal sizes |
+//! |---|---|---|---|---|---|
+//! | `glitch` | `0x10002e90` | `0x10002740` `tTVPTransGlitch` | 1 `ttExchange` | 0 `tutDivisibleFade` | required |
+//! | `fadeglitch` | `0x10002ca0` | `0x10002340` `tTVPTransFadeGlitch` | 0 `ttSimple` | 0 `tutDivisibleFade` | not required |
+//! | `loopglitch` | `0x10002df0` | `0x10002670` `tTVPTransLoopGlitch` | 0 `ttSimple` | 0 | not required |
+//!
+//! The options each factory reads, in its own order (`FUN_10001cd0` = an
+//! integer with a caller default, `FUN_10001dd0` = a real, `FUN_10001ee0` = a
+//! `tTVInteger`):
+//!
+//! * `glitch`: `time` (`-1` default, so a missing or negative one fails the
+//!   call; clamped to `>= 2`), `gamma_in` (1.0), `gamma_out` (1.0), `block`
+//!   (`0x10`, `<= 0` back to `0x10`).
+//! * `fadeglitch`: `time` (same rule), `nofade` (0), `fadein` (0),
+//!   `gamma_in` when `fadein` is set and `gamma_out` otherwise (1.0 either
+//!   way), `block` (same), `color` (0 — and forced to `0x808080` when
+//!   `nofade` is set).
+//! * `loopglitch`: `block` alone — no `time` at all.
+//!
+//! Each factory also copies the option object (`FUN_10001bc0` reads the eight
+//! distortion parameters out of it) and hands the copy to the handler's base
+//! constructor, which stores it (`0x10002420`) so the per-pass table fills can
+//! rebuild from it.
+//!
+//! **Per frame** the handler's `StartProcess` (`0x100057a0`, the shared base)
+//! computes `ratio = (tick - first_tick) / time` — returning 2, i.e. "stop",
+//! once `tick` reaches `time` — and calls the class's own virtual hook, which
+//! **reseeds the generator from the tick and rebuilds the row and block
+//! tables**; `Process` (`0x10004e10`, shared) resolves the three scanline
+//! providers and calls the class's compose hook. The compose hooks:
+//!
+//! * `glitch` (`0x10004d70`): `FUN_100048f0` over **`Src1`** — the
+//!   destination's own bitmap — at the constant scale `[this+0xc0]`, which
+//!   the constructor initialised to `gamma_out`.
+//! * `fadeglitch` (`0x100047a0`): `x = ratio` (or `1 - ratio` under
+//!   `fadein`), the walk runs over `Src1` (or `Src2` under `fadein`) at
+//!   `pow(x, gamma)`, and when `color != 0x808080` a colour wash
+//!   ([`colour_wash`]) runs over the composed bitmap with the value
+//!   `FUN_10003710` derives from `x²`.
+//! * `loopglitch` (`0x10004da0`): `FUN_10004830` picks a face per row from a
+//!   per-pass mask (`0x10005ef0`, one bit per row with probability `ratio`):
+//!   masked rows take `Src1` at `pow(ratio, [this+0xb8])` (the constructor's
+//!   `+0xb8` is 0, so 1.0), the others `Src2` at `pow(1 - ratio,
+//!   [this+0xc0])` (the constructor's `+0xc0` is 1.0, so `1 - ratio`).
+//!
+//! `ttExchange` is what swaps the two layers at the stop
+//! (`LayerIntf.cpp:6371`); `tutDivisibleFade` is what makes the reference
+//! re-read the live bitmaps instead of the frozen `Src1Bmp`/`Src2Bmp`
+//! (`LayerIntf.cpp:6581`, `:6601`) — see the deviations below.
+//!
+//! ## Options that are parse-only in the shipped DLL
+//!
+//! * **`break`**: read by `0x100055d0` — `glitch`'s per-pass hook — into the
+//!   byte at `+0xc8`, from the option provider pointer the hook finds at
+//!   `+0xb8`.  That pointer is never set: `SetOption` (`0x10005520`, the
+//!   class's override) is the only writer and the reference core never calls
+//!   `iTVPBaseTransHandler::SetOption` (`krkrz`'s `visual/LayerIntf.cpp` has
+//!   no call site), so `+0xb8` still holds the constructor's `gamma_in`
+//!   double and the hook's `*(int*)(this + 0xb8) != 0` test reads its low
+//!   dword — zero for every ordinary value, which skips the reads.  Nothing
+//!   anywhere reads `+0xc8` afterwards.  The port does not implement `break`:
+//!   there is no effect to reproduce.
+//! * **`coef`**: the same dead read; `glitch`'s scale stays `gamma_out`.
+//! * **`gamma_in`** in `glitch`: read by the factory (so a non-numeric value
+//!   fails the call, which the port keeps) and stored at the slot the dead
+//!   lazy read reinterprets; never read as a number.
+//!
+//! ## Deviations from the reference
+//!
+//! * **The generator stream.**  The per-pass rebuild seeds the tables from
+//!   the tick exactly as the DLL does, but the port's splitmix64/Marsaglia
+//!   pipeline is the module's own (see [`GlitchTables`]): runs are
+//!   reproducible from the tick, not bit-identical to the DLL's.
+//! * **`Src1` is the frozen bitmap here.**  The registry's channel hands a
+//!   handler the destination layer's bitmap *as it was when the transition
+//!   started* (`plugin_api::transition`: `dest_before`), which is the
+//!   reference's `tutDivisible` spelling; these three providers report
+//!   `tutDivisibleFade`, where the core re-reads the destination's live
+//!   image.  For a transition whose destination does not change under it the
+//!   two are the same bitmap.
+//! * **`ttSimple` has no spelling in the registry.**  `fadeglitch` and
+//!   `loopglitch` report `ttSimple`, so the reference does *not* exchange the
+//!   two layers at the stop and *does* accept a call without a source layer;
+//!   the registry's `TransitionHandlerProvider` has no way to report either,
+//!   so this engine treats every provider transition like `ttExchange` and
+//!   requires a source layer (a `beginTransition` without one fails before
+//!   any provider runs).
+//! * **`loopglitch`'s stop.**  Its handler's `time` stays -1, and
+//!   `0x100057a0` then answers "stop" at the first tick past zero, so the
+//!   reference's own `loopglitch` ends after its tick-0 pass.  This port
+//!   leaves the clock to the engine: a `loopglitch` call without a `time`
+//!   option completes immediately (the registry's no-clock rule), and one
+//!   with a `time` runs for that clock.
 //!
 //! # Recovered parameters
 //!
@@ -129,11 +253,19 @@
 //!   engine's views are RGBA, so the port's channel order is R, G, B, A
 //!   (`docs/plugins/plugin-facing-engine-facilities.md` §B.3.4).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use krkr_engine::{
     KrkrHost, KrkrPlugin,
-    plugin_api::layer::{LayerBitmap, layer_bitmap_read_write, layer_update},
+    plugin_api::layer::{layer_bitmap_read_write, layer_update},
+    plugin_api::transition::{
+        TransitionFrame, TransitionHandler, TransitionHandlerError, TransitionHandlerProvider,
+        TransitionOptions, TransitionRequest, register_transition_provider,
+        unregister_transition_provider,
+    },
 };
 use krkr_tjs2::{
     Result, TjsError,
@@ -144,8 +276,8 @@ use crate::catalog::{PluginMeta, PluginStatus};
 
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
-    feature: "Layer.doGlitch / Layer.glitchCopy pixel glitch, and the glitch / fadeglitch / loopglitch transition names",
-    notes: "The two Layer members are real pixel work: the recovered splitmix64-seeded block/row/colour displacement — a Marsaglia-polar normal step per entry, accumulated into a running walk that `per_reset` zeroes (defaults noise 4, sft_x 16, sft_y 8, sft_col 8, per_x 0.5, per_y 0.25, per_col 0.05, per_reset 0.02, size 16, coef 1) — runs over the scoped layer bitmap views and repaints; `doGlitch` takes its two object arguments as the reference invoker type-checks them. The three transition providers are not implemented — the engine has no plugin transition-provider registry, so its lookup maps the name to crossfade while GlitchEffect.dll is linked — and the handler-only options (time, block, break, nofade, fadein, gamma_in, gamma_out, color) are therefore read by nothing.",
+    feature: "Layer.doGlitch / Layer.glitchCopy pixel glitch, and the glitch / fadeglitch / loopglitch transition providers",
+    notes: "All three surfaces are real. The two Layer members run the recovered splitmix64-seeded block/row/colour displacement — a Marsaglia-polar normal step per entry, accumulated into a running walk that `per_reset` zeroes (defaults noise 4, sft_x 16, sft_y 8, sft_col 8, per_x 0.5, per_y 0.25, per_col 0.05, per_reset 0.02, size 16, coef 1) — over the scoped layer bitmap views and repaint; `doGlitch` takes its two object arguments as the reference invoker type-checks them. The three transition providers register from `register` (the DLL's `V2Link`) and unregister from `unregister` (`V2Unlink`) through plugin_api::transition: `glitch` distorts Src1 with gamma_out as the scale and requires equal sizes, `fadeglitch` distorts Src1 (or Src2 under `fadein`) at pow(ratio, gamma) with the `color` wash, `loopglitch` splits rows between the two faces by a per-pass random mask; all three rebuild their tables every pass from the tick, as the DLL's StartProcess hooks do. `break` is parsed by the shipped DLL and never read (the only reader is its own dead lazy `coef` path), and gamma_in reaches nothing in `glitch`: both are documented, not implemented.",
     install: |engine| engine.register_plugin(GlitchEffectPlugin),
 };
 
@@ -158,6 +290,16 @@ impl KrkrPlugin for GlitchEffectPlugin {
 
     fn register(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
         install_layer_members(runtime);
+        for provider in transition_providers() {
+            register_transition_provider(runtime, Arc::clone(provider))?;
+        }
+        Ok(())
+    }
+
+    fn unregister(&self, runtime: &mut Runtime<KrkrHost>) -> Result<()> {
+        for name in TRANSITION_NAMES {
+            unregister_transition_provider(runtime, name);
+        }
         Ok(())
     }
 }
@@ -483,35 +625,38 @@ type Rgba = [u8; 4];
 /// and alpha and the same span `dcol` either side for red and blue — the
 /// `± 4*channelOffset` pointers the copy loop builds around its centre
 /// pointer.
+#[allow(clippy::too_many_arguments)]
 fn apply_glitch(
     source: &[u8],
-    source_bitmap: &LayerBitmap,
+    source_width: u32,
+    source_height: u32,
     dest: &mut [u8],
-    dest_bitmap: &LayerBitmap,
+    dest_width: u32,
+    dest_height: u32,
     clip: (i64, i64, i64, i64),
+    scale: f64,
     tables: &GlitchTables,
-    options: &GlitchOptions,
 ) {
     let (left, top, width, height) = clip;
-    let right = (left + width).clamp(0, i64::from(dest_bitmap.width));
-    let bottom = (top + height).clamp(0, i64::from(dest_bitmap.height));
-    let left = left.clamp(0, i64::from(dest_bitmap.width));
-    let top = top.clamp(0, i64::from(dest_bitmap.height));
+    let right = (left + width).clamp(0, i64::from(dest_width));
+    let bottom = (top + height).clamp(0, i64::from(dest_height));
+    let left = left.clamp(0, i64::from(dest_width));
+    let top = top.clamp(0, i64::from(dest_height));
 
-    let source_width = i64::from(source_bitmap.width);
-    let source_pixels = source_width * i64::from(source_bitmap.height);
+    let source_width = i64::from(source_width);
+    let source_pixels = source_width * i64::from(source_height);
     let size = i64::from(tables.size);
 
     for y in top..bottom {
-        let line = tables.line[(y as u32).min(dest_bitmap.height.saturating_sub(1)) as usize];
+        let line = tables.line[(y as u32).min(dest_height.saturating_sub(1)) as usize];
         let mut x = left;
         while x < right {
             let run_end = (((x / size) + 1) * size).min(right);
             let length = run_end - x;
             let cell = tables.cell(x as u32, y as u32);
-            let shift_x = ((line + tables.dx[cell]) * options.coef) as i64;
-            let shift_y = (tables.dy[cell] * options.coef) as i64;
-            let colour = (tables.colour[cell] * options.coef) as i64;
+            let shift_x = ((line + tables.dx[cell]) * scale) as i64;
+            let shift_y = (tables.dy[cell] * scale) as i64;
+            let colour = (tables.colour[cell] * scale) as i64;
 
             // The run's start pixel, clamped the way the reference clamps the
             // whole pointer: a run whose start falls outside the plane is
@@ -528,7 +673,7 @@ fn apply_glitch(
                 let green = plane_pixel(source, centre + step);
                 let red = plane_pixel(source, red + step);
                 let blue = plane_pixel(source, blue + step);
-                let index = pixel_offset((x + step) as u32, y as u32, dest_bitmap.width);
+                let index = pixel_offset((x + step) as u32, y as u32, dest_width);
                 dest[index..index + 4].copy_from_slice(&[red[0], green[1], blue[2], green[3]]);
             }
             x = run_end;
@@ -569,12 +714,14 @@ fn run_glitch(
         let tables = GlitchTables::build(options, dest_view.bitmap.width, dest_view.bitmap.height);
         apply_glitch(
             source_view.pixels,
-            &source_view.bitmap,
+            source_view.bitmap.width,
+            source_view.bitmap.height,
             dest_view.pixels,
-            &dest_view.bitmap,
+            dest_view.bitmap.width,
+            dest_view.bitmap.height,
             dest_view.bitmap.clip,
+            options.coef,
             &tables,
-            options,
         );
     })?;
     layer_update(runtime, dest)
@@ -656,18 +803,518 @@ fn is_layer_like(runtime: &Runtime<KrkrHost>, object: ObjectHandle) -> bool {
     !matches!(runtime.object_member(object, "hasImage"), Variant::Void)
 }
 
+// ------------------------------------------------------ transition providers
+
+/// The three `GetName` strings — the exact spellings
+/// `TVPFindTransHandlerProvider` hashes (`TransIntf.cpp:341-359`), sorted.
+///
+/// `V2Link`'s `onV2Link` (`0x10006030`) installs them in the order `glitch`
+/// (`0x100053f0`), `fadeglitch` (`0x10005310`), `loopglitch` (`0x10005380`) —
+/// one `TVPAddTransHandlerProvider` call each, on a singleton provider object
+/// built once.  Order is not part of the registry's contract, so this module
+/// keeps them sorted.
+const TRANSITION_NAMES: [&str; 3] = ["fadeglitch", "glitch", "loopglitch"];
+
+/// Which of the three handler classes a provider builds
+/// (`tTVPTransGlitch` / `tTVPTransFadeGlitch` / `tTVPTransLoopGlitch`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlitchTransitionKind {
+    /// `glitch` (`0x10002e90` → `tTVPTransGlitch`, ctor `0x10002740`).
+    Glitch,
+    /// `fadeglitch` (`0x10002ca0` → `tTVPTransFadeGlitch`, ctor `0x10002340`).
+    FadeGlitch,
+    /// `loopglitch` (`0x10002df0` → `tTVPTransLoopGlitch`, ctor `0x10002670`).
+    LoopGlitch,
+}
+
+/// The three providers, built once and handed back on every `register` — the
+/// registry treats a repeat of the identical `Arc` as a no-op, which is what
+/// this engine needs because it runs `register` at boot *and* at the first
+/// `Plugins.link` (the reference's single `V2Link`).
+fn transition_providers() -> &'static [Arc<dyn TransitionHandlerProvider>; 3] {
+    static PROVIDERS: OnceLock<[Arc<dyn TransitionHandlerProvider>; 3]> = OnceLock::new();
+    PROVIDERS.get_or_init(|| {
+        [
+            Arc::new(GlitchTransitionProvider::new(
+                GlitchTransitionKind::FadeGlitch,
+            )),
+            Arc::new(GlitchTransitionProvider::new(GlitchTransitionKind::Glitch)),
+            Arc::new(GlitchTransitionProvider::new(
+                GlitchTransitionKind::LoopGlitch,
+            )),
+        ]
+    })
+}
+
+struct GlitchTransitionProvider {
+    kind: GlitchTransitionKind,
+}
+
+impl GlitchTransitionProvider {
+    fn new(kind: GlitchTransitionKind) -> Self {
+        Self { kind }
+    }
+
+    fn name(&self) -> &'static str {
+        match self.kind {
+            GlitchTransitionKind::Glitch => "glitch",
+            GlitchTransitionKind::FadeGlitch => "fadeglitch",
+            GlitchTransitionKind::LoopGlitch => "loopglitch",
+        }
+    }
+}
+
+impl TransitionHandlerProvider for GlitchTransitionProvider {
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn start_transition(
+        &self,
+        request: &TransitionRequest,
+    ) -> std::result::Result<Box<dyn TransitionHandler>, TransitionHandlerError> {
+        let settings = TransitionSettings::parse(self.kind, &request.options)?;
+        // The provider's own size rule (`tTVPTransHandlerProvider<T>`'s
+        // `StartTransition`, one template for the three): the registration
+        // helper's byte at `+0x14` gates it, and only `glitch` sets it
+        // (`0x100053f0`), so only `glitch` refuses a mismatched pair
+        // (`src1w == src2w && src1h == src2h`).  `fadeglitch` and `loopglitch`
+        // (both `ttSimple`) accept any source size and may even run without a
+        // source layer at all.
+        if self.kind == GlitchTransitionKind::Glitch
+            && request.source_size != Some(request.dest_size)
+        {
+            return Err(TransitionHandlerError::new(
+                "glitch: the transition source and destination must be the same size",
+            ));
+        }
+        let (width, height) = request.dest_size;
+        Ok(Box::new(GlitchTransitionHandler::new(
+            settings, width, height,
+        )))
+    }
+}
+
+// ------------------------------------------------- provider options
+
+/// The options one of the three factories reads (`0x10002e90` `glitch`,
+/// `0x10002ca0` `fadeglitch`, `0x10002df0` `loopglitch`).
+///
+/// Every factory also copies the whole options object and hands it to the
+/// handler's base constructor (`FUN_10001bc0` → `FUN_10002420`); the eight
+/// distortion parameters are read from that copy once here, because the
+/// per-pass table fills read the stored values, not the script object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TransitionSettings {
+    kind: GlitchTransitionKind,
+    /// `time` in milliseconds: `glitch` and `fadeglitch` read it first and
+    /// return `TJS_E_FAIL` when it is missing or negative (`FUN_10001cd0`
+    /// answers the `-1` default), then clamp it to the reference's 2 ms floor.
+    /// `loopglitch` never reads it and keeps the constructor's `-1`, which
+    /// makes its first `StartProcess` past tick 0 answer "stop"
+    /// (`0x100057a0` returns 2 once `elapsed >= time`) — see
+    /// [`GlitchTransitionHandler`].
+    time_ms: Option<i64>,
+    /// `block` (`0x10` default, `<= 0` falls back to `0x10`): the square the
+    /// walk copies one run at a time.
+    block: i64,
+    /// `glitch`: `gamma_out` (`1.0` default).  `fadeglitch`: `gamma_in` when
+    /// `fadein` is set, `gamma_out` otherwise — the factory picks the name
+    /// (`0x10002ca0`: `pwVar4 = L"gamma_in"; if (iVar3 == 0) pwVar4 =
+    /// L"gamma_out";`).  `loopglitch`: unused.
+    gamma: f64,
+    /// `fadeglitch`'s `fadein` (`0` default): non-zero swaps the distorted
+    /// face to `Src2` and the clock to `1 - ratio`.
+    fadein: bool,
+    /// `fadeglitch`'s `color` (`0` default; forced to `0x808080` when
+    /// `nofade` is set).  `0x808080` is the "no colour wash" spelling: the
+    /// handler's `+0xc8` flag is exactly `color != 0x808080`.
+    colour: u32,
+    noise: f64,
+    sft_x: f64,
+    sft_y: f64,
+    sft_col: f64,
+    per_x: f64,
+    per_y: f64,
+    per_col: f64,
+    per_reset: f64,
+}
+
+/// `FUN_10001dd0`/`FUN_10001cd0`: one option read by name, the caller's
+/// default kept when the member is absent or `void`, and a member that cannot
+/// be converted failing the call (the C++ `(tjs_int)tmp`/`(double)tmp` throws
+/// `TJSConvertError` out of `StartTransition`).
+fn transition_real(
+    options: &TransitionOptions,
+    name: &str,
+    default: f64,
+) -> std::result::Result<f64, TransitionHandlerError> {
+    match options.value(name) {
+        None | Some(Variant::Void) => Ok(default),
+        Some(value) => value.to_real().map_err(|error| {
+            TransitionHandlerError::new(format!("option `{name}` cannot be read: {error}"))
+        }),
+    }
+}
+
+fn transition_integer(
+    options: &TransitionOptions,
+    name: &str,
+    default: i64,
+) -> std::result::Result<i64, TransitionHandlerError> {
+    match options.value(name) {
+        None | Some(Variant::Void) => Ok(default),
+        Some(value) => value.to_integer().map_err(|error| {
+            TransitionHandlerError::new(format!("option `{name}` cannot be read: {error}"))
+        }),
+    }
+}
+
+impl TransitionSettings {
+    fn parse(
+        kind: GlitchTransitionKind,
+        options: &TransitionOptions,
+    ) -> std::result::Result<Self, TransitionHandlerError> {
+        // `block`: `FUN_10001cd0(options, L"block", 0x10)` then the `cmovle`
+        // fallback back to 16.
+        let block = {
+            let block = transition_integer(options, "block", DEFAULT_SIZE)?;
+            if block < 1 { DEFAULT_SIZE } else { block }
+        };
+        let settings = Self {
+            kind,
+            time_ms: None,
+            block,
+            gamma: DEFAULT_COEF,
+            fadein: false,
+            colour: 0x808080,
+            noise: transition_real(options, "noise", DEFAULT_NOISE)?,
+            sft_x: transition_real(options, "sft_x", DEFAULT_SFT_X)?,
+            sft_y: transition_real(options, "sft_y", DEFAULT_SFT_Y)?,
+            sft_col: transition_real(options, "sft_col", DEFAULT_SFT_COL)?,
+            per_x: transition_real(options, "per_x", DEFAULT_PER_X)?,
+            per_y: transition_real(options, "per_y", DEFAULT_PER_Y)?,
+            per_col: transition_real(options, "per_col", DEFAULT_PER_COL)?,
+            per_reset: transition_real(options, "per_reset", DEFAULT_PER_RESET)?,
+        };
+        match kind {
+            GlitchTransitionKind::Glitch => {
+                // `iVar1 = FUN_10001cd0(param_1, L"time", 0xffffffff); if
+                // (-1 < iVar1) { if (iVar1 < 2) iVar1 = 2; ... }` — an absent
+                // or negative `time` leaves the factory at its failure exit.
+                let time = transition_integer(options, "time", -1)?;
+                if time < 0 {
+                    return Err(TransitionHandlerError::new(
+                        "glitch: option `time` is required",
+                    ));
+                }
+                // `gamma_in` is read (`0x10002e90`) into the slot the DLL's
+                // only lazy reader (`0x100055d0`) then reinterprets as the
+                // option provider pointer; that reader tests the low dword of
+                // the stored double and skips for every ordinary value, so the
+                // number itself reaches nothing.  Read, for the reference's
+                // own conversion-failure behaviour, then dropped.
+                let _gamma_in = transition_real(options, "gamma_in", DEFAULT_COEF)?;
+                Ok(Self {
+                    time_ms: Some(time.max(2)),
+                    gamma: transition_real(options, "gamma_out", DEFAULT_COEF)?,
+                    ..settings
+                })
+            }
+            GlitchTransitionKind::FadeGlitch => {
+                let time = transition_integer(options, "time", -1)?;
+                if time < 0 {
+                    return Err(TransitionHandlerError::new(
+                        "fadeglitch: option `time` is required",
+                    ));
+                }
+                let fadein = transition_integer(options, "fadein", 0)? != 0;
+                let nofade = transition_integer(options, "nofade", 0)? != 0;
+                let gamma = transition_real(
+                    options,
+                    if fadein { "gamma_in" } else { "gamma_out" },
+                    DEFAULT_COEF,
+                )?;
+                // `FUN_10001ee0(options, L"color", 0, 0)`: a `tTVInteger` read
+                // truncated to 32 bits by the C++ `(int)` cast, and the forced
+                // `0x808080` when `nofade` is set.
+                let colour = if nofade {
+                    0x808080
+                } else {
+                    transition_integer(options, "color", 0)? as u32
+                };
+                Ok(Self {
+                    time_ms: Some(time.max(2)),
+                    gamma,
+                    fadein,
+                    colour,
+                    ..settings
+                })
+            }
+            // The factory (`0x10002df0`) reads `block` and nothing else: no
+            // `time`, no gammas, no colour.  Its handler keeps the
+            // constructor's `time = -1`.
+            GlitchTransitionKind::LoopGlitch => Ok(settings),
+        }
+    }
+}
+
+// --------------------------------------------- the per-playback handlers
+
+/// The per-playback handler all three providers build
+/// (`tTVPTransGlitchBase`'s constructor chain).
+///
+/// The per-frame flow is the reference's: `StartProcess(tick)` computes the
+/// ratio `elapsed / time` and calls the class hook that **rebuilds the
+/// displacement tables**, seeded from the tick; `Process` then composes one
+/// pass with the class's own hook.  `0x100055d0` (glitch), `0x10005540`
+/// (fadeglitch) and `0x10005730` (loopglitch) all reseed `0x10005c50` twice
+/// from the tick and refill the row table (`0x10005fc0`) and the three block
+/// tables (`0x10005dc0`), so the distortion is fresh every frame.  A pass
+/// therefore builds its tables here, exactly once.
+///
+/// The three compose hooks:
+///
+/// * `glitch` (`0x10004d70`): `FUN_100048f0(…, src1_layout, [this+0xc0], …)` —
+///   the scale is `gamma_out` (the DLL's `coef` override is unreachable, see
+///   [`TransitionSettings::parse`]) and the distorted face is **`Src1`**, the
+///   destination's own bitmap.  `ttExchange` then swaps the two layers at the
+///   stop.
+/// * `fadeglitch` (`0x100047a0`): the scale is `pow(ratio, gamma)` —
+///   `pow(1 - ratio, gamma)` under `fadein`, which also swaps the source to
+///   `Src2`; the tables are rebuilt with the colour value for that pass, and
+///   when `color != 0x808080` the colour wash ([`colour_wash`]) runs over the
+///   composed bitmap.
+/// * `loopglitch` (`0x10004da0`): `FUN_10004830` walks the rows and picks a
+///   face per row from the per-pass random mask (`0x10005ef0`, one bit per
+///   row with probability `ratio`): masked rows take `Src1` at full scale
+///   (`pow(ratio, [this+0xb8])`, and `+0xb8` is the constructor's `0`), the
+///   others `Src2` at `pow(1 - ratio, [this+0xc0])` (`+0xc0` is `1.0`).
+struct GlitchTransitionHandler {
+    settings: TransitionSettings,
+    width: u32,
+    height: u32,
+    /// `loopglitch`'s row mask (`+0x80`, filled by `0x10005ef0`), one bit per
+    /// row, low bit first; rebuilt every pass.
+    loop_mask: Vec<u64>,
+}
+
+impl GlitchTransitionHandler {
+    fn new(settings: TransitionSettings, width: u32, height: u32) -> Self {
+        Self {
+            settings,
+            width,
+            height,
+            loop_mask: Vec::new(),
+        }
+    }
+
+    /// The parsed options as the per-pass table fill sees them: the eight
+    /// distortion parameters, `block` as the block size, and the pass's own
+    /// tick as the seed (`coef` is the walk's per-pass scale here, which the
+    /// compose hooks pass separately).
+    fn table_options(&self, tick: Duration) -> GlitchOptions {
+        let settings = &self.settings;
+        GlitchOptions {
+            noise: settings.noise,
+            sft_x: settings.sft_x,
+            sft_y: settings.sft_y,
+            sft_col: settings.sft_col,
+            per_x: settings.per_x,
+            per_y: settings.per_y,
+            per_col: settings.per_col,
+            per_reset: settings.per_reset,
+            size: settings.block,
+            seed: tick.as_millis() as u64,
+            coef: 1.0,
+        }
+    }
+
+    /// `0x10005ef0(this, ratio)`: one bit per row, set with probability
+    /// `ratio` from the pass's generator stream.  The reference draws a
+    /// 64-bit uniform per 64-row group and compares it against the ratio; the
+    /// port draws one uniform per row from the same splitmix64 the tables
+    /// use, which is the same distribution and the module's own generator
+    /// (the bit stream is not the DLL's anywhere — see the module docs).
+    fn fill_loop_mask(&mut self, ratio: f64, seed: u64) {
+        let rows = self.height as usize;
+        self.loop_mask.clear();
+        self.loop_mask.resize(rows.div_ceil(64), 0);
+        let mut rng = SplitMix64::new(seed);
+        for row in 0..rows {
+            if rng.uniform01() < ratio {
+                self.loop_mask[row / 64] |= 1 << (row % 64);
+            }
+        }
+    }
+
+    fn row_masked(&self, row: u32) -> bool {
+        let row = row as usize;
+        self.loop_mask
+            .get(row / 64)
+            .is_some_and(|word| word & (1 << (row % 64)) != 0)
+    }
+}
+
+impl TransitionHandler for GlitchTransitionHandler {
+    fn process(&mut self, frame: TransitionFrame<'_>, dest: &mut [u8]) {
+        let (width, height) = (self.width, self.height);
+        let row_bytes = width as usize * 4;
+        let needed = row_bytes * height as usize;
+        if dest.len() < needed || frame.dest_before.pixels.len() < needed {
+            return;
+        }
+        let tables = GlitchTables::build(&self.table_options(frame.tick), width, height);
+        let progress = f64::from(frame.progress.clamp(0.0, 1.0));
+        let source = frame.source.filter(|source| {
+            source.pixels.len() >= needed && source.width == width && source.height == height
+        });
+        let dest_before = frame.dest_before;
+
+        match self.settings.kind {
+            // `Src1` at a constant scale; the tables carry the per-frame
+            // randomness.
+            GlitchTransitionKind::Glitch => {
+                apply_glitch(
+                    dest_before.pixels,
+                    width,
+                    height,
+                    dest,
+                    width,
+                    height,
+                    (0, 0, i64::from(width), i64::from(height)),
+                    self.settings.gamma,
+                    &tables,
+                );
+            }
+            GlitchTransitionKind::FadeGlitch => {
+                // `x` is the reference's ratio, reversed under `fadein`; the
+                // walk's scale is `pow(x, gamma)` and the colour wash uses
+                // `x²`.
+                let x = if self.settings.fadein {
+                    1.0 - progress
+                } else {
+                    progress
+                };
+                let scale = x.powf(self.settings.gamma);
+                let plane = if self.settings.fadein {
+                    source
+                } else {
+                    Some(dest_before)
+                };
+                let Some(plane) = plane else { return };
+                apply_glitch(
+                    plane.pixels,
+                    plane.width,
+                    plane.height,
+                    dest,
+                    width,
+                    height,
+                    (0, 0, i64::from(width), i64::from(height)),
+                    scale,
+                    &tables,
+                );
+                if self.settings.colour != 0x808080 {
+                    colour_wash(
+                        &mut dest[..needed],
+                        washed_colour(self.settings.colour, x * x),
+                    );
+                }
+            }
+            GlitchTransitionKind::LoopGlitch => {
+                let Some(source) = source else { return };
+                // `0x10005730` fills the mask from the pass's ratio, after
+                // the tables.
+                self.fill_loop_mask(progress, frame.tick.as_millis() as u64);
+                // `0x10004da0`'s two powers: `pow(ratio, [this+0xb8])` with
+                // the constructor's `+0xb8 = 0` answers 1, and
+                // `pow(1 - ratio, [this+0xc0])` with `+0xc0 = 1.0` is the
+                // complement itself.
+                let complement = 1.0 - progress;
+                for row in 0..height {
+                    let (plane, scale) = if self.row_masked(row) {
+                        (dest_before.pixels, 1.0)
+                    } else {
+                        (source.pixels, complement)
+                    };
+                    apply_glitch(
+                        plane,
+                        width,
+                        height,
+                        dest,
+                        width,
+                        height,
+                        (0, i64::from(row), i64::from(width), 1),
+                        scale,
+                        &tables,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `FUN_10003710` (`0x10003710`): the colour value a `fadeglitch` pass washes
+/// toward, `round(channel * x + (1 - x) * 128)` per channel — from the neutral
+/// grey 128 at `x = 0` to the requested colour at `x = 1`.  The reference's
+/// `ROUND` is the x87 rounding mode (nearest, ties to even); `f64::round` is
+/// nearest-away-from-zero, which differs only on an exact tie.
+fn washed_colour(colour: u32, x: f64) -> u32 {
+    let channel = |value: u32| {
+        (f64::from(value) * x + (1.0 - x) * 128.0)
+            .round()
+            .clamp(0.0, 255.0) as u32
+    };
+    (channel(colour >> 16) << 16) | (channel((colour >> 8) & 0xff) << 8) | channel(colour & 0xff)
+}
+
+/// `FUN_100033f0` (`0x100033f0`): the `fadeglitch` colour wash, transcribed
+/// from the listing instruction by instruction.
+///
+/// Every pixel is averaged toward `colour` with the DLL's own per-byte
+/// arithmetic — one 32-bit word at a time, so the subtractions and the
+/// doubling carry across byte lanes and the two per-byte `0x7f` masks
+/// (`uVar3` from the colour's high bits, `uVar7` from the sum's carry bit)
+/// are what keep the result inside the byte.  `colour` is the reference's
+/// `0xRRGGBB` word and the reference's lanes are BGRA, while the engine's
+/// store is RGBA, so each pixel is rotated into the reference's lane order,
+/// washed, and rotated back.
+fn colour_wash(pixels: &mut [u8], colour: u32) {
+    let lanes = (((colour >> 7) & 0x10101).wrapping_add(0x7f7f7f)) ^ 0x7f7f7f;
+    let colour = colour & 0x7f7f7f;
+    for pixel in pixels.chunks_exact_mut(4) {
+        let value = (u32::from(pixel[3]) << 24)
+            | (u32::from(pixel[0]) << 16)
+            | (u32::from(pixel[1]) << 8)
+            | u32::from(pixel[2]);
+        let carry = (((value >> 1) & 0x7f7f7f).wrapping_add(colour)) & 0x808080;
+        let mask = ((carry >> 7).wrapping_add(0x7f7f7f)) ^ 0x7f7f7f;
+        let sum = value.wrapping_add(colour.wrapping_sub(carry).wrapping_mul(2));
+        let washed = (sum & (mask | lanes)) | (mask & lanes) | (value & 0xff00_0000);
+        pixel[3] = (washed >> 24) as u8;
+        pixel[0] = (washed >> 16) as u8;
+        pixel[1] = (washed >> 8) as u8;
+        pixel[2] = washed as u8;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use krkr_core::{FrameInput, Size};
     use krkr_engine::{
         EngineConfig, EngineInput, KrkrEngine,
         plugin_api::layer::{LayerBitmap, layer_bitmap_read},
+        plugin_api::transition::{
+            TransitionHandler, TransitionHandlerError, TransitionHandlerProvider,
+            TransitionRequest, register_transition_provider, transition_provider_names,
+        },
     };
     use krkr_tjs2::runtime::Variant;
 
-    use super::{GlitchEffectPlugin, GlitchOptions, PLUGIN_NAME};
+    use super::{GlitchEffectPlugin, GlitchOptions, TRANSITION_NAMES, colour_wash, washed_colour};
 
     /// A layer big enough for four 8-pixel blocks per axis. The source
     /// encodes its own coordinates — red carries `x`, green carries `y`, blue
@@ -1240,39 +1887,452 @@ mod tests {
         );
     }
 
-    /// The plugin's linkage is what makes its three transition names resolve
-    /// at all: the engine's lookup answers a linked plugin's names with the
-    /// crossfade degrade (`PLUGIN_TRANSITION_NAMES`), and without the plugin
-    /// they stay unknown — the reference's own provider-gated behaviour.
+    /// `V2Link` registers exactly the three `GetName` names and `V2Unlink`
+    /// takes them away again: while the module is linked each name answers
+    /// through the registry (no kernel transition reaches the frame output),
+    /// and once it is not, the name is the official unknown-name error again.
     #[test]
-    fn the_three_transition_names_follow_the_plugin_linkage() {
-        for name in ["glitch", "fadeglitch", "loopglitch"] {
-            let mut linked = engine();
-            run(&mut linked, SOURCE_LAYER);
-            run(
-                &mut linked,
-                &format!("source.beginTransition(\"{name}\", true, dest, %[time: 10]);"),
-            );
-            let frame = linked
-                .update(
-                    EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
-                    Duration::ZERO,
-                )
-                .expect("update");
-            assert_eq!(
-                frame.output.transitions.first().expect("transition").method,
-                "crossfade",
-                "{name} is mapped by the engine while {PLUGIN_NAME} is linked"
-            );
+    fn the_plugin_registers_its_three_names_and_unlinks_them() {
+        let mut engine = engine();
+        let expected = TRANSITION_NAMES.map(str::to_string).to_vec();
+        assert_eq!(transition_provider_names(engine.tjs_runtime()), expected);
 
-            let mut unlinked = KrkrEngine::new(EngineConfig::default()).expect("engine");
-            run(&mut unlinked, SOURCE_LAYER);
+        // The engine runs `register` twice (boot and the first
+        // `Plugins.link`); the second pass hands back the same providers.
+        engine
+            .register_plugin(GlitchEffectPlugin)
+            .expect("re-register");
+        assert_eq!(transition_provider_names(engine.tjs_runtime()), expected);
+
+        run(&mut engine, TRANSITION_PAIR);
+        run(
+            &mut engine,
+            r#"dest.beginTransition("fadeglitch", true, source, %[time: 10]);"#,
+        );
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::ZERO,
+            )
+            .expect("update");
+        assert!(
+            frame.output.transitions.is_empty(),
+            "a registered provider composes CPU-side, not through a crossfade kernel"
+        );
+        run(&mut engine, "dest.stopTransition();");
+
+        run(&mut engine, r#"Plugins.unlink("GlitchEffect.dll");"#);
+        assert!(transition_provider_names(engine.tjs_runtime()).is_empty());
+        let message = run(
+            &mut engine,
+            r#"
+            var message = "";
+            try { dest.beginTransition("fadeglitch", true, source, %[time: 10]); }
+            catch (e) { message = e.message; }
+            return message;
+            "#,
+        );
+        assert_eq!(
+            message.to_tjs_string().expect("string"),
+            "Cannot find transition handler fadeglitch",
+            "an unlinked provider's name is the official unknown-name error"
+        );
+
+        run(&mut engine, r#"Plugins.link("GlitchEffect.dll");"#);
+        assert_eq!(transition_provider_names(engine.tjs_runtime()), expected);
+        run(
+            &mut engine,
+            r#"dest.beginTransition("fadeglitch", true, source, %[time: 10]);"#,
+        );
+    }
+
+    /// A name one of the engine's own kernel providers answers to is already
+    /// registered (`TVPTransAlreadyRegistered`), which the registry refuses
+    /// with the reference's text.
+    #[test]
+    fn the_registry_refuses_a_default_kernel_name() {
+        struct WaveNamed;
+
+        impl TransitionHandlerProvider for WaveNamed {
+            fn name(&self) -> &str {
+                "wave"
+            }
+
+            fn start_transition(
+                &self,
+                _request: &TransitionRequest,
+            ) -> std::result::Result<Box<dyn TransitionHandler>, TransitionHandlerError>
+            {
+                unreachable!("the registry refuses this provider before any factory runs")
+            }
+        }
+
+        let mut engine = engine();
+        let error = register_transition_provider(engine.tjs_runtime_mut(), Arc::new(WaveNamed))
+            .expect_err("a kernel name is taken");
+        assert_eq!(error.message, "Transition wave already registerd");
+    }
+
+    /// The 32x32 pair the transition tests run on: the destination encodes its
+    /// own position (`x` in red, `y` in green, `0x80` in blue) and the source
+    /// the mirrored one (`31 - x`, `31 - y`, `0x40`), so a composed pixel
+    /// names the face and the position each channel came from.
+    const TRANSITION_PAIR: &str = r#"
+        global.dest = new Layer();
+        dest.setImageSize(32, 32);
+        global.source = new Layer();
+        source.setImageSize(32, 32);
+        for (var y = 0; y < 32; y = y + 1) {
+            for (var x = 0; x < 32; x = x + 1) {
+                dest.fillRect(x, y, 1, 1, 0xff000000 | (x << 16) | (y << 8) | 0x80);
+                source.fillRect(x, y, 1, 1, 0xff000000 | ((31 - x) << 16) | ((31 - y) << 8) | 0x40);
+            }
+        }
+        dest.visible = true;
+        source.visible = true;
+    "#;
+
+    /// One glitch-family transition over [`TRANSITION_PAIR`]: start `name`
+    /// with `options`, advance the clock by `tick`, and answer the
+    /// destination's composed pixels.  The tables are seeded from the tick, so
+    /// the same call is reproducible.
+    fn transition_pass(name: &str, options: &str, tick: u64) -> Vec<u8> {
+        transition_pass_with(name, options, "", tick)
+    }
+
+    /// [`transition_pass`] with a script step between building the options
+    /// object and the call — the way a script reaches a member the `%[...]`
+    /// literal cannot spell (`break` is a TJS keyword).
+    fn transition_pass_with(name: &str, options: &str, setup: &str, tick: u64) -> Vec<u8> {
+        let mut engine = engine();
+        run(&mut engine, TRANSITION_PAIR);
+        run(&mut engine, &format!("global.opts = {options}; {setup}"));
+        run(
+            &mut engine,
+            &format!(r#"dest.beginTransition("{name}", true, source, opts);"#),
+        );
+        let frame = engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(tick),
+            )
+            .expect("update");
+        assert!(
+            frame.output.transitions.is_empty(),
+            "{name} must resolve to this module's provider, not to a kernel"
+        );
+        pixels(&mut engine, "dest").1
+    }
+
+    /// The walk's displacement options the option pins below start from:
+    /// `noise` 0 (no per-row jitter), `per_x`/`per_y` 1.0 (every block takes a
+    /// step, so the walk moves), `per_reset` 0 (it never returns to zero) and
+    /// the colour split off.
+    ///
+    /// The `fadeglitch` pins add `color: 0x808080` — the class's neutral
+    /// spelling, which keeps the wash the identity — so a pin compares the
+    /// walk alone.  A `fadeglitch` call without it (the game's own
+    /// `FadeGlitch` passes none) *does* wash: `color` defaults to 0, a fade
+    /// toward black, which saturates these encoded planes.  `glitch` and
+    /// `loopglitch` read no `color` at all.
+    const WALK: &str = "noise: 0, sft_x: 16, sft_y: 8, sft_col: 0, per_x: 1.0, per_y: 1.0, per_col: 0, per_reset: 0";
+
+    /// `time` is the clock the walk's scale is read from: the same pass at 50
+    /// ms composes differently under a 100 ms clock (`ratio = 0.5`) and a
+    /// 200 ms one (`ratio = 0.25`).
+    #[test]
+    fn the_time_option_sets_the_clock_the_scale_is_read_from() {
+        let fast = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, color: 0x808080, {WALK}]"),
+            50,
+        );
+        let slow = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 200, color: 0x808080, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            fast,
+            slow,
+            "ratio 0.5 and 0.25 must displace differently: {}",
+            first_difference(&fast, &slow, WIDTH)
+        );
+    }
+
+    /// `block` is the edge of the square the walk copies one run at a time
+    /// (`0x10004f40`), and the cell grid the displacement tables are indexed
+    /// by — the same clock with 8-pixel and 16-pixel blocks composes
+    /// differently.
+    #[test]
+    fn the_block_option_sets_the_run_and_cell_grid() {
+        let small = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, block: 8, color: 0x808080, {WALK}]"),
+            50,
+        );
+        let large = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, block: 16, color: 0x808080, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            small,
+            large,
+            "8- and 16-pixel blocks must partition the rows differently: {}",
+            first_difference(&small, &large, WIDTH)
+        );
+    }
+
+    /// `glitch`'s scale is `gamma_out` itself, the exponent the fade family
+    /// applies to the clock (`0x10004d70` reads `[this+0xc0]` with no `pow`).
+    #[test]
+    fn the_gamma_out_option_scales_glitchs_walk() {
+        let weak = transition_pass(
+            "glitch",
+            &format!("%[time: 100, gamma_out: 0.25, {WALK}]"),
+            50,
+        );
+        let strong = transition_pass(
+            "glitch",
+            &format!("%[time: 100, gamma_out: 4.0, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            weak,
+            strong,
+            "gamma_out 0.25 and 4.0 must displace differently: {}",
+            first_difference(&weak, &strong, WIDTH)
+        );
+    }
+
+    /// `fadein` swaps the distorted face (`Src1` → `Src2`, `0x100047a0`) and
+    /// makes the factory read `gamma_in` instead of `gamma_out`; at half the
+    /// clock both scales are `0.5`, so the difference is the face itself.
+    #[test]
+    fn fadein_swaps_the_distorted_face() {
+        let forward = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, fadein: 0, color: 0x808080, {WALK}]"),
+            50,
+        );
+        let backward = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, fadein: 1, color: 0x808080, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            forward,
+            backward,
+            "the destination's own face and the source's must compose differently: {}",
+            first_difference(&forward, &backward, WIDTH)
+        );
+
+        // `fadein` also routes the gamma name: `gamma_in` is the scale then.
+        let slow_in = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, fadein: 1, gamma_in: 0.25, color: 0x808080, {WALK}]"),
+            50,
+        );
+        let fast_in = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, fadein: 1, gamma_in: 4.0, color: 0x808080, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            slow_in,
+            fast_in,
+            "gamma_in must be the exponent under fadein: {}",
+            first_difference(&slow_in, &fast_in, WIDTH)
+        );
+        // `gamma_out` is dead under `fadein` (the factory read `gamma_in`).
+        let with_out = transition_pass(
+            "fadeglitch",
+            &format!(
+                "%[time: 100, fadein: 1, gamma_in: 0.25, gamma_out: 8.0, color: 0x808080, {WALK}]"
+            ),
+            50,
+        );
+        assert_eq!(
+            slow_in, with_out,
+            "gamma_out is not the name `fadein` reads"
+        );
+    }
+
+    /// `nofade` turns the colour wash off (the factory forces `color` to the
+    /// neutral `0x808080`), and `color` picks the colour it washes toward.
+    #[test]
+    fn nofade_and_color_drive_the_colour_wash() {
+        let washed = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, color: 0xff0000, {WALK}]"),
+            50,
+        );
+        let plain = transition_pass("fadeglitch", &format!("%[time: 100, {WALK}]"), 50);
+        let unwash = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, nofade: 1, color: 0xff0000, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            washed,
+            unwash,
+            "the wash must move pixels when it runs and not when `nofade` is set: {}",
+            first_difference(&washed, &unwash, WIDTH)
+        );
+        assert_ne!(
+            plain,
+            unwash,
+            "the default `color` (0) is a wash too — only 0x808080 is neutral: {}",
+            first_difference(&plain, &unwash, WIDTH)
+        );
+
+        let red = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, color: 0xff0000, {WALK}]"),
+            50,
+        );
+        let blue = transition_pass(
+            "fadeglitch",
+            &format!("%[time: 100, color: 0x0000ff, {WALK}]"),
+            50,
+        );
+        assert_ne!(
+            red,
+            blue,
+            "the wash colour must reach the pixels: {}",
+            first_difference(&red, &blue, WIDTH)
+        );
+    }
+
+    /// The eight distortion parameters feed the per-pass tables: `noise` is
+    /// the row table's scale (`0x10005fc0`), `sft_*` the block walks'
+    /// (`0x10005dc0`), and each is read from the options object copied at
+    /// `StartTransition`.
+    #[test]
+    fn the_distortion_options_feed_the_per_pass_tables() {
+        let quiet = transition_pass(
+            "fadeglitch",
+            "%[time: 100, color: 0x808080, noise: 0, sft_x: 0, sft_y: 0, sft_col: 0, per_x: 0, per_y: 0, per_col: 0, per_reset: 0]",
+            50,
+        );
+        let noisy = transition_pass(
+            "fadeglitch",
+            "%[time: 100, color: 0x808080, noise: 16, sft_x: 0, sft_y: 0, sft_col: 0, per_x: 0, per_y: 0, per_col: 0, per_reset: 0]",
+            50,
+        );
+        assert_ne!(
+            quiet[..],
+            noisy[..],
+            "`noise` must move whole rows: {}",
+            first_difference(&quiet, &noisy, WIDTH)
+        );
+
+        let walked = transition_pass(
+            "fadeglitch",
+            "%[time: 100, color: 0x808080, noise: 0, sft_x: 16, sft_y: 0, sft_col: 0, per_x: 1.0, per_y: 0, per_col: 0, per_reset: 0]",
+            50,
+        );
+        assert_ne!(
+            quiet[..],
+            walked[..],
+            "`sft_x`/`per_x` must walk the blocks horizontally: {}",
+            first_difference(&quiet, &walked, WIDTH)
+        );
+    }
+
+    /// The reference rebuilds the displacement tables inside `StartProcess`
+    /// (`0x100055d0`, `0x10005540`, `0x10005730` all reseed from the tick), so
+    /// two passes of a `glitch` transition — whose scale is a constant — still
+    /// compose differently, because their seeds differ.
+    #[test]
+    fn every_pass_rebuilds_the_tables_from_the_tick() {
+        let mut engine = engine();
+        run(&mut engine, TRANSITION_PAIR);
+        run(
+            &mut engine,
+            &format!(r#"dest.beginTransition("glitch", true, source, %[time: 1000, {WALK}]);"#),
+        );
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(100),
+            )
+            .expect("first pass");
+        let first = pixels(&mut engine, "dest").1;
+        engine
+            .update(
+                EngineInput::new(FrameInput::new(Size::new(320.0, 240.0), 0.0), Vec::new()),
+                Duration::from_millis(100),
+            )
+            .expect("second pass");
+        let second = pixels(&mut engine, "dest").1;
+        assert_ne!(
+            first,
+            second,
+            "a constant scale and the frozen `Src1` leave the seed as the only \
+             difference between two passes: {}",
+            first_difference(&first, &second, WIDTH)
+        );
+    }
+
+    /// `break` is a parse-only option in the shipped DLL: `0x100055d0` stores
+    /// its truthiness at `+0xc8` through a lazy option read that never runs
+    /// (the provider pointer the read goes through is only ever set by
+    /// `SetOption`, which the reference core never calls), and nothing reads
+    /// the byte afterwards.  The port accepts it and composes identically.
+    #[test]
+    fn break_is_accepted_and_changes_nothing() {
+        let plain = transition_pass(
+            "glitch",
+            &format!("%[time: 100, gamma_out: 1.5, {WALK}]"),
+            50,
+        );
+        let broken = transition_pass_with(
+            "glitch",
+            &format!("%[time: 100, gamma_out: 1.5, {WALK}]"),
+            r#"opts["break"] = 1;"#,
+            50,
+        );
+        assert_eq!(plain, broken, "`break` has no reader in the DLL");
+    }
+
+    /// `loopglitch` splits the rows between the two faces with a per-pass mask
+    /// (`0x10005ef0`'s one bit per row, set with probability `ratio`), so a
+    /// composed frame carries pixels of both.
+    #[test]
+    fn loopglitch_mixes_rows_of_both_faces() {
+        let composed =
+            transition_pass("loopglitch", &format!("%[time: 100, block: 8, {WALK}]"), 50);
+        let blues = composed
+            .chunks_exact(4)
+            .map(|pixel| pixel[2])
+            .collect::<Vec<_>>();
+        assert!(
+            blues.contains(&0x80) && blues.contains(&0x40),
+            "both faces' rows must appear: dest 0x80 and source 0x40, got {:?}",
+            blues
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// The factories' own rules: `glitch` and `fadeglitch` require `time`
+    /// (`0x10002e90`/`0x10002ca0` read it with a `-1` default and leave
+    /// through their failure exit), and `glitch`'s provider requires equal
+    /// sizes (the `+0x14` flag only its registration helper sets).
+    #[test]
+    fn the_factories_enforce_their_required_options() {
+        let mut engine = engine();
+        run(&mut engine, TRANSITION_PAIR);
+        for name in ["glitch", "fadeglitch"] {
             let message = run(
-                &mut unlinked,
+                &mut engine,
                 &format!(
                     r#"
                     var message = "";
-                    try {{ source.beginTransition("{name}", true, dest, %[time: 10]); }}
+                    try {{ dest.beginTransition("{name}", true, source, %[block: 8]); }}
                     catch (e) {{ message = e.message; }}
                     return message;
                     "#
@@ -1280,9 +2340,68 @@ mod tests {
             );
             assert_eq!(
                 message.to_tjs_string().expect("string"),
-                format!("Cannot find transition handler {name}"),
-                "{name} stays unknown without the plugin, as the reference does"
+                "Transition handler error iTVPTransHandlerProvider::StartTransition failed",
+                "{name} must fail without `time`"
             );
         }
+
+        // `glitch` refuses an unequal pair; `fadeglitch` (`ttSimple`) accepts
+        // one.  (`beginTransition` rejects a 4x4 source for the crossfade
+        // family's own rules, so the mismatch here is one the provider sees.)
+        run(
+            &mut engine,
+            r#"
+            global.wide = new Layer();
+            wide.setImageSize(64, 32);
+            wide.fillRect(0, 0, 64, 32, 0xff000000);
+            wide.visible = true;
+            "#,
+        );
+        let message = run(
+            &mut engine,
+            r#"
+            var message = "";
+            try { dest.beginTransition("glitch", true, wide, %[time: 10]); }
+            catch (e) { message = e.message; }
+            return message;
+            "#,
+        );
+        assert_eq!(
+            message.to_tjs_string().expect("string"),
+            "Transition handler error iTVPTransHandlerProvider::StartTransition failed"
+        );
+        assert!(
+            engine
+                .host()
+                .logs()
+                .iter()
+                .any(|line| line.contains("must be the same size")),
+            "the provider's own reason reaches the host log"
+        );
+    }
+
+    /// The colour wash (`0x100033f0`) is transcribed from the listing: the
+    /// neutral colour is the identity, and every other colour moves the
+    /// pixel — as the DLL's own byte masks do, not as an average would.
+    #[test]
+    fn the_colour_wash_is_the_reference_transcription() {
+        // `0x808080` is the class's neutral spelling: the wash still runs, and
+        // it is the identity because `e - carry` cancels.
+        let neutral = [0x11, 0x22, 0x33, 0xff];
+        let mut pixels = neutral;
+        colour_wash(&mut pixels, 0x808080);
+        assert_eq!(pixels, neutral, "0x808080 is the neutral colour");
+
+        // A colour washes every pixel toward itself; the alpha lane is kept.
+        let mut pixels = neutral;
+        colour_wash(&mut pixels, 0xff0000);
+        assert_ne!(pixels, neutral);
+        assert_eq!(pixels[3], 0xff, "the wash keeps the alpha lane");
+
+        // `washed_colour` (`0x10003710`) runs from the neutral grey 128 at
+        // `x = 0` to the requested colour at `x = 1`.
+        assert_eq!(washed_colour(0xff0000, 0.0), 0x808080);
+        assert_eq!(washed_colour(0xff0000, 1.0), 0xff0000);
+        assert_eq!(washed_colour(0x808080, 0.5), 0x808080);
     }
 }

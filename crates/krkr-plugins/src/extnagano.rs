@@ -100,27 +100,31 @@
 //!   arithmetic. **Not** the reference effect — see the per-provider reasons
 //!   in [`META`] and the notes on each parser.
 //!
-//! The blockers are specific, not a shrug:
+//! The blockers are specific, not a shrug.  Two of them used to name gaps in
+//! the registry the M79 round-2 channel has since closed — a provider factory
+//! now *can* load a rule graphic (`TransitionContext::load_image` / the
+//! [`TransitionHandlerProvider::start_transition_with`] entry point) and *can*
+//! queue a script callback (`TransitionContext::script_callback`), and
+//! [`TransitionOptions`] now captures nested option tables
+//! ([`TransitionOptions::table`]) — so what remains below is missing
+//! **evidence about the DLL**, not missing engine surface:
 //!
 //! * `3duniversal` and `imagewipe` need the **rule image** their factory loads
 //!   through `iTVPSimpleImageProvider::LoadImage` (`transhandler.h:149-166`,
-//!   `0x100022e0` and `0x10007780`). The plugin-facing registry has no image
-//!   provider, so a `rule` handed in as a filename can never become pixels
-//!   here; the reference's perspective/rule-driven rasteriser
-//!   (`FUN_10002390`/`0x100015f0`) has no input.
-//! * `morphing` needs `before.Array`/`after.Array`: **nested** members of the
-//!   options object (`0x100152d0` walks `Array` and `count` through
-//!   `PropGetByNum`, then keeps `min(256, count/6)` patches of six `tjs_int`
-//!   each per side), and a `TransitionOptions` snapshot carries the options
-//!   object's *own* members only. The mesh geometry is unreachable from the
-//!   handler side — and its consumer is not pinned either: the handler's
-//!   constructor `FUN_10015090` is not in the corpus and `Process` runs past
-//!   the decompiler's per-function cap.
+//!   `0x100022e0` and `0x10007780`).  A provider could load it through the
+//!   context today; what is not pinned is the reference's
+//!   perspective/rule-driven rasteriser (`FUN_10002390`/`0x100015f0`), which
+//!   would consume it.
+//! * `morphing` needs `before.Array`/`after.Array` (`0x100152d0` walks `Array`
+//!   and `count` through `PropGetByNum`, then keeps `min(256, count/6)`
+//!   patches of six `tjs_int` each per side).  The snapshot now carries those
+//!   nested members; the consumer is not pinned — the handler's constructor
+//!   `FUN_10015090` is not in the corpus and `Process` runs past the
+//!   decompiler's per-function cap.
 //! * `multiripple` drives its ripples through the `callback` script object
-//!   (`0x10016e70` stores the variant for the handler, `FUN_10016350`).
-//!   Calling TJS from the pass is impossible in this channel (the handler has
-//!   no runtime), so the recovered wave field would silently lose the hook
-//!   that schedules it.
+//!   (`0x10016e70` stores the variant for the handler, `FUN_10016350`), which
+//!   the context's `TransitionScriptCallback` could defer to the script
+//!   thread; the recovered wave field itself is what is missing.
 //! * `blurfade`, `book`, `flutter`, `honeyturn`, `spin` and `zoomfade` own
 //!   substantial precomputed state — `blurfade` an internal blur-buffer class
 //!   (`FUN_10003da0`/`FUN_10002a80`, plus the `prerender` cache), `book` the
@@ -202,7 +206,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "the twelve extNagano transition providers (3duniversal, blurfade, book, flutter, honeyturn, imagewipe, morphing, multiripple, rgbfade, scanline, spin, zoomfade)",
-    notes: "All twelve names are registered through plugin_api::transition and their recovered option vocabulary is parsed and enforced (time required, equal source/destination sizes, honeyturn's size/twist/order, imagewipe's/3duniversal's rule). Two providers are real pixel work: rgbfade (the recovered per-channel delayed fade, delays as ms of the clock and the max(1, (255 - maxdelay) * time / 255) span, reference lerp) and scanline (the recovered moving split with its wrap-around alternating rows). The other ten compose a plain crossfade — the same composite the interim projection produced — and are documented as degraded: 3duniversal and imagewipe need a rule image the plugin API cannot load, morphing needs the nested before.Array/after.Array patch meshes a snapshot cannot reach, multiripple needs its callback script object, and blurfade/book/flutter/honeyturn/spin/zoomfade have their per-pixel math (blur buffers, page-fold tables, per-column sample tables) only partly pinned.",
+    notes: "All twelve names are registered through plugin_api::transition and their recovered option vocabulary is parsed and enforced (time required, equal source/destination sizes, honeyturn's size/twist/order, imagewipe's/3duniversal's rule). Two providers are real pixel work: rgbfade (the recovered per-channel delayed fade, delays as ms of the clock and the max(1, (255 - maxdelay) * time / 255) span, reference lerp) and scanline (the recovered moving split with its wrap-around alternating rows). The other ten compose a plain crossfade — the same composite the interim projection produced — and are documented as degraded, because the per-pixel math is not recovered: 3duniversal and imagewipe need their rule-driven rasteriser (the rule graphic itself is loadable through TransitionContext::load_image), morphing its patch-mesh consumer (the nested before.Array/after.Array members are in the options snapshot), multiripple its wave field (the callback is queueable through TransitionContext::script_callback), and blurfade/book/flutter/honeyturn/spin/zoomfade their blur buffers, page-fold tables and per-column sample tables.",
     install: |engine| engine.register_plugin(ExtNaganoPlugin),
 };
 
@@ -1034,6 +1038,35 @@ mod tests {
                 r#"dest.beginTransition("rgbfade", true, source, %[time: 10]);"#,
             )
             .expect("the name answers again");
+    }
+
+    /// A provider name the engine's own kernels answer to is already
+    /// registered — those are the reference's always-present default
+    /// providers — and the registry refuses it with the reference's
+    /// `TVPTransAlreadyRegistered` text rather than shadowing the kernel.
+    #[test]
+    fn the_registry_refuses_a_default_kernel_name() {
+        struct CrossfadeNamed;
+
+        impl TransitionHandlerProvider for CrossfadeNamed {
+            fn name(&self) -> &str {
+                "crossfade"
+            }
+
+            fn start_transition(
+                &self,
+                _request: &TransitionRequest,
+            ) -> std::result::Result<Box<dyn TransitionHandler>, TransitionHandlerError>
+            {
+                unreachable!("the registry refuses this provider before any factory runs")
+            }
+        }
+
+        let mut engine = engine();
+        let error =
+            register_transition_provider(engine.tjs_runtime_mut(), Arc::new(CrossfadeNamed))
+                .expect_err("a kernel name is taken");
+        assert_eq!(error.message, "Transition crossfade already registerd");
     }
 
     /// A provider name no longer resolves to the engine's crossfade kernel:
