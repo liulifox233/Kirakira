@@ -3699,10 +3699,13 @@ fn install_wave_sound_buffer_methods(runtime: &mut Runtime<KrkrHost>, handle: Ob
 /// A run can be *counted* from these lines alone (`KRKR_TRACE=audio` with
 /// `--virtual-audio` on a host with no audio device): a `play` opens a backend
 /// stream under its id, and only a `stop` with that id (or a `StopBus`) closes
-/// it, so two `play` lines whose ids never see a matching `stop` are two live
-/// streams.  `(paused)` marks an armed play whose stream stays inaudible (the
-/// reference's `Paused`, see `wave_sound_buffer_play`) and `(already playing)`
-/// a play the idempotent `Play` refused; neither adds an audible stream.
+/// it -- an `open` on a playing buffer closes it too, through the reference's
+/// `Clear` path (see `stop_wave_playback_for_open`, traced as
+/// `open: replacing playback of ...`), so two `play` lines whose ids never see
+/// a matching `stop` are two live streams.  `(paused)` marks an armed play
+/// whose stream stays inaudible (the reference's `Paused`, see
+/// `wave_sound_buffer_play`) and `(already playing)` a play the idempotent
+/// `Play` refused; neither adds an audible stream.
 struct WaveTraceBuffer {
     id: AudioInstanceId,
     storage: String,
@@ -3743,6 +3746,14 @@ fn wave_sound_buffer_open(
         .map(Variant::to_tjs_string)
         .transpose()?
         .ok_or_else(|| TjsError::runtime("WaveSoundBuffer.open requires storage"))?;
+    // `tTJSNI_WaveSoundBuffer::Open` (`sound/win32/WaveImpl.cpp:2918-2923`) calls
+    // `Clear()` (`:2328-2345`) before it loads the decoder, and `Clear` stops the
+    // buffer through `Stop()` (`:2875-2890`) -> `StopPlay` (`:2842-2855`): a
+    // stream the instance was playing is replaced, never left running under the
+    // newly opened storage.  Without this the following `play` met the stale
+    // `playing` flag and answered `(already playing)` while the old storage kept
+    // sounding -- how PARQUET's SE path lost a buffer's replacement.
+    stop_wave_playback_for_open(runtime, this);
     runtime
         .host_mut()
         .open_native_audio_storage(this, storage)?;
@@ -3759,32 +3770,55 @@ fn wave_sound_buffer_open(
         &format!("WaveSoundBuffer.open: {opened_storage} id={opened_id}"),
     );
     set_wave_status(runtime, this, "stop");
-    // `tTJSNI_WaveSoundBuffer::Open` runs `Clear()` before it loads the
-    // decoder, and `Clear` resets the pause flag (`sound/win32/WaveImpl.cpp:
-    // 2328-2345`, `Paused = false` at `:2340`): a buffer re-opened after it
-    // was armed with `paused = true` starts unpaused.  `Play` (`:2857`) and
-    // `Stop` (`:2877`) leave the flag alone -- that is what makes an armed
-    // play silent, and `play` keeps it (see `wave_sound_buffer_play`).
+    // `Clear()` resets the pause flag unconditionally (`sound/win32/WaveImpl.cpp:2328-2345`,
+    // `Paused = false` at `:2340`): a buffer re-opened after it was armed with
+    // `paused = true` starts unpaused, playing or not.  `Play` (`:2857-2873`)
+    // and `Stop` (`:2875-2890`) leave the flag alone -- that is what makes an
+    // armed play silent, and `play` keeps it (see `wave_sound_buffer_play`).
     reset_wave_pause_on_open(runtime, this);
     runtime.set_object_member(this, "position", Variant::Integer(0));
     runtime.set_object_member(this, "samplePosition", Variant::Integer(0));
     Ok(Variant::Void)
 }
 
-/// The pause state `open` leaves behind: the reference's `Clear()` resets it,
-/// but this engine's `open` does not stop an already-playing stream (that
-/// play-time teardown is a separate divergence, filed as a finding), so the
-/// flag is only rewritten where the reference's reset is observable for the
-/// `open` + `paused` + `play` flows the games use -- on a buffer that is not
-/// playing, where it is a pure flag write with no backend command.
-fn reset_wave_pause_on_open(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    let playing = runtime
-        .host()
-        .native_audio_buffer(handle)
-        .is_some_and(|buffer| buffer.playing);
-    if playing {
+/// The stop-a-playing-stream half of the reference's `Open` -> `Clear()`
+/// (`sound/win32/WaveImpl.cpp:2918-2923`, `:2328-2345`): `Clear` calls `Stop`,
+/// whose `StopPlay` (`:2842-2855`) halts the sound buffer and clears
+/// `BufferPlaying`.  It runs before the new storage replaces the buffer's, so
+/// the trace names the storage that is being replaced.
+fn stop_wave_playback_for_open(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
+    let Some(buffer) = runtime.host().native_audio_buffer(handle) else {
+        return;
+    };
+    if !buffer.playing {
         return;
     }
+    let id = buffer.id;
+    let storage = buffer
+        .storage
+        .clone()
+        .unwrap_or_else(|| "<unopened>".to_string());
+    runtime.host_mut().cancel_audio_fade_completion(handle);
+    runtime.host_mut().queue_audio_command(AudioCommand::Stop {
+        id,
+        fade_seconds: 0.0,
+    });
+    runtime.host_mut().mark_native_audio_stopped(handle);
+    runtime.host_mut().trace(
+        TraceCategory::Audio,
+        &format!(
+            "WaveSoundBuffer.open: replacing playback of {storage} id={}",
+            id.0
+        ),
+    );
+}
+
+/// The pause state `open` leaves behind: the reference's `Clear()` resets it
+/// unconditionally, and our `open` now performs the same teardown (see
+/// `stop_wave_playback_for_open`), so nothing conditions the reset any more.
+/// The backend command follows only when the buffer is still marked playing;
+/// `mark_native_audio_stopped` has already cleared that flag otherwise.
+fn reset_wave_pause_on_open(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.host_mut().set_native_audio_paused(handle, false);
     set_wave_paused(runtime, handle, false);
 }
@@ -3860,6 +3894,10 @@ fn wave_sound_buffer_stop(
         .host()
         .native_audio_buffer(this)
         .is_some_and(|buffer| buffer.playing);
+    let was_paused = runtime
+        .host()
+        .native_audio_buffer(this)
+        .is_some_and(|buffer| buffer.paused);
     if !was_playing
         && matches!(&previous_status, Variant::String(status) if status == "unload" || status == "stop")
     {
@@ -3889,9 +3927,17 @@ fn wave_sound_buffer_stop(
         });
     }
     runtime.host_mut().mark_native_audio_stopped(this);
+    // `tTJSNI_WaveSoundBuffer::Stop` (`sound/win32/WaveImpl.cpp:2875-2890`)
+    // leaves `Paused` alone: `StopPlay` (`:2842-2855`) clears `BufferPlaying`,
+    // and the pause flag the script armed stays armed -- `stop` + `paused = 0`
+    // + `play` is the full sequence that unarms it, and an `open` in between
+    // resets it through `Clear` (`:2340`).  `mark_native_audio_stopped` clears
+    // the flag while it clears the playing state, so restore it here.
+    if was_paused {
+        runtime.host_mut().set_native_audio_paused(this, true);
+    }
     let status_changed = set_wave_status(runtime, this, "stop");
-    let paused_changed = set_wave_paused(runtime, this, false);
-    if status_changed || paused_changed {
+    if status_changed {
         call_wave_status_changed(runtime, this)?;
     }
     Ok(Variant::Void)
@@ -12044,6 +12090,154 @@ mod tests {
             )
             .expect("script");
         assert_eq!(value, Variant::String("stop:0".to_string()));
+    }
+
+    /// The divergence this mission fixes: `Open` runs `Clear()` before it loads
+    /// the decoder (`sound/win32/WaveImpl.cpp:2918-2923`), and `Clear` stops the
+    /// buffer through `Stop()` (`:2328-2345`, `StopPlay` at `:2842-2855`).  A
+    /// buffer that was playing storage A therefore must not keep A sounding
+    /// under B: before the fix the second `open` left `playing` set, the
+    /// following `play` was refused as `(already playing)`, and no command for
+    /// storage B ever reached the audio layer.
+    #[test]
+    fn wave_sound_buffer_open_replaces_a_playing_stream() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_open_replaces.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.looping = 1;
+                buffer.open("first.ogg");
+                buffer.play();
+                buffer.open("second.ogg");
+                buffer.play();
+                return buffer.status + ":" + buffer.paused;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("play:0".to_string()));
+
+        let commands = engine.host_mut().take_audio_commands();
+        let events: Vec<String> = commands
+            .iter()
+            .map(|command| match command {
+                AudioCommand::Preload { source, .. } => format!("preload:{}", source.storage()),
+                AudioCommand::Play { id, source, .. } => {
+                    format!("play:{}:{}", source.storage(), id.0)
+                }
+                AudioCommand::Stop { id, .. } => format!("stop:{}", id.0),
+                other => format!("other:{other:?}"),
+            })
+            .collect();
+        let id = match commands.as_slice() {
+            [_, AudioCommand::Play { id, .. }, ..] => id.0,
+            other => panic!("expected a play for the first storage, got {other:?}"),
+        };
+        assert_eq!(
+            events,
+            vec![
+                "preload:first.ogg".to_string(),
+                format!("play:first.ogg:{id}"),
+                format!("stop:{id}"),
+                "preload:second.ogg".to_string(),
+                format!("play:second.ogg:{id}"),
+            ],
+            "open must close the old stream (Stop) before it preloads and plays \
+             the replacement -- and the second play must be a real start"
+        );
+    }
+
+    /// `Clear()` resets `Paused` unconditionally (`sound/win32/WaveImpl.cpp:
+    /// 2328-2345`, `:2340`), and it does so *after* `Stop()`: an armed buffer
+    /// that is still marked playing when `open` arrives loses both the old
+    /// stream and the arm.  M207's conditional reset skipped exactly this case
+    /// because a playing buffer's `open` did not stop anything; now that it
+    /// does, the reset follows `Clear` without a condition.
+    #[test]
+    fn wave_sound_buffer_open_stops_an_armed_stream_and_clears_the_pause() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_open_armed.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.looping = 1;
+                buffer.open("first.ogg");
+                buffer.paused = 1;
+                buffer.play();
+                var armed = buffer.status + ":" + buffer.paused;
+                buffer.open("second.ogg");
+                return armed + " -> " + buffer.status + ":" + buffer.paused;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("play:1 -> stop:0".to_string()));
+
+        let commands = engine.host_mut().take_audio_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, AudioCommand::Stop { .. })),
+            "the armed stream that `open` superseded must be stopped, got {commands:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, AudioCommand::Play { .. }))
+                .count(),
+            1,
+            "the replacement storage is opened, not played, by `open`"
+        );
+    }
+
+    /// `tTJSNI_WaveSoundBuffer::Stop` (`sound/win32/WaveImpl.cpp:2875-2890`)
+    /// leaves `Paused` alone: `StopPlay` (`:2842-2855`) clears `BufferPlaying`,
+    /// and the flag the script armed survives the stop -- only a later `open`
+    /// (`Clear`, `:2340`) or the script itself resets it.  Our stop used to
+    /// clear it, so `stop` silently disarmed a buffer the game had armed for a
+    /// later `play`.
+    #[test]
+    fn wave_sound_buffer_stop_keeps_an_armed_pause() {
+        use crate::{EngineConfig, KrkrEngine};
+        use krkr_tjs2::runtime::Variant;
+
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "wave_stop_keeps_pause.tjs",
+                r#"
+                var buffer = new WaveSoundBuffer();
+                buffer.looping = 1;
+                buffer.open("bgm91.opus");
+                buffer.paused = 1;
+                buffer.play();
+                buffer.stop();
+                return buffer.status + ":" + buffer.paused;
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("stop:1".to_string()));
+
+        let commands = engine.host_mut().take_audio_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, AudioCommand::Stop { .. })),
+            "the armed stream stops, got {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AudioCommand::Resume { .. })),
+            "a stopped buffer must not resume its stream to honor the pause"
+        );
     }
 
     /// The two-BGM shape of the report: a looping title BGM on one buffer,
