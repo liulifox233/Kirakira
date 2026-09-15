@@ -2215,14 +2215,33 @@ mod tests {
 
     /// The marker is a comment, not code: it must not keep the implicit
     /// function epilogue alive. `drop_trailing_bare_return` only looks at the
-    /// last statement, so appending the marker after a body's `srv`/`ret`
-    /// would leave every dropped function ending in a `return;` the original
-    /// never had.
+    /// last statement, so a marker appended *after* a body's `srv`/`ret`
+    /// leaves every dropped body ending in a `return;` the original never had.
+    ///
+    /// The shape below is the smallest one found that reaches the epilogue
+    /// *and* drops a region (an `if/else-if/else` chain; the `else if` is the
+    /// region the walk abandons). Measured on the previous build, whose
+    /// marker went in last:
+    ///
+    /// ```text
+    ///     }
+    ///     return;                      <- resurrected epilogue
+    ///     // <unhandled: dropped region bytecode 0x1f to 0x1f ...>
+    /// }
+    /// ```
+    ///
+    /// and on this branch (with the marker before the return) the same
+    /// program ends at `}` + the marker, byte-identical to main's output plus
+    /// the marker:
+    ///
+    /// ```text
+    ///     }
+    ///     // <unhandled: dropped region bytecode 0x1f to 0x1f ...>
+    /// }
+    /// ```
     #[test]
     fn a_dropped_region_does_not_keep_the_implicit_return() {
-        let text = rendered(
-            "function f(n) { var i = 0; while (i < n) { i = i + 1; if (i == 3) continue; } }",
-        );
+        let text = rendered("function f(a) { if (a) { g(); } else if (b) { h(); } else { i(); } }");
         assert!(text.contains("dropped region bytecode 0x"), "{text}");
         let mut previous = "";
         for line in text.lines() {

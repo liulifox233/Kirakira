@@ -11,6 +11,18 @@
 //! not depend on whether the host has an output device: a bogus path makes
 //! alsa-lib fail to open anything, and the documented null-PCM config
 //! (`docs/DEBUGGING.md`) gives a healthy device that renders nothing.
+//!
+//! That lever is Linux-only — it is the ALSA backend's own environment, and
+//! the cpal backends on macOS/Windows do not consult it, so on a host with a
+//! device the "dead backend" probe would run as a *healthy* one and fail. The
+//! two ALSA probes are therefore `cfg(target_os = "linux")`; what covers the
+//! rest of the platform matrix is the verdict-text unit test
+//! (`the_audio_verdict_names_the_sink_it_actually_had`, which pins all four
+//! outcomes including the reported-error one) plus the ungated probe below,
+//! which pins that `--virtual-audio` still selects and reports the silent
+//! sink. The macOS/Windows wiring itself (status event -> `audio_last_report`
+//! -> verdict) is not exercised by an automated test here, and this branch
+//! claims no run on those hosts.
 
 use std::{fs, path::PathBuf, process::Command};
 
@@ -52,6 +64,7 @@ fn verdict(output: &str) -> &str {
 /// A backend that dies on its own thread (no output device) is named: the
 /// closing line carries the sink's own report instead of reading like a
 /// healthy run that played nothing.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dead_backend_is_named_in_the_verdict() {
     let root = scratch_root("audio-dead-backend");
@@ -72,6 +85,7 @@ fn a_dead_backend_is_named_in_the_verdict() {
 
 /// A healthy device that renders nothing says exactly that — no error claim —
 /// so the two silent-looking runs cannot be confused.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_healthy_silent_sink_says_only_what_it_decoded() {
     let root = scratch_root("audio-healthy-silent");
