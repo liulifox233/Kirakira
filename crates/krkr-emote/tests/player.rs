@@ -8,10 +8,11 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use krkr_emote::{Canvas, Motion, MotionPlayer, SpriteBlend, TextureCache, Tint, render_draw_list};
-use support::player_fixture::blinking_motion;
+use support::player_fixture::{BODY_STEP_TICK, blinking_motion, blinking_motion_with_body};
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -203,4 +204,104 @@ fn the_draw_list_carries_the_authored_blend_and_corner_state() {
     let items = player.draw_list();
     assert_eq!(items.len(), 1);
     authored(&items[0]);
+}
+
+/// One frame's icons, in draw order.
+fn icons(player: &MotionPlayer) -> Vec<String> {
+    player
+        .draw_list()
+        .into_iter()
+        .map(|item| item.icon)
+        .collect()
+}
+
+/// A host that keeps its own position model drives the session with
+/// `advance_and_sample`: the session's own clock takes the delta — the control
+/// pass and every timed write move with it — while the frame comes from the
+/// sample position the host chose. That split is what the plugin's loop wrap
+/// needs: a motion re-entering at its `loopTime` restarts the frame without
+/// rewinding the controls, which run on the player's clock.
+#[test]
+fn a_host_position_and_the_sessions_clock_are_separate() {
+    let motion = Arc::new(Motion::from_bytes(&blinking_motion_with_body()).expect("fixture loads"));
+    let mut player = MotionPlayer::with_motion(&motion, "idle").expect("player");
+
+    // A timed write gives the session's own clock something to move: 40 ticks
+    // of a 20-tick write lands on the target.
+    assert!(
+        player.write_variable_timed("face", 1.0, 20.0, 0.0),
+        "`face` is an authored variable"
+    );
+    player
+        .advance_and_sample(40.0, 0.0, &BTreeMap::new())
+        .expect("step");
+
+    assert_eq!(
+        player.elapsed_ticks(),
+        0.0,
+        "the animation's sample time is the host's, not the clock's"
+    );
+    assert_eq!(
+        player.variable("face"),
+        Some(1.0),
+        "the session's clock ran the write out"
+    );
+    let sampled = icons(&player);
+    assert!(
+        sampled.iter().any(|icon| icon == "body_early"),
+        "the frame is the host's sample (tick 0), not the clock's: {sampled:?}"
+    );
+    assert!(
+        sampled.iter().any(|icon| icon == "eye_closed"),
+        "…while the control's output is where the clock put it: {sampled:?}"
+    );
+
+    // Re-sampling re-keys the time-driven layer without touching the clock.
+    player.sample_at(35.0, &BTreeMap::new()).expect("sample");
+    let sampled = icons(&player);
+    assert!(
+        sampled.iter().any(|icon| icon == "body_late"),
+        "the position write past tick {BODY_STEP_TICK} re-samples the body: {sampled:?}"
+    );
+    assert_eq!(
+        player.variable("face"),
+        Some(1.0),
+        "a sample is not an advance"
+    );
+}
+
+/// A host record for a name the session knows does not shadow the player's own
+/// table: `face` belongs to the authored eye control, so a host map entry for it
+/// cannot pin the eye open or shut behind the control's back. The host's records
+/// exist for the names the *file* never mentions.
+#[test]
+fn host_records_do_not_shadow_the_sessions_variables() {
+    let motion = Arc::new(Motion::from_bytes(&blinking_motion()).expect("fixture loads"));
+    let mut player = MotionPlayer::with_motion(&motion, "idle").expect("player");
+    let overrides = BTreeMap::from([("face".to_owned(), 1.0)]);
+    let items = player.sample_at(0.0, &overrides).expect("sample");
+    assert_eq!(
+        items[0].icon, "eye_open",
+        "the evaluated table wins for a name the file authors"
+    );
+}
+
+/// `write_variable`/`write_variable_timed` answer whether the session knows the
+/// name. A `false` is the host's own record — eluna's table is built from the
+/// parse and cannot grow — which the host layers into a sample
+/// (`MotionPlayer::sample_at`); the plugin's own
+/// `variable_setters_change_the_drawn_frame` is the end-to-end half of that.
+#[test]
+fn a_write_for_a_name_the_file_never_authors_is_the_hosts() {
+    let motion = Arc::new(Motion::from_bytes(&blinking_motion()).expect("fixture loads"));
+    let mut player = MotionPlayer::with_motion(&motion, "idle").expect("player");
+    assert!(player.write_variable("face", 0.5));
+    assert!(!player.write_variable("unheard_of", 1.0));
+    assert!(!player.write_variable_timed("unheard_of", 1.0, 10.0, 0.0));
+    assert_eq!(
+        player.variable("unheard_of"),
+        None,
+        "the session has no record for it"
+    );
+    assert_eq!(player.variable("face"), Some(0.5));
 }

@@ -17,7 +17,9 @@
 //!   `Motion.ResourceManager.load`) read the storage file
 //!   and parse it through [`krkr_emote::Motion`] (eluna's PSB reader plus the
 //!   PARQUET-flavor adaptation). The handle the game gets back carries
-//!   `.metadata`, which its wrapper requires (`!l2.metadata === void`).
+//!   `.metadata`, which its wrapper requires (`!l2.metadata === void`): a file
+//!   with no root `metadata` answers `void`, which is what that strict test
+//!   reads as "no metadata" (see [`motion_metadata`]).
 //! * **The `.mtn` graphic loader** — the module claims `.mtn` in the engine's
 //!   script image path ([`krkr_engine::plugin_api::graphic`], the counterpart
 //!   of the reference's `TVPRegisterGraphicLoadingHandler`), so
@@ -27,13 +29,45 @@
 //!   stays **live**: the engine's frame clock advances the animation and swaps
 //!   the pixels of every layer showing it. PARQUET's title screen is exactly
 //!   that — `custom.ks` `*title_start`'s motion branch loads `title_bg.mtn` as
-//!   a layer image, and the logo lives in that motion.
+//!   a layer image.
+//!
+//!   This path has no player behind it: a script image is the file's *static*
+//!   frame at the clock's tick (`Motion::draw_list`), not a `Motion.Player`'s
+//!   evaluated scene, and it keeps its own "hold the last drawn frame over an
+//!   empty tail" rule. It stays on the static sampler deliberately — PARQUET's
+//!   motions carry no controls or variables for a session to resolve, and the
+//!   title's pixels are the path M230 settled. The title screen also drives a
+//!   real `Motion.Player` through the game's `AffineSourceMotion` (native-call
+//!   tracing on `Player.` shows `clear`/`draw`/`progress(16)` per frame there);
+//!   that one *is* on the live session.
 //! * **The state machine** — `play`/`stop`/`progress`/`frameProgress`/`skip`/
 //!   `skipToSync`, `speed`, `tickCount`, `playing`, `loopTime`/`lastTime`, and
 //!   `setVariable(name, value[, time, easing])` and `setColor(argb[, time,
 //!   easing])` with linear/smoothstep timed writes are driven by the adapter's
 //!   own model; a motion that does not loop stops at its duration and clears
 //!   `playing`.
+//! * **The live player session** — behind that model each player drives a
+//!   [`krkr_emote::MotionPlayer`], the reference's `MEmotePlayer` loop over the
+//!   loaded file: the authored variable table, the per-tick eye/brow/mouth
+//!   control pass (blink timers), the timelines and the evaluated-variable
+//!   scene rebuild. `play` opens one (or switches/restarts the animation of the
+//!   one already there — a session belongs to a loaded file, and the player's
+//!   variables, control timers and timelines outlive a motion switch, which is
+//!   the reference's `play(name, flags)`), `progress`/`frameProgress` advance
+//!   it by the same delta the model advanced by and sample the scene at the
+//!   position the model landed on ([`krkr_emote::MotionPlayer::advance_and_sample`]),
+//!   and `draw` asks *it* for the frame. The static scene constructor
+//!   (`Motion::draw_list*`) samples the file with only the variables the caller
+//!   names: no control ever runs there, so it is not what a `Motion.Player`
+//!   draws.
+//!
+//!   One consequence, measured on PARQUET's own title: the session carries the
+//!   previous frame's per-layer state (eluna's recovery of the native
+//!   `sub_1032FB00` step), so an animation that *hides* a layer near its end now
+//!   hides it, where the static sampler answered an empty frame there and the
+//!   one-shot hold put the last non-empty tick back on screen. `title_bg.mtn`'s
+//!   `title` animation is that shape: its `bgframe1` decoration stops at ~tick
+//!   122 and every later frame is a HOLD for the layers that remain.
 //! * **The time model (settled against the DLL)** — the plain time members are
 //!   milliseconds-facing and the `frame*` family is raw 1/60 s ticks, exactly
 //!   like the reference: `progress`'s handler converts with `×60/1000`
@@ -52,13 +86,16 @@
 //!   `variableKeys` listing the game's `_getOptions` iterates are real: the
 //!   reference's `variableKeys` (handler `FUN_10015690`) collects the player's
 //!   variable-key strings into a TJS array, and this port answers the same
-//!   array shape from the names its `setVariable` writes created.
-//! * **Rendering** — `draw(layer)` samples the current tick, applies the
-//!   player's `setCoord`/`setRotate`/`setScale`/`setDrawAffineTranslateMatrix`
-//!   transform and its colour filter, and composites the draw list into the
-//!   layer's bitmap through the engine's plugin-facing layer path
-//!   ([`krkr_engine::plugin_api::layer`]). Icon resources are RL-decoded and
-//!   palettes expanded by [`krkr_emote`].
+//!   array shape from the names its `setVariable` writes created. A write also
+//!   reaches the live session's table for every name the file authors, so the
+//!   control pass reads it and `getVariable` answers with the *evaluated*
+//!   value; see [`player_set_variable`].
+//! * **Rendering** — `draw(layer)` samples the current tick through the live
+//!   session, applies the player's `setCoord`/`setRotate`/`setScale`/
+//!   `setDrawAffineTranslateMatrix` transform and its colour filter, and
+//!   composites the draw list into the layer's bitmap through the engine's
+//!   plugin-facing layer path ([`krkr_engine::plugin_api::layer`]). Icon
+//!   resources are RL-decoded and palettes expanded by [`krkr_emote`].
 //! * **The separate-layer canvas** — `new Motion.SeparateLayerAdaptor(owner)`
 //!   answers a real drawable `Layer` (the engine's plugin canvas seam), sized
 //!   like its owner and attached under it as a visible child with
@@ -72,12 +109,29 @@
 //!   `hitThreshold = 0x100` (`FUN_1000d280`, disasm `0x1000d93d`/`0x1000d96c`)
 //!   — and the game's `entryOwner` rewrites an `ltAlpha` owner to `ltBinder`
 //!   right after constructing it, so only a visible child can reach the
-//!   screen. `getSubImageLayers()` stays `void`, which is what makes the game
-//!   take its single-canvas path (the reference has no such member at all).
+//!   screen.
+//!
+//!   `getSubImageLayers()` answers `void`, and that is the whole per-part story
+//!   this port can tell. The game's branch reads it off the **owner** layer,
+//!   not the adaptor (`AffineSourceMotion.tjs:3237`, `var l4 =
+//!   a2.getSubImageLayers();` with `a2` the `AffineLayer` the wrapper called
+//!   `_image.drawAffine(a0, a1, this, …)` on), and the two implementations in
+//!   the shipped scripts are the base layer's empty function (void — the
+//!   single-canvas path this port takes) and the *layer link's*
+//!   `_linkchildren` (`world.tjs:2843`, only when its `_image` is an
+//!   `AffineSourceMotion`), whose children are themselves whole
+//!   `AffineSourceMotion`s — a game-side link model, not E-mote parts. The
+//!   reference's own per-part surface is the DLL's `SeparateLayerAdaptor`
+//!   sub-layers plus `Player.LayerGetter`/`LayerSetter`
+//!   (`motionplayer_nod3d.dll 100385e0_FUN_100385e0.c`; eluna produces one flat
+//!   sprite list with no part-to-layer mapping, see
+//!   `crates/krkr-emote/src/player.rs`'s module docs, gap 1), so answering
+//!   anything else here would invent layers with no part behind them. PARQUET
+//!   never calls this member.
 //!
 //! # What is not, and says so
 //!
-//! Physics (`initPhysics`, wind/pend controls), timelines
+//! Physics *members* (`initPhysics`, wind/pend controls), timeline *members*
 //! (`playTimeline`/`setTimelineBlendRatio`/`fadeOutTimeline` and the
 //! `*Timeline*` listings beyond the loaded animation names), mesh deformation
 //! (`LayerMeshSupport`, `meshDivisionRatio`, `processedMeshVerticesNum`),
@@ -90,6 +144,52 @@
 //! `typeof Motion.Player.useD3D == "Object"` and falling into the catch sets
 //! `Motion.enableD3D = 0`, exactly what the no-D3D reference build does
 //! (`AffineSourceMotion.tjs`, decompiled at `/tmp/m38/AffineSourceMotion.decomp.tjs:3447-3457`).
+//!
+//! Two of those lines moved with the live session: a file whose physics
+//! controls and timelines *do* have content now has them evaluated and played
+//! by the session's per-tick pass (eluna's state, driven by
+//! [`krkr_emote::MotionPlayer::advance_and_sample`]), so their output reaches
+//! the frame while the TJS members that would author them by hand stay stubs.
+//! A `.psb` *model*/emote surface is unreachable for a different reason:
+//! PARQUET's only `.psb` members are the 37 CG thumbnails under `thum/cgthum/`
+//! in `data.xp3` (and neither `data.xp3` nor `main.xp3` carries an E-mote
+//! model), so the game only ever takes `motion.tjs`'s `Motion.Player` branch —
+//! the `Motion.EmotePlayer` sets (`initPhysics(_metadata)`,
+//! `_metadata.base.chara`'s auto-play, `useD3D`) are registered and diagnosed,
+//! not exercised. The `.metadata` payload itself is not consumed by anything in
+//! this port; the session reads the same tables from the file.
+//!
+//! # Pausing is stalling the clock (settled)
+//!
+//! There is no pause member to wire: neither shipped build registers one
+//! (member names live as UTF-16 strings in the image — `progress`,
+//! `frameProgress`, `syncActive`, `setVariable` all appear in
+//! `motionplayer_nod3d.dll`, nothing `pause`- or `resume`-shaped does), and the
+//! game's own wrapper pauses by **not feeding time**: every update goes through
+//! `progress`/`frameProgress` (`AffineSourceMotion.tjs` `_drawAffine`:
+//! `if (_interval > 0) _player.progress(_interval), _interval = 0; else
+//! _player.progress(0)`), and the value side is `stop()` plus a silent
+//! `progress(1)` before it when the last frame matters
+//! (`removePlayer`/`stopMovie`).
+//!
+//! So a paused player here is the states the game actually reaches — a
+//! `progress(0)` frame, a `stop()`, a one-shot that has ended — and in every one
+//! of them the whole session stands still: [`advance_player`] only calls
+//! [`krkr_emote::MotionPlayer::advance_and_sample`] when the player's own model
+//! advances, so the animation clock, the eye/brow/mouth control pass and the
+//! physics all freeze together and `draw` re-composites the same frame. That is
+//! the *frozen whole frame* and not eluna's narrower freeze —
+//! `ElunaPlayer::set_paused(true)` stops the control pass while a wrapper that
+//! keeps advancing the animation clock would keep serving new frames with a
+//! frozen face (`vendor/eluna/crates/eluna/src/runtime.rs:2306-2316`) — which is
+//! why this module never calls `set_paused`. The reference's own reading of a
+//! paused motion is the same one: eluna's recovery notes that native pause
+//! "freezes MMotionPlayer effective time and all timed control transitions",
+//! i.e. the motion's effective time itself stops.
+//! `crates/krkr-plugins/src/motion_player.rs`'s
+//! `a_stalled_player_is_a_frozen_frame` pins it: the drawn frame, the position
+//! and the blink variable all stand still while `progress(200)` keeps arriving
+//! after a `stop()`.
 //!
 //! # The `opa` scale (settled)
 //!
@@ -108,12 +208,23 @@
 //! ```text
 //! cargo test -p krkr-plugins --lib motion_player -- --nocapture
 //!     # synthetic end-to-end: load → play → progress → draw, asserted on
-//!     # layer.getMainPixel; the state machine, variables and opa too
+//!     # layer.getMainPixel; the state machine, variables, the authored-control
+//!     # blink, the motion switch and the frozen-frame rule too
+//! cargo test -p krkr-emote --test player -- --nocapture
+//!     # the live session itself: the control pass blinks on its own clock, a
+//!     # host position and the session's clock stay separate
 //! cargo test -p krkr-emote --test parquet -- --nocapture
 //!     # the game's own sd101.mtn: icon decode, the opa fade at tick 90 and a
 //!     # 1500x900 render (skips itself when /Users/ruri/Downloads/PARQUET is
 //!     # absent; override the directory with KRKR_EMOTE_PARQUET_DIR)
 //! ```
+//!
+//! Failure modes with their pins: the drawn frame stops following an authored
+//! control (`an_authored_control_drives_the_players_drawn_frame`), `play` stops
+//! restarting the animation clock (`play_restarts_the_animations_clock`), a
+//! stalled player keeps animating (`a_stalled_player_is_a_frozen_frame`), a
+//! file without metadata answers `Null` instead of `void`
+//! (`a_motion_without_metadata_answers_void`).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -121,7 +232,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use krkr_emote::{
-    EMOTE_TICKS_PER_SECOND, Motion, MotionDrawItem, TextureCache, Tint, render_draw_list_into,
+    EMOTE_TICKS_PER_SECOND, Motion, MotionDrawItem, MotionPlayer, TextureCache, Tint,
+    render_draw_list_into,
 };
 use krkr_engine::{
     KrkrHost, KrkrPlugin,
@@ -148,8 +260,14 @@ pub(crate) const META: PluginMeta = PluginMeta {
             (progress converts ×60/1000, frameProgress is raw, tickCount/lastTime/loopTime report as ms while the \
             frame* family stays raw ticks, loops wrap to loopTime), play/progress/stop/skip/speed and \
             timed setVariable(name, value, time, easing) plus getVariable/contains/variableKeys drive the model's \
-            own clock and variable state, and draw(layer) composites the sampled draw list into the layer bitmap \
-            through plugin_api::layer with the player's coord/rotate/scale/affine transform and colour filter. \
+            own clock and variable state, and draw(layer) composites the frame the player's live session \
+            (krkr_emote::MotionPlayer - the reference's MEmotePlayer loop: authored variables, the per-tick \
+            eye/brow/mouth control pass with its blink timers, timelines and the evaluated-variable scene \
+            rebuild) produced into the layer bitmap through plugin_api::layer with the player's \
+            coord/rotate/scale/affine transform and colour filter. play opens that session per loaded file and \
+            restarts or switches its animation, progress/frameProgress advance its clock by the same delta, and a \
+            stalled player (stop, progress(0), a one-shot that ended) freezes the whole frame - controls, \
+            timelines and clocks together. \
             The module also claims `.mtn` in the engine's script image path (plugin_api::graphic, the reference's \
             TVPRegisterGraphicLoadingHandler), so Layer.loadImages of a motion yields a real bitmap sized by the \
             file's screenSize and the engine keeps it animating frame by frame - PARQUET's title_bg.mtn (the title \
@@ -157,10 +275,11 @@ pub(crate) const META: PluginMeta = PluginMeta {
             Motion.SeparateLayerAdaptor(owner) is a real drawable Layer (a plugin_api canvas) sized like its owner \
             and attached as its visible child, which is how the reference's adaptor reaches the screen under a \
             ltBinder owner; the game's clear/draw/Layer.assignImages publish path works on top of that. \
-            Not implemented, and honest: physics (initPhysics, wind/pend), \
-            timelines, mesh deformation, particles \
+            Not implemented, and honest: the physics/timeline members that would author those by hand \
+            (initPhysics, startWind/stopWind, playTimeline and the rest), mesh deformation, particles \
             and EmotePlayer's `.psb` model playback; each such member is \
-            registered and logs a one-time warning on first call instead of returning a silent success. \
+            registered and logs a one-time warning on first call instead of returning a silent success (a file \
+            whose physics controls or timelines have content still has them evaluated and played by the session). \
             The recovered ResourceManager member table (loadSource/load/unload/unloadAll/isExistMotion/ \
             findMotion/findSource/random/requireLayerId/releaseLayerId/clearCache/bufLayer) is registered on \
             Motion.ResourceManager, where the reference's own table lives - the reference Motion class carries \
@@ -267,6 +386,19 @@ struct PlayerState {
     /// reference, like the reference's player does.
     motion: Option<Arc<Motion>>,
     motion_storage: Option<String>,
+    /// The live session behind the player: the reference's `MEmotePlayer`
+    /// state — the authored variable table, the per-tick eye/brow/mouth control
+    /// pass (blink timers, timelines) and the evaluated-variable scene rebuild.
+    /// `draw` samples this, so what a script does to the player — and what the
+    /// motion's own controls do — reaches the game's frame; the file's *static*
+    /// scene constructor (`Motion::draw_list`) resolves neither.
+    ///
+    /// One session per loaded [`Motion`]: `play` on another file's motion
+    /// drops it (`session`), the same file's motion switches or restarts the
+    /// animation in place ([`open_session`]), because the session's player
+    /// state — variables, control timers, timelines — is the reference's and
+    /// outlives a motion switch.
+    session: Option<MotionPlayer>,
     texture_cache: Option<TextureCache>,
     /// Current position, in 1/60 s ticks.
     tick: f64,
@@ -1157,14 +1289,20 @@ fn load_handle(runtime: &mut Runtime<KrkrHost>, path: &str, metadata: Variant) -
 }
 
 /// The `.metadata` member: the file's root `metadata` value when it has one,
-/// otherwise `Null` (which the game's wrapper treats as "no metadata").
+/// and `void` when it has none — the game's own test is strict
+/// (`AffineSourceMotion.tjs` `loadResource`: `if (a1 && !(l2.metadata ===
+/// void)) _metadata = l2.metadata;`), and `Null === void` is false in TJS2
+/// (`tTJSVariant::DiscernCompare`; `crates/krkr-tjs2/src/runtime/value.rs`
+/// `discern_eq`), so a `Null` here would count as "has metadata" and hand the
+/// `.psb` emote path an empty one to read `.base.chara` off. A file that
+/// authors `metadata: null` outright converts to `Null` and stays that way.
 fn motion_metadata(runtime: &mut Runtime<KrkrHost>, motion: &Motion) -> Variant {
     let Some(metadata) = motion.psb().root.field("metadata") else {
-        return Variant::Null;
+        return Variant::Void;
     };
     match psb_value_to_variant(runtime, metadata) {
         Some(value) => value,
-        None => Variant::Null,
+        None => Variant::Void,
     }
 }
 
@@ -1524,10 +1662,23 @@ fn refit_adaptor_canvas(runtime: &mut Runtime<KrkrHost>, target: ObjectHandle) -
 }
 
 /// `SeparateLayerAdaptor.getSubImageLayers()` answers `void` — "no sub-layer
-/// model" — which is what makes the game take its single-canvas path
-/// (`AffineSourceMotion.tjs:3238-3250` branches on `l4 === void`). Returning
-/// an empty array is *not* equivalent: it selects the per-part path and draws
-/// nothing.
+/// model" — and that is this port's honest shape for the reference's per-part
+/// surface.
+///
+/// The game's per-part branch reads the member off the **owner layer**, not the
+/// adaptor (`system/AffineSourceMotion.tjs` `drawAffine`: `var l4 =
+/// a2.getSubImageLayers();`, with `a2` the `AffineLayer` that handed itself to
+/// `_image.drawAffine(a0, a1, this, …)`), and the shipped scripts' two
+/// implementations are the base layer's empty function (void — the
+/// single-canvas path this port takes) and the layer link's `_linkchildren`
+/// (`world.tjs`, only when its `_image` is an `AffineSourceMotion`) whose
+/// children are whole `AffineSourceMotion`s rather than E-mote parts. The
+/// DLL's own adaptor *does* have a sub-layer model —
+/// `Player.LayerGetter`/`LayerSetter` hand each part its own TVP layer (nod3d
+/// `100385e0_FUN_100385e0.c`) — but eluna produces one flat sprite list with no
+/// part-to-layer mapping (`crates/krkr-emote/src/player.rs`'s module docs,
+/// gap 1), so any array answered here would be layers with no part behind them;
+/// PARQUET never calls the member at all.
 fn get_sub_image_layers(
     runtime: &mut Runtime<KrkrHost>,
     _this_obj: Option<ObjectHandle>,
@@ -2191,6 +2342,7 @@ fn player_play(
         with_player_mut(Some(this), |state| {
             state.animation = animation;
             state.motion = None;
+            state.session = None;
             state.texture_cache = None;
             state.playing = false;
         });
@@ -2204,6 +2356,9 @@ fn player_play(
             .is_none_or(|current| !Arc::ptr_eq(current, &motion))
         {
             state.texture_cache = Some(TextureCache::new(Arc::clone(&motion)));
+            // Another file's motion is another player state: its live session
+            // is that file's parsed tables, so the old one goes.
+            state.session = None;
         }
         state.motion = Some(motion);
         state.motion_storage = Some(storage);
@@ -2213,7 +2368,54 @@ fn player_play(
         state.tweens.clear();
         state.playing = true;
     });
+    let opened = PLAYERS.with(|players| {
+        let mut players = players.borrow_mut();
+        match players.get_mut(&this) {
+            Some(state) => open_session(state),
+            None => Ok(()),
+        }
+    });
+    if let Err(error) = opened {
+        runtime.host_mut().log(&format!(
+            "motionplayer.dll: play: the live player session could not be opened: {error}"
+        ));
+    }
     Ok(Variant::Void)
+}
+
+/// Opens the live session behind `play`, or restarts the animation of the one
+/// already there.
+///
+/// A session belongs to a *loaded file*: `play` on another file's motion builds
+/// a fresh one ([`player_play`] drops the old one first), and `play` on the
+/// same file's motion switches or restarts the animation in place the way the
+/// reference does — the switch is `play(name, flags)`, not a property write, so
+/// the new animation starts at its own time 0 while the player's state
+/// (variables, control timers, timelines) keeps running
+/// ([`MotionPlayer::set_motion`]).
+///
+/// The player's own variable records travel into a session being built: a write
+/// that happened before a session existed — the game's `_setOptions` writes run
+/// right after `new Motion.Player`, before any `play` — is replayed for every
+/// name the file authors. A name the file does not author has no record in
+/// eluna's table; it stays the host's record in [`PlayerState::variables`] and
+/// is layered into every sample ([`MotionPlayer::sample_at`]).
+fn open_session(state: &mut PlayerState) -> std::result::Result<(), krkr_emote::MotionError> {
+    let Some(motion) = state.motion.clone() else {
+        state.session = None;
+        return Ok(());
+    };
+    match state.session.as_mut() {
+        Some(session) => session.set_motion(&state.animation),
+        None => {
+            let mut session = MotionPlayer::with_motion(&motion, &state.animation)?;
+            for (name, value) in &state.variables {
+                session.write_variable(name, *value);
+            }
+            state.session = Some(session);
+            Ok(())
+        }
+    }
 }
 
 fn find_motion_in_manager(
@@ -2304,13 +2506,22 @@ fn player_advance(
     let Some(this) = this_obj.map(|handle| runtime.bound_this(handle).unwrap_or(handle)) else {
         return Ok(Variant::Void);
     };
-    let finished = PLAYERS.with(|players| {
+    let outcome = PLAYERS.with(|players| {
         let mut players = players.borrow_mut();
         let Some(state) = players.get_mut(&this) else {
-            return false;
+            return Ok(false);
         };
         advance_player(state, ticks)
     });
+    let finished = match outcome {
+        Ok(finished) => finished,
+        Err(error) => {
+            runtime.host_mut().log(&format!(
+                "motionplayer.dll: the live player session could not advance: {error}"
+            ));
+            false
+        }
+    };
     if finished && let Some(handler) = script_callback(runtime, this, "onSync") {
         runtime.call_function(handler, Vec::new())?;
     }
@@ -2319,7 +2530,25 @@ fn player_advance(
 
 /// Advances one player by `ticks` raw ticks; returns whether a non-looping
 /// motion just finished.
-fn advance_player(state: &mut PlayerState, ticks: f64) -> bool {
+///
+/// The player's own model moves first — the position with its wrap or clamp,
+/// and the plugin's timed `setVariable` writes — and the live session is then
+/// driven by the same delta, its animation sampled at the position the model
+/// landed on ([`MotionPlayer::advance_and_sample`]: the session's own clock
+/// keeps counting through a loop wrap while the sample restarts, which is how
+/// the reference's controls and timelines treat the motion's `loopTime`).
+///
+/// A player that is not playing, or a zero delta — `progress(0)` is the game's
+/// paused frame (`AffineSourceMotion.tjs` `_drawAffine`: `if (_interval > 0)
+/// _player.progress(_interval), _interval = 0; else _player.progress(0)` —
+/// drives nothing at all: the session's clock, its control pass (blink timers)
+/// and its physics all stand still. A stalled player is a frozen *frame*, not a
+/// frozen face over a running animation; see [`player_draw`] and the module
+/// docs' pause note.
+fn advance_player(
+    state: &mut PlayerState,
+    ticks: f64,
+) -> std::result::Result<bool, krkr_emote::MotionError> {
     let duration = player_duration_ticks(state).filter(|duration| *duration > 0.0);
     let loop_time = player_loop_ticks(state);
 
@@ -2330,36 +2559,39 @@ fn advance_player(state: &mut PlayerState, ticks: f64) -> bool {
 
     if !state.playing || ticks == 0.0 {
         apply_variable_tweens(state);
-        return false;
+        return Ok(false);
     }
 
-    state.tick = (state.tick + ticks * state.speed).max(0.0);
+    let delta = ticks * state.speed;
+    state.tick = (state.tick + delta).max(0.0);
     apply_variable_tweens(state);
 
-    let Some(duration) = duration else {
-        return false;
-    };
-    if loop_time >= 0.0 {
-        if state.tick >= duration {
-            // The reference wraps to the motion's `loopTime` (+0x150), not to
-            // tick 0: a file with a mid-animation loop point re-enters at that
-            // point. `(position - duration) % (duration - loopTime)` carries
-            // however far past the end the step went.
-            let span = duration - loop_time;
-            state.tick = if span > 0.0 {
-                loop_time + (state.tick - duration) % span
-            } else {
-                loop_time
-            };
+    let mut finished = false;
+    if let Some(duration) = duration {
+        if loop_time >= 0.0 {
+            if state.tick >= duration {
+                // The reference wraps to the motion's `loopTime` (+0x150), not to
+                // tick 0: a file with a mid-animation loop point re-enters at that
+                // point. `(position - duration) % (duration - loopTime)` carries
+                // however far past the end the step went.
+                let span = duration - loop_time;
+                state.tick = if span > 0.0 {
+                    loop_time + (state.tick - duration) % span
+                } else {
+                    loop_time
+                };
+            }
+        } else if state.tick >= duration {
+            state.tick = duration;
+            state.playing = false;
+            finished = true;
         }
-        return false;
     }
-    if state.tick >= duration {
-        state.tick = duration;
-        state.playing = false;
-        return true;
+
+    if let Some(session) = state.session.as_mut() {
+        session.advance_and_sample(delta as f32, state.tick as f32, &state.variables)?;
     }
-    false
+    Ok(finished)
 }
 
 /// Applies every timed `setVariable` write at the player's current position.
@@ -2441,6 +2673,18 @@ fn ease(t: f64, easing: f64) -> f64 {
 /// `setVariable(name, value[, time, easing])` — a timed write eases over
 /// `time` ticks (the game converts its milliseconds with `* 60 / 1000`), an
 /// untimed one lands immediately.
+///
+/// The write is two records at once, because the port has two:
+///
+/// * the **session's** table — the reference's per-player records — where a
+///   name the file authors (its `variableList`, its control outputs, its
+///   timeline tracks) lives, so the control pass reads the script's write and a
+///   later control tick can take the variable back;
+/// * the plugin's own map, which is what `variableKeys` lists and what a name
+///   the file never mentions has (eluna's table is built from the parse and
+///   cannot grow): those entries are layered under the evaluated table of every
+///   sample ([`MotionPlayer::sample_at`]), which is how a parameterised layer
+///   reading an un-authored name still follows the script.
 fn player_set_variable(
     _runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -2467,6 +2711,13 @@ fn player_set_variable(
         .transpose()?
         .unwrap_or(0.0);
     with_player_mut(this_obj, |state| {
+        if let Some(session) = state.session.as_mut() {
+            if time <= 0.0 || !time.is_finite() {
+                session.write_variable(&name, value);
+            } else {
+                session.write_variable_timed(&name, value, time as f32, easing as f32);
+            }
+        }
         if time <= 0.0 || !time.is_finite() {
             state.variables.insert(name.clone(), value);
             state.tweens.retain(|tween| tween.name != name);
@@ -2485,6 +2736,10 @@ fn player_set_variable(
     Ok(Variant::Void)
 }
 
+/// `getVariable(name)` reads the session first — a name the file authors has
+/// the reference's record, evaluated (a control's output, a timeline's write,
+/// the script's last write) — and falls back to the plugin's own map for the
+/// names the file does not mention.
 fn player_get_variable(
     _runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -2495,16 +2750,23 @@ fn player_get_variable(
         .map(Variant::to_tjs_string)
         .transpose()?
         .unwrap_or_default();
-    let value = with_player(this_obj, |state| state.variables.get(&name).copied()).flatten();
+    let value = with_player(this_obj, |state| {
+        state
+            .session
+            .as_ref()
+            .and_then(|session| session.variable(&name))
+            .or_else(|| state.variables.get(&name).copied())
+    })
+    .flatten();
     Ok(value
         .map(|value| Variant::Real(f64::from(value)))
         .unwrap_or(Variant::Void))
 }
 
 /// `contains(name)`: whether the player already knows the name — a set
-/// variable, or a layer label of the animation being played. (The reference's
-/// exact predicate was not recovered; this is the reading the game's usage
-/// supports.)
+/// variable, a variable the loaded file authors (the session's table), or a
+/// layer label of the animation being played. (The reference's exact predicate
+/// was not recovered; this is the reading the game's usage supports.)
 fn player_contains(
     _runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -2519,6 +2781,13 @@ fn player_contains(
         if state.variables.contains_key(&name) {
             return true;
         }
+        if state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.variable(&name).is_some())
+        {
+            return true;
+        }
         state
             .motion
             .as_ref()
@@ -2529,11 +2798,21 @@ fn player_contains(
     Ok(Variant::Integer(i64::from(contains)))
 }
 
-/// `draw(layer)`: composites the sampled draw list into the layer's bitmap.
+/// `draw(layer)`: composites the frame the player's live session produced into
+/// the layer's bitmap.
 ///
-/// The sample happens before the layer callback (the layer API lends the
-/// pixels through a closure), and the decode cache travels with it so a motion
-/// decodes each texture once per player.
+/// The sample is the session's, not the file's static scene constructor: the
+/// scene is rebuilt from the *evaluated* variable table, so the authored
+/// eye/brow/mouth controls' current output, the timelines running on the
+/// player's clock and every `setVariable` write are in the frame the game gets
+/// ([`MotionPlayer::sample_at`], the reference's per-frame rebuild). The rest is
+/// the same as before: the position the plugin's own model landed on, the
+/// one-shot hold over an empty tail, the player's placement transform and
+/// colour filter; the decode cache travels with the frame so a motion decodes
+/// each texture once per player.
+///
+/// A session that cannot sample logs and draws nothing, the shape the static
+/// path had; a player with no session (no motion loaded) draws nothing at all.
 fn player_draw(
     runtime: &mut Runtime<KrkrHost>,
     this_obj: Option<ObjectHandle>,
@@ -2577,13 +2856,14 @@ fn player_draw(
         // itself wrote `loopTime 0`, which loops.
         let one_shot = player_loop_ticks(state) < 0.0;
         let mut tick = state.tick as f32;
-        let mut sampled = motion.draw_list_with_variables(&animation, tick, &variables);
+        let session = state.session.as_mut()?;
+        let mut sampled = session.sample_at(tick, &variables);
         if let Ok(items) = &sampled {
             if items.iter().any(|item| item.visible) {
                 state.held_tick = Some(tick);
             } else if one_shot && let Some(held) = state.held_tick {
                 tick = held;
-                sampled = motion.draw_list_with_variables(&animation, tick, &variables);
+                sampled = session.sample_at(tick, &variables);
             }
         }
         let Ok(mut items) = sampled else {
@@ -3108,6 +3388,16 @@ mod tests {
         // tests; not every helper is used on this side.
         #![allow(dead_code)]
         include!("../../krkr-emote/tests/support/psb_write.rs");
+    }
+
+    /// The player fixture the live-session tests use — an authored
+    /// `EPEyeControl` writing a variable a parameterised layer samples — shared
+    /// verbatim from the adapter crate's test support. PARQUET's own 23 `.mtn`
+    /// members carry no controls at all, so this is the only authored control a
+    /// test here can drive.
+    mod player_fixture {
+        #![allow(dead_code)]
+        include!("../../krkr-emote/tests/support/player_fixture.rs");
     }
 
     use psb_write::{PsbWriter, Value, int, list, object, text};
@@ -3746,6 +4036,402 @@ mod tests {
             integer(&mut engine, "layer.getMainPixel(20, 20)"),
             0,
             "outside the quad stays clear"
+        );
+    }
+
+    /// The live player session is what `Player.draw` samples: this fixture's
+    /// face is an authored `EPEyeControl`'s variable and nothing in the script
+    /// drives the frame — the blink timer does, on the player's own clock.
+    ///
+    /// Fails before the wiring: `draw` sampled the file's static scene
+    /// constructor, which runs no control and reads no variable, so the pixel
+    /// never changed and `getVariable("face")` answered void.
+    #[test]
+    fn an_authored_control_drives_the_players_drawn_frame() {
+        let mut engine = engine_with(&[(MOTION_STORAGE, player_fixture::blinking_motion())]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script(
+                "blink.tjs",
+                r#"
+                player.play("idle", 0);
+                player.draw(layer);
+                global.opened = layer.getMainPixel(20, 20);
+                global.opened_face = player.getVariable("face");
+                global.closed_at = -1;
+                for (var i = 1; i <= 40; i++) {
+                    player.frameProgress(1);
+                    player.clear(layer, 0);
+                    player.draw(layer);
+                    if (layer.getMainPixel(20, 20) != global.opened) {
+                        global.closed_at = i;
+                        break;
+                    }
+                }
+                global.closed = layer.getMainPixel(20, 20);
+                global.closed_face = player.getVariable("face");
+                "#,
+            )
+            .expect("the fixture's blink");
+        assert_ne!(
+            integer(&mut engine, "opened"),
+            0,
+            "the open eye draws at tick 0"
+        );
+        assert_eq!(
+            real(&mut engine, "opened_face"),
+            0.0,
+            "the authored default is the face's value before any tick"
+        );
+        assert!(
+            integer(&mut engine, "closed_at") > 0,
+            "the authored blink closed the eye on the player's own clock"
+        );
+        assert_ne!(
+            integer(&mut engine, "closed"),
+            integer(&mut engine, "opened"),
+            "the drawn frame changed with the control"
+        );
+        assert_ne!(
+            integer(&mut engine, "closed"),
+            0,
+            "the closed frame is drawn, not an empty canvas"
+        );
+        assert!(
+            real(&mut engine, "closed_face") >= 0.5,
+            "the control's output is the player's variable value: {}",
+            real(&mut engine, "closed_face")
+        );
+    }
+
+    /// A one-layer motion with two animations of the same shape, so `play`'s
+    /// switch semantics can be driven through the plugin surface: each
+    /// animation's two keyframes use colours that identify which animation drew
+    /// at which tick.
+    fn two_animation_motion() -> Vec<u8> {
+        let mut writer = PsbWriter::default();
+        let mut icon_fields = Vec::new();
+        for (name, colour) in [
+            ("white", [255, 255, 255, 255]),
+            ("red", [255, 0, 0, 255]),
+            ("blue", [0, 0, 255, 255]),
+            ("green", [0, 255, 0, 255]),
+        ] {
+            let pixel = writer.add_resource(block(colour));
+            icon_fields.push((name, icon(&pixel)));
+        }
+        let layer = |first: &'static str,
+                     first_coord: [i64; 2],
+                     second: &'static str,
+                     second_coord: [i64; 2]| {
+            object(vec![
+                ("label", text("body")),
+                ("coordinate", int(0)),
+                ("children", list(vec![])),
+                (
+                    "frameList",
+                    list(vec![
+                        object(vec![
+                            ("content", content(first, first_coord, 255)),
+                            ("time", int(0)),
+                            ("type", int(2)),
+                        ]),
+                        object(vec![
+                            ("content", content(second, second_coord, 255)),
+                            ("time", int(30)),
+                            ("type", int(3)),
+                        ]),
+                        object(vec![("time", int(60)), ("type", int(0))]),
+                    ]),
+                ),
+            ])
+        };
+        let motion = |name: &'static str, layer: Value| {
+            (
+                name,
+                object(vec![
+                    ("lastTime", int(60)),
+                    ("loopTime", int(-1)),
+                    ("layer", list(vec![layer])),
+                ]),
+            )
+        };
+        let root = object(vec![
+            ("id", text("motion")),
+            ("label", text("Synthetic")),
+            ("metadata", Value::Null),
+            (
+                "source",
+                object(vec![(
+                    "hero",
+                    object(vec![("type", int(1)), ("icon", object(icon_fields))]),
+                )]),
+            ),
+            (
+                "object",
+                object(vec![(
+                    "hero",
+                    object(vec![
+                        ("metadata", Value::Null),
+                        (
+                            "motion",
+                            object(vec![
+                                motion(
+                                    "idle",
+                                    layer("src/hero/white", [8, 8], "src/hero/red", [16, 16]),
+                                ),
+                                motion(
+                                    "walk",
+                                    layer("src/hero/blue", [24, 24], "src/hero/green", [4, 4]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                )]),
+            ),
+        ]);
+        writer.finish(4, &root)
+    }
+
+    /// `play` restarts the animation's clock through the plugin surface: the new
+    /// animation's tick-0 frame is what `draw` shows and its own clock then runs
+    /// from there, not from where the old animation stood.
+    ///
+    /// Fails if `play` re-points the player at another animation without
+    /// restarting the session's sample time (the frame would still be the old
+    /// clock's) — the plugin's `frameTickCount` would read 0 while `draw` showed
+    /// tick 45.
+    #[test]
+    fn play_restarts_the_animations_clock() {
+        let mut engine = engine_with(&[(MOTION_STORAGE, two_animation_motion())]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script(
+                "idle.tjs",
+                "player.play(\"idle\", 0); player.progress(750); player.draw(layer);",
+            )
+            .expect("idle at tick 45");
+        assert_eq!(integer(&mut engine, "player.frameTickCount"), 45);
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(15, 15)"),
+            0x00ff_0000,
+            "idle's second keyframe is the one at tick 45"
+        );
+
+        engine
+            .execute_script(
+                "walk.tjs",
+                "layer.fillRect(0, 0, 32, 32, 0x00000000); \
+                 player.play(\"walk\", 0); player.draw(layer);",
+            )
+            .expect("walk at tick 0");
+        assert_eq!(integer(&mut engine, "player.motion == \"walk\""), 1);
+        assert_eq!(
+            integer(&mut engine, "player.frameTickCount"),
+            0,
+            "the switch restarts the clock"
+        );
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(24, 24)"),
+            0x0000_00ff,
+            "the new animation's tick-0 frame is what draws"
+        );
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(15, 15)"),
+            0,
+            "the old animation's frame is gone"
+        );
+
+        engine
+            .execute_script(
+                "walk_on.tjs",
+                "layer.fillRect(0, 0, 32, 32, 0x00000000); \
+                 player.progress(750); player.draw(layer);",
+            )
+            .expect("walk at tick 45");
+        assert_eq!(
+            integer(&mut engine, "layer.getMainPixel(4, 4)"),
+            0x0000_ff00,
+            "the new animation's clock runs from its own 0"
+        );
+    }
+
+    /// A stalled player is a frozen **frame**, not a frozen face over a running
+    /// animation: after `stop()` every `progress(200)` the game keeps sending
+    /// moves nothing — neither the animation's clock (the fixture's time-keyed
+    /// body layer) nor the control pass (the authored blink) — while the same
+    /// motion advanced by the same amount of time *does* move both.
+    ///
+    /// That is the wire a `Player.pause` would have needed and the reference
+    /// does not have (no `pause`/`resume` member exists in either shipped
+    /// build): eluna's `set_paused(true)` would have frozen only the control
+    /// pass while the animation clock kept counting
+    /// (`vendor/eluna/crates/eluna/src/runtime.rs:2306-2316`), which this
+    /// module never calls.
+    #[test]
+    fn a_stalled_player_is_a_frozen_frame() {
+        let mut engine =
+            engine_with(&[(MOTION_STORAGE, player_fixture::blinking_motion_with_body())]);
+        engine.execute_script("setup.tjs", SETUP).expect("setup");
+        engine
+            .execute_script(
+                "stall.tjs",
+                r#"
+                player.play("idle", 0);
+                player.frameProgress(10);
+                player.draw(layer);
+                global.body_before = layer.getMainPixel(4, 4);
+                global.eye_before = layer.getMainPixel(20, 20);
+                global.face_before = player.getVariable("face");
+                player.stop();
+                global.stall_moves = 0;
+                for (var i = 0; i < 10; i++) {
+                    player.progress(200);
+                    player.clear(layer, 0);
+                    player.draw(layer);
+                    if (layer.getMainPixel(20, 20) != global.eye_before ||
+                        layer.getMainPixel(4, 4) != global.body_before) {
+                        global.stall_moves++;
+                    }
+                }
+                global.body_after = layer.getMainPixel(4, 4);
+                global.eye_after = layer.getMainPixel(20, 20);
+                global.face_after = player.getVariable("face");
+                global.tick_after = player.frameTickCount;
+                // The same clock, fed: `play` restarts the animation, and the
+                // body's step at tick 30 really is reachable.
+                player.play("idle", 0);
+                player.frameProgress(35);
+                player.clear(layer, 0);
+                player.draw(layer);
+                global.body_running = layer.getMainPixel(4, 4);
+                "#,
+            )
+            .expect("the stalled player");
+        assert_eq!(
+            integer(&mut engine, "tick_after"),
+            10,
+            "stop keeps the position"
+        );
+        assert_ne!(
+            integer(&mut engine, "body_before"),
+            0,
+            "the body layer drew before the stall"
+        );
+        assert_eq!(
+            integer(&mut engine, "stall_moves"),
+            0,
+            "two seconds of progress on a stopped player moved neither its position nor its control pass"
+        );
+        assert_eq!(
+            integer(&mut engine, "body_after"),
+            integer(&mut engine, "body_before"),
+            "…the time-keyed body layer stands still"
+        );
+        assert_eq!(
+            integer(&mut engine, "eye_after"),
+            integer(&mut engine, "eye_before"),
+            "…and so does the control pass"
+        );
+        assert_eq!(
+            real(&mut engine, "face_after"),
+            real(&mut engine, "face_before"),
+            "…the blink variable included"
+        );
+        assert_ne!(
+            integer(&mut engine, "body_running"),
+            integer(&mut engine, "body_before"),
+            "the same tick count *does* move the body when the player runs"
+        );
+    }
+
+    /// A file with no root `metadata` answers **`void`** off the load handle,
+    /// which is the shape the game's own strict test reads as "no metadata"
+    /// (`AffineSourceMotion.tjs` `loadResource`: `! (l2.metadata === void)`).
+    /// `Null` would not do: `Null === void` is false in TJS2
+    /// (`crates/krkr-tjs2/src/runtime/value.rs` `discern_eq`), so a `.psb`
+    /// load with no metadata would hand the emote path an empty one to read
+    /// `.base.chara` off.
+    #[test]
+    fn a_motion_without_metadata_answers_void() {
+        /// A one-icon, one-layer fixture with no root `metadata` field at all.
+        fn motion_bytes_without_metadata() -> Vec<u8> {
+            let mut writer = PsbWriter::default();
+            let pixel = writer.add_resource(block([255, 255, 255, 255]));
+            let root = object(vec![
+                ("id", text("motion")),
+                ("label", text("Synthetic")),
+                (
+                    "source",
+                    object(vec![(
+                        "hero",
+                        object(vec![
+                            ("type", int(1)),
+                            ("icon", object(vec![("white", icon(&pixel))])),
+                        ]),
+                    )]),
+                ),
+                (
+                    "object",
+                    object(vec![(
+                        "hero",
+                        object(vec![
+                            ("metadata", Value::Null),
+                            (
+                                "motion",
+                                object(vec![(
+                                    "idle",
+                                    object(vec![
+                                        ("lastTime", int(60)),
+                                        ("loopTime", int(-1)),
+                                        (
+                                            "layer",
+                                            list(vec![single_frame_layer(
+                                                "src/hero/white",
+                                                [8, 8],
+                                                255,
+                                            )]),
+                                        ),
+                                    ]),
+                                )]),
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]);
+            writer.finish(4, &root)
+        }
+
+        let mut engine = engine_with(&[(MOTION_STORAGE, motion_bytes_without_metadata())]);
+        engine
+            .execute_script(
+                "load.tjs",
+                "global.rm = new Motion.ResourceManager(0, 0); \
+                 global.res = rm.load(\"motion/hero.mtn\");",
+            )
+            .expect("load");
+        assert_eq!(
+            integer(&mut engine, "res.metadata === void"),
+            1,
+            "a file with no metadata answers void, the game's \"no metadata\""
+        );
+        // The fixture every other test loads *does* write `metadata: null`,
+        // which converts to `Null` and stays distinguishable from `void`.
+        let mut with_null = engine_with(&[(
+            MOTION_STORAGE,
+            motion_bytes(
+                vec![("white", [255, 255, 255, 255])],
+                single_frame_layer("src/hero/white", [8, 8], 255),
+                -1,
+            ),
+        )]);
+        with_null
+            .execute_script("setup.tjs", SETUP)
+            .expect("the shared setup");
+        assert_eq!(
+            integer(&mut with_null, "res.metadata === void"),
+            0,
+            "an authored `metadata` field is metadata, not a miss"
         );
     }
 

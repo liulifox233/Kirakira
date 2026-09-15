@@ -289,7 +289,7 @@ impl MotionPlayer {
         };
         self.motion_ticks += delta;
         self.player.progress_ticks_without_physics(delta);
-        self.rebuild_with_physics(delta)
+        self.rebuild_with_physics(delta, &BTreeMap::new())
     }
 
     /// [`MotionPlayer::advance_ticks`] from milliseconds, capped the way the
@@ -307,6 +307,63 @@ impl MotionPlayer {
     /// [`MotionPlayer::advance_ticks`] from seconds.
     pub fn advance_seconds(&mut self, delta_seconds: f32) -> Result<(), MotionError> {
         self.advance_ticks(delta_seconds * eluna::EMOTE_TICKS_PER_SECOND)
+    }
+
+    /// One update step for a caller that keeps its own position model: the
+    /// session's own clock — timed variable writes in flight, the
+    /// eye/brow/mouth control pass, every playing timeline, physics — advances
+    /// by `delta_ticks`, while the scene is sampled at `sample_ticks`, the
+    /// position the caller's model landed on (its own loop wrap, its clamp at a
+    /// one-shot's end, a `tickCount` write, …).
+    ///
+    /// The reference has one position (`MMotionPlayer::Progress`), so
+    /// [`MotionPlayer::advance_ticks`] moves the sample time by the same delta
+    /// it moves the clock by. A host whose position can *jump* — the plugin's
+    /// `advance_player` wraps a looping motion back to its `loopTime` — needs
+    /// the two numbers separately: the clock must keep counting while the
+    /// sample restarts, exactly as the reference's controls and timelines run on
+    /// the player's clock rather than on the motion's own time.
+    ///
+    /// `host_variables` is the caller's own variable records (see
+    /// [`MotionPlayer::write_variable`]): their entries for names the session
+    /// does not know are layered under the evaluated table for this sample.
+    pub fn advance_and_sample(
+        &mut self,
+        delta_ticks: f32,
+        sample_ticks: f32,
+        host_variables: &BTreeMap<String, f32>,
+    ) -> Result<(), MotionError> {
+        let delta = if delta_ticks.is_finite() {
+            delta_ticks.max(0.0)
+        } else {
+            0.0
+        };
+        self.motion_ticks = if sample_ticks.is_finite() {
+            sample_ticks.max(0.0)
+        } else {
+            0.0
+        };
+        self.player.progress_ticks_without_physics(delta);
+        self.rebuild_with_physics(delta, host_variables)
+    }
+
+    /// Re-samples the scene at `ticks` — the reference's `tickCount` /
+    /// `frameTickCount` position write, and how a host restarts or wraps an
+    /// animation — and answers that frame's draw list. The player's own state
+    /// (its variables, control timers and timelines) is untouched, exactly as a
+    /// position write leaves it.
+    pub fn sample_at(
+        &mut self,
+        ticks: f32,
+        host_variables: &BTreeMap<String, f32>,
+    ) -> Result<Vec<MotionDrawItem>, MotionError> {
+        self.motion_ticks = if ticks.is_finite() {
+            ticks.max(0.0)
+        } else {
+            0.0
+        };
+        self.rebuild_with_physics(0.0, host_variables)?;
+        Ok(self.draw_list())
     }
 
     /// The scene the last tick produced.
@@ -352,6 +409,40 @@ impl MotionPlayer {
         self.player
             .set_variable_timed(name, value, time_ticks, easing);
         self.rebuild()
+    }
+
+    /// `SetVariable(name, value)` on the session's own table, without
+    /// re-sampling the scene (the next sample picks the value up), answering
+    /// whether the session knew the name.
+    ///
+    /// A `false` means the file does not author the variable: eluna builds its
+    /// table from the parse, so a name the file never mentions has no record —
+    /// the reference's records are created by a write. The host keeps such a
+    /// name in its own records and hands them to the next sample
+    /// (`MotionPlayer::sample_at`), which layers them under the evaluated table.
+    pub fn write_variable(&mut self, name: &str, value: f32) -> bool {
+        if self.player.variable_value(name).is_none() {
+            return false;
+        }
+        self.player.set_variable_immediate(name, value);
+        true
+    }
+
+    /// `SetVariable(name, value, time, easing)` on the session's own table,
+    /// without re-sampling the scene; see [`MotionPlayer::write_variable`].
+    pub fn write_variable_timed(
+        &mut self,
+        name: &str,
+        value: f32,
+        time_ticks: f32,
+        easing: f32,
+    ) -> bool {
+        if self.player.variable_value(name).is_none() {
+            return false;
+        }
+        self.player
+            .set_variable_timed(name, value, time_ticks, easing);
+        true
     }
 
     /// The file's timeline names, in file order.
@@ -406,10 +497,15 @@ impl MotionPlayer {
     /// `vendor/eluna/crates/eluna/src/runtime.rs:2313-2315`), while
     /// [`MotionPlayer::advance_ticks`] still moves the animation clock — so a
     /// paused session keeps drawing new frames of the animation with its face
-    /// controllers frozen, not a frozen picture. Nothing in this repository
-    /// pauses a session today; a plugin that wires `Player.pause` has to decide
-    /// between pausing the whole session (stop calling `advance_ticks`) and
-    /// eluna's narrower freeze.
+    /// controllers frozen, not a frozen picture. That freeze is *not* the paused
+    /// motion the plugin's surface has: the reference's `Player`/`EmotePlayer`
+    /// member tables carry no `pause` at all (the shipped binaries' UTF-16
+    /// member-name strings; `motionplayer_nod3d.dll` spells `progress`,
+    /// `frameProgress` and `syncActive` but nothing pause-shaped), and a driver
+    /// only moves when the game feeds it a delta. The plugin therefore pauses by
+    /// not calling [`MotionPlayer::advance_and_sample`], which freezes the whole
+    /// frame — the same rule a `progress(0)` or a `stop` follows — instead of
+    /// eluna's narrower control-only freeze.
     pub fn inner_mut(&mut self) -> &mut ElunaPlayer {
         &mut self.player
     }
@@ -420,52 +516,51 @@ impl MotionPlayer {
     /// travels along because nested motions and type-0 HOLD frames read their
     /// previous positions from it.
     fn rebuild(&mut self) -> Result<(), MotionError> {
-        self.rebuild_with_physics(0.0)
+        self.rebuild_with_physics(0.0, &BTreeMap::new())
     }
 
-    fn rebuild_with_physics(&mut self, physics_delta_ticks: f32) -> Result<(), MotionError> {
+    fn rebuild_with_physics(
+        &mut self,
+        physics_delta_ticks: f32,
+        host_variables: &BTreeMap<String, f32>,
+    ) -> Result<(), MotionError> {
         let previous = self.player.scene().clone();
-        let build = |player: &ElunaPlayer,
-                     schema: &eluna::EmoteModelSchema,
-                     psb: &eluna::PsbFile,
-                     data: &[u8],
-                     motion: &str,
-                     motion_ticks: f32,
-                     previous: &EmoteStaticScene| {
-            schema.build_motion_scene_at_with_resources_variables_previous_scene_and_ground_hook(
-                psb,
-                data,
-                motion,
-                motion_ticks,
-                &player.evaluated_variable_values(),
-                previous,
-                None,
-            )
-        };
-        let scene = build(
-            &self.player,
-            &self.schema,
-            &self.psb,
-            &self.normalized_data,
-            &self.motion,
-            self.motion_ticks,
-            &previous,
-        )?;
+        let scene = self.build_scene(host_variables, &previous)?;
         self.player.replace_scene(scene);
         if physics_delta_ticks > 0.0 && self.player.is_physics_enabled() {
             self.player
                 .evaluate_physics_for_current_scene(physics_delta_ticks);
-            let scene = build(
-                &self.player,
-                &self.schema,
+            let scene = self.build_scene(host_variables, &previous)?;
+            self.player.replace_scene(scene);
+        }
+        Ok(())
+    }
+
+    /// Builds one scene at [`MotionPlayer::motion_ticks`] from the evaluated
+    /// variable table plus the host's own records for the names the session
+    /// does not know — a parameterised layer resolves its sample time from the
+    /// same map, so an unknown name reaches the layer that reads it.
+    fn build_scene(
+        &self,
+        host_variables: &BTreeMap<String, f32>,
+        previous: &EmoteStaticScene,
+    ) -> Result<EmoteStaticScene, MotionError> {
+        let mut variables = self.player.evaluated_variable_values();
+        for (name, value) in host_variables {
+            if !variables.contains_key(name) {
+                variables.insert(name.clone(), *value);
+            }
+        }
+        Ok(self
+            .schema
+            .build_motion_scene_at_with_resources_variables_previous_scene_and_ground_hook(
                 &self.psb,
                 &self.normalized_data,
                 &self.motion,
                 self.motion_ticks,
-                &previous,
-            )?;
-            self.player.replace_scene(scene);
-        }
-        Ok(())
+                &variables,
+                previous,
+                None,
+            )?)
     }
 }
