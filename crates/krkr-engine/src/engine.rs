@@ -21805,11 +21805,14 @@ mod tests {
         fs::write(
             root.join("custom.ks"),
             "[addSysScript name=\"game\" storage=\"wrong\"]\n\
-             [addSysScript name=\"game.from.title\" storage='&VolumeFile(\"vol1.ks\")' target=\"*start\"]\n",
+             [addSysScript name=\"game.from.title\" storage='&VolumeFile(\"vol1.ks\")' target=\"*later\"]\n",
         )
         .expect("write sys-script declarations");
         fs::write(root.join("wrong.ks"), "WRONG[s]").expect("write head-entry scenario");
-        fs::write(root.join("vol1.ks"), "*start\nVOLUME[s]").expect("write volume scenario");
+        // The entry's label is deliberately not the scenario's first: a
+        // resolution that only loaded the storage would stop at `*first`.
+        fs::write(root.join("vol1.ks"), "*first\nFIRST[s]\n*later\nLATER[s]")
+            .expect("write volume scenario");
 
         let mut engine = image_test_engine(&root);
         engine
@@ -21822,7 +21825,7 @@ mod tests {
         let tick = engine.tick().expect("system jump");
 
         assert_eq!(tick.state, KagTaskState::Finished);
-        assert_eq!(engine.message_layer().lines, vec!["VOLUME".to_string()]);
+        assert_eq!(engine.message_layer().lines, vec!["LATER".to_string()]);
         fs::remove_dir_all(root).expect("cleanup");
     }
 

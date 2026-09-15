@@ -207,7 +207,7 @@ fn register_system_hooks(host: &mut KrkrHost, text: &str) {
             SystemHookRegistration {
                 storage: kag_decl_attr(command, "storage"),
                 target: kag_decl_attr(command, "target"),
-                call: !is_script && kag_decl_is_call(command),
+                call: !is_script && kag_decl_jump_or_call(command),
             },
         );
     }
@@ -223,12 +223,26 @@ fn kag_decl_attr(command: &str, name: &str) -> Option<String> {
     decl_attr(command, name).map(str::to_string)
 }
 
-/// The boolean `call` attribute of a declaration, read the way the engine's
-/// twin does (`engine::hook_is_call`) and the way the tag path reads the same
-/// attribute (`kag_bool_attr`): the bare flag the reference's attribute reader
-/// turns into `true` is a call, and `call=false` is not.
-fn kag_decl_is_call(command: &str) -> bool {
-    matches!(decl_attr(command, "call"), Some("true" | "yes" | "1"))
+/// The boolean `call`/`jump` flavour of a declaration, read the way the
+/// engine's twin does (`engine::decl_jump_or_call`) and the way the tag path
+/// reads the same attributes (`kag_bool_attr`): `[addSysHook]` defaults to a
+/// call (`kagAdd` passes `1` to `_JumpOrCall`), `call=<value>` sets
+/// `iscall = +call` and `jump=<value>` overrides it with `iscall = !+jump`, so
+/// the shipped bare `jump` flag registers a jump and a declaration naming
+/// neither registers a call.
+fn kag_decl_jump_or_call(command: &str) -> bool {
+    if let Some(jump) = kag_decl_bool_attr(command, "jump") {
+        return !jump;
+    }
+    kag_decl_bool_attr(command, "call").unwrap_or(true)
+}
+
+/// The boolean value of one `name=value` attribute of a declaration; `None`
+/// when the declaration does not carry the attribute. A bare flag reads as
+/// `"true"` (`next_decl_attr`), which is the value the reference's attribute
+/// reader gives it.
+fn kag_decl_bool_attr(command: &str, name: &str) -> Option<bool> {
+    decl_attr(command, name).map(|value| matches!(value, "true" | "yes" | "1"))
 }
 
 /// `true` for a `custom.ks` line the reference's scenario reader skips as a
@@ -1298,12 +1312,13 @@ fn apply_snapshot_macros_from_object(
 
     let macros = runtime.object_member(snapshot_object, "macros");
     if let Some(macros) = macros.object_handle() {
-        let definitions = runtime.object_members(macros).into_iter().filter_map(
-            |(name, value)| match value {
+        let definitions = runtime
+            .object_members(macros)
+            .into_iter()
+            .filter_map(|(name, value)| match value {
                 Variant::String(source) => Some((name, source)),
                 _ => None,
-            },
-        );
+            });
         snapshot.set_macro_definitions(definitions);
     } else if matches!(macros, Variant::Void) {
         snapshot.set_macro_definitions(
@@ -1446,11 +1461,12 @@ mod tests {
 
         // The unquoted line is the later declaration of the same name, so the
         // table ends on its values: a key built from the whole remainder would
-        // have left the quoted declaration in place.
+        // have left the quoted declaration in place. Both spellings name no
+        // `call`/`jump`, so both keep the `kagAdd` default of a call.
         let probe = engine.host().system_hook("probe").expect("probe hook");
         assert_eq!(probe.storage.as_deref(), Some("unquoted.ks"));
         assert_eq!(probe.target.as_deref(), Some("*unquoted"));
-        assert!(!probe.call);
+        assert!(probe.call);
 
         let unquoted = engine
             .host()
@@ -1495,13 +1511,16 @@ mod tests {
         assert!(engine.host().system_hook("title.from.soundmode").is_none());
     }
 
-    /// The `call` flag is the attribute's value, not a `" call"` substring:
-    /// `call=false` registers a jump, and a `" call"` inside another value is
-    /// not the flag. The reference's own template reads the attribute value
-    /// (`_JumpOrCall` computes `iscall = +call`; PARQUET's compiled
-    /// `data/system/System.tjs`), and the engine's tag path reads the same
-    /// attribute with `kag_bool_attr`, which the scan now matches. The shipped
-    /// declarations write the bare flag, so they keep registering a call.
+    /// The declaration's `call`/`jump` flags are attribute values, not the
+    /// `" call"` substring the scan used to look for: `call=false` and a bare
+    /// `jump` register the hook as a jump, and neither substring inside another
+    /// value is a flag. That is how the reference's own template reads them
+    /// (`_JumpOrCall`: `iscall = +call`, then `iscall = !+jump`; PARQUET/GINKA
+    /// `sysscn/system.tjs`) and how the engine's tag path reads the same
+    /// attributes (`kag_bool_attr`), so a declaration the scan reads and the
+    /// same declaration met as a tag cannot disagree. The shipped declarations
+    /// write the bare `call` or `jump` flag, and one that names neither — the
+    /// reference's `kagAdd` default — registers a call.
     #[test]
     fn register_system_hooks_reads_call_false_as_a_jump() {
         let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
@@ -1509,7 +1528,9 @@ mod tests {
             engine.host_mut(),
             "\t[addSysHook name=\"probe.jump\" call=false storage=\"hook.ks\" target=\"*probe\"]\n\
              \t[addSysHook name=\"probe.call\" call storage=\"hook.ks\" target=\"*probe\"]\n\
-             \t[addSysHook name=\"probe.decoy\" storage=\"a call.ks\" target=\"*probe\"]\n",
+             \t[addSysHook name=\"probe.decoy\" storage=\"a call.ks\" target=\"*probe\"]\n\
+             \t[addSysHook name=\"probe.jumponly\" jump storage=\"hook.ks\" target=\"*probe\"]\n\
+             \t[addSysHook name=\"probe.jumpfalse\" jump=false storage=\"hook.ks\" target=\"*probe\"]\n",
         );
 
         let jump = engine.host().system_hook("probe.jump").expect("jump hook");
@@ -1518,8 +1539,19 @@ mod tests {
             .host()
             .system_hook("probe.decoy")
             .expect("decoy hook");
+        let jumponly = engine
+            .host()
+            .system_hook("probe.jumponly")
+            .expect("jump-only hook");
+        let jumpfalse = engine
+            .host()
+            .system_hook("probe.jumpfalse")
+            .expect("jump=false hook");
         assert!(!jump.call);
         assert!(call.call);
-        assert!(!decoy.call);
+        // No flag at all is the reference's default: a call.
+        assert!(decoy.call);
+        assert!(!jumponly.call);
+        assert!(jumpfalse.call);
     }
 }
