@@ -66,7 +66,9 @@
 //!                           (same syntax as the KRKR_TRACE env var)
 //!   --trace-call <pattern>  log calls into a native method from startup on
 //!                           (e.g. `Layer.affineCopy`; repeatable)
-//!   --timed-transitions     keep timed transitions (default: immediate)
+//!   --immediate-transitions finish every transition in the frame it starts
+//!                           (default: the engine's real frame clock; see the
+//!                           policy note in `main`)
 //!   --time-scale <f>        virtual clock multiplier (default 1.0)
 //!   --realtime              sleep per frame instead of fast-forwarding
 //!   --virtual-audio         consume audio commands without an output device
@@ -175,7 +177,7 @@ struct Config {
     dump_auto_paths: bool,
     dump_layer_images: Option<String>,
     logs: bool,
-    timed_transitions: bool,
+    immediate_transitions: bool,
     time_scale: f64,
     realtime: bool,
     virtual_audio: bool,
@@ -192,12 +194,16 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
 }
 
 fn parse_args() -> Config {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
     let mut config = Config {
         max_frames: 100_000,
         time_scale: 1.0,
         ..Config::default()
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-b" | "--break" => config.breakpoints.push(next_arg(&mut args, "-b")),
@@ -286,7 +292,10 @@ fn parse_args() -> Config {
                 config.dump_layer_images = Some(next_arg(&mut args, "--dump-layer-images"));
             }
             "--logs" => config.logs = true,
-            "--timed-transitions" => config.timed_transitions = true,
+            "--immediate-transitions" => config.immediate_transitions = true,
+            // The flag that used to request this behavior before it was the
+            // default; keep accepting it so existing probe scripts do not die.
+            "--timed-transitions" => {}
             "--time-scale" => {
                 config.time_scale = next_arg(&mut args, "--time-scale")
                     .parse()
@@ -509,6 +518,27 @@ fn report_unfinished_at_scripts(scripts: &AtFrameScripts, max_frames: usize, end
     any
 }
 
+/// The transition policy the headless shell asks the engine for.
+///
+/// Transitions run on the engine's real frame clock — the windowed shell's
+/// behavior — unless the caller explicitly asks for the immediate policy,
+/// which a probe can be killed by without any visible symptom: it finishes the
+/// transition inside `Layer.beginTransition`, so `onTransitionCompleted` is
+/// delivered before the script that started the transition has returned.
+/// KAGEX registers the wait that completion satisfies in that same script turn
+/// (right after beginning the transition), keyed `trans_<layer>` /
+/// `trans_<layer>_arg`; a completion that fires first leaves the conductor
+/// parked on a wait no later event can satisfy — the restored title ignores
+/// every click while every screenshot still looks right.  The reference never
+/// completes a transition inside that call: it clamps the `time` option to a
+/// minimum of 2 ms (`visual/TransIntf.cpp:530`, `:768`) and only stops the
+/// transition on an update tick (`visual/LayerIntf.cpp:6338`, `:6420`).
+fn requested_transition_policy(config: &Config) -> Option<TransitionPolicy> {
+    config
+        .immediate_transitions
+        .then_some(TransitionPolicy::Immediate)
+}
+
 fn main() {
     let config = parse_args();
     let root = config
@@ -530,10 +560,8 @@ fn main() {
     if let Some(categories) = &config.trace {
         engine.host_mut().set_trace_categories(categories);
     }
-    if !config.timed_transitions {
-        engine
-            .host_mut()
-            .set_transition_policy(TransitionPolicy::Immediate);
+    if let Some(policy) = requested_transition_policy(&config) {
+        engine.host_mut().set_transition_policy(policy);
     }
     krkr_plugins::register_reference_plugins(&mut engine).expect("plugins");
     if !config.trace_calls.is_empty() {
@@ -1288,9 +1316,37 @@ fn queue_virtual_audio_completions(
 
 #[cfg(test)]
 mod tests {
+    use super::{TransitionPolicy, parse_args_from, requested_transition_policy};
     use krkr_debug::console::{
         DEFAULT_LOG_TAIL, InteractiveCommand, TraceCommand, parse_interactive_command,
     };
+
+    fn args(values: &[&str]) -> impl Iterator<Item = String> {
+        values.iter().map(|value| value.to_string())
+    }
+
+    /// The headless shell must leave the engine's Animated default in place:
+    /// the immediate policy finishes a transition inside `Layer.beginTransition`,
+    /// which delivers `onTransitionCompleted` before the game's own script turn
+    /// has registered the `conductor.wait` keys that completion satisfies — the
+    /// returned-to PARQUET title then parks forever on a wait no later event can
+    /// trigger while every screenshot still looks right.  Only an explicit flag
+    /// may select it (`requested_transition_policy` carries the reference
+    /// argument).
+    #[test]
+    fn immediate_transitions_are_opt_in() {
+        for default_args in [&["--kag-state"][..], &["--timed-transitions"][..]] {
+            assert_eq!(
+                requested_transition_policy(&parse_args_from(args(default_args))),
+                None,
+                "{default_args:?}"
+            );
+        }
+        assert_eq!(
+            requested_transition_policy(&parse_args_from(args(&["--immediate-transitions"]))),
+            Some(TransitionPolicy::Immediate)
+        );
+    }
 
     #[test]
     fn interactive_control_commands_are_deterministic() {
