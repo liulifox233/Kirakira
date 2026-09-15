@@ -334,16 +334,98 @@ fn array_index_for_set(name: &str, len: usize) -> Option<usize> {
     usize::try_from(index).ok()
 }
 
+/// The index a numeric member name addresses, ported from the reference's two
+/// helpers.  `IsNumber` (`tjsArray.cpp:54-77`) decides *whether* the name is a
+/// number: an optional sign, then digits and dots, with nothing but spaces
+/// around them.  `TJS_atoi` (`tjsConfig.cpp:54-79`) then parses the sign and
+/// the integer prefix of that name into a 32-bit `tjs_int`
+/// (`tjsTypes.h:59`), wrapping on overflow.  So `"1e3"` is not a number at all
+/// and stays an ordinary member name, `"1.5"` is element 1, and
+/// `"4294967296"` is element 0 rather than a four-billion element index.
 fn parse_array_index_name(name: &str) -> Option<i64> {
-    let name = name.trim();
-    if name.is_empty() {
+    let chars: Vec<char> = name.chars().collect();
+    let mut position = 0;
+    while position < chars.len() && is_tjs_space(chars[position]) {
+        position += 1;
+    }
+    if position == chars.len() {
         return None;
     }
-    if let Ok(index) = name.parse::<i64>() {
-        return Some(index);
+    // `orgstr` is the name `TJS_atoi` parses: the original string, or what
+    // follows a `+`, which the reference skips past before parsing.
+    let mut integer_start = position;
+    match chars[position] {
+        '-' => position += 1,
+        '+' => {
+            position += 1;
+            integer_start = position;
+        }
+        _ => {}
     }
-    let value = name.parse::<f64>().ok()?;
-    value.is_finite().then_some(value as i64)
+    if position == chars.len() {
+        return None;
+    }
+    while position < chars.len() && is_tjs_space(chars[position]) {
+        position += 1;
+    }
+    if position == chars.len() {
+        return None;
+    }
+    if !chars[position].is_ascii_digit() {
+        return None;
+    }
+    while position < chars.len() && (chars[position].is_ascii_digit() || chars[position] == '.') {
+        position += 1;
+    }
+    while position < chars.len() && is_tjs_space(chars[position]) {
+        position += 1;
+    }
+    if position != chars.len() {
+        return None;
+    }
+    Some(tjs_atoi(&chars[integer_start..]))
+}
+
+/// `TJS_iswspace` (`tjsArray.cpp:40-44`): C's `isspace` in the `C` locale --
+/// space plus `\t`, `\n`, `\v`, `\f` and `\r` -- and nothing above `0xff`,
+/// which no non-ASCII character in a name ever is.
+fn is_tjs_space(ch: char) -> bool {
+    ch.is_ascii_whitespace() || ch == '\u{b}'
+}
+
+/// `TJS_atoi` (`tjsConfig.cpp:54-79`): skip everything up to and including
+/// `0x20`, take an optional `-`, then read decimal digits into an `int`.  The
+/// 32-bit accumulator is what makes an overlong name wrap.
+fn tjs_atoi(chars: &[char]) -> i64 {
+    let mut position = 0;
+    while position < chars.len() && (chars[position] as u32) <= 0x20 {
+        position += 1;
+    }
+    if position == chars.len() {
+        return 0;
+    }
+    let mut negative = false;
+    if chars[position] == '-' {
+        negative = true;
+        position += 1;
+        while position < chars.len() && (chars[position] as u32) <= 0x20 {
+            position += 1;
+        }
+        if position == chars.len() {
+            return 0;
+        }
+    }
+    let mut value: i32 = 0;
+    while position < chars.len() && chars[position].is_ascii_digit() {
+        value = value
+            .wrapping_mul(10)
+            .wrapping_add(chars[position] as i32 - '0' as i32);
+        position += 1;
+    }
+    if negative {
+        value = value.wrapping_neg();
+    }
+    value as i64
 }
 
 #[cfg(test)]
@@ -400,6 +482,46 @@ mod tests {
         empty.set("0", Variant::Integer(1));
         assert!(!empty.array_negative_index_after_wrap("-1"));
         assert!(empty.array_negative_index_after_wrap("-2"));
+    }
+
+    /// `IsNumber` (`tjsArray.cpp:54-77`) accepts an optional sign, digits and
+    /// dots -- and then `TJS_atoi` (`tjsConfig.cpp:54-79`) parses that name as
+    /// the *integer prefix* it starts with, accumulating into a 32-bit
+    /// `tjs_int` (`tjsTypes.h:59`).  Neither rule is Rust's `i64`/`f64`
+    /// parsing, which is what used to decide the index: `"1e3"` is not a
+    /// number here at all, and `"4294967296"` wraps instead of naming a
+    /// four-billion-element index.
+    #[test]
+    fn numeric_member_names_follow_isnumber_and_tjs_atoi() {
+        // Accepted: sign, digits, dots, surrounding spaces.
+        assert_eq!(parse_array_index_name("0"), Some(0));
+        assert_eq!(parse_array_index_name(" 12 "), Some(12));
+        assert_eq!(parse_array_index_name("+5"), Some(5));
+        assert_eq!(parse_array_index_name("-3"), Some(-3));
+        assert_eq!(parse_array_index_name("  + 5  "), Some(5));
+        assert_eq!(parse_array_index_name("1."), Some(1));
+        assert_eq!(parse_array_index_name("1.5"), Some(1));
+        assert_eq!(parse_array_index_name("1.5.5"), Some(1));
+
+        // Rejected: anything the digit scan does not cover.  `1e3` is an
+        // exponent to Rust and a member name to the reference.
+        assert_eq!(parse_array_index_name("1e3"), None);
+        assert_eq!(parse_array_index_name("0x10"), None);
+        assert_eq!(parse_array_index_name("1e"), None);
+        assert_eq!(parse_array_index_name("."), None);
+        assert_eq!(parse_array_index_name("--5"), None);
+        assert_eq!(parse_array_index_name("5x"), None);
+        assert_eq!(parse_array_index_name("five"), None);
+        assert_eq!(parse_array_index_name(""), None);
+        assert_eq!(parse_array_index_name("   "), None);
+        assert_eq!(parse_array_index_name("１２"), None);
+
+        // The 32-bit wrap: `TJS_atoi`'s accumulator is an `int`, so 2^n
+        // aliases to 0 and the two's-complement value of 2^32-1 is -1.
+        assert_eq!(parse_array_index_name("4294967296"), Some(0));
+        assert_eq!(parse_array_index_name("4294967297"), Some(1));
+        assert_eq!(parse_array_index_name("-4294967295"), Some(1));
+        assert_eq!(parse_array_index_name("4294967295"), Some(-1));
     }
 }
 

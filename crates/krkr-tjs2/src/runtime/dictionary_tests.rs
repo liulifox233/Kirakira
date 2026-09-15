@@ -38,9 +38,13 @@
 //! `count`/`length` as (non-static) properties (`tjsArray.cpp:980-1013`), so
 //! `d.count` is a miss while a data key named `count` is ordinary data.
 
+use crate::compile_source_to_bytecode;
 use crate::compiler::execute_source;
-use crate::error::{TjsError, TjsErrorKind};
+use crate::error::{Result, TjsError, TjsErrorKind};
 use crate::runtime::value::Variant;
+use crate::runtime::{Runtime, TjsHost};
+
+use std::collections::BTreeMap;
 
 fn run(name: &str, source: &str) -> Variant {
     execute_source(name, source).expect("execute")
@@ -725,5 +729,134 @@ fn dictionary_creation_size_changes_the_order() {
     assert_eq!(
         build("%[e2 => 1]"),
         Variant::String("e,1,e2,1,c,1,l2,1,a,1,b,1,w2,1,y2,1".into())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `loadStruct`'s container rule
+
+/// A host with only the binary storage `loadStruct` reads.
+#[derive(Default)]
+struct StructStorage {
+    binary: BTreeMap<String, Vec<u8>>,
+}
+
+impl StructStorage {
+    fn with(files: &[(&str, &[u8])]) -> Self {
+        Self {
+            binary: files
+                .iter()
+                .map(|(name, contents)| (name.to_string(), contents.to_vec()))
+                .collect(),
+        }
+    }
+}
+
+impl TjsHost for StructStorage {
+    fn read_binary(&mut self, name: &str, _mode: &str) -> Result<Vec<u8>> {
+        self.binary
+            .get(name)
+            .cloned()
+            .ok_or_else(|| TjsError::runtime(format!("cannot open {name}")))
+    }
+
+    fn write_binary(&mut self, name: &str, _mode: &str, bytes: &[u8]) -> Result<()> {
+        self.binary.insert(name.to_string(), bytes.to_vec());
+        Ok(())
+    }
+}
+
+fn run_with_struct_storage(files: &[(&str, &[u8])], source: &str) -> Variant {
+    let mut runtime = Runtime::with_host(StructStorage::with(files));
+    let file = compile_source_to_bytecode("dictionary.tjs", source).expect("compile");
+    runtime.execute_file(&file).expect("execute")
+}
+
+fn struct_storage_failure(files: &[(&str, &[u8])], source: &str) -> TjsError {
+    let mut runtime = Runtime::with_host(StructStorage::with(files));
+    let file = compile_source_to_bytecode("dictionary.tjs", source).expect("compile");
+    runtime.execute_file(&file).expect_err("script must fail")
+}
+
+/// `Dictionary.loadStruct` reads the reference's container only:
+/// `tTJSBinarySerializer::IsBinary` decides (`tjsDictionary.cpp:72-76`) against
+/// the eight-byte `KBAD100\0` header (`tjsBinarySerializer.cpp:19-21`), and a
+/// readable path holding anything else fails with `TJS_E_INVALIDPARAM`
+/// (`return TJS_E_INVALIDPARAM;`, `:121`).  There is no Integer success flag,
+/// and no line-based reconstruction of the file.
+#[test]
+fn load_struct_accepts_only_the_binary_container() {
+    // A `TJS/4s0` data pack (`PackinOne.dll`'s LZ4 framing), which is what
+    // `patch.xp3>title.pbd` holds.
+    let error = struct_storage_failure(
+        &[("data.pbd", b"TJS/4s0\0\x01\x02")],
+        r#"return Dictionary.loadStruct("data.pbd");"#,
+    );
+    assert_eq!(error.kind, TjsErrorKind::InvalidParam);
+    assert_eq!(error.tjs_error_code(), Some(-1003));
+
+    // A text struct is not a container either: the reference's text path reads
+    // the file as a *script expression* (`LoadTextDictionaryArray`,
+    // `tjs.cpp:607-624`) and only when the caller wants the value, which the
+    // TJS2-side reader here cannot see; a `key = value` file parses under
+    // neither rule.
+    let error = struct_storage_failure(
+        &[("state.ksd", b"answer = 42\r\n")],
+        r#"return Dictionary.loadStruct("state.ksd");"#,
+    );
+    assert_eq!(error.kind, TjsErrorKind::InvalidParam);
+
+    // An unreadable path: the reference's stream creation fails first and
+    // answers `TJS_E_INVALIDPARAM` too (`tjsDictionary.cpp:71-72`).
+    let error = struct_storage_failure(&[], r#"return Dictionary.loadStruct("missing.ksd");"#);
+    assert_eq!(error.kind, TjsErrorKind::InvalidParam);
+}
+
+/// The positive half: a `KBAD100\0` pack decodes and the call answers the
+/// *deserialized root* (`if(result) *result = *var;`, `tjsDictionary.cpp:84-88`),
+/// not a success flag.
+#[test]
+fn load_struct_returns_the_deserialized_root() {
+    assert_eq!(
+        run_with_struct_storage(
+            &[],
+            r#"
+            var saved = %[];
+            saved.answer = 42;
+            saved.child = %[];
+            saved.child.name = "nested";
+            (Dictionary.saveStruct incontextof saved)("pack.ksd", "b");
+            var loaded = Dictionary.loadStruct("pack.ksd");
+            return typeof loaded + ":" + loaded.answer + ":" + loaded.child.name;
+            "#,
+        ),
+        Variant::String("Object:42:nested".into())
+    );
+}
+
+/// A dictionary receiver *is* the serializer's `RootDictionary`
+/// (`tTJSBinarySerializer binload(dic)`, `tjsDictionary.cpp:78-82`): it is
+/// cleared before the stream is opened (`ni->Clear()`, `:57-62`) and restored
+/// in file order.  A receiver without a Dictionary native instance -- the
+/// class object -- is left alone and decoded into a throw-away dictionary
+/// (`if(!dic) dic = TJSCreateDictionaryObject();`).
+#[test]
+fn load_struct_restores_a_dictionary_receiver_in_place() {
+    assert_eq!(
+        run_with_struct_storage(
+            &[],
+            r#"
+            var saved = %[];
+            saved.answer = 42;
+            (Dictionary.saveStruct incontextof saved)("pack.ksd", "b");
+            var loaded = %[];
+            loaded.stale = 1;
+            (Dictionary.loadStruct incontextof loaded)("pack.ksd");
+            var class_object = Dictionary.loadStruct("pack.ksd");
+            return typeof loaded.stale + ":" + loaded.answer +
+                ":" + class_object.answer;
+            "#,
+        ),
+        Variant::String("undefined:42:42".into())
     );
 }

@@ -19,6 +19,8 @@ pub mod value;
 #[cfg(test)]
 mod array_tests;
 #[cfg(test)]
+mod class_tests;
+#[cfg(test)]
 mod dictionary_tests;
 
 pub use self::object::{NativeArgCount, NativePropertyAccess, Object, ObjectKind};

@@ -48,10 +48,12 @@ use crate::runtime::builtins::install_array_methods;
 use crate::runtime::object::Object;
 use crate::runtime::{ObjectHandle, Runtime, TjsHost, Variant};
 
-/// A host with the text storage `Array.load`/`Array.save` use.
+/// A host with the text storage `Array.load`/`Array.save` use, plus the binary
+/// storage the structured container (`saveStruct`/`loadStruct`) reads.
 #[derive(Default)]
 struct StorageHost {
     files: BTreeMap<String, String>,
+    binary: BTreeMap<String, Vec<u8>>,
 }
 
 impl StorageHost {
@@ -60,6 +62,17 @@ impl StorageHost {
             files: files
                 .iter()
                 .map(|(name, contents)| (name.to_string(), contents.to_string()))
+                .collect(),
+            binary: BTreeMap::new(),
+        }
+    }
+
+    fn with_binary(files: &[(&str, &[u8])]) -> Self {
+        Self {
+            files: BTreeMap::new(),
+            binary: files
+                .iter()
+                .map(|(name, contents)| (name.to_string(), contents.to_vec()))
                 .collect(),
         }
     }
@@ -71,6 +84,18 @@ impl TjsHost for StorageHost {
             .get(name)
             .cloned()
             .ok_or_else(|| TjsError::runtime(format!("cannot open {name}")))
+    }
+
+    fn read_binary(&mut self, name: &str, _mode: &str) -> Result<Vec<u8>> {
+        self.binary
+            .get(name)
+            .cloned()
+            .ok_or_else(|| TjsError::runtime(format!("cannot open {name}")))
+    }
+
+    fn write_binary(&mut self, name: &str, _mode: &str, bytes: &[u8]) -> Result<()> {
+        self.binary.insert(name.to_string(), bytes.to_vec());
+        Ok(())
     }
 
     fn write_text(&mut self, name: &str, _mode: &str, text: &str) -> Result<()> {
@@ -337,5 +362,132 @@ fn load_on_a_non_array_receiver_is_a_native_class_crash() {
     assert_eq!(
         run(&mut runtime, "return typeof (new Array()).load;"),
         Variant::String("Object".to_string())
+    );
+}
+
+/// A numeric member name is what `IsNumber` says it is (`tjsArray.cpp:54-77`):
+/// an optional sign, digits and dots -- not Rust's numeric syntax.  `"1e3"` is
+/// therefore an ordinary member name, never element 1000, and `"0x10"` is a
+/// member name too.
+#[test]
+fn a_numeric_member_name_is_isnumber_not_rust_number_syntax() {
+    let mut runtime = Runtime::with_host(StorageHost::with(&[]));
+    let value = run(
+        &mut runtime,
+        r#"
+        var arr = new Array();
+        arr["1e3"] = 1;
+        arr["0x10"] = 2;
+        return arr.count + ":" + arr["1e3"] + ":" + arr["0x10"] + ":" + typeof arr["1e3"];
+        "#,
+    );
+    assert_eq!(value, Variant::String("0:1:2:Integer".to_string()));
+}
+
+/// `TJS_atoi` accumulates into a 32-bit `int` (`tjsConfig.cpp:54-79`,
+/// `tjsTypes.h:59`), so an index whose value wraps is the wrapped -- small --
+/// index.  `"4294967296"` is element 0, not a four-billion element resize.
+#[test]
+fn a_numeric_member_name_wraps_at_32_bits_like_tjs_atoi() {
+    let mut runtime = Runtime::with_host(StorageHost::with(&[]));
+    let value = run(
+        &mut runtime,
+        r#"
+        var arr = new Array();
+        arr["4294967296"] = 7;
+        arr["4294967297"] = 8;
+        return arr.count + ":" + arr[0] + ":" + arr[1];
+        "#,
+    );
+    assert_eq!(value, Variant::String("2:7:8".to_string()));
+}
+
+/// `Array.split` replaces the receiver's *items* (`ni->Items.resize(0)` plus
+/// the pushes, `tjsArray.cpp:508-560`), never the receiver itself, exactly as
+/// `Array.load` does (`:270-332`).  Every member and every alias therefore
+/// survives the call.
+#[test]
+fn split_replaces_the_items_and_keeps_the_receivers_members() {
+    let mut runtime = Runtime::with_host(StorageHost::with(&[]));
+    let value = run(
+        &mut runtime,
+        r#"
+        var arr = new Array();
+        var alias = arr;
+        arr.add("stale");
+        arr.save2 = function(path) { return "wrote:" + path; };
+        var returned = arr.split(",", "x,y");
+        return arr.count + ":" + arr[0] + ":" + arr[1] + ":" + typeof arr.save2 +
+            ":" + arr.save2("out") + ":" + alias.count + ":" + alias[0] +
+            ":" + typeof returned;
+        "#,
+    );
+    assert_eq!(
+        value,
+        Variant::String("2:x:y:Object:wrote:out:2:x:Object".to_string())
+    );
+}
+
+/// `Array.loadStruct` reads the reference's container and nothing else:
+/// `tTJSBinarySerializer::IsBinary` decides (`tjsArray.cpp:379-385`), and a
+/// readable path holding anything else is `TJS_E_INVALIDPARAM` (`:400-402`) --
+/// there is no text path and no Integer success flag.
+#[test]
+fn load_struct_accepts_only_the_binary_container() {
+    // A `TJS/4s0` data pack, the container `patch.xp3>title.pbd` carries.
+    let mut runtime = Runtime::with_host(StorageHost::with_binary(&[(
+        "data.pbd",
+        b"TJS/4s0\0\x01\x02",
+    )]));
+    let error = failure(
+        &mut runtime,
+        r#"return (new Array()).loadStruct("data.pbd");"#,
+    );
+    assert_eq!(error.kind, TjsErrorKind::InvalidParam);
+    assert_eq!(error.tjs_error_code(), Some(-1003));
+    // `ni->Items.clear()` runs before the stream is opened (`tjsArray.cpp:373`),
+    // so the receiver is empty however the read ends.
+    let value = run(
+        &mut runtime,
+        r#"
+        var arr = new Array();
+        arr.add("stale");
+        try { arr.loadStruct("data.pbd"); } catch (e) { return arr.count; }
+        return "no error";
+        "#,
+    );
+    assert_eq!(value, Variant::Integer(0));
+}
+
+/// The positive half of the same rule: a `KBAD100\0` pack is restored into the
+/// receiver in file order (`tTJSBinarySerializer::CreateArray`'s `RootArray`
+/// path, `tjsBinarySerializer.cpp:104-112`), and `ReadArray` hands that same
+/// receiver back as the result (`:268-280`).
+#[test]
+fn load_struct_restores_a_binary_pack_into_the_receiver() {
+    let mut runtime = Runtime::with_host(StorageHost::with(&[]));
+    let value = run(
+        &mut runtime,
+        r#"
+        var arr = new Array();
+        arr.add(5);
+        arr.add("six");
+        arr.saveStruct("pack.ksd", "b");
+        var loaded = new Array();
+        loaded.add("stale");
+        loaded.save2 = function() { return "kept"; };
+        var returned = loaded.loadStruct("pack.ksd");
+        return loaded.count + ":" + loaded[0] + ":" + loaded[1] + ":" +
+            typeof loaded.save2 + ":" + typeof returned;
+        "#,
+    );
+    assert_eq!(value, Variant::String("2:5:six:Object:Object".to_string()));
+    assert!(
+        runtime
+            .host()
+            .binary
+            .get("pack.ksd")
+            .expect("the binary pack was written")
+            .starts_with(b"KBAD100\0")
     );
 }
