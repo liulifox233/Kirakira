@@ -363,9 +363,10 @@ impl<'bc, 'rt, H: TjsHost + 'static> Vm<'bc, 'rt, H> {
     /// rendered like `PropGetByNum`/`PropSetByNum`/`OperationByNum`
     /// (`tjsObject.cpp:157-180`), so `o[4294967296]` addresses member `"0"`.
     /// Any other member goes through `AsString()` (`tjsVariant.h:760-772`),
-    /// which answers NULL for a void member -- the object protocols read a
-    /// NULL member name as `TJS_E_INVALIDTYPE` (`tjsObject.cpp:1375-1378`) --
-    /// and throws the official convert error for an octet.
+    /// which answers NULL for a void member -- the object protocols answer a
+    /// NULL member name with `TJS_E_INVALIDTYPE` (`tjsObject.cpp:1405-1408`
+    /// for `PropGet`, `:1577-1581` for `PropSetByVS`) -- and throws the
+    /// official convert error for an octet.
     fn indirect_member_name(&self, member: &Variant) -> Result<String> {
         match member {
             Variant::Integer(value) => Ok((*value as i32).to_string()),
@@ -5686,7 +5687,7 @@ mod tests {
         // `tjsInterCodeExec.cpp:2058-2075`): no integer narrowing, and a void
         // member fails the delete instead of raising, so the member stays.
         assert_eq!(
-            run(r#"var o = %[x => 1]; delete o[void]; return (o.x === void) ? "gone" : "kept";"#)
+            run(r#"var o = %["x" => 1]; delete o[void]; return (o.x === void) ? "gone" : "kept";"#)
                 .expect("void delete"),
             Variant::String("kept".to_string())
         );
@@ -5720,7 +5721,7 @@ mod tests {
             Variant::String("void".to_string())
         );
         assert_eq!(
-            run(r#"var a = []; a.assign(%[x => 1]); return a.count + ":" + a[0] + ":" + a[1];"#)
+            run(r#"var a = []; a.assign(%["x" => 1]); return a.count + ":" + a[0] + ":" + a[1];"#)
                 .expect("dictionary source"),
             Variant::String("2:x:1".to_string())
         );

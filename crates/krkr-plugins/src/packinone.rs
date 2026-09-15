@@ -2029,10 +2029,10 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 r#"(function() {
-                    var data = %[id => "save-id", core => %[storeTime => 1234],
-                                 user => %[], history => %[]];
-                    var digest = %[width => 4, height => 2, ext => "jpg",
-                                  compress => 1, cryptmode => 1, iv => "title"];
+                    var data = %["id" => "save-id", "core" => %["storeTime" => 1234],
+                                 "user" => %[], "history" => %[]];
+                    var digest = %["width" => 4, "height" => 2, "ext" => "jpg",
+                                  "compress" => 1, "cryptmode" => 1, "iv" => "title"];
                     digest.seed = Scripts.makeDataPackDigest(data, 7, "save-id");
                     global.thumbLayer = new Layer();
                     thumbLayer.setImageSize(4, 2);
@@ -2123,8 +2123,8 @@ mod tests {
             .execute_script(
                 "inline.tjs",
                 r#"(function() {
-                    var data = %[id => "x", core => %[storeTime => 5, name => "あ"],
-                                 list => [1, 2, <% 01 02 %>], flag => null, neg => -2];
+                    var data = %["id" => "x", "core" => %["storeTime" => 5, "name" => "あ"],
+                                 "list" => [1, 2, <% 01 02 %>], "flag" => null, "neg" => -2];
                     Scripts.saveDataPack("mine.pbd", data);
                 })();"#,
             )

@@ -2052,7 +2052,7 @@ mod tests {
             (
                 "mapRect",
                 "d.mapRect()",
-                "d.mapRect(%[left => 0, top => 0, right => 1, bottom => 1])",
+                "d.mapRect(%[\"left\" => 0, \"top\" => 0, \"right\" => 1, \"bottom\" => 1])",
             ),
             (
                 "invalidateRect",
@@ -2128,7 +2128,7 @@ mod tests {
             (
                 "setPlacement",
                 "d.setPlacement()",
-                "d.setPlacement(%[showCmd => 1])",
+                "d.setPlacement(%[\"showCmd\" => 1])",
             ),
             // Statics: `static int MessageBox(iTJSDispatch2*, NameT, NameT,
             // UINT)` (`:1127`), `static bool InitCommonControlsEx(DWORD)`
@@ -2300,7 +2300,7 @@ mod tests {
             ),
             (
                 "setPlacement",
-                "(function() { var d = new WIN32Dialog(); return typeof d.setPlacement(%[showCmd => 1]); })()",
+                "(function() { var d = new WIN32Dialog(); return typeof d.setPlacement(%[\"showCmd\" => 1]); })()",
             ),
         ] {
             let value = engine
@@ -2365,7 +2365,7 @@ mod tests {
                      dialog.getItem(1);\n\
                      dialog.setItemLong(1, 0, 5);\n\
                      dialog.setPos(10, 20);\n\
-                     dialog.mapRect(%[left => 0, top => 0, right => 1, bottom => 1]);\n\
+                     dialog.mapRect(%[\"left\" => 0, \"top\" => 0, \"right\" => 1, \"bottom\" => 1]);\n\
                      return WIN32Dialog.messageBox(dialog, \"msg\", \"title\", 4);\n\
                  })()",
             )
@@ -2384,7 +2384,7 @@ mod tests {
                      }\n\
                      if (typeof console.maximize == \"Object\") { console.maximize(); }\n\
                      if (typeof console.restoreMaximize == \"Object\") { console.restoreMaximize(); }\n\
-                     return console.setPlacement(%[showCmd => 1, flags => 0, normalLeft => 0, normalTop => 0, normalRight => 640, normalBottom => 480]) === void;\n\
+                     return console.setPlacement(%[\"showCmd\" => 1, \"flags\" => 0, \"normalLeft\" => 0, \"normalTop\" => 0, \"normalRight\" => 640, \"normalBottom\" => 480]) === void;\n\
                  })()",
             )
             .expect("the console placement dance must run");

@@ -38,7 +38,7 @@
 //!   non-String element (the reference's strict `GetString` throws).
 //! - A dictionary member is never skipped by name: the reference filters by
 //!   the `TJS_HIDDENMEMBER` flag, and this object model's dictionary
-//!   instances carry only data, so `%[count => 1]` serializes its key. Array
+//!   instances carry only data, so `%["count" => 1]` serializes its key. Array
 //!   instances, whose member map also holds the built-in Array methods, skip
 //!   those (`scripts_ex::is_hidden_member`).
 //! - `ssoHidden` therefore has no effect: only `__`-prefixed bookkeeping and
@@ -737,7 +737,7 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var data = %[answer => 42, flag => true];\n\
+                     var data = %[\"answer\" => 42, \"flag\" => true];\n\
                      return (Dictionary.toStructString incontextof data)(1);\n\
                  })()",
             )
@@ -761,7 +761,7 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var data = %[count => 1, length => 2, save => 3];\n\
+                     var data = %[\"count\" => 1, \"length\" => 2, \"save\" => 3];\n\
                      (Dictionary.saveStruct2 incontextof data)(\"keys.ksd\");\n\
                      return (Dictionary.toStructString incontextof data)();\n\
                  })()",
@@ -795,7 +795,7 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var data = %[name => \"soldier\", values => [1, 2]];\n\
+                     var data = %[\"name\" => \"soldier\", \"values\" => [1, 2]];\n\
                      (Dictionary.saveStruct2 incontextof data)(\"state.ksd\");\n\
                      var lines = [\"first\", \"second\"];\n\
                      lines.save2(\"lines.txt\");\n\
@@ -871,7 +871,7 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var text = %[path => \"c:\\\\save \\\"x\\\"\"];\n\
+                     var text = %[\"path\" => \"c:\\\\save \\\"x\\\"\"];\n\
                      return (Dictionary.toStructString incontextof text)();\n\
                  })()",
             )
@@ -891,15 +891,15 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var data = %[scale => 1.5];\n\
+                     var data = %[\"scale\" => 1.5];\n\
                      var text = Scripts.toStructString(data, 1);\n\
                      var lines = Scripts.toStructString([1, 2], 1);\n\
-                     var two = %[first => 1, second => 2];\n\
+                     var two = %[\"first\" => 1, \"second\" => 2];\n\
                      var lf = Scripts.toStructString(two, 1);\n\
                      var crlf = Scripts.toStructString(two, 0);\n\
                      return text + \"|\" + lines + \"|\" + (lf.indexOf(\"\\r\\n\") == -1) + \":\" +\n\
                          (crlf.indexOf(\"\\r\\n\") != -1) + \":\" +\n\
-                         (Scripts.toStructString(%[a => 1, b => 2]).indexOf(\"\\n\") != -1);\n\
+                         (Scripts.toStructString(%[\"a\" => 1, \"b\" => 2]).indexOf(\"\\n\") != -1);\n\
                  })()",
             )
             .expect("scripts struct text");
@@ -920,9 +920,9 @@ mod tests {
             .execute_expression(
                 "inline.tjs",
                 "(function() {\n\
-                     var text = Scripts.toStructString(%[zero => 0.0, negative => -1.5], 1);\n\
-                     var tiny = Scripts.toStructString(%[small => 5e-324], 1);\n\
-                     var negzero = Scripts.toStructString(%[minus => -0.0], 1);\n\
+                     var text = Scripts.toStructString(%[\"zero\" => 0.0, \"negative\" => -1.5], 1);\n\
+                     var tiny = Scripts.toStructString(%[\"small\" => 5e-324], 1);\n\
+                     var negzero = Scripts.toStructString(%[\"minus\" => -0.0], 1);\n\
                      return text + \"|\" + tiny + \"|\" + negzero;\n\
                  })()",
             )
@@ -947,7 +947,7 @@ mod tests {
         for call in [
             "(new Array()).save2()",
             "(new Array()).saveStruct2()",
-            "(Dictionary.saveStruct2 incontextof %[a => 1])()",
+            "(Dictionary.saveStruct2 incontextof %[\"a\" => 1])()",
             "Scripts.toStructString()",
         ] {
             let error = engine

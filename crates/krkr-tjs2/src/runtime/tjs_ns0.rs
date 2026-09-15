@@ -530,7 +530,7 @@ mod tests {
         bytes
     }
 
-    /// The hand-built `%[answer => 42]` pack: a zero seed makes every
+    /// The hand-built `%["answer" => 42]` pack: a zero seed makes every
     /// byte-check and the final check zero, so the payload is one dictionary
     /// tag, its key, one integer and that zero final check.
     fn answer_pack() -> Vec<u8> {

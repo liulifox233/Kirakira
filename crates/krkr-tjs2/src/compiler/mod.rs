@@ -238,6 +238,84 @@ mod tests {
         );
     }
 
+    /// A dictionary element evaluates its key: `dic_elm` is the two-expression
+    /// production `expr_no_comma "," expr_no_comma` (`syntax/tjs.y:799-801`),
+    /// and the `=>` spelling of that separator lexes as `T_COMMA`
+    /// (`tjsLex.cpp:1367`), so `%[ tag => name ]` keys the entry by the
+    /// *value* of `tag` -- `tjsInterCodeGen.cpp:2461-2472` compiles both
+    /// nodes and emits `VM_SPIS %object.%name, %value`.  PARQUET's
+    /// `LangNameBrackets` builds its `"【${pad}${name}${pad}】"` replacement
+    /// dictionary exactly that way (`tag = "name"`); reading it as the
+    /// literal name left the nameplate template's `${name}` unbound.
+    #[test]
+    fn dictionary_bare_identifier_key_is_evaluated() {
+        assert_eq!(
+            execute_source(
+                "dict_key.tjs",
+                r#"
+                var tag = "name";
+                var name = "ABC";
+                var d = %[ tag => name, pad: " " ];
+                return d["name"] + "|" + d["pad"] + "|" + (d["tag"] === void);
+                "#,
+            )
+            .expect("execute"),
+            Variant::String("ABC| |1".to_string())
+        );
+    }
+
+    /// The literal forms keep their names: the colon production wraps its
+    /// symbol in a constant string node (`syntax/tjs.y:800-803`, which the
+    /// parser rewrites into `ExprKind::String`), and a string key evaluates to
+    /// itself.
+    #[test]
+    fn dictionary_literal_keys_stay_literal() {
+        assert_eq!(
+            execute_source(
+                "dict_key.tjs",
+                r#"var d = %[ "name" => "LIT", pad: "P", kind: 2 ];
+                   return d["name"] + "|" + d["pad"] + "|" + d["kind"];"#,
+            )
+            .expect("execute"),
+            Variant::String("LIT|P|2".to_string())
+        );
+    }
+
+    /// An integer-valued key is evaluated too, and lands under the decimal
+    /// spelling `PropSetByNum` gives it (`tjsObject.cpp:167-180`) -- the way
+    /// the games key their tables by `VK_F1`-style constants.
+    #[test]
+    fn dictionary_constant_valued_key_is_evaluated() {
+        assert_eq!(
+            execute_source(
+                "dict_key.tjs",
+                r#"var vk = 112; var d = %[ vk => "F1" ]; return d[112] + "|" + d["112"];"#,
+            )
+            .expect("execute"),
+            Variant::String("F1|F1".to_string())
+        );
+    }
+
+    /// A key expression that evaluates to void reaches `spis` with a void
+    /// member, and `SetPropertyIndirect` hands the store to `PropSetByVS` with
+    /// a NULL member name (`tjsInterCodeExec.cpp:1771`), which answers
+    /// `TJS_E_INVALIDTYPE` (`tjsObject.cpp:1577-1581`; the read side does the
+    /// same at `:1405-1408`) -- so the dictionary construction raises instead
+    /// of storing a void-named entry.
+    #[test]
+    fn dictionary_void_key_raises_invalid_type() {
+        let error = execute_source(
+            "dict_key.tjs",
+            "var empty; var d = %[ empty => 1 ]; return d;",
+        )
+        .expect_err("void key should fail");
+        assert_eq!(error.kind, TjsErrorKind::InvalidType);
+        assert_eq!(
+            error.message,
+            "Not a function or invalid method/property type"
+        );
+    }
+
     #[test]
     fn execute_source_erases_array_element() {
         assert_eq!(
@@ -807,10 +885,12 @@ mod tests {
         // A member that exists but holds void reaches
         // `TJSDefaultFuncCall`'s `TJS_E_INVALIDTYPE` branch
         // (`tjsObject.cpp:1280-1312`), which is where the callee type comes
-        // from.
+        // from.  The key is written as a string literal because a bare
+        // identifier would be *evaluated* (`dic_elm`, `syntax/tjs.y:799`)
+        // and `missing` is not a variable.
         let error = execute_source(
             "debug.tjs",
-            "function run() {\n  var d = %[missing => void];\n  d.missing();\n}\nrun();",
+            "function run() {\n  var d = %[\"missing\" => void];\n  d.missing();\n}\nrun();",
         )
         .expect_err("void callee should fail");
         let text = error.to_string();
