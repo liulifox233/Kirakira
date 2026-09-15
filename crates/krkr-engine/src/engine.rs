@@ -3749,13 +3749,28 @@ impl KagSession {
         runtime: &mut Runtime<KrkrHost>,
         from: &str,
         to: &str,
-    ) -> (String, Option<String>) {
+    ) -> (Option<String>, Option<String>) {
+        let pair = format!("{to}.from.{from}");
+        // The project's own table first, exactly as the reference asks it:
+        // `SystemManager.kagJump` -> `_jump` -> `SystemScript.get(to + ".from." +
+        // from)`. That object is project script (GINKA/PARQUET `sysscn/system.tjs`
+        // builds it and registers its ~30 default destinations on it), so the
+        // entries it holds are the authority — including the ones the engine's
+        // own scan of `custom.ks` cannot see. `get` performs the head-name
+        // inheritance itself, so one query covers both forms.
+        if let Some((storage, target)) = self.live_sys_script_entry(runtime, &pair) {
+            runtime.host_mut().log(&format!(
+                "KAG `[sysjump]` {from}->{to} resolved by the project's `SystemScript` entry \
+                 `{pair}`: storage={storage:?} target={target:?}"
+            ));
+            return (storage, target);
+        }
         if let Some((name, storage, target)) = self.sysjump_registry_entry(from, to) {
             runtime.host_mut().log(&format!(
                 "KAG `[sysjump]` {from}->{to} resolved by the registered entry `{name}`: \
                  storage=`{storage}` target={target:?}"
             ));
-            return (storage, target);
+            return (Some(storage), target);
         }
         // The declarations are normally already in the table by the time a
         // project jumps (its `custom.ks` runs at boot, and each `[addSysScript]`
@@ -3767,13 +3782,49 @@ impl KagSession {
                 "KAG `[sysjump]` {from}->{to} resolved by the scanned entry `{name}`: \
                  storage=`{storage}` target={target:?}"
             ));
-            return (storage, target);
+            return (Some(storage), target);
         }
         runtime.host_mut().log(&format!(
             "KAG `[sysjump]` {from}->{to} has no sys-script entry; loading the scenario \
              `{to}.ks`"
         ));
-        (format!("{to}.ks"), None)
+        (Some(format!("{to}.ks")), None)
+    }
+
+    /// The project's live `SystemScript` table's answer for one name, as
+    /// `(storage, target)`, or `None` when the project has no such object or
+    /// the name resolves to nothing.
+    ///
+    /// `SystemScriptMap.get` answers an empty dictionary for a name it does not
+    /// hold *and* for an entry that names nothing, so the two are one answer
+    /// here — unregistered, and the caller's next candidate stands. An entry
+    /// that names only a target is real and is used as such: the reference then
+    /// runs `kag.process(void, target)`, a move inside the scenario it is
+    /// already in.
+    fn live_sys_script_entry(
+        &mut self,
+        runtime: &mut Runtime<KrkrHost>,
+        name: &str,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let script = runtime.global_member("SystemScript").object_handle()?;
+        if matches!(
+            runtime.resolve_object_member(script, "get").ok()?,
+            Variant::Void
+        ) {
+            return None;
+        }
+        let value = self
+            .call_tag_handler(
+                runtime,
+                script,
+                "get",
+                vec![Variant::String(name.to_string())],
+            )
+            .ok()?;
+        let entry = value.object_handle()?;
+        let storage = kag_dictionary_string(runtime, entry, "storage");
+        let target = kag_dictionary_string(runtime, entry, "target");
+        (storage.is_some() || target.is_some()).then_some((storage, target))
     }
 
     /// The registry entry a `[sysjump]` resolves to, with the name it matched:
@@ -4093,14 +4144,16 @@ impl KagSession {
                 if let Some(expression) = tag.literal_attr("exp") {
                     execute_expression_on_runtime(runtime, "kag next", expression)?;
                 }
-                // An empty value is not an absent one: the handler's no-op test
-                // is `l0 == "" && l1 == ""` and the hooks are called with the
-                // values as written (`[next storage="scn000.ks" target=""]`
-                // hands the hook `""`, which is a target it can look at), so
-                // only the no-op check reads emptiness.
+                // The reference's no-op test is *existence*, not emptiness:
+                // `if (elm.storage !== void || elm.target !== void)`
+                // (`MainWindow.tjs:11603`). A tag that writes an attribute —
+                // `[next storage=""]` — still asks the project's hooks with the
+                // empty value it wrote (`forEachFunctionHook("onNext", elm.storage,
+                // elm.target)`), and only a tag naming neither attribute does
+                // nothing at all.
                 let storage = tag.literal_attr("storage");
                 let target = tag.literal_attr("target");
-                if storage.unwrap_or("").is_empty() && target.unwrap_or("").is_empty() {
+                if storage.is_none() && target.is_none() {
                     return Ok(TagAction::Continue);
                 }
                 if self.run_on_next_hooks(runtime, storage, target)? {
@@ -4149,9 +4202,14 @@ impl KagSession {
                 // reference's `kag.process(storage, target)`), which the load
                 // alone would leave unentered.
                 let checkpoint = parser.store();
-                let mut moved = parser.load_scenario_with(storage.clone(), &mut host);
+                let mut moved = match storage.as_deref() {
+                    Some(storage) => parser.load_scenario_with(storage.to_string(), &mut host),
+                    // An entry that names no scenario is the reference's
+                    // `kag.process(void, target)`: stay in the current one.
+                    None => Ok(()),
+                };
                 if let Some(target) = target.as_deref().filter(|_| moved.is_ok()) {
-                    moved = parser.go_to_with(Some(&storage), Some(target), &mut host);
+                    moved = parser.go_to_with(storage.as_deref(), Some(target), &mut host);
                 }
                 if let Err(error) = moved {
                     let escaped = host.script_exception_or(error);
@@ -4498,6 +4556,21 @@ fn declared_hook_value(runtime: &mut Runtime<KrkrHost>, value: Option<String>) -
             ));
             None
         }
+    }
+}
+
+/// One member of a dictionary the project's own script returned, as the string
+/// a KAG destination is: `None` when the member is void or empty, which is how
+/// the reference's `SystemScriptMap.get` leaves an entry that names no storage
+/// or no target.
+fn kag_dictionary_string(
+    runtime: &mut Runtime<KrkrHost>,
+    object: ObjectHandle,
+    name: &str,
+) -> Option<String> {
+    match runtime.resolve_object_member(object, name).ok()? {
+        Variant::Void => None,
+        value => value.to_tjs_string().ok().filter(|text| !text.is_empty()),
     }
 }
 
@@ -21788,6 +21861,50 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// The registry the engine asks first is the project's own live
+    /// `SystemScript` object, not the engine's scan of `custom.ks`: the games
+    /// register their destinations in `system.tjs` on exactly that object
+    /// (PARQUET's `option.from.title` answers `option.ks`/`*start_title`), and a
+    /// text scan of `custom.ks` cannot see them. The reference asks that object
+    /// itself (`_jump`: `SystemScript.get(to + ".from." + from)`), and an entry
+    /// that names no storage moves inside the scenario it is already in
+    /// (`kag.process(void, target)`) instead of loading `<to>.ks`.
+    #[test]
+    fn kag_sysjump_asks_the_projects_own_sys_script_table_first() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "*start\n[sysjump from=title to=option]\n[s]\n*later\nLIVE[s]",
+        )
+        .expect("write scenario");
+        fs::write(root.join("option.ks"), "*start_title\nFALLBACK[s]")
+            .expect("write the scenario named after the destination");
+
+        let mut engine = image_test_engine(&root);
+        engine
+            .execute_script(
+                "sys-script-table.tjs",
+                r#"
+                global.SystemScript = %[];
+                SystemScript.get = function(name) {
+                    if (name == "option.from.title") {
+                        return %[target: "*later"];
+                    }
+                    return %[];
+                };
+                "#,
+            )
+            .expect("install the project's sys-script table");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("system jump");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["LIVE".to_string()]);
+        assert_eq!(engine.kag_parser().cur_storage(), Some("first.ks"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     /// The declarations the engine scans are evaluated the way the reference's
     /// parser hands them to the project's own handler, so the entry the pair
     /// names is the one that resolves. GINKA declares exactly this shape twice
@@ -21911,10 +22028,53 @@ mod tests {
 
         // The reference calls the hooks with the values as written, so an empty
         // `target` is `""` and not void (`MainWindow.tjs`, the `next` handler:
-        // only its own no-op test reads emptiness, `l0 == "" && l1 == ""`).
+        // the hooks see the attributes themselves, and the handler's own guard
+        // is the existence of one of them).
         assert_eq!(
             engine.tjs_runtime().global_member("nextHook"),
             Variant::String("onNext|<scn000.ks>|<>".to_string())
+        );
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["AFTER".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The `next` handler's guard is the *existence* of an attribute, not its
+    /// value: `if (elm.storage !== void || elm.target !== void)`
+    /// (`MainWindow.tjs:11603`). A tag that writes an empty value —
+    /// `[next storage=""]` — therefore still asks the project's `onNext` hooks
+    /// with the value it wrote; only a tag that names neither attribute is the
+    /// no-op. A hook that answers takes the tag, which makes the difference
+    /// observable.
+    #[test]
+    fn kag_next_with_an_empty_storage_still_asks_the_projects_hooks() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[next storage=\"\"]AFTER[s]").expect("write scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine
+            .execute_script(
+                "kag-next-empty.tjs",
+                r#"
+                global.kag = new Dictionary();
+                global.nextHook = "<not asked>";
+                function show(value) {
+                    return value === void ? "<void>" : "<" + value + ">";
+                }
+                kag.forEachFunctionHook = function(name, storage, target) {
+                    global.nextHook = "" + name + "|" + show(storage) + "|" + show(target);
+                    return 1;
+                };
+                "#,
+            )
+            .expect("install onNext hook");
+        let tick = engine.tick().expect("next tag with an empty storage");
+
+        assert_eq!(
+            engine.tjs_runtime().global_member("nextHook"),
+            Variant::String("onNext|<>|<void>".to_string())
         );
         assert_eq!(tick.state, KagTaskState::Finished);
         assert_eq!(engine.message_layer().lines, vec!["AFTER".to_string()]);
