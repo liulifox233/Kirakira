@@ -146,6 +146,70 @@ fn sleep_scratch_root(name: &str) -> PathBuf {
     root
 }
 
+/// A project whose `kag` has **no** `onPrimaryClick`: the only click entry the
+/// engine can reach is the layer under a placed cursor, whose own
+/// `onMouseDown` is game code that wakes the conductor.
+const LAYER_CLICK_STARTUP: &str = r#"
+global.__layerClicks = 0;
+global.__handlerCalls = 0;
+
+System.exceptionHandler = function(e) {
+    global.__handlerCalls++;
+    return true;
+};
+
+class LayerConductor {
+    var status = 2; // mWait
+    var mRun = 1;
+    var mStop = 0;
+    var mWait = 2;
+    var curLine = 7;
+    var waitUntil = %[];
+    function trigger(name) {
+        if (status != mWait) return false;
+        var handler = waitUntil[name];
+        if (handler === void) return false;
+        handler();
+        (Dictionary.clear incontextof waitUntil)();
+        status = mRun;
+        return true;
+    }
+}
+
+class LayerKAG {
+    var conductor;
+    var currentStorage = "probe.ks";
+    var currentLabel = "*click";
+    var inSleep = 0;
+    function LayerKAG() {
+        this.conductor = new LayerConductor();
+    }
+}
+
+global.kag = new LayerKAG();
+kag.conductor.waitUntil["click"] = function() {
+    global.__woke = 1;
+};
+
+var wakeLayer = new Layer();
+wakeLayer.setPos(300, 220);
+wakeLayer.setSize(40, 40);
+wakeLayer.hitThreshold = 0;
+wakeLayer.visible = true;
+wakeLayer.onMouseDown = function(x, y, button, shift) {
+    global.__layerClicks++;
+    global.kag.conductor.trigger("click");
+};
+"#;
+
+fn layer_scratch_root(name: &str) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("scratch root");
+    fs::write(root.join("Startup.tjs"), LAYER_CLICK_STARTUP).expect("startup script");
+    root
+}
+
 fn run_probe(root: &PathBuf, extra: &[&str]) -> (String, Option<i32>) {
     let output = Command::new(env!("CARGO_BIN_EXE_krkr-debug"))
         .arg(root)
@@ -260,4 +324,59 @@ fn a_click_wait_is_never_woken_by_the_harness_itself() {
 
     assert!(out.contains("-> engine primary click"), "{out}");
     assert!(!out.contains("wake-sleep"), "{out}");
+}
+
+/// The engine's dispatch has two entries, and the harness must not refuse a
+/// click the first one can carry: a project whose `kag` has **no**
+/// `onPrimaryClick` still gets the click when a cursor sits over a layer with
+/// a handler — that layer's own `onMouseDown` is what runs, through
+/// `call_event_method`'s boundary (`handle_input_events`, engine.rs:1996).
+/// Pre-fix this case woke the conductor from the harness's own script; the
+/// check must not turn it into a refusal.
+#[test]
+fn a_project_without_on_primary_click_clicks_through_the_layer_under_the_cursor() {
+    let root = layer_scratch_root("kag-click-layer-target");
+    let (out, code) = run_probe(
+        &root,
+        &[
+            "--move",
+            "4,320,240",
+            "--kag-click",
+            "5",
+            "--expr",
+            "global.__layerClicks + ':' + global.__woke + ':' + global.kag.conductor.status",
+        ],
+    );
+
+    assert!(
+        out.contains("kag-click frame=5 -> engine primary click"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("no click target"),
+        "a placed cursor is an entry: {out}"
+    );
+    // The layer's own handler ran (1), its `trigger("click")` ran the click
+    // wait handler (1) and left the conductor running (status mRun).
+    assert!(out.contains("expression=\"1:1:1\""), "{out}");
+    assert_eq!(code, Some(0), "{out}");
+}
+
+/// With neither entry — no cursor placed and no `kag.onPrimaryClick` — the
+/// engine genuinely has nowhere to deliver the click, and the harness says so
+/// rather than arming one that would be dropped (or waking the conductor
+/// itself, which is the divergence this mission removed).
+#[test]
+fn a_click_with_no_target_is_named_instead_of_armed() {
+    let root = layer_scratch_root("kag-click-no-target");
+    let (out, code) = run_probe(
+        &root,
+        &["--kag-click", "5", "--expr", "global.__layerClicks"],
+    );
+
+    assert!(out.contains("no click target"), "{out}");
+    assert!(out.contains("no onPrimaryClick"), "{out}");
+    assert!(!out.contains("-> engine primary click"), "{out}");
+    assert!(out.contains("expression=0"), "{out}");
+    assert_eq!(code, Some(0), "{out}");
 }

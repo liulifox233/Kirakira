@@ -37,7 +37,8 @@
 //!                           log which reflects the engine-side session
 //!   --kag-click <frame>     semantic click on frame n (repeatable): a
 //!                           player's primary click, delivered through the
-//!                           engine's input dispatch (`kag.onPrimaryClick`),
+//!                           engine's input dispatch (`kag.onPrimaryClick`,
+//!                           or the layer under a cursor that was placed),
 //!                           so an exception escaping the game's own handler
 //!                           is contained exactly like every other event's; a
 //!                           sleeping `[s]` conductor is woken through the
@@ -388,16 +389,24 @@ fn kag_in_sleep(engine: &KrkrEngine) -> bool {
 /// dispatch has no entry for.
 ///
 /// A conductor that stopped through `[s]` (KAGEX's `s` handler sets `inSleep`
-/// and returns -1) waits on no signal key, so a primary click ends at
-/// `kag.onPrimaryClick`, and KAGEX's own handler only acts while the
-/// conductor waits.  Verified live on PARQUET's title: neither the semantic
-/// click nor a coordinate click past the engine's dispatch moves
-/// `title.ks@*wait:35`.  The harness therefore asks the game for the wait its
-/// own `waitClick` builds and fires it — the wake a click on the message
-/// layer produces, and what this flag has always done.  It is a game-side
-/// synthesis (the script runs the game's own two functions), so a raise from
-/// one of them is reported as the harness error it is; the click a game waits
-/// on goes through the engine instead.
+/// and returns -1) waits on no signal key.  A primary click that carries no
+/// cursor reaches no layer (`layer_at_cursor`, `engine.rs:2699`, is `None`)
+/// and the window handlers need a position too (`dispatch_window_pointer_event`,
+/// :2316), so its only entry is `kag.onPrimaryClick` — and KAGEX's own handler
+/// acts on that only while the conductor waits, so nothing wakes the sleep.
+///
+/// A *positioned* click can wake one, but only where the game has a control
+/// that does the waking, and the harness cannot pick such a point.  On
+/// PARQUET's title a click at (227,438) wakes `title.ks@*wait:35` through the
+/// layer under it (layer 294, local (175,28), `pressed=Some(294)` on the
+/// release that advances the label to `:68`), while (960,540) — layer 10, also
+/// script-handled — plus (100,100) and (1850,1050) leave it parked.  The
+/// semantic click is defined in game terms instead of screen coordinates, so
+/// it asks the game for the wait its own `waitClick` builds and fires it, the
+/// wake this flag has always used.  It is a game-side synthesis (the script
+/// runs the game's own two functions), so a raise from one of them is
+/// reported as the harness error it is; the click a game waits on goes
+/// through the engine instead.
 const KAG_SLEEP_WAKE_SOURCE: &str = r#"
 (function() {
     var k = global.kag;
@@ -416,18 +425,33 @@ const KAG_SLEEP_WAKE_SOURCE: &str = r#"
 })()
 "#;
 
-/// True when the game's KAG object exposes the primary-click entry the
-/// engine posts a player's click to.  The check mirrors
-/// `fire_kag_primary_click` (`engine.rs:2552-2567`) exactly, including the
-/// unwrap of the self-bound closure the game stores in `global.kag`: without
-/// the entry the engine's dispatch has nowhere to deliver a click, and the
-/// harness must say so instead of inventing a different call.
+/// True when the game's KAG object exposes the primary-click entry a click no
+/// layer claims goes to.  The check mirrors `fire_kag_primary_click`
+/// (`engine.rs:2552-2567`) exactly, including the unwrap of the self-bound
+/// closure the game stores in `global.kag`.
 fn kag_has_primary_click(engine: &KrkrEngine) -> bool {
     let runtime = engine.tjs_runtime();
     let Some(kag) = runtime.global_member("kag").object_handle() else {
         return false;
     };
     !matches!(runtime.object_member(kag, "onPrimaryClick"), Variant::Void)
+}
+
+/// True when the engine's input dispatch has an entry a primary click can
+/// reach.
+///
+/// `handle_input_events` posts the click to the layer under the cursor
+/// (`layer_at_cursor`, `engine.rs:1996`/`:2016`, whose `onMouseDown`,
+/// `onMouseUp` and `onClick` the engine calls through `call_event_method`),
+/// and falls back to `kag.onPrimaryClick` for a click no layer claims
+/// (`fire_kag_primary_click`, `:2552`).  With no cursor placed and no
+/// `onPrimaryClick` the engine has nowhere to deliver the click at all, and
+/// the harness says so rather than arming one that can only be dropped —
+/// whether the layer under a placed cursor actually has a handler is the
+/// engine's own hit test to make (it may run the game's `onHitTest`), so this
+/// mirrors the entries, not the per-layer outcome.
+fn click_has_target(engine: &KrkrEngine, cursor: Option<Point>) -> bool {
+    cursor.is_some() || kag_has_primary_click(engine)
 }
 
 /// `storage:line st=<status>` for a click report: enough of
@@ -481,32 +505,33 @@ fn kag_click_context(engine: &KrkrEngine) -> String {
 /// conductor parked on a `click` wait, or the `[s]` sleep state — so a
 /// `--kag-click` on a frame where the game is not waiting stays the no-op it
 /// has always been.  What the game receives is the engine's primary click: a
-/// press and release that moves no cursor, so on a project whose cursor was
-/// never placed the engine's hit test finds no layer and
-/// `fire_kag_primary_click` posts the click to `kag.onPrimaryClick` itself;
-/// when an earlier `--click`/`--move` left the cursor over a layer, that
+/// press and release that moves no cursor, so a placed cursor (`--click`,
+/// `--move`, the interactive console) selects the layer under it and that
 /// layer's own handler takes the click — the same target a player's click
-/// there would select, and one whose raise the engine contains the same way.
-/// A sleeping `[s]` conductor keeps [`KAG_SLEEP_WAKE_SOURCE`].  `quiet`
-/// suppresses only the success lines, as `--kag-auto-click` has always
-/// behaved.
+/// there would select, and one whose raise the engine contains the same way —
+/// while on a project with no cursor the click reaches `kag.onPrimaryClick`
+/// (`fire_kag_primary_click`).  [`click_has_target`] reports the case where
+/// the engine has neither.  A sleeping `[s]` conductor keeps
+/// [`KAG_SLEEP_WAKE_SOURCE`].  `quiet` suppresses only the success lines, as
+/// `--kag-auto-click` has always behaved.
 fn arm_semantic_click(
     runtime: &mut RuntimeSession,
     frame_index: usize,
     label: &str,
     quiet: bool,
+    cursor: Option<Point>,
 ) -> bool {
     let context = kag_click_context(runtime.engine());
-    if !kag_has_primary_click(runtime.engine()) {
-        // No entry to deliver to: naming it beats arming a click the engine
-        // would drop, and beats the harness calling the game's conductor
-        // itself (the divergence this replaced).
-        println!(
-            "{label} frame={frame_index} -> no kag.onPrimaryClick; the engine's input dispatch has no primary-click entry to deliver ({context})"
-        );
-        return false;
-    }
     if kag_awaits_click(runtime.engine()) {
+        if !click_has_target(runtime.engine(), cursor) {
+            // Neither entry exists: naming it beats arming a click the engine
+            // would drop, and beats the harness calling the game's conductor
+            // itself (the divergence this replaced).
+            println!(
+                "{label} frame={frame_index} -> no click target: no cursor is placed and the game's kag has no onPrimaryClick, so the engine's input dispatch has nowhere to deliver the click ({context})"
+            );
+            return false;
+        }
         if !quiet {
             println!("{label} frame={frame_index} -> engine primary click ({context})");
         }
@@ -858,6 +883,12 @@ fn main() {
     );
     let mut injection_failed = false;
     let mut kag_auto_click_parked = false;
+    // The cursor the engine holds: every `CursorMoved` the harness puts on a
+    // frame is applied in the order the events are built, so replaying this
+    // frame's list at the end of the frame keeps the value the engine has
+    // when the next frame's click is armed (the semantic click's own events
+    // carry no position and are processed first).
+    let mut pointer_position: Option<Point> = None;
     for frame_index in 0..config.max_frames {
         // Interactive mode is deliberately deterministic: it starts paused,
         // and only `advance`/`run`/`click` allow another frame to execute.
@@ -996,7 +1027,13 @@ fn main() {
                     injection_failed = true;
                     continue;
                 }
-                semantic_click |= arm_semantic_click(&mut runtime, frame_index, "kag-click", false);
+                semantic_click |= arm_semantic_click(
+                    &mut runtime,
+                    frame_index,
+                    "kag-click",
+                    false,
+                    pointer_position,
+                );
             }
         }
         // A parked VM cannot dispatch the click either, so the automatic
@@ -1011,7 +1048,13 @@ fn main() {
             } else {
                 kag_auto_click_parked = false;
                 if kag_awaits_click(runtime.engine())
-                    && arm_semantic_click(&mut runtime, frame_index, "kag-auto-click", config.quiet)
+                    && arm_semantic_click(
+                        &mut runtime,
+                        frame_index,
+                        "kag-auto-click",
+                        config.quiet,
+                        pointer_position,
+                    )
                 {
                     semantic_click = true;
                 }
@@ -1117,6 +1160,15 @@ fn main() {
                 events.push(EngineEvent::CursorMoved {
                     position: *position,
                 });
+            }
+        }
+        // Replay this frame's own cursor moves onto the tracked position, so
+        // the next frame's semantic click sees what the engine will hold when
+        // its press-and-release (which carries no position and is processed
+        // first) is dispatched.
+        for event in &events {
+            if let EngineEvent::CursorMoved { position } = event {
+                pointer_position = Some(*position);
             }
         }
         if (config.auto_click || interactive_auto_click)
