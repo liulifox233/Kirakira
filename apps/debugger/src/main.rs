@@ -64,7 +64,10 @@
 //!   --dump-auto-paths       print the auto search paths the storage holds,
 //!                           in declaration order (last wins), after startup
 //!   --dump-layer-images <dir>
-//!                           write one PNG per layer image at the end
+//!                           write one PNG per layer image at the end,
+//!                           creating the directory when it does not exist; a
+//!                           file that cannot be written prints
+//!                           `layer-image error:` and fails the run
 //!   --logs                  dump host logs at the end
 //!   --trace <cats>          enable trace categories: audio,kag or all
 //!                           (same syntax as the KRKR_TRACE env var)
@@ -76,6 +79,9 @@
 //!   --time-scale <f>        virtual clock multiplier (default 1.0)
 //!   --realtime              sleep per frame instead of fast-forwarding
 //!   --virtual-audio         consume audio commands without an output device
+//!                           (default: decode and play through the real audio
+//!                           system, like krkr-desktop; the silent sink
+//!                           synthesizes the completion events instead)
 //!   --interactive           deterministic stdin control (starts paused)
 //!   --quiet                 suppress periodic frame/pixel progress output
 //!   --max-frames <n>        frame budget (default 100000)
@@ -109,6 +115,12 @@
 //!   members [-a] [-f <substr>] <expr>
 //!                           list an object's data members (`-a` also shows
 //!                           methods, `-f` filters by name)
+//!   textrender [--class <name>] [--size <px>] [--width <px>] <text>
+//!                           render message text through a TextRender class
+//!                           (default TextRenderBase) and print one line per
+//!                           character record plus getKeyWait() entries; the
+//!                           text is verbatim, so `\n`/`\k` stay the message
+//!                           format's escapes
 //!   q                       quit
 //!
 //! See `docs/DEBUGGING.md` for a worked investigation using these commands.
@@ -136,10 +148,20 @@ use krkr_debug::{
     snapshot,
 };
 
-use std::{collections::VecDeque, io::Write, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{
+    collections::VecDeque,
+    io::Write,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use krkr_assets::{NativeAssetStore, ProjectStorage};
-use krkr_audio::VirtualAudioSink;
+use krkr_audio::{AudioError, AudioEvent, AudioSink, AudioSystem, PcmTap, VirtualAudioSink};
 use krkr_core::{
     AudioCommand, AudioInstanceId, ButtonState, DrawCommand, EngineEvent, FrameInput, FrameOutput,
     Point, PointerButton, Size,
@@ -752,12 +774,51 @@ fn main() {
         runtime.set_debug_ui(Box::new(CliDebugger::new(config.commands_file.clone())));
     }
 
+    // The audio wiring mirrors `krkr-desktop` (its `AudioSystem::new` /
+    // `prepare` / `set_resource_provider` sequence) unless `--virtual-audio`
+    // asks for the silent sink explicitly. The audio system is prepared
+    // before the session takes it, and the tap is kept so the end of the run
+    // can report what was actually decoded.
+    let audio_degraded = Arc::new(AtomicBool::new(false));
+    let virtual_audio = config.virtual_audio;
+    let (audio, audio_note, audio_tap): (Box<dyn AudioSink>, String, Option<PcmTap>) =
+        if virtual_audio {
+            (
+                Box::new(DebugAudioSink::Virtual(VirtualAudioSink::default())),
+                "audio sink=virtual (silent: commands are consumed and their completions synthesized, nothing decodes)"
+                    .to_string(),
+                None,
+            )
+        } else {
+            let mut audio = AudioSystem::new();
+            let tap = audio.pcm_tap();
+            let note = match audio.prepare() {
+                Ok(()) => match audio.set_resource_provider(engine.host().resource_provider()) {
+                    Ok(()) => "audio sink=system (decoding)".to_string(),
+                    Err(error) => format!(
+                        "audio sink=system provider_error={error}; nothing decodes (`--virtual-audio` selects the silent sink)"
+                    ),
+                },
+                Err(error) => format!(
+                    "audio sink=system prepare_error={error}; nothing decodes (`--virtual-audio` selects the silent sink)"
+                ),
+            };
+            (
+                Box::new(DebugAudioSink::System {
+                    system: audio,
+                    degraded: Arc::clone(&audio_degraded),
+                }),
+                note,
+                Some(tap),
+            )
+        };
     let mut runtime = RuntimeSession::new(
         engine,
         Box::new(NativeAssetStore::new(root.clone())),
-        Box::new(VirtualAudioSink::default()),
+        audio,
         Box::new(krkr_core::VirtualClock::default()),
     );
+    println!("{audio_note}");
 
     match runtime.start_project() {
         Ok(()) => println!("startup=ok (project dispatcher)"),
@@ -1200,6 +1261,16 @@ fn main() {
             frame_delta,
         ) {
             Ok(runtime_frame) => {
+                // The decoder's own diagnostics (a backend that could not
+                // open an output device, a codec that could not load) reach
+                // the console the same way `krkr-desktop` shows them; a
+                // silently quiet audio path is what made the reviewed wiring
+                // invisible.
+                for event in &runtime_frame.audio {
+                    if let krkr_core::AudioEvent::Status(status) = event {
+                        println!("audio status={:?} {}", status.level, status.message);
+                    }
+                }
                 let frame = runtime_frame.engine;
                 for upload in &frame.output.image_uploads {
                     textures.insert(
@@ -1215,8 +1286,12 @@ fn main() {
                     // `shot` command while paused between updates.
                     last_frame_output = Some(frame.output.clone());
                 }
+                // A real sink executes its commands and returns none here (its
+                // `PlaybackStopped` events complete the waits inside
+                // `RuntimeSession::update`); the silent sink hands over what
+                // it stored, and the harness synthesizes their completions.
                 let commands = runtime.take_audio_commands();
-                if config.virtual_audio {
+                if !commands.is_empty() {
                     queue_virtual_audio_completions(&commands, &mut pending_audio_stops);
                 }
                 for (path, raw) in pending_interactive_shots.drain(..) {
@@ -1431,7 +1506,12 @@ fn main() {
             semantic_kag_state(runtime.engine()).unwrap_or_else(|| "-".to_string())
         );
     }
+    report_audio_tap(audio_tap.as_ref(), audio_degraded.load(Ordering::Relaxed));
     println!("done frames={}", config.max_frames);
+    // A requested dump is a result the caller scripted around: a layer image
+    // or a shot that could not be written must be reported and fail the run,
+    // never panic the rest of this section (and the exit status) away.
+    let mut dump_failed = false;
     if let Some(dir) = &config.dump_layer_images {
         for layer in runtime.engine().host().layer_tree().layers() {
             if let Some(image) = &layer.image {
@@ -1439,13 +1519,17 @@ fn main() {
                     "{dir}/layer_{}_{}x{}.png",
                     layer.id, image.upload.width, image.upload.height
                 );
-                snapshot::write_png(
+                // `write_png` creates the target directory, so a dump into a
+                // path the caller never created works (the reviewed panic).
+                if let Err(error) = snapshot::write_png(
                     &path,
                     image.upload.width,
                     image.upload.height,
                     &image.upload.rgba,
-                )
-                .expect("dump layer image");
+                ) {
+                    println!("layer-image error: {path}: {error}");
+                    dump_failed = true;
+                }
             }
         }
     }
@@ -1468,21 +1552,164 @@ fn main() {
                 } else {
                     snapshot::composite_frame_output(width, height, &frame, &textures)
                 };
-                snapshot::write_png(path, width, height, &rgba).expect("write screenshot");
-                println!(
-                    "screenshot={path} size={width}x{height} transitions={} raw={}",
-                    frame.transitions.len(),
-                    config.shot_raw
-                );
+                match snapshot::write_png(path, width, height, &rgba) {
+                    Ok(()) => println!(
+                        "screenshot={path} size={width}x{height} transitions={} raw={}",
+                        frame.transitions.len(),
+                        config.shot_raw
+                    ),
+                    Err(error) => {
+                        println!("screenshot_error={path}: {error}");
+                        dump_failed = true;
+                    }
+                }
             }
             None => println!("screenshot_error={path}: no frame was rendered"),
         }
     }
-    // Diagnostics are printed first: a run whose requested injection or
-    // expression never happened must not look like a successful probe.
+    // Diagnostics are printed first: a run whose requested injection,
+    // expression or dump never happened must not look like a successful probe.
     if injection_failed {
         println!("injection=error");
+    }
+    if dump_failed {
+        println!("dump=error");
+    }
+    if injection_failed || dump_failed {
         std::process::exit(1);
+    }
+}
+
+/// The sink the headless harness hands to `RuntimeSession`.
+///
+/// The default is the real decoder ([`AudioSystem`]) — what `krkr-desktop`
+/// passes — so a probe decodes the game's audio and the audio worker's own
+/// `PlaybackStopped` events complete the waits; `--virtual-audio` selects the
+/// silent sink instead. The reviewed bug passed `VirtualAudioSink`
+/// unconditionally, so no run ever decoded a sample and its help text
+/// described the opposite of the code.
+///
+/// The silence case needs this wrapper rather than a bare
+/// `Box::new(VirtualAudioSink::default())`: `VirtualAudioSink::take_commands`
+/// is an *inherent* method, and the session calls the trait method on a
+/// `Box<dyn AudioSink>`, where only the trait's default (an empty queue) is
+/// reachable. The harness's completion synthesis therefore never saw a single
+/// command and a `--virtual-audio` run could park on an audio wait forever.
+/// Overriding the trait method here reaches the stored commands.
+///
+/// A real decoder whose backend dies (a headless box has no output device)
+/// degrades to that same silent sink with a printed notification: the
+/// alternative on this machine was a run that aborted at frame 4 of the first
+/// BGM cue with `audio command failed`. The end of the run reports the sink
+/// it really had, so a probe can never mistake "no audio decoded" for "the
+/// game has no audio".
+enum DebugAudioSink {
+    /// The decoder: commands execute on the audio worker, and completions
+    /// arrive through [`AudioSink::poll_events`].
+    System {
+        system: AudioSystem,
+        /// Set when the backend died and the sink degraded to `Virtual`, so
+        /// the end of the run reports the audio path it really had.
+        degraded: Arc<AtomicBool>,
+    },
+    /// The deterministic sink: commands accumulate until the harness takes
+    /// them and synthesizes the completions the game waits on.
+    Virtual(VirtualAudioSink),
+}
+
+impl AudioSink for DebugAudioSink {
+    fn prepare(&mut self) -> Result<(), AudioError> {
+        match self {
+            Self::System { system, .. } => system.prepare(),
+            Self::Virtual(sink) => sink.prepare(),
+        }
+    }
+
+    fn submit(&mut self, commands: &[AudioCommand]) -> Result<(), AudioError> {
+        match self {
+            Self::System { system, degraded } => match system.submit(commands) {
+                Ok(()) => Ok(()),
+                // A headless box has no output device, and kira's backend then
+                // dies on the first command: the run must say so and continue
+                // on the silent sink (with the harness's completion synthesis,
+                // so a game waiting on an audio instance is not parked
+                // forever) instead of failing at the game's first BGM cue.
+                Err(error) => {
+                    println!(
+                        "audio error: {error}; continuing with the silent sink (no audio decodes)"
+                    );
+                    degraded.store(true, Ordering::Relaxed);
+                    let mut sink = VirtualAudioSink::default();
+                    sink.submit(commands)?;
+                    *self = Self::Virtual(sink);
+                    Ok(())
+                }
+            },
+            Self::Virtual(sink) => sink.submit(commands),
+        }
+    }
+
+    fn poll_events(&mut self) -> Vec<AudioEvent> {
+        match self {
+            Self::System { system, .. } => system.poll_events(),
+            Self::Virtual(sink) => sink.poll_events(),
+        }
+    }
+
+    fn take_commands(&mut self) -> Vec<AudioCommand> {
+        match self {
+            Self::System { .. } => Vec::new(),
+            Self::Virtual(sink) => sink.take_commands(),
+        }
+    }
+}
+
+/// Reports what the audio path actually did, from the decoder's PCM tap.
+///
+/// `cursor` is the instance's rendered-frame clock: frames the decoder
+/// actually played. A virtual run has no tap, so it reports nothing decoded —
+/// the difference a probe needs between "the audio path ran" and "the
+/// commands were merely consumed".
+fn report_audio_tap(tap: Option<&PcmTap>, degraded: bool) {
+    let Some(tap) = tap else {
+        println!("audio decoded instances=0 rendered_frames=0 (virtual sink: nothing decodes)");
+        return;
+    };
+    if degraded {
+        println!(
+            "audio decoded instances=0 rendered_frames=0 (the backend was unavailable; the run continued on the silent sink, nothing decodes)"
+        );
+        return;
+    }
+    let ids = tap.instance_ids();
+    let mut rendered = 0_u64;
+    let mut lines = Vec::new();
+    for id in &ids {
+        let cursor = tap.cursor(*id).unwrap_or(0);
+        rendered += cursor;
+        let spec = tap
+            .spec(*id)
+            .map(|spec| format!("{}Hz/{}ch", spec.sample_rate, spec.channels))
+            .unwrap_or_else(|| "?".to_string());
+        let state = tap.state(*id).map(|state| format!("{state:?}"));
+        // The tap only allocates when somebody reads; a 480-frame window
+        // (~10 ms) is enough to tell decoded audio from silence.
+        let recent = tap
+            .read_recent(*id, 480)
+            .map(|snapshot| snapshot.available_frames)
+            .unwrap_or(0);
+        lines.push(format!(
+            "audio instance id={} spec={spec} state={} rendered_frames={cursor} recent_decoded_frames={recent}/480",
+            id.0,
+            state.as_deref().unwrap_or("?")
+        ));
+    }
+    println!(
+        "audio decoded instances={} rendered_frames={rendered}",
+        ids.len()
+    );
+    for line in lines {
+        println!("{line}");
     }
 }
 
@@ -1743,6 +1970,80 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("member conductor=object")),
             "{lines:?}"
+        );
+    }
+
+    /// `textrender` keeps the text verbatim, so a typed `\n` stays the two
+    /// characters the message format uses as a line break, and every flag is
+    /// validated before the script is built.
+    #[test]
+    fn textrender_command_keeps_the_text_verbatim() {
+        assert!(matches!(
+            parse_interactive_command(r"textrender --size 48 --width 320 A\nB"),
+            Ok(InteractiveCommand::TextRender { class, size, width, text })
+                if class == "TextRenderBase" && size == 48 && width == 320.0 && text == r"A\nB"
+        ));
+        assert!(matches!(
+            parse_interactive_command("textrender --class TextRender hi"),
+            Ok(InteractiveCommand::TextRender { class, .. }) if class == "TextRender"
+        ));
+        assert!(matches!(
+            parse_interactive_command("textrender plain text with spaces"),
+            Ok(InteractiveCommand::TextRender { text, .. }) if text == "plain text with spaces"
+        ));
+        assert!(parse_interactive_command("textrender").is_err());
+        assert!(parse_interactive_command("textrender --size 0 x").is_err());
+        assert!(parse_interactive_command("textrender --nope x").is_err());
+        assert!(parse_interactive_command("textrender --class 1bad x").is_err());
+    }
+
+    /// The reviewed wiring: every run was handed a `VirtualAudioSink`, so no
+    /// run ever decoded a sample although the tool links the Opus decoder and
+    /// `krkr-desktop` plays through `AudioSystem`. The flag is now the opt-in
+    /// that selects the silent sink, matching its own help text.
+    #[test]
+    fn audio_decodes_by_default_and_the_silent_sink_is_opt_in() {
+        let config = parse_args_from(args(&["--kag-state"]));
+        assert!(
+            !config.virtual_audio,
+            "the default must be the real audio system, like krkr-desktop"
+        );
+        assert!(parse_args_from(args(&["--virtual-audio"])).virtual_audio);
+    }
+
+    /// The silent sink must hand its commands to the harness: `RuntimeSession`
+    /// reaches `take_commands` through `Box<dyn AudioSink>`, where the trait's
+    /// default (an empty queue) is what a bare `VirtualAudioSink` answers,
+    /// because the crate's `take_commands` is an inherent method. Before this
+    /// wrapper, `--virtual-audio` synthesized no completion at all, so a game
+    /// waiting on an audio instance parked forever.
+    #[test]
+    fn the_silent_sink_hands_its_commands_to_the_harness() {
+        use super::{AudioCommand, AudioInstanceId, DebugAudioSink, VirtualAudioSink};
+        use krkr_audio::AudioSink;
+
+        let mut sink: Box<dyn AudioSink> =
+            Box::new(DebugAudioSink::Virtual(VirtualAudioSink::default()));
+        sink.submit(&[AudioCommand::Stop {
+            id: AudioInstanceId(7),
+            fade_seconds: 0.0,
+        }])
+        .expect("submit");
+        let commands = sink.take_commands();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+
+        // The trap this wrapper exists for: the same commands through the
+        // crate's own sink reach the trait's default empty queue.
+        let mut bare: Box<dyn AudioSink> = Box::new(VirtualAudioSink::default());
+        bare.submit(&[AudioCommand::Stop {
+            id: AudioInstanceId(7),
+            fade_seconds: 0.0,
+        }])
+        .expect("submit");
+        assert!(
+            bare.take_commands().is_empty(),
+            "a bare `VirtualAudioSink` answers the trait's empty default; \
+             if this changed, the wrapper is no longer needed"
         );
     }
 }

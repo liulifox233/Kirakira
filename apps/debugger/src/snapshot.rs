@@ -377,7 +377,18 @@ fn blend_pixel(canvas: &mut [u8], width: u32, x: u32, y: u32, src: &[u8], alpha:
     *dst.last_mut().expect("alpha channel") = out_a as u8;
 }
 
+/// Encodes RGBA pixels and writes them as a PNG, creating the target
+/// directory when it does not exist.
+///
+/// A dump costs a whole frame budget, so writing into a directory the caller
+/// never created must not lose the run to `NotFound`; `--dump-layer-images`
+/// passed the reviewed path that did.
 pub fn write_png(path: &str, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut raw = Vec::with_capacity((width * height * 4 + height) as usize);
     for row in rgba.chunks_exact((width * 4) as usize) {
         raw.push(0);

@@ -103,6 +103,29 @@ fn compute_dominators(blocks: &[Block]) -> Vec<BTreeSet<usize>> {
     dom
 }
 
+/// Blocks the entry can reach through the CFG, i.e. the code that is part of
+/// the body's control flow (dead code the compiler emitted after a `return`
+/// is not).
+fn reachable_blocks(blocks: &[Block]) -> BTreeSet<usize> {
+    let mut reachable = BTreeSet::new();
+    let mut frontier = vec![0usize];
+    while let Some(index) = frontier.pop() {
+        if index >= blocks.len() || !reachable.insert(index) {
+            continue;
+        }
+        match blocks[index].term {
+            Term::Fall => frontier.push(index + 1),
+            Term::Jmp(target) => frontier.push(target),
+            Term::Cond { target, .. } => {
+                frontier.push(target);
+                frontier.push(index + 1);
+            }
+            Term::Ret | Term::Throw => {}
+        }
+    }
+    reachable
+}
+
 fn find_index(instructions: &[Instruction], word_offset: usize) -> usize {
     instructions
         .iter()
@@ -234,6 +257,10 @@ struct BodyDecompiler<'f> {
     back_edges: BTreeMap<usize, Vec<usize>>,
     /// Blocks consumed by condition fusion (dead after decompilation).
     dead: BTreeSet<usize>,
+    /// Blocks the walk consumed (their instructions are reconstructed, in the
+    /// output or as a construct's own rendering). A reachable block that is
+    /// neither handled nor dead was dropped, and [`Self::run`] has to say so.
+    handled: BTreeSet<usize>,
     unhandled: usize,
     /// Recursion depth of `seq`. Pathological try/if matching can re-enter
     /// the same region; degrade instead of overflowing the native stack.
@@ -272,6 +299,7 @@ impl<'f> BodyDecompiler<'f> {
             blocks,
             back_edges,
             dead: BTreeSet::new(),
+            handled: BTreeSet::new(),
             unhandled: 0,
             seq_depth: 0,
         }
@@ -290,13 +318,56 @@ impl<'f> BodyDecompiler<'f> {
                 || !followed.insert(target)
             {
                 self.unhandled += 1;
-                statements
-                    .push(self.marker(&format!("unexpected trailing jump to block {target}")));
+                statements.push(self.marker_at(target, "unexpected trailing jump"));
                 break;
             }
             let (more, next) = self.seq(target, &SeqCtx::default());
             statements.extend(more);
             end = next;
+        }
+        // A body the walk did not finish leaves instructions nobody scanned:
+        // an abandoned tail is a region of the original that is simply not in
+        // the output, so "48 objects, 13 unhandled fragments" must not be the
+        // only trace of it (M35 read a truncated Initialize.tjs as complete).
+        // Reachable-and-unscanned is the dropped set; dead code the compiler
+        // left after a `return` and the jmp-only trampolines the walk skips on
+        // purpose are not "dropped", they are not statements at all.  The
+        // marker names the byte range, which is enough to find the region in
+        // a disassembly.
+        let reachable = reachable_blocks(&self.blocks);
+        let mut dropped: Vec<usize> = Vec::new();
+        for index in reachable.iter().copied() {
+            if self.dead.contains(&index) || self.is_trampoline(index) {
+                continue;
+            }
+            let block = &self.blocks[index];
+            let end = block.end.min(self.instructions.len().saturating_sub(1));
+            let terminator = !matches!(self.blocks[index].term, Term::Fall);
+            for position in block.start..=end {
+                let instruction = &self.instructions[position];
+                if self.scanner.scanned_offsets().contains(&instruction.offset) {
+                    continue;
+                }
+                // Two kinds of instruction carry no statement of their own:
+                // the block's terminator (control flow the walk's construct
+                // interpreted as `break`/`continue`/`return`/a loop jump) and
+                // the `entry`/`extry` markers the `try` reconstruction
+                // consumes.  A dropped region is reported for its statements,
+                // so these alone are not a drop.
+                if matches!(instruction.opcode, 120 | 121) || (terminator && position == end) {
+                    continue;
+                }
+                dropped.push(instruction.offset);
+            }
+        }
+        dropped.sort_unstable();
+        if let (Some(first), Some(last)) = (dropped.first(), dropped.last()) {
+            self.unhandled += 1;
+            super::count_dropped_region();
+            statements.push(self.marker(&format!(
+                "dropped region bytecode 0x{first:x} to 0x{last:x} {} instructions never reconstructed",
+                dropped.len()
+            )));
         }
         self.unhandled += self.scanner.unhandled_count();
         statements.extend(self.scanner.take_out());
@@ -314,6 +385,31 @@ impl<'f> BodyDecompiler<'f> {
             )),
             Span::empty(0),
         )
+    }
+
+    /// A block whose instructions are only its control-flow terminator: the
+    /// walk skips these on purpose (`skip_trampolines`), so they are handled,
+    /// not dropped.
+    fn is_trampoline(&self, index: usize) -> bool {
+        index < self.blocks.len()
+            && matches!(self.blocks[index].term, Term::Jmp(_))
+            && self.block_body(index).is_empty()
+    }
+
+    /// A marker that names the bytecode offset the give-up happened at, so
+    /// the region can be found in a disassembly. Every abandon path reports
+    /// a location; a marker without one is not actionable.
+    fn marker_at(&self, block: usize, reason: &str) -> Stmt {
+        match self
+            .blocks
+            .get(block)
+            .and_then(|block| self.instructions.get(block.start))
+        {
+            Some(instruction) => {
+                self.marker(&format!("{reason} at offset 0x{:x}", instruction.offset))
+            }
+            None => self.marker(&format!("{reason} outside the instruction stream")),
+        }
     }
 
     fn block_insts(&self, index: usize) -> &[Instruction] {
@@ -360,6 +456,7 @@ impl<'f> BodyDecompiler<'f> {
             } => (target, jump_if_true),
             _ => unreachable!("cond_info on non-cond block"),
         };
+        self.handled.insert(index);
         let body = self.block_body(index);
         let (cond, prelude) = self.scanner.scan_condition_block(&body);
         let cond = cond.unwrap_or_else(|| Expr::new(ExprKind::Bool(true), Span::empty(0)));
@@ -369,6 +466,7 @@ impl<'f> BodyDecompiler<'f> {
     /// Scans a cond block and returns the raw flag condition plus any
     /// prelude statements.
     fn raw_cond(&mut self, index: usize) -> (Option<Cond>, Vec<Stmt>) {
+        self.handled.insert(index);
         let body = self.block_body(index);
         self.scanner.scan_condition_block_raw(&body)
     }
@@ -378,9 +476,7 @@ impl<'f> BodyDecompiler<'f> {
         const MAX_SEQ_DEPTH: usize = 256;
         if self.seq_depth >= MAX_SEQ_DEPTH {
             self.unhandled += 1;
-            stmts.push(self.marker(&format!(
-                "control-flow nest limit exceeded at block {entry}"
-            )));
+            stmts.push(self.marker_at(entry, "control-flow nest limit exceeded"));
             return (stmts, SeqEnd::Returned);
         }
         self.seq_depth += 1;
@@ -403,10 +499,12 @@ impl<'f> BodyDecompiler<'f> {
             && self.block_body(entry).is_empty()
         {
             if target == loop_ctx.exit {
+                self.handled.insert(entry);
                 stmts.push(Stmt::new(StmtKind::Break, Span::empty(0)));
                 return (stmts, SeqEnd::Returned);
             }
             if target == loop_ctx.continue_target && !ctx.stop.contains(&target) {
+                self.handled.insert(entry);
                 stmts.push(Stmt::new(StmtKind::Continue, Span::empty(0)));
                 return (stmts, SeqEnd::Returned);
             }
@@ -418,6 +516,7 @@ impl<'f> BodyDecompiler<'f> {
             && !ctx.suppress_loop_at_entry
             && self.back_edges.contains_key(&entry)
         {
+            self.handled.insert(entry);
             stmts.push(Stmt::new(StmtKind::Continue, Span::empty(0)));
             return (stmts, SeqEnd::Returned);
         }
@@ -429,9 +528,7 @@ impl<'f> BodyDecompiler<'f> {
             if iterations > bound {
                 // Degrade instead of looping forever on pathological CFGs.
                 self.unhandled += 1;
-                stmts.push(self.marker(&format!(
-                    "control-flow iteration bound exceeded at block {current}"
-                )));
+                stmts.push(self.marker_at(current, "control-flow iteration bound exceeded"));
                 return (stmts, SeqEnd::Returned);
             }
             while self.dead.contains(&current) {
@@ -440,6 +537,7 @@ impl<'f> BodyDecompiler<'f> {
             if ctx.stop.contains(&current) || current >= self.blocks.len() {
                 return (stmts, SeqEnd::StoppedAt(current));
             }
+            self.handled.insert(current);
 
             if !(first && ctx.suppress_try_at_entry) && self.block_starts_with_entry(current) {
                 match self.try_construct(current, ctx) {
@@ -450,7 +548,7 @@ impl<'f> BodyDecompiler<'f> {
                     }
                     Err(()) => {
                         self.unhandled += 1;
-                        stmts.push(self.marker("unmatched try structure"));
+                        stmts.push(self.marker_at(current, "unmatched try structure"));
                         return (stmts, SeqEnd::Returned);
                     }
                 }
@@ -485,7 +583,7 @@ impl<'f> BodyDecompiler<'f> {
                     stmts.extend(self.scanner.take_out());
                     if target == usize::MAX {
                         self.unhandled += 1;
-                        stmts.push(self.marker("invalid jump target"));
+                        stmts.push(self.marker_at(current, "invalid jump target"));
                         return (stmts, SeqEnd::Returned);
                     }
                     if target <= current {
@@ -549,7 +647,7 @@ impl<'f> BodyDecompiler<'f> {
                         }
                     }
                     self.unhandled += 1;
-                    stmts.push(self.marker("unmatched conditional structure"));
+                    stmts.push(self.marker_at(current, "unmatched conditional structure"));
                     return (stmts, SeqEnd::Returned);
                 }
                 Term::Fall => {
@@ -949,6 +1047,8 @@ impl<'f> BodyDecompiler<'f> {
         self.scanner.set_reg(then_reg, conditional);
         self.dead.insert(then_entry);
         self.dead.insert(else_entry);
+        self.handled.insert(then_entry);
+        self.handled.insert(else_entry);
         self.scanner.restore_out(saved_out);
         self.scanner.materialize = saved_materialize;
         Some(merge)
@@ -1104,7 +1204,7 @@ impl<'f> BodyDecompiler<'f> {
                 ) && !matches!(else_end, SeqEnd::Returned)
                 {
                     self.unhandled += 1;
-                    let marker = self.marker("unexpected if tail structure");
+                    let marker = self.marker_at(then_entry, "unexpected if tail structure");
                     let if_stmt = Stmt::new(
                         StmtKind::If {
                             condition: negate_condition(cond),
@@ -1151,7 +1251,7 @@ impl<'f> BodyDecompiler<'f> {
                     SeqEnd::StoppedAt(block2) | SeqEnd::Jumped(block2) if block2 == block
                 ) {
                     self.unhandled += 1;
-                    let marker = self.marker("unexpected mirrored if structure");
+                    let marker = self.marker_at(then_entry, "unexpected mirrored if structure");
                     let if_stmt = Stmt::new(
                         StmtKind::If {
                             condition: cond,
@@ -1246,6 +1346,16 @@ impl<'f> BodyDecompiler<'f> {
                     SeqEnd::StoppedAt(end) | SeqEnd::Jumped(end) if end == merge => {
                         (if_stmt, SeqEnd::StoppedAt(merge))
                     }
+                    // The else side ends control flow where it stands (a
+                    // `throw`, a `return`, a `break`): the merge is still
+                    // reached through the then branch, which jumps to it, so
+                    // the body continues there.  Propagating `Returned`
+                    // ended the whole walk at the if/else and silently
+                    // dropped every statement after it -- exactly the shape
+                    // PARQUET's `system/Initialize.tjs` ends its top level
+                    // with (an if/else whose else throws, then the KAG
+                    // system loader).
+                    SeqEnd::Returned => (if_stmt, SeqEnd::StoppedAt(merge)),
                     other => (if_stmt, other),
                 }
             }
@@ -1292,7 +1402,7 @@ impl<'f> BodyDecompiler<'f> {
                     }
                     _ => {
                         self.unhandled += 1;
-                        let marker = self.marker("unexpected continue structure");
+                        let marker = self.marker_at(then_entry, "unexpected continue structure");
                         let if_stmt = Stmt::new(
                             StmtKind::If {
                                 condition: cond,
@@ -1344,7 +1454,7 @@ impl<'f> BodyDecompiler<'f> {
             }
             other => {
                 self.unhandled += 1;
-                let marker = self.marker("unexpected if branch structure");
+                let marker = self.marker_at(then_entry, "unexpected if branch structure");
                 let if_stmt = Stmt::new(
                     StmtKind::If {
                         condition: cond,
@@ -1482,6 +1592,7 @@ impl<'f> BodyDecompiler<'f> {
             },
         );
         if post_block.is_none() {
+            self.handled.insert(tail);
             let tail_body = self.block_body(tail);
             self.scanner.scan_linear(&tail_body);
             body.extend(self.scanner.take_out());
@@ -1490,6 +1601,7 @@ impl<'f> BodyDecompiler<'f> {
 
         let stmt = match post_block {
             Some(post) => {
+                self.handled.insert(post);
                 let post_insts = self.block_body(post);
                 let saved = self.scanner.materialize;
                 self.scanner.materialize = false;
@@ -1599,6 +1711,7 @@ impl<'f> BodyDecompiler<'f> {
                 .find(|inst| inst.opcode == 7 && inst.operands[0] == anchor)?;
             let ceq = ceq.clone();
             eval_insts.extend(body_insts.iter().filter(|inst| inst.opcode != 8).cloned());
+            self.handled.insert(test);
             self.scanner.scan_condition_block(&eval_insts);
             let value = self.scanner.reg_expr(ceq.operands[1]);
             let (body_entry, next_test) = match self.blocks[test].term {
@@ -1986,6 +2099,16 @@ mod tests {
         (print_statements(&output.statements), output.unhandled)
     }
 
+    /// The final text of a whole program: `render_program` turns the marker
+    /// statements into `// <unhandled: ...>` comments.
+    fn rendered(source: &str) -> String {
+        let file = compile_source_to_bytecode("control.tjs", source).expect("compile");
+        let output =
+            crate::decompile::decompile(&file, &crate::decompile::DecompileOptions::default())
+                .expect("decompile");
+        output.sources[0].text.clone()
+    }
+
     #[test]
     fn decompiles_if_else() {
         let (text, unhandled) = decompile("if (a) { b(); } else { c(); } d();");
@@ -2039,5 +2162,75 @@ mod tests {
         );
         assert_eq!(unhandled, 0, "{text}");
         assert!(text.contains("continue;"), "{text}");
+    }
+
+    /// The `Initialize.tjs` shape: an `if/else` whose else side ends control
+    /// flow (a `throw`), with statements after the if/else. The merge is
+    /// reached through the then branch, so those statements are live code and
+    /// must be reconstructed; the walk used to propagate the else side's
+    /// `Returned` and end the body at the if/else (PARQUET's
+    /// `system/Initialize.tjs` stopped at the `Config.tjs` loader, and its
+    /// summary line still said "0 unhandled fragments").
+    #[test]
+    fn a_throwing_else_branch_keeps_the_statements_after_it() {
+        let (text, unhandled) = decompile(
+            "var hit = 0; \
+             if (flag) { hit = 1; } else { throw new Exception(\"boom\"); } \
+             hit = hit + 2;",
+        );
+        assert!(text.contains("hit = hit + 2;"), "{text}");
+        assert!(text.contains("throw"), "{text}");
+        assert_eq!(unhandled, 0, "{text}");
+    }
+
+    /// The reviewer's complaint: a body the walk cannot finish was reported as
+    /// an empty tail ("0 unhandled fragments") although a region of the
+    /// original is missing from the output. The dropped region is now named
+    /// with its byte range, so a reader can find it in a disassembly.
+    #[test]
+    fn a_body_the_walk_cannot_finish_reports_the_dropped_region() {
+        let text = rendered("var i = 0; while (i < n) { i = i + 1; if (i == 3) continue; }");
+        assert!(
+            text.contains("// <unhandled: dropped region bytecode 0x"),
+            "the dropped region must be named: {text}"
+        );
+    }
+
+    /// A dropped region carries its own counter next to the fragment count,
+    /// so a caller can tell an abandoned region from a construct no pattern
+    /// covers (the fuzz corpus's completeness net subtracts the former).
+    #[test]
+    fn a_dropped_region_is_counted_next_to_the_pattern_gaps() {
+        let file = compile_source_to_bytecode(
+            "control.tjs",
+            "var i = 0; while (i < n) { i = i + 1; if (i == 3) continue; }",
+        )
+        .expect("compile");
+        let output =
+            crate::decompile::decompile(&file, &crate::decompile::DecompileOptions::default())
+                .expect("decompile");
+        assert!(output.stats.dropped_regions > 0, "{:?}", output.stats);
+        assert!(
+            output.stats.unhandled >= output.stats.dropped_regions,
+            "{:?}",
+            output.stats
+        );
+        assert!(
+            output.sources[0]
+                .text
+                .contains("dropped region bytecode 0x"),
+            "{}",
+            output.sources[0].text
+        );
+    }
+
+    /// The other side of the same net: dead code the compiler emitted after a
+    /// `return` on every path is not a dropped region, and a complete body
+    /// carries no marker at all.
+    #[test]
+    fn dead_code_after_a_return_is_not_a_dropped_region() {
+        let (text, unhandled) = decompile("if (a) { return 1; } else { return 2; } return 3;");
+        assert!(!text.contains("dropped region"), "{text}");
+        assert_eq!(unhandled, 0, "{text}");
     }
 }
