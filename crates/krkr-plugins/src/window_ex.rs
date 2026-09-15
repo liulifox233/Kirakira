@@ -143,9 +143,12 @@
 //!   (`classes.rs:43`); `install_pad_ex` above attaches `registerExEvent` as
 //!   soon as the global exists.
 //! * **`Debug.console`** — the object belongs to console.dll, not to windowEx:
-//!   neither shipped game ships console.dll, so the reference has no
-//!   `Debug.console` for this content either, and backing its seven functions
-//!   is a console-window emulation rather than a windowEx change.
+//!   the plugin sets the earlier missions copied out of the games contain no
+//!   console.dll, and PARQUET's own `system/MainWindow.tjs` compares
+//!   `Debug.console` against `undefined` before it uses it (its string pool
+//!   carries `Debug`/`console` next to `undefined`), so the reference takes the
+//!   same absence path this engine takes. Backing the seven functions is a
+//!   console-window emulation rather than a windowEx change.
 //!
 //! Nothing here is invented: a member the engine cannot back either keeps the
 //! reference's value for a window-less object or is absent with the

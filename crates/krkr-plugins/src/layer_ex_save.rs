@@ -645,13 +645,17 @@ fn average_color(
         height = height.wrapping_add(top);
         top = 0;
     }
+    // Both steps wrap, like the reference's `tjs_int` arithmetic: the wrapped
+    // results are what its own `width -= cut` produces, and a script value at
+    // the 32-bit edge must not abort the process (a Rust overflow panic is not
+    // something a script `catch` can stop).
     let cut = left.wrapping_add(width).wrapping_sub(image_width);
     if cut > 0 {
-        width -= cut;
+        width = width.wrapping_sub(cut);
     }
     let cut = top.wrapping_add(height).wrapping_sub(image_height);
     if cut > 0 {
-        height -= cut;
+        height = height.wrapping_sub(cut);
     }
     if width <= 0 || height <= 0 {
         return Err(TjsError::runtime("invalid layer range"));
@@ -670,6 +674,14 @@ fn average_color(
             sums[3] += u64::from(pixel[3]);
             count += 1;
         }
+    }
+    if count == 0 {
+        // `left + width` (or `top + height`) overflowed, so the clip above left
+        // the rectangle unclipped and the loop bound is the wrapped value: the
+        // reference's own loop body never runs either, and its `a /= size`
+        // divides a zero sum, answering 0. Dividing by this zero count instead
+        // would kill the process.
+        return Ok(0);
     }
     let mean = |sum: u64| ((sum / count) & 0xff) as u32;
     let packed =
@@ -2911,6 +2923,81 @@ mod tests {
             )
             .expect_err("no image");
         assert_eq!(error.message, "src must be Layer.");
+    }
+
+    /// The two 32-bit sums `getAverageColor` builds its rectangle from wrap in
+    /// the reference (`tjs_int` arithmetic), and so must the port's: neither the
+    /// division nor the subtraction may abort the process, which no script-level
+    /// `catch` could stop.
+    ///
+    /// * A rectangle whose `left + width` overflows escapes the clip (the
+    ///   reference's `left + width - sw` wraps negative, so its `cut > 0` test
+    ///   fails the same way) and its loop bound is the wrapped negative value,
+    ///   so the body never runs: the reference divides a zero sum by `size` and
+    ///   answers 0.
+    /// * A `width` of `tjs_int` minimum underflows the clip subtraction; the
+    ///   reference's wrapped result is `imageWidth - left`, i.e. the rest of the
+    ///   row, which is the same rectangle the explicit call below measures.
+    #[test]
+    fn get_average_color_wraps_like_the_reference_instead_of_aborting() {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "layer.tjs",
+            r#"
+            global.layer = new Layer();
+            layer.setImageSize(2, 1);
+            layer.fillRect(0, 0, 1, 1, 0xff112233);
+            layer.fillRect(1, 0, 1, 1, 0x80405060);
+            "#,
+        );
+        let average = |engine: &mut KrkrEngine, call: &str| -> i64 {
+            engine
+                .execute_expression("average.tjs", call)
+                .expect("getAverageColor")
+                .to_integer()
+                .expect("integer")
+        };
+        assert_eq!(
+            average(
+                &mut engine,
+                "layer.getAverageColor(1500000000, 0, 1500000000, 1)"
+            ),
+            0,
+            "an overflowing left + width visits no pixel"
+        );
+        assert_eq!(
+            average(
+                &mut engine,
+                "layer.getAverageColor(0, 1500000000, 1, 1500000000)"
+            ),
+            0,
+            "the height overflow answers the same"
+        );
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(0, 0, -2147483648, 1)"),
+            0x493928bf,
+            "the underflowing cut leaves imageWidth - left"
+        );
+        assert_eq!(
+            average(&mut engine, "layer.getAverageColor(0, 0, 2, 1)"),
+            0x493928bf,
+            "the same rectangle named explicitly"
+        );
+        // The corners of the argument space in every position: each call wraps
+        // its way to a clipped rectangle, an empty one or the range error, and
+        // the pin is only that it returns — an `Err` here is the reference's
+        // `invalid layer range`, and a panic would take the process with it.
+        for call in [
+            "layer.getAverageColor(-2147483648, -2147483648, -2147483648, -2147483648)",
+            "layer.getAverageColor(2147483647, 2147483647, 2147483647, 2147483647)",
+            "layer.getAverageColor(2147483647, 0, 1, 1)",
+            "layer.getAverageColor(-1, -1, -2147483648, 2147483648)",
+            "layer.getAverageColor(0, 0, 2147483647, 2147483647)",
+            "layer.getAverageColor(2147483647, 2147483647, 1, 1)",
+        ] {
+            let _ = engine.execute_expression("average.tjs", call);
+        }
     }
 
     /// `clearAlpha` (`utils.cpp:485-510`): pixels at or below the threshold
