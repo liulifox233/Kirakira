@@ -194,7 +194,7 @@ pub const CATALOG: &[PluginEntry] = &[
         name: "win32dialog.dll",
         aliases: &["Win32Dialog.dll"],
         family: PluginFamily::System,
-        source: "https://github.com/wtnbgo/win32dialog",
+        source: "https://github.com/wtnbgo/win32dialog (the shipped DLL is newer than the bundled source: it also registers getWindowRect/getClientRect/getPlacement/setPlacement/restoreMaximize/maximize/setActive, and the port follows the DLL)",
         parquet: true,
         meta: crate::win32_dialog::META,
     },

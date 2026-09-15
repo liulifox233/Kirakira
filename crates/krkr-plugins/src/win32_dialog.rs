@@ -7,14 +7,47 @@
 //! `chooseColor` reports cancellation, so scripts that merely probe the API
 //! keep running. Real dialog interaction is out of scope for the stub.
 //!
-//! The members whose reference declarations carry parameters keep their
-//! argument counts: the plugin registers them with `Method(...)`, i.e.
-//! ncbind's `ncbNativeClassMethod`, whose `ArgsCount` is the member's PMF
-//! parameter count and whose `doInvoke` rejects a shorter call with
-//! `TJS_E_BADPARAMCOUNT` before the body runs (`ncbind.hpp:1186`). The games
-//! always pass the full list (`close(id)`, `setItemLong(id, index, value)`,
-//! `mapRect(rect)`, `messageBox(win, msg, caption, type)`), so the floors only
-//! turn a silent short call into the reference's error.
+//! Every member the reference registers with `Method(...)` carries its
+//! parameter count as ncbind's `ArgsCount` — `ncbNativeClassMethod`'s
+//! `doInvoke` rejects a shorter call with `TJS_E_BADPARAMCOUNT` before the body
+//! runs (`ncbind.hpp:1186`, min-only) — so each one is registered here with
+//! that count as `NativeArgCount::AtLeast(N)`, and the nested classes' members
+//! with theirs. The members the reference registers with `RawCallback(...)`
+//! have no registration-time count; the ones whose handler itself returns
+//! `TJS_E_BADPARAMCOUNT` for a short call (`loadResource`, `makeTemplate`,
+//! `setItemBitmap`, `sendItemMessage`, `openProgress`, `setScrollInfo`) get the
+//! handler's minimum instead. Properties carry no floor (a getter/setter is
+//! invoked with a fixed count) and neither do the constructors, which ncbind
+//! treats as a zero-argument call when the script passes none.
+//!
+//! The counts are the shipped artifact's, not assumed from the source: the
+//! DLL's registration sequence and the MSVC RTTI type of every
+//! `ncbNativeClassMethod` instantiation give each member's kind and parameter
+//! count (Ghidra over `plugin/win32dialog.dll`, `docs/plugins/win32dialog.md`
+//! §4), and the bundled source (`src/plugins/win32/win32dialog/main.cpp` in the
+//! kirikiri2 trunk — the line numbers cited below, identical to the krkrz
+//! snapshot this module was written against) agrees member for member. That
+//! build registers four members the source does not have, and they are Win32
+//! window operations on the dialog's own `HWND`:
+//!
+//! * `getPlacement()` / `setPlacement(dict)` wrap `GetWindowPlacement` /
+//!   `SetWindowPlacement`; `setPlacement` is a raw callback that answers
+//!   `TJS_E_BADPARAMCOUNT` for `num < 1` and `TJS_E_INVALIDPARAM` for a first
+//!   argument that is not an object.
+//! * `restoreMaximize()` / `maximize()` (no parameters) post `SC_RESTORE` /
+//!   `SC_MAXIMIZE` to the window and return whether they had one
+//!   (`dialogHWND != 0`).
+//!
+//! No Kirakira platform owns a dialog window, so the `HWND` is always 0 and
+//! what is registered here is the reference's own no-window answer rather
+//! than a pretend success: `getPlacement()` returns void (the result is
+//! cleared before the placement is read) and `setPlacement(dict)` returns
+//! void (the placement is never applied), while the maximize pair returns
+//! false. The games always pass the full argument lists (`close(id)`,
+//! `setItemLong(id, index, value)`, `setItemPos(id, x, y)`, `mapRect(rect)`,
+//! `messageBox(win, msg, caption, type)`), and their console placement dance
+//! probes the window members with `typeof` before calling them, so the floors
+//! only turn a silent short call into the reference's error.
 
 use krkr_engine::{KrkrHost, KrkrPlugin};
 use krkr_tjs2::{
@@ -27,7 +60,7 @@ use crate::catalog::{PluginMeta, PluginStatus};
 pub(crate) const META: PluginMeta = PluginMeta {
     status: PluginStatus::Shim,
     feature: "WIN32Dialog",
-    notes: "No-op dialog classes (WIN32Dialog plus Header/Items/Bitmap/SolidBrush/DrawItem/Notify/Blob) with the constants scripts reference; open() reports immediately.",
+    notes: "No-op dialog classes (WIN32Dialog plus Header/Items/Bitmap/SolidBrush/DrawItem/Notify/Blob) with the constants scripts reference; open() reports immediately. Every declared argument floor of the shipped DLL is enforced, and its four DLL-only window members (getPlacement/setPlacement/restoreMaximize/maximize) answer the reference's own no-window result: void/void/false/false.",
     install: |engine| engine.register_plugin(Win32DialogPlugin),
 };
 
@@ -84,103 +117,209 @@ fn bound_instance(
 
 fn install_dialog_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.register_object_native(handle, "finalize", native_void);
-    // `void close(DWORD id)` (`main.cpp:610`, registered with `Method(...)` at
-    // `:1692`) and `void SetPos(int x, int y)` (`:492`, `:1724`).
-    runtime.register_object_native_with_arg_count(
-        handle,
-        "close",
-        NativeArgCount::AtLeast(1),
-        native_void,
-    );
-    runtime.register_object_native_with_arg_count(
-        handle,
-        "setPos",
-        NativeArgCount::AtLeast(2),
-        native_void,
-    );
-    for name in [
-        "loadResource",
-        "makeTemplate",
-        "show",
-        "setItemInt",
-        "setItemText",
-        "setItemEnabled",
-        "setItemFocus",
-        "setItemPos",
-        "setItemSize",
-        "setSize",
-        "setActive",
-        "bringToFront",
-        "setScrollInfo",
-        "setMessageResult",
-        "closeProgress",
-        // event default stubs
-        "onInit",
-        "onCommand",
-        "onNotify",
-        "onHScroll",
-        "onVScroll",
-        "onSize",
-    ] {
-        runtime.register_object_native(handle, name, native_void);
+
+    // Raw callbacks whose handler checks `numparams` itself: one argument for
+    // `loadResource(dll, res?)` (`:349`) and `makeTemplate(header, items*)`
+    // (`:1360`), two for `setItemBitmap(id, Bitmap)` (`:484`) and
+    // `sendItemMessage(id, msg, wp?, lp?)` (`:529`); each returns
+    // `TJS_E_BADPARAMCOUNT` below its own count. `open(window?)` has no such
+    // check — it treats the argument as optional (`:602-607`).
+    for name in ["loadResource", "makeTemplate"] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(1),
+            native_void,
+        );
     }
-    // `tjs_int64 GetItem(int id) const` (`:415`, registered `:1694`) and
-    // `long SetItemLong(int id, int index, long newlong)` (`:419`, `:1697`).
-    runtime.register_object_native_with_arg_count(
-        handle,
-        "getItem",
-        NativeArgCount::AtLeast(1),
-        zero,
-    );
-    runtime.register_object_native_with_arg_count(
-        handle,
-        "setItemLong",
-        NativeArgCount::AtLeast(3),
-        zero,
-    );
+    for name in ["setItemBitmap", "sendItemMessage"] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(2),
+            zero,
+        );
+    }
+    runtime.register_object_native(handle, "open", zero);
+
+    // `Method(...)` members at their PMF parameter count. One argument:
+    // `void close(DWORD id)` (`:610`), `void show(int nCmdShow)` (`:626`),
+    // `void SetItemFocus(int id)` (`:464`), `void setMessageResult(LONG)`
+    // (`:845`), and the `setScrollInfo(id, pos?, min?, max?, page?)` raw
+    // callback, whose handler checks `num < 1` (`:1001-1002`).
     for name in [
-        "open",
+        "close",
+        "show",
+        "setItemFocus",
+        "setMessageResult",
+        "setScrollInfo",
+    ] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(1),
+            native_void,
+        );
+    }
+    // One argument, zero answer: `tjs_int64 GetItem(int id) const` (`:415`),
+    // `int GetItemID(tjs_int64 hwnd)` (`:416`), `int GetItemInt(int id)`
+    // (`:430`), `bool GetItemEnabled(int id)` (`:461`), `long
+    // GetItemLeft/Top/Width/Height(int id)` (`:472-475`), `bool
+    // IsExistentItem(int id)` (`:417`), `bool LockItemUpdate(int id)`
+    // (`:427`), `bool InvalidateAll(bool erase)` (`:589`), `tjs_int64
+    // DeleteAllTabItem(int tabid)` (`:942`), `tjs_int GetCurSelTab(int tabid)`
+    // (`:949`) and the `openProgress(id, window?, dsapp?, breathe?)` raw
+    // callback, whose handler checks `num < 1` (`:1566`).
+    for name in [
+        "getItem",
         "getItemID",
-        "getItemLong",
         "getItemInt",
         "getItemEnabled",
         "getItemLeft",
         "getItemTop",
         "getItemWidth",
         "getItemHeight",
-        "setItemBitmap",
         "isExistentItem",
         "lockItemUpdate",
-        "unlockItemUpdate",
-        "sendItemMessage",
-        "invalidateRect",
         "invalidateAll",
-        "insertTab",
-        "deleteTab",
         "deleteAllTab",
         "getCurSel",
+        "openProgress",
+    ] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(1),
+            zero,
+        );
+    }
+    // `VarT getScrollInfo(int id)` (`:1028`, registered `:3101`) answers the
+    // scroll position dictionary.
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "getScrollInfo",
+        NativeArgCount::AtLeast(1),
+        scroll_info,
+    );
+    // One argument, string answer: `VarT GetItemClassName(int id)` (`:400`)
+    // and `StringT GetItemText(int id)` (`:441`).
+    for name in ["getItemClassName", "getItemText"] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(1),
+            empty_string,
+        );
+    }
+    // Two arguments: `void SetItemInt(int id, int value)` (`:436`), `void
+    // SetItemText(int id, NameT string)` (`:451`), `void SetItemEnabled(int
+    // id, bool en)` (`:458`), `void SetSize(int w, int h)` (`:493`),
+    // `void SetPos(int x, int y)` (`:492`), and the `onNotify(long wp,
+    // NotifyAccessor *acc)` default stub (`:635`).
+    for name in [
+        "setItemInt",
+        "setItemText",
+        "setItemEnabled",
+        "setSize",
+        "setPos",
+        "onNotify",
+    ] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(2),
+            native_void,
+        );
+    }
+    // Two arguments, zero answer: `long GetItemLong(int id, int index)`
+    // (`:418`), `bool InvalidateRect(VarT vrect, bool erase)` (`:593`),
+    // `tjs_int64 DeleteTabItem(int tabid, VarT pos)` (`:935`), `tjs_int
+    // SetCurSelTab(int tabid, VarT pos)` (`:955`) and `tjs_int64
+    // SelectTab(int tabid, VarT dlg)` (`:962`).
+    for name in [
+        "getItemLong",
+        "invalidateRect",
+        "deleteTab",
         "setCurSel",
         "selectTab",
-        "openProgress",
-        "propSheetMessage",
     ] {
-        runtime.register_object_native(handle, name, zero);
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(2),
+            zero,
+        );
     }
-    runtime.register_object_native(handle, "getItemClassName", empty_string);
-    runtime.register_object_native(handle, "getItemText", empty_string);
+    // Three arguments: `long SetItemLong(int id, int index, long newlong)`
+    // (`:419`), `void SetItemPos(int id, int x, int y)` (`:476`), `void
+    // SetItemSize(int id, int w, int h)` (`:479`), `tjs_int64
+    // InsertTabItem(int tabid, VarT pos, VarT title)` (`:920`), `LRESULT
+    // propSheetMessage(int msg, VarT wp, VarT lp)` (`:811`) and the
+    // `(msg, wp, lp)` event default stubs (`:633-638`).
+    for name in [
+        "setItemPos",
+        "setItemSize",
+        "onInit",
+        "onCommand",
+        "onHScroll",
+        "onVScroll",
+        "onSize",
+    ] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(3),
+            native_void,
+        );
+    }
+    for name in ["setItemLong", "insertTab", "propSheetMessage"] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(3),
+            zero,
+        );
+    }
+    // No parameter at all: `bool UnlockItemUpdate()` (`:428`), `VarT
+    // GetBaseUnits()` (`:566`), `void closeProgress()` (`:994`), `void
+    // BringToFront()` (`:1289`), and the shipped DLL's `void setActive()` and
+    // its two rectangle readers `VarT getWindowRect() const` /
+    // `VarT getClientRect() const`, which register no parameter either.
+    for name in ["bringToFront", "closeProgress", "setActive"] {
+        runtime.register_object_native(handle, name, native_void);
+    }
+    runtime.register_object_native(handle, "unlockItemUpdate", zero);
     runtime.register_object_native(handle, "getBaseUnits", base_units);
-    // `VarT MapRect(VarT in) const` (`:576`, registered `:1720`); the
-    // `getWindowRect`/`getClientRect` pair takes no argument.
+    for name in ["getWindowRect", "getClientRect"] {
+        runtime.register_object_native(handle, name, empty_rect);
+    }
+    // `VarT MapRect(VarT in) const` (`:576`, registered `:1720`).
     runtime.register_object_native_with_arg_count(
         handle,
         "mapRect",
         NativeArgCount::AtLeast(1),
         empty_rect,
     );
-    for name in ["getWindowRect", "getClientRect"] {
-        runtime.register_object_native(handle, name, empty_rect);
+
+    // The shipped DLL's four window members (`docs/plugins/win32dialog.md`
+    // §4), which the bundled source does not register. They act on the
+    // dialog's own `HWND`, which no Kirakira platform gives us, so each
+    // answers the reference's own no-window result: `getPlacement` and
+    // `setPlacement` leave the result void, `maximize` and `restoreMaximize`
+    // return `hasWin` = false. `setPlacement` is a raw callback in the DLL
+    // (`0x100059e0`) that checks the count itself (`num < 1` is
+    // `TJS_E_BADPARAMCOUNT`) and rejects a first argument that is not an
+    // object with `TJS_E_INVALIDPARAM`.
+    runtime.register_object_native(handle, "getPlacement", native_void);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "setPlacement",
+        NativeArgCount::AtLeast(1),
+        set_placement,
+    );
+    for name in ["maximize", "restoreMaximize"] {
+        runtime.register_object_native(handle, name, zero);
     }
-    runtime.register_object_native(handle, "getScrollInfo", scroll_info);
 
     // read/write data members
     runtime.set_object_member(handle, "modeless", Variant::Integer(0));
@@ -252,12 +391,33 @@ fn install_dialog_statics(runtime: &mut Runtime<KrkrHost>, class: ObjectHandle) 
         NativeArgCount::AtLeast(4),
         message_box,
     );
-    runtime.register_object_native(class, "chooseColor", native_void);
+    // `static bool InitCommonControlsEx(DWORD icc)` (`:1212`), `static
+    // tjs_int64 GetOctetAddress(tTJSVariant oct)` (`:1280`) and
+    // `GetStringAddress(tTJSVariant str)` (`:1283`) take one parameter;
+    // `static tjs_int64 OpenPropertySheet(VarT win, VarT vpages, VarT velm)`
+    // (`:849`) takes three. `static void InitCommonControls()` (`:1209`) takes
+    // none, and `chooseColor(window?, elm?)` is a raw callback that reads
+    // `num >= 1` / `num >= 2` itself (`:1231-1245`).
+    runtime.register_object_native_with_arg_count(
+        class,
+        "initCommonControlsEx",
+        NativeArgCount::AtLeast(1),
+        one,
+    );
+    for (name, count) in [
+        ("getOctetAddress", 1),
+        ("getStringAddress", 1),
+        ("openPropertySheet", 3),
+    ] {
+        runtime.register_object_native_with_arg_count(
+            class,
+            name,
+            NativeArgCount::AtLeast(count),
+            zero,
+        );
+    }
     runtime.register_object_native(class, "initCommonControls", native_void);
-    runtime.register_object_native(class, "initCommonControlsEx", one);
-    runtime.register_object_native(class, "getOctetAddress", zero);
-    runtime.register_object_native(class, "getStringAddress", zero);
-    runtime.register_object_native(class, "openPropertySheet", zero);
+    runtime.register_object_native(class, "chooseColor", native_void);
 }
 
 // Pretend the user pressed the default button of the message box.
@@ -330,12 +490,24 @@ fn subclass_constructor(
 }
 
 fn install_header_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    runtime.register_object_native(handle, "store", native_void);
+    // `void store(tTJSVariant elmobj)` (`:1308`).
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "store",
+        NativeArgCount::AtLeast(1),
+        native_void,
+    );
     runtime.set_object_member(handle, "dlgItems", Variant::Integer(0));
 }
 
 fn install_items_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    runtime.register_object_native(handle, "store", native_void);
+    // `void store(tTJSVariant elmobj)` (`:1338`).
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "store",
+        NativeArgCount::AtLeast(1),
+        native_void,
+    );
 }
 
 fn bitmap_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
@@ -363,7 +535,13 @@ fn solid_brush_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
 }
 
 fn install_draw_item_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
-    runtime.register_object_native(handle, "draw", native_void);
+    // `void draw(Bitmap *bmp, tjs_int x, tjs_int y)` (`:130`).
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "draw",
+        NativeArgCount::AtLeast(3),
+        native_void,
+    );
     for name in [
         "ctrlType",
         "ctrlID",
@@ -382,8 +560,15 @@ fn install_notify_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle)
     for name in ["hwndFrom", "idFrom", "code"] {
         runtime.register_object_native_property(handle, name, prop_zero, prop_read_only);
     }
+    // `BYTE GetByte(int ofs)`, `WORD GetWord(int ofs)`, `DWORD
+    // GetDWord(int ofs)` (`:154-156`).
     for name in ["getByte", "getWord", "getDWord"] {
-        runtime.register_object_native(handle, name, zero);
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(1),
+            zero,
+        );
     }
 }
 
@@ -399,7 +584,13 @@ fn blob_constructor(runtime: &mut Runtime<KrkrHost>) -> ObjectHandle {
     );
     runtime.add_object_class_info(handle, "Blob");
     install_blob_members(runtime, handle);
-    runtime.register_object_native(handle, "ReferPointer", blob_refer_pointer);
+    // `static Blob *ReferPointer(DWORD ptr)` (`:176`).
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "ReferPointer",
+        NativeArgCount::AtLeast(1),
+        blob_refer_pointer,
+    );
     handle
 }
 
@@ -427,13 +618,35 @@ fn blob_refer_pointer(
 
 fn install_blob_members(runtime: &mut Runtime<KrkrHost>, handle: ObjectHandle) {
     runtime.register_object_native_property(handle, "pointer", prop_zero, prop_read_only);
-    for name in ["getByte", "getWord", "getDWord", "getDWordLong"] {
-        runtime.register_object_native(handle, name, zero);
+    // `BYTE/ WORD/ DWORD GetByte/GetWord/GetDWord(int ofs) const` (`:168-170`),
+    // `ttstr GetText(int ofs) const` (`:174`); `getDWordLong` is this stub's
+    // own convenience member (`Blob` has no 64-bit accessor in the reference).
+    for name in ["getByte", "getWord", "getDWord"] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(1),
+            zero,
+        );
     }
-    runtime.register_object_native(handle, "getText", empty_string);
-    for name in ["setByte", "setWord", "setDWord", "setDWordLong", "setText"] {
-        runtime.register_object_native(handle, name, native_void);
+    runtime.register_object_native_with_arg_count(
+        handle,
+        "getText",
+        NativeArgCount::AtLeast(1),
+        empty_string,
+    );
+    runtime.register_object_native(handle, "getDWordLong", zero);
+    // `void SetByte/SetWord/SetDWord(int ofs, v)` (`:171-173`) and `void
+    // SetText(int ofs, tjs_char const *text)` (`:175`).
+    for name in ["setByte", "setWord", "setDWord", "setText"] {
+        runtime.register_object_native_with_arg_count(
+            handle,
+            name,
+            NativeArgCount::AtLeast(2),
+            native_void,
+        );
     }
+    runtime.register_object_native(handle, "setDWordLong", native_void);
 }
 
 // -------------------------------------------------------------
@@ -532,6 +745,30 @@ fn native_void(
     _this_obj: Option<ObjectHandle>,
     _args: Vec<Variant>,
 ) -> Result<Variant> {
+    Ok(Variant::Void)
+}
+
+/// The shipped DLL's `setPlacement(dict)` raw callback (`0x100059e0`), which
+/// the bundled source does not register: `num < 1` is `TJS_E_BADPARAMCOUNT`
+/// (registered here as the member's `AtLeast(1)` floor), a first argument that
+/// is not an object is `TJS_E_INVALIDPARAM`, and the placement itself goes to
+/// `SetWindowPlacement` — which has no dialog window to apply to, so the
+/// reference's own no-window answer is void.
+// `result_large_err` is the crate-wide `TjsError` size lint every native
+// handler carries (`k2compat.rs` allows it too); the handlers this module
+// already had predate that allowance, and this one adds no further warning.
+#[allow(clippy::result_large_err)]
+fn set_placement(
+    _runtime: &mut Runtime<KrkrHost>,
+    _this_obj: Option<ObjectHandle>,
+    args: Vec<Variant>,
+) -> Result<Variant> {
+    let Some(placement) = args.first() else {
+        return Err(TjsError::bad_param_count());
+    };
+    if placement.object_handle().is_none() {
+        return Err(TjsError::invalid_param());
+    }
     Ok(Variant::Void)
 }
 
@@ -1705,7 +1942,7 @@ const STR_CONSTANTS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use krkr_engine::{EngineConfig, KrkrEngine};
-    use krkr_tjs2::runtime::Variant;
+    use krkr_tjs2::{TjsErrorKind, runtime::Variant};
 
     use super::Win32DialogPlugin;
 
@@ -1715,34 +1952,269 @@ mod tests {
         engine
     }
 
-    /// Every member the reference registers with `Method(...)` carries its
-    /// PMF's parameter count as ncbind's `ArgsCount`, so a shorter call is
-    /// `TJS_E_BADPARAMCOUNT` (`ncbind.hpp:1186`), code -1004 — the members are
-    /// `close(id)` (`main.cpp:610`), `getItem(id)` (`:415`),
-    /// `setItemLong(id, index, value)` (`:419`), `setPos(x, y)` (`:492`),
-    /// `mapRect(rect)` (`:576`) and `messageBox(window, text, caption, type)`
-    /// (`:1127`).
+    /// Every member whose reference registration declares a parameter count —
+    /// the DLL's `ncbNativeClassMethod` `ArgsCount` for `Method(...)` members
+    /// (`ncbind.hpp:1186`: `numparams < ArgsCount` is `TJS_E_BADPARAMCOUNT`
+    /// before the body runs, code -1004) and the handler's own `num < n` check
+    /// for the raw callbacks — rejects a shorter call with the reference's
+    /// error and still accepts a call at the declared arity. Anchors are the
+    /// bundled source (`main.cpp`, same line numbers as the krkrz snapshot);
+    /// the shipped DLL's registration RTTI carries the same counts.
     #[test]
     fn short_calls_are_bad_parameter_counts() {
         let mut engine = engine();
-        for (member, call) in [
-            ("close", "var d = new WIN32Dialog(); d.close();"),
-            ("getItem", "var d = new WIN32Dialog(); d.getItem();"),
+        for (member, short, exact) in [
+            // `void close(DWORD id)` (`:610`), `tjs_int64 GetItem(int)` (`:415`).
+            ("close", "d.close()", "d.close(0)"),
+            ("getItem", "d.getItem()", "d.getItem(1)"),
+            // `int GetItemID(tjs_int64 hwnd)` (`:416`), `VarT
+            // GetItemClassName(int)` (`:400`).
+            ("getItemID", "d.getItemID()", "d.getItemID(1)"),
+            (
+                "getItemClassName",
+                "d.getItemClassName()",
+                "d.getItemClassName(1)",
+            ),
+            // `long SetItemLong(int, int, long)` (`:419`), `long
+            // GetItemLong(int, int)` (`:418`).
             (
                 "setItemLong",
-                "var d = new WIN32Dialog(); d.setItemLong(1, 0);",
+                "d.setItemLong(1, 0)",
+                "d.setItemLong(1, 0, 5)",
             ),
-            ("setPos", "var d = new WIN32Dialog(); d.setPos(1);"),
-            ("mapRect", "var d = new WIN32Dialog(); d.mapRect();"),
+            ("getItemLong", "d.getItemLong(1)", "d.getItemLong(1, 0)"),
+            // `void SetItemInt(int, int)` (`:436`), `int GetItemInt(int)`
+            // (`:430`).
+            ("setItemInt", "d.setItemInt(1)", "d.setItemInt(1, 0)"),
+            ("getItemInt", "d.getItemInt()", "d.getItemInt(1)"),
+            // `void SetItemText(int, NameT)` (`:451`), `StringT
+            // GetItemText(int)` (`:441`).
+            (
+                "setItemText",
+                "d.setItemText(1)",
+                "d.setItemText(1, \"text\")",
+            ),
+            ("getItemText", "d.getItemText()", "d.getItemText(1)"),
+            // `void SetItemEnabled(int, bool)` (`:458`), `bool
+            // GetItemEnabled(int)` (`:461`), `void SetItemFocus(int)` (`:464`).
+            (
+                "setItemEnabled",
+                "d.setItemEnabled(1)",
+                "d.setItemEnabled(1, 1)",
+            ),
+            (
+                "getItemEnabled",
+                "d.getItemEnabled()",
+                "d.getItemEnabled(1)",
+            ),
+            ("setItemFocus", "d.setItemFocus()", "d.setItemFocus(1)"),
+            // `long GetItemLeft/Top/Width/Height(int)` (`:472-475`).
+            ("getItemLeft", "d.getItemLeft()", "d.getItemLeft(1)"),
+            ("getItemTop", "d.getItemTop()", "d.getItemTop(1)"),
+            ("getItemWidth", "d.getItemWidth()", "d.getItemWidth(1)"),
+            ("getItemHeight", "d.getItemHeight()", "d.getItemHeight(1)"),
+            // `void SetItemPos(int, int, int)` (`:476`), `void
+            // SetItemSize(int, int, int)` (`:479`).
+            ("setItemPos", "d.setItemPos(1, 0)", "d.setItemPos(1, 0, 0)"),
+            (
+                "setItemSize",
+                "d.setItemSize(1, 0)",
+                "d.setItemSize(1, 0, 0)",
+            ),
+            // Raw callbacks whose handler checks `numparams`: `setItemBitmap`
+            // (`:484`) and `sendItemMessage` (`:529`) need two.
+            (
+                "setItemBitmap",
+                "d.setItemBitmap(1)",
+                "d.setItemBitmap(1, null)",
+            ),
+            (
+                "sendItemMessage",
+                "d.sendItemMessage(1)",
+                "d.sendItemMessage(1, 1)",
+            ),
+            // `bool IsExistentItem(int)` (`:417`), `bool LockItemUpdate(int)`
+            // (`:427`).
+            (
+                "isExistentItem",
+                "d.isExistentItem()",
+                "d.isExistentItem(1)",
+            ),
+            (
+                "lockItemUpdate",
+                "d.lockItemUpdate()",
+                "d.lockItemUpdate(1)",
+            ),
+            // `VarT MapRect(VarT)` (`:576`), `bool InvalidateRect(VarT, bool)`
+            // (`:593`), `bool InvalidateAll(bool)` (`:589`).
+            (
+                "mapRect",
+                "d.mapRect()",
+                "d.mapRect(%[left => 0, top => 0, right => 1, bottom => 1])",
+            ),
+            (
+                "invalidateRect",
+                "d.invalidateRect(%[])",
+                "d.invalidateRect(%[], 0)",
+            ),
+            ("invalidateAll", "d.invalidateAll()", "d.invalidateAll(0)"),
+            // `void SetPos(int, int)` (`:492`), `void SetSize(int, int)`
+            // (`:493`), `void show(int)` (`:626`).
+            ("setPos", "d.setPos(1)", "d.setPos(0, 0)"),
+            ("setSize", "d.setSize(1)", "d.setSize(0, 0)"),
+            ("show", "d.show()", "d.show(1)"),
+            // The `(msg, wp, lp)` event default stubs (`:633-638`) and
+            // `onNotify(wp, Notify)` (`:635`).
+            ("onInit", "d.onInit()", "d.onInit(0, 0, 0)"),
+            ("onCommand", "d.onCommand()", "d.onCommand(0, 0, 0)"),
+            ("onNotify", "d.onNotify(0)", "d.onNotify(0, null)"),
+            ("onHScroll", "d.onHScroll()", "d.onHScroll(0, 0, 0)"),
+            ("onVScroll", "d.onVScroll()", "d.onVScroll(0, 0, 0)"),
+            ("onSize", "d.onSize()", "d.onSize(0, 0, 0)"),
+            // `VarT getScrollInfo(int)` (`:1028`), the `setScrollInfo(id,
+            // pos?, min?, max?, page?)` raw callback (`:1001`), the
+            // `openProgress(id, …)` raw callback (`:1566`).
+            ("getScrollInfo", "d.getScrollInfo()", "d.getScrollInfo(1)"),
+            (
+                "setScrollInfo",
+                "d.setScrollInfo()",
+                "d.setScrollInfo(1, 0, 0, 0, 0)",
+            ),
+            ("openProgress", "d.openProgress()", "d.openProgress(1)"),
+            // `loadResource(dll, res?)` (`:349`) and `makeTemplate(header,
+            // items*)` (`:1360`), raw callbacks with a `numparams < 1` check.
+            (
+                "loadResource",
+                "d.loadResource()",
+                "d.loadResource(\"resource.dll\")",
+            ),
+            (
+                "makeTemplate",
+                "d.makeTemplate()",
+                "d.makeTemplate(new WIN32Dialog.Header())",
+            ),
+            // `tjs_int64 InsertTabItem(int, VarT, VarT)` (`:920`), `tjs_int64
+            // DeleteTabItem(int, VarT)` (`:935`), `tjs_int64
+            // DeleteAllTabItem(int)` (`:942`).
+            (
+                "insertTab",
+                "d.insertTab(1, 0)",
+                "d.insertTab(1, 0, \"title\")",
+            ),
+            ("deleteTab", "d.deleteTab(1)", "d.deleteTab(1, 0)"),
+            ("deleteAllTab", "d.deleteAllTab()", "d.deleteAllTab(1)"),
+            // `tjs_int GetCurSelTab(int)` (`:949`), `tjs_int
+            // SetCurSelTab(int, VarT)` (`:955`), `tjs_int64 SelectTab(int,
+            // VarT)` (`:962`).
+            ("getCurSel", "d.getCurSel()", "d.getCurSel(1)"),
+            ("setCurSel", "d.setCurSel(1)", "d.setCurSel(1, 0)"),
+            ("selectTab", "d.selectTab(1)", "d.selectTab(1, null)"),
+            // `LRESULT propSheetMessage(int, VarT, VarT)` (`:811`), `void
+            // setMessageResult(LONG)` (`:845`).
+            (
+                "propSheetMessage",
+                "d.propSheetMessage(1, 0)",
+                "d.propSheetMessage(1, 0, 0)",
+            ),
+            (
+                "setMessageResult",
+                "d.setMessageResult()",
+                "d.setMessageResult(0)",
+            ),
+            // The shipped DLL's `setPlacement` raw callback checks `num < 1`
+            // itself (`0x100059e0`); its `dict` argument must be an object.
+            (
+                "setPlacement",
+                "d.setPlacement()",
+                "d.setPlacement(%[showCmd => 1])",
+            ),
+            // Statics: `static int MessageBox(iTJSDispatch2*, NameT, NameT,
+            // UINT)` (`:1127`), `static bool InitCommonControlsEx(DWORD)`
+            // (`:1212`), `static tjs_int64 GetOctetAddress(tTJSVariant)`
+            // (`:1280`) and `GetStringAddress` (`:1283`), `static tjs_int64
+            // OpenPropertySheet(VarT, VarT, VarT)` (`:849`).
             (
                 "messageBox",
-                "WIN32Dialog.messageBox(0, \"text\", \"caption\");",
+                "WIN32Dialog.messageBox(0, \"text\", \"caption\")",
+                "WIN32Dialog.messageBox(0, \"text\", \"caption\", 4)",
+            ),
+            (
+                "initCommonControlsEx",
+                "WIN32Dialog.initCommonControlsEx()",
+                "WIN32Dialog.initCommonControlsEx(0)",
+            ),
+            (
+                "getOctetAddress",
+                "WIN32Dialog.getOctetAddress()",
+                "WIN32Dialog.getOctetAddress(0)",
+            ),
+            (
+                "getStringAddress",
+                "WIN32Dialog.getStringAddress()",
+                "WIN32Dialog.getStringAddress(\"text\")",
+            ),
+            (
+                "openPropertySheet",
+                "WIN32Dialog.openPropertySheet(0, %[])",
+                "WIN32Dialog.openPropertySheet(0, %[], null)",
+            ),
+            // Nested classes: `Header.store(dict)` / `Items.store(dict)`
+            // (`:1308`, `:1338`), `DrawItem.draw(Bitmap, int, int)` (`:130`),
+            // `Notify.getByte/Word/DWord(int)`, `Blob.getByte/…/getText(int)`
+            // and `setByte/…/setText(int, v)` (`:154-176`), the static
+            // `Blob.ReferPointer(DWORD)` (`:176`).
+            (
+                "Header.store",
+                "var h = new WIN32Dialog.Header(); h.store()",
+                "var h = new WIN32Dialog.Header(); h.store(%[])",
+            ),
+            (
+                "Items.store",
+                "var i = new WIN32Dialog.Items(); i.store()",
+                "var i = new WIN32Dialog.Items(); i.store(%[])",
+            ),
+            (
+                "DrawItem.draw",
+                "var item = new WIN32Dialog.DrawItem(); item.draw(null, 0)",
+                "var item = new WIN32Dialog.DrawItem(); item.draw(null, 0, 0)",
+            ),
+            (
+                "Notify.getByte",
+                "var n = new WIN32Dialog.Notify(); n.getByte()",
+                "var n = new WIN32Dialog.Notify(); n.getByte(0)",
+            ),
+            (
+                "Blob.getByte",
+                "var b = new WIN32Dialog.Blob(8); b.getByte()",
+                "var b = new WIN32Dialog.Blob(8); b.getByte(0)",
+            ),
+            (
+                "Blob.getText",
+                "var b = new WIN32Dialog.Blob(8); b.getText()",
+                "var b = new WIN32Dialog.Blob(8); b.getText(0)",
+            ),
+            (
+                "Blob.setByte",
+                "var b = new WIN32Dialog.Blob(8); b.setByte(0)",
+                "var b = new WIN32Dialog.Blob(8); b.setByte(0, 1)",
+            ),
+            (
+                "Blob.setText",
+                "var b = new WIN32Dialog.Blob(8); b.setText(0)",
+                "var b = new WIN32Dialog.Blob(8); b.setText(0, \"text\")",
+            ),
+            (
+                "Blob.ReferPointer",
+                "WIN32Dialog.Blob.ReferPointer()",
+                "WIN32Dialog.Blob.ReferPointer(0)",
             ),
         ] {
-            let error = engine.execute_script("short.tjs", call).expect_err(member);
+            let error = engine
+                .execute_script("short.tjs", &format!("var d = new WIN32Dialog(); {short};"))
+                .expect_err(member);
             assert_eq!(
                 error.kind,
-                krkr_tjs2::TjsErrorKind::BadParamCount,
+                TjsErrorKind::BadParamCount,
                 "{member}: {}",
                 error.message
             );
@@ -1752,13 +2224,103 @@ mod tests {
                 "{member} must be the reference's TJS_E_BADPARAMCOUNT"
             );
             assert_eq!(error.message, "Invalid argument count", "{member}");
+            engine
+                .execute_script("exact.tjs", &format!("var d = new WIN32Dialog(); {exact};"))
+                .unwrap_or_else(|error| {
+                    panic!("{member} rejects its declared arity: {}", error.message)
+                });
+        }
+    }
+
+    /// The four members the shipped DLL registers and the bundled source does
+    /// not (`docs/plugins/win32dialog.md` §4) are reachable — `typeof` is the
+    /// "Object" the games' own guards probe for — and answer exactly what the
+    /// reference answers while no dialog window exists: `getPlacement()` and
+    /// `setPlacement(dict)` leave the result void (nothing to read or write
+    /// without an `HWND`) and `maximize()` / `restoreMaximize()` return
+    /// `hasWin`, false. `setPlacement` keeps the DLL's own checks: no argument
+    /// is `TJS_E_BADPARAMCOUNT`, a first argument that is not an object is
+    /// `TJS_E_INVALIDPARAM`.
+    #[test]
+    fn the_dll_window_members_answer_the_reference_without_a_window() {
+        let mut engine = engine();
+        let kinds = engine
+            .execute_expression(
+                "kinds.tjs",
+                "(function() {\n\
+                     var dialog = new WIN32Dialog(null);\n\
+                     return \"\" + (typeof dialog.getPlacement)\n\
+                         + \",\" + (typeof dialog.setPlacement)\n\
+                         + \",\" + (typeof dialog.restoreMaximize)\n\
+                         + \",\" + (typeof dialog.maximize);\n\
+                 })()",
+            )
+            .expect("the DLL's members must be reachable");
+        assert_eq!(
+            kinds,
+            Variant::String("Object,Object,Object,Object".to_owned())
+        );
+
+        for (member, source) in [
+            (
+                "getPlacement",
+                "(function() { var d = new WIN32Dialog(); return typeof d.getPlacement(); })()",
+            ),
+            (
+                "setPlacement",
+                "(function() { var d = new WIN32Dialog(); return typeof d.setPlacement(%[showCmd => 1]); })()",
+            ),
+        ] {
+            let value = engine
+                .execute_expression("no_window.tjs", source)
+                .unwrap_or_else(|error| panic!("{member}: {}", error.message));
+            // `typeof` names the void result in the reference's own spelling.
+            assert_eq!(value, Variant::String("void".to_owned()), "{member}");
+        }
+        for (member, source) in [
+            (
+                "maximize",
+                "(function() { var d = new WIN32Dialog(); return d.maximize(); })()",
+            ),
+            (
+                "restoreMaximize",
+                "(function() { var d = new WIN32Dialog(); return d.restoreMaximize(); })()",
+            ),
+        ] {
+            let value = engine
+                .execute_expression("no_window.tjs", source)
+                .expect(member);
+            assert_eq!(value, Variant::Integer(0), "{member} returns hasWin");
+        }
+
+        for (member, call, kind, code) in [
+            (
+                "setPlacement()",
+                "var d = new WIN32Dialog(); d.setPlacement();",
+                TjsErrorKind::BadParamCount,
+                -1004,
+            ),
+            (
+                "setPlacement(1)",
+                "var d = new WIN32Dialog(); d.setPlacement(1);",
+                TjsErrorKind::InvalidParam,
+                -1003,
+            ),
+        ] {
+            let error = engine
+                .execute_script("window_member.tjs", call)
+                .expect_err(member);
+            assert_eq!(error.kind, kind, "{member}: {}", error.message);
+            assert_eq!(error.kind.tjs_error_code(), Some(code), "{member}");
         }
     }
 
     /// The shapes the games call still run against the stub:
     /// `k2compat_modeless.tjs`'s `setPos`/`setSize`/`mapRect`,
-    /// `WIN32DialogEX`'s item plumbing, and `world.tjs`'s
-    /// `messageBox(win, msg, title, type)`.
+    /// `WIN32DialogEX`'s item plumbing, `world.tjs`'s
+    /// `messageBox(win, msg, title, type)`, and the console placement dance
+    /// PARQUET's `MainWindow.tjs` runs against `Debug.console` (`getPlacement`
+    /// probed with `typeof`, then the guarded `maximize`/`restoreMaximize`).
     #[test]
     fn the_games_call_shapes_still_run() {
         let mut engine = engine();
@@ -1778,5 +2340,24 @@ mod tests {
             .expect("the games' call shapes must run");
         // MB_YESNO: the stub reports the default button, IDYES.
         assert_eq!(value, Variant::Integer(6));
+
+        let value = engine
+            .execute_expression(
+                "console_placement.tjs",
+                "(function() {\n\
+                     var console = new WIN32Dialog(null);\n\
+                     var place = console.getPlacement();\n\
+                     if (typeof place == \"Object\") {\n\
+                         console.setPos(place.normalLeft, place.normalTop);\n\
+                     }\n\
+                     if (typeof console.maximize == \"Object\") { console.maximize(); }\n\
+                     if (typeof console.restoreMaximize == \"Object\") { console.restoreMaximize(); }\n\
+                     return console.setPlacement(%[showCmd => 1, flags => 0, normalLeft => 0, normalTop => 0, normalRight => 640, normalBottom => 480]) === void;\n\
+                 })()",
+            )
+            .expect("the console placement dance must run");
+        // Without a dialog window the placement reads back void, so the guard
+        // skips the reposition and `setPlacement` keeps the dictionary.
+        assert_eq!(value, Variant::Integer(1));
     }
 }
