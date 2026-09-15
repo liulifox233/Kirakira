@@ -4225,12 +4225,26 @@ impl KagSession {
                 Ok(TagAction::Continue)
             }
             NativeFallbackTag::Next => {
-                // The reference's `next` handler (`MainWindow.tjs`, the `next`
-                // tag): `exp` first, then nothing at all when the tag names
-                // neither `storage` nor `target`, then the project's own
-                // `onNext` function hooks — GINKA's world player answers those
-                // with the scene it advances to — and only when no hook took
-                // the tag KAG's own transition, `process(storage, target)`.
+                // The reference's `next` handler (`MainWindow.tjs:11592`, the
+                // `next` tag): the `eval` gate (`:11599`) first, then `exp`,
+                // then nothing at all when the tag names neither `storage` nor
+                // `target`, then the project's own `onNext` function hooks —
+                // GINKA's world player answers those with the scene it advances
+                // to — and only when no hook took the tag KAG's own transition,
+                // `process(storage, target)`.
+                //
+                // The gate lives *here*, in the handler, not in the parser:
+                // `eval` is arbitrary TJS (the reference evaluates it exactly
+                // once per fetched tag) and this tag has two paths — a project
+                // whose own conductor pulls it with `getNextTag` evaluates it in
+                // its own handler, and one the engine session drives evaluates
+                // it here. A parser-level gate would add a second evaluation on
+                // the first path (`Scripts.eval` may have side effects), and the
+                // reference parser has no `eval` gate at all — it special-cases
+                // only `cond` (`KAGParser.cpp:2223-2232`).
+                if !kag_eval_allows(runtime, &tag)? {
+                    return Ok(TagAction::Continue);
+                }
                 if let Some(expression) = tag.literal_attr("exp") {
                     execute_expression_on_runtime(runtime, "kag next", expression)?;
                 }
@@ -4897,12 +4911,20 @@ const TJS_NATIVE_FALLBACK_STEP: i64 = -1_000_000;
 ///    `envinit.tjs` gives the `ev` object's class (`event`) `"trans","normal"`
 ///    and defines `transitions.normal = %[time:1000, method:"", sync:true]`
 ///    (plus a global `fadeValue => 1000` fallback).
-///    Caveat for anyone re-running it: a wrapped `afterCommand` makes GINKA's
-///    conductor stop at the episode (the wrapped run ends at `*logo:172`
-///    `st=stop`, while the unpatched run's `waitall` there spans the 63 frames
-///    of step 2), so read the pin from the log — the *unpatched* run is the one
-///    that measures the durations. The engine itself is clean here: it delivers
-///    the attribute and leaves the game's transition selection alone.
+///    Caveat for anyone re-running it: *this* patch (an `--at-script` closure
+///    assigned over `KAGEnvImage.afterCommand`) makes GINKA's conductor stop at
+///    the episode — the wrapped run ends at `*logo:172` `st=stop` while the
+///    unpatched run's `waitall` there spans the 63 frames of step 2 — so read
+///    the pin from the log; the unpatched run is the one that measures the
+///    durations. Whether a wrapper perturbs the flow depends on which function
+///    object is replaced and how the wrapper is written, not on wrapping as
+///    such: M240's review took the same reading with a wrapper over
+///    `KAGEnvTrans.afterCommand` (original kept in a global) that lets the
+///    episode run to completion, and reproduced this one's stop with the
+///    `KAGEnvImage.afterCommand` hook. Prefer that `KAGEnvTrans` form if the
+///    flow after the pin matters. Neither variant points at an engine defect:
+///    the engine delivers the attribute and leaves the game's transition
+///    selection alone.
 pub(crate) fn kag_tag_trace_wanted(tagname: &str) -> bool {
     static FILTER: OnceLock<Vec<String>> = OnceLock::new();
     let filter = FILTER.get_or_init(|| {
@@ -5021,6 +5043,50 @@ fn cancel_kag_auto_mode(runtime: &mut Runtime<KrkrHost>) {
         return;
     };
     runtime.set_object_member(kag, "autoMode", Variant::Integer(0));
+}
+
+/// The `eval` gate of the reference's `next` handler
+/// (`MainWindow.tjs:11599`): a missing or empty attribute runs the tag,
+/// anything else is evaluated and decides. `Scripts.eval` is arbitrary TJS, so
+/// this runs exactly once per fetched `[next]` — the arm that calls it explains
+/// why the gate belongs to the handler rather than to the parser.
+///
+/// Only `next` reaches an engine-side gate, because only its handler is the
+/// engine's own; every other tag's `eval` belongs to whoever implements the
+/// tag, and the reference parser gates on nothing but `cond`. Audited against
+/// the KAG3/KAGEX template the roster games ship
+/// (`krkr2/kirikiri2/branches/kag3ex3/template/system/MainWindow.tjs`):
+///
+/// * `next` — handler gate wrapping the whole body (`:11599`); engine-owned
+///   (`NativeFallbackTag::Next`), so the gate is here.
+/// * `exit` — handler gate (`:11622`) with auto-label bookkeeping *before* it
+///   (`:11614-11621`). The engine has no `exit` implementation, so the tag
+///   reaches the project's handler untouched (GINKA's shipped `t1["exit"]` is
+///   that handler) and nothing here may pre-evaluate it.
+/// * `seladd` — handler gate with pre-gate bookkeeping: the option is only
+///   registered when the expression is true (`if (show) { … f.selectInfos.add(e) }`,
+///   `:4408-4414`), and `f.selectTotalCount++` runs before the gate (`:4402`).
+/// * `mseladd` — handler gate around `addSelect` (`:4506-4508`).
+/// * `bradd`/`branch` — deferred value: `addBranch` only stores the entry
+///   (`:4532-4543`), and `doBranch` evaluates each stored entry's `eval` when it
+///   runs (`:4550`).
+/// * `beginskip` — value: `enableLeftBeginSkip = (elm.eval == "" || Scripts.eval(elm.eval))`
+///   (`:11646`), and the tag runs either way.
+/// * every other tag — its handler never reads `eval`; the reference parser
+///   stores the attribute like any other (`KAGParser.cpp:2223-2232`
+///   special-cases only `cond`, which it drops), so such a tag acts
+///   unconditionally.
+#[allow(clippy::result_large_err)] // the crate-wide `TjsError` size lint
+fn kag_eval_allows(runtime: &mut Runtime<KrkrHost>, tag: &Tag) -> Result<bool> {
+    let Some(value) = tag.attr("eval") else {
+        return Ok(true);
+    };
+    let expression = value.raw();
+    if expression.is_empty() {
+        return Ok(true);
+    }
+    let evaluated = execute_expression_on_runtime(runtime, "kag eval", expression)?;
+    Ok(evaluated.is_truthy())
 }
 
 fn kag_transition_spec(
@@ -22182,6 +22248,44 @@ mod tests {
 
         assert_eq!(tick.state, KagTaskState::Finished);
         assert_eq!(engine.message_layer().lines, vec!["AFTER".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The reference's `next` handler wraps its whole body in
+    /// `if (elm.eval == "" || Scripts.eval(elm.eval))` (`MainWindow.tjs:11599`)
+    /// and evaluates that expression exactly once per fetched tag. The gate
+    /// lives in the engine's arm, not in the parser (`KAGParser.cpp:2223-2232`
+    /// gates only `cond`), so each path evaluates it once and never twice: this
+    /// engine-session path here, and a project that pulls the tag with
+    /// `getNextTag` in its own handler.
+    #[test]
+    fn kag_next_eval_gates_the_move_and_runs_once_per_tag() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            root.join("first.ks"),
+            "[next storage=\"wrong.ks\" eval='f.calls = f.calls + 1, false'][next storage=\"right.ks\" eval='f.calls = f.calls + 1, true'][s]",
+        )
+        .expect("write scenario");
+        fs::write(root.join("wrong.ks"), "WRONG[s]").expect("write gated scenario");
+        fs::write(root.join("right.ks"), "RIGHT[s]").expect("write target scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine
+            .execute_script("inline.tjs", "var f = new Dictionary(); f.calls = 0;")
+            .expect("counter");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        engine.tick().expect("next transition");
+
+        // The gated-out tag did not move the scenario, the second one did, and
+        // each of the two tags ran its `eval` exactly once.
+        assert_eq!(engine.kag_location().storage.as_deref(), Some("right.ks"));
+        assert_eq!(
+            engine
+                .execute_expression("probe.tjs", "f.calls")
+                .expect("calls"),
+            Variant::Integer(2)
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
