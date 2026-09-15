@@ -3750,34 +3750,55 @@ impl KagSession {
         from: &str,
         to: &str,
     ) -> (String, Option<String>) {
-        if let Some(entry) = self.sysjump_registry_entry(from, to) {
-            return entry;
+        if let Some((name, storage, target)) = self.sysjump_registry_entry(from, to) {
+            runtime.host_mut().log(&format!(
+                "KAG `[sysjump]` {from}->{to} resolved by the registered entry `{name}`: \
+                 storage=`{storage}` target={target:?}"
+            ));
+            return (storage, target);
         }
         // The declarations are normally already in the table by the time a
         // project jumps (its `custom.ks` runs at boot, and each `[addSysScript]`
         // registers itself); a project that reaches a sysjump first still gets
         // the same declarations from the scan, exactly as `[syshook]` does.
         self.load_system_hook_declarations(runtime);
-        self.sysjump_registry_entry(from, to)
-            .unwrap_or_else(|| (format!("{to}.ks"), None))
+        if let Some((name, storage, target)) = self.sysjump_registry_entry(from, to) {
+            runtime.host_mut().log(&format!(
+                "KAG `[sysjump]` {from}->{to} resolved by the scanned entry `{name}`: \
+                 storage=`{storage}` target={target:?}"
+            ));
+            return (storage, target);
+        }
+        runtime.host_mut().log(&format!(
+            "KAG `[sysjump]` {from}->{to} has no sys-script entry; loading the scenario \
+             `{to}.ks`"
+        ));
+        (format!("{to}.ks"), None)
     }
 
-    fn sysjump_registry_entry(&self, from: &str, to: &str) -> Option<(String, Option<String>)> {
+    /// The registry entry a `[sysjump]` resolves to, with the name it matched:
+    /// `"<to>.from.<from>"` first, then the reference's head-name inheritance
+    /// (`SystemScriptMap.get`) with the entry named `<to>` and no target.
+    fn sysjump_registry_entry(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Option<(String, String, Option<String>)> {
         let exact = format!("{to}.from.{from}");
-        if let Some(storage) = self
-            .system_hooks
-            .get(&exact)
-            .and_then(|hook| hook.storage.as_deref())
-            .filter(|storage| is_sysjump_storage(storage))
-        {
-            let target = self.system_hooks[&exact].target.clone();
-            return Some((sysjump_storage(storage), target));
+        if let Some((storage, target)) = self.system_hooks.get(&exact).and_then(|hook| {
+            hook.storage
+                .as_deref()
+                .filter(|storage| is_sysjump_storage(storage))
+                .map(|storage| (sysjump_storage(storage), hook.target.clone()))
+        }) {
+            return Some((exact, storage, target));
         }
-        self.system_hooks
-            .get(to)
-            .and_then(|hook| hook.storage.as_deref())
-            .filter(|storage| is_sysjump_storage(storage))
-            .map(|storage| (sysjump_storage(storage), None))
+        self.system_hooks.get(to).and_then(|hook| {
+            hook.storage
+                .as_deref()
+                .filter(|storage| is_sysjump_storage(storage))
+                .map(|storage| (to.to_string(), sysjump_storage(storage), None))
+        })
     }
 
     /// The engine-driven read of the project's `custom.ks` hook declarations,
@@ -3810,11 +3831,13 @@ impl KagSession {
             let Some(hook_name) = hook_attr(command, "name") else {
                 continue;
             };
+            let storage = declared_hook_value(runtime, hook_attr(command, "storage"));
+            let target = declared_hook_value(runtime, hook_attr(command, "target"));
             self.system_hooks.insert(
                 hook_name,
                 SystemHook {
-                    storage: hook_attr(command, "storage"),
-                    target: hook_attr(command, "target"),
+                    storage,
+                    target,
                     call: command.starts_with("[addSysHook") && decl_jump_or_call(command, true),
                 },
             );
@@ -4070,11 +4093,14 @@ impl KagSession {
                 if let Some(expression) = tag.literal_attr("exp") {
                     execute_expression_on_runtime(runtime, "kag next", expression)?;
                 }
-                let storage = tag
-                    .literal_attr("storage")
-                    .filter(|value| !value.is_empty());
-                let target = tag.literal_attr("target").filter(|value| !value.is_empty());
-                if storage.is_none() && target.is_none() {
+                // An empty value is not an absent one: the handler's no-op test
+                // is `l0 == "" && l1 == ""` and the hooks are called with the
+                // values as written (`[next storage="scn000.ks" target=""]`
+                // hands the hook `""`, which is a target it can look at), so
+                // only the no-op check reads emptiness.
+                let storage = tag.literal_attr("storage");
+                let target = tag.literal_attr("target");
+                if storage.unwrap_or("").is_empty() && target.unwrap_or("").is_empty() {
                     return Ok(TagAction::Continue);
                 }
                 if self.run_on_next_hooks(runtime, storage, target)? {
@@ -4439,6 +4465,40 @@ impl KagSession {
 /// The native twin (`native::kag::kag_decl_attr`) reads the same spellings.
 fn hook_attr(command: &str, name: &str) -> Option<String> {
     non_empty_string(decl_attr(command, name)?)
+}
+
+/// One declared `storage`/`target` as the reference's tag parser would have
+/// handed it to the project's own handler: an `&expr` value is evaluated
+/// (`KAGParser.cpp:1587-1590`, `TVPExecuteExpression`, then the result as a
+/// string) and the handler receives *that*, never the source text. The scan
+/// reads the declaration instead of running it, so the evaluation has to happen
+/// here — GINKA's `game.from.title` names its scene that way
+/// (`storage='&GetVolumeFileName("start.ks")'`, `main/custom.ks:24`, which is
+/// not a storage until it is evaluated) and a value the engine cannot turn into
+/// an existing scenario has to fall through to the caller's next candidate.
+fn declared_hook_value(runtime: &mut Runtime<KrkrHost>, value: Option<String>) -> Option<String> {
+    let value = value?;
+    let Some(expression) = value.strip_prefix('&') else {
+        return Some(value);
+    };
+    match execute_expression_on_runtime(runtime, "KAG sys-script declaration", expression) {
+        Ok(Variant::Void) => None,
+        Ok(resolved) => match resolved.to_tjs_string() {
+            Ok(text) => non_empty_string(&text),
+            Err(error) => {
+                runtime.host_mut().log(&format!(
+                    "KAG sys-script declaration `{expression}` is not a scenario name: {error}"
+                ));
+                None
+            }
+        },
+        Err(error) => {
+            runtime.host_mut().log(&format!(
+                "KAG sys-script declaration `{expression}` did not evaluate: {error}"
+            ));
+            None
+        }
+    }
 }
 
 /// `true` for a `custom.ks` line the reference's scenario reader skips as a
@@ -5340,12 +5400,12 @@ fn sysjump_storage(storage: &str) -> String {
     format!("{storage}.ks")
 }
 
-/// `true` for a system-script `storage` a transition can load. A value that
-/// still carries its `&` is one the engine's own `custom.ks` scan read raw —
-/// the project never executed that declaration, or the scan ran first — and the
-/// evaluation is what names the scenario (`&GetVolumeFileName("start.ks")` is
-/// not a storage), so such an entry is treated as unregistered and the caller's
-/// fallback stands.
+/// `true` for a system-script `storage` a transition can load. The declarations
+/// the engine scans are evaluated like the reference's parser would hand them
+/// over (`declared_hook_value`), so a value that still carries its `&` can only
+/// come from a path that read the text raw; it names no scenario
+/// (`&GetVolumeFileName("start.ks")` is not a storage), so such an entry counts
+/// as unregistered and the caller's next candidate stands.
 fn is_sysjump_storage(storage: &str) -> bool {
     !storage.is_empty() && !storage.starts_with('&')
 }
@@ -21728,6 +21788,44 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// The declarations the engine scans are evaluated the way the reference's
+    /// parser hands them to the project's own handler, so the entry the pair
+    /// names is the one that resolves. GINKA declares exactly this shape twice
+    /// (`main/custom.ks:23-24`): a short entry `game` with a literal storage and
+    /// the pair entry `game.from.title` whose storage is an entity,
+    /// `&GetVolumeFileName("start.ks")`. A scanner that kept that text as the
+    /// storage would drop the pair entry and resolve through `game` instead —
+    /// the same scene only while the volume's file happens to be `start.ks`.
+    #[test]
+    fn kag_sysjump_evaluates_a_declared_entity_storage() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(root.join("first.ks"), "[sysjump from=title to=game][s]")
+            .expect("write scenario");
+        fs::write(
+            root.join("custom.ks"),
+            "[addSysScript name=\"game\" storage=\"wrong\"]\n\
+             [addSysScript name=\"game.from.title\" storage='&VolumeFile(\"vol1.ks\")' target=\"*start\"]\n",
+        )
+        .expect("write sys-script declarations");
+        fs::write(root.join("wrong.ks"), "WRONG[s]").expect("write head-entry scenario");
+        fs::write(root.join("vol1.ks"), "*start\nVOLUME[s]").expect("write volume scenario");
+
+        let mut engine = image_test_engine(&root);
+        engine
+            .execute_script(
+                "volume-file.tjs",
+                "global.VolumeFile = function(name) { return name; };",
+            )
+            .expect("install the project's volume-name picker");
+        engine.load_kag_scenario("first.ks").expect("load scenario");
+        let tick = engine.tick().expect("system jump");
+
+        assert_eq!(tick.state, KagTaskState::Finished);
+        assert_eq!(engine.message_layer().lines, vec!["VOLUME".to_string()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     /// `[next storage=X target=Y]` is KAG's own transition tag, the same load
     /// and label move `[jump]` performs (`MainWindow.tjs`, the `next` tag:
     /// `process(storage, target)`). GINKA's volume select reaches its scene
@@ -21796,8 +21894,11 @@ mod tests {
                 r#"
                 global.kag = new Dictionary();
                 global.nextHook = "";
+                function show(value) {
+                    return value === void ? "<void>" : "<" + value + ">";
+                }
                 kag.forEachFunctionHook = function(name, storage, target) {
-                    global.nextHook = "" + name + "|" + storage + "|" + target;
+                    global.nextHook = "" + name + "|" + show(storage) + "|" + show(target);
                     return 1;
                 };
                 "#,
@@ -21805,9 +21906,12 @@ mod tests {
             .expect("install onNext hook");
         let tick = engine.tick().expect("handled next tag");
 
+        // The reference calls the hooks with the values as written, so an empty
+        // `target` is `""` and not void (`MainWindow.tjs`, the `next` handler:
+        // only its own no-op test reads emptiness, `l0 == "" && l1 == ""`).
         assert_eq!(
             engine.tjs_runtime().global_member("nextHook"),
-            Variant::String("onNext|scn000.ks|".to_string())
+            Variant::String("onNext|<scn000.ks>|<>".to_string())
         );
         assert_eq!(tick.state, KagTaskState::Finished);
         assert_eq!(engine.message_layer().lines, vec!["AFTER".to_string()]);
