@@ -75,16 +75,24 @@
 //!   reference streams from the archive. `Seek` on the resulting stream is
 //!   therefore a memory cursor (`UnzipStream::Seek` in the reference also only
 //!   supports rewinding, `storage.cpp:275-296`).
-//! * **Name decoding for non-UTF-8 entries.** A name without flag bit 11 is
-//!   converted through the host's ANSI code page by `NarrowString`
-//!   (`narrow.h:9-29`, `storeFilename` `main.cpp:334-350`). This port decodes
-//!   such names as UTF-8 when they are valid UTF-8 and otherwise maps them
-//!   through CP437 (the ZIP spec's default for un-flagged names); a CP932 name
-//!   in a flag-less archive cannot be recovered without an encoding facility,
-//!   so it will not match its script string. Filed as a finding. The flag is
-//!   honoured per entry, where the reference decides the whole archive's
-//!   encoding from the *first* entry (`main.cpp:379-384`) — a mixed archive
-//!   decodes more of its names here, never fewer.
+//! * **Name decoding for flag-less entries.** Flag bit 11 alone decides the
+//!   encoding (`storeFilename`, `main.cpp:335-350`): set means UTF-8, clear
+//!   means the host's ANSI code page, because the flag-less branch's
+//!   `ttstr = const char*` assignment reaches `TJS_mbstowcs` —
+//!   `MultiByteToWideChar(CP_ACP, …)` (`tjsConfig.cpp:208-243`), CP932 on the
+//!   Japanese Windows hosts the reference ships to — and queries are converted
+//!   back through the same code page (`NarrowString(srcname, utf8)`,
+//!   `main.cpp:491`, `narrow.h:22-28`). This port decodes a flag-less name with
+//!   the same WHATWG table the engine reads project text with
+//!   (`encoding_rs::SHIFT_JIS`, `krkr-assets/src/storage.rs:2600`), and keeps
+//!   its previous fallback — valid UTF-8 as-is, otherwise CP437 — only for
+//!   bytes that code page cannot represent at all, where the reference throws
+//!   instead (`TJSNarrowToWideConversionError`, `tjsVariantString.h:110-112`).
+//!   The flag is honoured per entry, where the reference decides the whole
+//!   archive's encoding from the *first* entry (`main.cpp:379-384`,
+//!   `storage.cpp:60-61`) — a mixed archive decodes more of its names here,
+//!   never fewer. Names are read from the central directory only and entry
+//!   comments are never decoded, both as in the reference.
 //! * **Passwords are UTF-8.** `NarrowString(password)` uses the ANSI code page
 //!   (`narrow.h:22-28`); identical for ASCII passwords.
 //! * **DOS timestamps are interpreted as UTC.** DOS dates are local time and
@@ -118,6 +126,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+use encoding_rs::SHIFT_JIS;
 use krkr_engine::{
     KrkrHost, KrkrPlugin,
     plugin_api::{self, ResourceStream, StorageMediaProvider},
@@ -139,8 +148,9 @@ pub(crate) const META: PluginMeta = PluginMeta {
             writer stores or fixed-Huffman-deflates, computes CRCs, encrypts with PKWARE \
             ZipCrypto and appends by rewriting the central directory. Deviations: whole-buffer \
             storage writes instead of a writable IStream, entry data materialized in memory, \
-            non-UTF-8 entry names decoded as UTF-8-or-CP437 instead of the host ANSI code page, \
-            DOS dates treated as UTC, CRC-mismatched extraction reports failure.",
+            flag-less entry names decoded through CP932 (the reference's ANSI code page on its \
+            Japanese hosts; UTF-8-as-is or CP437 only for bytes CP932 cannot represent, where the \
+            reference throws), DOS dates treated as UTC, CRC-mismatched extraction reports failure.",
     install: |engine| engine.register_plugin(MinizipPlugin::new()),
 };
 
@@ -1262,14 +1272,36 @@ fn zip64_extra_values(extra: &[u8]) -> Option<Vec<u64>> {
     None
 }
 
-/// Decodes an entry name (`storeFilename`, `main.cpp:334-350`). The reference
-/// converts the bytes through the host ANSI code page when flag bit 11 is
-/// clear; without an encoding facility this port takes valid UTF-8 as-is and
-/// otherwise maps the bytes through CP437 (the ZIP specification's default for
-/// un-flagged names) — see the module docs and the filed finding.
+/// Decodes an entry name (`storeFilename`, `main.cpp:335-350`).
+///
+/// Flag bit 11 decides the encoding, and only that: a flagged name is UTF-8
+/// (`MultiByteToWideChar(CP_UTF8, 0, …)`, `main.cpp:337-346`), and a flag-less
+/// name is the host's ANSI code page — the `ttstr = const char*` assignment at
+/// `main.cpp:348` reaches `SetString(const tjs_nchar*)`
+/// (`tjsVariantString.h:108-122`) and therefore `TJS_mbstowcs`
+/// (`tjsConfig.h:99-100`), which on Windows is
+/// `MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED|MB_ERR_INVALID_CHARS, …)`
+/// (`tjsConfig.cpp:208-243`). CP932 is that code page on the Japanese Windows
+/// hosts the reference ships to, and the engine already reads project text
+/// through the same WHATWG table (`krkr-assets/src/storage.rs:2600`), so a
+/// stored name and the script string asking for it land on the same code
+/// points. Queries travel the other way through the same code page
+/// (`NarrowString(srcname, utf8)`, `main.cpp:491`; `narrow.h:22-28`), which is
+/// why resolving one against `locate_entry`'s decoded name is equivalent to the
+/// reference's byte comparison.
+///
+/// Bytes the code page cannot represent leave the reference with no name at
+/// all: `TJS_mbstowcs` returns `-1` and `SetString` throws
+/// `TJSNarrowToWideConversionError` (`tjsVariantString.h:110-112`). This port
+/// keeps the previous fallback there — valid UTF-8 as-is, otherwise CP437 —
+/// rather than failing the archive.
 fn decode_name(raw: &[u8], utf8: bool) -> String {
     if utf8 {
         return String::from_utf8_lossy(raw).into_owned();
+    }
+    let (text, _, had_errors) = SHIFT_JIS.decode(raw);
+    if !had_errors {
+        return text.into_owned();
     }
     match std::str::from_utf8(raw) {
         Ok(text) => text.to_owned(),
@@ -1277,6 +1309,8 @@ fn decode_name(raw: &[u8], utf8: bool) -> String {
     }
 }
 
+/// The ZIP specification's default for un-flagged names, kept only for bytes
+/// the reference's code page cannot decode at all (see [`decode_name`]).
 fn cp437(raw: &[u8]) -> String {
     const HIGH: [char; 128] = [
         'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ',
@@ -2408,6 +2442,23 @@ mod tests {
     /// central directory holds the truth.
     const FIXTURE_DESCRIPTOR_ZIP_HEX: &str = "504b0304140008080800060422580000000000000000000000000c00000073747265616d65642e7478744b492d4e2eca2c28c92f5248cd2b29aa542848acccc94f4cd151282fca2c2949cd53282e294a4dcccdcc4bd72d2ea9cc49d5e30200504b07087cf6c06d3500000033000000504b01021400140008080800060422587cf6c06d35000000330000000c000000000000000000000000000000000073747265616d65642e747874504b050600000000010001003a0000006f0000000000";
 
+    /// The name both entries of [`FIXTURE_CP932_ZIP_HEX`] carry, and its CP932
+    /// bytes (`正` `90 b3`, `し` `82 b5`, `い` `82 a2`, `名` `96 bc`, `前` `91 4f`).
+    const CP932_NAME: &str = "正しい名前.txt";
+    const CP932_NAME_BYTES: [u8; 14] = [
+        0x90, 0xb3, 0x82, 0xb5, 0x82, 0xa2, 0x96, 0xbc, 0x91, 0x4f, 0x2e, 0x74, 0x78, 0x74,
+    ];
+
+    /// A hand-built archive: two stored entries, no extra fields, no data
+    /// descriptors. Entry 0 is named `正しい名前.txt` in CP932 bytes with
+    /// general-purpose flag bit 11 **clear** — the shape a legacy Japanese
+    /// writer produces — and holds `cp932 named entry\n`; entry 1 is named
+    /// `日本語.txt` in UTF-8 bytes with bit 11 set and holds
+    /// `utf8 named entry\n`. The name bytes and payloads are quoted here, so
+    /// the image regenerates from them alone. One archive therefore pins both
+    /// decode rules at once.
+    const FIXTURE_CP932_ZIP_HEX: &str = "504b030414000000000022581883fc826e2c12000000120000000e00000090b382b582a296bc914f2e7478746370393332206e616d656420656e7472790a504b0304140000080000225818833371643311000000110000000d000000e697a5e69cace8aa9e2e74787475746638206e616d656420656e7472790a504b0102140014000000000022581883fc826e2c12000000120000000e000000000000000000000000000000000090b382b582a296bc914f2e747874504b01021400140000080000225818833371643311000000110000000d000000000000000000000000003e000000e697a5e69cace8aa9e2e747874504b05060000000002000200770000007a0000000000";
+
     /// zlib's raw-DEFLATE encoding of `deflate_test_text()` at level 6 with
     /// `Z_FIXED` (one fixed-Huffman block).
     const DEFLATE_FIXED_HEX: &str = "cbce2c4acc066285aacc0285b4cc8a92d2a2548594cabcc4dccc64858cd2b4b4dcc43c85a49cfce46c85e4fcb2d4a2c4f4543d0503432363135333730b4b85c4a4e494d4b4f48cccacec9cdcbcfc82c2a2e292d2b2f28aca2a05472767175737770f4f2f6f1f5f3fff80c0a0e090d0b0f088c8286b85a2d482d4c41285928c548592c4cc1c85e27c85dcc492e48cd46285c402a054919e42f6a8cb465d36eab251978dba6cd465a32e1b75d9a8cb465d36eab251978dba6cd465a32e1b75d9a8cb465d36eab251978dba6cd465a32ea392cb00";
@@ -2541,14 +2592,64 @@ mod tests {
         assert_eq!(unix_millis_from_dos(0, 0), None);
     }
 
+    /// `storeFilename` decides a name's encoding from general-purpose flag bit
+    /// 11 alone (`main.cpp:335-350`): set means UTF-8, clear means the host
+    /// ANSI code page — the `ttstr = const char*` assignment reaches
+    /// `SetString(const tjs_nchar*)` → `TJS_mbstowcs` (`tjsVariantString.h:108-122`,
+    /// `tjsConfig.h:99-100`), which on Windows is
+    /// `MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED|MB_ERR_INVALID_CHARS, …)`
+    /// (`tjsConfig.cpp:208-243`). CP932 is that code page on the Japanese
+    /// Windows hosts the reference ships to, and the engine already reads
+    /// project text through the same table (`krkr-assets/src/storage.rs:2600`).
+    /// CP437 is not part of that rule; it survives here only for bytes the ANSI
+    /// code page cannot represent, where the reference throws instead
+    /// (`TJSThrowNarrowToWideConversionError`, `tjsVariantString.cpp:34-37`).
     #[test]
-    fn decode_name_handles_utf8_and_cp437() {
+    fn decode_name_follows_the_reference_ansi_rule() {
         assert_eq!(decode_name(b"plain.txt", false), "plain.txt");
+        // Flag bit 11 set: UTF-8 bytes, unchanged.
         assert_eq!(decode_name("café.txt".as_bytes(), true), "café.txt");
-        // Valid UTF-8 without the flag is kept as-is.
-        assert_eq!(decode_name("café.txt".as_bytes(), false), "café.txt");
-        // 0x82 0xA0 is "éá" in CP437 (0x82 = é, 0xA0 = á).
-        assert_eq!(decode_name(&[0x82, 0xA0], false), "éá");
+        assert_eq!(decode_name(CP932_NAME.as_bytes(), true), CP932_NAME);
+        // Flag bit 11 clear: the bytes are the ANSI code page.
+        assert_eq!(decode_name(&CP932_NAME_BYTES, false), CP932_NAME);
+        // 0x82 0xA0 is "あ" in CP932; CP437 would render "éá".
+        assert_eq!(decode_name(&[0x82, 0xA0], false), "あ");
+        // The reference throws on bytes the ANSI code page cannot represent;
+        // this port keeps its previous fallback instead of failing the whole
+        // archive, so a UTF-8-encoded Japanese name without the flag still
+        // decodes (`日本語` is not a valid CP932 byte sequence).
+        assert_eq!(decode_name("日本語.txt".as_bytes(), false), "日本語.txt");
+        // Neither encoding fits 0x82 followed by a space: CP437's "é " it is.
+        assert_eq!(decode_name(&[0x82, 0x20], false), "é ");
+    }
+
+    /// A bit-11-clear name is CP932, so the script string the game would ask
+    /// for resolves and the CP437 mojibake the same bytes used to decode to no
+    /// longer answers. The bit-11 entry in the same archive keeps resolving as
+    /// UTF-8.
+    #[test]
+    fn flagless_cp932_names_resolve_where_their_mojibake_does_not() {
+        let entries = read_archive_index(&mut Cursor::new(hex(FIXTURE_CP932_ZIP_HEX)))
+            .expect("fixture index");
+        assert_eq!(entries[0].flags & FLAG_UTF8, 0);
+        assert_eq!(entries[1].flags & FLAG_UTF8, FLAG_UTF8);
+        assert_eq!(entries[0].name_raw, CP932_NAME_BYTES);
+        assert_eq!(entries[1].name_raw, "日本語.txt".as_bytes());
+        assert_eq!(entries[0].name, CP932_NAME);
+        assert_eq!(entries[1].name, "日本語.txt");
+        assert_eq!(
+            locate_entry(&entries, CP932_NAME).map(|entry| entry.name.as_str()),
+            Some(CP932_NAME)
+        );
+        assert_eq!(
+            locate_entry(&entries, "日本語.txt").map(|entry| entry.name.as_str()),
+            Some("日本語.txt")
+        );
+        // What CP437 made of the flag-less bytes — the spelling the old decode
+        // reported, and the one a lookup must now miss.
+        assert_eq!(cp437(&CP932_NAME_BYTES), "É│é╡éóû╝æO.txt");
+        assert_ne!(decode_name(&CP932_NAME_BYTES, false), "É│é╡éóû╝æO.txt");
+        assert!(locate_entry(&entries, "É│é╡éóû╝æO.txt").is_none());
     }
 
     /// The listing table has the reference's shape: files land under
@@ -2993,6 +3094,89 @@ mod tests {
         assert_eq!(
             evaluate(&mut engine, "Storages.unmountZip(\"data\")").expect("unmount again"),
             Variant::Integer(0)
+        );
+    }
+
+    /// The script path over a legacy archive: `Unzip.list` reports the CP932
+    /// name, `extract` resolves the script string the game would pass, and the
+    /// `zip://` media serves it. Before the ANSI decode this was the reported
+    /// failure — the entry existed, but nothing could name it.
+    #[test]
+    fn a_legacy_cp932_archive_is_reachable_by_its_real_names() {
+        let root = temp_root("cp932");
+        write_file(&root, "legacy.zip", &hex(FIXTURE_CP932_ZIP_HEX));
+        let mut engine = plugin_engine(&root);
+
+        let listed = evaluate(
+            &mut engine,
+            "(function() {\n\
+                 var z = new Unzip();\n\
+                 z.open(\"legacy.zip\");\n\
+                 var l = z.list();\n\
+                 var out = l[0].filename + \"|\" + l[1].filename + \"|\" + l.length;\n\
+                 z.close();\n\
+                 return out;\n\
+             })()",
+        )
+        .expect("list the legacy archive");
+        assert_eq!(
+            listed,
+            Variant::String("正しい名前.txt|日本語.txt|2".to_string())
+        );
+
+        let extracted = evaluate(
+            &mut engine,
+            "(function() {\n\
+                 var z = new Unzip();\n\
+                 z.open(\"legacy.zip\");\n\
+                 var ok = z.extract(\"正しい名前.txt\", \"out/name.txt\");\n\
+                 z.close();\n\
+                 return ok;\n\
+             })()",
+        )
+        .expect("extract by the CP932 name");
+        assert_eq!(extracted, Variant::Integer(1));
+        assert_eq!(
+            storage_read(&engine, "out/name.txt"),
+            b"cp932 named entry\n"
+        );
+
+        // The mojibake spelling the flag-less bytes used to decode to must not
+        // resolve, or the fix would have traded one name for another.
+        let mojibake = evaluate(
+            &mut engine,
+            "(function() {\n\
+                 var z = new Unzip();\n\
+                 z.open(\"legacy.zip\");\n\
+                 var ok = z.extract(\"É│é╡éóû╝æO.txt\", \"out/mojibake.txt\");\n\
+                 z.close();\n\
+                 return ok;\n\
+             })()",
+        )
+        .expect("extract by the mojibake name");
+        assert_eq!(mojibake, Variant::Integer(0));
+
+        evaluate(&mut engine, "Storages.mountZip(\"legacy\", \"legacy.zip\")").expect("mount");
+        assert_eq!(
+            storage_read(&engine, "zip://legacy/正しい名前.txt"),
+            b"cp932 named entry\n"
+        );
+        assert_eq!(
+            storage_read(&engine, "zip://legacy/日本語.txt"),
+            b"utf8 named entry\n"
+        );
+        let storage = engine
+            .tjs_runtime()
+            .host()
+            .project_storage()
+            .expect("project storage");
+        assert!(storage.storage_exists("zip://legacy/正しい名前.txt"));
+        assert!(!storage.storage_exists("zip://legacy/É│é╡éóû╝æO.txt"));
+        assert_eq!(
+            storage
+                .list_directory("zip://legacy/")
+                .expect("list the legacy root"),
+            vec!["正しい名前.txt".to_string(), "日本語.txt".to_string()]
         );
     }
 
