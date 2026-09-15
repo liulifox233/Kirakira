@@ -14,7 +14,7 @@
 //!    option whose selection differs from its default into
 //!    `<datapath>/<exe>.cfu` (`:204-254`); at startup the engine pushes the
 //!    command line, that file and the exe's own `.cf` into the argument stock
-//!    (`PushConfigFileOptions`, `krkrz/base/win32/SysInitImpl.cpp:1651-1703`),
+//!    (`PushConfigFileOptions`, `krkrz/base/win32/SysInitImpl.cpp:1640-1649`),
 //!    so `System.getArgument("-<name>")` answers before any script runs.
 //! 3. **The window group is applied by the game's own scripts**, not by the
 //!    engine: the only readers of `fullscreenmode`/`maximizemode`/

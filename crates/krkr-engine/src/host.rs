@@ -1457,8 +1457,9 @@ impl KrkrHost {
     /// stock, the way the reference engine merges its per-user configuration
     /// file at startup — before any script runs, so
     /// `System.getArgument("-<name>")` already answers when the game's boot
-    /// code asks (`TVPInitProgramArgumentsAndDataPath` ->
-    /// `PushConfigFileOptions`, `krkrz/base/win32/SysInitImpl.cpp:1651-1703`).
+    /// code asks (`TVPInitProgramArgumentsAndDataPath`,
+    /// `krkrz/base/win32/SysInitImpl.cpp:1651-1703` → `PushConfigFileOptions`,
+    /// `:1640-1649`).
     /// The shell reads the file (its path is a native path only the shell
     /// knows) and hands the text in.
     ///

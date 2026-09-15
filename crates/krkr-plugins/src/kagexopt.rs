@@ -34,7 +34,8 @@
 //!    option whose selection differs from its default into
 //!    `<datapath>/<exe>.cfu` (`:204-254`), and at startup the engine pushes
 //!    the command line, that file and the exe's own `.cf` into the argument
-//!    stock (`PushConfigFileOptions`, `krkrz/base/win32/SysInitImpl.cpp:1625-1634`)
+//!    stock (`PushConfigFileOptions`,
+//!    `krkrz/base/win32/SysInitImpl.cpp:1640-1649`)
 //!    before any script runs, so `System.getArgument("-<name>")` answers
 //!    (`SystemImpl.cpp:848-861`).
 //! 3. **The window group is applied by the game's scripts, not the engine.**
