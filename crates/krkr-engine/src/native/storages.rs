@@ -617,4 +617,35 @@ mod tests {
             .expect("script");
         assert_eq!(value, Variant::String(String::new()));
     }
+
+    /// M249.  KAGEX's bookmark save writes the file first and then calls
+    /// `Storages.commitSavedata()`; its catch calls
+    /// `Storages.rollbackSavedata()`.  Neither member exists on our surface
+    /// (`rg commitSavedata crates/` is empty), so the file lands and the save
+    /// still reports failure.  This is the shape the game runs against:
+    /// `try { write; commit } catch { rollback }`.
+    #[test]
+    fn kagex_save_sequence_commits_without_throwing() {
+        let mut engine = KrkrEngine::new(EngineConfig::default()).expect("engine");
+        let value = engine
+            .execute_script(
+                "kagex_savedata_shape.tjs",
+                r#"
+                function saveBookMarkToFile() {
+                    try {
+                        // (BookMarkIO.save incontextof this)(...) -- the game's
+                        // own write path lands the artifact here.
+                        Storages.commitSavedata();
+                    } catch (e) {
+                        Storages.rollbackSavedata();
+                        return "caught: " + e.message;
+                    }
+                    return "committed";
+                }
+                return saveBookMarkToFile();
+                "#,
+            )
+            .expect("script");
+        assert_eq!(value, Variant::String("committed".to_string()));
+    }
 }
