@@ -137,6 +137,10 @@ impl TerminalApp {
         let project_root = project_root
             .or_else(initial_project_root)
             .ok_or_else(|| "failed to resolve project root".to_string())?;
+        // Resolve the caller's spelling once: the storage and the asset store
+        // map absolute storage names onto their layers by comparing paths, so
+        // everything the engine receives is absolute.
+        let project_root = absolute_root(&project_root);
         if !project_root.is_dir() {
             return Err(format!(
                 "project path is not a directory: {}",
@@ -630,7 +634,25 @@ fn initial_project_root() -> Option<PathBuf> {
         .or_else(|| env::current_dir().ok())
 }
 
+/// The `SystemPaths` this shell hands the engine for a project root.
+///
+/// `System.exePath` must reach scripts absolute: the reference's
+/// `TVPGetAppPath()` (`SystemImpl.cpp:777` -> `StorageImpl.cpp:388`) is the
+/// running program's own directory, and a game that probes
+/// `Storages.isExistentStorage(System.exePath + <own file>)` misses when the
+/// value is the caller's relative spelling instead (GINKA's boot patch answers
+/// that miss by replacing `Scripts.execStorage` with a no-op, so
+/// `system/Initialize.tjs` never runs and `global.kag` is never created).
+///
+/// The one shared definition for the native shells is
+/// `krkr_debug::console::system_paths_for_project`, which the headless and
+/// windowed shells call; this shell deliberately does not depend on the
+/// debugger crate — that would pull its `opus`-enabled `krkr-audio` (an extra
+/// CMake toolchain) into the terminal binary — so the rule is repeated here and
+/// pinned by the test below.  A root-aware constructor on
+/// `krkr_engine::SystemPaths` is where the single copy belongs once one exists.
 fn system_paths_for_project(root: &Path) -> SystemPaths {
+    let root = absolute_root(root);
     let root_display = root.display().to_string();
     let temp_display = env::temp_dir().display().to_string();
     SystemPaths {
@@ -644,6 +666,16 @@ fn system_paths_for_project(root: &Path) -> SystemPaths {
         personal_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
         app_data_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
     }
+}
+
+/// `path` as an absolute path, resolved against the process's current
+/// directory — the shell's one place to settle a caller's relative spelling
+/// before the engine sees it.  Nothing on disk is consulted: the reference
+/// neither resolves symlinks nor requires the directory to exist, and only a
+/// path `std::path::absolute` refuses (an empty argument, or a cwd that cannot
+/// be read) keeps its old spelling rather than inventing one.
+fn absolute_root(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn looks_like_project_root(path: &Path) -> bool {
@@ -1293,6 +1325,36 @@ mod tests {
 
     use super::*;
     use krkr_core::{FrameOutput, ImageUpload};
+
+    /// The shell resolves the caller's spelling before the engine sees it: the
+    /// storage only maps an absolute storage name onto its file layer when the
+    /// layer root is spelled the same way, so a relative root drops the loose
+    /// project files from `Storages.dirlist(System.exePath)`.
+    #[test]
+    fn the_root_handed_over_is_resolved_once() {
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(
+            absolute_root(Path::new("m246-relative-root")),
+            cwd.join("m246-relative-root")
+        );
+        assert_eq!(absolute_root(&cwd), cwd);
+    }
+
+    /// The terminal hands the engine the same absolute `System.exePath` as the
+    /// other shells whatever spelling the root arrived in — a relative value
+    /// makes every game-side `System.exePath + name` probe miss.
+    #[test]
+    fn a_relative_project_root_reaches_the_engine_absolute() {
+        let root = Path::new("m246-relative-root");
+        let paths = system_paths_for_project(root);
+        let expected = format!("{}/", env::current_dir().unwrap().join(root).display());
+        assert_eq!(paths.exe_path, expected);
+        assert!(
+            Path::new(&paths.exe_path).is_absolute(),
+            "{}",
+            paths.exe_path
+        );
+    }
 
     #[test]
     fn transcript_tracker_emits_only_appended_text() {

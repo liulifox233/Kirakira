@@ -1356,7 +1356,27 @@ pub fn composited_command_count(frame: &FrameOutput) -> usize {
             .sum::<usize>()
 }
 
+/// The `SystemPaths` a shell hands the engine for one project root.
+///
+/// `System.exePath` is the reference's `TVPGetAppPath()` (`SystemImpl.cpp:777`
+/// -> `StorageImpl.cpp:388`): the directory part of the *running program's own*
+/// path, and therefore always absolute — `ExePath()` is `GetModuleFileName`
+/// (`environ/win32/Application.cpp:70`) and the reference never echoes a
+/// caller's spelling back at scripts.  Our shells launch the game from outside
+/// its directory, so the value that names the app's files is the project root;
+/// that root must still arrive absolute, because games concatenate it with
+/// file names of their own.  GINKA's loose `patch.tjs` probes
+/// `Storages.isExistentStorage(System.exePath + "禁止设置门槛分享本资源")` and,
+/// when the probe misses, replaces `Scripts.execStorage` with a no-op — a
+/// relative root silently disables `system/Initialize.tjs` and `global.kag` is
+/// never created.
+///
+/// This is the shared home for the shells that can reach it: the windowed
+/// `krkr-desktop` calls it directly.  The terminal shell keeps its own copy
+/// (it does not depend on this crate) and `crates/krkr-engine`'s `SystemPaths`
+/// remains the place a root-aware constructor belongs once the tower opens it.
 pub fn system_paths_for_project(root: &std::path::Path) -> SystemPaths {
+    let root = absolute_app_root(root);
     let root_display = root.display().to_string();
     let temp_display = std::env::temp_dir().display().to_string();
     SystemPaths {
@@ -1370,6 +1390,24 @@ pub fn system_paths_for_project(root: &std::path::Path) -> SystemPaths {
         personal_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
         app_data_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
     }
+}
+
+/// `root` as an absolute path, resolved against the process's current
+/// directory the way the reference's own value comes from the process's module
+/// path.  Nothing on disk is consulted — the reference neither resolves
+/// symlinks nor requires the directory to exist at that point.  Only a root
+/// `std::path::absolute` refuses (an empty argument, or a cwd that cannot be
+/// read) keeps its old spelling rather than inventing a path.
+///
+/// Every shell resolves a user-supplied root through this before it hands it
+/// over, not just for `System.exePath`: the storage maps an *absolute* storage
+/// name onto its file layer only when the layer root is spelled the same way
+/// (`crates/krkr-assets/src/storage.rs`, `layer_directory_path`), so a
+/// relative root silently drops the loose project files from
+/// `Storages.dirlist(System.exePath)` — GINKA's `system/Initialize.tjs` walks
+/// that listing to register auto paths and recurses on it.
+pub fn absolute_app_root(root: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 pub fn dump_logs(engine: &KrkrEngine) {
@@ -1499,5 +1537,56 @@ pub fn variant_kind(engine: &KrkrEngine, value: &Variant) -> &'static str {
         Variant::Object(_) => "object",
         Variant::Closure(_) => "closure",
         Variant::CodeObject(_) => "code-object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{absolute_app_root, system_paths_for_project};
+    use std::path::Path;
+
+    /// `System.exePath` reaches scripts absolute however the caller spelled the
+    /// root (`SystemImpl.cpp:777` -> `TVPGetAppPath`): games build their own
+    /// file names on it, and a relative value resolves those against whatever
+    /// directory the launcher happened to be started in.  The un-absolutised
+    /// shell echoed `m246-relative-root/` here.
+    #[test]
+    fn a_relative_project_root_yields_an_absolute_exe_path() {
+        let root = Path::new("m246-relative-root");
+        let paths = system_paths_for_project(root);
+        let expected = format!("{}/", std::env::current_dir().unwrap().join(root).display());
+        assert_eq!(paths.exe_path, expected);
+        assert!(
+            Path::new(&paths.exe_path).is_absolute(),
+            "{}",
+            paths.exe_path
+        );
+    }
+
+    /// An already-absolute root keeps naming the same directory — the fix must
+    /// not rewrite a value the caller got right.
+    #[test]
+    fn an_absolute_project_root_still_names_its_directory() {
+        let root = std::env::current_dir().unwrap();
+        let paths = system_paths_for_project(&root);
+        let expected = format!(
+            "{}/",
+            root.display().to_string().trim_end_matches(['/', '\\'])
+        );
+        assert_eq!(paths.exe_path, expected);
+    }
+
+    /// The shells resolve the caller's spelling before the engine sees it: the
+    /// storage only maps an absolute storage name onto its file layer when the
+    /// layer root is spelled the same way, so a relative root drops the loose
+    /// project files from `Storages.dirlist(System.exePath)`.
+    #[test]
+    fn the_root_handed_over_is_resolved_once() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_app_root(Path::new("m246-relative-root")),
+            cwd.join("m246-relative-root")
+        );
+        assert_eq!(absolute_app_root(&cwd), cwd);
     }
 }

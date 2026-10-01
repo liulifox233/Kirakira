@@ -10,7 +10,7 @@ use krkr_debug::{
 };
 use krkr_engine::{
     EngineConfig as KrkrEngineConfig, EngineInput as KrkrEngineInput, KrkrEngine, RuntimeSession,
-    SystemMetrics, SystemPaths,
+    SystemMetrics,
 };
 use krkr_plugins::register_reference_plugins;
 use krkr_render::{RenderError, Renderer};
@@ -865,6 +865,9 @@ impl DesktopApp {
     }
 
     fn launch_project(&mut self, root: PathBuf, window: &Window) -> bool {
+        // Resolve the launcher's spelling once: the storage, the asset store
+        // and `System.exePath` all see the absolute path.
+        let root = console::absolute_app_root(&root);
         if !root.is_dir() {
             let message = format!("project path is not a directory: {}", root.display());
             self.set_status(StatusLevel::Error, message.clone(), Some(window));
@@ -885,7 +888,10 @@ impl DesktopApp {
         };
         let mut krkr_engine = match KrkrEngine::new(KrkrEngineConfig {
             project_storage: Some(Arc::new(storage)),
-            system_paths: system_paths_for_project(&root),
+            // The debugger library owns the one definition of how a shell
+            // turns a project root into `SystemPaths`; its `System.exePath`
+            // must reach scripts absolute (`SystemImpl.cpp:777`).
+            system_paths: console::system_paths_for_project(&root),
             system_metrics: system_metrics_for_window(window),
             video_factory: Arc::new(PlatformVideoFactory),
             ..KrkrEngineConfig::default()
@@ -1149,22 +1155,6 @@ impl DesktopApp {
         self.state = DesktopState::FatalError;
         self.status = Some(DesktopStatus::new(StatusLevel::Error, message));
         event_loop.exit();
-    }
-}
-
-fn system_paths_for_project(root: &std::path::Path) -> SystemPaths {
-    let root_display = root.display().to_string();
-    let temp_display = std::env::temp_dir().display().to_string();
-    SystemPaths {
-        exe_path: format!("{}/", root_display.trim_end_matches(['/', '\\'])),
-        data_path: if cfg!(windows) {
-            let data = root.join("savedata").display().to_string();
-            format!("{}\\", data.trim_end_matches(['/', '\\']))
-        } else {
-            "savedata/".to_string()
-        },
-        personal_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
-        app_data_path: format!("{}/", temp_display.trim_end_matches(['/', '\\'])),
     }
 }
 
@@ -1471,6 +1461,23 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// The window shell hands the engine the same absolute `System.exePath` as
+    /// the headless one: the launcher is usually started from elsewhere, and a
+    /// relative value makes every game-side `System.exePath + name` lookup miss
+    /// (GINKA's boot patch answers that by disabling `Scripts.execStorage`).
+    #[test]
+    fn a_relative_project_root_reaches_the_engine_absolute() {
+        let root = std::path::Path::new("m246-relative-root");
+        let paths = console::system_paths_for_project(root);
+        let expected = format!("{}/", std::env::current_dir().unwrap().join(root).display());
+        assert_eq!(paths.exe_path, expected);
+        assert!(
+            std::path::Path::new(&paths.exe_path).is_absolute(),
+            "{}",
+            paths.exe_path
+        );
+    }
 
     /// The desktop's frame loop without a window or a GPU: the console tick
     /// runs first, then the frame it allowed, exactly as `handle_redraw` runs

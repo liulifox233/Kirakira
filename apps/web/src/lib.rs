@@ -586,6 +586,14 @@ impl WebRuntime {
             system_paths: krkr_engine::SystemPaths {
                 // These are logical virtual paths, never host filesystem
                 // paths. Save writes are routed through WebSaveStore.
+                //
+                // `./` is deliberate here, not the relative-root defect the
+                // native shells had: the package namespace is relative end to
+                // end — every manifest entry is a file below the package root
+                // and the memory storage resolves only relative names — so
+                // `System.exePath + name` must spell the namespace's own root:
+                // `./data.xp3` resolves to the manifest key, `/data.xp3`
+                // resolves to nothing.
                 exe_path: "./".to_string(),
                 data_path: "savedata/".to_string(),
                 personal_path: "savedata/".to_string(),

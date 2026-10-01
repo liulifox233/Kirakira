@@ -720,6 +720,9 @@ fn main() {
         .root
         .clone()
         .expect("usage: krkr-debug <game_dir> [-b spec]... [options]");
+    // Resolve the caller's spelling once: the storage and the scripts both see
+    // the absolute path (see `console::absolute_app_root`).
+    let root = absolute_app_root(&root);
 
     let storage = ProjectStorage::for_root(&root).expect("storage");
     // The engine takes its own `Arc`; this handle stays with the debugger so
